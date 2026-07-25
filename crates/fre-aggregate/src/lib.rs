@@ -53,7 +53,8 @@ mod required_internal_anchor;
 pub use accounting::{CompileAccounting, ExecutionAccounting};
 pub use compile::{
     CompileAttemptError, CompileAttemptIdentity, CompileAttemptKind, CompileAttemptReceipt,
-    CompiledRegex, PlanId, RustByteProfile,
+    CompileConstructionActual, CompileConstructionAttempt, CompileConstructionAttemptError,
+    CompileConstructionAttemptReceipt, CompiledRegex, PlanId, RustByteProfile,
 };
 pub use error::{Error, Resource, Unsupported};
 pub use limits::{CompileLimits, OperationLimits};

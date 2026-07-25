@@ -18,6 +18,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "token-phrase.maximal-ascii-token-stream.v1";
 pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v1";
@@ -303,67 +305,108 @@ impl TokenPhrasePlan {
         outer_word_assertions: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if literal.is_empty() {
-            return Err(BuildError::EmptyLiteral);
-        }
-        enforce_build(
-            literal.len(),
-            limits.max_literal_bytes,
-            BuildResource::LiteralBytes,
-        )?;
-        let work_upper_bound = literal
-            .len()
-            .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
-            .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "complete literal build work",
-            })?;
-        enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
-        let scratch_bytes = 0;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal.len())
+        Self::build_attempt(literal, outer_word_assertions, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact successful or partial terminal effects.
+    pub fn build_attempt(
+        literal: &[u8],
+        outer_word_assertions: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if literal.is_empty() {
+                return Err(BuildError::EmptyLiteral);
+            }
+            enforce_build(
+                literal.len(),
+                limits.max_literal_bytes,
+                BuildResource::LiteralBytes,
+            )?;
+            let work_upper_bound = literal
+                .len()
+                .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
+                    computation: "complete literal build work",
                 })?;
-        let peak_bytes = persistent_bytes;
-        enforce_build(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-        for &byte in literal {
-            if !is_ascii_word(byte) {
-                return Err(BuildError::NonWordLiteral { byte });
+            enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
+            let scratch_bytes = 0;
+            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+            )?;
+            let peak_bytes = persistent_bytes;
+            enforce_build(
+                scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            actual.work =
+                u64::try_from(FIXED_BUILD_WORK).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "fixed build work conversion",
+                })?;
+            for &byte in literal {
+                actual.work = actual
+                    .work
+                    .checked_add(u64::try_from(LITERAL_BUILD_WORK_PER_BYTE).map_err(|_| {
+                        BuildError::ArithmeticOverflow {
+                            computation: "literal byte build work conversion",
+                        }
+                    })?)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "literal byte build work",
+                    })?;
+                if !is_ascii_word(byte) {
+                    return Err(BuildError::NonWordLiteral { byte });
+                }
+            }
+            let literal = fre_exact_alloc::copy_exact(literal)
+                .map(Vec::into_boxed_slice)
+                .map_err(|error| match error {
+                    CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                        computation: "exact literal allocation layout",
+                    },
+                    CopyError::AllocationFailed => BuildError::AllocationFailed {
+                        bytes: literal.len(),
+                    },
+                })?;
+            debug_assert_eq!(usize::try_from(actual.work), Ok(work_upper_bound));
+            actual.allocations = 1;
+            actual.allocated_bytes = literal.len();
+            actual.copied_bytes = literal.len();
+            actual.initialized_bytes = persistent_bytes;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = persistent_bytes;
+            Ok(Self {
+                literal,
+                outer_word_assertions,
+                build: BuildAccounting {
+                    literal_bytes: persistent_bytes - size_of::<Self>(),
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
             }
         }
-        let literal = fre_exact_alloc::copy_exact(literal)
-            .map(Vec::into_boxed_slice)
-            .map_err(|error| match error {
-                CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
-                    computation: "exact literal allocation layout",
-                },
-                CopyError::AllocationFailed => BuildError::AllocationFailed {
-                    bytes: literal.len(),
-                },
-            })?;
-        Ok(Self {
-            literal,
-            outer_word_assertions,
-            build: BuildAccounting {
-                literal_bytes: persistent_bytes - size_of::<Self>(),
-                work_upper_bound,
-                scratch_bytes,
-                persistent_bytes,
-                peak_bytes,
-            },
-        })
     }
 
     #[must_use]
@@ -1137,5 +1180,40 @@ mod tests {
         for limits in cases {
             assert!(plan.span_sum(haystack, limits).is_err());
         }
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let literal = b"Holmes";
+        let attempt =
+            TokenPhrasePlan::build_attempt(literal, true, BuildLimits::default()).unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, literal.len());
+        assert_eq!(actual.copied_bytes, literal.len());
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error =
+            TokenPhrasePlan::build_attempt(b"ok-", false, BuildLimits::default()).unwrap_err();
+        assert!(matches!(
+            error.source(),
+            BuildError::NonWordLiteral { byte: b'-' }
+        ));
+        assert_eq!(
+            error.actual().work,
+            u64::try_from(FIXED_BUILD_WORK + 3 * LITERAL_BUILD_WORK_PER_BYTE).unwrap()
+        );
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().allocated_bytes, 0);
+        assert_eq!(error.actual().copied_bytes, 0);
+        assert_eq!(error.actual().initialized_bytes, 0);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, 0);
     }
 }

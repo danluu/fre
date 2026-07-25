@@ -16,6 +16,8 @@ use core::{fmt, mem::size_of};
 use fre_exact_alloc::CopyError;
 use memchr::memchr;
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "literal-assertions.memchr-start-or-end-line.v1";
 pub const COUNT_OPERATION_ID: &str = "literal-assertions.count.byte-stable.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "literal-assertions.span-sum.byte-stable.v1";
@@ -317,62 +319,96 @@ impl LiteralAssertionsPlan {
         line_terminator: u8,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if literal.is_empty() {
-            return Err(BuildError::EmptyLiteral);
-        }
-        enforce_build(
-            literal.len(),
-            limits.max_literal_bytes,
-            BuildResource::LiteralBytes,
-        )?;
-        let work_upper_bound = literal
-            .len()
-            .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
-            .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "literal build work",
-            })?;
-        enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
-        let scratch_bytes = 0;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal.len())
+        Self::build_attempt(literal, line_terminator, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact successful or partial terminal effects.
+    pub fn build_attempt(
+        literal: &[u8],
+        line_terminator: u8,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if literal.is_empty() {
+                return Err(BuildError::EmptyLiteral);
+            }
+            enforce_build(
+                literal.len(),
+                limits.max_literal_bytes,
+                BuildResource::LiteralBytes,
+            )?;
+            let work_upper_bound = literal
+                .len()
+                .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
+                    computation: "literal build work",
                 })?;
-        let peak_bytes = persistent_bytes;
-        enforce_build(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-        let literal = fre_exact_alloc::copy_exact(literal)
-            .map(Vec::into_boxed_slice)
-            .map_err(|error| match error {
-                CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
-                    computation: "exact literal allocation layout",
+            enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
+            let scratch_bytes = 0;
+            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
                 },
-                CopyError::AllocationFailed => BuildError::AllocationFailed {
-                    bytes: literal.len(),
-                },
-            })?;
-        Ok(Self {
-            literal,
-            line_terminator,
-            build: BuildAccounting {
-                literal_bytes: persistent_bytes - size_of::<Self>(),
-                work_upper_bound,
+            )?;
+            let peak_bytes = persistent_bytes;
+            enforce_build(
                 scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
                 persistent_bytes,
-                peak_bytes,
-            },
-        })
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            actual.work =
+                u64::try_from(FIXED_BUILD_WORK).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "fixed build work conversion",
+                })?;
+            let literal = fre_exact_alloc::copy_exact(literal)
+                .map(Vec::into_boxed_slice)
+                .map_err(|error| match error {
+                    CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                        computation: "exact literal allocation layout",
+                    },
+                    CopyError::AllocationFailed => BuildError::AllocationFailed {
+                        bytes: literal.len(),
+                    },
+                })?;
+            actual.work =
+                u64::try_from(work_upper_bound).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "literal build work conversion",
+                })?;
+            actual.allocations = 1;
+            actual.allocated_bytes = literal.len();
+            actual.copied_bytes = literal.len();
+            actual.initialized_bytes = persistent_bytes;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = persistent_bytes;
+            Ok(Self {
+                literal,
+                line_terminator,
+                build: BuildAccounting {
+                    literal_bytes: persistent_bytes - size_of::<Self>(),
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1140,5 +1176,28 @@ mod tests {
         for limits in cases {
             assert!(plan.span_sum(haystack, limits).is_err());
         }
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_preflight_failure() {
+        let literal = b"needle";
+        let attempt =
+            LiteralAssertionsPlan::build_attempt(literal, b'\n', BuildLimits::default()).unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, literal.len());
+        assert_eq!(actual.copied_bytes, literal.len());
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error =
+            LiteralAssertionsPlan::build_attempt(b"", b'\n', BuildLimits::default()).unwrap_err();
+        assert!(matches!(error.source(), BuildError::EmptyLiteral));
+        assert_eq!(error.actual(), crate::DirectBuildAttemptActual::default());
     }
 }

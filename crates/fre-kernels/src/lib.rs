@@ -19,6 +19,7 @@ mod bounded_literal_pair;
 mod bounded_separated_fields;
 mod byte_start_map;
 mod determinize_state_codec;
+mod direct_build_attempt;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
 mod fixed_predicate_word64;
@@ -38,6 +39,10 @@ mod sparse_ordered_literal_aggregate;
 mod token_phrase;
 mod unicode_scalar_aggregate;
 mod url_aggregate;
+
+pub use direct_build_attempt::{
+    DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError,
+};
 
 pub use bounded_class_sequence::{
     BoundedClassSequencePlan, BuildAccounting as BoundedClassSequenceBuildAccounting,
@@ -175,7 +180,14 @@ pub use fixed_class_sandwich::{
     Semantics as FixedClassSandwichSemantics, SpanSumResult as FixedClassSandwichSpanSumResult,
 };
 pub use fixed_predicate_word64::{
+    BUILD_ATTEMPT_ACCOUNTING_VERSION as FIXED_PREDICATE_WORD64_BUILD_ATTEMPT_ACCOUNTING_VERSION,
+    BUILD_ATTEMPT_ALGORITHM_VERSION as FIXED_PREDICATE_WORD64_BUILD_ATTEMPT_ALGORITHM_VERSION,
     BuildAccounting as FixedPredicateWord64BuildAccounting,
+    BuildAttempt as FixedPredicateWord64BuildAttempt,
+    BuildAttemptActual as FixedPredicateWord64BuildAttemptActual,
+    BuildAttemptError as FixedPredicateWord64BuildAttemptError,
+    BuildAttemptIdentity as FixedPredicateWord64BuildAttemptIdentity,
+    BuildAttemptReceipt as FixedPredicateWord64BuildAttemptReceipt,
     BuildError as FixedPredicateWord64BuildError, BuildLimits as FixedPredicateWord64BuildLimits,
     COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
     CountResult as FixedPredicateWord64CountResult, FixedPredicateWord64Plan,
@@ -278,13 +290,19 @@ pub use literal_set::{
 };
 pub use ordered_literal_aggregate::{
     ALGORITHM_ID as ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    BUILD_ATTEMPT_ACCOUNTING_VERSION as ORDERED_LITERAL_AGGREGATE_BUILD_ATTEMPT_ACCOUNTING_VERSION,
+    BUILD_ATTEMPT_ALGORITHM_VERSION as ORDERED_LITERAL_AGGREGATE_BUILD_ATTEMPT_ALGORITHM_VERSION,
     BoundarySemantics as OrderedLiteralAggregateBoundarySemantics,
     BuildAccounting as OrderedLiteralAggregateBuildAccounting,
+    BuildAttemptActual as OrderedLiteralAggregateBuildAttemptActual,
+    BuildAttemptError as OrderedLiteralAggregateBuildAttemptError,
+    BuildAttemptIdentity as OrderedLiteralAggregateBuildAttemptIdentity,
+    BuildAttemptReceipt as OrderedLiteralAggregateBuildAttemptReceipt,
     BuildError as OrderedLiteralAggregateBuildError,
     BuildLimits as OrderedLiteralAggregateBuildLimits,
     COUNT_PLAN_ID as ORDERED_LITERAL_COUNT_PLAN_ID,
     CacheIdentity as OrderedLiteralAggregateCacheIdentity,
-    CountResult as OrderedLiteralCountResult,
+    CountBuildAttempt as OrderedLiteralCountBuildAttempt, CountResult as OrderedLiteralCountResult,
     IterationSemantics as OrderedLiteralAggregateIterationSemantics,
     MatchSemantics as OrderedLiteralAggregateMatchSemantics,
     Operation as OrderedLiteralAggregateOperation, OrderedLiteralCountPlan,
@@ -294,7 +312,9 @@ pub use ordered_literal_aggregate::{
     ReduceLimits as OrderedLiteralAggregateReduceLimits,
     ReduceUpperBounds as OrderedLiteralAggregateUpperBounds,
     SPAN_SUM_PLAN_ID as ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    Semantics as OrderedLiteralAggregateSemantics, SpanSumResult as OrderedLiteralSpanSumResult,
+    Semantics as OrderedLiteralAggregateSemantics,
+    SpanSumBuildAttempt as OrderedLiteralSpanSumBuildAttempt,
+    SpanSumResult as OrderedLiteralSpanSumResult,
 };
 pub use packed_literal_set::{
     PackedLiteralSetAccounting, PackedLiteralSetBuildAccounting, PackedLiteralSetBuildLimits,
@@ -383,12 +403,19 @@ pub use required_literal::{
 };
 pub use sparse_ordered_literal_aggregate::{
     ALGORITHM_ID as SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    BUILD_ATTEMPT_ACCOUNTING_VERSION as SPARSE_ORDERED_LITERAL_AGGREGATE_BUILD_ATTEMPT_ACCOUNTING_VERSION,
+    BUILD_ATTEMPT_ALGORITHM_VERSION as SPARSE_ORDERED_LITERAL_AGGREGATE_BUILD_ATTEMPT_ALGORITHM_VERSION,
     BoundarySemantics as SparseOrderedLiteralAggregateBoundarySemantics,
     BuildAccounting as SparseOrderedLiteralAggregateBuildAccounting,
+    BuildAttemptActual as SparseOrderedLiteralAggregateBuildAttemptActual,
+    BuildAttemptError as SparseOrderedLiteralAggregateBuildAttemptError,
+    BuildAttemptIdentity as SparseOrderedLiteralAggregateBuildAttemptIdentity,
+    BuildAttemptReceipt as SparseOrderedLiteralAggregateBuildAttemptReceipt,
     BuildError as SparseOrderedLiteralAggregateBuildError,
     BuildLimits as SparseOrderedLiteralAggregateBuildLimits,
     COUNT_PLAN_ID as SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     CacheIdentity as SparseOrderedLiteralAggregateCacheIdentity,
+    CountBuildAttempt as SparseOrderedLiteralCountBuildAttempt,
     CountResult as SparseOrderedLiteralCountResult,
     IterationSemantics as SparseOrderedLiteralAggregateIterationSemantics,
     MatchSemantics as SparseOrderedLiteralAggregateMatchSemantics,
@@ -400,6 +427,7 @@ pub use sparse_ordered_literal_aggregate::{
     ReduceUpperBounds as SparseOrderedLiteralAggregateUpperBounds,
     SPAN_SUM_PLAN_ID as SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     Semantics as SparseOrderedLiteralAggregateSemantics,
+    SpanSumBuildAttempt as SparseOrderedLiteralSpanSumBuildAttempt,
     SpanSumResult as SparseOrderedLiteralSpanSumResult, SparseOrderedLiteralCountPlan,
     SparseOrderedLiteralSpanSumPlan,
 };

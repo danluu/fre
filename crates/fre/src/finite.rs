@@ -5,23 +5,228 @@
     reason = "word and work are distinct domain quantities throughout this checked planner"
 )]
 
-use core::mem::size_of;
+use core::{
+    cell::RefCell,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
+use crate::BuildError;
 use crate::guarded_ascii_word::{
-    BuildDimensions as GuardedBuildDimensions, BuildError as GuardedBuildError,
-    BuildLimits as GuardedBuildLimits, BuildProspective as GuardedBuildProspective,
-    Dictionary as GuardedDictionary, Guard, SourceWord,
+    BuildActual as GuardedBuildActual, BuildDimensions as GuardedBuildDimensions,
+    BuildError as GuardedBuildError, BuildLimits as GuardedBuildLimits,
+    BuildProspective as GuardedBuildProspective, Dictionary as GuardedDictionary, Guard,
+    PublishedBuildAccounting as GuardedPublishedBuild, SourceWord,
 };
-use crate::{BuildError, charge_planner, reserve_planner};
 
 const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 2;
 const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
 const FIXED_PREDICATE_MAX_RANGES: usize = 2;
 
-/// Exhaustive finite-language planner disposition with cumulative work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FiniteExtractionTerminal {
+    Fits,
+    GuardedFiniteBody,
+    TooLargeFixedSequence,
+    Unsupported,
+    ResourceFailure,
+    GuardedResourceFailure,
+}
+
+/// Exact effects owned directly by the general finite extractor.
+///
+/// Guarded-dictionary effects remain in their native nested receipt and are
+/// never flattened into these counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FiniteExtractionLocalActual {
+    pub(crate) allocations: usize,
+    pub(crate) reallocations: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) copied_bytes: usize,
+    pub(crate) initialized_bytes: usize,
+    pub(crate) released_persistent_bytes: usize,
+    pub(crate) released_scratch_bytes: usize,
+    pub(crate) live_persistent_bytes: usize,
+    pub(crate) live_scratch_bytes: usize,
+    pub(crate) high_water_bytes: usize,
+}
+
+/// Native guarded-dictionary evidence nested without copying its counters into
+/// [`FiniteExtractionLocalActual`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FiniteExtractionGuardedEvidence {
+    Succeeded {
+        accounting: GuardedPublishedBuild,
+        co_live_local_scratch_bytes: usize,
+        retained: bool,
+    },
+    Failed {
+        accounting: GuardedBuildActual,
+        co_live_local_scratch_bytes: usize,
+    },
+}
+
+/// Cumulative observed effects through one finite-extraction terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FiniteExtractionActual {
+    pub(crate) work: u64,
+    pub(crate) local: FiniteExtractionLocalActual,
+    pub(crate) guarded: Option<FiniteExtractionGuardedEvidence>,
+}
+
+/// Closed receipt retained by every general finite-extraction outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FiniteExtractionAttemptReceipt {
+    initial_work: u64,
+    work_limit: u64,
+    actual: FiniteExtractionActual,
+    terminal: FiniteExtractionTerminal,
+    closed: bool,
+}
+
+/// Exact construction boundary composed from the finite extractor's local
+/// ledger and the guarded dictionary's native terminal receipt.
+///
+/// Nested dictionary counters remain authoritative in
+/// [`FiniteExtractionGuardedEvidence`]; this is a checked projection for the
+/// aggregate construction transaction, not a second independently maintained
+/// ledger.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FiniteExtractionBoundaryActual {
+    pub(crate) work: u64,
+    pub(crate) allocations: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) copied_bytes: usize,
+    pub(crate) initialized_bytes: usize,
+    pub(crate) live_persistent_bytes: usize,
+    pub(crate) high_water_bytes: usize,
+    pub(crate) abandonable_bytes: usize,
+}
+
+#[allow(
+    dead_code,
+    reason = "the aggregate construction transaction consumes these crate-private projections"
+)]
+impl FiniteExtractionAttemptReceipt {
+    pub(crate) const fn actual(self) -> FiniteExtractionActual {
+        self.actual
+    }
+
+    pub(crate) const fn terminal(self) -> FiniteExtractionTerminal {
+        self.terminal
+    }
+
+    pub(crate) const fn is_closed(self) -> bool {
+        self.closed
+    }
+
+    pub(crate) fn boundary_actual(&self) -> Option<FiniteExtractionBoundaryActual> {
+        if !(*self).has_basic_closure() {
+            return None;
+        }
+        let local = self.actual.local;
+        let work = self.actual.work.checked_sub(self.initial_work)?;
+        let mut allocations = local.allocations;
+        let mut allocated_bytes = local.allocated_bytes;
+        let mut copied_bytes = local.copied_bytes;
+        let mut initialized_bytes = local.initialized_bytes;
+        let mut live_persistent_bytes = local.live_persistent_bytes;
+        let mut high_water_bytes = local.high_water_bytes;
+        let mut guarded_abandonable_bytes = 0_usize;
+        if let Some(guarded) = self.actual.guarded {
+            let (actual, co_live_local_scratch_bytes, retained) = match guarded {
+                FiniteExtractionGuardedEvidence::Succeeded {
+                    accounting,
+                    co_live_local_scratch_bytes,
+                    retained,
+                } => (accounting.actual()?, co_live_local_scratch_bytes, retained),
+                FiniteExtractionGuardedEvidence::Failed {
+                    accounting,
+                    co_live_local_scratch_bytes,
+                } => (accounting, co_live_local_scratch_bytes, false),
+            };
+            let dictionary_allocated_bytes = guarded_allocated_bytes(actual)?;
+            allocations = allocations.checked_add(actual.allocations)?;
+            allocated_bytes = allocated_bytes.checked_add(dictionary_allocated_bytes)?;
+            copied_bytes = copied_bytes.checked_add(actual.byte_copies)?;
+            initialized_bytes = initialized_bytes
+                .checked_add(actual.initialized_bytes)?
+                .checked_add(
+                    usize::from(actual.published).checked_mul(size_of::<GuardedDictionary>())?,
+                )?;
+            let guarded_co_live = co_live_local_scratch_bytes.checked_add(actual.peak_bytes)?;
+            high_water_bytes = high_water_bytes.max(guarded_co_live);
+            if retained {
+                live_persistent_bytes =
+                    live_persistent_bytes.checked_add(actual.persistent_bytes)?;
+            } else {
+                guarded_abandonable_bytes = if actual.published {
+                    actual.persistent_bytes
+                } else {
+                    dictionary_allocated_bytes
+                };
+            }
+        }
+        let successful_terminal = matches!(
+            self.terminal,
+            FiniteExtractionTerminal::Fits | FiniteExtractionTerminal::GuardedFiniteBody
+        );
+        let abandonable_bytes = if successful_terminal {
+            0
+        } else {
+            local
+                .released_persistent_bytes
+                .checked_add(local.released_scratch_bytes)?
+                .checked_add(guarded_abandonable_bytes)?
+        };
+        Some(FiniteExtractionBoundaryActual {
+            work,
+            allocations,
+            allocated_bytes,
+            copied_bytes,
+            initialized_bytes,
+            live_persistent_bytes,
+            high_water_bytes,
+            abandonable_bytes,
+        })
+    }
+
+    fn has_basic_closure(self) -> bool {
+        let local_capacity_closes = self
+            .actual
+            .local
+            .released_persistent_bytes
+            .checked_add(self.actual.local.released_scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(self.actual.local.live_persistent_bytes))
+            .and_then(|bytes| bytes.checked_add(self.actual.local.live_scratch_bytes))
+            == Some(self.actual.local.allocated_bytes);
+        self.closed
+            && self.actual.work >= self.initial_work
+            && (self.actual.work <= self.work_limit
+                || self.initial_work > self.work_limit && self.actual.work == self.initial_work)
+            && self.actual.local.live_scratch_bytes == 0
+            && self.actual.local.reallocations <= self.actual.local.allocations
+            && self.actual.local.copied_bytes <= self.actual.local.initialized_bytes
+            && local_capacity_closes
+            && self.actual.local.live_persistent_bytes <= self.actual.local.high_water_bytes
+            && self.actual.local.high_water_bytes <= self.actual.local.allocated_bytes
+    }
+}
+
+fn guarded_allocated_bytes(actual: GuardedBuildActual) -> Option<usize> {
+    if actual.allocations == 0 {
+        (actual.persistent_bytes == 0).then_some(0)
+    } else {
+        actual
+            .persistent_bytes
+            .checked_sub(size_of::<GuardedDictionary>())
+    }
+}
+
+/// Exhaustive finite-language planner disposition with one closed receipt.
 ///
 /// In particular, a semantic refusal never resets the work charged by an
 /// earlier proof attempt. Callers can therefore continue with another
@@ -29,32 +234,632 @@ const FIXED_PREDICATE_MAX_RANGES: usize = 2;
 pub(crate) enum FiniteOutcome {
     Fits {
         words: Vec<Vec<u8>>,
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
     GuardedFiniteBody {
         dictionary: GuardedDictionary,
         accounting: GuardedFiniteAccounting,
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
     TooLargeFixedSequence {
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
     Unsupported {
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
     ResourceFailure {
         error: BuildError,
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
     GuardedResourceFailure {
         error: GuardedFiniteBuildError,
-        work: u64,
+        receipt: FiniteExtractionAttemptReceipt,
     },
 }
 
+#[derive(Clone, Copy)]
+enum FiniteStorage {
+    Persistent,
+    Scratch,
+}
+
+struct FiniteExtractionState {
+    work: u64,
+    local: FiniteExtractionLocalActual,
+    guarded: Option<FiniteExtractionGuardedEvidence>,
+}
+
+struct FiniteExtractionContext {
+    initial_work: u64,
+    work_limit: u64,
+    state: RefCell<FiniteExtractionState>,
+}
+
+impl FiniteExtractionContext {
+    fn new(initial_work: u64, work_limit: u64) -> Self {
+        Self {
+            initial_work,
+            work_limit,
+            state: RefCell::new(FiniteExtractionState {
+                work: initial_work,
+                local: FiniteExtractionLocalActual::default(),
+                guarded: None,
+            }),
+        }
+    }
+
+    fn work(&self) -> u64 {
+        self.state.borrow().work
+    }
+
+    fn live_scratch_bytes(&self) -> usize {
+        self.state.borrow().local.live_scratch_bytes
+    }
+
+    fn charge(&self, amount: u64) -> Result<(), BuildError> {
+        let mut state = self.state.borrow_mut();
+        let needed = state
+            .work
+            .checked_add(amount)
+            .ok_or(BuildError::PlannerWorkLimit {
+                needed: u64::MAX,
+                limit: self.work_limit,
+            })?;
+        if needed > self.work_limit {
+            return Err(BuildError::PlannerWorkLimit {
+                needed,
+                limit: self.work_limit,
+            });
+        }
+        state.work = needed;
+        Ok(())
+    }
+
+    fn record_capacity_change<T>(
+        &self,
+        old_capacity: usize,
+        new_capacity: usize,
+        storage: FiniteStorage,
+    ) -> Result<(), BuildError> {
+        if old_capacity == new_capacity || size_of::<T>() == 0 {
+            return Ok(());
+        }
+        let old_bytes = old_capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let new_bytes = new_capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let mut state = self.state.borrow_mut();
+        let local = &mut state.local;
+        let allocations = local
+            .allocations
+            .checked_add(1)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let reallocations = local
+            .reallocations
+            .checked_add(usize::from(old_capacity != 0))
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let allocated_bytes = local
+            .allocated_bytes
+            .checked_add(new_bytes)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let (current_live, current_released, other_live) = match storage {
+            FiniteStorage::Persistent => (
+                local.live_persistent_bytes,
+                local.released_persistent_bytes,
+                local.live_scratch_bytes,
+            ),
+            FiniteStorage::Scratch => (
+                local.live_scratch_bytes,
+                local.released_scratch_bytes,
+                local.live_persistent_bytes,
+            ),
+        };
+        let next_live = current_live
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .ok_or(BuildError::InternalInvariant(
+                "finite capacity transition lost live-byte closure",
+            ))?;
+        let next_released = current_released
+            .checked_add(old_bytes)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let total_live = next_live
+            .checked_add(other_live)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        local.allocations = allocations;
+        local.reallocations = reallocations;
+        local.allocated_bytes = allocated_bytes;
+        match storage {
+            FiniteStorage::Persistent => {
+                local.live_persistent_bytes = next_live;
+                local.released_persistent_bytes = next_released;
+            }
+            FiniteStorage::Scratch => {
+                local.live_scratch_bytes = next_live;
+                local.released_scratch_bytes = next_released;
+            }
+        }
+        local.high_water_bytes = local.high_water_bytes.max(total_live);
+        Ok(())
+    }
+
+    fn record_initialization<T>(&self, count: usize, copied: bool) -> Result<(), BuildError> {
+        if count == 0 || size_of::<T>() == 0 {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        let mut state = self.state.borrow_mut();
+        state.local.initialized_bytes = state
+            .local
+            .initialized_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        if copied {
+            state.local.copied_bytes = state
+                .local
+                .copied_bytes
+                .checked_add(bytes)
+                .ok_or(BuildError::PersistentBytesOverflow)?;
+        }
+        Ok(())
+    }
+
+    fn release_capacity<T>(&self, capacity: usize, storage: FiniteStorage) {
+        if capacity == 0 || size_of::<T>() == 0 {
+            return;
+        }
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .expect("a previously recorded finite capacity remains representable");
+        let mut state = self.state.borrow_mut();
+        let local = &mut state.local;
+        let (live, released) = match storage {
+            FiniteStorage::Persistent => (
+                &mut local.live_persistent_bytes,
+                &mut local.released_persistent_bytes,
+            ),
+            FiniteStorage::Scratch => (
+                &mut local.live_scratch_bytes,
+                &mut local.released_scratch_bytes,
+            ),
+        };
+        *live = live
+            .checked_sub(bytes)
+            .expect("a finite buffer releases only its recorded live capacity");
+        *released = released
+            .checked_add(bytes)
+            .expect("finite released-byte accounting remains representable");
+    }
+
+    fn bind_guarded(&self, evidence: &FiniteExtractionGuardedEvidence) -> Result<(), BuildError> {
+        let mut state = self.state.borrow_mut();
+        if state.guarded.replace(*evidence).is_some() {
+            return Err(BuildError::InternalInvariant(
+                "finite extraction bound guarded evidence twice",
+            ));
+        }
+        Ok(())
+    }
+
+    fn retain_guarded(&self) -> Result<(), BuildError> {
+        let mut state = self.state.borrow_mut();
+        let Some(FiniteExtractionGuardedEvidence::Succeeded { retained, .. }) =
+            state.guarded.as_mut()
+        else {
+            return Err(BuildError::InternalInvariant(
+                "finite extraction retained missing guarded success evidence",
+            ));
+        };
+        if core::mem::replace(retained, true) {
+            return Err(BuildError::InternalInvariant(
+                "finite extraction retained guarded evidence twice",
+            ));
+        }
+        Ok(())
+    }
+
+    fn close(&self, terminal: FiniteExtractionTerminal) -> FiniteExtractionAttemptReceipt {
+        let state = self.state.borrow();
+        FiniteExtractionAttemptReceipt {
+            initial_work: self.initial_work,
+            work_limit: self.work_limit,
+            actual: FiniteExtractionActual {
+                work: state.work,
+                local: state.local,
+                guarded: state.guarded,
+            },
+            terminal,
+            closed: true,
+        }
+    }
+
+    fn close_fixed_predicate(
+        &self,
+        terminal: FixedPredicateInspectionTerminal,
+    ) -> FixedPredicateInspectionAttemptReceipt {
+        let state = self.state.borrow();
+        FixedPredicateInspectionAttemptReceipt {
+            initial_work: self.initial_work,
+            work_limit: self.work_limit,
+            actual: FixedPredicateInspectionActual {
+                work: state.work,
+                local: state.local,
+            },
+            terminal,
+            closed: state.guarded.is_none(),
+        }
+    }
+}
+
+struct AccountedVec<'context, T> {
+    values: Vec<T>,
+    context: &'context FiniteExtractionContext,
+    storage: FiniteStorage,
+    accounted_capacity: usize,
+}
+
+impl<'context, T> AccountedVec<'context, T> {
+    fn new(context: &'context FiniteExtractionContext, storage: FiniteStorage) -> Self {
+        Self {
+            values: Vec::new(),
+            context,
+            storage,
+            accounted_capacity: 0,
+        }
+    }
+
+    fn reserve_planner(
+        &mut self,
+        additional: usize,
+        structure: &'static str,
+    ) -> Result<(), BuildError> {
+        let needed =
+            self.values
+                .len()
+                .checked_add(additional)
+                .ok_or(BuildError::PlannerWorkLimit {
+                    needed: u64::MAX,
+                    limit: self.context.work_limit,
+                })?;
+        if needed > self.values.capacity() {
+            self.context
+                .charge(u64::try_from(self.values.len()).unwrap_or(u64::MAX))?;
+        }
+        self.context
+            .charge(u64::try_from(additional).unwrap_or(u64::MAX))?;
+        let old_capacity = self.values.capacity();
+        self.values
+            .try_reserve(additional)
+            .map_err(|_| BuildError::AllocationFailed {
+                structure,
+                additional,
+            })?;
+        let new_capacity = self.values.capacity();
+        self.context
+            .record_capacity_change::<T>(old_capacity, new_capacity, self.storage)?;
+        self.accounted_capacity = new_capacity;
+        Ok(())
+    }
+
+    fn push_reserved(&mut self, value: T) -> Result<(), BuildError> {
+        debug_assert!(size_of::<T>() == 0 || self.values.len() < self.values.capacity());
+        self.values.push(value);
+        self.context.record_initialization::<T>(1, false)
+    }
+
+    fn extend_reserved<I>(&mut self, values: I, count: usize) -> Result<(), BuildError>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        debug_assert!(
+            size_of::<T>() == 0
+                || self.values.len().saturating_add(count) <= self.values.capacity()
+        );
+        self.values.extend(values);
+        self.context.record_initialization::<T>(count, true)
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.values.pop()
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn reverse(&mut self) {
+        self.values.reverse();
+    }
+
+    fn into_inner_kept(mut self) -> Vec<T> {
+        self.accounted_capacity = 0;
+        core::mem::take(&mut self.values)
+    }
+}
+
+impl<T> Deref for AccountedVec<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.values.as_slice()
+    }
+}
+
+impl<T> DerefMut for AccountedVec<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.values.as_mut_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a AccountedVec<'_, T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut AccountedVec<'_, T> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter_mut()
+    }
+}
+
+impl<T> Drop for AccountedVec<'_, T> {
+    fn drop(&mut self) {
+        self.context
+            .release_capacity::<T>(self.accounted_capacity, self.storage);
+    }
+}
+
+struct AccountedExactVec<'context, T> {
+    values: ExactVec<T>,
+    context: &'context FiniteExtractionContext,
+    storage: FiniteStorage,
+    accounted_capacity: usize,
+}
+
+impl<'context, T> AccountedExactVec<'context, T> {
+    fn empty(context: &'context FiniteExtractionContext, storage: FiniteStorage) -> Self {
+        Self {
+            values: ExactVec::default(),
+            context,
+            storage,
+            accounted_capacity: 0,
+        }
+    }
+
+    fn try_with_capacity(
+        context: &'context FiniteExtractionContext,
+        storage: FiniteStorage,
+        capacity: usize,
+        structure: &'static str,
+    ) -> Result<Self, BuildError> {
+        let values = ExactVec::try_with_capacity(capacity)
+            .map_err(|error| map_guarded_source_allocation(error, structure, capacity))?;
+        let observed = values.capacity();
+        context.record_capacity_change::<T>(0, observed, storage)?;
+        Ok(Self {
+            values,
+            context,
+            storage,
+            accounted_capacity: observed,
+        })
+    }
+
+    fn push_accounted(
+        &mut self,
+        value: T,
+        copied: bool,
+        capacity_detail: &'static str,
+    ) -> Result<(), BuildError> {
+        self.values
+            .try_push(value)
+            .map_err(|_| BuildError::InternalInvariant(capacity_detail))?;
+        self.context.record_initialization::<T>(1, copied)
+    }
+
+    fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn into_inner_kept(mut self) -> ExactVec<T> {
+        self.accounted_capacity = 0;
+        core::mem::take(&mut self.values)
+    }
+}
+
+impl<T> Deref for AccountedExactVec<'_, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        self.values.as_slice()
+    }
+}
+
+impl<T> DerefMut for AccountedExactVec<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.values.as_mut_slice()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a AccountedExactVec<'_, T> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut AccountedExactVec<'_, T> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter_mut()
+    }
+}
+
+impl<T> Drop for AccountedExactVec<'_, T> {
+    fn drop(&mut self) {
+        self.context
+            .release_capacity::<T>(self.accounted_capacity, self.storage);
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "legacy crate-private projection remains for compatibility and focused parity tests"
+)]
 pub(crate) struct FixedPredicateInspection {
     pub(crate) source: Option<FixedPredicateWord64Source>,
     pub(crate) work: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FixedPredicateInspectionTerminal {
+    Succeeded,
+    Refused,
+    ResourceFailure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixedPredicateInspectionActual {
+    pub(crate) work: u64,
+    pub(crate) local: FiniteExtractionLocalActual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FixedPredicateInspectionAttemptReceipt {
+    initial_work: u64,
+    work_limit: u64,
+    actual: FixedPredicateInspectionActual,
+    terminal: FixedPredicateInspectionTerminal,
+    closed: bool,
+}
+
+#[allow(
+    dead_code,
+    reason = "the aggregate construction transaction consumes these crate-private projections"
+)]
+impl FixedPredicateInspectionAttemptReceipt {
+    pub(crate) const fn initial_work(self) -> u64 {
+        self.initial_work
+    }
+
+    pub(crate) const fn work_limit(self) -> u64 {
+        self.work_limit
+    }
+
+    pub(crate) const fn actual(self) -> FixedPredicateInspectionActual {
+        self.actual
+    }
+
+    pub(crate) const fn terminal(self) -> FixedPredicateInspectionTerminal {
+        self.terminal
+    }
+
+    pub(crate) const fn is_closed(self) -> bool {
+        self.closed
+    }
+
+    fn has_basic_closure(self) -> bool {
+        let local = self.actual.local;
+        let local_capacity_closes = local
+            .released_persistent_bytes
+            .checked_add(local.released_scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(local.live_persistent_bytes))
+            .and_then(|bytes| bytes.checked_add(local.live_scratch_bytes))
+            == Some(local.allocated_bytes);
+        self.closed
+            && self.actual.work >= self.initial_work
+            && (self.actual.work <= self.work_limit
+                || self.initial_work > self.work_limit && self.actual.work == self.initial_work)
+            && local.live_persistent_bytes == 0
+            && local.live_scratch_bytes == 0
+            && local.reallocations <= local.allocations
+            && local.copied_bytes <= local.initialized_bytes
+            && local.high_water_bytes <= local.allocated_bytes
+            && local_capacity_closes
+    }
+}
+
+pub(crate) enum FixedPredicateInspectionAttempt {
+    Succeeded {
+        source: FixedPredicateWord64Source,
+        receipt: FixedPredicateInspectionAttemptReceipt,
+    },
+    Refused {
+        receipt: FixedPredicateInspectionAttemptReceipt,
+    },
+    ResourceFailure {
+        error: BuildError,
+        receipt: FixedPredicateInspectionAttemptReceipt,
+    },
+}
+
+impl FixedPredicateInspectionAttempt {
+    pub(crate) const fn receipt(&self) -> FixedPredicateInspectionAttemptReceipt {
+        match self {
+            Self::Succeeded { receipt, .. }
+            | Self::Refused { receipt }
+            | Self::ResourceFailure { receipt, .. } => *receipt,
+        }
+    }
+
+    pub(crate) fn has_closed_receipt(&self) -> bool {
+        let receipt = self.receipt();
+        let terminal_matches = matches!(
+            (self, receipt.terminal),
+            (
+                Self::Succeeded { .. },
+                FixedPredicateInspectionTerminal::Succeeded
+            ) | (
+                Self::Refused { .. },
+                FixedPredicateInspectionTerminal::Refused
+            ) | (
+                Self::ResourceFailure { .. },
+                FixedPredicateInspectionTerminal::ResourceFailure
+            )
+        );
+        terminal_matches && receipt.has_basic_closure()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "legacy crate-private projection remains for compatibility and focused parity tests"
+    )]
+    pub(crate) fn into_legacy(self) -> Result<FixedPredicateInspection, BuildError> {
+        if !self.has_closed_receipt() {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate inspection lost its attempt closure",
+            ));
+        }
+        match self {
+            Self::Succeeded { source, receipt } => Ok(FixedPredicateInspection {
+                source: Some(source),
+                work: receipt.actual.work,
+            }),
+            Self::Refused { receipt } => Ok(FixedPredicateInspection {
+                source: None,
+                work: receipt.actual.work,
+            }),
+            Self::ResourceFailure { error, .. } => Err(error),
+        }
+    }
 }
 
 /// Inline proof source for a fixed-width ASCII-byte predicate word.
@@ -223,17 +1028,115 @@ impl From<BuildError> for GuardedAttemptError {
 
 impl FiniteOutcome {
     pub(crate) const fn work(&self) -> u64 {
+        self.receipt().actual.work
+    }
+
+    pub(crate) const fn receipt(&self) -> &FiniteExtractionAttemptReceipt {
         match self {
-            Self::Fits { work, .. }
-            | Self::GuardedFiniteBody { work, .. }
-            | Self::TooLargeFixedSequence { work }
-            | Self::Unsupported { work }
-            | Self::ResourceFailure { work, .. }
-            | Self::GuardedResourceFailure { work, .. } => *work,
+            Self::Fits { receipt, .. }
+            | Self::GuardedFiniteBody { receipt, .. }
+            | Self::TooLargeFixedSequence { receipt }
+            | Self::Unsupported { receipt }
+            | Self::ResourceFailure { receipt, .. }
+            | Self::GuardedResourceFailure { receipt, .. } => receipt,
+        }
+    }
+
+    pub(crate) fn has_closed_receipt(&self) -> bool {
+        let receipt = *self.receipt();
+        if !receipt.has_basic_closure() {
+            return false;
+        }
+        match self {
+            Self::Fits { words, .. } => {
+                receipt.terminal == FiniteExtractionTerminal::Fits
+                    && receipt.actual.guarded.is_none()
+                    && finite_words_capacity_bytes(words)
+                        == Some(receipt.actual.local.live_persistent_bytes)
+            }
+            Self::GuardedFiniteBody {
+                dictionary,
+                accounting,
+                ..
+            } => {
+                receipt.terminal == FiniteExtractionTerminal::GuardedFiniteBody
+                    && receipt.actual.local.live_persistent_bytes == 0
+                    && accounting.is_consistent(dictionary)
+                    && receipt.actual.guarded
+                        == Some(FiniteExtractionGuardedEvidence::Succeeded {
+                            accounting: match dictionary.build_accounting().published() {
+                                Some(accounting) => accounting,
+                                None => return false,
+                            },
+                            co_live_local_scratch_bytes: receipt
+                                .actual
+                                .guarded
+                                .and_then(|evidence| match evidence {
+                                    FiniteExtractionGuardedEvidence::Succeeded {
+                                        co_live_local_scratch_bytes,
+                                        ..
+                                    } => Some(co_live_local_scratch_bytes),
+                                    FiniteExtractionGuardedEvidence::Failed { .. } => None,
+                                })
+                                .unwrap_or(usize::MAX),
+                            retained: true,
+                        })
+            }
+            Self::TooLargeFixedSequence { .. } => {
+                receipt.terminal == FiniteExtractionTerminal::TooLargeFixedSequence
+                    && receipt.actual.guarded.is_none()
+                    && receipt.actual.local.live_persistent_bytes == 0
+            }
+            Self::Unsupported { .. } => {
+                receipt.terminal == FiniteExtractionTerminal::Unsupported
+                    && receipt.actual.guarded.is_none()
+                    && receipt.actual.local.live_persistent_bytes == 0
+            }
+            Self::ResourceFailure { .. } => {
+                let guarded_released = !matches!(
+                    receipt.actual.guarded,
+                    Some(FiniteExtractionGuardedEvidence::Succeeded { retained: true, .. })
+                );
+                receipt.terminal == FiniteExtractionTerminal::ResourceFailure
+                    && receipt.actual.local.live_persistent_bytes == 0
+                    && guarded_released
+            }
+            Self::GuardedResourceFailure { error, .. } => {
+                let guarded_closes = match error {
+                    GuardedFiniteBuildError::Dictionary(error) => {
+                        receipt.actual.guarded
+                            == Some(FiniteExtractionGuardedEvidence::Failed {
+                                accounting: error.actual(),
+                                co_live_local_scratch_bytes: receipt
+                                    .actual
+                                    .guarded
+                                    .and_then(|evidence| match evidence {
+                                        FiniteExtractionGuardedEvidence::Failed {
+                                            co_live_local_scratch_bytes,
+                                            ..
+                                        } => Some(co_live_local_scratch_bytes),
+                                        FiniteExtractionGuardedEvidence::Succeeded { .. } => None,
+                                    })
+                                    .unwrap_or(usize::MAX),
+                            })
+                    }
+                    GuardedFiniteBuildError::ConstructionLimit { .. } => {
+                        receipt.actual.guarded.is_none()
+                    }
+                };
+                receipt.terminal == FiniteExtractionTerminal::GuardedResourceFailure
+                    && receipt.actual.local.live_persistent_bytes == 0
+                    && guarded_closes
+            }
         }
     }
 
     pub(crate) fn into_incumbent_words(self) -> IncumbentFiniteResult {
+        if !self.has_closed_receipt() {
+            return Err(BuildError::InternalInvariant(
+                "finite outcome lost its extraction-attempt closure",
+            ));
+        }
         let cumulative_work = self.work();
         match self {
             Self::Fits { words, .. } => Ok((Some(words), cumulative_work)),
@@ -260,6 +1163,17 @@ impl FiniteOutcome {
     }
 }
 
+fn finite_words_capacity_bytes(words: &Vec<Vec<u8>>) -> Option<usize> {
+    words
+        .capacity()
+        .checked_mul(size_of::<Vec<u8>>())?
+        .checked_add(
+            words
+                .iter()
+                .try_fold(0_usize, |bytes, word| bytes.checked_add(word.capacity()))?,
+        )
+}
+
 enum Analysis {
     Fits(Shape),
     TooLargeFixedSequence,
@@ -273,9 +1187,87 @@ enum Task<'a> {
     FinishAlternation(usize),
 }
 
-struct Language {
+struct Language<'context> {
     words: Vec<Vec<u8>>,
     bytes: usize,
+    context: &'context FiniteExtractionContext,
+    accounted_outer_capacity: usize,
+}
+
+impl<'context> Language<'context> {
+    fn empty(context: &'context FiniteExtractionContext, bytes: usize) -> Self {
+        Self {
+            words: Vec::new(),
+            bytes,
+            context,
+            accounted_outer_capacity: 0,
+        }
+    }
+
+    fn reserve_words(
+        &mut self,
+        additional: usize,
+        structure: &'static str,
+    ) -> Result<(), BuildError> {
+        let needed =
+            self.words
+                .len()
+                .checked_add(additional)
+                .ok_or(BuildError::PlannerWorkLimit {
+                    needed: u64::MAX,
+                    limit: self.context.work_limit,
+                })?;
+        if needed > self.words.capacity() {
+            self.context
+                .charge(u64::try_from(self.words.len()).unwrap_or(u64::MAX))?;
+        }
+        self.context
+            .charge(u64::try_from(additional).unwrap_or(u64::MAX))?;
+        let old_capacity = self.words.capacity();
+        self.words
+            .try_reserve(additional)
+            .map_err(|_| BuildError::AllocationFailed {
+                structure,
+                additional,
+            })?;
+        let new_capacity = self.words.capacity();
+        self.context.record_capacity_change::<Vec<u8>>(
+            old_capacity,
+            new_capacity,
+            FiniteStorage::Persistent,
+        )?;
+        self.accounted_outer_capacity = new_capacity;
+        Ok(())
+    }
+
+    fn push_word(&mut self, word: AccountedVec<'context, u8>) -> Result<(), BuildError> {
+        debug_assert!(self.words.len() < self.words.capacity());
+        self.words.push(word.into_inner_kept());
+        self.context.record_initialization::<Vec<u8>>(1, false)
+    }
+
+    fn append_words(&mut self, source: &mut Self) -> Result<(), BuildError> {
+        let count = source.words.len();
+        debug_assert!(self.words.len().saturating_add(count) <= self.words.capacity());
+        self.words.append(&mut source.words);
+        self.context.record_initialization::<Vec<u8>>(count, true)
+    }
+
+    fn into_words(mut self) -> Vec<Vec<u8>> {
+        self.accounted_outer_capacity = 0;
+        core::mem::take(&mut self.words)
+    }
+}
+
+impl Drop for Language<'_> {
+    fn drop(&mut self) {
+        self.context
+            .release_capacity::<Vec<u8>>(self.accounted_outer_capacity, FiniteStorage::Persistent);
+        for word in &self.words {
+            self.context
+                .release_capacity::<u8>(word.capacity(), FiniteStorage::Persistent);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -299,71 +1291,100 @@ pub(crate) fn extract(
     derive_guarded_dictionary: bool,
     guarded_limits: GuardedFiniteBuildLimits,
 ) -> FiniteOutcome {
-    let mut work = initial_work;
-    match extract_plain(hir, max_words, max_bytes, &mut work, work_limit) {
-        Ok(Some(words)) => FiniteOutcome::Fits { words, work },
+    let context = FiniteExtractionContext::new(initial_work, work_limit);
+    match extract_plain(hir, max_words, max_bytes, &context) {
+        Ok(Some(words)) => FiniteOutcome::Fits {
+            words,
+            receipt: context.close(FiniteExtractionTerminal::Fits),
+        },
         Ok(None) if derive_guarded_dictionary => {
-            match extract_guarded_dictionary(
-                hir,
-                max_words,
-                max_bytes,
-                &mut work,
-                work_limit,
-                guarded_limits,
-            ) {
+            match extract_guarded_dictionary(hir, max_words, max_bytes, &context, guarded_limits) {
                 Ok(Ok((dictionary, accounting))) => FiniteOutcome::GuardedFiniteBody {
                     dictionary,
                     accounting,
-                    work,
+                    receipt: context.close(FiniteExtractionTerminal::GuardedFiniteBody),
                 },
                 Ok(Err(GuardedRefusal::TooLargeFixedSequence)) => {
-                    FiniteOutcome::TooLargeFixedSequence { work }
+                    FiniteOutcome::TooLargeFixedSequence {
+                        receipt: context.close(FiniteExtractionTerminal::TooLargeFixedSequence),
+                    }
                 }
-                Ok(Err(GuardedRefusal::Unsupported)) => FiniteOutcome::Unsupported { work },
-                Err(GuardedAttemptError::Planner(error)) => {
-                    FiniteOutcome::ResourceFailure { error, work }
-                }
-                Err(GuardedAttemptError::Build(error)) => {
-                    FiniteOutcome::GuardedResourceFailure { error, work }
-                }
+                Ok(Err(GuardedRefusal::Unsupported)) => FiniteOutcome::Unsupported {
+                    receipt: context.close(FiniteExtractionTerminal::Unsupported),
+                },
+                Err(GuardedAttemptError::Planner(error)) => FiniteOutcome::ResourceFailure {
+                    error,
+                    receipt: context.close(FiniteExtractionTerminal::ResourceFailure),
+                },
+                Err(GuardedAttemptError::Build(error)) => FiniteOutcome::GuardedResourceFailure {
+                    error,
+                    receipt: context.close(FiniteExtractionTerminal::GuardedResourceFailure),
+                },
             }
         }
-        Ok(None) => FiniteOutcome::Unsupported { work },
-        Err(PlainFailure::TooLargeFixedSequence) => FiniteOutcome::TooLargeFixedSequence { work },
-        Err(PlainFailure::Resource(error)) => FiniteOutcome::ResourceFailure { error, work },
+        Ok(None) => FiniteOutcome::Unsupported {
+            receipt: context.close(FiniteExtractionTerminal::Unsupported),
+        },
+        Err(PlainFailure::TooLargeFixedSequence) => FiniteOutcome::TooLargeFixedSequence {
+            receipt: context.close(FiniteExtractionTerminal::TooLargeFixedSequence),
+        },
+        Err(PlainFailure::Resource(error)) => FiniteOutcome::ResourceFailure {
+            error,
+            receipt: context.close(FiniteExtractionTerminal::ResourceFailure),
+        },
     }
 }
 
 /// Inspect the compact predicate proof after an incumbent finite route has
 /// refused. `initial_work` is the completed incumbent work, so this retry
 /// cannot reset or launder the shared planner quota.
+pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+    hir: &Hir,
+    initial_work: u64,
+    work_limit: u64,
+) -> FixedPredicateInspectionAttempt {
+    let context = FiniteExtractionContext::new(initial_work, work_limit);
+    match inspect_fixed_predicate_word64(hir, &context) {
+        Ok(Some(source)) => FixedPredicateInspectionAttempt::Succeeded {
+            source,
+            receipt: context.close_fixed_predicate(FixedPredicateInspectionTerminal::Succeeded),
+        },
+        Ok(None) => FixedPredicateInspectionAttempt::Refused {
+            receipt: context.close_fixed_predicate(FixedPredicateInspectionTerminal::Refused),
+        },
+        Err(error) => FixedPredicateInspectionAttempt::ResourceFailure {
+            error,
+            receipt: context
+                .close_fixed_predicate(FixedPredicateInspectionTerminal::ResourceFailure),
+        },
+    }
+}
+
+/// Legacy projection of
+/// [`inspect_fixed_predicate_word64_after_finite_refusal_attempt`].
+#[allow(
+    dead_code,
+    reason = "legacy crate-private projection remains for compatibility and focused parity tests"
+)]
 pub(crate) fn inspect_fixed_predicate_word64_after_finite_refusal(
     hir: &Hir,
     initial_work: u64,
     work_limit: u64,
 ) -> Result<FixedPredicateInspection, BuildError> {
-    let mut work = initial_work;
-    let source = inspect_fixed_predicate_word64(hir, &mut work, work_limit)?;
-    Ok(FixedPredicateInspection { source, work })
+    inspect_fixed_predicate_word64_after_finite_refusal_attempt(hir, initial_work, work_limit)
+        .into_legacy()
 }
 
 fn inspect_fixed_predicate_word64(
     hir: &Hir,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Option<FixedPredicateWord64Source>, BuildError> {
-    let mut tasks = Vec::new();
-    reserve_planner(
-        &mut tasks,
-        1,
-        work,
-        work_limit,
-        "fixed-predicate task stack",
-    )?;
-    tasks.push(hir);
+    let mut tasks = AccountedVec::new(context, FiniteStorage::Scratch);
+    tasks.reserve_planner(1, "fixed-predicate task stack")?;
+    tasks.push_reserved(hir)?;
     let mut source = FixedPredicateWord64Source::EMPTY;
     while let Some(node) = tasks.pop() {
-        charge_planner(work, 1, work_limit)?;
+        context.charge(1)?;
         source.hir_nodes = source
             .hir_nodes
             .checked_add(1)
@@ -379,32 +1400,20 @@ fn inspect_fixed_predicate_word64(
                         .ok_or(BuildError::InternalInvariant(
                             "fixed-predicate capture accounting overflow",
                         ))?;
-                reserve_planner(
-                    &mut tasks,
-                    1,
-                    work,
-                    work_limit,
-                    "fixed-predicate task stack",
-                )?;
-                tasks.push(capture.sub.as_ref());
+                tasks.reserve_planner(1, "fixed-predicate task stack")?;
+                tasks.push_reserved(capture.sub.as_ref())?;
             }
             HirKind::Concat(children) if !children.is_empty() => {
-                reserve_planner(
-                    &mut tasks,
-                    children.len(),
-                    work,
-                    work_limit,
-                    "fixed-predicate task stack",
-                )?;
-                tasks.extend(children.iter().rev());
+                tasks.reserve_planner(children.len(), "fixed-predicate task stack")?;
+                tasks.extend_reserved(children.iter().rev(), children.len())?;
             }
             HirKind::Literal(literal) if !literal.0.is_empty() => {
-                if !push_fixed_ascii_literal(&mut source, &literal.0, work, work_limit)? {
+                if !push_fixed_ascii_literal(&mut source, &literal.0, context)? {
                     return Ok(None);
                 }
             }
             HirKind::Class(Class::Bytes(class)) => {
-                if !push_fixed_ascii_case_pair(&mut source, class, work, work_limit)? {
+                if !push_fixed_ascii_case_pair(&mut source, class, context)? {
                     return Ok(None);
                 }
             }
@@ -420,8 +1429,7 @@ fn inspect_fixed_predicate_word64(
 fn push_fixed_ascii_literal(
     source: &mut FixedPredicateWord64Source,
     literal: &[u8],
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<bool, BuildError> {
     let width = source
         .width()
@@ -432,16 +1440,12 @@ fn push_fixed_ascii_literal(
     if width > FIXED_PREDICATE_WORD64_MAX_WIDTH {
         return Ok(false);
     }
-    charge_planner(
-        work,
-        u64::try_from(literal.len()).unwrap_or(u64::MAX),
-        work_limit,
-    )?;
+    context.charge(u64::try_from(literal.len()).unwrap_or(u64::MAX))?;
     for &byte in literal {
         if !byte.is_ascii() {
             return Ok(false);
         }
-        charge_planner(work, 1, work_limit)?;
+        context.charge(1)?;
         if !source.push(FixedPredicate::singleton(byte), false)? {
             return Ok(false);
         }
@@ -452,8 +1456,7 @@ fn push_fixed_ascii_literal(
 fn push_fixed_ascii_case_pair(
     source: &mut FixedPredicateWord64Source,
     class: &regex_syntax::hir::ClassBytes,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<bool, BuildError> {
     let [first, second] = class.ranges() else {
         return Ok(false);
@@ -461,7 +1464,7 @@ fn push_fixed_ascii_case_pair(
     if source.width() == FIXED_PREDICATE_WORD64_MAX_WIDTH {
         return Ok(false);
     }
-    charge_planner(work, 2, work_limit)?;
+    context.charge(2)?;
     if first.start() != first.end() || second.start() != second.end() {
         return Ok(false);
     }
@@ -476,7 +1479,7 @@ fn push_fixed_ascii_case_pair(
     if !is_ascii_case_pair {
         return Ok(false);
     }
-    charge_planner(work, 1, work_limit)?;
+    context.charge(1)?;
     source.push(FixedPredicate::pair(first, second), true)
 }
 
@@ -495,9 +1498,74 @@ struct GuardedPath {
     symbols: ExactVec<GuardedSymbol>,
 }
 
-struct GuardedLanguage {
+struct GuardedPathLease<'context> {
+    path: GuardedPath,
+    context: &'context FiniteExtractionContext,
+}
+
+impl<'context> GuardedPathLease<'context> {
+    fn new(path: GuardedPath, context: &'context FiniteExtractionContext) -> Self {
+        Self { path, context }
+    }
+}
+
+impl Deref for GuardedPathLease<'_> {
+    type Target = GuardedPath;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for GuardedPathLease<'_> {
+    fn drop(&mut self) {
+        self.context.release_capacity::<GuardedSymbol>(
+            self.path.symbols.capacity(),
+            FiniteStorage::Scratch,
+        );
+    }
+}
+
+struct GuardedLanguage<'context> {
     paths: ExactVec<GuardedPath>,
     bytes: usize,
+    context: &'context FiniteExtractionContext,
+    accounted: bool,
+}
+
+impl<'context> GuardedLanguage<'context> {
+    fn from_paths(paths: AccountedExactVec<'context, GuardedPath>, bytes: usize) -> Self {
+        let context = paths.context;
+        Self {
+            paths: paths.into_inner_kept(),
+            bytes,
+            context,
+            accounted: true,
+        }
+    }
+
+    fn empty(context: &'context FiniteExtractionContext) -> Self {
+        Self {
+            paths: ExactVec::default(),
+            bytes: 0,
+            context,
+            accounted: true,
+        }
+    }
+}
+
+impl Drop for GuardedLanguage<'_> {
+    fn drop(&mut self) {
+        if !self.accounted {
+            return;
+        }
+        self.context
+            .release_capacity::<GuardedPath>(self.paths.capacity(), FiniteStorage::Scratch);
+        for path in &self.paths {
+            self.context
+                .release_capacity::<GuardedSymbol>(path.symbols.capacity(), FiniteStorage::Scratch);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -512,10 +1580,22 @@ struct GuardedSourceWord {
     right: Guard,
 }
 
-struct GuardedSource {
+struct GuardedSource<'context> {
     words: ExactVec<GuardedSourceWord>,
     accounting: GuardedSourceAccounting,
     dictionary_prospective: GuardedBuildProspective,
+    context: &'context FiniteExtractionContext,
+}
+
+impl Drop for GuardedSource<'_> {
+    fn drop(&mut self) {
+        self.context
+            .release_capacity::<GuardedSourceWord>(self.words.capacity(), FiniteStorage::Scratch);
+        for word in &self.words {
+            self.context
+                .release_capacity::<u8>(word.bytes.capacity(), FiniteStorage::Scratch);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -622,43 +1702,31 @@ enum GuardedRefusal {
     Unsupported,
 }
 
-type GuardedSourceResult = Result<GuardedSource, GuardedRefusal>;
+type GuardedSourceResult<'context> = Result<GuardedSource<'context>, GuardedRefusal>;
 type GuardedDictionaryResult = Result<(GuardedDictionary, GuardedFiniteAccounting), GuardedRefusal>;
 
 fn extract_plain(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Option<Vec<Vec<u8>>>, PlainFailure> {
-    match analyze(hir, max_words, max_bytes, work, work_limit).map_err(PlainFailure::Resource)? {
+    match analyze(hir, max_words, max_bytes, context).map_err(PlainFailure::Resource)? {
         Analysis::Fits(_) => {}
         Analysis::TooLargeFixedSequence => return Err(PlainFailure::TooLargeFixedSequence),
         Analysis::Unsupported => return Ok(None),
     }
-    let mut tasks = Vec::new();
-    reserve_planner(
-        &mut tasks,
-        1,
-        work,
-        work_limit,
-        "finite-language task stack",
-    )
-    .map_err(PlainFailure::Resource)?;
-    tasks.push(Task::Visit(hir));
-    let mut values = Vec::new();
+    let mut tasks = AccountedVec::new(context, FiniteStorage::Scratch);
+    tasks
+        .reserve_planner(1, "finite-language task stack")
+        .map_err(PlainFailure::Resource)?;
+    tasks
+        .push_reserved(Task::Visit(hir))
+        .map_err(PlainFailure::Resource)?;
+    let mut values = AccountedVec::new(context, FiniteStorage::Scratch);
     while let Some(task) = tasks.pop() {
-        charge_planner(work, 1, work_limit).map_err(PlainFailure::Resource)?;
-        execute_plain_task(
-            task,
-            &mut tasks,
-            &mut values,
-            max_words,
-            max_bytes,
-            work,
-            work_limit,
-        )?;
+        context.charge(1).map_err(PlainFailure::Resource)?;
+        execute_plain_task(task, &mut tasks, &mut values, max_words, max_bytes, context)?;
     }
     if values.len() != 1 {
         return Err(PlainFailure::Resource(BuildError::InternalInvariant(
@@ -670,98 +1738,81 @@ fn extract_plain(
         .ok_or(PlainFailure::Resource(BuildError::InternalInvariant(
             "finite-language value disappeared",
         )))?;
-    Ok(Some(language.words))
+    Ok(Some(language.into_words()))
 }
 
-fn execute_plain_task<'a>(
-    task: Task<'a>,
-    tasks: &mut Vec<Task<'a>>,
-    values: &mut Vec<Language>,
+fn execute_plain_task<'hir, 'context>(
+    task: Task<'hir>,
+    tasks: &mut AccountedVec<'context, Task<'hir>>,
+    values: &mut AccountedVec<'context, Language<'context>>,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &'context FiniteExtractionContext,
 ) -> Result<(), PlainFailure> {
     match task {
-        Task::Visit(node) => {
-            visit_plain_node(node, tasks, values, max_words, max_bytes, work, work_limit)
+        Task::Visit(node) => visit_plain_node(node, tasks, values, max_words, max_bytes, context),
+        Task::FinishConcat(children) => {
+            finish_plain_languages(values, children, true, max_words, max_bytes, context)
         }
-        Task::FinishConcat(children) => finish_plain_languages(
-            values, children, true, max_words, max_bytes, work, work_limit,
-        ),
-        Task::FinishAlternation(children) => finish_plain_languages(
-            values, children, false, max_words, max_bytes, work, work_limit,
-        ),
+        Task::FinishAlternation(children) => {
+            finish_plain_languages(values, children, false, max_words, max_bytes, context)
+        }
     }
 }
 
-fn visit_plain_node<'a>(
-    node: &'a Hir,
-    tasks: &mut Vec<Task<'a>>,
-    values: &mut Vec<Language>,
+fn visit_plain_node<'hir, 'context>(
+    node: &'hir Hir,
+    tasks: &mut AccountedVec<'context, Task<'hir>>,
+    values: &mut AccountedVec<'context, Language<'context>>,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &'context FiniteExtractionContext,
 ) -> Result<(), PlainFailure> {
     let language = match node.kind() {
-        HirKind::Empty => {
-            Some(singleton_language(Vec::new(), work, work_limit).map_err(PlainFailure::Resource)?)
-        }
+        HirKind::Empty => Some(
+            singleton_language(
+                AccountedVec::new(context, FiniteStorage::Persistent),
+                context,
+            )
+            .map_err(PlainFailure::Resource)?,
+        ),
         HirKind::Literal(literal) => {
             if literal.0.len() > max_bytes || max_words == 0 {
                 return Err(plain_invariant(
                     "finite literal exceeded successful analysis",
                 ));
             }
-            let mut word = Vec::new();
-            reserve_planner(
-                &mut word,
-                literal.0.len(),
-                work,
-                work_limit,
-                "finite-language literal bytes",
-            )
-            .map_err(PlainFailure::Resource)?;
-            word.extend_from_slice(&literal.0);
-            Some(singleton_language(word, work, work_limit).map_err(PlainFailure::Resource)?)
+            let mut word = AccountedVec::new(context, FiniteStorage::Persistent);
+            word.reserve_planner(literal.0.len(), "finite-language literal bytes")
+                .map_err(PlainFailure::Resource)?;
+            word.extend_reserved(literal.0.iter().copied(), literal.0.len())
+                .map_err(PlainFailure::Resource)?;
+            Some(singleton_language(word, context).map_err(PlainFailure::Resource)?)
         }
         HirKind::Class(Class::Bytes(class)) => Some(
-            byte_class(class, max_words, max_bytes, work, work_limit)
+            byte_class(class, max_words, max_bytes, context)
                 .map_err(PlainFailure::Resource)?
                 .ok_or_else(|| plain_invariant("finite byte class exceeded successful analysis"))?,
         ),
         HirKind::Class(Class::Unicode(class)) => Some(
-            unicode_class(class, max_words, max_bytes, work, work_limit)
+            unicode_class(class, max_words, max_bytes, context)
                 .map_err(PlainFailure::Resource)?
                 .ok_or_else(|| {
                     plain_invariant("finite Unicode class exceeded successful analysis")
                 })?,
         ),
         HirKind::Capture(capture) => {
-            push_visit(tasks, &capture.sub, work, work_limit).map_err(PlainFailure::Resource)?;
+            push_visit(tasks, &capture.sub).map_err(PlainFailure::Resource)?;
             None
         }
         HirKind::Concat(children) => {
-            push_children(
-                tasks,
-                children,
-                Task::FinishConcat(children.len()),
-                work,
-                work_limit,
-            )
-            .map_err(PlainFailure::Resource)?;
+            push_children(tasks, children, Task::FinishConcat(children.len()))
+                .map_err(PlainFailure::Resource)?;
             None
         }
         HirKind::Alternation(children) => {
-            push_children(
-                tasks,
-                children,
-                Task::FinishAlternation(children.len()),
-                work,
-                work_limit,
-            )
-            .map_err(PlainFailure::Resource)?;
+            push_children(tasks, children, Task::FinishAlternation(children.len()))
+                .map_err(PlainFailure::Resource)?;
             None
         }
         HirKind::Look(_) | HirKind::Repetition(_) => {
@@ -771,80 +1822,72 @@ fn visit_plain_node<'a>(
         }
     };
     if let Some(language) = language {
-        push_language(values, language, work, work_limit).map_err(PlainFailure::Resource)?;
+        push_language(values, language).map_err(PlainFailure::Resource)?;
     }
     Ok(())
 }
 
-fn finish_plain_languages(
-    values: &mut Vec<Language>,
+fn finish_plain_languages<'context>(
+    values: &mut AccountedVec<'context, Language<'context>>,
     children: usize,
     concatenate: bool,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &'context FiniteExtractionContext,
 ) -> Result<(), PlainFailure> {
     let child_languages =
-        pop_languages(values, children, work, work_limit).map_err(PlainFailure::Resource)?;
+        pop_languages(values, children, context).map_err(PlainFailure::Resource)?;
     let language = if concatenate {
-        concat_languages(child_languages, max_words, max_bytes, work, work_limit)
+        concat_languages(child_languages, max_words, max_bytes, context)
     } else {
-        alternate_languages(child_languages, max_words, max_bytes, work, work_limit)
+        alternate_languages(child_languages, max_words, max_bytes, context)
     }
     .map_err(PlainFailure::Resource)?
     .ok_or_else(|| plain_invariant("finite combination exceeded successful analysis"))?;
-    push_language(values, language, work, work_limit).map_err(PlainFailure::Resource)
+    push_language(values, language).map_err(PlainFailure::Resource)
 }
 
 const fn plain_invariant(detail: &'static str) -> PlainFailure {
     PlainFailure::Resource(BuildError::InternalInvariant(detail))
 }
 
-fn extract_guarded_source(
+fn extract_guarded_source<'context>(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &'context FiniteExtractionContext,
     guarded_limits: GuardedFiniteBuildLimits,
-) -> Result<GuardedSourceResult, GuardedAttemptError> {
-    let materialization = match prove_guarded_materialization(
-        hir,
-        max_words,
-        max_bytes,
-        work,
-        work_limit,
-        guarded_limits,
-    )? {
-        Ok(materialization) => materialization,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
+) -> Result<GuardedSourceResult<'context>, GuardedAttemptError> {
+    let materialization =
+        match prove_guarded_materialization(hir, max_words, max_bytes, context, guarded_limits)? {
+            Ok(materialization) => materialization,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
     let plan = materialization.plan;
-    admit_guarded_source_work(plan, *work, work_limit)?;
-    publish_guarded_source(materialization, plan, work, work_limit).map_err(Into::into)
+    admit_guarded_source_work(plan, context.work(), context.work_limit)?;
+    publish_guarded_source(materialization, plan, context).map_err(Into::into)
 }
 
-struct GuardedMaterialization {
-    language: GuardedLanguage,
+struct GuardedMaterialization<'context> {
+    language: GuardedLanguage<'context>,
     expansion_actual: GuardedExpansionActual,
     plan: GuardedSourcePlan,
 }
 
-type GuardedMaterializationResult = Result<GuardedMaterialization, GuardedRefusal>;
+type GuardedMaterializationResult<'context> =
+    Result<GuardedMaterialization<'context>, GuardedRefusal>;
 
-fn prove_guarded_materialization(
+fn prove_guarded_materialization<'context>(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &'context FiniteExtractionContext,
     guarded_limits: GuardedFiniteBuildLimits,
-) -> Result<GuardedMaterializationResult, GuardedAttemptError> {
-    if !guarded_structure_supported(hir, work, work_limit)? {
+) -> Result<GuardedMaterializationResult<'context>, GuardedAttemptError> {
+    if !guarded_structure_supported(hir, context)? {
         return Ok(Err(GuardedRefusal::Unsupported));
     }
-    let Some(shape) = guarded_shape(hir, work, work_limit)? else {
+    let Some(shape) = guarded_shape(hir, context)? else {
         return Ok(Err(GuardedRefusal::TooLargeFixedSequence));
     };
     if !shape.fits(max_words, max_bytes) {
@@ -861,23 +1904,22 @@ fn prove_guarded_materialization(
         )
         .into());
     }
-    let plan = close_guarded_source_plan(shape, guarded_limits)?;
-    admit_guarded_source_work(plan, *work, work_limit)?;
-    let mut context = GuardedExpansionContext {
+    let plan = close_guarded_source_plan(shape, guarded_limits, context)?;
+    admit_guarded_source_work(plan, context.work(), context.work_limit)?;
+    let mut expansion = GuardedExpansionContext {
         max_words,
         max_bytes,
-        work,
-        work_limit,
+        attempt: context,
         actual: GuardedExpansionActual::default(),
     };
-    let language = match expand_guarded(hir, &mut context)? {
+    let language = match expand_guarded(hir, &mut expansion)? {
         GuardedExpansion::Fits(language) => language,
         GuardedExpansion::TooLargeFixedSequence => {
             return Ok(Err(GuardedRefusal::TooLargeFixedSequence));
         }
         GuardedExpansion::Unsupported => return Ok(Err(GuardedRefusal::Unsupported)),
     };
-    let expansion_actual = context.actual;
+    let expansion_actual = expansion.actual;
     if language.paths.is_empty() {
         return Ok(Err(GuardedRefusal::Unsupported));
     }
@@ -922,6 +1964,7 @@ struct GuardedSourcePlan {
 fn close_guarded_source_plan(
     shape: GuardedShape,
     limits: GuardedFiniteBuildLimits,
+    context: &FiniteExtractionContext,
 ) -> Result<GuardedSourcePlan, GuardedAttemptError> {
     let source_words = shape.paths;
     let source_word_bytes = shape.bytes;
@@ -948,9 +1991,18 @@ fn close_guarded_source_plan(
         packed_bytes: source_word_bytes,
     };
     let dictionary_prospective =
-        GuardedDictionary::preflight(dictionary_dimensions, limits.dictionary).map_err(
-            |error| GuardedAttemptError::Build(GuardedFiniteBuildError::Dictionary(error)),
-        )?;
+        match GuardedDictionary::preflight(dictionary_dimensions, limits.dictionary) {
+            Ok(prospective) => prospective,
+            Err(error) => {
+                context.bind_guarded(&FiniteExtractionGuardedEvidence::Failed {
+                    accounting: error.actual(),
+                    co_live_local_scratch_bytes: context.live_scratch_bytes(),
+                })?;
+                return Err(GuardedAttemptError::Build(
+                    GuardedFiniteBuildError::Dictionary(error),
+                ));
+            }
+        };
     let dictionary_peak_bytes_upper_bound = source_storage_bytes
         .checked_add(dictionary_prospective.peak_bytes)
         .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -1042,28 +2094,27 @@ fn admit_guarded_source_work(
     Ok(())
 }
 
-fn publish_guarded_source(
-    materialization: GuardedMaterialization,
+fn publish_guarded_source<'context>(
+    materialization: GuardedMaterialization<'context>,
     plan: GuardedSourcePlan,
-    work: &mut u64,
-    work_limit: u64,
-) -> Result<GuardedSourceResult, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<GuardedSourceResult<'context>, BuildError> {
     let GuardedMaterialization {
         mut language,
         expansion_actual,
         plan: _,
     } = materialization;
-    charge_planner(
-        work,
-        u64::try_from(plan.words).unwrap_or(u64::MAX),
-        work_limit,
+    context.charge(u64::try_from(plan.words).unwrap_or(u64::MAX))?;
+    let mut source = AccountedExactVec::try_with_capacity(
+        context,
+        FiniteStorage::Scratch,
+        plan.words,
+        "guarded finite source words",
     )?;
-    let mut source = ExactVec::try_with_capacity(plan.words).map_err(|error| {
-        map_guarded_source_allocation(error, "guarded finite source words", plan.words)
-    })?;
     language.paths.as_mut_slice().reverse();
     while let Some(path) = language.paths.pop() {
-        charge_planner(work, 1, work_limit)?;
+        let path = GuardedPathLease::new(path, context);
+        context.charge(1)?;
         let Some((first, middle)) = path.symbols.split_first() else {
             return Ok(Err(GuardedRefusal::Unsupported));
         };
@@ -1082,35 +2133,38 @@ fn publish_guarded_source(
         let Some(right) = map_right_guard(*right) else {
             return Ok(Err(GuardedRefusal::Unsupported));
         };
-        charge_planner(
-            work,
-            u64::try_from(body.len()).unwrap_or(u64::MAX),
-            work_limit,
+        context.charge(u64::try_from(body.len()).unwrap_or(u64::MAX))?;
+        let mut bytes = AccountedExactVec::try_with_capacity(
+            context,
+            FiniteStorage::Scratch,
+            body.len(),
+            "guarded finite word bytes",
         )?;
-        let mut bytes = ExactVec::try_with_capacity(body.len()).map_err(|error| {
-            map_guarded_source_allocation(error, "guarded finite word bytes", body.len())
-        })?;
         for symbol in body {
-            charge_planner(work, 1, work_limit)?;
+            context.charge(1)?;
             let GuardedSymbol::Byte(byte) = symbol else {
                 return Ok(Err(GuardedRefusal::Unsupported));
             };
             if !is_ascii_word_byte(*byte) {
                 return Ok(Err(GuardedRefusal::Unsupported));
             }
-            bytes.try_push(*byte).map_err(|_| {
-                BuildError::InternalInvariant("exact guarded word capacity changed")
-            })?;
+            bytes.push_accounted(*byte, true, "exact guarded word capacity changed")?;
         }
         if bytes.is_empty() {
             return Ok(Err(GuardedRefusal::Unsupported));
         }
-        source
-            .try_push(GuardedSourceWord { bytes, left, right })
-            .map_err(|_| BuildError::InternalInvariant("exact guarded source capacity changed"))?;
+        source.push_accounted(
+            GuardedSourceWord {
+                bytes: bytes.into_inner_kept(),
+                left,
+                right,
+            },
+            false,
+            "exact guarded source capacity changed",
+        )?;
     }
     Ok(Ok(GuardedSource {
-        words: source,
+        words: source.into_inner_kept(),
         accounting: GuardedSourceAccounting {
             words: plan.words,
             word_bytes: plan.word_bytes,
@@ -1128,6 +2182,7 @@ fn publish_guarded_source(
             construction_peak_bytes_upper_bound: plan.construction_peak_bytes_upper_bound,
         },
         dictionary_prospective: plan.dictionary_prospective,
+        context,
     }))
 }
 
@@ -1147,10 +2202,9 @@ const fn map_guarded_source_allocation(
 
 fn guarded_structure_supported(
     hir: &Hir,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<bool, BuildError> {
-    let Some(relation) = guarded_relation(hir, work, work_limit)? else {
+    let Some(relation) = guarded_relation(hir, context)? else {
         return Ok(false);
     };
     Ok(relation.rows[GUARDED_START_STATE] == GUARDED_ACCEPT_BIT)
@@ -1207,16 +2261,15 @@ impl GuardedRelation {
 
 fn guarded_relation(
     hir: &Hir,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Option<GuardedRelation>, BuildError> {
-    charge_planner(work, 1, work_limit)?;
+    context.charge(1)?;
     match hir.kind() {
         HirKind::Empty => Ok(Some(GuardedRelation::identity())),
         HirKind::Literal(literal) => {
             let mut relation = GuardedRelation::identity();
             for &byte in &literal.0 {
-                charge_planner(work, 1, work_limit)?;
+                context.charge(1)?;
                 if !is_ascii_word_byte(byte) {
                     return Ok(None);
                 }
@@ -1228,7 +2281,7 @@ fn guarded_relation(
             let mut has_member = false;
             for range in class.ranges() {
                 for byte in range.start()..=range.end() {
-                    charge_planner(work, 1, work_limit)?;
+                    context.charge(1)?;
                     if !is_ascii_word_byte(byte) {
                         return Ok(None);
                     }
@@ -1241,7 +2294,7 @@ fn guarded_relation(
             let mut has_member = false;
             for range in class.ranges() {
                 for scalar in range.start()..=range.end() {
-                    charge_planner(work, 1, work_limit)?;
+                    context.charge(1)?;
                     let Ok(byte) = u8::try_from(u32::from(scalar)) else {
                         return Ok(None);
                     };
@@ -1254,11 +2307,11 @@ fn guarded_relation(
             Ok(has_member.then_some(guarded_byte_relation()))
         }
         HirKind::Look(look) => Ok(guarded_look_relation(*look)),
-        HirKind::Capture(capture) => guarded_relation(&capture.sub, work, work_limit),
+        HirKind::Capture(capture) => guarded_relation(&capture.sub, context),
         HirKind::Concat(children) => {
             let mut relation = GuardedRelation::identity();
             for child in children {
-                let Some(child) = guarded_relation(child, work, work_limit)? else {
+                let Some(child) = guarded_relation(child, context)? else {
                     return Ok(None);
                 };
                 relation = relation.then(child);
@@ -1268,7 +2321,7 @@ fn guarded_relation(
         HirKind::Alternation(children) => {
             let mut relation = GuardedRelation::empty_language();
             for child in children {
-                let Some(child) = guarded_relation(child, work, work_limit)? else {
+                let Some(child) = guarded_relation(child, context)? else {
                     return Ok(None);
                 };
                 relation = relation.union(child);
@@ -1282,14 +2335,14 @@ fn guarded_relation(
             if maximum < repetition.min {
                 return Ok(None);
             }
-            let Some(sub) = guarded_relation(&repetition.sub, work, work_limit)? else {
+            let Some(sub) = guarded_relation(&repetition.sub, context)? else {
                 return Ok(None);
             };
             let mut result = GuardedRelation::empty_language();
             let mut power = GuardedRelation::identity();
             let mut count = 0_u32;
             loop {
-                charge_planner(work, 1, work_limit)?;
+                context.charge(1)?;
                 if count >= repetition.min {
                     result = result.union(power);
                 }
@@ -1408,10 +2461,9 @@ fn guarded_expansion_storage_bytes(paths: usize, symbols: usize) -> Option<usize
 
 fn guarded_shape(
     hir: &Hir,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Option<GuardedShape>, BuildError> {
-    charge_planner(work, 1, work_limit)?;
+    context.charge(1)?;
     match hir.kind() {
         HirKind::Empty => Ok(GuardedShape::leaf(1, 0, 0)),
         HirKind::Literal(literal) => Ok(GuardedShape::leaf(1, literal.0.len(), literal.0.len())),
@@ -1428,13 +2480,13 @@ fn guarded_shape(
             Ok(GuardedShape::leaf(count, bytes, count))
         }
         HirKind::Look(_) => Ok(GuardedShape::leaf(1, 0, 1)),
-        HirKind::Capture(capture) => guarded_shape(&capture.sub, work, work_limit),
+        HirKind::Capture(capture) => guarded_shape(&capture.sub, context),
         HirKind::Concat(children) => {
             let Some(mut output) = GuardedShape::leaf(1, 0, 0) else {
                 return Ok(None);
             };
             for child in children {
-                let Some(child) = guarded_shape(child, work, work_limit)? else {
+                let Some(child) = guarded_shape(child, context)? else {
                     return Ok(None);
                 };
                 let Some(next) = concat_guarded_shape(output, child) else {
@@ -1447,7 +2499,7 @@ fn guarded_shape(
         HirKind::Alternation(children) => {
             let mut output = GuardedShape::empty_language();
             for child in children {
-                let Some(child) = guarded_shape(child, work, work_limit)? else {
+                let Some(child) = guarded_shape(child, context)? else {
                     return Ok(None);
                 };
                 let Some(next) = alternate_guarded_shape(output, child) else {
@@ -1457,14 +2509,13 @@ fn guarded_shape(
             }
             Ok(Some(output))
         }
-        HirKind::Repetition(repetition) => guarded_repetition_shape(repetition, work, work_limit),
+        HirKind::Repetition(repetition) => guarded_repetition_shape(repetition, context),
     }
 }
 
 fn guarded_repetition_shape(
     repetition: &regex_syntax::hir::Repetition,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Option<GuardedShape>, BuildError> {
     let Some(maximum) = repetition.max else {
         return Ok(None);
@@ -1472,7 +2523,7 @@ fn guarded_repetition_shape(
     let Some(optional) = maximum.checked_sub(repetition.min) else {
         return Ok(None);
     };
-    let Some(sub) = guarded_shape(&repetition.sub, work, work_limit)? else {
+    let Some(sub) = guarded_shape(&repetition.sub, context)? else {
         return Ok(None);
     };
     let Some(mut output) = GuardedShape::leaf(1, 0, 0) else {
@@ -1505,14 +2556,14 @@ fn guarded_repetition_shape(
     };
     output.construction_initialized_bytes_upper_bound = initialized_bytes;
     for _ in 0..repetition.min {
-        charge_planner(work, 1, work_limit)?;
+        context.charge(1)?;
         let Some(next) = concat_guarded_shape(output, sub) else {
             return Ok(None);
         };
         output = next;
     }
     for _ in 0..optional {
-        charge_planner(work, 1, work_limit)?;
+        context.charge(1)?;
         let Some(next) = optional_guarded_shape(output, sub) else {
             return Ok(None);
         };
@@ -1647,12 +2698,10 @@ fn extract_guarded_dictionary(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
     limits: GuardedFiniteBuildLimits,
 ) -> Result<GuardedDictionaryResult, GuardedAttemptError> {
-    let source = match extract_guarded_source(hir, max_words, max_bytes, work, work_limit, limits)?
-    {
+    let source = match extract_guarded_source(hir, max_words, max_bytes, context, limits)? {
         Ok(source) => source,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -1669,20 +2718,35 @@ fn extract_guarded_dictionary(
     {
         Ok(dictionary) => dictionary,
         Err(error) => {
-            charge_planner(work, error.actual().build_work, work_limit)?;
+            let evidence = FiniteExtractionGuardedEvidence::Failed {
+                accounting: error.actual(),
+                co_live_local_scratch_bytes: context.live_scratch_bytes(),
+            };
+            context.bind_guarded(&evidence)?;
+            context.charge(error.actual().build_work)?;
             return Err(GuardedAttemptError::Build(
                 GuardedFiniteBuildError::Dictionary(error),
             ));
         }
     };
     let dictionary_accounting = dictionary.build_accounting();
+    let published = dictionary_accounting
+        .published()
+        .ok_or(BuildError::InternalInvariant(
+            "guarded dictionary lost its native published receipt",
+        ))?;
+    context.bind_guarded(&FiniteExtractionGuardedEvidence::Succeeded {
+        accounting: published,
+        co_live_local_scratch_bytes: context.live_scratch_bytes(),
+        retained: false,
+    })?;
     if dictionary_accounting.prospective != source.dictionary_prospective {
         return Err(BuildError::InternalInvariant(
             "guarded dictionary prospective changed after source publication",
         )
         .into());
     }
-    charge_planner(work, dictionary_accounting.actual.build_work, work_limit)?;
+    context.charge(dictionary_accounting.actual.build_work)?;
     let allocations_actual = source
         .accounting
         .expansion_allocations_actual
@@ -1728,6 +2792,7 @@ fn extract_guarded_dictionary(
         )
         .into());
     }
+    context.retain_guarded()?;
     Ok(Ok((dictionary, accounting)))
 }
 
@@ -1749,63 +2814,74 @@ const fn map_right_guard(look: Look) -> Option<Guard> {
     }
 }
 
-enum GuardedExpansion {
-    Fits(GuardedLanguage),
+enum GuardedExpansion<'context> {
+    Fits(GuardedLanguage<'context>),
     TooLargeFixedSequence,
     Unsupported,
 }
 
-struct GuardedExpansionContext<'a> {
+struct GuardedExpansionContext<'context> {
     max_words: usize,
     max_bytes: usize,
-    work: &'a mut u64,
-    work_limit: u64,
+    attempt: &'context FiniteExtractionContext,
     actual: GuardedExpansionActual,
 }
 
-impl GuardedExpansionContext<'_> {
+impl<'context> GuardedExpansionContext<'context> {
     fn charge(&mut self, amount: usize) -> Result<(), BuildError> {
-        charge_planner(
-            self.work,
-            u64::try_from(amount).unwrap_or(u64::MAX),
-            self.work_limit,
-        )
+        self.attempt
+            .charge(u64::try_from(amount).unwrap_or(u64::MAX))
     }
 
     fn allocate<T>(
         &mut self,
         capacity: usize,
         structure: &'static str,
-    ) -> Result<ExactVec<T>, BuildError> {
+    ) -> Result<AccountedExactVec<'context, T>, BuildError> {
         self.charge(capacity)?;
-        let values = ExactVec::try_with_capacity(capacity)
-            .map_err(|error| map_guarded_source_allocation(error, structure, capacity))?;
-        if capacity != 0 {
+        let values = AccountedExactVec::try_with_capacity(
+            self.attempt,
+            FiniteStorage::Scratch,
+            capacity,
+            structure,
+        )?;
+        if values.capacity() != 0 {
             self.actual.allocations = self
                 .actual
                 .allocations
                 .checked_add(1)
                 .ok_or(BuildError::PersistentBytesOverflow)?;
-            let bytes = capacity
-                .checked_mul(size_of::<T>())
-                .ok_or(BuildError::PersistentBytesOverflow)?;
-            self.actual.initialized_bytes = self
-                .actual
-                .initialized_bytes
-                .checked_add(bytes)
-                .ok_or(BuildError::PersistentBytesOverflow)?;
         }
         Ok(values)
     }
+
+    fn push<T>(
+        &mut self,
+        target: &mut AccountedExactVec<'context, T>,
+        value: T,
+        copied: bool,
+    ) -> Result<(), BuildError> {
+        target.push_accounted(value, copied, "exact guarded expansion capacity changed")?;
+        let bytes = size_of::<T>();
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::PersistentBytesOverflow)?;
+        Ok(())
+    }
 }
 
-fn expand_guarded(
+fn expand_guarded<'context>(
     hir: &Hir,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     context.charge(1)?;
     match hir.kind() {
-        HirKind::Empty => guarded_singleton(ExactVec::default(), context),
+        HirKind::Empty => guarded_singleton(
+            AccountedExactVec::empty(context.attempt, FiniteStorage::Scratch),
+            context,
+        ),
         HirKind::Literal(literal) => expand_guarded_literal(&literal.0, context),
         HirKind::Class(Class::Bytes(class)) => expand_guarded_byte_class(class, context),
         HirKind::Class(Class::Unicode(class)) => expand_guarded_unicode_class(class, context),
@@ -1817,26 +2893,24 @@ fn expand_guarded(
     }
 }
 
-fn expand_guarded_literal(
+fn expand_guarded_literal<'context>(
     literal: &[u8],
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     if context.max_words == 0 || literal.len() > context.max_bytes {
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     }
     let mut symbols = context.allocate(literal.len(), "guarded finite literal symbols")?;
     for &byte in literal {
-        symbols
-            .try_push(GuardedSymbol::Byte(byte))
-            .map_err(|_| BuildError::InternalInvariant("exact guarded literal capacity changed"))?;
+        context.push(&mut symbols, GuardedSymbol::Byte(byte), true)?;
     }
     guarded_singleton(symbols, context)
 }
 
-fn expand_guarded_byte_class(
+fn expand_guarded_byte_class<'context>(
     class: &regex_syntax::hir::ClassBytes,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let mut count = 0_usize;
     for range in class.ranges() {
         for byte in range.start()..=range.end() {
@@ -1846,7 +2920,7 @@ fn expand_guarded_byte_class(
             }
             count = count.checked_add(1).ok_or(BuildError::PlannerWorkLimit {
                 needed: u64::MAX,
-                limit: context.work_limit,
+                limit: context.attempt.work_limit,
             })?;
         }
     }
@@ -1857,24 +2931,25 @@ fn expand_guarded_byte_class(
     for range in class.ranges() {
         for byte in range.start()..=range.end() {
             let mut symbols = context.allocate(1, "guarded finite byte-class symbol")?;
-            symbols
-                .try_push(GuardedSymbol::Byte(byte))
-                .map_err(|_| BuildError::InternalInvariant("exact byte-class capacity changed"))?;
-            paths
-                .try_push(GuardedPath { symbols })
-                .map_err(|_| BuildError::InternalInvariant("exact byte-class paths changed"))?;
+            context.push(&mut symbols, GuardedSymbol::Byte(byte), false)?;
+            context.push(
+                &mut paths,
+                GuardedPath {
+                    symbols: symbols.into_inner_kept(),
+                },
+                false,
+            )?;
         }
     }
-    Ok(GuardedExpansion::Fits(GuardedLanguage {
-        paths,
-        bytes: count,
-    }))
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, count,
+    )))
 }
 
-fn expand_guarded_unicode_class(
+fn expand_guarded_unicode_class<'context>(
     class: &regex_syntax::hir::ClassUnicode,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let mut count = 0_usize;
     for range in class.ranges() {
         for scalar in range.start()..=range.end() {
@@ -1887,7 +2962,7 @@ fn expand_guarded_unicode_class(
             }
             count = count.checked_add(1).ok_or(BuildError::PlannerWorkLimit {
                 needed: u64::MAX,
-                limit: context.work_limit,
+                limit: context.attempt.work_limit,
             })?;
         }
     }
@@ -1903,25 +2978,29 @@ fn expand_guarded_unicode_class(
                 )
             })?;
             let mut symbols = context.allocate(1, "guarded finite Unicode-class symbol")?;
-            symbols.try_push(GuardedSymbol::Byte(byte)).map_err(|_| {
-                BuildError::InternalInvariant("exact Unicode-class capacity changed")
-            })?;
-            paths
-                .try_push(GuardedPath { symbols })
-                .map_err(|_| BuildError::InternalInvariant("exact Unicode-class paths changed"))?;
+            context.push(&mut symbols, GuardedSymbol::Byte(byte), false)?;
+            context.push(
+                &mut paths,
+                GuardedPath {
+                    symbols: symbols.into_inner_kept(),
+                },
+                false,
+            )?;
         }
     }
-    Ok(GuardedExpansion::Fits(GuardedLanguage {
-        paths,
-        bytes: count,
-    }))
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, count,
+    )))
 }
 
-fn expand_guarded_concat(
+fn expand_guarded_concat<'context>(
     children: &[Hir],
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
-    let mut accumulator = match guarded_singleton(ExactVec::default(), context)? {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
+    let mut accumulator = match guarded_singleton(
+        AccountedExactVec::empty(context.attempt, FiniteStorage::Scratch),
+        context,
+    )? {
         GuardedExpansion::Fits(language) => language,
         other => return Ok(other),
     };
@@ -1938,14 +3017,11 @@ fn expand_guarded_concat(
     Ok(GuardedExpansion::Fits(accumulator))
 }
 
-fn expand_guarded_alternation(
+fn expand_guarded_alternation<'context>(
     children: &[Hir],
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
-    let mut accumulator = GuardedLanguage {
-        paths: ExactVec::default(),
-        bytes: 0,
-    };
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
+    let mut accumulator = GuardedLanguage::empty(context.attempt);
     for child in children {
         let language = match expand_guarded(child, context)? {
             GuardedExpansion::Fits(language) => language,
@@ -1959,10 +3035,10 @@ fn expand_guarded_alternation(
     Ok(GuardedExpansion::Fits(accumulator))
 }
 
-fn expand_guarded_repetition(
+fn expand_guarded_repetition<'context>(
     repetition: &regex_syntax::hir::Repetition,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let Some(maximum) = repetition.max else {
         return Ok(GuardedExpansion::Unsupported);
     };
@@ -1973,10 +3049,10 @@ fn expand_guarded_repetition(
     expand_bounded_repetition(&sub, repetition.min, maximum, repetition.greedy, context)
 }
 
-fn guarded_singleton(
-    symbols: ExactVec<GuardedSymbol>,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+fn guarded_singleton<'context>(
+    symbols: AccountedExactVec<'context, GuardedSymbol>,
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     if context.max_words == 0 {
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     }
@@ -1985,28 +3061,32 @@ fn guarded_singleton(
         .filter(|symbol| matches!(symbol, GuardedSymbol::Byte(_)))
         .count();
     let mut paths = context.allocate(1, "guarded finite singleton path")?;
-    paths
-        .try_push(GuardedPath { symbols })
-        .map_err(|_| BuildError::InternalInvariant("exact singleton path capacity changed"))?;
-    Ok(GuardedExpansion::Fits(GuardedLanguage { paths, bytes }))
+    context.push(
+        &mut paths,
+        GuardedPath {
+            symbols: symbols.into_inner_kept(),
+        },
+        false,
+    )?;
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, bytes,
+    )))
 }
 
-fn guarded_look_singleton(
+fn guarded_look_singleton<'context>(
     look: Look,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let mut symbols = context.allocate(1, "guarded finite look symbol")?;
-    symbols
-        .try_push(GuardedSymbol::Look(look))
-        .map_err(|_| BuildError::InternalInvariant("exact look capacity changed"))?;
+    context.push(&mut symbols, GuardedSymbol::Look(look), false)?;
     guarded_singleton(symbols, context)
 }
 
-fn concat_guarded(
-    left: &GuardedLanguage,
-    right: &GuardedLanguage,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+fn concat_guarded<'context>(
+    left: &GuardedLanguage<'context>,
+    right: &GuardedLanguage<'context>,
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let Some(path_count) = left.paths.len().checked_mul(right.paths.len()) else {
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     };
@@ -2031,25 +3111,31 @@ fn concat_guarded(
                 .checked_add(right_path.symbols.len())
                 .ok_or(BuildError::PlannerWorkLimit {
                     needed: u64::MAX,
-                    limit: context.work_limit,
+                    limit: context.attempt.work_limit,
                 })?;
             let mut symbols =
                 context.allocate(symbol_count, "guarded finite concatenation symbols")?;
-            push_guarded_symbols(&mut symbols, &left_path.symbols)?;
-            push_guarded_symbols(&mut symbols, &right_path.symbols)?;
-            paths.try_push(GuardedPath { symbols }).map_err(|_| {
-                BuildError::InternalInvariant("exact concatenation paths capacity changed")
-            })?;
+            push_guarded_symbols(&mut symbols, &left_path.symbols, context)?;
+            push_guarded_symbols(&mut symbols, &right_path.symbols, context)?;
+            context.push(
+                &mut paths,
+                GuardedPath {
+                    symbols: symbols.into_inner_kept(),
+                },
+                false,
+            )?;
         }
     }
-    Ok(GuardedExpansion::Fits(GuardedLanguage { paths, bytes }))
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, bytes,
+    )))
 }
 
-fn append_guarded(
-    mut accumulator: GuardedLanguage,
-    mut language: GuardedLanguage,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+fn append_guarded<'context>(
+    mut accumulator: GuardedLanguage<'context>,
+    mut language: GuardedLanguage<'context>,
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let Some(path_count) = accumulator.paths.len().checked_add(language.paths.len()) else {
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     };
@@ -2060,43 +3146,43 @@ fn append_guarded(
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     }
     let mut paths = context.allocate(path_count, "guarded finite alternation paths")?;
-    move_guarded_paths(&mut accumulator.paths, &mut paths)?;
-    move_guarded_paths(&mut language.paths, &mut paths)?;
-    Ok(GuardedExpansion::Fits(GuardedLanguage { paths, bytes }))
+    move_guarded_paths(&mut accumulator.paths, &mut paths, context)?;
+    move_guarded_paths(&mut language.paths, &mut paths, context)?;
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, bytes,
+    )))
 }
 
-fn push_guarded_symbols(
-    target: &mut ExactVec<GuardedSymbol>,
+fn push_guarded_symbols<'context>(
+    target: &mut AccountedExactVec<'context, GuardedSymbol>,
     source: &[GuardedSymbol],
+    context: &mut GuardedExpansionContext<'context>,
 ) -> Result<(), BuildError> {
     for &symbol in source {
-        target
-            .try_push(symbol)
-            .map_err(|_| BuildError::InternalInvariant("exact guarded symbol capacity changed"))?;
+        context.push(target, symbol, true)?;
     }
     Ok(())
 }
 
-fn move_guarded_paths(
+fn move_guarded_paths<'context>(
     source: &mut ExactVec<GuardedPath>,
-    target: &mut ExactVec<GuardedPath>,
+    target: &mut AccountedExactVec<'context, GuardedPath>,
+    context: &mut GuardedExpansionContext<'context>,
 ) -> Result<(), BuildError> {
     source.as_mut_slice().reverse();
     while let Some(path) = source.pop() {
-        target
-            .try_push(path)
-            .map_err(|_| BuildError::InternalInvariant("exact guarded path capacity changed"))?;
+        context.push(target, path, true)?;
     }
     Ok(())
 }
 
-fn expand_bounded_repetition(
-    sub: &GuardedLanguage,
+fn expand_bounded_repetition<'context>(
+    sub: &GuardedLanguage<'context>,
     minimum: u32,
     maximum: u32,
     greedy: bool,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let Some(optional_count) = maximum.checked_sub(minimum) else {
         return Ok(GuardedExpansion::Unsupported);
     };
@@ -2114,12 +3200,12 @@ fn expand_bounded_repetition(
     Ok(GuardedExpansion::Fits(output))
 }
 
-fn append_optional_guarded(
-    prefixes: &GuardedLanguage,
-    sub: &GuardedLanguage,
+fn append_optional_guarded<'context>(
+    prefixes: &GuardedLanguage<'context>,
+    sub: &GuardedLanguage<'context>,
     greedy: bool,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
     let Some(choices) = sub.paths.len().checked_add(1) else {
         return Ok(GuardedExpansion::TooLargeFixedSequence);
     };
@@ -2150,30 +3236,36 @@ fn append_optional_guarded(
             push_guarded_path_copy(&mut paths, prefix, context)?;
         }
     }
-    Ok(GuardedExpansion::Fits(GuardedLanguage { paths, bytes }))
+    Ok(GuardedExpansion::Fits(GuardedLanguage::from_paths(
+        paths, bytes,
+    )))
 }
 
-fn push_guarded_path_copy(
-    paths: &mut ExactVec<GuardedPath>,
+fn push_guarded_path_copy<'context>(
+    paths: &mut AccountedExactVec<'context, GuardedPath>,
     path: &GuardedPath,
-    context: &mut GuardedExpansionContext<'_>,
+    context: &mut GuardedExpansionContext<'context>,
 ) -> Result<(), BuildError> {
     let mut symbols = context.allocate(
         path.symbols.len(),
         "guarded finite optional skipped symbols",
     )?;
-    push_guarded_symbols(&mut symbols, &path.symbols)?;
-    paths
-        .try_push(GuardedPath { symbols })
-        .map_err(|_| BuildError::InternalInvariant("exact optional paths capacity changed"))?;
+    push_guarded_symbols(&mut symbols, &path.symbols, context)?;
+    context.push(
+        paths,
+        GuardedPath {
+            symbols: symbols.into_inner_kept(),
+        },
+        true,
+    )?;
     Ok(())
 }
 
-fn push_guarded_path_concat(
-    paths: &mut ExactVec<GuardedPath>,
+fn push_guarded_path_concat<'context>(
+    paths: &mut AccountedExactVec<'context, GuardedPath>,
     prefix: &GuardedPath,
     suffix: &GuardedPath,
-    context: &mut GuardedExpansionContext<'_>,
+    context: &mut GuardedExpansionContext<'context>,
 ) -> Result<(), BuildError> {
     let symbol_count = prefix
         .symbols
@@ -2181,24 +3273,31 @@ fn push_guarded_path_concat(
         .checked_add(suffix.symbols.len())
         .ok_or(BuildError::PlannerWorkLimit {
             needed: u64::MAX,
-            limit: context.work_limit,
+            limit: context.attempt.work_limit,
         })?;
     let mut symbols =
         context.allocate(symbol_count, "guarded finite optional continued symbols")?;
-    push_guarded_symbols(&mut symbols, &prefix.symbols)?;
-    push_guarded_symbols(&mut symbols, &suffix.symbols)?;
-    paths
-        .try_push(GuardedPath { symbols })
-        .map_err(|_| BuildError::InternalInvariant("exact optional paths capacity changed"))?;
+    push_guarded_symbols(&mut symbols, &prefix.symbols, context)?;
+    push_guarded_symbols(&mut symbols, &suffix.symbols, context)?;
+    context.push(
+        paths,
+        GuardedPath {
+            symbols: symbols.into_inner_kept(),
+        },
+        true,
+    )?;
     Ok(())
 }
 
-fn repeat_guarded_exact(
-    sub: &GuardedLanguage,
+fn repeat_guarded_exact<'context>(
+    sub: &GuardedLanguage<'context>,
     count: u32,
-    context: &mut GuardedExpansionContext<'_>,
-) -> Result<GuardedExpansion, BuildError> {
-    let mut output = match guarded_singleton(ExactVec::default(), context)? {
+    context: &mut GuardedExpansionContext<'context>,
+) -> Result<GuardedExpansion<'context>, BuildError> {
+    let mut output = match guarded_singleton(
+        AccountedExactVec::empty(context.attempt, FiniteStorage::Scratch),
+        context,
+    )? {
         GuardedExpansion::Fits(language) => language,
         other => return Ok(other),
     };
@@ -2220,21 +3319,14 @@ fn analyze(
     hir: &Hir,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
+    context: &FiniteExtractionContext,
 ) -> Result<Analysis, BuildError> {
-    let mut tasks = Vec::new();
-    reserve_planner(
-        &mut tasks,
-        1,
-        work,
-        work_limit,
-        "finite-language analysis tasks",
-    )?;
-    tasks.push(Task::Visit(hir));
-    let mut values = Vec::new();
+    let mut tasks = AccountedVec::new(context, FiniteStorage::Scratch);
+    tasks.reserve_planner(1, "finite-language analysis tasks")?;
+    tasks.push_reserved(Task::Visit(hir))?;
+    let mut values = AccountedVec::new(context, FiniteStorage::Scratch);
     while let Some(task) = tasks.pop() {
-        charge_planner(work, 1, work_limit)?;
+        context.charge(1)?;
         match task {
             Task::Visit(node) => {
                 let analysis = match node.kind() {
@@ -2244,12 +3336,7 @@ fn analyze(
                     }
                     HirKind::Class(Class::Bytes(class)) => {
                         let Some(count) = byte_class_count(class) else {
-                            push_analysis(
-                                &mut values,
-                                Analysis::TooLargeFixedSequence,
-                                work,
-                                work_limit,
-                            )?;
+                            push_analysis(&mut values, Analysis::TooLargeFixedSequence)?;
                             continue;
                         };
                         bounded_shape(Shape::leaf(count, count), max_words, max_bytes)
@@ -2257,28 +3344,17 @@ fn analyze(
                     HirKind::Class(Class::Unicode(class)) => {
                         let Some((words, bytes)) = unicode_class_count(class, max_words, max_bytes)
                         else {
-                            push_analysis(
-                                &mut values,
-                                Analysis::TooLargeFixedSequence,
-                                work,
-                                work_limit,
-                            )?;
+                            push_analysis(&mut values, Analysis::TooLargeFixedSequence)?;
                             continue;
                         };
                         bounded_shape(Shape::leaf(words, bytes), max_words, max_bytes)
                     }
                     HirKind::Capture(capture) => {
-                        push_visit(&mut tasks, &capture.sub, work, work_limit)?;
+                        push_visit(&mut tasks, &capture.sub)?;
                         continue;
                     }
                     HirKind::Concat(children) => {
-                        push_children(
-                            &mut tasks,
-                            children,
-                            Task::FinishConcat(children.len()),
-                            work,
-                            work_limit,
-                        )?;
+                        push_children(&mut tasks, children, Task::FinishConcat(children.len()))?;
                         continue;
                     }
                     HirKind::Alternation(children) => {
@@ -2286,24 +3362,22 @@ fn analyze(
                             &mut tasks,
                             children,
                             Task::FinishAlternation(children.len()),
-                            work,
-                            work_limit,
                         )?;
                         continue;
                     }
                     HirKind::Look(_) | HirKind::Repetition(_) => Analysis::Unsupported,
                 };
-                push_analysis(&mut values, analysis, work, work_limit)?;
+                push_analysis(&mut values, analysis)?;
             }
             Task::FinishConcat(count) | Task::FinishAlternation(count) => {
-                let children = pop_analyses(&mut values, count, work, work_limit)?;
+                let children = pop_analyses(&mut values, count, context)?;
                 let analysis = combine_analysis(
                     &children,
                     matches!(task, Task::FinishConcat(_)),
                     max_words,
                     max_bytes,
                 );
-                push_analysis(&mut values, analysis, work, work_limit)?;
+                push_analysis(&mut values, analysis)?;
             }
         }
     }
@@ -2375,41 +3449,31 @@ const fn bounded_shape(shape: Shape, max_words: usize, max_bytes: usize) -> Anal
 }
 
 fn push_analysis(
-    values: &mut Vec<Analysis>,
+    values: &mut AccountedVec<'_, Analysis>,
     analysis: Analysis,
-    work: &mut u64,
-    limit: u64,
 ) -> Result<(), BuildError> {
-    reserve_planner(values, 1, work, limit, "finite-language analysis values")?;
-    values.push(analysis);
-    Ok(())
+    values.reserve_planner(1, "finite-language analysis values")?;
+    values.push_reserved(analysis)
 }
 
-fn pop_analyses(
-    values: &mut Vec<Analysis>,
+fn pop_analyses<'context>(
+    values: &mut AccountedVec<'context, Analysis>,
     count: usize,
-    work: &mut u64,
-    limit: u64,
-) -> Result<Vec<Analysis>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<AccountedVec<'context, Analysis>, BuildError> {
     if values.len() < count {
         return Err(BuildError::InternalInvariant(
             "finite-language analysis value stack underflow",
         ));
     }
-    let mut children = Vec::new();
-    reserve_planner(
-        &mut children,
-        count,
-        work,
-        limit,
-        "finite-language analysis children",
-    )?;
+    let mut children = AccountedVec::new(context, FiniteStorage::Scratch);
+    children.reserve_planner(count, "finite-language analysis children")?;
     for _ in 0..count {
-        children.push(values.pop().ok_or(BuildError::InternalInvariant(
+        children.push_reserved(values.pop().ok_or(BuildError::InternalInvariant(
             "finite-language analysis disposition disappeared",
-        ))?);
+        ))?)?;
     }
-    charge_planner(work, u64::try_from(count).unwrap_or(u64::MAX), limit)?;
+    context.charge(u64::try_from(count).unwrap_or(u64::MAX))?;
     children.reverse();
     Ok(children)
 }
@@ -2499,32 +3563,25 @@ fn analysis_shape_with_evaluation_peak(
     })
 }
 
-fn unicode_class(
+fn unicode_class<'context>(
     class: &regex_syntax::hir::ClassUnicode,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
-) -> Result<Option<Language>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<Option<Language<'context>>, BuildError> {
     let count = class.ranges().iter().try_fold(0_usize, |count, range| {
         count
             .checked_add(range.len())
             .ok_or(BuildError::PlannerWorkLimit {
                 needed: u64::MAX,
-                limit: work_limit,
+                limit: context.work_limit,
             })
     })?;
     if count > max_words {
         return Ok(None);
     }
-    let mut words = Vec::new();
-    reserve_planner(
-        &mut words,
-        count,
-        work,
-        work_limit,
-        "finite-language Unicode-class words",
-    )?;
+    let mut language = Language::empty(context, 0);
+    language.reserve_words(count, "finite-language Unicode-class words")?;
     let mut bytes = 0_usize;
     for range in class.ranges() {
         for scalar in range.start()..=range.end() {
@@ -2534,153 +3591,117 @@ fn unicode_class(
                 Some(bytes) if bytes <= max_bytes => bytes,
                 _ => return Ok(None),
             };
-            let mut word = Vec::new();
-            reserve_planner(
-                &mut word,
-                encoded.len(),
-                work,
-                work_limit,
-                "finite-language Unicode scalar bytes",
-            )?;
-            word.extend_from_slice(encoded);
-            words.push(word);
+            let mut word = AccountedVec::new(context, FiniteStorage::Persistent);
+            word.reserve_planner(encoded.len(), "finite-language Unicode scalar bytes")?;
+            word.extend_reserved(encoded.iter().copied(), encoded.len())?;
+            language.push_word(word)?;
         }
     }
-    Ok(Some(Language { words, bytes }))
+    language.bytes = bytes;
+    Ok(Some(language))
 }
 
-fn byte_class(
+fn byte_class<'context>(
     class: &regex_syntax::hir::ClassBytes,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    work_limit: u64,
-) -> Result<Option<Language>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<Option<Language<'context>>, BuildError> {
     let count = class.ranges().iter().try_fold(0_usize, |count, range| {
         count
             .checked_add(range.len())
             .ok_or(BuildError::PlannerWorkLimit {
                 needed: u64::MAX,
-                limit: work_limit,
+                limit: context.work_limit,
             })
     })?;
     if count > max_words || count > max_bytes {
         return Ok(None);
     }
-    let mut words = Vec::new();
-    reserve_planner(
-        &mut words,
-        count,
-        work,
-        work_limit,
-        "finite-language byte-class words",
-    )?;
+    let mut language = Language::empty(context, count);
+    language.reserve_words(count, "finite-language byte-class words")?;
     for range in class.ranges() {
         for byte in range.start()..=range.end() {
-            let mut word = Vec::new();
-            reserve_planner(
-                &mut word,
-                1,
-                work,
-                work_limit,
-                "finite-language byte-class byte",
-            )?;
-            word.push(byte);
-            words.push(word);
+            let mut word = AccountedVec::new(context, FiniteStorage::Persistent);
+            word.reserve_planner(1, "finite-language byte-class byte")?;
+            word.push_reserved(byte)?;
+            language.push_word(word)?;
         }
     }
-    Ok(Some(Language {
-        words,
-        bytes: count,
-    }))
+    Ok(Some(language))
 }
 
-fn push_visit<'a>(
-    tasks: &mut Vec<Task<'a>>,
-    node: &'a Hir,
-    work: &mut u64,
-    limit: u64,
+fn push_visit<'hir>(
+    tasks: &mut AccountedVec<'_, Task<'hir>>,
+    node: &'hir Hir,
 ) -> Result<(), BuildError> {
-    reserve_planner(tasks, 1, work, limit, "finite-language task stack")?;
-    tasks.push(Task::Visit(node));
-    Ok(())
+    tasks.reserve_planner(1, "finite-language task stack")?;
+    tasks.push_reserved(Task::Visit(node))
 }
 
-fn push_children<'a>(
-    tasks: &mut Vec<Task<'a>>,
-    children: &'a [Hir],
-    finish: Task<'a>,
-    work: &mut u64,
-    limit: u64,
+fn push_children<'hir>(
+    tasks: &mut AccountedVec<'_, Task<'hir>>,
+    children: &'hir [Hir],
+    finish: Task<'hir>,
 ) -> Result<(), BuildError> {
     let additional = children
         .len()
         .checked_add(1)
         .ok_or(BuildError::PlannerWorkLimit {
             needed: u64::MAX,
-            limit,
+            limit: tasks.context.work_limit,
         })?;
-    reserve_planner(tasks, additional, work, limit, "finite-language task stack")?;
-    tasks.push(finish);
-    tasks.extend(children.iter().rev().map(Task::Visit));
-    Ok(())
+    tasks.reserve_planner(additional, "finite-language task stack")?;
+    tasks.push_reserved(finish)?;
+    tasks.extend_reserved(children.iter().rev().map(Task::Visit), children.len())
 }
 
-fn push_language(
-    values: &mut Vec<Language>,
-    language: Language,
-    work: &mut u64,
-    limit: u64,
+fn push_language<'context>(
+    values: &mut AccountedVec<'context, Language<'context>>,
+    language: Language<'context>,
 ) -> Result<(), BuildError> {
-    reserve_planner(values, 1, work, limit, "finite-language value stack")?;
-    values.push(language);
-    Ok(())
+    values.reserve_planner(1, "finite-language value stack")?;
+    values.push_reserved(language)
 }
 
-fn singleton_language(word: Vec<u8>, work: &mut u64, limit: u64) -> Result<Language, BuildError> {
+fn singleton_language<'context>(
+    word: AccountedVec<'context, u8>,
+    context: &'context FiniteExtractionContext,
+) -> Result<Language<'context>, BuildError> {
     let bytes = word.len();
-    let mut words = Vec::new();
-    reserve_planner(&mut words, 1, work, limit, "finite-language singleton word")?;
-    words.push(word);
-    Ok(Language { words, bytes })
+    let mut language = Language::empty(context, bytes);
+    language.reserve_words(1, "finite-language singleton word")?;
+    language.push_word(word)?;
+    Ok(language)
 }
 
-fn pop_languages(
-    values: &mut Vec<Language>,
+fn pop_languages<'context>(
+    values: &mut AccountedVec<'context, Language<'context>>,
     count: usize,
-    work: &mut u64,
-    limit: u64,
-) -> Result<Vec<Language>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<AccountedVec<'context, Language<'context>>, BuildError> {
     if values.len() < count {
         return Err(BuildError::InternalInvariant(
             "finite-language value stack underflow",
         ));
     }
-    let mut children = Vec::new();
-    reserve_planner(
-        &mut children,
-        count,
-        work,
-        limit,
-        "finite-language child values",
-    )?;
+    let mut children = AccountedVec::new(context, FiniteStorage::Scratch);
+    children.reserve_planner(count, "finite-language child values")?;
     for _ in 0..count {
-        children.push(values.pop().ok_or(BuildError::InternalInvariant(
+        children.push_reserved(values.pop().ok_or(BuildError::InternalInvariant(
             "finite-language value disappeared while popping children",
-        ))?);
+        ))?)?;
     }
-    charge_planner(work, u64::try_from(count).unwrap_or(u64::MAX), limit)?;
-    children.reverse();
+    context.charge(u64::try_from(count).unwrap_or(u64::MAX))?;
     Ok(children)
 }
 
-fn alternate_languages(
-    children: Vec<Language>,
+fn alternate_languages<'context>(
+    mut children: AccountedVec<'context, Language<'context>>,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    limit: u64,
-) -> Result<Option<Language>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<Option<Language<'context>>, BuildError> {
     let mut word_count = 0_usize;
     let mut byte_count = 0_usize;
     for child in &children {
@@ -2696,34 +3717,26 @@ fn alternate_languages(
     if word_count > max_words || byte_count > max_bytes {
         return Ok(None);
     }
-    let mut words = Vec::new();
-    reserve_planner(
-        &mut words,
-        word_count,
-        work,
-        limit,
-        "finite-language alternation words",
-    )?;
-    for mut child in children {
-        words.append(&mut child.words);
+    let mut language = Language::empty(context, byte_count);
+    language.reserve_words(word_count, "finite-language alternation words")?;
+    while let Some(mut child) = children.pop() {
+        language.append_words(&mut child)?;
     }
-    Ok(Some(Language {
-        words,
-        bytes: byte_count,
-    }))
+    Ok(Some(language))
 }
 
-fn concat_languages(
-    children: Vec<Language>,
+fn concat_languages<'context>(
+    mut children: AccountedVec<'context, Language<'context>>,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    limit: u64,
-) -> Result<Option<Language>, BuildError> {
-    let mut accumulator = singleton_language(Vec::new(), work, limit)?;
-    for child in children {
-        let Some(next) = concat_pair(&accumulator, &child, max_words, max_bytes, work, limit)?
-        else {
+    context: &'context FiniteExtractionContext,
+) -> Result<Option<Language<'context>>, BuildError> {
+    let mut accumulator = singleton_language(
+        AccountedVec::new(context, FiniteStorage::Persistent),
+        context,
+    )?;
+    while let Some(child) = children.pop() {
+        let Some(next) = concat_pair(&accumulator, &child, max_words, max_bytes, context)? else {
             return Ok(None);
         };
         accumulator = next;
@@ -2731,14 +3744,13 @@ fn concat_languages(
     Ok(Some(accumulator))
 }
 
-fn concat_pair(
-    left: &Language,
-    right: &Language,
+fn concat_pair<'context>(
+    left: &Language<'context>,
+    right: &Language<'context>,
     max_words: usize,
     max_bytes: usize,
-    work: &mut u64,
-    limit: u64,
-) -> Result<Option<Language>, BuildError> {
+    context: &'context FiniteExtractionContext,
+) -> Result<Option<Language<'context>>, BuildError> {
     let Some(word_count) = left.words.len().checked_mul(right.words.len()) else {
         return Ok(None);
     };
@@ -2754,39 +3766,24 @@ fn concat_pair(
     if word_count > max_words || byte_count > max_bytes {
         return Ok(None);
     }
-    let mut words = Vec::new();
-    reserve_planner(
-        &mut words,
-        word_count,
-        work,
-        limit,
-        "finite-language concatenation words",
-    )?;
+    let mut language = Language::empty(context, byte_count);
+    language.reserve_words(word_count, "finite-language concatenation words")?;
     for left_word in &left.words {
         for right_word in &right.words {
             let length = left_word.len().checked_add(right_word.len()).ok_or(
                 BuildError::PlannerWorkLimit {
                     needed: u64::MAX,
-                    limit,
+                    limit: context.work_limit,
                 },
             )?;
-            let mut word = Vec::new();
-            reserve_planner(
-                &mut word,
-                length,
-                work,
-                limit,
-                "finite-language concatenated bytes",
-            )?;
-            word.extend_from_slice(left_word);
-            word.extend_from_slice(right_word);
-            words.push(word);
+            let mut word = AccountedVec::new(context, FiniteStorage::Persistent);
+            word.reserve_planner(length, "finite-language concatenated bytes")?;
+            word.extend_reserved(left_word.iter().copied(), left_word.len())?;
+            word.extend_reserved(right_word.iter().copied(), right_word.len())?;
+            language.push_word(word)?;
         }
     }
-    Ok(Some(Language {
-        words,
-        bytes: byte_count,
-    }))
+    Ok(Some(language))
 }
 
 #[cfg(test)]
@@ -2795,7 +3792,7 @@ mod tests {
 
     use super::{
         BuildError, FiniteOutcome, Guard, GuardedDictionary, GuardedFiniteBuildError,
-        GuardedFiniteBuildLimits, GuardedFiniteBuildResource,
+        GuardedFiniteBuildLimits, GuardedFiniteBuildResource, guarded_allocated_bytes,
     };
     use crate::guarded_ascii_word::{
         BuildErrorKind as GuardedBuildErrorKind, BuildLimits as GuardedBuildLimits,
@@ -2846,8 +3843,10 @@ mod tests {
     fn guarded(pattern: &str, max_words: usize, max_bytes: usize) -> (GuardedDictionary, u64) {
         match extract(&parse(pattern), max_words, max_bytes, 0, u64::MAX, true) {
             FiniteOutcome::GuardedFiniteBody {
-                dictionary, work, ..
-            } => (dictionary, work),
+                dictionary,
+                receipt,
+                ..
+            } => (dictionary, receipt.actual.work),
             other => panic!("expected guarded finite body, work={}", other.work()),
         }
     }
@@ -3001,32 +4000,34 @@ mod tests {
     #[test]
     fn outcomes_are_typed_and_guarded_work_never_resets() {
         let plain = parse("a|bb");
-        let FiniteOutcome::Fits { words, work } = extract(&plain, 16, 16, 7, u64::MAX, false)
+        let FiniteOutcome::Fits { words, receipt } = extract(&plain, 16, 16, 7, u64::MAX, false)
         else {
             panic!("ordinary finite language should fit");
         };
+        let work = receipt.actual.work;
         assert_eq!(words, [b"a".to_vec(), b"bb".to_vec()]);
         assert!(work > 7);
         assert!(matches!(
             extract(&plain, 1, 16, 7, u64::MAX, false),
-            FiniteOutcome::TooLargeFixedSequence { work } if work > 7
+            FiniteOutcome::TooLargeFixedSequence { receipt } if receipt.actual.work > 7
         ));
 
         let guarded_hir = parse(r"\b(a(?:s|sync)|Self)\b");
-        let FiniteOutcome::Unsupported {
-            work: incumbent_work,
-        } = extract(&guarded_hir, 16, 128, 0, u64::MAX, false)
+        let FiniteOutcome::Unsupported { receipt } =
+            extract(&guarded_hir, 16, 128, 0, u64::MAX, false)
         else {
             panic!("incumbent finite callers must not derive U5 eagerly");
         };
+        let incumbent_work = receipt.actual.work;
         let FiniteOutcome::GuardedFiniteBody {
             dictionary,
             accounting,
-            work: baseline_work,
+            receipt,
         } = extract(&guarded_hir, 16, 128, 0, u64::MAX, true)
         else {
             panic!("guarded baseline should fit");
         };
+        let baseline_work = receipt.actual.work;
         assert!(baseline_work > incumbent_work);
         assert!(accounting.is_consistent(&dictionary));
         assert!(accounting.source.expansion_allocations_actual > 0);
@@ -3063,19 +4064,276 @@ mod tests {
         let exact_limit = expected_actual.checked_add(prospective_slack).unwrap();
         assert!(matches!(
             extract(&guarded_hir, 16, 128, initial, exact_limit, true),
-            FiniteOutcome::GuardedFiniteBody { work, .. } if work == expected_actual
+            FiniteOutcome::GuardedFiniteBody { receipt, .. }
+                if receipt.actual.work == expected_actual
         ));
         let one_below = exact_limit.checked_sub(1).unwrap();
         assert!(matches!(
             extract(&guarded_hir, 16, 128, initial, one_below, true),
             FiniteOutcome::ResourceFailure {
                 error: BuildError::PlannerWorkLimit { limit, .. },
-                work,
-            } if limit == one_below && work >= initial && work <= one_below
+                receipt,
+            } if limit == one_below
+                && receipt.actual.work >= initial
+                && receipt.actual.work <= one_below
         ));
     }
 
     #[test]
+    fn finite_attempt_receipts_close_success_refusals_and_legacy_projection() {
+        let hir = parse("a|bb");
+        let success = extract(&hir, 16, 16, 7, u64::MAX, false);
+        assert!(success.has_closed_receipt());
+        assert!(success.receipt().is_closed());
+        assert_eq!(
+            success.receipt().terminal(),
+            super::FiniteExtractionTerminal::Fits
+        );
+        let actual = success.receipt().actual();
+        assert!(actual.work > 7);
+        assert!(actual.local.allocations > 0);
+        assert!(actual.local.allocated_bytes > 0);
+        assert!(actual.local.initialized_bytes > 0);
+        assert_eq!(actual.local.live_scratch_bytes, 0);
+        assert!(actual.local.live_persistent_bytes > 0);
+        assert!(actual.local.high_water_bytes >= actual.local.live_persistent_bytes);
+
+        let (legacy_words, legacy_work) = extract(&hir, 16, 16, 7, u64::MAX, false)
+            .into_incumbent_words()
+            .unwrap();
+        assert_eq!(legacy_words.unwrap(), [b"a".to_vec(), b"bb".to_vec()]);
+        assert_eq!(legacy_work, actual.work);
+
+        let unsupported = extract(&parse("a*"), 16, 16, 0, u64::MAX, false);
+        assert!(matches!(unsupported, FiniteOutcome::Unsupported { .. }));
+        assert!(unsupported.has_closed_receipt());
+        assert_eq!(
+            unsupported.receipt().terminal(),
+            super::FiniteExtractionTerminal::Unsupported
+        );
+        let unsupported_actual = unsupported.receipt().actual();
+        assert!(unsupported_actual.work > 0);
+        assert_eq!(unsupported_actual.local.live_persistent_bytes, 0);
+        assert_eq!(unsupported_actual.local.live_scratch_bytes, 0);
+        assert!(unsupported_actual.local.released_scratch_bytes > 0);
+
+        let too_large = extract(&hir, 1, 16, 0, u64::MAX, false);
+        assert!(matches!(
+            too_large,
+            FiniteOutcome::TooLargeFixedSequence { .. }
+        ));
+        assert!(too_large.has_closed_receipt());
+        assert_eq!(
+            too_large.receipt().terminal(),
+            super::FiniteExtractionTerminal::TooLargeFixedSequence
+        );
+        assert_eq!(too_large.receipt().actual().local.live_persistent_bytes, 0);
+    }
+
+    #[test]
+    fn finite_attempt_retains_partial_work_and_allocations_on_failure() {
+        let hir = parse("(ab|cd)(ef|gh)");
+        let baseline = extract(&hir, 32, 256, 0, u64::MAX, false);
+        assert!(baseline.has_closed_receipt());
+        let exact_work = baseline.work();
+        let one_below = exact_work.checked_sub(1).unwrap();
+        let refused = extract(&hir, 32, 256, 0, one_below, false);
+        assert!(matches!(refused, FiniteOutcome::ResourceFailure { .. }));
+        assert!(refused.has_closed_receipt());
+        let actual = refused.receipt().actual();
+        assert!(actual.work <= one_below);
+        assert!(actual.work > 0);
+        assert!(actual.local.allocations > 0);
+        assert!(actual.local.initialized_bytes > 0);
+        assert_eq!(actual.local.live_persistent_bytes, 0);
+        assert_eq!(actual.local.live_scratch_bytes, 0);
+
+        let before_first_effect = extract(&hir, 32, 256, 0, 0, false);
+        assert!(matches!(
+            before_first_effect,
+            FiniteOutcome::ResourceFailure {
+                error: BuildError::PlannerWorkLimit { .. },
+                ..
+            }
+        ));
+        assert!(before_first_effect.has_closed_receipt());
+        let actual = before_first_effect.receipt().actual();
+        assert_eq!(actual.work, 0);
+        assert_eq!(actual.local.allocations, 0);
+        assert_eq!(actual.local.allocated_bytes, 0);
+        assert_eq!(actual.local.initialized_bytes, 0);
+
+        let already_over_limit = extract(&hir, 32, 256, 2, 1, false);
+        assert!(already_over_limit.has_closed_receipt());
+        assert_eq!(already_over_limit.work(), 2);
+        let projected = already_over_limit.into_incumbent_words();
+        assert!(
+            matches!(
+                projected,
+                Err(BuildError::PlannerWorkLimit {
+                    needed: 2,
+                    limit: 1
+                })
+            ),
+            "projected={projected:?}"
+        );
+    }
+
+    #[test]
+    fn finite_allocation_failure_closes_with_observed_partial_actual() {
+        let context = super::FiniteExtractionContext::new(0, u64::MAX);
+        let mut values = super::AccountedVec::new(&context, super::FiniteStorage::Scratch);
+        values
+            .reserve_planner(1, "finite allocation-failure fixture")
+            .unwrap();
+        values.push_reserved(17_u64).unwrap();
+        let impossible = usize::try_from(isize::MAX)
+            .unwrap()
+            .checked_div(core::mem::size_of::<u64>())
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        let error = values
+            .reserve_planner(impossible, "finite allocation-failure fixture")
+            .unwrap_err();
+        assert!(matches!(error, BuildError::AllocationFailed { .. }));
+        drop(values);
+        let outcome = FiniteOutcome::ResourceFailure {
+            error,
+            receipt: context.close(super::FiniteExtractionTerminal::ResourceFailure),
+        };
+        assert!(outcome.has_closed_receipt());
+        let actual = outcome.receipt().actual();
+        assert_eq!(actual.local.allocations, 1);
+        assert_eq!(actual.local.reallocations, 0);
+        assert!(actual.local.allocated_bytes >= core::mem::size_of::<u64>());
+        assert_eq!(actual.local.initialized_bytes, core::mem::size_of::<u64>());
+        assert_eq!(actual.local.live_scratch_bytes, 0);
+        assert_eq!(
+            actual.local.released_scratch_bytes,
+            actual.local.allocated_bytes
+        );
+    }
+
+    #[test]
+    fn guarded_dictionary_receipt_stays_nested_and_captures_co_live_peak() {
+        let outcome = extract(
+            &parse(r"\b(a(?:s|sync)|Self)\b"),
+            16,
+            128,
+            0,
+            u64::MAX,
+            true,
+        );
+        assert!(outcome.has_closed_receipt());
+        let FiniteOutcome::GuardedFiniteBody {
+            dictionary,
+            accounting: finite_accounting,
+            receipt,
+            ..
+        } = &outcome
+        else {
+            panic!("guarded finite extraction should publish");
+        };
+        let nested = dictionary.build_accounting();
+        let super::FiniteExtractionGuardedEvidence::Succeeded {
+            accounting,
+            co_live_local_scratch_bytes,
+            retained,
+        } = receipt.actual().guarded.unwrap()
+        else {
+            panic!("guarded dictionary evidence must remain nested");
+        };
+        assert_eq!(Some(accounting), nested.published());
+        assert!(retained);
+        assert_eq!(
+            co_live_local_scratch_bytes,
+            finite_accounting.source.storage_bytes
+        );
+        let actual = receipt.actual();
+        let nested_actual = accounting.actual().unwrap();
+        assert!(nested_actual.allocations > 0);
+        assert!(nested_actual.persistent_bytes > 0);
+        let nested_co_live = co_live_local_scratch_bytes
+            .checked_add(nested_actual.peak_bytes)
+            .unwrap();
+        assert!(nested_co_live > co_live_local_scratch_bytes);
+        assert!(actual.local.high_water_bytes > 0);
+        let boundary = receipt.boundary_actual().unwrap();
+        assert_eq!(boundary.work, receipt.actual().work);
+        assert_eq!(
+            boundary.allocations,
+            actual.local.allocations + nested_actual.allocations
+        );
+        assert_eq!(
+            boundary.allocated_bytes,
+            actual.local.allocated_bytes + guarded_allocated_bytes(nested_actual).unwrap()
+        );
+        assert_eq!(
+            boundary.copied_bytes,
+            actual.local.copied_bytes + nested_actual.byte_copies
+        );
+        assert_eq!(
+            boundary.initialized_bytes,
+            actual.local.initialized_bytes
+                + nested_actual.initialized_bytes
+                + core::mem::size_of::<GuardedDictionary>()
+        );
+        assert_eq!(
+            boundary.live_persistent_bytes,
+            nested_actual.persistent_bytes
+        );
+        assert_eq!(
+            boundary.high_water_bytes,
+            actual.local.high_water_bytes.max(nested_co_live)
+        );
+        assert_eq!(boundary.abandonable_bytes, 0);
+    }
+
+    #[test]
+    fn finite_receipt_mutations_break_closure() {
+        let hir = parse("a|bb");
+        let FiniteOutcome::Fits { words, receipt } = extract(&hir, 16, 16, 0, u64::MAX, false)
+        else {
+            panic!("finite fixture should fit");
+        };
+
+        let mut bad = receipt;
+        bad.closed = false;
+        assert!(
+            !FiniteOutcome::Fits {
+                words: words.clone(),
+                receipt: bad,
+            }
+            .has_closed_receipt()
+        );
+
+        let mut bad = receipt;
+        bad.terminal = super::FiniteExtractionTerminal::Unsupported;
+        assert!(
+            !FiniteOutcome::Fits {
+                words: words.clone(),
+                receipt: bad,
+            }
+            .has_closed_receipt()
+        );
+
+        let mut bad = receipt;
+        bad.actual.local.allocated_bytes = bad.actual.local.allocated_bytes.checked_add(1).unwrap();
+        assert!(
+            !FiniteOutcome::Fits {
+                words,
+                receipt: bad,
+            }
+            .has_closed_receipt()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact/one-below matrix keeps every guarded construction cap and receipt closure adjacent"
+    )]
     fn guarded_build_caps_admit_exactly_and_refuse_one_below_before_expansion() {
         let hir = parse(r"\b(a(?:s|sync)|Self)\b");
         let FiniteOutcome::GuardedFiniteBody {
@@ -3108,15 +4366,43 @@ mod tests {
             max_scratch_bytes: scratch_bytes,
             max_peak_bytes: peak_bytes,
         };
-        assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, exact),
-            FiniteOutcome::GuardedFiniteBody { .. }
-        ));
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, exact);
+        assert!(outcome.has_closed_receipt());
+        assert!(matches!(outcome, FiniteOutcome::GuardedFiniteBody { .. }));
 
         let mut one_below = exact;
         one_below.dictionary.max_identity_bytes = prospective.identity_bytes - 1;
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below);
+        assert!(outcome.has_closed_receipt());
+        let failure_actual = match &outcome {
+            FiniteOutcome::GuardedResourceFailure {
+                error: GuardedFiniteBuildError::Dictionary(error),
+                ..
+            } => error.actual(),
+            _ => panic!("identity cap should retain a dictionary failure"),
+        };
+        let super::FiniteExtractionGuardedEvidence::Failed {
+            accounting,
+            co_live_local_scratch_bytes: _,
+        } = outcome.receipt().actual().guarded.unwrap()
+        else {
+            panic!("guarded failure must retain its native partial actual");
+        };
+        assert_eq!(accounting, failure_actual);
+        let boundary = outcome.receipt().boundary_actual().unwrap();
+        assert_eq!(
+            boundary.allocations,
+            outcome.receipt().actual().local.allocations + failure_actual.allocations
+        );
+        assert_eq!(boundary.live_persistent_bytes, 0);
+        assert_eq!(
+            boundary.abandonable_bytes,
+            outcome.receipt().actual().local.released_persistent_bytes
+                + outcome.receipt().actual().local.released_scratch_bytes
+                + guarded_allocated_bytes(failure_actual).unwrap()
+        );
         assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            outcome,
             FiniteOutcome::GuardedResourceFailure {
                 error: GuardedFiniteBuildError::Dictionary(error),
                 ..
@@ -3131,8 +4417,10 @@ mod tests {
 
         let mut one_below = exact;
         one_below.dictionary.max_build_work = prospective.build_work - 1;
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below);
+        assert!(outcome.has_closed_receipt());
         assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            outcome,
             FiniteOutcome::GuardedResourceFailure {
                 error: GuardedFiniteBuildError::Dictionary(error),
                 ..
@@ -3141,8 +4429,10 @@ mod tests {
 
         let mut one_below = exact;
         one_below.max_scratch_bytes = scratch_bytes - 1;
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below);
+        assert!(outcome.has_closed_receipt());
         assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            outcome,
             FiniteOutcome::GuardedResourceFailure {
                 error: GuardedFiniteBuildError::ConstructionLimit {
                     resource: GuardedFiniteBuildResource::ScratchBytes,
@@ -3154,8 +4444,10 @@ mod tests {
 
         let mut one_below = exact;
         one_below.dictionary.max_persistent_bytes = prospective.persistent_bytes - 1;
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below);
+        assert!(outcome.has_closed_receipt());
         assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            outcome,
             FiniteOutcome::GuardedResourceFailure {
                 error: GuardedFiniteBuildError::Dictionary(error),
                 ..
@@ -3170,8 +4462,10 @@ mod tests {
 
         let mut one_below = exact;
         one_below.max_peak_bytes = peak_bytes - 1;
+        let outcome = super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below);
+        assert!(outcome.has_closed_receipt());
         assert!(matches!(
-            super::extract(&hir, 16, 128, 0, u64::MAX, true, one_below),
+            outcome,
             FiniteOutcome::GuardedResourceFailure {
                 error: GuardedFiniteBuildError::ConstructionLimit {
                     resource: GuardedFiniteBuildResource::PeakBytes,
@@ -3212,13 +4506,117 @@ mod tests {
     }
 
     #[test]
+    fn fixed_predicate_attempt_receipts_close_success_refusal_and_partial_failure() {
+        let hir = parse_case_insensitive("Sherlock Holmes");
+        let successful =
+            super::inspect_fixed_predicate_word64_after_finite_refusal_attempt(&hir, 17, u64::MAX);
+        assert!(successful.has_closed_receipt());
+        let success_receipt = successful.receipt();
+        assert_eq!(success_receipt.initial_work(), 17);
+        assert_eq!(success_receipt.work_limit(), u64::MAX);
+        assert_eq!(
+            success_receipt.terminal(),
+            super::FixedPredicateInspectionTerminal::Succeeded
+        );
+        assert!(success_receipt.is_closed());
+        let success_actual = success_receipt.actual();
+        assert!(success_actual.work > 17);
+        assert!(success_actual.local.allocations > 0);
+        assert!(success_actual.local.reallocations > 0);
+        assert!(success_actual.local.allocated_bytes > 0);
+        assert!(success_actual.local.copied_bytes > 0);
+        assert!(success_actual.local.initialized_bytes >= success_actual.local.copied_bytes);
+        assert!(success_actual.local.high_water_bytes > 0);
+        assert_eq!(success_actual.local.live_persistent_bytes, 0);
+        assert_eq!(success_actual.local.live_scratch_bytes, 0);
+        assert!(matches!(
+            successful,
+            super::FixedPredicateInspectionAttempt::Succeeded { ref source, .. }
+                if source.width() == 15
+        ));
+
+        let legacy =
+            super::inspect_fixed_predicate_word64_after_finite_refusal(&hir, 17, u64::MAX).unwrap();
+        assert_eq!(legacy.work, success_actual.work);
+        assert_eq!(legacy.source.unwrap().width(), 15);
+
+        let refused_hir = parse("ab");
+        let refused = super::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+            &refused_hir,
+            3,
+            u64::MAX,
+        );
+        assert!(refused.has_closed_receipt());
+        assert!(matches!(
+            &refused,
+            super::FixedPredicateInspectionAttempt::Refused { .. }
+        ));
+        assert_eq!(
+            refused.receipt().terminal(),
+            super::FixedPredicateInspectionTerminal::Refused
+        );
+        assert_eq!(refused.receipt().initial_work(), 3);
+        assert!(refused.receipt().actual().work > 3);
+        assert_eq!(refused.receipt().actual().local.live_scratch_bytes, 0);
+
+        let one_below = success_actual.work.checked_sub(1).unwrap();
+        let failed =
+            super::inspect_fixed_predicate_word64_after_finite_refusal_attempt(&hir, 17, one_below);
+        assert!(failed.has_closed_receipt());
+        let failure_receipt = failed.receipt();
+        assert_eq!(
+            failure_receipt.terminal(),
+            super::FixedPredicateInspectionTerminal::ResourceFailure
+        );
+        let failure_actual = failure_receipt.actual();
+        assert!(failure_actual.work > 17);
+        assert!(failure_actual.work <= one_below);
+        assert!(failure_actual.local.allocations > 0);
+        assert!(failure_actual.local.reallocations > 0);
+        assert!(failure_actual.local.allocated_bytes > 0);
+        assert!(failure_actual.local.copied_bytes > 0);
+        assert!(failure_actual.local.initialized_bytes > 0);
+        assert!(failure_actual.local.high_water_bytes > 0);
+        assert_eq!(failure_actual.local.live_persistent_bytes, 0);
+        assert_eq!(failure_actual.local.live_scratch_bytes, 0);
+        assert!(matches!(
+            failed,
+            super::FixedPredicateInspectionAttempt::ResourceFailure {
+                error: BuildError::PlannerWorkLimit { needed, limit },
+                ..
+            } if needed == success_actual.work && limit == one_below
+        ));
+
+        let initially_over_limit =
+            super::inspect_fixed_predicate_word64_after_finite_refusal_attempt(&hir, 2, 1);
+        assert!(initially_over_limit.has_closed_receipt());
+        assert_eq!(initially_over_limit.receipt().initial_work(), 2);
+        assert_eq!(initially_over_limit.receipt().actual().work, 2);
+        assert_eq!(
+            initially_over_limit.receipt().actual().local,
+            super::FiniteExtractionLocalActual::default()
+        );
+        assert!(matches!(
+            initially_over_limit,
+            super::FixedPredicateInspectionAttempt::ResourceFailure {
+                error: BuildError::PlannerWorkLimit {
+                    needed: 2,
+                    limit: 1
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn typed_finite_refusal_can_continue_into_exact_inline_predicates() {
         let hir = parse_case_insensitive("Sherlock Holmes");
-        let FiniteOutcome::TooLargeFixedSequence { work: refusal_work } =
+        let FiniteOutcome::TooLargeFixedSequence { receipt } =
             extract(&hir, 4_096, usize::MAX, 17, u64::MAX, true)
         else {
             panic!("Sherlock closure should reach the typed finite refusal");
         };
+        let refusal_work = receipt.actual.work;
         let inspected = super::inspect_fixed_predicate_word64_after_finite_refusal(
             &hir,
             refusal_work,

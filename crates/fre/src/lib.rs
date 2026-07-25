@@ -26,6 +26,7 @@ use core::fmt;
 use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
+mod aggregate_construction;
 mod aggregate_many;
 mod blocking_delimiter;
 mod bounded_literal_pair;
@@ -59,6 +60,7 @@ pub use aggregate::{
     AggregateBoundedLiteralPairIdentity, AggregateBoundedSeparatedFieldsIdentity,
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
+    AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateConstructionRequest,
     AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateCountResult, AggregateDirectAttemptIdentity, AggregateDirectAttemptReceipt,
     AggregateDirectAttemptTerminal, AggregateDirectDeclaredFallback, AggregateDirectInvocation,
@@ -90,6 +92,19 @@ pub use aggregate::{
     AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateTokenPhraseIdentity,
     AggregateTokenPhraseSemantics, AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
     AggregateWordRunIdentity, AggregateWordRunSemantics,
+};
+pub use aggregate_construction::{
+    AGGREGATE_CONSTRUCTION_ACCOUNTING_VERSION, AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION,
+    AGGREGATE_CONSTRUCTION_LEDGER_CAPACITY, AggregateConstructionAbandonment,
+    AggregateConstructionActual, AggregateConstructionAttempt,
+    AggregateConstructionAttemptIdentity, AggregateConstructionAttemptReceipt,
+    AggregateConstructionDeclaredFallbackPolicy, AggregateConstructionEffect,
+    AggregateConstructionLedger, AggregateConstructionLedgerEntry,
+    AggregateConstructionPrepublicationFallback, AggregateConstructionProspective,
+    AggregateConstructionRequestInputs, AggregateConstructionRequestOwnerSeal,
+    AggregateConstructionSelectedPlanOwnerSeal, AggregateConstructionStage,
+    AggregateConstructionStageDisposition, AggregateConstructionStateError,
+    AggregateConstructionTerminal, AggregateConstructionTransition,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,

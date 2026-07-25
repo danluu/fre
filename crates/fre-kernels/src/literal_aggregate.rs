@@ -13,6 +13,8 @@ use core::{fmt, mem::size_of};
 
 use memchr::memmem::{Finder, FinderBuilder};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 /// Stable identity for the exact-literal whole-haystack strategy.
 pub const PLAN_ID: &str = "exact-literal-aggregate.memmem-find-iter.v1";
 /// Version of the exact-literal reduction algorithm.
@@ -1302,100 +1304,147 @@ impl LiteralAggregatePlan {
     /// Returns a typed arithmetic, allocation, or resource error without
     /// publishing a partial plan.
     pub fn build(needle: &[u8], limits: BuildLimits) -> Result<Self, BuildError> {
-        let needle_u64 =
-            u64::try_from(needle.len()).map_err(|_| BuildError::ArithmeticOverflow {
-                computation: "needle length as u64",
-            })?;
-        let work_upper_bound = needle_u64
-            .checked_add(1)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "build work upper bound",
-            })?;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(needle.len())
-                .ok_or(BuildError::ArithmeticOverflow {
+        Self::build_attempt(needle, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Copy and preprocess one exact byte literal with exact observed effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the literal attempt keeps legacy error precedence, observed reservation accounting, and publication in one transaction"
+    )]
+    pub fn build_attempt(
+        needle: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            let needle_u64 =
+                u64::try_from(needle.len()).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "needle length as u64",
+                })?;
+            let work_upper_bound =
+                needle_u64
+                    .checked_add(1)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "build work upper bound",
+                    })?;
+            let persistent_bytes = size_of::<Self>().checked_add(needle.len()).ok_or(
+                BuildError::ArithmeticOverflow {
                     computation: "persistent plan bytes",
-                })?;
+                },
+            )?;
 
-        if needle.len() > limits.max_needle_bytes {
-            return Err(BuildError::NeedleLimit {
-                needed: needle.len(),
-                limit: limits.max_needle_bytes,
-            });
-        }
-        if work_upper_bound > limits.max_build_work {
-            return Err(BuildError::WorkLimit {
-                needed: work_upper_bound,
-                limit: limits.max_build_work,
-            });
-        }
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
+            if needle.len() > limits.max_needle_bytes {
+                return Err(BuildError::NeedleLimit {
+                    needed: needle.len(),
+                    limit: limits.max_needle_bytes,
+                });
+            }
+            if work_upper_bound > limits.max_build_work {
+                return Err(BuildError::WorkLimit {
+                    needed: work_upper_bound,
+                    limit: limits.max_build_work,
+                });
+            }
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
 
-        let minimum_peak =
-            persistent_bytes
-                .checked_add(needle.len())
-                .ok_or(BuildError::ArithmeticOverflow {
+            let minimum_peak = persistent_bytes.checked_add(needle.len()).ok_or(
+                BuildError::ArithmeticOverflow {
                     computation: "minimum construction peak",
-                })?;
-        if needle.len() > limits.max_scratch_bytes {
-            return Err(BuildError::ScratchLimit {
-                needed: needle.len(),
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        if minimum_peak > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: minimum_peak,
-                limit: limits.max_peak_bytes,
-            });
-        }
+                },
+            )?;
+            if needle.len() > limits.max_scratch_bytes {
+                return Err(BuildError::ScratchLimit {
+                    needed: needle.len(),
+                    limit: limits.max_scratch_bytes,
+                });
+            }
+            if minimum_peak > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: minimum_peak,
+                    limit: limits.max_peak_bytes,
+                });
+            }
 
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(needle.len())
-            .map_err(|_| BuildError::AllocationFailed {
-                structure: "literal aggregate needle",
-                additional: needle.len(),
-            })?;
-        let temporary_capacity_bytes = owned.capacity();
-        let peak_bytes = persistent_bytes
-            .checked_add(temporary_capacity_bytes)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "actual construction peak",
-            })?;
-        if temporary_capacity_bytes > limits.max_scratch_bytes {
-            return Err(BuildError::ScratchLimit {
-                needed: temporary_capacity_bytes,
-                limit: limits.max_scratch_bytes,
-            });
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(needle.len())
+                .map_err(|_| BuildError::AllocationFailed {
+                    structure: "literal aggregate needle",
+                    additional: needle.len(),
+                })?;
+            let temporary_capacity_bytes = owned.capacity();
+            if temporary_capacity_bytes != 0 {
+                actual.allocations = 1;
+                actual.allocated_bytes = temporary_capacity_bytes;
+                actual.peak_bytes = temporary_capacity_bytes;
+            }
+            let peak_bytes = persistent_bytes
+                .checked_add(temporary_capacity_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual construction peak",
+                })?;
+            if temporary_capacity_bytes > limits.max_scratch_bytes {
+                return Err(BuildError::ScratchLimit {
+                    needed: temporary_capacity_bytes,
+                    limit: limits.max_scratch_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+            owned.extend_from_slice(needle);
+            actual.work = u64::try_from(owned.len())
+                .map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "actual literal copy work as u64",
+                })?
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual literal preprocessing work",
+                })?;
+            actual.copied_bytes = owned.len();
+            actual.initialized_bytes = owned.len();
+            let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
+            let build = BuildAccounting {
+                needle_bytes: needle.len(),
+                temporary_capacity_bytes,
+                work_upper_bound,
+                scratch_bytes: temporary_capacity_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            let plan = Self {
+                finder,
+                build,
+                plan_origin: PlanOrigin::unbound(),
+            };
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "published literal inline initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
         }
-        if peak_bytes > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
-        owned.extend_from_slice(needle);
-        let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
-        let build = BuildAccounting {
-            needle_bytes: needle.len(),
-            temporary_capacity_bytes,
-            work_upper_bound,
-            scratch_bytes: temporary_capacity_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            finder,
-            build,
-            plan_origin: PlanOrigin::unbound(),
-        })
     }
 
     /// Preprocessed exact byte literal.
@@ -2021,6 +2070,38 @@ mod tests {
 
     fn plan(needle: &[u8]) -> LiteralAggregatePlan {
         LiteralAggregatePlan::build(needle, BuildLimits::unlimited()).unwrap()
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_preflight_failure_effects() {
+        let needle = b"needle";
+        let attempt =
+            LiteralAggregatePlan::build_attempt(needle, BuildLimits::unlimited()).unwrap();
+        let actual = attempt.actual();
+        let (plan, repeated) = attempt.into_parts();
+        assert_eq!(actual, repeated);
+        let build = plan.build_accounting();
+        assert_eq!(actual.work, u64::try_from(needle.len()).unwrap() + 1);
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, build.temporary_capacity_bytes);
+        assert_eq!(actual.copied_bytes, needle.len());
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(
+            actual.peak_bytes,
+            build.temporary_capacity_bytes.max(build.persistent_bytes)
+        );
+
+        let failure = LiteralAggregatePlan::build_attempt(
+            needle,
+            BuildLimits {
+                max_build_work: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(failure.source(), BuildError::WorkLimit { .. }));
+        assert_eq!(failure.actual(), crate::DirectBuildAttemptActual::default());
     }
 
     fn initial_receipt(

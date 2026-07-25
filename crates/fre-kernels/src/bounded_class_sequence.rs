@@ -11,6 +11,8 @@
 
 use core::{fmt, mem::size_of};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "bounded-class-sequence-count.inline-byte-bitsets.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-class-sequence-count.count.v1";
 
@@ -286,19 +288,29 @@ struct ByteClass {
 }
 
 impl ByteClass {
-    fn from_ranges<I>(ranges: I, role: &'static str) -> Result<(Self, usize), BuildError>
+    fn from_ranges<I>(
+        ranges: I,
+        role: &'static str,
+        actual: &mut DirectBuildAttemptActual,
+    ) -> Result<(Self, usize), BuildError>
     where
         I: IntoIterator<Item = (u8, u8)>,
     {
         let mut class = Self::default();
+        charge_attempt_work(actual, class.words.len())?;
         let mut previous_end = None;
         let mut writes = 0_usize;
         for (start, end) in ranges {
+            charge_attempt_work(actual, 1)?;
+            charge_attempt_work(actual, 1)?;
             if start > end {
                 return Err(BuildError::ReversedRange { role, start, end });
             }
-            if previous_end.is_some_and(|previous| previous >= start) {
-                return Err(BuildError::NonCanonicalRanges { role });
+            if let Some(previous) = previous_end {
+                charge_attempt_work(actual, 1)?;
+                if previous >= start {
+                    return Err(BuildError::NonCanonicalRanges { role });
+                }
             }
             previous_end = Some(end);
             let first_word = usize::from(start) >> 6;
@@ -333,6 +345,7 @@ impl ByteClass {
                             computation: "bitmap last shift",
                         })?;
                 class.words[word_index] |= first_mask & last_mask;
+                charge_attempt_work(actual, 1)?;
                 writes = writes
                     .checked_add(1)
                     .ok_or(BuildError::ArithmeticOverflow {
@@ -349,12 +362,36 @@ impl ByteClass {
         self.words[word] & (1_u64 << bit) != 0
     }
 
-    fn overlaps(self, other: Self) -> bool {
-        self.words
-            .iter()
-            .zip(other.words)
-            .any(|(left, right)| left & right != 0)
+    fn overlaps(
+        self,
+        other: Self,
+        actual: &mut DirectBuildAttemptActual,
+    ) -> Result<bool, BuildError> {
+        for (left, right) in self.words.iter().zip(other.words) {
+            charge_attempt_work(actual, 1)?;
+            if left & right != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
+}
+
+fn charge_attempt_work(
+    actual: &mut DirectBuildAttemptActual,
+    amount: usize,
+) -> Result<(), BuildError> {
+    actual.work = actual
+        .work
+        .checked_add(
+            u64::try_from(amount).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "exact build work conversion",
+            })?,
+        )
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "exact build work",
+        })?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -385,102 +422,146 @@ impl BoundedClassSequencePlan {
         Body: ExactSizeIterator<Item = (u8, u8)> + Clone,
         Trail: ExactSizeIterator<Item = (u8, u8)> + Clone,
     {
-        enforce_build(BUILD_FIXED_WORK, limits.max_build_work, BuildResource::Work)?;
-        if minimum == 0 || maximum < minimum {
-            return Err(BuildError::InvalidRepeat { minimum, maximum });
-        }
-        if maximum > limits.max_repeat_bound {
-            return Err(BuildError::RepeatLimit {
-                needed: maximum,
-                limit: limits.max_repeat_bound,
-            });
-        }
-        let head_ranges = head.len();
-        let body_ranges = body.len();
-        let trail_ranges = trail.len();
-        for (role, count) in [
-            ("head", head_ranges),
-            ("body", body_ranges),
-            ("trail", trail_ranges),
-        ] {
-            if count == 0 {
-                return Err(BuildError::EmptyClass { role });
+        Self::build_attempt(head, body, trail, minimum, maximum, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps exact preflight and observed inline writes adjacent"
+    )]
+    pub fn build_attempt<Head, Body, Trail>(
+        head: Head,
+        body: Body,
+        trail: Trail,
+        minimum: u32,
+        maximum: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Head: ExactSizeIterator<Item = (u8, u8)> + Clone,
+        Body: ExactSizeIterator<Item = (u8, u8)> + Clone,
+        Trail: ExactSizeIterator<Item = (u8, u8)> + Clone,
+    {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            enforce_build(BUILD_FIXED_WORK, limits.max_build_work, BuildResource::Work)?;
+            if minimum == 0 || maximum < minimum {
+                return Err(BuildError::InvalidRepeat { minimum, maximum });
+            }
+            if maximum > limits.max_repeat_bound {
+                return Err(BuildError::RepeatLimit {
+                    needed: maximum,
+                    limit: limits.max_repeat_bound,
+                });
+            }
+            let head_ranges = head.len();
+            let body_ranges = body.len();
+            let trail_ranges = trail.len();
+            for (role, count) in [
+                ("head", head_ranges),
+                ("body", body_ranges),
+                ("trail", trail_ranges),
+            ] {
+                if count == 0 {
+                    return Err(BuildError::EmptyClass { role });
+                }
+            }
+            let source_ranges = head_ranges
+                .checked_add(body_ranges)
+                .and_then(|count| count.checked_add(trail_ranges))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "source range count",
+                })?;
+            enforce_build(
+                source_ranges,
+                limits.max_source_ranges,
+                BuildResource::Ranges,
+            )?;
+            let work_bound = source_ranges
+                .checked_mul(7)
+                .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "build work bound",
+                })?;
+            enforce_build(work_bound, limits.max_build_work, BuildResource::Work)?;
+            let validation_comparisons =
+                source_ranges
+                    .checked_mul(2)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "range validation comparison bound",
+                    })?;
+            let persistent_bytes = size_of::<Self>();
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(persistent_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+
+            // All range reads, comparisons, zero initialization, and possible
+            // bitmap writes were admitted above from exact iterator lengths.
+            charge_attempt_work(
+                &mut actual,
+                BUILD_FIXED_WORK - BITMAP_WORDS - OVERLAP_COMPARISONS,
+            )?;
+            let (head, head_writes) = ByteClass::from_ranges(head, "head", &mut actual)?;
+            let (body, body_writes) = ByteClass::from_ranges(body, "body", &mut actual)?;
+            let (trail, trail_writes) = ByteClass::from_ranges(trail, "trail", &mut actual)?;
+            if head.overlaps(body, &mut actual)?
+                || head.overlaps(trail, &mut actual)?
+                || body.overlaps(trail, &mut actual)?
+            {
+                return Err(BuildError::OverlappingClasses);
+            }
+            let bitmap_word_writes = head_writes
+                .checked_add(body_writes)
+                .and_then(|writes| writes.checked_add(trail_writes))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual bitmap word writes",
+                })?;
+            let build = BuildAccounting {
+                head_ranges,
+                body_ranges,
+                trail_ranges,
+                source_ranges,
+                minimum,
+                maximum,
+                range_inspections: source_ranges,
+                validation_comparisons,
+                bitmap_zero_writes: BITMAP_WORDS,
+                bitmap_word_writes,
+                overlap_comparisons: OVERLAP_COMPARISONS,
+                work_bound,
+                allocations: 0,
+                reserves: 0,
+                temporary_copies: 0,
+                scratch_bytes: 0,
+                persistent_bytes,
+                peak_bytes: persistent_bytes,
+            };
+            debug_assert!(actual.work <= u64::try_from(work_bound).unwrap_or(u64::MAX));
+            actual.initialized_bytes = persistent_bytes;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = persistent_bytes;
+            Ok(Self {
+                head,
+                body,
+                trail,
+                minimum,
+                maximum,
+                build,
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
             }
         }
-        let source_ranges = head_ranges
-            .checked_add(body_ranges)
-            .and_then(|count| count.checked_add(trail_ranges))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "source range count",
-            })?;
-        enforce_build(
-            source_ranges,
-            limits.max_source_ranges,
-            BuildResource::Ranges,
-        )?;
-        let work_bound = source_ranges
-            .checked_mul(7)
-            .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "build work bound",
-            })?;
-        enforce_build(work_bound, limits.max_build_work, BuildResource::Work)?;
-        let validation_comparisons =
-            source_ranges
-                .checked_mul(2)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "range validation comparison bound",
-                })?;
-        let persistent_bytes = size_of::<Self>();
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(persistent_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-
-        // All range reads, comparisons, zero initialization, and possible
-        // bitmap writes were admitted above from exact iterator lengths.
-        let (head, head_writes) = ByteClass::from_ranges(head, "head")?;
-        let (body, body_writes) = ByteClass::from_ranges(body, "body")?;
-        let (trail, trail_writes) = ByteClass::from_ranges(trail, "trail")?;
-        if head.overlaps(body) || head.overlaps(trail) || body.overlaps(trail) {
-            return Err(BuildError::OverlappingClasses);
-        }
-        let bitmap_word_writes = head_writes
-            .checked_add(body_writes)
-            .and_then(|writes| writes.checked_add(trail_writes))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "actual bitmap word writes",
-            })?;
-        let build = BuildAccounting {
-            head_ranges,
-            body_ranges,
-            trail_ranges,
-            source_ranges,
-            minimum,
-            maximum,
-            range_inspections: source_ranges,
-            validation_comparisons,
-            bitmap_zero_writes: BITMAP_WORDS,
-            bitmap_word_writes,
-            overlap_comparisons: OVERLAP_COMPARISONS,
-            work_bound,
-            allocations: 0,
-            reserves: 0,
-            temporary_copies: 0,
-            scratch_bytes: 0,
-            persistent_bytes,
-            peak_bytes: persistent_bytes,
-        };
-        Ok(Self {
-            head,
-            body,
-            trail,
-            minimum,
-            maximum,
-            build,
-        })
     }
 
     #[must_use]
@@ -1055,5 +1136,50 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let attempt = BoundedClassSequencePlan::build_attempt(
+            [(b'A', b'Z')].into_iter(),
+            [(b'a', b'z')].into_iter(),
+            [(b'0', b'9')].into_iter(),
+            2,
+            3,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        // Six fixed structural charges, three four-word zeroings, three
+        // range inspections/comparisons/writes, and twelve disjointness reads.
+        assert_eq!(actual.work, 39);
+        assert!(actual.work < u64::try_from(build.work_bound).unwrap());
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.allocated_bytes, 0);
+        assert_eq!(actual.copied_bytes, 0);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error = BoundedClassSequencePlan::build_attempt(
+            [(b'Z', b'A')].into_iter(),
+            [(b'a', b'z')].into_iter(),
+            [(b'0', b'9')].into_iter(),
+            2,
+            3,
+            BuildLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.source(),
+            BuildError::ReversedRange { role: "head", .. }
+        ));
+        assert_eq!(error.actual().work, 12);
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, 0);
     }
 }

@@ -79,7 +79,7 @@ fn holmes_watson_compile_and_span_sum_labels_bind_the_typed_plan() {
         regex.build_report().plan,
         AggregatePlanKind::BoundedLiteralPair
     );
-    assert_eq!(regex.build_report().schema_version, 34);
+    assert_eq!(regex.build_report().schema_version, 35);
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
         .expect("typed route identity");
 

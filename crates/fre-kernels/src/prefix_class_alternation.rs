@@ -55,6 +55,8 @@ use core::{fmt, mem::size_of, ops::Range};
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
@@ -699,7 +701,12 @@ impl ByteClass {
         Self { words: [0; 4] }
     }
 
-    fn insert_range(&mut self, start: u8, end: u8, work: &mut BuildWork) -> Result<(), BuildError> {
+    fn insert_range(
+        &mut self,
+        start: u8,
+        end: u8,
+        work: &mut BuildWork<'_>,
+    ) -> Result<(), BuildError> {
         let first_word = usize::from(start) >> 6;
         let last_word = usize::from(end) >> 6;
         for word in first_word..=last_word {
@@ -753,49 +760,85 @@ impl PrefixClassAlternationPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
+        Self::build_uniform_participation_attempt(prefixes, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the uniform-participation route with exact observed effects.
+    pub fn build_uniform_participation_attempt<I>(
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: UniformParticipationBuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<UniformParticipationBuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
         let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
-            UniformParticipationBuildError::ArithmeticOverflow {
-                computation: "direct prefix byte total",
-            },
+            DirectBuildAttemptError::new(
+                UniformParticipationBuildError::ArithmeticOverflow {
+                    computation: "direct prefix byte total",
+                },
+                DirectBuildAttemptActual::default(),
+            ),
         )?;
         let allocations = 2;
         let initialized_bitmap_bytes = size_of::<[u64; 8]>();
         if allocations > limits.max_allocations {
-            return Err(UniformParticipationBuildError::AllocationsLimit {
-                needed: allocations,
-                limit: limits.max_allocations,
-            });
+            return Err(DirectBuildAttemptError::new(
+                UniformParticipationBuildError::AllocationsLimit {
+                    needed: allocations,
+                    limit: limits.max_allocations,
+                },
+                DirectBuildAttemptActual::default(),
+            ));
         }
         if prefix_bytes > limits.max_copied_prefix_bytes {
-            return Err(UniformParticipationBuildError::CopiedPrefixBytesLimit {
-                needed: prefix_bytes,
-                limit: limits.max_copied_prefix_bytes,
-            });
+            return Err(DirectBuildAttemptError::new(
+                UniformParticipationBuildError::CopiedPrefixBytesLimit {
+                    needed: prefix_bytes,
+                    limit: limits.max_copied_prefix_bytes,
+                },
+                DirectBuildAttemptActual::default(),
+            ));
         }
         if prefix_bytes > limits.max_finder_preprocess_input_bytes {
-            return Err(
+            return Err(DirectBuildAttemptError::new(
                 UniformParticipationBuildError::FinderPreprocessInputBytesLimit {
                     needed: prefix_bytes,
                     limit: limits.max_finder_preprocess_input_bytes,
                 },
-            );
+                DirectBuildAttemptActual::default(),
+            ));
         }
         if initialized_bitmap_bytes > limits.max_initialized_bitmap_bytes {
-            return Err(
+            return Err(DirectBuildAttemptError::new(
                 UniformParticipationBuildError::InitializedBitmapBytesLimit {
                     needed: initialized_bitmap_bytes,
                     limit: limits.max_initialized_bitmap_bytes,
                 },
-            );
+                DirectBuildAttemptActual::default(),
+            ));
         }
         if prefix_bytes > limits.max_retained_capacity_bytes {
-            return Err(UniformParticipationBuildError::RetainedCapacityBytesLimit {
-                needed: prefix_bytes,
-                limit: limits.max_retained_capacity_bytes,
-            });
+            return Err(DirectBuildAttemptError::new(
+                UniformParticipationBuildError::RetainedCapacityBytesLimit {
+                    needed: prefix_bytes,
+                    limit: limits.max_retained_capacity_bytes,
+                },
+                DirectBuildAttemptActual::default(),
+            ));
         }
-        Self::build(prefixes, ranges, limits.kernel())
-            .map_err(UniformParticipationBuildError::Kernel)
+        match Self::build_attempt(prefixes, ranges, limits.kernel()) {
+            Ok(attempt) => Ok(attempt),
+            Err(error) => {
+                let actual = error.actual();
+                Err(DirectBuildAttemptError::new(
+                    UniformParticipationBuildError::Kernel(error.into_source()),
+                    actual,
+                ))
+            }
+        }
     }
 
     #[allow(
@@ -811,133 +854,166 @@ impl PrefixClassAlternationPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "prefix byte total",
-            },
-        )?;
-        let mut shape_units = prefix_bytes;
-        let prefix_build_work = prefix_bytes
-            .checked_mul(PREFIX_BUILD_WORK_PER_BYTE)
-            .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed and prefix build work",
-            })?;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(prefix_bytes)
+        Self::build_attempt(prefixes, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build two prefix/class alternatives with exact observed effects.
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the exact two-alternative attempt keeps validation, observed allocation, and publication adjacent"
+    )]
+    pub fn build_attempt<I>(
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        let mut tracker = DirectBuildTracker::new();
+        let result = (|| {
+            let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "prefix byte total",
+                },
+            )?;
+            let mut shape_units = prefix_bytes;
+            let prefix_build_work = prefix_bytes
+                .checked_mul(PREFIX_BUILD_WORK_PER_BYTE)
+                .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
+                    computation: "fixed and prefix build work",
                 })?;
-        let scratch_bytes = 0;
-        let peak_bytes = persistent_bytes;
+            let persistent_bytes = size_of::<Self>().checked_add(prefix_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+            )?;
+            let scratch_bytes = 0;
+            let peak_bytes = persistent_bytes;
 
-        enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
-        enforce_build(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
+            enforce_build(
+                scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
 
-        // This reservation precedes prefix validation, allocation, copying,
-        // bitmap initialization and Finder preprocessing. Range-dependent work
-        // is deliberately not guessed from `size_hint`/`ExactSizeIterator`.
-        let mut work = BuildWork::new(limits.max_build_work);
-        work.charge(prefix_build_work)?;
+            // This reservation precedes prefix validation, allocation, copying,
+            // bitmap initialization and Finder preprocessing. Range-dependent work
+            // is deliberately not guessed from `size_hint`/`ExactSizeIterator`.
+            let mut work = BuildWork::new(limits.max_build_work, &mut tracker);
+            work.charge(prefix_build_work)?;
 
-        for alternative in 0..2 {
-            let prefix = prefixes[alternative];
-            if prefix.is_empty() {
-                return Err(BuildError::EmptyPrefix { alternative });
-            }
-            for &byte in &prefix[1..] {
-                work.charge(1)?;
-                if byte == prefix[0] {
-                    return Err(BuildError::SelfOverlappingPrefix { alternative });
+            for alternative in 0..2 {
+                let prefix = prefixes[alternative];
+                if prefix.is_empty() {
+                    return Err(BuildError::EmptyPrefix { alternative });
                 }
-            }
-        }
-
-        let mut classes = [ByteClass::empty(); 2];
-        let mut class_ranges = 0_usize;
-        for (alternative, mut ranges) in ranges.into_iter().enumerate() {
-            let mut previous_end = None;
-            loop {
-                // Charge the traversal before calling user-supplied iterator
-                // code. This includes each yielded item and the terminal None.
-                work.charge(1)?;
-                let Some((start, end)) = ranges.next() else {
-                    break;
-                };
-                // Covers accepting the yielded item, both range/shape counter
-                // writes, their checked arithmetic, the shape-limit comparison
-                // and the previous-range presence branch before processing it.
-                work.charge(RANGE_ITEM_BASE_WORK)?;
-                class_ranges =
-                    class_ranges
-                        .checked_add(1)
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "class range total",
-                        })?;
-                shape_units = prefix_bytes.checked_add(class_ranges).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "shape units",
-                    },
-                )?;
-                enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
-
-                work.charge(1)?;
-                if start > end {
-                    return Err(BuildError::NonCanonicalClass { alternative });
-                }
-                if let Some(previous) = previous_end {
+                for &byte in &prefix[1..] {
                     work.charge(1)?;
-                    if previous >= start {
-                        return Err(BuildError::NonCanonicalClass { alternative });
+                    if byte == prefix[0] {
+                        return Err(BuildError::SelfOverlappingPrefix { alternative });
                     }
                 }
-                work.charge(1)?;
-                previous_end = Some(end);
-                classes[alternative].insert_range(start, end, &mut work)?;
             }
-            if previous_end.is_none() {
-                return Err(BuildError::EmptyClass { alternative });
+
+            let mut classes = [ByteClass::empty(); 2];
+            let mut class_ranges = 0_usize;
+            for (alternative, mut ranges) in ranges.into_iter().enumerate() {
+                let mut previous_end = None;
+                loop {
+                    // Charge the traversal before calling user-supplied iterator
+                    // code. This includes each yielded item and the terminal None.
+                    work.charge(1)?;
+                    let Some((start, end)) = ranges.next() else {
+                        break;
+                    };
+                    // Covers accepting the yielded item, both range/shape counter
+                    // writes, their checked arithmetic, the shape-limit comparison
+                    // and the previous-range presence branch before processing it.
+                    work.charge(RANGE_ITEM_BASE_WORK)?;
+                    class_ranges =
+                        class_ranges
+                            .checked_add(1)
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "class range total",
+                            })?;
+                    shape_units = prefix_bytes.checked_add(class_ranges).ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "shape units",
+                        },
+                    )?;
+                    enforce_build(shape_units, limits.max_shape_units, BuildResource::Shape)?;
+
+                    work.charge(1)?;
+                    if start > end {
+                        return Err(BuildError::NonCanonicalClass { alternative });
+                    }
+                    if let Some(previous) = previous_end {
+                        work.charge(1)?;
+                        if previous >= start {
+                            return Err(BuildError::NonCanonicalClass { alternative });
+                        }
+                    }
+                    work.charge(1)?;
+                    previous_end = Some(end);
+                    classes[alternative].insert_range(start, end, &mut work)?;
+                }
+                if previous_end.is_none() {
+                    return Err(BuildError::EmptyClass { alternative });
+                }
+            }
+
+            // Admission above covers both exact allocations, every copied byte,
+            // both Finder preprocessors, and all eight zero-initialized bitmap
+            // words before any of that work occurs.
+            let first = copy_prefix(prefixes[0], 0)?;
+            work.tracker.observe_prefix_copy(prefixes[0].len())?;
+            let second = copy_prefix(prefixes[1], 1)?;
+            work.tracker.observe_prefix_copy(prefixes[1].len())?;
+            let work_used = work.used();
+            let alternatives = [
+                Alternative {
+                    finder: FinderBuilder::new().build_forward_owned(first.into_boxed_slice()),
+                    class: classes[0],
+                },
+                Alternative {
+                    finder: FinderBuilder::new().build_forward_owned(second.into_boxed_slice()),
+                    class: classes[1],
+                },
+            ];
+            let plan = Self {
+                alternatives,
+                build: BuildAccounting {
+                    prefix_bytes,
+                    class_ranges,
+                    shape_units,
+                    work_upper_bound: work_used,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            };
+            tracker.publish(persistent_bytes)?;
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, tracker.actual)),
+            Err(source) => {
+                tracker.actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, tracker.actual))
             }
         }
-
-        // Admission above covers both exact allocations, every copied byte,
-        // both Finder preprocessors, and all eight zero-initialized bitmap
-        // words before any of that work occurs.
-        let first = copy_prefix(prefixes[0], 0)?;
-        let second = copy_prefix(prefixes[1], 1)?;
-        let alternatives = [
-            Alternative {
-                finder: FinderBuilder::new().build_forward_owned(first.into_boxed_slice()),
-                class: classes[0],
-            },
-            Alternative {
-                finder: FinderBuilder::new().build_forward_owned(second.into_boxed_slice()),
-                class: classes[1],
-            },
-        ];
-        Ok(Self {
-            alternatives,
-            build: BuildAccounting {
-                prefix_bytes,
-                class_ranges,
-                shape_units,
-                work_upper_bound: work.used(),
-                scratch_bytes,
-                persistent_bytes,
-                peak_bytes,
-            },
-        })
     }
 
     #[must_use]
@@ -1642,14 +1718,89 @@ fn copy_prefix(prefix: &[u8], alternative: usize) -> Result<Vec<u8>, BuildError>
 }
 
 #[derive(Clone, Copy, Debug)]
-struct BuildWork {
-    used: usize,
-    limit: usize,
+struct DirectBuildTracker {
+    actual: DirectBuildAttemptActual,
+    live_unpublished_bytes: usize,
 }
 
-impl BuildWork {
-    const fn new(limit: usize) -> Self {
-        Self { used: 0, limit }
+impl DirectBuildTracker {
+    const fn new() -> Self {
+        Self {
+            actual: DirectBuildAttemptActual {
+                work: 0,
+                allocations: 0,
+                allocated_bytes: 0,
+                copied_bytes: 0,
+                initialized_bytes: 0,
+                live_persistent_bytes: 0,
+                peak_bytes: 0,
+            },
+            live_unpublished_bytes: 0,
+        }
+    }
+
+    fn observe_prefix_copy(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.allocations =
+            self.actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual prefix allocation count",
+                })?;
+        self.actual.allocated_bytes = self.actual.allocated_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative prefix allocated bytes",
+            },
+        )?;
+        self.actual.copied_bytes =
+            self.actual
+                .copied_bytes
+                .checked_add(bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual copied prefix bytes",
+                })?;
+        self.actual.initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "actual initialized prefix bytes",
+            },
+        )?;
+        self.live_unpublished_bytes = self.live_unpublished_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "live unpublished prefix bytes",
+            },
+        )?;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(self.live_unpublished_bytes);
+        Ok(())
+    }
+
+    fn publish(&mut self, persistent_bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(size_of::<PrefixClassAlternationPlan>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "published prefix plan inline initialized bytes",
+            })?;
+        self.actual.live_persistent_bytes = persistent_bytes;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(persistent_bytes);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BuildWork<'a> {
+    used: usize,
+    limit: usize,
+    tracker: &'a mut DirectBuildTracker,
+}
+
+impl<'a> BuildWork<'a> {
+    const fn new(limit: usize, tracker: &'a mut DirectBuildTracker) -> Self {
+        Self {
+            used: 0,
+            limit,
+            tracker,
+        }
     }
 
     fn charge(&mut self, units: usize) -> Result<(), BuildError> {
@@ -1666,6 +1817,10 @@ impl BuildWork {
             });
         }
         self.used = needed;
+        self.tracker.actual.work =
+            u64::try_from(needed).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "actual prefix build work as u64",
+            })?;
         Ok(())
     }
 
@@ -1994,6 +2149,47 @@ mod tests {
             BuildLimits::unlimited(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_validation_failure() {
+        let attempt = PrefixClassAlternationPlan::build_attempt(
+            [b"ab", b"xy"],
+            [[(b'a', b'z')].into_iter(), [(b'0', b'9')].into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let plan = attempt.into_plan();
+        let build = plan.build_accounting();
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 2);
+        assert_eq!(actual.allocated_bytes, build.prefix_bytes);
+        assert_eq!(actual.copied_bytes, build.prefix_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.persistent_bytes);
+
+        let failure = PrefixClassAlternationPlan::build_attempt(
+            [b"ab", b"xy"],
+            [[(b'z', b'a')].into_iter(), [(b'0', b'9')].into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::NonCanonicalClass { alternative: 0 }
+        ));
+        let partial = failure.actual();
+        let expected_work =
+            4 * PREFIX_BUILD_WORK_PER_BYTE + FIXED_BUILD_WORK + 2 + 1 + RANGE_ITEM_BASE_WORK + 1;
+        assert_eq!(partial.work, u64::try_from(expected_work).unwrap());
+        assert_eq!(partial.allocations, 0);
+        assert_eq!(partial.allocated_bytes, 0);
+        assert_eq!(partial.copied_bytes, 0);
+        assert_eq!(partial.initialized_bytes, 0);
+        assert_eq!(partial.live_persistent_bytes, 0);
+        assert_eq!(partial.peak_bytes, 0);
     }
 
     fn sut_spans(plan: &PrefixClassAlternationPlan, haystack: &[u8]) -> Vec<Range<usize>> {

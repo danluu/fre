@@ -1,9 +1,12 @@
+use fre_kernels::DirectBuildAttemptActual;
 use regex_syntax::{
     ParserBuilder,
     hir::{Class, Hir, HirKind, Look},
 };
 
-use crate::{Match, SearchLimits, SearchWindow};
+use crate::{
+    Match, SearchLimits, SearchWindow, aggregate_construction::AggregateInspectionAttemptError,
+};
 
 pub const UNICODE_PLAN_ID: &str = "unicode-word-run-linear-v1";
 pub const ASCII_PLAN_ID: &str = "ascii-word-run-linear-v1";
@@ -92,6 +95,34 @@ pub struct AggregateBuildAccounting {
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AggregateBuildAttempt {
+    accounting: AggregateBuildAccounting,
+    actual: DirectBuildAttemptActual,
+}
+
+impl AggregateBuildAttempt {
+    pub(crate) const fn into_parts(self) -> (AggregateBuildAccounting, DirectBuildAttemptActual) {
+        (self.accounting, self.actual)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AggregateBuildAttemptError {
+    source: AggregateBuildError,
+    actual: DirectBuildAttemptActual,
+}
+
+impl AggregateBuildAttemptError {
+    pub(crate) const fn actual(&self) -> DirectBuildAttemptActual {
+        self.actual
+    }
+
+    pub(crate) const fn into_source(self) -> AggregateBuildError {
+        self.source
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +230,7 @@ pub enum AggregateBuildError {
     ScratchLimit { needed: usize, limit: usize },
     PersistentLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
+    ArithmeticOverflow { computation: &'static str },
 }
 
 impl core::fmt::Display for AggregateBuildError {
@@ -372,37 +404,59 @@ impl Plan {
         }
     }
 
-    pub(crate) fn aggregate_build_accounting(
+    pub(crate) fn aggregate_build_attempt(
         self,
         limits: AggregateBuildLimits,
-    ) -> Result<AggregateBuildAccounting, AggregateBuildError> {
-        let accounting = AggregateBuildAccounting {
-            work_upper_bound: FIXED_BUILD_WORK,
-            scratch_bytes: 0,
-            persistent_bytes: core::mem::size_of_val(&self),
-            peak_bytes: core::mem::size_of_val(&self),
+    ) -> Result<AggregateBuildAttempt, AggregateBuildAttemptError> {
+        let attempt = || -> Result<AggregateBuildAttempt, AggregateBuildError> {
+            let accounting = AggregateBuildAccounting {
+                work_upper_bound: FIXED_BUILD_WORK,
+                scratch_bytes: 0,
+                persistent_bytes: core::mem::size_of_val(&self),
+                peak_bytes: core::mem::size_of_val(&self),
+            };
+            enforce_build(
+                accounting.work_upper_bound,
+                limits.max_build_work,
+                AggregateBuildResource::Work,
+            )?;
+            enforce_build(
+                accounting.scratch_bytes,
+                limits.max_scratch_bytes,
+                AggregateBuildResource::Scratch,
+            )?;
+            enforce_build(
+                accounting.persistent_bytes,
+                limits.max_persistent_bytes,
+                AggregateBuildResource::Persistent,
+            )?;
+            enforce_build(
+                accounting.peak_bytes,
+                limits.max_peak_bytes,
+                AggregateBuildResource::Peak,
+            )?;
+            let work = u64::try_from(FIXED_BUILD_WORK).map_err(|_| {
+                AggregateBuildError::ArithmeticOverflow {
+                    computation: "word-run build work as u64",
+                }
+            })?;
+            Ok(AggregateBuildAttempt {
+                accounting,
+                actual: DirectBuildAttemptActual {
+                    work,
+                    allocations: 0,
+                    allocated_bytes: 0,
+                    copied_bytes: 0,
+                    initialized_bytes: accounting.persistent_bytes,
+                    live_persistent_bytes: accounting.persistent_bytes,
+                    peak_bytes: accounting.peak_bytes,
+                },
+            })
         };
-        enforce_build(
-            accounting.work_upper_bound,
-            limits.max_build_work,
-            AggregateBuildResource::Work,
-        )?;
-        enforce_build(
-            accounting.scratch_bytes,
-            limits.max_scratch_bytes,
-            AggregateBuildResource::Scratch,
-        )?;
-        enforce_build(
-            accounting.persistent_bytes,
-            limits.max_persistent_bytes,
-            AggregateBuildResource::Persistent,
-        )?;
-        enforce_build(
-            accounting.peak_bytes,
-            limits.max_peak_bytes,
-            AggregateBuildResource::Peak,
-        )?;
-        Ok(accounting)
+        attempt().map_err(|source| AggregateBuildAttemptError {
+            source,
+            actual: DirectBuildAttemptActual::default(),
+        })
     }
 
     pub(crate) const fn aggregate_count_identity(self) -> AggregateOperationIdentity {
@@ -812,12 +866,21 @@ pub(crate) fn extract(hir: &Hir) -> Option<Plan> {
     Some(Plan::new(usize::try_from(repetition.min).ok()?, mode))
 }
 
-pub(crate) fn inspect_aggregate(
+pub(crate) fn inspect_aggregate_attempt(
     hir: &Hir,
     limit: usize,
-) -> Result<AggregateInspectionOutcome, AggregateInspectionError> {
+) -> Result<AggregateInspectionOutcome, AggregateInspectionAttemptError<AggregateInspectionError>> {
     let mut accounting = InspectionAccounting::default();
-    let root = peel_captures_accounted(hir, limit, &mut accounting)?;
+    inspect_aggregate_with_accounting(hir, limit, &mut accounting)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
+}
+
+fn inspect_aggregate_with_accounting(
+    hir: &Hir,
+    limit: usize,
+    accounting: &mut InspectionAccounting,
+) -> Result<AggregateInspectionOutcome, AggregateInspectionError> {
+    let root = peel_captures_accounted(hir, limit, accounting)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -825,14 +888,14 @@ pub(crate) fn inspect_aggregate(
     let [start, repeated, end] = parts.as_slice() else {
         return Ok(accounting.ineligible());
     };
-    let start = peel_captures_accounted(start, limit, &mut accounting)?;
-    let end = peel_captures_accounted(end, limit, &mut accounting)?;
+    let start = peel_captures_accounted(start, limit, accounting)?;
+    let end = peel_captures_accounted(end, limit, accounting)?;
     let mode = match (start.kind(), end.kind()) {
         (HirKind::Look(Look::WordAscii), HirKind::Look(Look::WordAscii)) => WordMode::Ascii,
         (HirKind::Look(Look::WordUnicode), HirKind::Look(Look::WordUnicode)) => WordMode::Unicode,
         _ => return Ok(accounting.ineligible()),
     };
-    let repeated = peel_captures_accounted(repeated, limit, &mut accounting)?;
+    let repeated = peel_captures_accounted(repeated, limit, accounting)?;
     let HirKind::Repetition(repetition) = repeated.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -840,7 +903,7 @@ pub(crate) fn inspect_aggregate(
     if repetition.min == 0 || repetition.max.is_some() || !repetition.greedy {
         return Ok(accounting.ineligible());
     }
-    let class = peel_captures_accounted(&repetition.sub, limit, &mut accounting)?;
+    let class = peel_captures_accounted(&repetition.sub, limit, accounting)?;
     match (mode, class.kind()) {
         (WordMode::Ascii, HirKind::Class(Class::Bytes(class))) => {
             accounting.charge(class.ranges().len(), limit)?;
@@ -850,7 +913,7 @@ pub(crate) fn inspect_aggregate(
         }
         (WordMode::Unicode, HirKind::Class(Class::Unicode(class))) => {
             accounting.charge(class.ranges().len(), limit)?;
-            if !is_exact_unicode_word_class(class, limit, &mut accounting)? {
+            if !is_exact_unicode_word_class(class, limit, accounting)? {
                 return Ok(accounting.ineligible());
             }
         }

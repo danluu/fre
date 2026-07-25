@@ -1,20 +1,20 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
-    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
-    AggregateExecutionError, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics, AggregateGuardedAsciiWordSemantics,
-    AggregateLiteralIneligibility, AggregateOperation, AggregateOperationAttemptKind,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
-    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError,
-    LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
-    LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
-    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
-    guarded_ascii_word,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionAttemptIdentity,
+    AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionSource,
+    AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
+    AggregateGuardedAsciiWordSemantics, AggregateLiteralIneligibility, AggregateOperation,
+    AggregateOperationAttemptKind, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumRegex,
+    AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError, FixedClassSandwichOperation,
+    FixedClassSandwichReduceError, LITERAL_AGGREGATE_ACCOUNTING_VERSION,
+    LITERAL_AGGREGATE_ALGORITHM_VERSION, LiteralAggregateActualCounters,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateDeclaredFallback,
+    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceError,
+    PlanKind, PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -3979,6 +3979,48 @@ fn strategy_operation_limits_and_capacity_are_part_of_continuation_identity() {
             limit,
         }) if actual == required && limit == required - 1
     ));
+}
+
+#[test]
+fn continuation_terminal_rejects_caller_visible_coherent_mutations() {
+    let regex = aggregate_builder(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .strategy(AggregateStrategy::FullTable)
+        .build_count()
+        .unwrap();
+    let limits = AggregateRunLimits::default();
+    let admitted = regex.count(b"aaaa", limits).unwrap();
+    let (certificate, _) = continuation_details(admitted.report().details());
+    let mut refused_limits = limits;
+    refused_limits.continuation.max_random_access_bytes = certificate.random_access_bytes - 1;
+    let error = regex.count(b"aaaa", refused_limits).unwrap_err();
+    assert!(error.has_closed_continuation_attempt());
+
+    let mut invocation_mutation = error.clone();
+    let AggregateExecutionAttemptIdentity::Continuation { receipt, .. } =
+        &mut invocation_mutation.identity
+    else {
+        panic!("continuation terminal lost its receipt");
+    };
+    receipt.invocation.range = 0..1;
+    receipt.invocation.haystack_len = 0;
+    assert!(!invocation_mutation.has_closed_continuation_attempt());
+
+    let mut receipt_mutation = error.clone();
+    let AggregateExecutionAttemptIdentity::Continuation { receipt, .. } =
+        &mut receipt_mutation.identity
+    else {
+        panic!("continuation terminal lost its receipt");
+    };
+    receipt.identity.accounting_version = 3;
+    assert!(!receipt_mutation.has_closed_continuation_attempt());
+
+    let mut source_mutation = error;
+    source_mutation.source = AggregateExecutionSource::Continuation(
+        AggregateEngineError::InternalInvariant("caller-spliced continuation source"),
+    );
+    assert!(!source_mutation.has_closed_continuation_attempt());
 }
 
 #[test]

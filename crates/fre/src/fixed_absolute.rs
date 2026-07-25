@@ -9,7 +9,9 @@ use regex_syntax::hir::{
     Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look,
 };
 
-use crate::aggregate::AggregateOperation;
+use crate::{
+    aggregate::AggregateOperation, aggregate_construction::AggregateInspectionAttemptError,
+};
 
 /// Bounded structural classification before the optional selector.
 /// `ProvenEligible` is deliberately limited to small canonical skeletons so a
@@ -641,66 +643,70 @@ impl Shape<'_> {
     /// the canonical whole-scalar envelope. This mirrors the compiler's
     /// allocation-free HIR-stack growth, state-vector growth, scalar-set
     /// ownership, retained program copy, and six certification vectors.
-    pub(crate) fn scalar_residual_compile_allocations(
+    pub(crate) fn scalar_residual_compile_allocations_attempt(
         &self,
         hir: &Hir,
         limit: usize,
-    ) -> Result<Option<(usize, usize)>, InspectionError> {
+    ) -> Result<Option<(usize, usize)>, AggregateInspectionAttemptError<InspectionError>> {
         let Self::WholeScalarEnvelope { scalars, .. } = self else {
             return Ok(None);
         };
         let mut work = 0_usize;
-        let mut stack_capacity = CompiledRegex::pinned_hir_stack_initial_capacity();
-        let mut stack_allocations = 1_usize;
-        census_validation_stack(
-            hir,
-            0,
-            &mut stack_capacity,
-            &mut stack_allocations,
-            &mut work,
-            limit,
-        )?;
+        let result = (|| -> Result<Option<(usize, usize)>, InspectionError> {
+            let mut stack_capacity = CompiledRegex::pinned_hir_stack_initial_capacity();
+            let mut stack_allocations = 1_usize;
+            census_validation_stack(
+                hir,
+                0,
+                &mut stack_capacity,
+                &mut stack_allocations,
+                &mut work,
+                limit,
+            )?;
 
-        let class = scalar_envelope_class(hir, &mut work, limit)?;
-        charge_census(&mut work, limit, 1)?;
-        let maximum_width = class
-            .ranges()
-            .last()
-            .map_or(0, |range| range.end().len_utf8());
-        if maximum_width == 0 {
-            return Err(InspectionError::Overflow);
-        }
-        let scalar_count = usize::try_from(*scalars).map_err(|_| InspectionError::Overflow)?;
-        let states = scalar_count
-            .checked_mul(maximum_width)
-            .and_then(|states| states.checked_add(3))
-            .ok_or(InspectionError::Overflow)?;
-        let mut state_capacity = 0_usize;
-        let mut state_allocations = 0_usize;
-        while state_capacity < states {
+            let class = scalar_envelope_class(hir, &mut work, limit)?;
             charge_census(&mut work, limit, 1)?;
-            let required = state_capacity
-                .checked_add(1)
-                .ok_or(InspectionError::Overflow)?;
-            let grown = CompiledRegex::pinned_state_capacity_after_push(state_capacity, required)
-                .ok_or(InspectionError::Overflow)?;
-            if grown < required || grown <= state_capacity {
+            let maximum_width = class
+                .ranges()
+                .last()
+                .map_or(0, |range| range.end().len_utf8());
+            if maximum_width == 0 {
                 return Err(InspectionError::Overflow);
             }
-            state_capacity = grown;
-            state_allocations = state_allocations
-                .checked_add(1)
+            let scalar_count = usize::try_from(*scalars).map_err(|_| InspectionError::Overflow)?;
+            let states = scalar_count
+                .checked_mul(maximum_width)
+                .and_then(|states| states.checked_add(3))
                 .ok_or(InspectionError::Overflow)?;
-        }
-        charge_census(&mut work, limit, 1)?;
-        let allocations = stack_allocations
+            let mut state_capacity = 0_usize;
+            let mut state_allocations = 0_usize;
+            while state_capacity < states {
+                charge_census(&mut work, limit, 1)?;
+                let required = state_capacity
+                    .checked_add(1)
+                    .ok_or(InspectionError::Overflow)?;
+                let grown =
+                    CompiledRegex::pinned_state_capacity_after_push(state_capacity, required)
+                        .ok_or(InspectionError::Overflow)?;
+                if grown < required || grown <= state_capacity {
+                    return Err(InspectionError::Overflow);
+                }
+                state_capacity = grown;
+                state_allocations = state_allocations
+                    .checked_add(1)
+                    .ok_or(InspectionError::Overflow)?;
+            }
+            charge_census(&mut work, limit, 1)?;
+            let allocations = stack_allocations
             .checked_add(state_allocations)
             .and_then(|total| total.checked_add(scalar_count))
             // One retained-state allocation and six nonempty certification
             // vectors (outgoing, parent counts, offsets, parents, queue, order).
             .and_then(|total| total.checked_add(7))
             .ok_or(InspectionError::Overflow)?;
-        Ok(Some((allocations, work)))
+            Ok(Some((allocations, work)))
+        })();
+        result.map_err(|source| AggregateInspectionAttemptError::new(source, work))
     }
 }
 
@@ -791,10 +797,7 @@ fn peel_census<'a>(
 fn charge_census(work: &mut usize, limit: usize, amount: usize) -> Result<(), InspectionError> {
     let needed = work.checked_add(amount).ok_or(InspectionError::Overflow)?;
     if needed > limit {
-        return Err(InspectionError::WorkLimit {
-            needed,
-            consumed: *work,
-        });
+        return Err(InspectionError::WorkLimit { needed });
     }
     *work = needed;
     Ok(())
@@ -1033,22 +1036,32 @@ impl ExactSizeIterator for AlternativeIter<'_> {}
 impl core::iter::FusedIterator for AlternativeIter<'_> {}
 
 pub(crate) enum InspectionError {
-    WorkLimit { needed: usize, consumed: usize },
+    WorkLimit { needed: usize },
     Overflow,
 }
 
-pub(crate) fn inspect(
+pub(crate) fn inspect_attempt(
     hir: &Hir,
     unicode: bool,
     operation: AggregateOperation,
     limit: usize,
-) -> Result<Inspection<'_>, InspectionError> {
+) -> Result<Inspection<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut visitor = Visitor {
         work: 0,
         limit,
         hir_nodes: 0,
         captures: 0,
     };
+    inspect_with_visitor(hir, unicode, operation, &mut visitor)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, visitor.work))
+}
+
+fn inspect_with_visitor<'a>(
+    hir: &'a Hir,
+    unicode: bool,
+    operation: AggregateOperation,
+    visitor: &mut Visitor,
+) -> Result<Inspection<'a>, InspectionError> {
     let root = visitor.peel(hir)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(Inspection::Ineligible { work: visitor.work });
@@ -1058,9 +1071,9 @@ pub(crate) fn inspect(
     }
 
     let shape = match (unicode, operation) {
-        (false, AggregateOperation::SpanSum) => inspect_byte_span_sum(parts, &mut visitor)?,
-        (false, AggregateOperation::Count) => inspect_byte_count(parts, &mut visitor)?,
-        (true, AggregateOperation::Count) => inspect_scalar_count(parts, &mut visitor)?,
+        (false, AggregateOperation::SpanSum) => inspect_byte_span_sum(parts, visitor)?,
+        (false, AggregateOperation::Count) => inspect_byte_count(parts, visitor)?,
+        (true, AggregateOperation::Count) => inspect_scalar_count(parts, visitor)?,
         _ => None,
     };
     let Some(shape) = shape else {
@@ -1380,10 +1393,7 @@ impl Visitor {
             .checked_add(amount)
             .ok_or(InspectionError::Overflow)?;
         if needed > self.limit {
-            return Err(InspectionError::WorkLimit {
-                needed,
-                consumed: self.work,
-            });
+            return Err(InspectionError::WorkLimit { needed });
         }
         self.work = needed;
         Ok(())

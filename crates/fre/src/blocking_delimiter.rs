@@ -7,6 +7,8 @@
 
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Inspection {
     pub delimiters: [u8; 2],
@@ -67,9 +69,26 @@ impl Accounting {
 /// Prove exactly two shared delimiters, their complete complement as a greedy
 /// bounded byte repetition, a nonempty terminal byte class disjoint from the
 /// delimiters, and the same closing delimiter class.
+#[cfg(test)]
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(super) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<InspectionOutcome, AggregateInspectionAttemptError<InspectionError>> {
     let mut accounting = Accounting::default();
-    let root = peel_captures(hir, limit, &mut accounting)?;
+    inspect_with_accounting(hir, limit, &mut accounting)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
+}
+
+fn inspect_with_accounting(
+    hir: &Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<InspectionOutcome, InspectionError> {
+    let root = peel_captures(hir, limit, accounting)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -78,11 +97,11 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome, Insp
         return Ok(accounting.ineligible());
     };
 
-    let Some(delimiters) = two_singleton_bytes(opening, limit, &mut accounting)? else {
+    let Some(delimiters) = two_singleton_bytes(opening, limit, accounting)? else {
         return Ok(accounting.ineligible());
     };
 
-    let middle = peel_captures(middle, limit, &mut accounting)?;
+    let middle = peel_captures(middle, limit, accounting)?;
     let HirKind::Repetition(repetition) = middle.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -94,21 +113,20 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome, Insp
         return Ok(accounting.ineligible());
     }
     let maximum_middle_bytes = usize::try_from(maximum).map_err(|_| InspectionError::Overflow)?;
-    let repeated = peel_captures(&repetition.sub, limit, &mut accounting)?;
+    let repeated = peel_captures(&repetition.sub, limit, accounting)?;
     let HirKind::Class(Class::Bytes(repeated)) = repeated.kind() else {
         return Ok(accounting.ineligible());
     };
     accounting.charge(repeated.ranges().len(), limit)?;
-    if !is_complete_delimiter_complement(repeated, delimiters, limit, &mut accounting)? {
+    if !is_complete_delimiter_complement(repeated, delimiters, limit, accounting)? {
         return Ok(accounting.ineligible());
     }
 
-    let terminal = peel_captures(terminal, limit, &mut accounting)?;
+    let terminal = peel_captures(terminal, limit, accounting)?;
     let HirKind::Class(Class::Bytes(terminal)) = terminal.kind() else {
         return Ok(accounting.ineligible());
     };
-    let Some((terminal_words, terminal_members)) =
-        byte_class_words(terminal, limit, &mut accounting)?
+    let Some((terminal_words, terminal_members)) = byte_class_words(terminal, limit, accounting)?
     else {
         return Ok(accounting.ineligible());
     };
@@ -119,7 +137,7 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome, Insp
         }
     }
 
-    let Some(closing_delimiters) = two_singleton_bytes(closing, limit, &mut accounting)? else {
+    let Some(closing_delimiters) = two_singleton_bytes(closing, limit, accounting)? else {
         return Ok(accounting.ineligible());
     };
     accounting.charge(delimiters.len(), limit)?;

@@ -39,6 +39,10 @@ pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-sparse-
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str =
     "ordered-literal-aggregate.span-sum.reverse-sparse-ac-root256-dp.v2";
+/// Version of the receipt-bearing sparse construction protocol.
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+/// Version of the partial-actual sparse construction ledger.
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -329,6 +333,350 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Immutable identity and caller envelope for one sparse construction attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptIdentity {
+    pub algorithm_id: &'static str,
+    pub plan_id: &'static str,
+    pub operation: Operation,
+    pub limits: BuildLimits,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+}
+
+/// Exact effects committed through the last admitted sparse construction step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BuildAttemptActual {
+    pub work: u64,
+    pub allocations: usize,
+    pub allocated_bytes: usize,
+    pub copied_bytes: usize,
+    pub initialized_bytes: usize,
+    pub live_persistent_bytes: usize,
+    pub live_scratch_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// One success-or-failure sparse construction receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptReceipt {
+    identity: BuildAttemptIdentity,
+    actual: BuildAttemptActual,
+    accounting: Option<BuildAccounting>,
+    published: bool,
+}
+
+impl BuildAttemptReceipt {
+    #[must_use]
+    pub const fn identity(&self) -> BuildAttemptIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn actual(&self) -> BuildAttemptActual {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn accounting(&self) -> Option<BuildAccounting> {
+        self.accounting
+    }
+
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    #[must_use]
+    pub fn contains_actual(&self) -> bool {
+        self.identity.algorithm_id == ALGORITHM_ID
+            && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
+            && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
+            && self.actual.work <= self.identity.limits.max_build_work
+            && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
+            && self.actual.live_scratch_bytes <= self.identity.limits.max_scratch_bytes
+            && self.actual.peak_bytes <= self.identity.limits.max_peak_bytes
+            && self.actual.copied_bytes <= self.actual.initialized_bytes
+            && self.actual.peak_bytes
+                >= self
+                    .actual
+                    .live_persistent_bytes
+                    .saturating_add(self.actual.live_scratch_bytes)
+    }
+
+    fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
+        self.published
+            && self.identity.operation == operation
+            && self.identity.plan_id
+                == match operation {
+                    Operation::Count => COUNT_PLAN_ID,
+                    Operation::SpanSum => SPAN_SUM_PLAN_ID,
+                }
+            && self.accounting == Some(accounting)
+            && self.contains_actual()
+            && self.actual.work == accounting.build_work
+            && self.actual.live_persistent_bytes == accounting.persistent_bytes
+            && self.actual.live_scratch_bytes == 0
+            && self.actual.peak_bytes <= accounting.peak_bytes
+    }
+
+    fn closes_failure(&self) -> bool {
+        !self.published && self.accounting.is_none() && self.contains_actual()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildFailureKind {
+    EmptyPatternSet,
+    PatternLimit,
+    PatternBytesLimit,
+    IdentityBytesLimit,
+    TrieStatesLimit,
+    SparseEdgesLimit,
+    WorkLimit,
+    ScratchLimit,
+    PersistentLimit,
+    PeakLimit,
+    RepresentationLimit,
+    AllocationFailed,
+    InternalInvariant,
+    ArithmeticOverflow,
+}
+
+impl BuildFailureKind {
+    const fn from_error(error: &BuildError) -> Self {
+        match error {
+            BuildError::EmptyPatternSet => Self::EmptyPatternSet,
+            BuildError::PatternLimit { .. } => Self::PatternLimit,
+            BuildError::PatternBytesLimit { .. } => Self::PatternBytesLimit,
+            BuildError::IdentityBytesLimit { .. } => Self::IdentityBytesLimit,
+            BuildError::TrieStatesLimit { .. } => Self::TrieStatesLimit,
+            BuildError::SparseEdgesLimit { .. } => Self::SparseEdgesLimit,
+            BuildError::WorkLimit { .. } => Self::WorkLimit,
+            BuildError::ScratchLimit { .. } => Self::ScratchLimit,
+            BuildError::PersistentLimit { .. } => Self::PersistentLimit,
+            BuildError::PeakLimit { .. } => Self::PeakLimit,
+            BuildError::RepresentationLimit { .. } => Self::RepresentationLimit,
+            BuildError::AllocationFailed { .. } => Self::AllocationFailed,
+            BuildError::InternalInvariant { .. } => Self::InternalInvariant,
+            BuildError::ArithmeticOverflow { .. } => Self::ArithmeticOverflow,
+        }
+    }
+}
+
+/// Terminal sparse construction failure with its immutable partial actuals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildAttemptError {
+    source: BuildError,
+    receipt: BuildAttemptReceipt,
+    seal: BuildFailureKind,
+}
+
+impl BuildAttemptError {
+    fn new(source: BuildError, identity: BuildAttemptIdentity, actual: BuildAttemptActual) -> Self {
+        let seal = BuildFailureKind::from_error(&source);
+        Self {
+            source,
+            receipt: BuildAttemptReceipt {
+                identity,
+                actual,
+                accounting: None,
+                published: false,
+            },
+            seal,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &BuildError {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.seal == BuildFailureKind::from_error(&self.source) && self.receipt.closes_failure()
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> BuildError {
+        self.source
+    }
+}
+
+impl fmt::Display for BuildAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for BuildAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BuildAllocationClass {
+    Persistent,
+    Scratch,
+}
+
+struct BuildAttemptTracker {
+    actual: BuildAttemptActual,
+}
+
+impl BuildAttemptTracker {
+    fn new() -> Self {
+        Self {
+            actual: BuildAttemptActual::default(),
+        }
+    }
+
+    fn publish_inline(&mut self, bytes: usize) -> Result<(), BuildError> {
+        let live_persistent_bytes = self.actual.live_persistent_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "published inline plan bytes",
+            },
+        )?;
+        let initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "published inline initialized bytes",
+            },
+        )?;
+        self.actual.live_persistent_bytes = live_persistent_bytes;
+        self.actual.initialized_bytes = initialized_bytes;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(live_persistent_bytes);
+        Ok(())
+    }
+
+    fn sync_work(&mut self, work: &BuildWork) {
+        self.actual.work = work.used;
+    }
+
+    fn observe_copy(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.copied_bytes =
+            self.actual
+                .copied_bytes
+                .checked_add(bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual copied bytes",
+                })?;
+        self.observe_initialization(bytes)
+    }
+
+    fn observe_initialization(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "actual initialized bytes",
+            },
+        )?;
+        Ok(())
+    }
+
+    fn add_external_scratch(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.live_scratch_bytes = self.actual.live_scratch_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "borrowed source live scratch",
+            },
+        )?;
+        self.observe_peak()
+    }
+
+    fn release_external_scratch(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.live_scratch_bytes = self.actual.live_scratch_bytes.checked_sub(bytes).ok_or(
+            BuildError::InternalInvariant {
+                detail: "borrowed source scratch was live",
+            },
+        )?;
+        Ok(())
+    }
+
+    fn observe_reserve<T>(
+        &mut self,
+        before_capacity: usize,
+        after_capacity: usize,
+        class: BuildAllocationClass,
+    ) -> Result<(), BuildError> {
+        if after_capacity <= before_capacity {
+            return Ok(());
+        }
+        let before =
+            before_capacity
+                .checked_mul(size_of::<T>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "previous allocation capacity bytes",
+                })?;
+        let after =
+            after_capacity
+                .checked_mul(size_of::<T>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed allocation capacity bytes",
+                })?;
+        self.actual.allocations =
+            self.actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual build allocation count",
+                })?;
+        self.actual.allocated_bytes = self.actual.allocated_bytes.checked_add(after).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative allocated bytes",
+            },
+        )?;
+        let live = match class {
+            BuildAllocationClass::Persistent => &mut self.actual.live_persistent_bytes,
+            BuildAllocationClass::Scratch => &mut self.actual.live_scratch_bytes,
+        };
+        *live = live
+            .checked_sub(before)
+            .and_then(|bytes| bytes.checked_add(after))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "observed live allocation bytes",
+            })?;
+        self.observe_peak()
+    }
+
+    fn release<T>(
+        &mut self,
+        capacity: usize,
+        class: BuildAllocationClass,
+    ) -> Result<(), BuildError> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "released allocation capacity bytes",
+            })?;
+        let live = match class {
+            BuildAllocationClass::Persistent => &mut self.actual.live_persistent_bytes,
+            BuildAllocationClass::Scratch => &mut self.actual.live_scratch_bytes,
+        };
+        *live = live
+            .checked_sub(bytes)
+            .ok_or(BuildError::InternalInvariant {
+                detail: "released build capacity was live",
+            })?;
+        Ok(())
+    }
+
+    fn observe_peak(&mut self) -> Result<(), BuildError> {
+        let live = self
+            .actual
+            .live_persistent_bytes
+            .checked_add(self.actual.live_scratch_bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual construction live bytes",
+            })?;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(live);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReduceError {
@@ -567,10 +915,108 @@ pub struct SparseOrderedLiteralSpanSumPlan {
     core: PlanCore,
 }
 
+/// Successful sparse count-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct CountBuildAttempt {
+    plan: SparseOrderedLiteralCountPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl CountBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &SparseOrderedLiteralCountPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::Count, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (SparseOrderedLiteralCountPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> SparseOrderedLiteralCountPlan {
+        self.plan
+    }
+}
+
+/// Successful sparse span-sum-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct SpanSumBuildAttempt {
+    plan: SparseOrderedLiteralSpanSumPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl SpanSumBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &SparseOrderedLiteralSpanSumPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::SpanSum, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (SparseOrderedLiteralSpanSumPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> SparseOrderedLiteralSpanSumPlan {
+        self.plan
+    }
+}
+
 impl SparseOrderedLiteralCountPlan {
     /// Consume a concrete borrowed-pattern vector into a checked owned encoding.
     pub fn build(patterns: Vec<&[u8]>, limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(CountBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact success or partial-failure construction
+    /// effects.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_attempt(
+        patterns: Vec<&[u8]>,
+        limits: BuildLimits,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            algorithm_id: ALGORITHM_ID,
+            plan_id: COUNT_PLAN_ID,
+            operation: Operation::Count,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        };
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
+            |(core, receipt)| CountBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -614,7 +1060,35 @@ impl SparseOrderedLiteralCountPlan {
 impl SparseOrderedLiteralSpanSumPlan {
     /// Consume a concrete borrowed-pattern vector into a checked owned encoding.
     pub fn build(patterns: Vec<&[u8]>, limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(SpanSumBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact success or partial-failure construction
+    /// effects.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_attempt(
+        patterns: Vec<&[u8]>,
+        limits: BuildLimits,
+    ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            algorithm_id: ALGORITHM_ID,
+            plan_id: SPAN_SUM_PLAN_ID,
+            operation: Operation::SpanSum,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        };
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
+            |(core, receipt)| SpanSumBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -754,189 +1228,275 @@ impl PlanCore {
         clippy::too_many_lines,
         reason = "construction keeps all exact work and capacity checks adjacent"
     )]
-    fn build(
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    fn build_attempt(
         patterns: Vec<&[u8]>,
         limits: BuildLimits,
         inline_bytes: usize,
-    ) -> Result<Self, BuildError> {
+        identity: BuildAttemptIdentity,
+    ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
         let mut work = BuildWork::new(limits.max_build_work);
-        let (preflight, encoded_patterns, source_scratch_bytes, encoding_peak_bytes) =
-            encode_owned_patterns(patterns, limits, inline_bytes, &mut work)?;
+        let mut tracker = BuildAttemptTracker::new();
+        let result = (|| -> Result<Self, BuildError> {
+            let (preflight, encoded_patterns, source_scratch_bytes, encoding_peak_bytes) =
+                encode_owned_patterns(patterns, limits, inline_bytes, &mut work, &mut tracker)?;
 
-        let logical_scratch = preflight
-            .trie_states_upper_bound
-            .checked_mul(size_of::<RawNode>())
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    preflight
-                        .sparse_edges_upper_bound
-                        .checked_mul(size_of::<RawEdge>())?,
-                )
-            })
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "logical build scratch",
-            })?;
-        check_scratch(logical_scratch, limits)?;
-        let persistent_floor = inline_bytes.checked_add(preflight.identity_bytes).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "persistent floor",
-            },
-        )?;
-        check_persistent_peak(persistent_floor, logical_scratch, limits)?;
-
-        let mut raw_nodes =
-            reserve_vec::<RawNode>(preflight.trie_states_upper_bound, "temporary trie nodes")?;
-        let mut raw_edges =
-            reserve_vec::<RawEdge>(preflight.sparse_edges_upper_bound, "temporary trie edges")?;
-        work.charge(1)?;
-        checked_push(&mut raw_nodes, RawNode::EMPTY, "root node reservation")?;
-
-        let trie_scratch_bytes = capacity_bytes(&raw_nodes)?
-            .checked_add(capacity_bytes(&raw_edges)?)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "observed build scratch",
-            })?;
-        check_scratch(trie_scratch_bytes, limits)?;
-        let persistent_floor = inline_bytes
-            .checked_add(encoded_patterns.capacity())
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "observed persistent floor",
-            })?;
-        check_persistent_peak(persistent_floor, trie_scratch_bytes, limits)?;
-
-        insert_owned_patterns(
-            preflight,
-            &encoded_patterns,
-            &mut raw_nodes,
-            &mut raw_edges,
-            &mut work,
-        )?;
-        let state_count = raw_nodes.len();
-        let edge_count = raw_edges.len();
-
-        let offset_count = state_count
-            .checked_add(1)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "CSR offset count",
-            })?;
-        let requested_persistent = inline_bytes
-            .checked_add(encoded_patterns.capacity())
-            .and_then(|bytes| bytes.checked_add(offset_count.checked_mul(size_of::<u32>())?))
-            .and_then(|bytes| bytes.checked_add(edge_count.checked_mul(size_of::<u32>())?))
-            .and_then(|bytes| bytes.checked_add(state_count.checked_mul(size_of::<u32>())?))
-            .and_then(|bytes| bytes.checked_add(state_count.checked_mul(size_of::<Output>())?))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "requested sparse persistent bytes",
-            })?;
-        check_persistent_peak(requested_persistent, trie_scratch_bytes, limits)?;
-
-        work.charge(ROOT_TRANSITIONS)?;
-        let mut root_transitions = [0_u32; ROOT_TRANSITIONS];
-        let mut offsets = reserve_vec::<u32>(offset_count, "CSR offsets")?;
-        let mut edges = reserve_vec::<u32>(edge_count, "CSR edges")?;
-        let mut failure = reserve_vec::<u32>(state_count, "failure links")?;
-        let mut output = reserve_vec::<Output>(state_count, "outputs")?;
-
-        let persistent_bytes = inline_bytes
-            .checked_add(encoded_patterns.capacity())
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&offsets).ok()?))
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&edges).ok()?))
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&failure).ok()?))
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&output).ok()?))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "observed sparse persistent bytes",
-            })?;
-        let trie_peak_bytes = check_persistent_peak(persistent_bytes, trie_scratch_bytes, limits)?;
-        let scratch_bytes = trie_scratch_bytes.max(source_scratch_bytes);
-        let peak_bytes = trie_peak_bytes.max(encoding_peak_bytes);
-
-        for node in &raw_nodes {
-            work.charge(1)?;
-            checked_push(
-                &mut output,
-                Output {
-                    pattern: node.terminal_pattern_or_queue_next,
-                    length: node.terminal_length,
+            let logical_scratch = preflight
+                .trie_states_upper_bound
+                .checked_mul(size_of::<RawNode>())
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        preflight
+                            .sparse_edges_upper_bound
+                            .checked_mul(size_of::<RawEdge>())?,
+                    )
+                })
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "logical build scratch",
+                })?;
+            check_scratch(logical_scratch, limits)?;
+            let persistent_floor = inline_bytes.checked_add(preflight.identity_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent floor",
                 },
-                "output reservation",
             )?;
-            checked_push(&mut failure, 0, "failure reservation")?;
-        }
-        for (state, node) in raw_nodes.iter().enumerate() {
+            check_persistent_peak(persistent_floor, logical_scratch, limits)?;
+
+            let mut raw_nodes = reserve_build_vec::<RawNode>(
+                preflight.trie_states_upper_bound,
+                "temporary trie nodes",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
+            let mut raw_edges = reserve_build_vec::<RawEdge>(
+                preflight.sparse_edges_upper_bound,
+                "temporary trie edges",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
             work.charge(1)?;
+            checked_push(&mut raw_nodes, RawNode::EMPTY, "root node reservation")?;
+            tracker.observe_initialization(size_of::<RawNode>())?;
+
+            let trie_scratch_bytes = capacity_bytes(&raw_nodes)?
+                .checked_add(capacity_bytes(&raw_edges)?)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed build scratch",
+                })?;
+            check_scratch(trie_scratch_bytes, limits)?;
+            let persistent_floor = inline_bytes
+                .checked_add(encoded_patterns.capacity())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed persistent floor",
+                })?;
+            check_persistent_peak(persistent_floor, trie_scratch_bytes, limits)?;
+
+            insert_owned_patterns(
+                preflight,
+                &encoded_patterns,
+                &mut raw_nodes,
+                &mut raw_edges,
+                &mut work,
+                &mut tracker,
+            )?;
+            let state_count = raw_nodes.len();
+            let edge_count = raw_edges.len();
+
+            let offset_count =
+                state_count
+                    .checked_add(1)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "CSR offset count",
+                    })?;
+            let requested_persistent = inline_bytes
+                .checked_add(encoded_patterns.capacity())
+                .and_then(|bytes| bytes.checked_add(offset_count.checked_mul(size_of::<u32>())?))
+                .and_then(|bytes| bytes.checked_add(edge_count.checked_mul(size_of::<u32>())?))
+                .and_then(|bytes| bytes.checked_add(state_count.checked_mul(size_of::<u32>())?))
+                .and_then(|bytes| bytes.checked_add(state_count.checked_mul(size_of::<Output>())?))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "requested sparse persistent bytes",
+                })?;
+            check_persistent_peak(requested_persistent, trie_scratch_bytes, limits)?;
+
+            work.charge(ROOT_TRANSITIONS)?;
+            let mut root_transitions = [0_u32; ROOT_TRANSITIONS];
+            tracker.observe_initialization(
+                ROOT_TRANSITIONS.checked_mul(size_of::<u32>()).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "root transition initialized bytes",
+                    },
+                )?,
+            )?;
+            let mut offsets = reserve_build_vec::<u32>(
+                offset_count,
+                "CSR offsets",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut edges = reserve_build_vec::<u32>(
+                edge_count,
+                "CSR edges",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut failure = reserve_build_vec::<u32>(
+                state_count,
+                "failure links",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut output = reserve_build_vec::<Output>(
+                state_count,
+                "outputs",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+
+            let persistent_bytes = inline_bytes
+                .checked_add(encoded_patterns.capacity())
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&offsets).ok()?))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&edges).ok()?))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&failure).ok()?))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&output).ok()?))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed sparse persistent bytes",
+                })?;
+            let trie_peak_bytes =
+                check_persistent_peak(persistent_bytes, trie_scratch_bytes, limits)?;
+            let scratch_bytes = trie_scratch_bytes.max(source_scratch_bytes);
+            let peak_bytes = trie_peak_bytes.max(encoding_peak_bytes);
+
+            for node in &raw_nodes {
+                work.charge(1)?;
+                checked_push(
+                    &mut output,
+                    Output {
+                        pattern: node.terminal_pattern_or_queue_next,
+                        length: node.terminal_length,
+                    },
+                    "output reservation",
+                )?;
+                checked_push(&mut failure, 0, "failure reservation")?;
+                tracker.observe_initialization(
+                    size_of::<Output>().checked_add(size_of::<u32>()).ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "sparse state initialized bytes",
+                        },
+                    )?,
+                )?;
+            }
+            for (state, node) in raw_nodes.iter().enumerate() {
+                work.charge(1)?;
+                checked_push(
+                    &mut offsets,
+                    u32::try_from(edges.len()).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "CSR edge offsets",
+                        needed: edges.len(),
+                    })?,
+                    "CSR offset reservation",
+                )?;
+                tracker.observe_initialization(size_of::<u32>())?;
+                let mut edge = node.first_edge;
+                while edge != UNSET {
+                    work.charge(1)?;
+                    let raw = raw_edges[usize::try_from(edge).expect("u32 edge fits usize")];
+                    checked_push(&mut edges, raw.packed, "CSR edge reservation")?;
+                    tracker.observe_initialization(size_of::<u32>())?;
+                    if state == 0 {
+                        let byte = usize::from(edge_byte(raw.packed));
+                        let target = edge_target(raw.packed);
+                        if target == 0 || root_transitions[byte] != 0 {
+                            return Err(BuildError::InternalInvariant {
+                                detail: "root table has one non-root target per byte",
+                            });
+                        }
+                        root_transitions[byte] = target;
+                    }
+                    edge = raw.next_sibling;
+                }
+            }
             checked_push(
                 &mut offsets,
                 u32::try_from(edges.len()).map_err(|_| BuildError::RepresentationLimit {
                     structure: "CSR edge offsets",
                     needed: edges.len(),
                 })?,
-                "CSR offset reservation",
+                "terminal CSR offset reservation",
             )?;
-            let mut edge = node.first_edge;
-            while edge != UNSET {
-                work.charge(1)?;
-                let raw = raw_edges[usize::try_from(edge).expect("u32 edge fits usize")];
-                checked_push(&mut edges, raw.packed, "CSR edge reservation")?;
-                if state == 0 {
-                    let byte = usize::from(edge_byte(raw.packed));
-                    let target = edge_target(raw.packed);
-                    if target == 0 || root_transitions[byte] != 0 {
-                        return Err(BuildError::InternalInvariant {
-                            detail: "root table has one non-root target per byte",
-                        });
-                    }
-                    root_transitions[byte] = target;
-                }
-                edge = raw.next_sibling;
+            tracker.observe_initialization(size_of::<u32>())?;
+            if edges.len() != edge_count {
+                return Err(BuildError::InternalInvariant {
+                    detail: "CSR contains every temporary edge exactly once",
+                });
             }
-        }
-        checked_push(
-            &mut offsets,
-            u32::try_from(edges.len()).map_err(|_| BuildError::RepresentationLimit {
-                structure: "CSR edge offsets",
-                needed: edges.len(),
-            })?,
-            "terminal CSR offset reservation",
-        )?;
-        if edges.len() != edge_count {
-            return Err(BuildError::InternalInvariant {
-                detail: "CSR contains every temporary edge exactly once",
-            });
-        }
 
-        let mut automaton = SparseReverseAc {
-            root_transitions,
-            offsets,
-            edges,
-            failure,
-            output,
-        };
-        build_failure_links(&mut automaton, &mut raw_nodes, &mut work)?;
+            let mut automaton = SparseReverseAc {
+                root_transitions,
+                offsets,
+                edges,
+                failure,
+                output,
+            };
+            build_failure_links(&mut automaton, &mut raw_nodes, &mut work)?;
 
-        let max_edge_search_checks = max_search_checks(&automaton, &mut work)?;
-        let build = BuildAccounting {
-            patterns: preflight.patterns,
-            pattern_bytes: preflight.pattern_bytes,
-            identity_bytes: preflight.identity_bytes,
-            identity_capacity_bytes: encoded_patterns.capacity(),
-            trie_states_upper_bound: preflight.trie_states_upper_bound,
-            trie_states_actual: state_count,
-            sparse_edges_upper_bound: preflight.sparse_edges_upper_bound,
-            sparse_edges_actual: edge_count,
-            build_work: work.used,
-            max_pattern_bytes: preflight.max_pattern_bytes,
-            min_nonempty_pattern_bytes: preflight.min_nonempty_pattern_bytes,
-            has_empty_pattern: preflight.has_empty_pattern,
-            max_edge_search_checks,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            automaton,
-            encoded_patterns,
-            build,
-        })
+            let max_edge_search_checks = max_search_checks(&automaton, &mut work)?;
+            let build = BuildAccounting {
+                patterns: preflight.patterns,
+                pattern_bytes: preflight.pattern_bytes,
+                identity_bytes: preflight.identity_bytes,
+                identity_capacity_bytes: encoded_patterns.capacity(),
+                trie_states_upper_bound: preflight.trie_states_upper_bound,
+                trie_states_actual: state_count,
+                sparse_edges_upper_bound: preflight.sparse_edges_upper_bound,
+                sparse_edges_actual: edge_count,
+                build_work: work.used,
+                max_pattern_bytes: preflight.max_pattern_bytes,
+                min_nonempty_pattern_bytes: preflight.min_nonempty_pattern_bytes,
+                has_empty_pattern: preflight.has_empty_pattern,
+                max_edge_search_checks,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            let raw_nodes_capacity = raw_nodes.capacity();
+            let raw_edges_capacity = raw_edges.capacity();
+            drop(raw_nodes);
+            drop(raw_edges);
+            tracker.release::<RawNode>(raw_nodes_capacity, BuildAllocationClass::Scratch)?;
+            tracker.release::<RawEdge>(raw_edges_capacity, BuildAllocationClass::Scratch)?;
+            tracker.publish_inline(inline_bytes)?;
+            Ok(Self {
+                automaton,
+                encoded_patterns,
+                build,
+            })
+        })();
+        tracker.sync_work(&work);
+        match result {
+            Ok(core) => {
+                let receipt = BuildAttemptReceipt {
+                    identity,
+                    actual: tracker.actual,
+                    accounting: Some(core.build),
+                    published: true,
+                };
+                if !receipt.closes_success(identity.operation, core.build) {
+                    return Err(BuildAttemptError::new(
+                        BuildError::InternalInvariant {
+                            detail: "sparse build success did not close its receipt",
+                        },
+                        identity,
+                        tracker.actual,
+                    ));
+                }
+                Ok((core, receipt))
+            }
+            Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
+        }
     }
 
     fn preflight_reduce<T>(
@@ -1359,6 +1919,7 @@ fn begin_owned_pattern_encoding(
     inline_bytes: usize,
     source_scratch_bytes: usize,
     work: &mut BuildWork,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<Vec<u8>, BuildError> {
     if LENGTH_PREFIX_BYTES > limits.max_identity_bytes {
         return Err(BuildError::IdentityBytesLimit {
@@ -1373,8 +1934,14 @@ fn begin_owned_pattern_encoding(
                 computation: "initial identity allocation",
             })?;
     check_persistent_peak(initial_persistent, source_scratch_bytes, limits)?;
+    tracker.add_external_scratch(source_scratch_bytes)?;
     work.charge(LENGTH_PREFIX_BYTES)?;
-    let mut encoded = reserve_vec::<u8>(LENGTH_PREFIX_BYTES, "cache identity")?;
+    let mut encoded = reserve_build_vec::<u8>(
+        LENGTH_PREFIX_BYTES,
+        "cache identity",
+        BuildAllocationClass::Persistent,
+        tracker,
+    )?;
     let observed_initial =
         inline_bytes
             .checked_add(encoded.capacity())
@@ -1387,6 +1954,7 @@ fn begin_owned_pattern_encoding(
         &[0_u8; LENGTH_PREFIX_BYTES],
         "identity count prefix reservation",
     )?;
+    tracker.observe_copy(LENGTH_PREFIX_BYTES)?;
     Ok(encoded)
 }
 
@@ -1396,6 +1964,7 @@ fn reserve_owned_pattern_identity(
     limits: BuildLimits,
     inline_bytes: usize,
     source_scratch_bytes: usize,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<(), BuildError> {
     let identity_bytes = encoded
         .len()
@@ -1423,12 +1992,19 @@ fn reserve_owned_pattern_identity(
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "identity reservation increment",
             })?;
+    let before_capacity = encoded.capacity();
+    build_allocation_probe::before("cache identity", additional)?;
     encoded
         .try_reserve_exact(additional)
         .map_err(|_| BuildError::AllocationFailed {
             structure: "cache identity",
             additional,
         })?;
+    tracker.observe_reserve::<u8>(
+        before_capacity,
+        encoded.capacity(),
+        BuildAllocationClass::Persistent,
+    )?;
     let observed_persistent =
         inline_bytes
             .checked_add(encoded.capacity())
@@ -1443,6 +2019,7 @@ fn finish_owned_pattern_encoding(
     stats: OwnedPatternStats,
     mut encoded: Vec<u8>,
     work: &mut BuildWork,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<(BuildPreflight, Vec<u8>), BuildError> {
     let preflight = stats.finish(encoded.len())?;
     let count_prefix = u64::try_from(preflight.patterns)
@@ -1452,6 +2029,7 @@ fn finish_owned_pattern_encoding(
         .to_le_bytes();
     work.charge(LENGTH_PREFIX_BYTES)?;
     encoded[..LENGTH_PREFIX_BYTES].copy_from_slice(&count_prefix);
+    tracker.observe_copy(LENGTH_PREFIX_BYTES)?;
     Ok((preflight, encoded))
 }
 
@@ -1460,6 +2038,7 @@ fn encode_owned_patterns(
     limits: BuildLimits,
     inline_bytes: usize,
     work: &mut BuildWork,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<(BuildPreflight, Vec<u8>, usize, usize), BuildError> {
     let source_scratch_bytes = patterns.capacity().checked_mul(size_of::<&[u8]>()).ok_or(
         BuildError::ArithmeticOverflow {
@@ -1468,7 +2047,7 @@ fn encode_owned_patterns(
     )?;
     check_scratch(source_scratch_bytes, limits)?;
     let mut encoded =
-        begin_owned_pattern_encoding(limits, inline_bytes, source_scratch_bytes, work)?;
+        begin_owned_pattern_encoding(limits, inline_bytes, source_scratch_bytes, work, tracker)?;
     let mut stats = OwnedPatternStats::default();
     let mut index = 0_usize;
     while index < patterns.len() {
@@ -1481,6 +2060,7 @@ fn encode_owned_patterns(
             limits,
             inline_bytes,
             source_scratch_bytes,
+            tracker,
         )?;
         work.charge(LENGTH_PREFIX_BYTES)?;
         let length = u64::try_from(bytes.len()).map_err(|_| BuildError::ArithmeticOverflow {
@@ -1491,8 +2071,10 @@ fn encode_owned_patterns(
             &length.to_le_bytes(),
             "identity length reservation",
         )?;
+        tracker.observe_copy(LENGTH_PREFIX_BYTES)?;
         work.charge(bytes.len())?;
         checked_extend(&mut encoded, bytes, "identity byte reservation")?;
+        tracker.observe_copy(bytes.len())?;
         index = index.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
             computation: "borrowed pattern source index",
         })?;
@@ -1503,8 +2085,9 @@ fn encode_owned_patterns(
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "observed source encoding peak",
         })?;
-    let (preflight, encoded) = finish_owned_pattern_encoding(stats, encoded, work)?;
+    let (preflight, encoded) = finish_owned_pattern_encoding(stats, encoded, work, tracker)?;
     drop(patterns);
+    tracker.release_external_scratch(source_scratch_bytes)?;
     Ok((
         preflight,
         encoded,
@@ -1535,6 +2118,7 @@ fn insert_owned_patterns(
     nodes: &mut Vec<RawNode>,
     edges: &mut Vec<RawEdge>,
     work: &mut BuildWork,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<(), BuildError> {
     let mut count = 0_usize;
     let mut identity_offset = LENGTH_PREFIX_BYTES;
@@ -1585,7 +2169,7 @@ fn insert_owned_patterns(
         let mut state = 0_u32;
         for &byte in bytes.iter().rev() {
             work.charge(1)?;
-            state = child_or_insert(state, byte, nodes, edges, work)?;
+            state = child_or_insert(state, byte, nodes, edges, work, tracker)?;
         }
         work.charge(1)?;
         let terminal = &mut nodes[usize::try_from(state).expect("u32 state fits usize")];
@@ -1611,6 +2195,7 @@ fn child_or_insert(
     nodes: &mut Vec<RawNode>,
     edges: &mut Vec<RawEdge>,
     work: &mut BuildWork,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<u32, BuildError> {
     let state_index = usize::try_from(state).expect("u32 state fits usize");
     let mut previous = UNSET;
@@ -1657,6 +2242,13 @@ fn child_or_insert(
             next_sibling: current,
         },
         "temporary trie edge reservation",
+    )?;
+    tracker.observe_initialization(
+        size_of::<RawNode>()
+            .checked_add(size_of::<RawEdge>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "temporary trie initialized bytes",
+            })?,
     )?;
     if previous == UNSET {
         nodes[state_index].first_edge = edge_id;
@@ -1926,14 +2518,77 @@ const fn edge_target(packed: u32) -> u32 {
     packed & TARGET_MASK
 }
 
-fn reserve_vec<T>(additional: usize, structure: &'static str) -> Result<Vec<T>, BuildError> {
+#[cfg(not(test))]
+mod build_allocation_probe {
+    use super::BuildError;
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production and test probes intentionally share one fallible call-site contract"
+    )]
+    pub(super) const fn before(
+        _structure: &'static str,
+        _additional: usize,
+    ) -> Result<(), BuildError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod build_allocation_probe {
+    use std::cell::Cell;
+
+    use super::BuildError;
+
+    std::thread_local! {
+        static FAIL_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_AT.set(usize::MAX);
+            CALLS.set(0);
+        }
+    }
+
+    pub(crate) fn fail_at(ordinal: usize) -> Guard {
+        FAIL_AT.set(ordinal);
+        CALLS.set(0);
+        Guard
+    }
+
+    pub(super) fn before(structure: &'static str, additional: usize) -> Result<(), BuildError> {
+        let ordinal = CALLS.get();
+        CALLS.set(ordinal.saturating_add(1));
+        if ordinal == FAIL_AT.get() {
+            return Err(BuildError::AllocationFailed {
+                structure,
+                additional,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn reserve_build_vec<T>(
+    additional: usize,
+    structure: &'static str,
+    class: BuildAllocationClass,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<Vec<T>, BuildError> {
     let mut values = Vec::new();
+    build_allocation_probe::before(structure, additional)?;
+    let before = values.capacity();
     values
         .try_reserve_exact(additional)
         .map_err(|_| BuildError::AllocationFailed {
             structure,
             additional,
         })?;
+    tracker.observe_reserve::<T>(before, values.capacity(), class)?;
     Ok(values)
 }
 
@@ -2063,8 +2718,82 @@ mod tests {
     use super::{
         BuildError, BuildLimits, BuildWork, Output, ROOT_TRANSITIONS, RawEdge, RawNode,
         ReduceError, ReduceLimits, SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
-        SparseReverseAc, UNSET, build_failure_links, charged_dequeue, pack_edge,
+        SparseReverseAc, UNSET, build_allocation_probe, build_failure_links, charged_dequeue,
+        pack_edge,
     };
+
+    #[test]
+    fn build_attempt_receipts_close_success_and_partial_identity_failure() {
+        let patterns = vec![b"ab".as_slice(), b"ac".as_slice()];
+        let attempt = SparseOrderedLiteralCountPlan::build_attempt(
+            patterns.clone(),
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(attempt.closes());
+        let accounting = attempt.plan().build_accounting();
+        let receipt = attempt.receipt();
+        let actual = receipt.actual();
+        assert!(receipt.published());
+        assert_eq!(receipt.accounting(), Some(accounting));
+        assert_eq!(actual.work, accounting.build_work);
+        assert!(actual.allocations > 0);
+        assert!(actual.allocated_bytes >= accounting.identity_capacity_bytes);
+        assert!(actual.copied_bytes > 0);
+        assert!(actual.initialized_bytes >= actual.copied_bytes);
+        assert_eq!(actual.live_persistent_bytes, accounting.persistent_bytes);
+        assert_eq!(actual.live_scratch_bytes, 0);
+
+        let guard = build_allocation_probe::fail_at(1);
+        let failure = SparseOrderedLiteralCountPlan::build_attempt(
+            patterns.clone(),
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        drop(guard);
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed {
+                structure: "cache identity",
+                ..
+            }
+        ));
+        assert!(failure.closes());
+        let partial = failure.receipt().actual();
+        assert!(!failure.receipt().published());
+        assert_eq!(failure.receipt().accounting(), None);
+        assert_eq!(partial.allocations, 1);
+        assert!(partial.allocated_bytes > 0);
+        assert!(partial.work > 0);
+        assert!(partial.copied_bytes > 0);
+        assert_eq!(partial.initialized_bytes, partial.copied_bytes);
+
+        let guard = build_allocation_probe::fail_at(1);
+        let legacy =
+            SparseOrderedLiteralCountPlan::build(patterns, BuildLimits::unlimited()).unwrap_err();
+        drop(guard);
+        assert!(matches!(
+            legacy,
+            BuildError::AllocationFailed {
+                structure: "cache identity",
+                ..
+            }
+        ));
+
+        let refusal = SparseOrderedLiteralCountPlan::build_attempt(
+            vec![b"ab".as_slice(), b"ac".as_slice()],
+            BuildLimits {
+                max_persistent_bytes: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal.source(),
+            BuildError::PersistentLimit { .. }
+        ));
+        assert!(refusal.closes());
+    }
 
     fn regex(patterns: &[Vec<u8>]) -> Regex {
         let mut source = String::from("(?:");
@@ -2515,6 +3244,19 @@ mod tests {
                 assert!(
                     matches!(error, BuildError::$variant { limit: actual, .. } if actual == limit),
                     "one-below {} returned {error:?}",
+                    stringify!($field)
+                );
+                let terminal = SparseOrderedLiteralCountPlan::build_attempt(
+                    patterns.to_vec(),
+                    BuildLimits {
+                        $field: limit,
+                        ..exact
+                    },
+                )
+                .unwrap_err();
+                assert!(
+                    terminal.closes(),
+                    "one-below {} returned an unclosed attempt receipt: {terminal:?}",
                     stringify!($field)
                 );
             }};

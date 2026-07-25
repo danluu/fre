@@ -10,6 +10,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 /// Stable identity for the exact ordered grapheme scalar machine.
 pub const PLAN_ID: &str = "grapheme-scalar-dfa.utf8-role-transitions.v2";
 /// Stable identity for match counting.
@@ -639,6 +641,110 @@ struct BuildPreflight {
     peak_bytes: usize,
 }
 
+struct DirectBuildTracker {
+    actual: DirectBuildAttemptActual,
+    live_unpublished_bytes: usize,
+}
+
+impl DirectBuildTracker {
+    const fn new() -> Self {
+        Self {
+            actual: DirectBuildAttemptActual {
+                work: 0,
+                allocations: 0,
+                allocated_bytes: 0,
+                copied_bytes: 0,
+                initialized_bytes: 0,
+                live_persistent_bytes: 0,
+                peak_bytes: 0,
+            },
+            live_unpublished_bytes: 0,
+        }
+    }
+
+    fn charge(&mut self, units: usize) -> Result<(), BuildError> {
+        let units = u64::try_from(units).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual grapheme build work as u64",
+        })?;
+        self.actual.work =
+            self.actual
+                .work
+                .checked_add(units)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual grapheme build work",
+                })?;
+        Ok(())
+    }
+
+    fn observe_allocation<T>(&mut self, capacity: usize) -> Result<(), BuildError> {
+        if capacity == 0 {
+            return Ok(());
+        }
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "observed grapheme allocation bytes",
+            })?;
+        self.actual.allocations =
+            self.actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual grapheme allocation count",
+                })?;
+        self.actual.allocated_bytes = self.actual.allocated_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative grapheme allocated bytes",
+            },
+        )?;
+        self.live_unpublished_bytes = self.live_unpublished_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "live grapheme allocation bytes",
+            },
+        )?;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(self.live_unpublished_bytes);
+        self.charge(ALLOCATION_WORK)
+    }
+
+    fn observe_initialization<T>(&mut self) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(size_of::<T>())
+            .ok_or(BuildError::ArithmeticOverflow {
+            computation: "actual grapheme initialized bytes",
+        })?;
+        Ok(())
+    }
+
+    fn release<T>(&mut self, capacity: usize) -> Result<(), BuildError> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "released grapheme allocation bytes",
+            })?;
+        self.live_unpublished_bytes = self.live_unpublished_bytes.checked_sub(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "live grapheme allocation release",
+            },
+        )?;
+        Ok(())
+    }
+
+    fn publish(&mut self, persistent_bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(size_of::<GraphemeScalarDfaPlan>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "published grapheme inline initialized bytes",
+            })?;
+        self.actual.live_persistent_bytes = persistent_bytes;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(persistent_bytes);
+        Ok(())
+    }
+}
+
 impl BuildPreflight {
     fn for_range_count(source_ranges: usize) -> Result<Self, BuildError> {
         let events = checked_build_mul(source_ranges, 2, "event count")?;
@@ -755,11 +861,16 @@ struct BuildTransaction {
 }
 
 impl BuildTransaction {
-    fn allocate(preflight: BuildPreflight) -> Result<Self, BuildError> {
+    fn allocate(
+        preflight: BuildPreflight,
+        tracker: &mut DirectBuildTracker,
+    ) -> Result<Self, BuildError> {
         let events = ExactVec::try_with_capacity(preflight.events)
             .map_err(|error| map_exact_allocation(error, preflight.events))?;
+        tracker.observe_allocation::<Event>(events.capacity())?;
         let segments = ExactVec::try_with_capacity(preflight.segment_capacity)
             .map_err(|error| map_exact_allocation(error, preflight.segment_capacity))?;
+        tracker.observe_allocation::<RoleSegment>(segments.capacity())?;
         Ok(Self {
             events,
             segments,
@@ -771,11 +882,13 @@ impl BuildTransaction {
     fn populate_checked(
         &mut self,
         ranges: impl IntoIterator<Item = (GraphemeScalarClassRole, char, char)>,
+        tracker: &mut DirectBuildTracker,
     ) -> Result<(), BuildError> {
         let mut previous = [None::<u32>; ROLE_COUNT];
         let mut seen = [false; ROLE_COUNT];
         let mut source_ranges = 0_usize;
         for (role, start, end) in ranges {
+            tracker.charge(RANGE_VALIDATION_WORK)?;
             if start > end {
                 return Err(BuildError::ReversedRange { role, start, end });
             }
@@ -796,6 +909,8 @@ impl BuildTransaction {
                 .map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "preflight event capacity",
                 })?;
+            tracker.observe_initialization::<Event>()?;
+            tracker.charge(EVENT_WRITE_WORK)?;
             self.events
                 .try_push(Event {
                     point: end_u32
@@ -809,6 +924,8 @@ impl BuildTransaction {
                 .map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "preflight event capacity",
                 })?;
+            tracker.observe_initialization::<Event>()?;
+            tracker.charge(EVENT_WRITE_WORK)?;
         }
         if source_ranges != self.preflight.source_ranges {
             return Err(BuildError::ArithmeticOverflow {
@@ -825,17 +942,32 @@ impl BuildTransaction {
         Ok(())
     }
 
-    fn sort(&mut self) -> Result<(), BuildError> {
+    fn sort(&mut self, tracker: &mut DirectBuildTracker) -> Result<(), BuildError> {
         self.sort_comparisons = sort_events(self.events.as_mut_slice())?;
         if self.sort_comparisons > self.preflight.sort_comparisons {
             return Err(BuildError::ArithmeticOverflow {
                 computation: "sort comparison proof",
             });
         }
+        tracker.charge(
+            self.events
+                .len()
+                .checked_mul(SORT_EVENT_OVERHEAD_WORK)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual sort overhead work",
+                })?,
+        )?;
+        tracker.charge(
+            self.sort_comparisons
+                .checked_mul(SORT_COMPARISON_WORK)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual sort comparison work",
+                })?,
+        )?;
         Ok(())
     }
 
-    fn sweep(&mut self) -> Result<(), BuildError> {
+    fn sweep(&mut self, tracker: &mut DirectBuildTracker) -> Result<(), BuildError> {
         let mut active = 0_u32;
         let mut cursor = 0_u32;
         let mut event_index = 0_usize;
@@ -852,8 +984,11 @@ impl BuildTransaction {
                         roles: active,
                     },
                 )?;
+                tracker.observe_initialization::<RoleSegment>()?;
+                tracker.charge(SEGMENT_WRITE_WORK)?;
             }
             while event_index < self.events.len() && self.events[event_index].point == point {
+                tracker.charge(SWEEP_EVENT_WORK)?;
                 let event = self.events[event_index];
                 if event.add {
                     active |= event.role.bit();
@@ -877,8 +1012,10 @@ impl BuildTransaction {
                     roles: active,
                 },
             )?;
+            tracker.observe_initialization::<RoleSegment>()?;
+            tracker.charge(SEGMENT_WRITE_WORK)?;
         }
-        validate_semantics(&self.segments)
+        validate_semantics(&self.segments, tracker)
     }
 
     fn accounting(&self) -> Result<BuildAccounting, BuildError> {
@@ -1039,7 +1176,17 @@ impl GraphemeScalarDfaPlan {
         ranges: &[(GraphemeScalarClassRole, char, char)],
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build_from_counted_iter(ranges.len(), ranges.iter().copied(), limits)
+        Self::build_attempt(ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Overlay one canonical role-range slice with exact observed effects.
+    pub fn build_attempt(
+        ranges: &[(GraphemeScalarClassRole, char, char)],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        Self::build_from_counted_iter_attempt(ranges.len(), ranges.iter().copied(), limits)
     }
 
     /// Overlay a prospectively counted canonical range stream without
@@ -1050,16 +1197,51 @@ impl GraphemeScalarDfaPlan {
         ranges: impl IntoIterator<Item = (GraphemeScalarClassRole, char, char)>,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        let preflight = admitted_build_preflight(source_ranges, limits)?;
-        let mut transaction = BuildTransaction::allocate(preflight)?;
-        transaction.populate_checked(ranges)?;
-        transaction.sort()?;
-        transaction.sweep()?;
-        let build = transaction.accounting()?;
-        Ok(Self {
-            segments: transaction.segments,
-            build,
-        })
+        Self::build_from_counted_iter_attempt(source_ranges, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Overlay a counted range stream with exact observed construction effects.
+    pub fn build_from_counted_iter_attempt(
+        source_ranges: usize,
+        ranges: impl IntoIterator<Item = (GraphemeScalarClassRole, char, char)>,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut tracker = DirectBuildTracker::new();
+        let result = (|| {
+            let preflight = admitted_build_preflight(source_ranges, limits)?;
+            tracker.charge(BUILD_FIXED_WORK)?;
+            let mut transaction = BuildTransaction::allocate(preflight, &mut tracker)?;
+            transaction.populate_checked(ranges, &mut tracker)?;
+            transaction.sort(&mut tracker)?;
+            transaction.sweep(&mut tracker)?;
+            let build = transaction.accounting()?;
+            let expected_actual_work =
+                u64::try_from(build.actual_work).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "grapheme accounting actual work as u64",
+                })?;
+            if tracker.actual.work != expected_actual_work {
+                return Err(BuildError::ArithmeticOverflow {
+                    computation: "grapheme exact work accounting mismatch",
+                });
+            }
+            let event_capacity = transaction.events.capacity();
+            tracker.release::<Event>(event_capacity)?;
+            let plan = Self {
+                segments: transaction.segments,
+                build,
+            };
+            tracker.publish(build.persistent_bytes)?;
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, tracker.actual)),
+            Err(source) => {
+                tracker.actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, tracker.actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1613,9 +1795,13 @@ impl ClusterState {
     }
 }
 
-fn validate_semantics(segments: &[RoleSegment]) -> Result<(), BuildError> {
+fn validate_semantics(
+    segments: &[RoleSegment],
+    tracker: &mut DirectBuildTracker,
+) -> Result<(), BuildError> {
     let mut cursor = 0_u32;
     for segment in segments {
+        tracker.charge(SEMANTIC_SEGMENT_WORK)?;
         if cursor < segment.start
             && interval_has_scalar(
                 cursor,
@@ -2028,6 +2214,80 @@ mod tests {
             (Role::GenericCore, '\u{e}', '\u{10FFFF}'),
         ]);
         ranges
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_stream_failure() {
+        let ranges = ranges();
+        let attempt =
+            GraphemeScalarDfaPlan::build_attempt(&ranges, BuildLimits::unlimited()).unwrap();
+        let actual = attempt.actual();
+        let plan = attempt.into_plan();
+        let build = plan.build_accounting();
+        let allocated_bytes = build
+            .event_capacity
+            .checked_mul(size_of::<Event>())
+            .and_then(|bytes| {
+                build
+                    .segment_capacity
+                    .checked_mul(size_of::<RoleSegment>())
+                    .and_then(|segments| bytes.checked_add(segments))
+            })
+            .unwrap();
+        let initialized_bytes = build
+            .events
+            .checked_mul(size_of::<Event>())
+            .and_then(|bytes| {
+                build
+                    .retained_segments
+                    .checked_mul(size_of::<RoleSegment>())
+                    .and_then(|segments| bytes.checked_add(segments))
+            })
+            .and_then(|bytes| bytes.checked_add(size_of::<GraphemeScalarDfaPlan>()))
+            .unwrap();
+        assert_eq!(actual.work, u64::try_from(build.actual_work).unwrap());
+        assert_eq!(actual.allocations, build.allocations);
+        assert_eq!(actual.allocated_bytes, allocated_bytes);
+        assert_eq!(actual.copied_bytes, 0);
+        assert_eq!(actual.initialized_bytes, initialized_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(
+            actual.peak_bytes,
+            allocated_bytes.max(build.persistent_bytes)
+        );
+
+        let failure = GraphemeScalarDfaPlan::build_from_counted_iter_attempt(
+            2,
+            [(Role::Cr, '\r', '\r')],
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::ArithmeticOverflow {
+                computation: "preflight source range count"
+            }
+        ));
+        let partial = failure.actual();
+        assert_eq!(
+            partial.work,
+            u64::try_from(
+                super::BUILD_FIXED_WORK
+                    + 2 * super::ALLOCATION_WORK
+                    + super::RANGE_VALIDATION_WORK
+                    + 2 * super::EVENT_WRITE_WORK
+            )
+            .unwrap()
+        );
+        assert_eq!(partial.allocations, 2);
+        assert_eq!(
+            partial.allocated_bytes,
+            4 * size_of::<Event>() + 4 * size_of::<RoleSegment>()
+        );
+        assert_eq!(partial.copied_bytes, 0);
+        assert_eq!(partial.initialized_bytes, 2 * size_of::<Event>());
+        assert_eq!(partial.live_persistent_bytes, 0);
+        assert_eq!(partial.peak_bytes, partial.allocated_bytes);
     }
 
     fn plan() -> GraphemeScalarDfaPlan {

@@ -276,9 +276,9 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 3;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 4;
 
-/// Maximum allocation count representable by every route in accounting v3.
+/// Maximum allocation count representable by every route in accounting v4.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -585,6 +585,128 @@ pub struct OperationAttemptReceipt {
     pub allocation_limit: usize,
     /// Successful operation-local allocations committed by this attempt.
     pub actual_allocations: usize,
+    authentication: Option<OperationAttemptReceiptAuthentication>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationAttemptReceiptAuthentication {
+    identity: OperationAttemptIdentity,
+    invocation: OperationInvocation,
+    prospective: Option<OperationProspective>,
+    actual: ExecutionAccounting,
+    allocation_limit: usize,
+    actual_allocations: usize,
+    terminal: OperationAttemptTerminalAuthentication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationAttemptTerminalAuthentication {
+    Success,
+    Failure(Error),
+}
+
+impl OperationAttemptReceiptAuthentication {
+    fn new(
+        receipt: &OperationAttemptReceipt,
+        terminal: OperationAttemptTerminalAuthentication,
+    ) -> Self {
+        Self {
+            identity: receipt.identity,
+            invocation: receipt.invocation.clone(),
+            prospective: receipt.prospective,
+            actual: receipt.actual,
+            allocation_limit: receipt.allocation_limit,
+            actual_allocations: receipt.actual_allocations,
+            terminal,
+        }
+    }
+
+    fn matches(&self, receipt: &OperationAttemptReceipt) -> bool {
+        self.identity == receipt.identity
+            && self.invocation == receipt.invocation
+            && self.prospective == receipt.prospective
+            && self.actual == receipt.actual
+            && self.allocation_limit == receipt.allocation_limit
+            && self.actual_allocations == receipt.actual_allocations
+    }
+}
+
+impl OperationAttemptReceipt {
+    fn authenticate_terminal(&mut self, terminal: OperationAttemptTerminalAuthentication) {
+        debug_assert!(
+            self.authentication.is_none(),
+            "operation attempt terminal was authenticated more than once"
+        );
+        self.authentication = Some(OperationAttemptReceiptAuthentication::new(self, terminal));
+    }
+
+    /// Authenticate the exact immutable identity, invocation, P/A, and
+    /// allocation fields published by the operation executor.
+    #[must_use]
+    pub fn authenticates_canonical(&self) -> bool {
+        self.authentication
+            .as_ref()
+            .is_some_and(|authentication| authentication.matches(self))
+            && self.identity.algorithm_version == CONTINUATION_OPERATION_ALGORITHM_VERSION
+            && self.identity.accounting_version == CONTINUATION_OPERATION_ACCOUNTING_VERSION
+            && match self.prospective {
+                None => {
+                    self.identity.physical_route.is_none()
+                        && self.actual == ExecutionAccounting::default()
+                        && self.actual_allocations == 0
+                }
+                Some(prospective) => {
+                    self.identity.physical_route.is_some()
+                        && prospective.contains(self.actual)
+                        && self.actual_allocations <= prospective.allocations
+                        && self.actual_allocations <= self.allocation_limit
+                }
+            }
+    }
+
+    /// Authenticate a successful terminal and all of its exact public fields.
+    #[must_use]
+    pub fn authenticates_success(&self) -> bool {
+        self.authentication.as_ref().is_some_and(|authentication| {
+            self.authenticates_canonical()
+                && self.has_valid_invocation()
+                && authentication.terminal == OperationAttemptTerminalAuthentication::Success
+        })
+    }
+
+    /// Authenticate the exact typed failure paired with this terminal receipt.
+    #[must_use]
+    pub fn authenticates_source(&self, source: &Error) -> bool {
+        self.authentication.as_ref().is_some_and(|authentication| {
+            self.authenticates_canonical()
+                && self.invocation_authenticates_source(source)
+                && matches!(
+                    &authentication.terminal,
+                    OperationAttemptTerminalAuthentication::Failure(authenticated)
+                        if authenticated == source
+                )
+        })
+    }
+
+    fn has_valid_invocation(&self) -> bool {
+        self.invocation.range.start <= self.invocation.range.end
+            && self.invocation.range.end <= self.invocation.haystack_len
+    }
+
+    fn invocation_authenticates_source(&self, source: &Error) -> bool {
+        match *source {
+            Error::InvalidRange {
+                start,
+                end,
+                haystack_len,
+            } => {
+                self.invocation.range == (start..end)
+                    && self.invocation.haystack_len == haystack_len
+                    && (start > end || end > haystack_len)
+            }
+            _ => self.has_valid_invocation(),
+        }
+    }
 }
 
 /// Terminal failure from a receipt-bearing continuation attempt.
@@ -592,6 +714,21 @@ pub struct OperationAttemptReceipt {
 pub struct OperationAttemptError {
     pub source: Error,
     pub receipt: OperationAttemptReceipt,
+}
+
+impl OperationAttemptError {
+    fn new(source: Error, mut receipt: OperationAttemptReceipt) -> Self {
+        receipt.authenticate_terminal(OperationAttemptTerminalAuthentication::Failure(
+            source.clone(),
+        ));
+        Self { source, receipt }
+    }
+
+    /// Authenticate the exact public terminal source and immutable receipt.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt.authenticates_source(&self.source)
+    }
 }
 
 impl core::fmt::Display for OperationAttemptError {
@@ -1633,6 +1770,7 @@ impl CompiledRegex {
             actual: ExecutionAccounting::default(),
             allocation_limit,
             actual_allocations: 0,
+            authentication: None,
         };
         let result = {
             let publication = AttemptPublication {
@@ -1660,7 +1798,7 @@ impl CompiledRegex {
                         .certificate
                         .retain_published_prospective(prospective, receipt.actual_allocations)
                 {
-                    return Err(OperationAttemptError { source, receipt });
+                    return Err(OperationAttemptError::new(source, receipt));
                 }
                 let valid = receipt.prospective.as_ref().is_some_and(|upper| {
                     (*upper).contains(receipt.actual)
@@ -1681,13 +1819,14 @@ impl CompiledRegex {
                     && receipt.identity.prepublication_fallback
                         == result.certificate.prepublication_fallback;
                 if !valid || receipt.actual != result.accounting {
-                    return Err(OperationAttemptError {
-                        source: Error::InternalInvariant(
+                    return Err(OperationAttemptError::new(
+                        Error::InternalInvariant(
                             "continuation success route or actual counters diverged from its prospective certificate",
                         ),
                         receipt,
-                    });
+                    ));
                 }
+                receipt.authenticate_terminal(OperationAttemptTerminalAuthentication::Success);
                 Ok((result, receipt))
             }
             Err(mut source) => {
@@ -1702,7 +1841,7 @@ impl CompiledRegex {
                         "continuation attempt route or actual counters diverged from its prospective certificate",
                     );
                 }
-                Err(OperationAttemptError { source, receipt })
+                Err(OperationAttemptError::new(source, receipt))
             }
         }
     }
@@ -7470,6 +7609,15 @@ mod tests {
         assert_eq!(failure.receipt.identity.operation_id(), None);
         assert_eq!(failure.receipt.prospective, None);
         assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+        assert!(failure.closes());
+
+        let mut mismatched = failure;
+        mismatched.source = Error::InvalidRange {
+            start: 0,
+            end: 7,
+            haystack_len: 5,
+        };
+        assert!(!mismatched.closes());
     }
 
     #[test]
@@ -7630,7 +7778,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v3_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+    fn accounting_v4_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
         let compiled = terminal_frontier_count();
         let haystack = b"no terminal prefix here";
         let limits = OperationLimits::default();
@@ -7732,7 +7880,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v3_allocation_encoding_is_checked_at_its_route_maximum() {
+    fn accounting_v4_allocation_encoding_is_checked_at_its_route_maximum() {
         for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
             assert_eq!(
                 compact_operation_allocation_count(allocations).unwrap(),
@@ -8857,6 +9005,25 @@ mod tests {
             spans_first.receipt.identity.accounting_version,
             CONTINUATION_OPERATION_ACCOUNTING_VERSION
         );
+        assert!(spans_first.receipt.authenticates_success());
+        let mut mutated_success = spans_first.receipt.clone();
+        mutated_success.identity.accounting_version = 3;
+        assert!(!mutated_success.authenticates_canonical());
+        assert!(!mutated_success.authenticates_success());
+        let mut coherent_actual_mutation = spans_first.receipt.clone();
+        assert_ne!(
+            coherent_actual_mutation.actual,
+            ExecutionAccounting::default()
+        );
+        coherent_actual_mutation.actual = ExecutionAccounting::default();
+        coherent_actual_mutation.actual_allocations = 0;
+        assert!(
+            coherent_actual_mutation
+                .prospective
+                .is_some_and(|prospective| prospective.contains(coherent_actual_mutation.actual))
+        );
+        assert!(!coherent_actual_mutation.authenticates_canonical());
+        assert!(!coherent_actual_mutation.authenticates_success());
 
         let count = compiled
             .admit_count_attempt(&haystack, range.clone(), strategy, limits)
@@ -8927,6 +9094,18 @@ mod tests {
         );
         assert_eq!(spans_refusal.receipt.actual, ExecutionAccounting::default());
         assert_eq!(spans_refusal.receipt.actual_allocations, 0);
+        assert!(spans_refusal.closes());
+        let mut invocation_mutation = spans_refusal.clone();
+        invocation_mutation.receipt.invocation.range = 0..1;
+        invocation_mutation.receipt.invocation.haystack_len = 0;
+        assert!(!invocation_mutation.closes());
+        let mut source_mutation = spans_refusal.clone();
+        source_mutation.source = Error::InternalInvariant("caller-spliced continuation source");
+        assert!(!source_mutation.closes());
+        let mut receipt_mutation = spans_refusal.clone();
+        receipt_mutation.receipt.identity.algorithm_version =
+            CONTINUATION_OPERATION_ALGORITHM_VERSION.wrapping_add(1);
+        assert!(!receipt_mutation.closes());
 
         let mut sum_below = limits;
         sum_below.max_span_sum = sum_upper.span_sum - 1;

@@ -2,6 +2,8 @@
 
 use regex_syntax::hir::{Hir, HirKind, Look};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 pub(crate) struct Inspection<'a> {
     pub literal: &'a [u8],
     pub work: usize,
@@ -75,9 +77,25 @@ impl Budget {
 /// Captures may wrap any structural component because aggregate value
 /// operations erase them explicitly. Branch order remains exact, and the
 /// kernel is responsible for rejected-overlap discovery and global restart.
+#[cfg(test)]
 pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(crate) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<InspectionOutcome<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut budget = Budget::new(limit);
-    let root = transparent(hir, &mut budget)?;
+    inspect_with_budget(hir, &mut budget)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, budget.work))
+}
+
+fn inspect_with_budget<'a>(
+    hir: &'a Hir,
+    budget: &mut Budget,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    let root = transparent(hir, budget)?;
     let HirKind::Alternation(branches) = root.kind() else {
         return Ok(InspectionOutcome::Ineligible { work: budget.work });
     };
@@ -85,10 +103,10 @@ pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
     let [start_branch, end_branch] = branches.as_slice() else {
         return Ok(InspectionOutcome::Ineligible { work: budget.work });
     };
-    let Some(start_literal) = start_branch_literal(start_branch, &mut budget)? else {
+    let Some(start_literal) = start_branch_literal(start_branch, budget)? else {
         return Ok(InspectionOutcome::Ineligible { work: budget.work });
     };
-    let Some(end_literal) = end_branch_literal(end_branch, &mut budget)? else {
+    let Some(end_literal) = end_branch_literal(end_branch, budget)? else {
         return Ok(InspectionOutcome::Ineligible { work: budget.work });
     };
     let comparisons = start_literal

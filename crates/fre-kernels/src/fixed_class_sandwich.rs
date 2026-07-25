@@ -12,7 +12,7 @@
 
 use core::{fmt, mem::size_of};
 
-use crate::Window;
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
 pub const PLAN_ID: &str = "fixed-class-sandwich.circular-window-byte-bitsets.v2";
 pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v2";
@@ -78,6 +78,107 @@ pub struct BuildAccounting {
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
+}
+
+struct DirectBuildTracker {
+    actual: DirectBuildAttemptActual,
+    live_unpublished_bytes: usize,
+}
+
+impl DirectBuildTracker {
+    const fn new() -> Self {
+        Self {
+            actual: DirectBuildAttemptActual {
+                work: 0,
+                allocations: 0,
+                allocated_bytes: 0,
+                copied_bytes: 0,
+                initialized_bytes: 0,
+                live_persistent_bytes: 0,
+                peak_bytes: 0,
+            },
+            live_unpublished_bytes: 0,
+        }
+    }
+
+    fn record_work(&mut self, work: usize) -> Result<(), BuildError> {
+        self.actual.work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual fixed-class work as u64",
+        })?;
+        Ok(())
+    }
+
+    fn observe_reserve(
+        &mut self,
+        before_capacity: usize,
+        after_capacity: usize,
+    ) -> Result<(), BuildError> {
+        if after_capacity <= before_capacity {
+            return Ok(());
+        }
+        let before = before_capacity
+            .checked_mul(size_of::<ScalarRange>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "previous fixed-class capacity bytes",
+            })?;
+        let after = after_capacity.checked_mul(size_of::<ScalarRange>()).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "observed fixed-class capacity bytes",
+            },
+        )?;
+        self.actual.allocations =
+            self.actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual fixed-class allocation count",
+                })?;
+        self.actual.allocated_bytes = self.actual.allocated_bytes.checked_add(after).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative fixed-class allocated bytes",
+            },
+        )?;
+        self.live_unpublished_bytes = self
+            .live_unpublished_bytes
+            .checked_sub(before)
+            .and_then(|bytes| bytes.checked_add(after))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "live fixed-class capacity bytes",
+            })?;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(self.live_unpublished_bytes);
+        Ok(())
+    }
+
+    fn observe_range_copy(&mut self) -> Result<(), BuildError> {
+        self.actual.copied_bytes = self
+            .actual
+            .copied_bytes
+            .checked_add(size_of::<ScalarRange>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual fixed-class copied bytes",
+            })?;
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(size_of::<ScalarRange>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual fixed-class initialized bytes",
+            })?;
+        Ok(())
+    }
+
+    fn publish(&mut self, persistent_bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self
+            .actual
+            .initialized_bytes
+            .checked_add(size_of::<FixedClassSandwichPlan>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "published fixed-class inline initialized bytes",
+            })?;
+        self.actual.live_persistent_bytes = persistent_bytes;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(persistent_bytes);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -431,6 +532,7 @@ impl ByteClass {
         ranges: &[ScalarRange],
         limits: BuildLimits,
         work: &mut usize,
+        tracker: &mut DirectBuildTracker,
     ) -> Result<Self, BuildError> {
         let mut class = Self::default();
         for range in ranges {
@@ -484,6 +586,7 @@ impl ByteClass {
                     computation: "fixed class byte-mask work",
                 })?;
                 enforce_build(*work, limits.max_build_work, BuildResource::Work)?;
+                tracker.record_work(*work)?;
             }
         }
         Ok(class)
@@ -536,7 +639,20 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build_ranges(
+        Self::build_bytes_attempt(prefix, middle, suffix, middle_repetitions, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build a byte-semantics plan with exact observed construction effects.
+    pub fn build_bytes_attempt(
+        prefix: impl IntoIterator<Item = (u8, u8)>,
+        middle: impl IntoIterator<Item = (u8, u8)>,
+        suffix: impl IntoIterator<Item = (u8, u8)>,
+        middle_repetitions: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        Self::build_ranges_attempt(
             prefix
                 .into_iter()
                 .map(|(start, end)| (u32::from(start), u32::from(end))),
@@ -559,7 +675,20 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build_ranges(
+        Self::build_unicode_attempt(prefix, middle, suffix, middle_repetitions, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build a Unicode-semantics plan with exact observed construction effects.
+    pub fn build_unicode_attempt(
+        prefix: impl IntoIterator<Item = (char, char)>,
+        middle: impl IntoIterator<Item = (char, char)>,
+        suffix: impl IntoIterator<Item = (char, char)>,
+        middle_repetitions: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        Self::build_ranges_attempt(
             prefix
                 .into_iter()
                 .map(|(start, end)| (u32::from(start), u32::from(end))),
@@ -587,96 +716,134 @@ impl FixedClassSandwichPlan {
         middle_repetitions: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        let window_units = checked_window_units(middle_repetitions, limits)?;
-        let mut work = 0_usize;
-        let (prefix, prefix_capacity) =
-            collect_ranges(prefix, "prefix", semantics, limits, &mut work)?;
-        let (middle, middle_capacity) =
-            collect_ranges(middle, "middle", semantics, limits, &mut work)?;
-        let (suffix, suffix_capacity) =
-            collect_ranges(suffix, "suffix", semantics, limits, &mut work)?;
-        let source_ranges = prefix
-            .len()
-            .checked_add(middle.len())
-            .and_then(|count| count.checked_add(suffix.len()))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed class source ranges",
-            })?;
-        enforce_build(
-            source_ranges,
-            limits.max_source_ranges,
-            BuildResource::Ranges,
-        )?;
-        let byte_classes = if semantics == Semantics::RustBytesUnicodeOff {
-            Some([
-                ByteClass::from_ranges(&prefix, limits, &mut work)?,
-                ByteClass::from_ranges(&middle, limits, &mut work)?,
-                ByteClass::from_ranges(&suffix, limits, &mut work)?,
-            ])
-        } else {
-            None
-        };
-        work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
-            computation: "fixed class repetition work",
-        })?;
-        enforce_build(work, limits.max_build_work, BuildResource::Work)?;
-        let range_payload_bytes = source_ranges.checked_mul(size_of::<ScalarRange>()).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "fixed class range payload bytes",
-            },
-        )?;
-        let temporary_capacity_bytes = prefix_capacity
-            .checked_add(middle_capacity)
-            .and_then(|bytes| bytes.checked_add(suffix_capacity))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed class temporary capacity bytes",
-            })?;
-        let persistent_bytes = size_of::<Self>().checked_add(range_payload_bytes).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "fixed class persistent bytes",
-            },
-        )?;
-        let peak_bytes = persistent_bytes
-            .checked_add(temporary_capacity_bytes)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed class construction peak bytes",
-            })?;
-        enforce_build(
-            temporary_capacity_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-        let build = BuildAccounting {
-            semantics,
-            prefix_ranges: prefix.len(),
-            middle_ranges: middle.len(),
-            suffix_ranges: suffix.len(),
-            source_ranges,
-            middle_repetitions,
-            window_units,
-            range_payload_bytes,
-            work,
-            temporary_capacity_bytes,
-            scratch_bytes: temporary_capacity_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            prefix: prefix.into_boxed_slice(),
-            middle: middle.into_boxed_slice(),
-            suffix: suffix.into_boxed_slice(),
-            byte_classes,
+        Self::build_ranges_attempt(
+            prefix,
+            middle,
+            suffix,
             semantics,
             middle_repetitions,
-            window_units,
-            build,
-        })
+            limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build canonical scalar ranges with exact observed construction effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the three range owners share one exact accounting transaction and publication boundary"
+    )]
+    pub fn build_ranges_attempt(
+        prefix: impl IntoIterator<Item = (u32, u32)>,
+        middle: impl IntoIterator<Item = (u32, u32)>,
+        suffix: impl IntoIterator<Item = (u32, u32)>,
+        semantics: Semantics,
+        middle_repetitions: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut tracker = DirectBuildTracker::new();
+        let result = (|| {
+            let window_units = checked_window_units(middle_repetitions, limits)?;
+            let mut work = 0_usize;
+            let (prefix, prefix_capacity) =
+                collect_ranges(prefix, "prefix", semantics, limits, &mut work, &mut tracker)?;
+            let (middle, middle_capacity) =
+                collect_ranges(middle, "middle", semantics, limits, &mut work, &mut tracker)?;
+            let (suffix, suffix_capacity) =
+                collect_ranges(suffix, "suffix", semantics, limits, &mut work, &mut tracker)?;
+            let source_ranges = prefix
+                .len()
+                .checked_add(middle.len())
+                .and_then(|count| count.checked_add(suffix.len()))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class source ranges",
+                })?;
+            enforce_build(
+                source_ranges,
+                limits.max_source_ranges,
+                BuildResource::Ranges,
+            )?;
+            let byte_classes = if semantics == Semantics::RustBytesUnicodeOff {
+                Some([
+                    ByteClass::from_ranges(&prefix, limits, &mut work, &mut tracker)?,
+                    ByteClass::from_ranges(&middle, limits, &mut work, &mut tracker)?,
+                    ByteClass::from_ranges(&suffix, limits, &mut work, &mut tracker)?,
+                ])
+            } else {
+                None
+            };
+            work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+                computation: "fixed class repetition work",
+            })?;
+            enforce_build(work, limits.max_build_work, BuildResource::Work)?;
+            tracker.record_work(work)?;
+            let range_payload_bytes = source_ranges.checked_mul(size_of::<ScalarRange>()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "fixed class range payload bytes",
+                },
+            )?;
+            let temporary_capacity_bytes = prefix_capacity
+                .checked_add(middle_capacity)
+                .and_then(|bytes| bytes.checked_add(suffix_capacity))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class temporary capacity bytes",
+                })?;
+            let persistent_bytes = size_of::<Self>().checked_add(range_payload_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "fixed class persistent bytes",
+                },
+            )?;
+            let peak_bytes = persistent_bytes
+                .checked_add(temporary_capacity_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class construction peak bytes",
+                })?;
+            enforce_build(
+                temporary_capacity_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            let build = BuildAccounting {
+                semantics,
+                prefix_ranges: prefix.len(),
+                middle_ranges: middle.len(),
+                suffix_ranges: suffix.len(),
+                source_ranges,
+                middle_repetitions,
+                window_units,
+                range_payload_bytes,
+                work,
+                temporary_capacity_bytes,
+                scratch_bytes: temporary_capacity_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            let plan = Self {
+                prefix: prefix.into_boxed_slice(),
+                middle: middle.into_boxed_slice(),
+                suffix: suffix.into_boxed_slice(),
+                byte_classes,
+                semantics,
+                middle_repetitions,
+                window_units,
+                build,
+            };
+            tracker.publish(persistent_bytes)?;
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, tracker.actual)),
+            Err(source) => {
+                tracker.actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, tracker.actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1189,6 +1356,7 @@ fn collect_ranges(
     semantics: Semantics,
     limits: BuildLimits,
     work: &mut usize,
+    tracker: &mut DirectBuildTracker,
 ) -> Result<(Vec<ScalarRange>, usize), BuildError> {
     let mut output = Vec::new();
     let mut previous_end: Option<u32> = None;
@@ -1209,17 +1377,21 @@ fn collect_ranges(
             return Err(BuildError::NonCanonicalRanges { role });
         }
         previous_end = Some(end);
+        let before_capacity = output.capacity();
         output
             .try_reserve(1)
             .map_err(|_| BuildError::AllocationFailed {
                 role,
                 additional: 1,
             })?;
+        tracker.observe_reserve(before_capacity, output.capacity())?;
         output.push(ScalarRange { start, end });
+        tracker.observe_range_copy()?;
         *work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
             computation: "fixed class range work",
         })?;
         enforce_build(*work, limits.max_build_work, BuildResource::Work)?;
+        tracker.record_work(*work)?;
     }
     if output.is_empty() {
         return Err(BuildError::EmptyClass { role });
@@ -1347,6 +1519,62 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{BuildLimits, FixedClassSandwichPlan, ReduceLimits, Semantics};
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_range_failure() {
+        let attempt = FixedClassSandwichPlan::build_bytes_attempt(
+            [(b'a', b'a')],
+            [(b'b', b'b')],
+            [(b'c', b'c')],
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let plan = attempt.into_plan();
+        let build = plan.build_accounting();
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(actual.allocations, 3);
+        assert_eq!(actual.allocated_bytes, build.temporary_capacity_bytes);
+        assert_eq!(actual.copied_bytes, build.range_payload_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(
+            actual.peak_bytes,
+            build.temporary_capacity_bytes.max(build.persistent_bytes)
+        );
+
+        let failure = FixedClassSandwichPlan::build_bytes_attempt(
+            [(b'a', b'a')],
+            [(b'z', b'a')],
+            [(b'c', b'c')],
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            super::BuildError::ReversedRange {
+                role: "middle",
+                start,
+                end
+            } if *start == u32::from(b'z') && *end == u32::from(b'a')
+        ));
+        let partial = failure.actual();
+        assert_eq!(partial.work, 1);
+        assert_eq!(partial.allocations, 1);
+        assert!(partial.allocated_bytes >= core::mem::size_of::<super::ScalarRange>());
+        assert_eq!(
+            partial.copied_bytes,
+            core::mem::size_of::<super::ScalarRange>()
+        );
+        assert_eq!(
+            partial.initialized_bytes,
+            core::mem::size_of::<super::ScalarRange>()
+        );
+        assert_eq!(partial.live_persistent_bytes, 0);
+        assert!(partial.peak_bytes > 0);
+    }
 
     fn oracle(pattern: &str, unicode: bool, haystack: &[u8]) -> (u64, u64) {
         let regex = RegexBuilder::new(pattern).unicode(unicode).build().unwrap();

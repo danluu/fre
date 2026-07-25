@@ -16,8 +16,8 @@ const MAX_UNICODE_SEGMENT_ALIAS_BYTES: usize = 20;
 
 use crate::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
-    ErrorCategory, ParseError, ParseRecord, ParseRequest, ParseSummary, ResourceKind,
-    RustAstOptions, RustAstRecord, RustConstructor, RustOptions, RustParsed,
+    ErrorCategory, ParseAttemptActual, ParseError, ParseRecord, ParseRequest, ParseSummary,
+    ResourceKind, RustAstOptions, RustAstRecord, RustConstructor, RustOptions, RustParsed,
     RustRegexSetAdmissionError, RustUnicodeFeatures, SCHEMA_VERSION, SafetyEnvelope,
     UnicodeVersion,
 };
@@ -48,7 +48,7 @@ pub(crate) fn parse_rust_ast(
     request: ParseRequest,
     ast_options: RustAstOptions,
 ) -> Result<RustAstRecord, ParseError> {
-    let (pattern, profile, admission, safety) = request.into_parts();
+    let (pattern, profile, admission, safety, attempt_source_owner) = request.into_parts();
     let Some(source) = pattern.as_str() else {
         return Err(ParseError::new(
             profile,
@@ -91,6 +91,7 @@ pub(crate) fn parse_rust_ast(
             profile,
             admission,
             safety,
+            attempt_source_owner,
         },
         ast_options,
         admission_status: AdmissionStatus::from_policy(admission),
@@ -144,48 +145,84 @@ fn ast_node_upper_bound(source_bytes: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+pub(crate) struct RustParseOutput {
+    pub(crate) admission_status: AdmissionStatus,
+    pub(crate) summary: ParseSummary,
+    pub(crate) hir: Hir,
+}
+
+pub(crate) fn parse_rust_attempt(
+    request: &ParseRequest,
+    enforce_single_size_limit: bool,
+    actual: &mut ParseAttemptActual,
+) -> Result<RustParseOutput, ParseError> {
+    let result = (|| {
+        let profile = request.profile();
+        let admission = request.admission();
+        let safety = request.safety_envelope();
+        let Some(source) = request.pattern().as_str() else {
+            return Err(ParseError::new(
+                profile.clone(),
+                ErrorCategory::InvalidPatternEncoding,
+                "Rust regex patterns must be valid UTF-8 strings",
+            ));
+        };
+        let (options, utf8) = match profile {
+            CompatibilityProfile::RustText(rust) => (&rust.options, true),
+            CompatibilityProfile::RustBytes(rust) => (&rust.options, false),
+            CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+        };
+        validate_rust_configuration(profile, options)?;
+        actual.configuration_checks =
+            actual.configuration_checks.checked_add(1).ok_or_else(|| {
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::InvalidConfiguration,
+                    "parse-attempt configuration counter overflowed",
+                )
+            })?;
+
+        let features = match profile {
+            CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => {
+                rust.unicode_features
+            }
+            CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
+        };
+        let (hir, parse_work) = if features.is_all() {
+            record_opaque_parser_invocation(actual, profile)?;
+            (
+                configured_parser(options, utf8)
+                    .build()
+                    .parse(source)
+                    .map_err(|error| map_regex_syntax_error(profile, &error))?,
+                u64::try_from(source.len()).unwrap_or(u64::MAX),
+            )
+        } else {
+            parse_with_unicode_availability(
+                source, profile, options, utf8, features, admission, safety, actual,
+            )?
+        };
+        if enforce_single_size_limit {
+            enforce_high_level_size_limit(&hir, profile, options)?;
+        }
+        let summary = summarize_hir(&hir, parse_work, profile, admission, safety, actual)?;
+        Ok(RustParseOutput {
+            admission_status: AdmissionStatus::from_policy(admission),
+            summary,
+            hir,
+        })
+    })();
+    actual.authenticate_exact();
+    result
+}
+
 pub(crate) fn parse_rust(
     request: ParseRequest,
     enforce_single_size_limit: bool,
 ) -> Result<ParseRecord, ParseError> {
-    let (pattern, profile, admission, safety) = request.into_parts();
-    let Some(source) = pattern.as_str() else {
-        return Err(ParseError::new(
-            profile,
-            ErrorCategory::InvalidPatternEncoding,
-            "Rust regex patterns must be valid UTF-8 strings",
-        ));
-    };
-    let (options, utf8) = match &profile {
-        CompatibilityProfile::RustText(rust) => (&rust.options, true),
-        CompatibilityProfile::RustBytes(rust) => (&rust.options, false),
-        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
-    };
-    validate_rust_configuration(&profile, options)?;
-
-    let features = match &profile {
-        CompatibilityProfile::RustText(rust) | CompatibilityProfile::RustBytes(rust) => {
-            rust.unicode_features
-        }
-        CompatibilityProfile::Re2(_) => unreachable!("dispatch validated profile"),
-    };
-    let (hir, parse_work) = if features.is_all() {
-        (
-            configured_parser(options, utf8)
-                .build()
-                .parse(source)
-                .map_err(|error| map_regex_syntax_error(&profile, &error))?,
-            u64::try_from(source.len()).unwrap_or(u64::MAX),
-        )
-    } else {
-        parse_with_unicode_availability(
-            source, &profile, options, utf8, features, admission, safety,
-        )?
-    };
-    if enforce_single_size_limit {
-        enforce_high_level_size_limit(&hir, &profile, options)?;
-    }
-    let summary = summarize_hir(&hir, parse_work, &profile, admission, safety)?;
+    let mut actual = ParseAttemptActual::default();
+    let output = parse_rust_attempt(&request, enforce_single_size_limit, &mut actual)?;
+    let (pattern, profile, admission, safety, attempt_source_owner) = request.into_parts();
     Ok(ParseRecord {
         key: CacheKey {
             schema_version: SCHEMA_VERSION,
@@ -193,11 +230,30 @@ pub(crate) fn parse_rust(
             profile,
             admission,
             safety,
+            attempt_source_owner,
         },
-        admission_status: AdmissionStatus::from_policy(admission),
-        summary,
-        pattern: CanonicalPattern::Rust(RustParsed { hir }),
+        admission_status: output.admission_status,
+        summary: output.summary,
+        pattern: CanonicalPattern::Rust(RustParsed { hir: output.hir }),
     })
+}
+
+fn record_opaque_parser_invocation(
+    actual: &mut ParseAttemptActual,
+    profile: &CompatibilityProfile,
+) -> Result<(), ParseError> {
+    actual.opaque_parser_invocations =
+        actual
+            .opaque_parser_invocations
+            .checked_add(1)
+            .ok_or_else(|| {
+                ParseError::new(
+                    profile.clone(),
+                    ErrorCategory::InvalidConfiguration,
+                    "parse-attempt opaque parser invocation counter overflowed",
+                )
+            })?;
+    Ok(())
 }
 
 fn configured_parser(options: &RustOptions, utf8: bool) -> ParserBuilder {
@@ -245,6 +301,10 @@ fn with_regex_span(record: ParseError, span: Option<&ast::Span>) -> ParseError {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the attempt ledger joins the existing exact syntax/profile/admission inputs without hiding any identity field"
+)]
 fn parse_with_unicode_availability(
     source: &str,
     profile: &CompatibilityProfile,
@@ -253,6 +313,7 @@ fn parse_with_unicode_availability(
     features: RustUnicodeFeatures,
     admission: AdmissionPolicy,
     safety: SafetyEnvelope,
+    actual: &mut ParseAttemptActual,
 ) -> Result<(Hir, u64), ParseError> {
     // `ParseRequest::validate_and_charge_source` checked the initial source
     // byte charge before this single AST allocation. The availability walk
@@ -264,6 +325,7 @@ fn parse_with_unicode_availability(
         .nest_limit(options.nest_limit)
         .octal(options.octal)
         .ignore_whitespace(options.ignore_whitespace);
+    record_opaque_parser_invocation(actual, profile)?;
     let ast = ast_builder.build().parse(source).map_err(|error| {
         with_regex_span(
             ParseError::new(
@@ -281,6 +343,7 @@ fn parse_with_unicode_availability(
         safety,
         features,
         work: initial_work,
+        actual,
         flags: ActiveUnicodeFlags {
             case_insensitive: options.case_insensitive,
             unicode: options.unicode,
@@ -299,6 +362,7 @@ fn parse_with_unicode_availability(
         .crlf(options.crlf)
         .swap_greed(options.swap_greed)
         .unicode(options.unicode);
+    record_opaque_parser_invocation(actual, profile)?;
     let hir = translator
         .build()
         .translate(source, &ast)
@@ -321,6 +385,7 @@ struct UnicodeAvailabilityVisitor<'a> {
     safety: SafetyEnvelope,
     features: RustUnicodeFeatures,
     work: u64,
+    actual: &'a mut ParseAttemptActual,
     flags: ActiveUnicodeFlags,
     group_flags: Vec<ActiveUnicodeFlags>,
 }
@@ -451,7 +516,30 @@ impl UnicodeAvailabilityVisitor<'_> {
             self.admission,
             self.safety,
             ResourceKind::ParseWork,
-        )
+        )?;
+        self.actual.availability_work = self
+            .actual
+            .availability_work
+            .checked_add(amount)
+            .ok_or_else(|| {
+                ParseError::new(
+                    self.profile.clone(),
+                    ErrorCategory::InvalidConfiguration,
+                    "parse-attempt availability-work counter overflowed",
+                )
+            })?;
+        self.actual.observed_work =
+            self.actual
+                .observed_work
+                .checked_add(amount)
+                .ok_or_else(|| {
+                    ParseError::new(
+                        self.profile.clone(),
+                        ErrorCategory::InvalidConfiguration,
+                        "parse-attempt observed-work counter overflowed",
+                    )
+                })?;
+        Ok(())
     }
 
     fn reject(&self, span: &ast::Span, message: &'static str) -> Result<(), ParseError> {
@@ -2043,21 +2131,27 @@ fn checked_add(
 
 fn summarize_hir(
     hir: &Hir,
-    source_bytes: u64,
+    prior_parse_work: u64,
     profile: &CompatibilityProfile,
     admission: AdmissionPolicy,
     safety: SafetyEnvelope,
+    actual: &mut ParseAttemptActual,
 ) -> Result<ParseSummary, ParseError> {
     let mut summary = ParseSummary {
-        parse_work: source_bytes,
+        parse_work: prior_parse_work,
         guarantees_valid_utf8_nonempty: hir.properties().is_utf8(),
         ..ParseSummary::default()
     };
     let mut stack = Vec::new();
     stack.push((hir, 0_u64));
+    actual.traversal_stack_peak = 1;
     while let Some((node, depth)) = stack.pop() {
+        // Visiting one HIR node commits its node/work/depth counters together.
+        // Preflight that vector against a detached candidate before exposing
+        // any part of it in cumulative A.
+        let mut node_visit = summary.clone();
         checked_add(
-            &mut summary.hir_nodes,
+            &mut node_visit.hir_nodes,
             1,
             profile,
             admission,
@@ -2065,14 +2159,14 @@ fn summarize_hir(
             ResourceKind::HirNodes,
         )?;
         checked_add(
-            &mut summary.parse_work,
+            &mut node_visit.parse_work,
             1,
             profile,
             admission,
             safety,
             ResourceKind::ParseWork,
         )?;
-        summary.max_depth = summary.max_depth.max(depth);
+        node_visit.max_depth = node_visit.max_depth.max(depth);
         if depth > admission.limit_for(ResourceKind::Nesting, safety) {
             return Err(admission.limit_error(
                 profile.clone(),
@@ -2081,7 +2175,16 @@ fn summarize_hir(
                 depth,
             ));
         }
-        charge_kind(&mut summary, node.kind(), profile, admission, safety)?;
+        summary = node_visit;
+        sync_hir_actual(actual, &summary, prior_parse_work, profile)?;
+
+        // Kind-specific counters and their matching work charge are one second
+        // effect. A refusal retains the admitted node visit above, but none of
+        // this kind effect.
+        let mut node_kind = summary.clone();
+        charge_kind(&mut node_kind, node.kind(), profile, admission, safety)?;
+        summary = node_kind;
+        sync_hir_actual(actual, &summary, prior_parse_work, profile)?;
         for sub in node.kind().subs() {
             let pending = u64::try_from(stack.len()).unwrap_or(u64::MAX);
             let limit = admission.limit_for(ResourceKind::TraversalStack, safety);
@@ -2094,9 +2197,49 @@ fn summarize_hir(
                 ));
             }
             stack.push((sub, depth.saturating_add(1)));
+            actual.traversal_stack_peak = actual
+                .traversal_stack_peak
+                .max(u64::try_from(stack.len()).unwrap_or(u64::MAX));
         }
     }
     Ok(summary)
+}
+
+fn sync_hir_actual(
+    actual: &mut ParseAttemptActual,
+    summary: &ParseSummary,
+    prior_parse_work: u64,
+    profile: &CompatibilityProfile,
+) -> Result<(), ParseError> {
+    let hir_summary_work = summary
+        .parse_work
+        .checked_sub(prior_parse_work)
+        .ok_or_else(|| {
+            ParseError::new(
+                profile.clone(),
+                ErrorCategory::InvalidConfiguration,
+                "parse-attempt HIR work preceded its published reservation",
+            )
+        })?;
+    let observed_work = actual
+        .availability_work
+        .checked_add(hir_summary_work)
+        .ok_or_else(|| {
+            ParseError::new(
+                profile.clone(),
+                ErrorCategory::InvalidConfiguration,
+                "parse-attempt observed-work counter overflowed",
+            )
+        })?;
+    actual.hir_summary_work = hir_summary_work;
+    actual.observed_work = observed_work;
+    actual.hir_nodes = summary.hir_nodes;
+    actual.literal_bytes = summary.literal_bytes;
+    actual.class_ranges = summary.class_ranges;
+    actual.captures = summary.captures;
+    actual.repetitions = summary.repetitions;
+    actual.max_depth = summary.max_depth;
+    Ok(())
 }
 
 fn charge_kind(

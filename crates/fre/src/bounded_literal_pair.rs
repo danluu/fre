@@ -2,6 +2,8 @@
 
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 pub(crate) enum Inspection<'a> {
     Eligible {
         left: &'a [u8],
@@ -86,9 +88,25 @@ impl Budget {
 /// matches. Distinct leading bytes make the two start streams disjoint, while
 /// the kernel remains responsible for greedy endpoint selection and global
 /// non-overlapping restart semantics.
+#[cfg(test)]
 pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<Inspection<'_>, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(crate) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<Inspection<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut budget = Budget::new(limit);
-    let root = transparent(hir, &mut budget)?;
+    inspect_with_budget(hir, &mut budget)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, budget.work))
+}
+
+fn inspect_with_budget<'a>(
+    hir: &'a Hir,
+    budget: &mut Budget,
+) -> Result<Inspection<'a>, InspectionError> {
+    let root = transparent(hir, budget)?;
     let HirKind::Alternation(branches) = root.kind() else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
@@ -96,15 +114,15 @@ pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<Inspection<'_>, Inspect
     let [first, second] = branches.as_slice() else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
-    let Some(first) = branch(first, &mut budget)? else {
+    let Some(first) = branch(first, budget)? else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
-    let Some(second) = branch(second, &mut budget)? else {
+    let Some(second) = branch(second, budget)? else {
         return Ok(Inspection::Ineligible { work: budget.work });
     };
 
-    if !same_literal(first.prefix, second.suffix, &mut budget)?
-        || !same_literal(first.suffix, second.prefix, &mut budget)?
+    if !same_literal(first.prefix, second.suffix, budget)?
+        || !same_literal(first.suffix, second.prefix, budget)?
     {
         return Ok(Inspection::Ineligible { work: budget.work });
     }
@@ -112,7 +130,7 @@ pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<Inspection<'_>, Inspect
     if first.gap_max != second.gap_max || first.prefix[0] == first.suffix[0] {
         return Ok(Inspection::Ineligible { work: budget.work });
     }
-    if !same_class(first.class, second.class, &mut budget)? {
+    if !same_class(first.class, second.class, budget)? {
         return Ok(Inspection::Ineligible { work: budget.work });
     }
     Ok(Inspection::Eligible {

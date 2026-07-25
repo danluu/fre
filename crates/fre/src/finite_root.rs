@@ -18,6 +18,53 @@ pub(crate) enum InspectionError {
     Overflow,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RootLiteralInspectionActual {
+    pub(crate) work: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RootLiteralInspectionAttemptReceipt {
+    actual: RootLiteralInspectionActual,
+    closed: bool,
+}
+
+impl RootLiteralInspectionAttemptReceipt {
+    pub(crate) const fn actual(self) -> RootLiteralInspectionActual {
+        self.actual
+    }
+
+    pub(crate) const fn is_closed(self) -> bool {
+        self.closed
+    }
+}
+
+pub(crate) struct RootLiteralInspectionAttempt<'a> {
+    pub(crate) outcome: Inspection<'a>,
+    pub(crate) receipt: RootLiteralInspectionAttemptReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RootLiteralInspectionAttemptError {
+    source: InspectionError,
+    receipt: RootLiteralInspectionAttemptReceipt,
+}
+
+impl RootLiteralInspectionAttemptError {
+    pub(crate) const fn source(self) -> InspectionError {
+        self.source
+    }
+
+    pub(crate) const fn receipt(self) -> RootLiteralInspectionAttemptReceipt {
+        self.receipt
+    }
+
+    #[allow(dead_code, reason = "legacy projection retained for compatibility")]
+    pub(crate) const fn into_source(self) -> InspectionError {
+        self.source
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum MaterializationError {
     WorkLimit { needed: u64, limit: u64 },
@@ -25,6 +72,86 @@ pub(crate) enum MaterializationError {
     PeakLimit { needed: usize, limit: usize },
     AllocationFailed { additional: usize },
     Overflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RootLiteralMaterializationProspective {
+    pub(crate) final_work: u64,
+    pub(crate) allocations: usize,
+    pub(crate) initialized_bytes: usize,
+    pub(crate) scratch_bytes_limit: usize,
+    pub(crate) peak_bytes_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RootLiteralMaterializationActual {
+    pub(crate) work: u64,
+    pub(crate) allocations: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) initialized_bytes: usize,
+    pub(crate) live_scratch_bytes: usize,
+    pub(crate) peak_bytes: usize,
+    pub(crate) abandoned_allocations: usize,
+    pub(crate) abandoned_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RootLiteralMaterializationAttemptReceipt {
+    prospective: Option<RootLiteralMaterializationProspective>,
+    actual: RootLiteralMaterializationActual,
+    closed: bool,
+}
+
+impl RootLiteralMaterializationAttemptReceipt {
+    const fn open(actual_work: u64) -> Self {
+        Self {
+            prospective: None,
+            actual: RootLiteralMaterializationActual {
+                work: actual_work,
+                allocations: 0,
+                allocated_bytes: 0,
+                initialized_bytes: 0,
+                live_scratch_bytes: 0,
+                peak_bytes: 0,
+                abandoned_allocations: 0,
+                abandoned_bytes: 0,
+            },
+            closed: false,
+        }
+    }
+
+    pub(crate) const fn prospective(self) -> Option<RootLiteralMaterializationProspective> {
+        self.prospective
+    }
+
+    pub(crate) const fn actual(self) -> RootLiteralMaterializationActual {
+        self.actual
+    }
+
+    pub(crate) const fn is_closed(self) -> bool {
+        self.closed
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RootLiteralMaterializationAttemptError {
+    source: MaterializationError,
+    receipt: RootLiteralMaterializationAttemptReceipt,
+}
+
+impl RootLiteralMaterializationAttemptError {
+    pub(crate) const fn source(&self) -> &MaterializationError {
+        &self.source
+    }
+
+    pub(crate) const fn receipt(&self) -> RootLiteralMaterializationAttemptReceipt {
+        self.receipt
+    }
+
+    #[allow(dead_code, reason = "legacy projection retained for compatibility")]
+    pub(crate) fn into_source(self) -> MaterializationError {
+        self.source
+    }
 }
 
 pub(crate) enum Inspection<'a> {
@@ -63,65 +190,162 @@ impl RootLiteralAlternation<'_> {
     /// Materialize only borrowed slice pointers after exact work and capacity
     /// preflight. The returned concrete vector is the sparse builder's entire
     /// dynamic input; its observed capacity is checked again there.
+    #[allow(dead_code, reason = "legacy projection retained for compatibility")]
     pub(crate) fn materialize_patterns(
         &self,
         work_limit: u64,
         scratch_limit: usize,
         peak_limit: usize,
     ) -> Result<RootLiteralMaterialization<'_>, MaterializationError> {
-        let projection_work =
-            u64::try_from(self.children.len()).map_err(|_| MaterializationError::Overflow)?;
-        let final_work = self
-            .work
-            .checked_add(projection_work)
-            .ok_or(MaterializationError::Overflow)?;
-        if final_work > work_limit {
-            return Err(MaterializationError::WorkLimit {
-                needed: final_work,
-                limit: work_limit,
-            });
-        }
-        let requested = self
+        self.materialize_patterns_attempt(work_limit, scratch_limit, peak_limit)
+            .map_err(RootLiteralMaterializationAttemptError::into_source)
+    }
+
+    /// Receipt-bearing form of [`Self::materialize_patterns`].
+    ///
+    /// The prospective envelope is published before the pointer-vector
+    /// allocation. On a post-allocation limit refusal, the closed error
+    /// receipt retains the observed allocation and marks it abandoned.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the exact closed failure receipt must remain inline and allocation-free"
+    )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the linear materialization transaction keeps every charged step adjacent"
+    )]
+    pub(crate) fn materialize_patterns_attempt(
+        &self,
+        work_limit: u64,
+        scratch_limit: usize,
+        peak_limit: usize,
+    ) -> Result<RootLiteralMaterialization<'_>, RootLiteralMaterializationAttemptError> {
+        let mut receipt = RootLiteralMaterializationAttemptReceipt::open(self.work);
+        let projection_work = u64::try_from(self.children.len()).map_err(|_| {
+            close_materialization_error(&mut receipt, MaterializationError::Overflow)
+        })?;
+        let final_work = self.work.checked_add(projection_work).ok_or_else(|| {
+            close_materialization_error(&mut receipt, MaterializationError::Overflow)
+        })?;
+        let initialized_bytes = self
             .children
             .len()
             .checked_mul(size_of::<&[u8]>())
-            .ok_or(MaterializationError::Overflow)?;
-        check_source_capacity(requested, scratch_limit, peak_limit)?;
-        let mut patterns = Vec::new();
-        patterns
-            .try_reserve_exact(self.children.len())
-            .map_err(|_| MaterializationError::AllocationFailed {
-                additional: self.children.len(),
+            .ok_or_else(|| {
+                close_materialization_error(&mut receipt, MaterializationError::Overflow)
             })?;
+        receipt.prospective = Some(RootLiteralMaterializationProspective {
+            final_work,
+            allocations: usize::from(!self.children.is_empty()),
+            initialized_bytes,
+            scratch_bytes_limit: scratch_limit,
+            peak_bytes_limit: peak_limit,
+        });
+        if final_work > work_limit {
+            return Err(close_materialization_error(
+                &mut receipt,
+                MaterializationError::WorkLimit {
+                    needed: final_work,
+                    limit: work_limit,
+                },
+            ));
+        }
+        let requested = initialized_bytes;
+        if let Err(error) = check_source_capacity(requested, scratch_limit, peak_limit) {
+            return Err(close_materialization_error(&mut receipt, error));
+        }
+        let mut patterns = Vec::new();
+        if let Err(_error) = patterns.try_reserve_exact(self.children.len()) {
+            return Err(close_materialization_error(
+                &mut receipt,
+                MaterializationError::AllocationFailed {
+                    additional: self.children.len(),
+                },
+            ));
+        }
         let observed = patterns
             .capacity()
             .checked_mul(size_of::<&[u8]>())
-            .ok_or(MaterializationError::Overflow)?;
-        check_source_capacity(observed, scratch_limit, peak_limit)?;
+            .ok_or_else(|| {
+                close_materialization_error(&mut receipt, MaterializationError::Overflow)
+            })?;
+        if patterns.capacity() != 0 {
+            receipt.actual.allocations = 1;
+            receipt.actual.allocated_bytes = observed;
+            receipt.actual.live_scratch_bytes = observed;
+            receipt.actual.peak_bytes = observed;
+        }
+        if let Err(error) = check_source_capacity(observed, scratch_limit, peak_limit) {
+            abandon_materialization(&mut receipt);
+            return Err(close_materialization_error(&mut receipt, error));
+        }
 
         let mut work = self.work;
         for child in self.children {
-            let needed = work.checked_add(1).ok_or(MaterializationError::Overflow)?;
+            let needed = work.checked_add(1).ok_or_else(|| {
+                abandon_materialization(&mut receipt);
+                close_materialization_error(&mut receipt, MaterializationError::Overflow)
+            })?;
             if needed > work_limit {
-                return Err(MaterializationError::WorkLimit {
-                    needed,
-                    limit: work_limit,
-                });
+                abandon_materialization(&mut receipt);
+                return Err(close_materialization_error(
+                    &mut receipt,
+                    MaterializationError::WorkLimit {
+                        needed,
+                        limit: work_limit,
+                    },
+                ));
             }
             work = needed;
+            receipt.actual.work = work;
             let HirKind::Literal(literal) = child.kind() else {
                 unreachable!("proved root literal alternative changed during construction")
             };
             patterns.push(literal.0.as_ref());
+            let Some(initialized_bytes) = receipt
+                .actual
+                .initialized_bytes
+                .checked_add(size_of::<&[u8]>())
+            else {
+                abandon_materialization(&mut receipt);
+                return Err(close_materialization_error(
+                    &mut receipt,
+                    MaterializationError::Overflow,
+                ));
+            };
+            receipt.actual.initialized_bytes = initialized_bytes;
         }
         debug_assert_eq!(work, final_work);
-        Ok(RootLiteralMaterialization { patterns, work })
+        receipt.closed = true;
+        Ok(RootLiteralMaterialization {
+            patterns,
+            work,
+            receipt,
+        })
     }
 }
 
 pub(crate) struct RootLiteralMaterialization<'a> {
     pub(crate) patterns: Vec<&'a [u8]>,
     pub(crate) work: u64,
+    pub(crate) receipt: RootLiteralMaterializationAttemptReceipt,
+}
+
+fn abandon_materialization(receipt: &mut RootLiteralMaterializationAttemptReceipt) {
+    receipt.actual.abandoned_allocations = receipt.actual.allocations;
+    receipt.actual.abandoned_bytes = receipt.actual.allocated_bytes;
+    receipt.actual.live_scratch_bytes = 0;
+}
+
+fn close_materialization_error(
+    receipt: &mut RootLiteralMaterializationAttemptReceipt,
+    source: MaterializationError,
+) -> RootLiteralMaterializationAttemptError {
+    receipt.closed = true;
+    RootLiteralMaterializationAttemptError {
+        source,
+        receipt: *receipt,
+    }
 }
 
 fn check_source_capacity(
@@ -144,48 +368,64 @@ fn check_source_capacity(
     Ok(())
 }
 
+#[allow(dead_code, reason = "legacy projection retained for compatibility")]
 pub(crate) fn inspect(
     hir: &Hir,
     unicode: bool,
     work_limit: u64,
 ) -> Result<Inspection<'_>, InspectionError> {
+    inspect_attempt(hir, unicode, work_limit)
+        .map(|attempt| attempt.outcome)
+        .map_err(RootLiteralInspectionAttemptError::into_source)
+}
+
+pub(crate) fn inspect_attempt(
+    hir: &Hir,
+    unicode: bool,
+    work_limit: u64,
+) -> Result<RootLiteralInspectionAttempt<'_>, RootLiteralInspectionAttemptError> {
     let mut work = 0_u64;
-    charge(&mut work, 1, work_limit)?;
+    charge(&mut work, 1, work_limit).map_err(|source| close_inspection_error(source, work))?;
     let HirKind::Alternation(children) = hir.kind() else {
-        return Ok(Inspection::Ineligible { work });
+        return Ok(close_inspection(Inspection::Ineligible { work }, work));
     };
     if children.is_empty() {
-        return Ok(Inspection::Ineligible { work });
+        return Ok(close_inspection(Inspection::Ineligible { work }, work));
     }
 
     let mut pattern_bytes = 0_usize;
     let mut used = [false; 256];
     let mut used_count = 0_usize;
     for child in children {
-        charge(&mut work, 1, work_limit)?;
+        charge(&mut work, 1, work_limit).map_err(|source| close_inspection_error(source, work))?;
         let HirKind::Literal(literal) = child.kind() else {
-            return Ok(Inspection::Ineligible { work });
+            return Ok(close_inspection(Inspection::Ineligible { work }, work));
         };
         let bytes = literal.0.as_ref();
         if bytes.is_empty() {
-            return Ok(Inspection::Ineligible { work });
+            return Ok(close_inspection(Inspection::Ineligible { work }, work));
         }
-        let byte_work = u64::try_from(bytes.len()).map_err(|_| InspectionError::Overflow)?;
+        let byte_work = u64::try_from(bytes.len())
+            .map_err(|_| close_inspection_error(InspectionError::Overflow, work))?;
         if unicode {
-            charge(&mut work, byte_work, work_limit)?;
+            charge(&mut work, byte_work, work_limit)
+                .map_err(|source| close_inspection_error(source, work))?;
             if core::str::from_utf8(bytes).is_err() {
-                return Ok(Inspection::Ineligible { work });
+                return Ok(close_inspection(Inspection::Ineligible { work }, work));
             }
         }
-        charge(&mut work, byte_work, work_limit)?;
+        charge(&mut work, byte_work, work_limit)
+            .map_err(|source| close_inspection_error(source, work))?;
         pattern_bytes = pattern_bytes
             .checked_add(bytes.len())
-            .ok_or(InspectionError::Overflow)?;
+            .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
         for &byte in bytes {
             let slot = &mut used[usize::from(byte)];
             if !*slot {
                 *slot = true;
-                used_count = used_count.checked_add(1).ok_or(InspectionError::Overflow)?;
+                used_count = used_count
+                    .checked_add(1)
+                    .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
             }
         }
     }
@@ -195,33 +435,38 @@ pub(crate) fn inspect(
         .checked_add(
             pattern_count
                 .checked_mul(size_of::<u64>())
-                .ok_or(InspectionError::Overflow)?,
+                .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?,
         )
         .and_then(|bytes| bytes.checked_add(pattern_bytes))
-        .ok_or(InspectionError::Overflow)?;
+        .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
     let trie_states_upper_bound = pattern_bytes
         .checked_add(1)
-        .ok_or(InspectionError::Overflow)?;
+        .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
     let alphabet_classes = if used_count == 256 {
         256
     } else {
-        used_count.checked_add(1).ok_or(InspectionError::Overflow)?
+        used_count
+            .checked_add(1)
+            .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?
     };
     let dense_cells_upper_bound = trie_states_upper_bound
         .checked_mul(alphabet_classes)
-        .ok_or(InspectionError::Overflow)?;
+        .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
     let hir_nodes = pattern_count
         .checked_add(1)
-        .ok_or(InspectionError::Overflow)?;
-    Ok(Inspection::Eligible(RootLiteralAlternation {
-        children,
+        .ok_or_else(|| close_inspection_error(InspectionError::Overflow, work))?;
+    Ok(close_inspection(
+        Inspection::Eligible(RootLiteralAlternation {
+            children,
+            work,
+            hir_nodes,
+            pattern_bytes,
+            identity_bytes,
+            trie_states_upper_bound,
+            dense_cells_upper_bound,
+        }),
         work,
-        hir_nodes,
-        pattern_bytes,
-        identity_bytes,
-        trie_states_upper_bound,
-        dense_cells_upper_bound,
-    }))
+    ))
 }
 
 fn charge(work: &mut u64, amount: u64, limit: u64) -> Result<(), InspectionError> {
@@ -233,6 +478,29 @@ fn charge(work: &mut u64, amount: u64, limit: u64) -> Result<(), InspectionError
     Ok(())
 }
 
+const fn close_inspection(outcome: Inspection<'_>, work: u64) -> RootLiteralInspectionAttempt<'_> {
+    RootLiteralInspectionAttempt {
+        outcome,
+        receipt: RootLiteralInspectionAttemptReceipt {
+            actual: RootLiteralInspectionActual { work },
+            closed: true,
+        },
+    }
+}
+
+const fn close_inspection_error(
+    source: InspectionError,
+    work: u64,
+) -> RootLiteralInspectionAttemptError {
+    RootLiteralInspectionAttemptError {
+        source,
+        receipt: RootLiteralInspectionAttemptReceipt {
+            actual: RootLiteralInspectionActual { work },
+            closed: true,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -240,7 +508,9 @@ mod tests {
         reason = "exact one-below fixtures subtract from values proved positive in the same test"
     )]
 
-    use super::{Inspection, InspectionError, MaterializationError, inspect, size_of};
+    use super::{
+        Inspection, InspectionError, MaterializationError, inspect, inspect_attempt, size_of,
+    };
     use fre_kernels::OrderedLiteralAggregateBuildLimits;
     use regex_syntax::ParserBuilder;
 
@@ -265,7 +535,7 @@ mod tests {
             panic!("literal root should be eligible");
         };
         let materialized = proof
-            .materialize_patterns(u64::MAX, usize::MAX, usize::MAX)
+            .materialize_patterns_attempt(u64::MAX, usize::MAX, usize::MAX)
             .unwrap();
         assert_eq!(
             materialized.patterns,
@@ -277,6 +547,32 @@ mod tests {
             ]
         );
         assert_eq!(materialized.work, 17);
+        let prospective = materialized.receipt.prospective().unwrap();
+        let actual = materialized.receipt.actual();
+        assert!(materialized.receipt.is_closed());
+        assert_eq!(prospective.final_work, 17);
+        assert_eq!(prospective.allocations, 1);
+        assert_eq!(prospective.initialized_bytes, 4 * size_of::<&[u8]>());
+        assert_eq!(actual.work, 17);
+        assert_eq!(actual.allocations, 1);
+        assert!(actual.allocated_bytes >= prospective.initialized_bytes);
+        assert_eq!(actual.initialized_bytes, prospective.initialized_bytes);
+        assert_eq!(actual.live_scratch_bytes, actual.allocated_bytes);
+        assert_eq!(actual.peak_bytes, actual.allocated_bytes);
+        assert_eq!(actual.abandoned_allocations, 0);
+        assert_eq!(actual.abandoned_bytes, 0);
+        let Err(refused) = proof.materialize_patterns_attempt(proof.work, usize::MAX, usize::MAX)
+        else {
+            panic!("one-below materialization work limit should refuse");
+        };
+        assert!(refused.receipt().is_closed());
+        assert_eq!(refused.receipt().actual().work, proof.work);
+        assert_eq!(refused.receipt().actual().allocations, 0);
+        assert!(matches!(
+            refused.source(),
+            MaterializationError::WorkLimit { needed, limit }
+                if *needed == 17 && *limit == proof.work
+        ));
         assert!(matches!(
             proof.materialize_patterns(proof.work, usize::MAX, usize::MAX),
             Err(MaterializationError::WorkLimit { needed, limit })
@@ -303,6 +599,16 @@ mod tests {
         assert!(matches!(
             inspect(&hir, false, proof.work - 1),
             Err(InspectionError::WorkLimit { needed, limit })
+                if needed == proof.work && limit == proof.work - 1
+        ));
+        let Err(inspection_refused) = inspect_attempt(&hir, false, proof.work - 1) else {
+            panic!("one-below inspection work limit should refuse");
+        };
+        assert!(inspection_refused.receipt().is_closed());
+        assert_eq!(inspection_refused.receipt().actual().work, 10);
+        assert!(matches!(
+            inspection_refused.source(),
+            InspectionError::WorkLimit { needed, limit }
                 if needed == proof.work && limit == proof.work - 1
         ));
 

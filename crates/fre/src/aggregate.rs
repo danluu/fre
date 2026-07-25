@@ -8,23 +8,24 @@ use fre_aggregate::{
 };
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
-    BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CONTEXT_COUNT_OPERATION_ID,
-    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
-    BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
-    BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
-    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
-    BlockingDelimiterCountResult, BlockingDelimiterOperationIdentity, BlockingDelimiterPlan,
-    BlockingDelimiterReduceAccounting, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
-    BlockingDelimiterSpanSumResult, BoundedClassSequenceBuildAccounting,
-    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
-    BoundedClassSequenceCountResult, BoundedClassSequenceOperationIdentity,
-    BoundedClassSequencePlan, BoundedClassSequenceReduceAccounting,
-    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
-    BoundedContextBuildAccounting, BoundedContextBuildError, BoundedContextBuildLimits,
-    BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
-    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
-    BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
-    BoundedLiteralPairCountResult, BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
+    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
+    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
+    BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
+    BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BlockingDelimiterBuildAccounting,
+    BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterCountResult,
+    BlockingDelimiterOperationIdentity, BlockingDelimiterPlan, BlockingDelimiterReduceAccounting,
+    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BlockingDelimiterSpanSumResult,
+    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
+    BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
+    BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
+    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
+    BoundedClassSequenceReduceLimits, BoundedContextBuildAccounting, BoundedContextBuildError,
+    BoundedContextBuildLimits, BoundedContextCountResult, BoundedContextOperationIdentity,
+    BoundedContextPlan, BoundedContextReduceAccounting, BoundedContextReduceError,
+    BoundedContextReduceLimits, BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError,
+    BoundedLiteralPairBuildLimits, BoundedLiteralPairCountResult,
+    BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
     BoundedLiteralPairReduceAccounting, BoundedLiteralPairReduceError,
     BoundedLiteralPairReduceLimits, BoundedLiteralPairSpanSumResult,
     BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
@@ -33,9 +34,10 @@ use fre_kernels::{
     BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
-    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
-    FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
-    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    DirectBuildAttemptActual, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
+    FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
+    FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
+    FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
     FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainCountOutcome,
@@ -48,9 +50,10 @@ use fre_kernels::{
     FixedClassSandwichOperationIdentity, FixedClassSandwichPlan,
     FixedClassSandwichReduceAccounting, FixedClassSandwichReduceError,
     FixedClassSandwichReduceLimits, FixedClassSandwichSemantics, FixedClassSandwichSpanSumResult,
-    FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildError,
-    FixedPredicateWord64BuildLimits, FixedPredicateWord64CountResult,
-    FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
+    FixedPredicateWord64BuildAccounting, FixedPredicateWord64BuildAttemptActual,
+    FixedPredicateWord64BuildError, FixedPredicateWord64BuildLimits,
+    FixedPredicateWord64CountResult, FixedPredicateWord64Operation,
+    FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
     FixedPredicateWord64ReduceLimits, FixedPredicateWord64SpanSumResult,
     GRAPHEME_SCALAR_DFA_COUNT_OPERATION_ID, GRAPHEME_SCALAR_DFA_SPAN_SUM_OPERATION_ID,
@@ -76,10 +79,10 @@ use fre_kernels::{
     LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
     ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
-    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildAttemptActual,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PrefixClassAlternationBuildAccounting,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
@@ -87,13 +90,13 @@ use fre_kernels::{
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
-    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
-    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
-    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
-    TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
-    TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
-    TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
+    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildAttemptActual,
+    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
+    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
+    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
+    SparseOrderedLiteralSpanSumPlan, TOKEN_PHRASE_COUNT_OPERATION_ID,
+    TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseBuildAccounting, TokenPhraseBuildError,
+    TokenPhraseBuildLimits, TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
     TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
@@ -113,17 +116,22 @@ use regex_syntax::hir::{
 
 use crate::{
     AggregateCompileAccounting, AggregateCompileAttemptError, AggregateCompileLimits,
-    AggregateEngineError, AggregateExecutionAccounting, AggregateOperationCertificate,
-    AggregateOperationLimits, AggregatePlanId, AggregateResource, BuildError, Match,
-    blocking_delimiter, bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar,
-    guarded_ascii_word, literal_assertions, literal_class_run_literal, token_phrase,
-    unicode_word_run,
+    AggregateConstructionAbandonment, AggregateConstructionAttempt,
+    AggregateConstructionAttemptIdentity, AggregateConstructionAttemptReceipt,
+    AggregateConstructionEffect, AggregateConstructionPrepublicationFallback,
+    AggregateConstructionProspective, AggregateConstructionRequestInputs,
+    AggregateConstructionRequestOwnerSeal, AggregateConstructionSelectedPlanOwnerSeal,
+    AggregateConstructionStage, AggregateEngineError, AggregateExecutionAccounting,
+    AggregateOperationCertificate, AggregateOperationLimits, AggregatePlanId, AggregateResource,
+    BuildError, Match, aggregate_construction::AggregateInspectionAttemptError, blocking_delimiter,
+    bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
+    literal_assertions, literal_class_run_literal, token_phrase, unicode_word_run,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 34;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 35;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
@@ -718,6 +726,71 @@ fn include_fixed_absolute_owner_guard_actual(
     })
 }
 
+fn fixed_absolute_construction_effect(
+    planner_work: usize,
+    guard: FixedAbsoluteDomainBuildActual,
+    residual: Option<fre_aggregate::CompileConstructionActual>,
+    include_fixed_owner: bool,
+) -> Option<AggregateConstructionEffect> {
+    let planner_work = u64::try_from(planner_work).ok()?;
+    let residual = residual.unwrap_or_default();
+    let owner_bytes = include_fixed_owner
+        .then(fixed_absolute_owner_bytes)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let owner_handle_bytes = if include_fixed_owner {
+        core::mem::size_of::<AggregateExecutionIdentity>()
+    } else {
+        0
+    };
+    let owner_work = u64::try_from(owner_bytes).ok()?;
+    let work = planner_work
+        .checked_add(guard.build_work)?
+        .checked_add(u64::try_from(residual.work).ok()?)?
+        .checked_add(owner_work)?;
+    let allocations = guard
+        .allocations
+        .checked_add(residual.allocations)?
+        .checked_add(usize::from(include_fixed_owner))?;
+    let allocated_bytes = guard
+        .retained_heap_bytes
+        .checked_add(residual.allocated_bytes)?
+        .checked_add(owner_bytes)?;
+    let copied_bytes = guard
+        .copied_bytes
+        .checked_add(residual.copied_bytes)?
+        .checked_add(owner_bytes)?
+        .checked_add(owner_handle_bytes)?;
+    let initialized_bytes = guard
+        .initialized_bytes
+        .checked_add(residual.initialized_bytes)?
+        .checked_add(owner_bytes)?
+        .checked_add(owner_handle_bytes)?;
+    let guard_and_residual_live = guard
+        .persistent_bytes
+        .checked_add(residual.live_construction_bytes)?;
+    let retained_persistent_bytes = guard_and_residual_live
+        .checked_add(owner_bytes)?
+        .checked_add(owner_handle_bytes)?;
+    let residual_co_live = guard
+        .persistent_bytes
+        .checked_add(residual.construction_peak_bytes)?;
+    Some(AggregateConstructionEffect {
+        work,
+        allocations,
+        allocated_bytes,
+        copied_bytes,
+        initialized_bytes,
+        retained_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: guard
+            .peak_bytes
+            .max(residual_co_live)
+            .max(retained_persistent_bytes),
+    })
+}
+
 fn fixed_guard_build_limit_refusal(
     prospective: FixedAbsoluteDomainBuildProspective,
     limits: FixedAbsoluteDomainBuildLimits,
@@ -885,6 +958,18 @@ fn compose_fixed_residual_build_failure_actual(
         peak_bytes,
         published: false,
     })
+}
+
+const fn fixed_guard_build_failure_actual(
+    actual: FixedAbsoluteDomainBuildActual,
+) -> AggregateFixedAbsoluteDomainResidualBuildActual {
+    AggregateFixedAbsoluteDomainResidualBuildActual {
+        work: actual.build_work,
+        allocations: actual.allocations,
+        persistent_bytes: actual.persistent_bytes,
+        peak_bytes: actual.peak_bytes,
+        published: false,
+    }
 }
 
 /// Profile proof attached to a continuation-program facade identity.
@@ -1239,11 +1324,1053 @@ pub struct AggregateRunLimits {
     pub continuation: AggregateOperationLimits,
 }
 
+/// Exact immutable inputs owned by one whole-construction transaction.
+pub type AggregateConstructionRequest = AggregateConstructionRequestInputs<
+    fre_syntax::ParseAttemptIdentity,
+    AggregateOperation,
+    AggregatePlanSelection,
+    AggregateStrategy,
+    RustProfile,
+    AggregateBuildLimits,
+>;
+
+/// Closed current-schema construction receipt shared by successes and terminal
+/// attempt errors.
+pub type AggregateConstructionReceipt =
+    AggregateConstructionAttemptReceipt<AggregateConstructionRequest, AggregatePlanIdentity>;
+
+type AggregateConstructionTransaction =
+    AggregateConstructionAttempt<AggregateConstructionRequest, AggregatePlanIdentity>;
+
+#[derive(Debug)]
+struct AggregateConstructionContext {
+    transaction: AggregateConstructionTransaction,
+    source_owner: Option<AggregateConstructionSourceOwner>,
+    syntax_attempt: Option<fre_syntax::ParseAttemptReceipt>,
+    pending_terminal_effect: AggregateConstructionEffect,
+    selected_success_effect: Option<AggregateConstructionEffect>,
+}
+
+fn logical_arc_allocation_bytes<T>() -> Option<usize> {
+    let header = core::mem::size_of::<usize>().checked_mul(2)?;
+    let unpadded = header.checked_add(core::mem::size_of::<T>())?;
+    let alignment = core::mem::align_of::<T>().max(core::mem::align_of::<usize>());
+    let remainder = unpadded.checked_rem(alignment)?;
+    let padding = alignment.checked_sub(remainder)?.checked_rem(alignment)?;
+    unpadded.checked_add(padding)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the single prospective calculation keeps every route envelope visible at one audit boundary"
+)]
+fn aggregate_construction_prospective(
+    request: &fre_syntax::ParseRequest,
+    limits: &AggregateBuildLimits,
+) -> Result<AggregateConstructionProspective, &'static str> {
+    let syntax = request.attempt_prospective();
+    let sparse = sparse_finite_build_limits(limits.finite_literal);
+    let guarded = guarded_finite_build_limits(limits.finite_literal);
+    let fixed_predicate = fixed_predicate_word64_build_limits(limits.finite_literal);
+
+    let mut work = syntax.max_observed_work;
+    let mut add_work = |amount: u64| -> Result<(), &'static str> {
+        work = work
+            .checked_add(amount)
+            .ok_or("aggregate construction prospective work overflow")?;
+        Ok(())
+    };
+    for planner in [
+        limits.max_literal_planner_work,
+        limits.max_unicode_scalar_planner_work,
+        limits.max_word_run_planner_work,
+        limits.max_literal_assertions_planner_work,
+        limits.max_blocking_delimiter_planner_work,
+        limits.max_token_phrase_planner_work,
+        limits.max_fixed_class_sandwich_planner_work,
+        limits.max_bounded_affix_planner_work,
+        limits.max_grapheme_scalar_dfa_planner_work,
+        limits.max_bounded_class_sequence_planner_work,
+        limits.max_bounded_separated_fields_planner_work,
+        limits.max_prefix_class_alternation_planner_work,
+        limits.max_bounded_literal_pair_planner_work,
+        limits.max_literal_class_run_literal_planner_work,
+        limits.max_bounded_context_planner_work,
+        limits.max_fixed_absolute_planner_work,
+    ] {
+        add_work(
+            u64::try_from(planner).map_err(|_| "aggregate planner prospective does not fit u64")?,
+        )?;
+    }
+    add_work(limits.max_finite_planner_work)?;
+    for build in [
+        limits.exact_literal.max_build_work,
+        u64::try_from(limits.unicode_scalar.max_build_work)
+            .map_err(|_| "Unicode scalar construction work does not fit u64")?,
+        u64::try_from(limits.word_run.max_build_work)
+            .map_err(|_| "word-run construction work does not fit u64")?,
+        u64::try_from(limits.literal_assertions.max_build_work)
+            .map_err(|_| "literal-assertions construction work does not fit u64")?,
+        u64::try_from(limits.blocking_delimiter.max_build_work)
+            .map_err(|_| "blocking-delimiter construction work does not fit u64")?,
+        u64::try_from(limits.token_phrase.max_build_work)
+            .map_err(|_| "token-phrase construction work does not fit u64")?,
+        u64::try_from(limits.fixed_class_sandwich.max_build_work)
+            .map_err(|_| "fixed-class construction work does not fit u64")?,
+        u64::try_from(limits.grapheme_scalar_dfa.max_build_work)
+            .map_err(|_| "grapheme construction work does not fit u64")?,
+        u64::try_from(limits.bounded_class_sequence.max_build_work)
+            .map_err(|_| "bounded-class construction work does not fit u64")?,
+        u64::try_from(limits.bounded_separated_fields.max_build_work)
+            .map_err(|_| "separated-fields construction work does not fit u64")?,
+        u64::try_from(limits.prefix_class_alternation.max_build_work)
+            .map_err(|_| "prefix-class construction work does not fit u64")?,
+        u64::try_from(limits.bounded_literal_pair.max_build_work)
+            .map_err(|_| "bounded-pair construction work does not fit u64")?,
+        u64::try_from(limits.literal_class_run_literal.max_build_work)
+            .map_err(|_| "literal-class construction work does not fit u64")?,
+        u64::try_from(limits.bounded_context.max_build_work)
+            .map_err(|_| "bounded-context construction work does not fit u64")?,
+        limits.fixed_absolute.max_build_work,
+        limits.fixed_absolute_residual.max_work,
+        limits.finite_literal.max_build_work,
+        sparse.max_build_work,
+        guarded.dictionary.max_build_work,
+        fixed_predicate.max_build_work,
+        u64::try_from(limits.continuation.max_work)
+            .map_err(|_| "continuation construction work does not fit u64")?,
+    ] {
+        add_work(build)?;
+    }
+    // A successful transaction creates one construction-unique immutable
+    // report seal. Its allocation is itself one charged publication action.
+    add_work(1)?;
+
+    let key_owner_bytes = logical_arc_allocation_bytes::<CacheKey>()
+        .ok_or("syntax cache owner byte envelope overflow")?;
+    let source_owner_bytes = fre_syntax::ParseRequest::attempt_source_owner_allocation_bytes();
+    let source_owner_handle_bytes = fre_syntax::ParseRequest::attempt_source_owner_handle_bytes();
+    let key_owner_handle_bytes = core::mem::size_of::<Arc<CacheKey>>();
+    let plan_owner_bytes = core::mem::size_of::<AggregatePlanIdentity>();
+    let report_seal_bytes = logical_arc_allocation_bytes::<AggregatePublishedReportSeal>()
+        .ok_or("aggregate report seal byte envelope overflow")?;
+    let report_seal_owner_bytes = core::mem::size_of::<Arc<AggregatePublishedReportSeal>>()
+        .checked_mul(2)
+        .and_then(|owners| report_seal_bytes.checked_add(owners))
+        .ok_or("aggregate report seal owner byte envelope overflow")?;
+    let fixed_owner_handle_bytes = core::mem::size_of::<AggregateExecutionIdentity>();
+    let preterminal_owner_handle_bytes = source_owner_handle_bytes
+        .checked_mul(2)
+        .and_then(|bytes| {
+            key_owner_handle_bytes
+                .checked_mul(2)
+                .and_then(|key_handles| bytes.checked_add(key_handles))
+        })
+        .and_then(|bytes| bytes.checked_add(fixed_owner_handle_bytes))
+        .ok_or("aggregate preterminal owner-handle envelope overflow")?;
+    let base_live_bytes = source_owner_bytes
+        .checked_add(key_owner_bytes)
+        .and_then(|bytes| bytes.checked_add(preterminal_owner_handle_bytes))
+        .and_then(|bytes| bytes.checked_add(plan_owner_bytes))
+        .and_then(|bytes| bytes.checked_add(report_seal_owner_bytes))
+        .ok_or("aggregate construction base live-byte envelope overflow")?;
+    let mut peak = base_live_bytes.max(1);
+    let mut persistent = key_owner_bytes.max(
+        plan_owner_bytes
+            .checked_add(report_seal_owner_bytes)
+            .ok_or("aggregate publication persistent-byte envelope overflow")?,
+    );
+    for (route_peak, route_persistent) in [
+        (
+            limits.exact_literal.max_peak_bytes,
+            limits.exact_literal.max_persistent_bytes,
+        ),
+        (
+            limits.unicode_scalar.max_peak_bytes,
+            limits.unicode_scalar.max_persistent_bytes,
+        ),
+        (
+            limits.word_run.max_peak_bytes,
+            limits.word_run.max_persistent_bytes,
+        ),
+        (
+            limits.literal_assertions.max_peak_bytes,
+            limits.literal_assertions.max_persistent_bytes,
+        ),
+        (
+            limits.blocking_delimiter.max_peak_bytes,
+            limits.blocking_delimiter.max_persistent_bytes,
+        ),
+        (
+            limits.token_phrase.max_peak_bytes,
+            limits.token_phrase.max_persistent_bytes,
+        ),
+        (
+            limits.fixed_class_sandwich.max_peak_bytes,
+            limits.fixed_class_sandwich.max_persistent_bytes,
+        ),
+        (
+            limits.grapheme_scalar_dfa.max_peak_bytes,
+            limits.grapheme_scalar_dfa.max_persistent_bytes,
+        ),
+        (
+            limits.bounded_class_sequence.max_peak_bytes,
+            limits.bounded_class_sequence.max_persistent_bytes,
+        ),
+        (
+            limits.bounded_separated_fields.max_peak_bytes,
+            limits.bounded_separated_fields.max_persistent_bytes,
+        ),
+        (
+            limits.prefix_class_alternation.max_peak_bytes,
+            limits.prefix_class_alternation.max_persistent_bytes,
+        ),
+        (
+            limits.bounded_literal_pair.max_peak_bytes,
+            limits.bounded_literal_pair.max_persistent_bytes,
+        ),
+        (
+            limits.literal_class_run_literal.max_peak_bytes,
+            limits.literal_class_run_literal.max_persistent_bytes,
+        ),
+        (
+            limits.bounded_context.max_peak_bytes,
+            limits.bounded_context.max_persistent_bytes,
+        ),
+        (
+            limits.fixed_absolute.max_peak_bytes,
+            limits.fixed_absolute.max_persistent_bytes,
+        ),
+        (
+            limits.fixed_absolute_residual.max_peak_bytes,
+            limits.fixed_absolute_residual.max_persistent_bytes,
+        ),
+        (
+            limits.finite_literal.max_peak_bytes,
+            limits.finite_literal.max_persistent_bytes,
+        ),
+        (sparse.max_peak_bytes, sparse.max_persistent_bytes),
+        (
+            guarded.dictionary.max_peak_bytes,
+            guarded.dictionary.max_persistent_bytes,
+        ),
+        (
+            fixed_predicate.max_peak_bytes,
+            fixed_predicate.max_persistent_bytes,
+        ),
+        (
+            limits.continuation.max_program_bytes,
+            limits.continuation.max_program_bytes,
+        ),
+    ] {
+        peak = peak.max(
+            base_live_bytes
+                .checked_add(route_peak)
+                .ok_or("aggregate construction route peak envelope overflow")?,
+        );
+        persistent = persistent.max(route_persistent);
+    }
+    let allocations = usize::try_from(work)
+        .map_err(|_| "aggregate construction allocation envelope does not fit usize")?
+        .checked_add(2)
+        .ok_or("aggregate construction allocation envelope overflow")?;
+    let byte_envelope = allocations
+        .checked_mul(peak)
+        .ok_or("aggregate construction byte envelope overflow")?;
+    let syntax_failure_owner_handles = source_owner_handle_bytes
+        .checked_mul(3)
+        .ok_or("terminal source-owner handle envelope overflow")?;
+    let successful_cache_owner_handles = source_owner_handle_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(key_owner_handle_bytes))
+        .ok_or("successful cache-owner handle envelope overflow")?;
+    let final_owner_handle_bytes = syntax_failure_owner_handles
+        .max(successful_cache_owner_handles)
+        .checked_add(fixed_owner_handle_bytes)
+        .ok_or("aggregate terminal owner-handle envelope overflow")?;
+    let live_persistent_bytes = source_owner_bytes
+        .checked_add(key_owner_bytes)
+        .and_then(|bytes| bytes.checked_add(final_owner_handle_bytes))
+        .and_then(|bytes| bytes.checked_add(persistent))
+        .and_then(|bytes| bytes.checked_add(plan_owner_bytes))
+        .and_then(|bytes| bytes.checked_add(report_seal_owner_bytes))
+        .ok_or("aggregate construction live-byte envelope overflow")?;
+    if live_persistent_bytes > byte_envelope {
+        return Err("aggregate construction live bytes exceed byte envelope");
+    }
+    Ok(AggregateConstructionProspective {
+        work,
+        allocations,
+        allocated_bytes: byte_envelope,
+        copied_bytes: byte_envelope,
+        initialized_bytes: byte_envelope,
+        abandoned_work: work,
+        abandoned_allocations: allocations,
+        abandoned_bytes: byte_envelope,
+        live_persistent_bytes,
+        high_water_bytes: byte_envelope,
+    })
+}
+
+fn construction_request_owner_effect(owner_bytes: usize) -> AggregateConstructionEffect {
+    let handle_bytes = fre_syntax::ParseRequest::attempt_source_owner_handle_bytes();
+    let owner_and_handles = owner_bytes
+        .checked_add(
+            handle_bytes
+                .checked_mul(2)
+                .expect("two source-owner handles fit usize"),
+        )
+        .expect("source-owner allocation and handles fit usize");
+    AggregateConstructionEffect {
+        work: 0,
+        allocations: 1,
+        allocated_bytes: owner_bytes,
+        copied_bytes: handle_bytes
+            .checked_mul(2)
+            .expect("two copied source-owner handles fit usize"),
+        initialized_bytes: owner_and_handles,
+        retained_persistent_bytes: owner_and_handles,
+        released_persistent_bytes: 0,
+        co_live_bytes: owner_and_handles,
+    }
+}
+
+fn syntax_construction_effect(
+    receipt: &fre_syntax::ParseAttemptReceipt,
+    retained_key_payload: bool,
+) -> AggregateConstructionEffect {
+    let source_handle_bytes = fre_syntax::ParseRequest::attempt_source_owner_handle_bytes();
+    let key_allocation_bytes = if retained_key_payload {
+        logical_arc_allocation_bytes::<CacheKey>()
+            .expect("CacheKey Arc logical allocation layout fits usize")
+    } else {
+        0
+    };
+    let key_handle_bytes = core::mem::size_of::<Arc<CacheKey>>();
+    let copied_bytes = if retained_key_payload {
+        source_handle_bytes
+            .checked_add(
+                key_handle_bytes
+                    .checked_mul(2)
+                    .expect("two copied cache-key handles fit usize"),
+            )
+            .expect("syntax owner copied bytes fit usize")
+    } else {
+        source_handle_bytes
+    };
+    let initialized_bytes = if retained_key_payload {
+        key_allocation_bytes
+            .checked_add(source_handle_bytes)
+            .and_then(|bytes| {
+                key_handle_bytes
+                    .checked_mul(2)
+                    .and_then(|handles| bytes.checked_add(handles))
+            })
+            .expect("syntax owner initialized bytes fit usize")
+    } else {
+        source_handle_bytes
+    };
+    let retained_persistent_bytes = initialized_bytes;
+    let released_persistent_bytes = if retained_key_payload {
+        source_handle_bytes
+    } else {
+        0
+    };
+    let co_live_bytes = retained_persistent_bytes.saturating_sub(released_persistent_bytes);
+    AggregateConstructionEffect {
+        work: receipt.actual.observed_work,
+        allocations: usize::from(retained_key_payload),
+        allocated_bytes: key_allocation_bytes,
+        copied_bytes,
+        initialized_bytes,
+        retained_persistent_bytes,
+        released_persistent_bytes,
+        co_live_bytes,
+    }
+}
+
+fn construction_work_effect(work: usize) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: u64::try_from(work).unwrap_or(u64::MAX),
+        ..AggregateConstructionEffect::default()
+    }
+}
+
+fn include_construction_work(
+    mut effect: AggregateConstructionEffect,
+    work: usize,
+) -> Option<AggregateConstructionEffect> {
+    effect.work = effect.work.checked_add(u64::try_from(work).ok()?)?;
+    Some(effect)
+}
+
+const fn direct_build_attempt_effect(
+    actual: DirectBuildAttemptActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: actual.copied_bytes,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.peak_bytes,
+    }
+}
+
+fn direct_build_stage_effect(
+    inspection_work: usize,
+    actual: DirectBuildAttemptActual,
+) -> AggregateConstructionEffect {
+    include_construction_work(direct_build_attempt_effect(actual), inspection_work).unwrap_or_else(
+        || unreachable!("admitted direct construction effect exceeded its prospective envelope"),
+    )
+}
+
+fn retain_direct_build_success(
+    construction: &mut AggregateConstructionContext,
+    inspection_work: usize,
+    actual: DirectBuildAttemptActual,
+) {
+    let unpublished = direct_build_stage_effect(inspection_work, actual);
+    let published = include_selected_plan_owner_effect(unpublished).unwrap_or_else(|| {
+        unreachable!("admitted direct publication effect exceeded its prospective envelope")
+    });
+    construction.pending_terminal_effect = unpublished;
+    construction.selected_success_effect = Some(published);
+}
+
+fn select_construction_stage(
+    construction: &mut AggregateConstructionContext,
+    stage: AggregateConstructionStage,
+    effect: AggregateConstructionEffect,
+) {
+    if construction.transaction.select_stage(stage).is_err() {
+        unreachable!("selected aggregate stage violated construction order");
+    }
+    construction.pending_terminal_effect = effect;
+    construction.selected_success_effect = None;
+}
+
+fn record_construction_ineligible(
+    construction: &mut AggregateConstructionContext,
+    stage: AggregateConstructionStage,
+    work: usize,
+) {
+    if construction
+        .transaction
+        .record_semantic_ineligible(stage, construction_work_effect(work))
+        .is_err()
+    {
+        unreachable!("ineligible aggregate stage violated construction order");
+    }
+}
+
+fn record_construction_policy_skip(
+    construction: &mut AggregateConstructionContext,
+    stage: AggregateConstructionStage,
+) {
+    if construction.transaction.record_policy_skip(stage).is_err() {
+        unreachable!("skipped aggregate stage violated construction order");
+    }
+}
+
+fn resolve_construction_soft_refusal(
+    construction: &mut AggregateConstructionContext,
+    effect: AggregateConstructionEffect,
+    fallback: AggregateConstructionPrepublicationFallback,
+) {
+    if effect.allocations != 0
+        || effect.allocated_bytes != 0
+        || effect.copied_bytes != 0
+        || effect.initialized_bytes != 0
+        || effect.retained_persistent_bytes != 0
+        || effect.released_persistent_bytes != 0
+        || effect.co_live_bytes != 0
+    {
+        unreachable!("work-only aggregate soft refusal retained non-work construction effects");
+    }
+    let abandonment = AggregateConstructionAbandonment {
+        work: effect.work,
+        allocations: 0,
+        bytes: 0,
+        released_persistent_bytes: 0,
+    };
+    resolve_construction_soft_refusal_with_abandonment(construction, effect, abandonment, fallback);
+}
+
+fn resolve_construction_soft_refusal_with_abandonment(
+    construction: &mut AggregateConstructionContext,
+    effect: AggregateConstructionEffect,
+    abandonment: AggregateConstructionAbandonment,
+    fallback: AggregateConstructionPrepublicationFallback,
+) {
+    if construction
+        .transaction
+        .resolve_selected_soft_refusal(effect, abandonment, fallback)
+        .is_err()
+    {
+        unreachable!("aggregate soft refusal violated its typed selector edge");
+    }
+    construction.pending_terminal_effect = AggregateConstructionEffect::default();
+}
+
+fn dense_finite_abandonment(
+    prior: AggregateConstructionEffect,
+    build_effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionAbandonment> {
+    // A fallback abandons the complete finite-extraction/build branch, not
+    // only the capacities that happen to remain live at the refusal point.
+    // Both lower receipts retain cumulative successfully allocated capacity,
+    // including scratch released earlier in the branch.
+    Some(AggregateConstructionAbandonment {
+        work: prior.work.checked_add(build_effect.work)?,
+        allocations: prior.allocations.checked_add(build_effect.allocations)?,
+        bytes: prior
+            .allocated_bytes
+            .checked_add(build_effect.allocated_bytes)?,
+        released_persistent_bytes: prior
+            .retained_persistent_bytes
+            .checked_add(build_effect.retained_persistent_bytes)?
+            .checked_sub(build_effect.released_persistent_bytes)?,
+    })
+}
+
+fn include_selected_plan_owner_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    let owner_bytes = core::mem::size_of::<AggregatePlanIdentity>();
+    let retained_with_owner = effect.retained_persistent_bytes.checked_add(owner_bytes)?;
+    let post_release_owner_phase =
+        retained_with_owner.saturating_sub(effect.released_persistent_bytes);
+    Some(AggregateConstructionEffect {
+        work: effect.work,
+        allocations: effect.allocations,
+        allocated_bytes: effect.allocated_bytes,
+        copied_bytes: effect.copied_bytes.checked_add(owner_bytes)?,
+        initialized_bytes: effect.initialized_bytes.checked_add(owner_bytes)?,
+        retained_persistent_bytes: retained_with_owner,
+        released_persistent_bytes: effect.released_persistent_bytes,
+        co_live_bytes: effect.co_live_bytes.max(post_release_owner_phase),
+    })
+}
+
+fn include_fixed_construction_receipt_copy_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    let receipt_bytes = core::mem::size_of::<AggregateConstructionReceipt>();
+    Some(AggregateConstructionEffect {
+        work: effect.work,
+        allocations: effect.allocations,
+        allocated_bytes: effect.allocated_bytes,
+        copied_bytes: effect.copied_bytes.checked_add(receipt_bytes)?,
+        initialized_bytes: effect.initialized_bytes.checked_add(receipt_bytes)?,
+        retained_persistent_bytes: effect.retained_persistent_bytes,
+        released_persistent_bytes: effect.released_persistent_bytes,
+        co_live_bytes: effect.co_live_bytes,
+    })
+}
+
+fn release_transient_cache_key_owner_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    Some(AggregateConstructionEffect {
+        released_persistent_bytes: effect
+            .released_persistent_bytes
+            .checked_add(core::mem::size_of::<Arc<CacheKey>>())?,
+        ..effect
+    })
+}
+
+fn close_syntax_terminal_cache_key_owner_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    Some(AggregateConstructionEffect {
+        retained_persistent_bytes: effect
+            .retained_persistent_bytes
+            .checked_sub(core::mem::size_of::<Arc<CacheKey>>())?,
+        ..effect
+    })
+}
+
+fn include_published_report_seal_effect(
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    let allocation_bytes = logical_arc_allocation_bytes::<AggregatePublishedReportSeal>()?;
+    let payload_bytes = core::mem::size_of::<AggregatePublishedReportSeal>();
+    let owner_bytes = core::mem::size_of::<Arc<AggregatePublishedReportSeal>>().checked_mul(2)?;
+    let retained_bytes = allocation_bytes.checked_add(owner_bytes)?;
+    let retained_with_seal = effect
+        .retained_persistent_bytes
+        .checked_add(retained_bytes)?;
+    let released_persistent_bytes = effect
+        .released_persistent_bytes
+        .checked_add(core::mem::size_of::<Arc<CacheKey>>())?;
+    let post_release_seal_phase = retained_with_seal.saturating_sub(released_persistent_bytes);
+    Some(AggregateConstructionEffect {
+        work: effect.work.checked_add(1)?,
+        allocations: effect.allocations.checked_add(1)?,
+        allocated_bytes: effect.allocated_bytes.checked_add(allocation_bytes)?,
+        copied_bytes: effect
+            .copied_bytes
+            .checked_add(payload_bytes)?
+            .checked_add(owner_bytes)?,
+        initialized_bytes: effect
+            .initialized_bytes
+            .checked_add(allocation_bytes)?
+            .checked_add(owner_bytes)?,
+        retained_persistent_bytes: retained_with_seal,
+        released_persistent_bytes,
+        co_live_bytes: effect.co_live_bytes.max(post_release_seal_phase),
+    })
+}
+
+fn sparse_finite_construction_effect(
+    materialization: finite_root::RootLiteralMaterializationActual,
+    build: SparseOrderedLiteralAggregateBuildAttemptActual,
+) -> Option<AggregateConstructionEffect> {
+    let build_co_live = materialization
+        .live_scratch_bytes
+        .checked_add(build.peak_bytes)?;
+    Some(AggregateConstructionEffect {
+        work: materialization.work.checked_add(build.work)?,
+        allocations: materialization.allocations.checked_add(build.allocations)?,
+        allocated_bytes: materialization
+            .allocated_bytes
+            .checked_add(build.allocated_bytes)?,
+        copied_bytes: build.copied_bytes,
+        initialized_bytes: materialization
+            .initialized_bytes
+            .checked_add(build.initialized_bytes)?,
+        retained_persistent_bytes: build.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: materialization.peak_bytes.max(build_co_live),
+    })
+}
+
+fn sparse_finite_abandonment(
+    effect: AggregateConstructionEffect,
+) -> AggregateConstructionAbandonment {
+    // `allocated_bytes` is cumulative across the materialization and sparse
+    // builder receipts, whereas their live counters intentionally shrink as
+    // scratch and superseded capacities are released.
+    AggregateConstructionAbandonment {
+        work: effect.work,
+        allocations: effect.allocations,
+        bytes: effect.allocated_bytes,
+        released_persistent_bytes: effect.retained_persistent_bytes,
+    }
+}
+
+const fn root_materialization_effect(
+    actual: finite_root::RootLiteralMaterializationActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: 0,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: 0,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.peak_bytes,
+    }
+}
+
+const fn root_materialization_abandonment(
+    actual: finite_root::RootLiteralMaterializationActual,
+    effect: AggregateConstructionEffect,
+) -> AggregateConstructionAbandonment {
+    AggregateConstructionAbandonment {
+        work: effect.work,
+        allocations: effect.allocations,
+        bytes: actual.abandoned_bytes,
+        released_persistent_bytes: effect.retained_persistent_bytes,
+    }
+}
+
+fn finite_extraction_effect(
+    receipt: &finite::FiniteExtractionAttemptReceipt,
+) -> Option<AggregateConstructionEffect> {
+    let actual = receipt.boundary_actual()?;
+    Some(AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: actual.copied_bytes,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.high_water_bytes,
+    })
+}
+
+fn finite_extraction_abandonment(
+    receipt: &finite::FiniteExtractionAttemptReceipt,
+    effect: AggregateConstructionEffect,
+) -> Option<AggregateConstructionAbandonment> {
+    let actual = receipt.boundary_actual()?;
+    Some(AggregateConstructionAbandonment {
+        work: effect.work,
+        allocations: effect.allocations,
+        bytes: actual.abandonable_bytes,
+        released_persistent_bytes: effect.retained_persistent_bytes,
+    })
+}
+
+fn fixed_predicate_inspection_effect(
+    receipt: finite::FixedPredicateInspectionAttemptReceipt,
+) -> Option<AggregateConstructionEffect> {
+    let actual = receipt.actual();
+    Some(AggregateConstructionEffect {
+        work: actual.work.checked_sub(receipt.initial_work())?,
+        allocations: actual.local.allocations,
+        allocated_bytes: actual.local.allocated_bytes,
+        copied_bytes: actual.local.copied_bytes,
+        initialized_bytes: actual.local.initialized_bytes,
+        retained_persistent_bytes: actual.local.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.local.high_water_bytes,
+    })
+}
+
+const fn ordered_finite_build_effect(
+    actual: OrderedLiteralAggregateBuildAttemptActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: actual.copied_bytes,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.peak_bytes,
+    }
+}
+
+fn fixed_predicate_build_effect(
+    actual: FixedPredicateWord64BuildAttemptActual,
+    inspection: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    Some(AggregateConstructionEffect {
+        work: inspection.work.checked_add(actual.work)?,
+        allocations: inspection.allocations.checked_add(actual.allocations)?,
+        allocated_bytes: inspection.allocated_bytes,
+        copied_bytes: inspection.copied_bytes.checked_add(actual.copied_bytes)?,
+        initialized_bytes: inspection
+            .initialized_bytes
+            .checked_add(actual.initialized_bytes)?,
+        retained_persistent_bytes: actual.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: inspection.co_live_bytes.max(actual.peak_bytes),
+    })
+}
+
+fn fixed_predicate_abandonment(
+    prior: Option<(AggregateConstructionEffect, usize)>,
+    effect: AggregateConstructionEffect,
+    build: FixedPredicateWord64BuildAttemptActual,
+) -> Option<AggregateConstructionAbandonment> {
+    let (prior, prior_abandonable_bytes) =
+        prior.unwrap_or((AggregateConstructionEffect::default(), 0));
+    Some(AggregateConstructionAbandonment {
+        work: prior.work.checked_add(effect.work)?,
+        allocations: prior.allocations.checked_add(effect.allocations)?,
+        bytes: prior_abandonable_bytes
+            .checked_add(effect.allocated_bytes)?
+            .checked_add(build.initialized_bytes)?,
+        released_persistent_bytes: prior
+            .retained_persistent_bytes
+            .checked_add(effect.retained_persistent_bytes)?,
+    })
+}
+
+fn continuation_compile_effect(
+    actual: fre_aggregate::CompileConstructionActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: u64::try_from(actual.work).unwrap_or(u64::MAX),
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: actual.copied_bytes,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_construction_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.construction_peak_bytes,
+    }
+}
+
+/// Project a stage-local effect through an unpublished hard terminal.
+///
+/// The lower receipt observes construction bytes immediately before its
+/// failure unwinds. Those bytes still contribute to cumulative counters and
+/// the co-live peak, but no stage artifact escapes in the aggregate error, so
+/// none remain live after the aggregate terminal is closed.
+const fn hard_terminal_effect(effect: AggregateConstructionEffect) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        retained_persistent_bytes: 0,
+        ..effect
+    }
+}
+
+fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateConstructionStage {
+    match report.plan {
+        AggregatePlanKind::ExactLiteral => AggregateConstructionStage::ExactLiteral,
+        AggregatePlanKind::UnicodeScalarClass => AggregateConstructionStage::UnicodeScalar,
+        AggregatePlanKind::WordRun => AggregateConstructionStage::WordRun,
+        AggregatePlanKind::LiteralAssertions => AggregateConstructionStage::LiteralAssertions,
+        AggregatePlanKind::BlockingDelimiter => AggregateConstructionStage::BlockingDelimiter,
+        AggregatePlanKind::TokenPhrase => AggregateConstructionStage::TokenPhrase,
+        AggregatePlanKind::FixedClassSandwich => AggregateConstructionStage::FixedClassSandwich,
+        AggregatePlanKind::GraphemeScalarDfa => AggregateConstructionStage::GraphemeScalarDfa,
+        AggregatePlanKind::BoundedClassSequence => AggregateConstructionStage::BoundedClassSequence,
+        AggregatePlanKind::BoundedSeparatedFields => {
+            AggregateConstructionStage::BoundedSeparatedFields
+        }
+        AggregatePlanKind::PrefixClassAlternation => {
+            AggregateConstructionStage::PrefixClassAlternation
+        }
+        AggregatePlanKind::BoundedLiteralPair => AggregateConstructionStage::BoundedLiteralPair,
+        AggregatePlanKind::LiteralClassRunLiteral => {
+            AggregateConstructionStage::LiteralClassRunLiteral
+        }
+        AggregatePlanKind::BoundedContext
+            if matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::BoundedContext(identity)
+                    if identity.kernel.plan_id == BOUNDED_AFFIX_PLAN_ID
+            ) =>
+        {
+            AggregateConstructionStage::BoundedAffix
+        }
+        AggregatePlanKind::BoundedContext => AggregateConstructionStage::BoundedContext,
+        AggregatePlanKind::FixedAbsoluteDomain => AggregateConstructionStage::FixedAbsolute,
+        AggregatePlanKind::FiniteLiteralDfa
+            if matches!(
+                report.build,
+                AggregateBuildAccounting::SparseFiniteLiteral(_)
+            ) =>
+        {
+            AggregateConstructionStage::SparseFiniteRoot
+        }
+        AggregatePlanKind::FiniteLiteralDfa => AggregateConstructionStage::DenseFinite,
+        AggregatePlanKind::GuardedAsciiWordDictionary => {
+            AggregateConstructionStage::GeneralFiniteExtraction
+        }
+        AggregatePlanKind::FixedPredicateWord64 => AggregateConstructionStage::FixedPredicateWord64,
+        AggregatePlanKind::ContinuationProgram => AggregateConstructionStage::Continuation,
+    }
+}
+
+const fn construction_stage_closes_plan(
+    stage: AggregateConstructionStage,
+    plan: AggregatePlanKind,
+    identity: AggregatePlanIdentity,
+) -> bool {
+    matches!(
+        (stage, plan, identity),
+        (
+            AggregateConstructionStage::ExactLiteral,
+            AggregatePlanKind::ExactLiteral,
+            AggregatePlanIdentity::ExactLiteral(_),
+        ) | (
+            AggregateConstructionStage::UnicodeScalar,
+            AggregatePlanKind::UnicodeScalarClass,
+            AggregatePlanIdentity::UnicodeScalar(_),
+        ) | (
+            AggregateConstructionStage::WordRun,
+            AggregatePlanKind::WordRun,
+            AggregatePlanIdentity::WordRun(_),
+        ) | (
+            AggregateConstructionStage::LiteralAssertions,
+            AggregatePlanKind::LiteralAssertions,
+            AggregatePlanIdentity::LiteralAssertions(_),
+        ) | (
+            AggregateConstructionStage::BlockingDelimiter,
+            AggregatePlanKind::BlockingDelimiter,
+            AggregatePlanIdentity::BlockingDelimiter(_),
+        ) | (
+            AggregateConstructionStage::TokenPhrase,
+            AggregatePlanKind::TokenPhrase,
+            AggregatePlanIdentity::TokenPhrase(_),
+        ) | (
+            AggregateConstructionStage::FixedClassSandwich,
+            AggregatePlanKind::FixedClassSandwich,
+            AggregatePlanIdentity::FixedClassSandwich(_),
+        ) | (
+            AggregateConstructionStage::GraphemeScalarDfa,
+            AggregatePlanKind::GraphemeScalarDfa,
+            AggregatePlanIdentity::GraphemeScalarDfa(_),
+        ) | (
+            AggregateConstructionStage::BoundedClassSequence,
+            AggregatePlanKind::BoundedClassSequence,
+            AggregatePlanIdentity::BoundedClassSequence(_),
+        ) | (
+            AggregateConstructionStage::BoundedSeparatedFields,
+            AggregatePlanKind::BoundedSeparatedFields,
+            AggregatePlanIdentity::BoundedSeparatedFields(_),
+        ) | (
+            AggregateConstructionStage::PrefixClassAlternation,
+            AggregatePlanKind::PrefixClassAlternation,
+            AggregatePlanIdentity::PrefixClassAlternation(_),
+        ) | (
+            AggregateConstructionStage::BoundedLiteralPair,
+            AggregatePlanKind::BoundedLiteralPair,
+            AggregatePlanIdentity::BoundedLiteralPair(_),
+        ) | (
+            AggregateConstructionStage::LiteralClassRunLiteral,
+            AggregatePlanKind::LiteralClassRunLiteral,
+            AggregatePlanIdentity::LiteralClassRunLiteral(_),
+        ) | (
+            AggregateConstructionStage::BoundedAffix | AggregateConstructionStage::BoundedContext,
+            AggregatePlanKind::BoundedContext,
+            AggregatePlanIdentity::BoundedContext(_),
+        ) | (
+            AggregateConstructionStage::FixedAbsolute,
+            AggregatePlanKind::FixedAbsoluteDomain,
+            AggregatePlanIdentity::FixedAbsoluteDomain(_),
+        ) | (
+            AggregateConstructionStage::SparseFiniteRoot | AggregateConstructionStage::DenseFinite,
+            AggregatePlanKind::FiniteLiteralDfa,
+            AggregatePlanIdentity::FiniteLiteral(_),
+        ) | (
+            AggregateConstructionStage::GeneralFiniteExtraction,
+            AggregatePlanKind::GuardedAsciiWordDictionary,
+            AggregatePlanIdentity::GuardedAsciiWord(_),
+        ) | (
+            AggregateConstructionStage::FixedPredicateWord64,
+            AggregatePlanKind::FixedPredicateWord64,
+            AggregatePlanIdentity::FixedPredicateWord64(_),
+        ) | (
+            AggregateConstructionStage::Continuation,
+            AggregatePlanKind::ContinuationProgram,
+            AggregatePlanIdentity::Continuation(_),
+        )
+    )
+}
+
+fn construction_strategy_closes_plan(
+    requested: AggregateStrategy,
+    continuation: Option<AggregateStrategy>,
+    plan: AggregatePlanKind,
+    identity: AggregatePlanIdentity,
+) -> bool {
+    match (plan, identity) {
+        (
+            AggregatePlanKind::FixedAbsoluteDomain,
+            AggregatePlanIdentity::FixedAbsoluteDomain(identity),
+        ) => {
+            let scalar = identity.kernel.descriptor.kind()
+                == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
+            if scalar {
+                continuation == Some(requested) && identity.residual_strategy == Some(requested)
+            } else {
+                continuation.is_none() && identity.residual_strategy.is_none()
+            }
+        }
+        (AggregatePlanKind::ContinuationProgram, AggregatePlanIdentity::Continuation(_)) => {
+            continuation == Some(requested)
+        }
+        _ => continuation.is_none(),
+    }
+}
+
+fn complete_construction_selector_ledger(
+    transaction: &mut AggregateConstructionTransaction,
+    report: &AggregateBuildReport,
+) -> Result<AggregateConstructionStage, crate::AggregateConstructionStateError> {
+    let selected = construction_stage_for_report(report);
+    if transaction.selected_stage() == Some(selected) {
+        Ok(selected)
+    } else {
+        Err(crate::AggregateConstructionStateError::InvalidTransition)
+    }
+}
+
+fn finish_construction_failure(
+    context: AggregateConstructionContext,
+    source: AggregateBuildError,
+    sealed_stage: AggregateConstructionStage,
+) -> AggregateConstructionAttemptError {
+    let receipt = match context.transaction.finish_failure() {
+        Ok(receipt) => receipt,
+        Err(_state) => {
+            unreachable!("construction transaction failed to close its hard terminal")
+        }
+    };
+    let Some(source_owner) = context.source_owner else {
+        unreachable!("construction terminal lost its exact source owner");
+    };
+    AggregateConstructionAttemptError::new(
+        source,
+        receipt,
+        source_owner,
+        context.syntax_attempt,
+        sealed_stage,
+    )
+}
+
+/// Private closure evidence excluded from structural public report/cache
+/// equality. Independent constructions of the same request remain equal as
+/// before U0-F, while explicit closure methods still authenticate the exact
+/// source-bound receipts retained here.
+#[derive(Clone, Debug)]
+struct AggregateClosureEvidence<T>(Option<T>);
+
+impl<T> AggregateClosureEvidence<T> {
+    const fn empty() -> Self {
+        Self(None)
+    }
+
+    const fn from_option(value: Option<T>) -> Self {
+        Self(value)
+    }
+
+    const fn as_ref(&self) -> Option<&T> {
+        self.0.as_ref()
+    }
+
+    fn set(&mut self, value: Option<T>) {
+        self.0 = value;
+    }
+}
+
+impl<T> PartialEq for AggregateClosureEvidence<T> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<T> Eq for AggregateClosureEvidence<T> {}
+
+/// Construction-unique closure retained with the public receipt.
+///
+/// The receipt remains the stable public projection. The private Arc binds
+/// that projection to the exact report/cache owner that was published, so a
+/// structurally equal receipt or source key from another construction cannot
+/// authenticate this artifact.
+#[derive(Clone, Debug)]
+struct AggregateClosedConstructionEvidence {
+    receipt: AggregateConstructionReceipt,
+    report_seal: Arc<AggregatePublishedReportSeal>,
+}
+
 /// Auditable construction facts for one operation-specific aggregate plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateBuildReport {
     /// Report schema.
     pub schema_version: u32,
+    /// Closed whole-construction receipt. This is populated by the outer
+    /// transaction before any compiled artifact becomes observable.
+    construction_attempt: AggregateClosureEvidence<AggregateClosedConstructionEvidence>,
+    /// Independent artifact-side handle to the construction-unique report
+    /// seal. Closure requires pointer equality with the receipt-side handle.
+    published_artifact_owner: AggregateClosureEvidence<Arc<AggregatePublishedReportSeal>>,
+    /// Nested syntax-attempt receipt whose exact source owner is the
+    /// colocated `syntax_key`.
+    syntax_attempt: AggregateClosureEvidence<fre_syntax::ParseAttemptReceipt>,
     /// Full syntax/cache input, including original pattern and profile. The
     /// shared allocation is created during construction, never reducer timing.
     pub syntax_key: Arc<CacheKey>,
@@ -1255,6 +2382,12 @@ pub struct AggregateBuildReport {
     pub operation: AggregateOperation,
     /// Requested construction-time plan policy.
     pub selection: AggregatePlanSelection,
+    /// Original caller-selected continuation strategy, including when a
+    /// direct plan makes `continuation_strategy` inapplicable.
+    pub requested_strategy: AggregateStrategy,
+    /// Complete caller-supplied construction limits authenticated by the
+    /// whole-construction receipt.
+    pub build_limits: AggregateBuildLimits,
     /// Plan family selected before publication.
     pub plan: AggregatePlanKind,
     /// Continuation storage strategy, present for continuation plans and the
@@ -1340,6 +2473,234 @@ pub struct AggregateBuildReport {
     pub retained_capacity_bytes: usize,
 }
 
+/// Immutable success-only snapshot of every public build-report field.
+///
+/// This is deliberately private and construction-unique. Equality of the
+/// public fields is necessary, while pointer equality of the owning Arc is
+/// what rejects cross-construction splices between structurally equal plans.
+#[derive(Debug)]
+struct AggregatePublishedReportSeal {
+    schema_version: u32,
+    syntax_key: Weak<CacheKey>,
+    admission: AdmissionStatus,
+    syntax: ParseSummary,
+    operation: AggregateOperation,
+    selection: AggregatePlanSelection,
+    requested_strategy: AggregateStrategy,
+    build_limits: AggregateBuildLimits,
+    plan: AggregatePlanKind,
+    construction_stage: AggregateConstructionStage,
+    continuation_strategy: Option<AggregateStrategy>,
+    capture_semantics: AggregateCaptureSemantics,
+    planner_work: usize,
+    unicode_scalar_planner_work: usize,
+    word_run_planner_work: usize,
+    literal_assertions_planner_work: usize,
+    blocking_delimiter_planner_work: usize,
+    token_phrase_planner_work: usize,
+    fixed_class_sandwich_planner_work: usize,
+    bounded_affix_planner_work: usize,
+    grapheme_scalar_dfa_planner_work: usize,
+    bounded_class_sequence_planner_work: usize,
+    bounded_separated_fields_planner_work: usize,
+    prefix_class_alternation_planner_work: usize,
+    literal_class_run_literal_planner_work: usize,
+    bounded_literal_pair_planner_work: usize,
+    bounded_context_planner_work: usize,
+    fixed_absolute_planner_work: u32,
+    finite_planner_work: u64,
+    capture_erasure_work: usize,
+    captures_erased: usize,
+    build: AggregateBuildAccounting,
+    plan_identity: AggregatePlanIdentity,
+    retained_capacity_bytes: usize,
+}
+
+impl AggregatePublishedReportSeal {
+    fn from_report(report: &AggregateBuildReport) -> Self {
+        Self {
+            schema_version: report.schema_version,
+            syntax_key: Arc::downgrade(&report.syntax_key),
+            admission: report.admission,
+            syntax: report.syntax.clone(),
+            operation: report.operation,
+            selection: report.selection,
+            requested_strategy: report.requested_strategy,
+            build_limits: report.build_limits,
+            plan: report.plan,
+            construction_stage: construction_stage_for_report(report),
+            continuation_strategy: report.continuation_strategy,
+            capture_semantics: report.capture_semantics,
+            planner_work: report.planner_work,
+            unicode_scalar_planner_work: report.unicode_scalar_planner_work,
+            word_run_planner_work: report.word_run_planner_work,
+            literal_assertions_planner_work: report.literal_assertions_planner_work,
+            blocking_delimiter_planner_work: report.blocking_delimiter_planner_work,
+            token_phrase_planner_work: report.token_phrase_planner_work,
+            fixed_class_sandwich_planner_work: report.fixed_class_sandwich_planner_work,
+            bounded_affix_planner_work: report.bounded_affix_planner_work,
+            grapheme_scalar_dfa_planner_work: report.grapheme_scalar_dfa_planner_work,
+            bounded_class_sequence_planner_work: report.bounded_class_sequence_planner_work,
+            bounded_separated_fields_planner_work: report.bounded_separated_fields_planner_work,
+            prefix_class_alternation_planner_work: report.prefix_class_alternation_planner_work,
+            literal_class_run_literal_planner_work: report.literal_class_run_literal_planner_work,
+            bounded_literal_pair_planner_work: report.bounded_literal_pair_planner_work,
+            bounded_context_planner_work: report.bounded_context_planner_work,
+            fixed_absolute_planner_work: report.fixed_absolute_planner_work,
+            finite_planner_work: report.finite_planner_work,
+            capture_erasure_work: report.capture_erasure_work,
+            captures_erased: report.captures_erased,
+            build: report.build,
+            plan_identity: report.plan_identity,
+            retained_capacity_bytes: report.retained_capacity_bytes,
+        }
+    }
+
+    fn matches_report(&self, report: &AggregateBuildReport) -> bool {
+        self.syntax_key.as_ptr() == Arc::as_ptr(&report.syntax_key)
+            && self.schema_version == report.schema_version
+            && self.admission == report.admission
+            && self.syntax == report.syntax
+            && self.operation == report.operation
+            && self.selection == report.selection
+            && self.requested_strategy == report.requested_strategy
+            && self.build_limits == report.build_limits
+            && self.plan == report.plan
+            && self.construction_stage == construction_stage_for_report(report)
+            && self.continuation_strategy == report.continuation_strategy
+            && self.capture_semantics == report.capture_semantics
+            && self.planner_work == report.planner_work
+            && self.unicode_scalar_planner_work == report.unicode_scalar_planner_work
+            && self.word_run_planner_work == report.word_run_planner_work
+            && self.literal_assertions_planner_work == report.literal_assertions_planner_work
+            && self.blocking_delimiter_planner_work == report.blocking_delimiter_planner_work
+            && self.token_phrase_planner_work == report.token_phrase_planner_work
+            && self.fixed_class_sandwich_planner_work == report.fixed_class_sandwich_planner_work
+            && self.bounded_affix_planner_work == report.bounded_affix_planner_work
+            && self.grapheme_scalar_dfa_planner_work == report.grapheme_scalar_dfa_planner_work
+            && self.bounded_class_sequence_planner_work
+                == report.bounded_class_sequence_planner_work
+            && self.bounded_separated_fields_planner_work
+                == report.bounded_separated_fields_planner_work
+            && self.prefix_class_alternation_planner_work
+                == report.prefix_class_alternation_planner_work
+            && self.literal_class_run_literal_planner_work
+                == report.literal_class_run_literal_planner_work
+            && self.bounded_literal_pair_planner_work == report.bounded_literal_pair_planner_work
+            && self.bounded_context_planner_work == report.bounded_context_planner_work
+            && self.fixed_absolute_planner_work == report.fixed_absolute_planner_work
+            && self.finite_planner_work == report.finite_planner_work
+            && self.capture_erasure_work == report.capture_erasure_work
+            && self.captures_erased == report.captures_erased
+            && self.build == report.build
+            && self.plan_identity == report.plan_identity
+            && self.retained_capacity_bytes == report.retained_capacity_bytes
+    }
+
+    fn matches_cache(&self, cache: &AggregateCacheIdentity) -> bool {
+        self.syntax_key.as_ptr() == Arc::as_ptr(&cache.syntax_key)
+            && self.schema_version == cache.schema_version
+            && self.operation == cache.operation
+            && self.selection == cache.selection
+            && self.requested_strategy == cache.requested_strategy
+            && self.plan == cache.plan
+            && self.continuation_strategy == cache.continuation_strategy
+            && self.capture_semantics == cache.capture_semantics
+            && self.plan_identity == cache.plan_identity
+            && self.build_limits == cache.build_limits
+            && self.construction_stage == cache.construction_stage
+    }
+}
+
+impl AggregateBuildReport {
+    /// Closed identity/P/A/stage/publication receipt for this construction.
+    #[must_use]
+    pub const fn construction_attempt_receipt(&self) -> Option<&AggregateConstructionReceipt> {
+        match self.construction_attempt.as_ref() {
+            Some(evidence) => Some(&evidence.receipt),
+            None => None,
+        }
+    }
+
+    /// Nested receipt for the actual syntax effects consumed by this
+    /// construction.
+    #[must_use]
+    pub const fn syntax_attempt_receipt(&self) -> Option<&fre_syntax::ParseAttemptReceipt> {
+        self.syntax_attempt.as_ref()
+    }
+
+    /// Authenticate the exact source owner, nested syntax receipt, selected
+    /// plan owner, schema, P/A ledger, and one-shot publication state.
+    #[must_use]
+    pub fn has_closed_construction_attempt(&self) -> bool {
+        let (Some(evidence), Some(artifact_owner), Some(syntax)) = (
+            self.construction_attempt.as_ref(),
+            self.published_artifact_owner.as_ref(),
+            self.syntax_attempt.as_ref(),
+        ) else {
+            return false;
+        };
+        let construction = &evidence.receipt;
+        let Some(plan) = construction.published_plan.as_ref() else {
+            return false;
+        };
+        let request = construction.identity.request_owner.request();
+        let syntax_ledger_closes = construction.ledger.iter().any(|entry| {
+            entry.stage == AggregateConstructionStage::SyntaxParseAdmission
+                && entry.disposition == crate::AggregateConstructionStageDisposition::Completed
+                && entry.effect == syntax_construction_effect(syntax, true)
+        });
+        construction.closes(&construction.identity, Some(plan))
+            && construction.terminal == crate::AggregateConstructionTerminal::Success
+            && Arc::ptr_eq(&evidence.report_seal, artifact_owner)
+            && evidence.report_seal.matches_report(self)
+            && self.schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+            && construction.identity.explain_schema_version == self.schema_version
+            && request.syntax_request.has_stable_source_owner()
+            && request.operation == self.operation
+            && request.selection == self.selection
+            && request.strategy == self.requested_strategy
+            && request.build_limits == self.build_limits
+            && matches!(
+                &self.syntax_key.profile,
+                CompatibilityProfile::RustBytes(profile) if profile == &request.profile
+            )
+            && request.syntax_request.authenticates_key(&self.syntax_key)
+            && syntax.identity == request.syntax_request
+            && syntax.terminal == fre_syntax::ParseAttemptTerminal::Success
+            && syntax.authenticates_canonical()
+            && syntax.identity.authenticates_key(&self.syntax_key)
+            && syntax_ledger_closes
+            && self.syntax.hir_nodes == syntax.actual.hir_nodes
+            && self.syntax.max_depth == syntax.actual.max_depth
+            && self.syntax.literal_bytes == syntax.actual.literal_bytes
+            && self.syntax.class_ranges == syntax.actual.class_ranges
+            && self.syntax.captures == syntax.actual.captures
+            && self.syntax.repetitions == syntax.actual.repetitions
+            && syntax.prospective.and_then(|prospective| {
+                prospective
+                    .source_bytes
+                    .checked_add(syntax.actual.observed_work)
+            }) == Some(self.syntax.parse_work)
+            && matches!(
+                (self.build_limits.admission, self.admission),
+                (
+                    AdmissionPolicy::Strict(_),
+                    AdmissionStatus::UpstreamOraclePending,
+                ) | (AdmissionPolicy::Quota(_), AdmissionStatus::QuotaChecked)
+            )
+            && plan.stage() == construction_stage_for_report(self)
+            && construction_stage_closes_plan(plan.stage(), self.plan, self.plan_identity)
+            && construction_strategy_closes_plan(
+                self.requested_strategy,
+                self.continuation_strategy,
+                self.plan,
+                self.plan_identity,
+            )
+            && plan.plan() == &self.plan_identity
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AggregateRequiredInternalAnchorSeal {
     program: AggregatePlanId,
@@ -1364,12 +2725,15 @@ enum AggregateUrlOrFixedSeal {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AggregateFixedAbsoluteDomainSeal {
+    construction_attempt: Option<AggregateConstructionReceipt>,
     schema_version: u32,
     syntax_key: Arc<CacheKey>,
     admission: AdmissionStatus,
     syntax: ParseSummary,
     operation: AggregateOperation,
     selection: AggregatePlanSelection,
+    requested_strategy: AggregateStrategy,
+    build_limits: AggregateBuildLimits,
     plan: AggregatePlanKind,
     continuation_strategy: Option<AggregateStrategy>,
     capture_semantics: AggregateCaptureSemantics,
@@ -1385,6 +2749,8 @@ struct AggregateFixedAbsoluteDomainSeal {
     bounded_class_sequence_planner_work: usize,
     bounded_separated_fields_planner_work: usize,
     prefix_class_alternation_planner_work: usize,
+    literal_class_run_literal_planner_work: usize,
+    bounded_literal_pair_planner_work: usize,
     bounded_context_planner_work: usize,
     fixed_absolute_planner_work: usize,
     max_fixed_absolute_planner_work: usize,
@@ -1406,7 +2772,8 @@ impl AggregateFixedAbsoluteDomainSeal {
     fn matches_build_inputs(&self, limits: &AggregateBuildLimits) -> bool {
         let scalar = self.identity.kernel.descriptor.kind()
             == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
-        self.admission_policy == limits.admission
+        self.build_limits == *limits
+            && self.admission_policy == limits.admission
             && self.syntax_safety == limits.syntax_safety
             && self.max_fixed_absolute_planner_work == limits.max_fixed_absolute_planner_work
             && self.guard_build_limits == limits.fixed_absolute
@@ -1415,13 +2782,57 @@ impl AggregateFixedAbsoluteDomainSeal {
                     && self.continuation_build_limits == limits.continuation)
     }
 
+    fn has_closed_construction_attempt(&self) -> bool {
+        let Some(construction) = &self.construction_attempt else {
+            return false;
+        };
+        let Some(plan) = construction.published_plan.as_ref() else {
+            return false;
+        };
+        let request = construction.identity.request_owner.request();
+        construction.closes(&construction.identity, Some(plan))
+            && construction.terminal == crate::AggregateConstructionTerminal::Success
+            && self.schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+            && construction.identity.explain_schema_version == self.schema_version
+            && request.syntax_request.has_stable_source_owner()
+            && plan.stage() == AggregateConstructionStage::FixedAbsolute
+            && construction_stage_closes_plan(
+                AggregateConstructionStage::FixedAbsolute,
+                self.plan,
+                AggregatePlanIdentity::FixedAbsoluteDomain(self.identity),
+            )
+            && plan.plan() == &AggregatePlanIdentity::FixedAbsoluteDomain(self.identity)
+            && self.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+            && self.matches_build_inputs(&self.build_limits)
+            && request.operation == self.operation
+            && request.selection == self.selection
+            && request.strategy == self.requested_strategy
+            && request.build_limits == self.build_limits
+            && matches!(
+                &self.syntax_key.profile,
+                CompatibilityProfile::RustBytes(profile) if profile == &request.profile
+            )
+            && request.syntax_request.authenticates_key(&self.syntax_key)
+            && construction_strategy_closes_plan(
+                self.requested_strategy,
+                self.continuation_strategy,
+                self.plan,
+                AggregatePlanIdentity::FixedAbsoluteDomain(self.identity),
+            )
+    }
+
     fn matches_public_report(&self, report: &AggregateBuildReport) -> bool {
-        self.schema_version == report.schema_version
+        self.has_closed_construction_attempt()
+            && report.has_closed_construction_attempt()
+            && self.construction_attempt.as_ref() == report.construction_attempt_receipt()
+            && self.schema_version == report.schema_version
             && self.syntax_key == report.syntax_key
             && self.admission == report.admission
             && self.syntax == report.syntax
             && self.operation == report.operation
             && self.selection == report.selection
+            && self.requested_strategy == report.requested_strategy
+            && self.build_limits == report.build_limits
             && self.plan == report.plan
             && self.continuation_strategy == report.continuation_strategy
             && self.capture_semantics == report.capture_semantics
@@ -1440,6 +2851,9 @@ impl AggregateFixedAbsoluteDomainSeal {
                 == report.bounded_separated_fields_planner_work
             && self.prefix_class_alternation_planner_work
                 == report.prefix_class_alternation_planner_work
+            && self.literal_class_run_literal_planner_work
+                == report.literal_class_run_literal_planner_work
+            && self.bounded_literal_pair_planner_work == report.bounded_literal_pair_planner_work
             && self.bounded_context_planner_work == report.bounded_context_planner_work
             && u32::try_from(self.fixed_absolute_planner_work).ok()
                 == Some(report.fixed_absolute_planner_work)
@@ -1647,6 +3061,7 @@ impl AggregateBuildReport {
                         }
                     )
                     && sealed.matches_public_report(self)
+                    && owner.has_closed_fixed_construction()
                     && identity == sealed.identity
                     && build == sealed.build
                     && fixed_guard_build_actual_fits(build.kernel.actual, build.kernel.prospective)
@@ -1841,15 +3256,76 @@ impl AggregateBuildReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateCacheIdentity {
     pub schema_version: u32,
+    construction_attempt: AggregateClosureEvidence<AggregateClosedConstructionEvidence>,
+    artifact_owner: AggregateClosureEvidence<Arc<AggregatePublishedReportSeal>>,
+    construction_stage: AggregateConstructionStage,
     pub syntax_key: Arc<CacheKey>,
     pub operation: AggregateOperation,
     pub selection: AggregatePlanSelection,
+    pub requested_strategy: AggregateStrategy,
     pub plan: AggregatePlanKind,
     pub continuation_strategy: Option<AggregateStrategy>,
     pub capture_semantics: AggregateCaptureSemantics,
     pub plan_identity: AggregatePlanIdentity,
     pub build_limits: AggregateBuildLimits,
     pub execution_limits: AggregateRunLimits,
+}
+
+impl AggregateCacheIdentity {
+    /// The same closed whole-construction receipt retained by the compiled
+    /// artifact's build report.
+    #[must_use]
+    pub const fn construction_attempt_receipt(&self) -> Option<&AggregateConstructionReceipt> {
+        match self.construction_attempt.as_ref() {
+            Some(evidence) => Some(&evidence.receipt),
+            None => None,
+        }
+    }
+
+    /// Authenticate this cache identity against its exact construction owner.
+    #[must_use]
+    pub fn has_closed_construction_attempt(&self) -> bool {
+        let (Some(evidence), Some(artifact_owner)) = (
+            self.construction_attempt.as_ref(),
+            self.artifact_owner.as_ref(),
+        ) else {
+            return false;
+        };
+        let construction = &evidence.receipt;
+        let Some(plan) = construction.published_plan.as_ref() else {
+            return false;
+        };
+        let request = construction.identity.request_owner.request();
+        construction.closes(&construction.identity, Some(plan))
+            && construction.terminal == crate::AggregateConstructionTerminal::Success
+            && Arc::ptr_eq(&evidence.report_seal, artifact_owner)
+            && evidence.report_seal.matches_cache(self)
+            && self.schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+            && construction.identity.explain_schema_version == self.schema_version
+            && request.syntax_request.has_stable_source_owner()
+            && plan.stage() == self.construction_stage
+            && construction_stage_closes_plan(
+                self.construction_stage,
+                self.plan,
+                self.plan_identity,
+            )
+            && request.operation == self.operation
+            && request.selection == self.selection
+            && request.strategy == self.requested_strategy
+            && request.build_limits == self.build_limits
+            && matches!(
+                &self.syntax_key.profile,
+                CompatibilityProfile::RustBytes(profile) if profile == &request.profile
+            )
+            && request.syntax_request.authenticates_key(&self.syntax_key)
+            && construction_strategy_closes_plan(
+                self.requested_strategy,
+                self.continuation_strategy,
+                self.plan,
+                self.plan_identity,
+            )
+            && plan.plan() == &self.plan_identity
+    }
 }
 
 /// Physical direct reducer selected before an aggregate invocation can inspect
@@ -1921,6 +3397,7 @@ impl AggregateDirectRouteIdentity {
             && self.algorithm_version == AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION
             && self.accounting_version == AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION
             && self.declared_fallback == AggregateDirectDeclaredFallback::None
+            && cache.has_closed_construction_attempt()
             && direct_route_matches_plan(self.route, cache.plan, cache.plan_identity)
             && direct_plan_operation_closes(cache)
     }
@@ -2847,6 +4324,44 @@ impl AggregateExecutionIdentity {
     fn fixed_absolute_domain_seal(&self) -> &AggregateFixedAbsoluteDomainSeal {
         &self.0.seal
     }
+
+    fn attach_construction_attempt(
+        &mut self,
+        receipt: AggregateConstructionReceipt,
+    ) -> Result<(), &'static str> {
+        let inner = Arc::get_mut(&mut self.0)
+            .ok_or("fixed-domain construction owner was shared before publication")?;
+        if inner.seal.construction_attempt.is_some() {
+            return Err("fixed-domain construction receipt was already attached");
+        }
+        inner.seal.construction_attempt = Some(receipt);
+        Ok(())
+    }
+
+    fn construction_attempt_receipt(&self) -> Option<&AggregateConstructionReceipt> {
+        self.0.seal.construction_attempt.as_ref()
+    }
+
+    fn has_closed_fixed_construction(&self) -> bool {
+        let sealed = &self.0.seal;
+        let identity = &self.0.identity;
+        sealed.has_closed_construction_attempt()
+            && identity.schema_version == sealed.schema_version
+            && identity.syntax_key == sealed.syntax_key
+            && identity.operation == sealed.operation
+            && identity.selection == sealed.selection
+            && identity.continuation_strategy == sealed.continuation_strategy
+            && identity.capture_semantics == sealed.capture_semantics
+            && identity.admission == sealed.admission_policy
+            && identity.syntax_safety == sealed.syntax_safety
+            && identity.max_fixed_absolute_planner_work == sealed.max_fixed_absolute_planner_work
+            && identity.fixed_absolute_planner_work == sealed.fixed_absolute_planner_work
+            && identity.plan_identity == sealed.identity
+            && identity.guard_build_limits == sealed.guard_build_limits
+            && identity.residual_build_limits == sealed.residual_build_limits
+            && identity.continuation_build_limits == sealed.continuation_build_limits
+            && identity.residual_allocation_census == sealed.residual_allocation_census
+    }
 }
 
 /// Opaque fixed-domain attempt identity. Construction provenance and its one
@@ -3003,22 +4518,29 @@ impl AggregateExecutionAttemptIdentity {
     fn closes_fixed_source_kind(&self, source: &AggregateExecutionSource) -> bool {
         match (self, source) {
             (Self::FixedAbsoluteDomain(attempt), AggregateExecutionSource::FixedAbsoluteDomain) => {
-                attempt.receipt().guard_error().is_some()
+                attempt.owner.has_closed_fixed_construction()
+                    && attempt.receipt().guard_error().is_some()
             }
             (
                 Self::FixedAbsoluteDomain(attempt),
                 AggregateExecutionSource::FixedAbsoluteDomainResidual,
-            ) => attempt
-                .receipt()
-                .residual_error()
-                .is_some_and(|(continuation, composite)| {
-                    continuation
-                        .receipt
-                        .identity
-                        .authenticates_limits(attempt.receipt().continuation_limits())
-                        && composite.contains_actual_with(&continuation.receipt)
-                }),
-            (Self::Continuation { cache, receipt }, AggregateExecutionSource::Continuation(_)) => {
+            ) => {
+                attempt.owner.has_closed_fixed_construction()
+                    && attempt.receipt().residual_error().is_some_and(
+                        |(continuation, composite)| {
+                            continuation.closes()
+                                && continuation
+                                    .receipt
+                                    .identity
+                                    .authenticates_limits(attempt.receipt().continuation_limits())
+                                && composite.contains_actual_with(&continuation.receipt)
+                        },
+                    )
+            }
+            (
+                Self::Continuation { cache, receipt },
+                AggregateExecutionSource::Continuation(source),
+            ) => {
                 let operation_matches = matches!(
                     (cache.operation, receipt.identity.operation),
                     (AggregateOperation::Spans, OperationAttemptKind::Spans)
@@ -3032,6 +4554,8 @@ impl AggregateExecutionAttemptIdentity {
                 );
                 operation_matches
                     && plan_matches
+                    && cache.has_closed_construction_attempt()
+                    && receipt.authenticates_source(source)
                     && cache.continuation_strategy == Some(receipt.identity.strategy)
                     && receipt
                         .identity
@@ -3399,6 +4923,475 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         detail: &'static str,
     },
+}
+
+impl AggregateBuildError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive projection keeps every public error variant bound to its request coordinates"
+    )]
+    fn construction_request_coordinates(&self) -> (AggregateOperation, AggregatePlanSelection) {
+        match self {
+            Self::Syntax {
+                operation,
+                selection,
+                ..
+            }
+            | Self::LiteralPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::UnicodeScalarPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::WordRunPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::LiteralAssertionsPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BlockingDelimiterPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::TokenPhrasePlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedClassSandwichPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedAffixPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::GraphemeScalarDfaPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedClassSequencePlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedSeparatedFieldsPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::PrefixClassAlternationPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::LiteralClassRunLiteralPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedLiteralPairPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedContextPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedAbsoluteDomainPlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FinitePlannerWorkLimit {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FinitePlannerAllocationFailed {
+                operation,
+                selection,
+                ..
+            }
+            | Self::ExactLiteralIneligible {
+                operation,
+                selection,
+                ..
+            }
+            | Self::ExactLiteralBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::UnicodeScalarBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::WordRunBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::LiteralAssertionsBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BlockingDelimiterBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::TokenPhraseBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedClassSandwichBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::GraphemeScalarDfaBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedClassSequenceBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedSeparatedFieldsBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::PrefixClassAlternationBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::LiteralClassRunLiteralBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedLiteralPairBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::BoundedContextBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedAbsoluteDomainBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedAbsoluteDomainResidualGuardBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedAbsoluteDomainResidualPreflight {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedAbsoluteDomainResidualCompile {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FiniteLiteralBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::SparseFiniteLiteralBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::GuardedAsciiWordBuild {
+                operation,
+                selection,
+                ..
+            }
+            | Self::FixedPredicateWord64Build {
+                operation,
+                selection,
+                ..
+            }
+            | Self::ContinuationCompile {
+                operation,
+                selection,
+                ..
+            }
+            | Self::InternalInvariant {
+                operation,
+                selection,
+                ..
+            } => (*operation, *selection),
+        }
+    }
+
+    fn closes_construction_terminal_stage(&self, stage: AggregateConstructionStage) -> bool {
+        match self {
+            Self::Syntax { .. } => stage == AggregateConstructionStage::SyntaxParseAdmission,
+            Self::LiteralPlannerWorkLimit { .. } | Self::ExactLiteralBuild { .. } => {
+                stage == AggregateConstructionStage::ExactLiteral
+            }
+            Self::ExactLiteralIneligible { .. } => matches!(
+                stage,
+                AggregateConstructionStage::PreSyntaxForceExactLiteralSpans
+                    | AggregateConstructionStage::ExactLiteral
+            ),
+            Self::UnicodeScalarPlannerWorkLimit { .. } | Self::UnicodeScalarBuild { .. } => {
+                stage == AggregateConstructionStage::UnicodeScalar
+            }
+            Self::WordRunPlannerWorkLimit { .. } | Self::WordRunBuild { .. } => {
+                stage == AggregateConstructionStage::WordRun
+            }
+            Self::LiteralAssertionsPlannerWorkLimit { .. }
+            | Self::LiteralAssertionsBuild { .. } => {
+                stage == AggregateConstructionStage::LiteralAssertions
+            }
+            Self::BlockingDelimiterPlannerWorkLimit { .. }
+            | Self::BlockingDelimiterBuild { .. } => {
+                stage == AggregateConstructionStage::BlockingDelimiter
+            }
+            Self::TokenPhrasePlannerWorkLimit { .. } | Self::TokenPhraseBuild { .. } => {
+                stage == AggregateConstructionStage::TokenPhrase
+            }
+            Self::FixedClassSandwichPlannerWorkLimit { .. }
+            | Self::FixedClassSandwichBuild { .. } => {
+                stage == AggregateConstructionStage::FixedClassSandwich
+            }
+            Self::BoundedAffixPlannerWorkLimit { .. } => {
+                stage == AggregateConstructionStage::BoundedAffix
+            }
+            Self::GraphemeScalarDfaPlannerWorkLimit { .. }
+            | Self::GraphemeScalarDfaBuild { .. } => {
+                stage == AggregateConstructionStage::GraphemeScalarDfa
+            }
+            Self::BoundedClassSequencePlannerWorkLimit { .. }
+            | Self::BoundedClassSequenceBuild { .. } => {
+                stage == AggregateConstructionStage::BoundedClassSequence
+            }
+            Self::BoundedSeparatedFieldsPlannerWorkLimit { .. }
+            | Self::BoundedSeparatedFieldsBuild { .. } => {
+                stage == AggregateConstructionStage::BoundedSeparatedFields
+            }
+            Self::PrefixClassAlternationPlannerWorkLimit { .. }
+            | Self::PrefixClassAlternationBuild { .. } => {
+                stage == AggregateConstructionStage::PrefixClassAlternation
+            }
+            Self::LiteralClassRunLiteralPlannerWorkLimit { .. }
+            | Self::LiteralClassRunLiteralBuild { .. } => {
+                stage == AggregateConstructionStage::LiteralClassRunLiteral
+            }
+            Self::BoundedLiteralPairPlannerWorkLimit { .. }
+            | Self::BoundedLiteralPairBuild { .. } => {
+                stage == AggregateConstructionStage::BoundedLiteralPair
+            }
+            Self::BoundedContextPlannerWorkLimit { .. } => {
+                stage == AggregateConstructionStage::BoundedContext
+            }
+            Self::BoundedContextBuild { .. } => matches!(
+                stage,
+                AggregateConstructionStage::BoundedAffix
+                    | AggregateConstructionStage::BoundedContext
+            ),
+            Self::FixedAbsoluteDomainPlannerWorkLimit { .. }
+            | Self::FixedAbsoluteDomainBuild { .. }
+            | Self::FixedAbsoluteDomainResidualGuardBuild { .. }
+            | Self::FixedAbsoluteDomainResidualPreflight { .. }
+            | Self::FixedAbsoluteDomainResidualCompile { .. } => {
+                stage == AggregateConstructionStage::FixedAbsolute
+            }
+            Self::FinitePlannerWorkLimit { .. } | Self::FinitePlannerAllocationFailed { .. } => {
+                matches!(
+                    stage,
+                    AggregateConstructionStage::SparseFiniteRoot
+                        | AggregateConstructionStage::GeneralFiniteExtraction
+                        | AggregateConstructionStage::DenseFinite
+                        | AggregateConstructionStage::FixedPredicateWord64
+                )
+            }
+            Self::FiniteLiteralBuild { .. } => stage == AggregateConstructionStage::DenseFinite,
+            Self::SparseFiniteLiteralBuild { .. } => {
+                stage == AggregateConstructionStage::SparseFiniteRoot
+            }
+            Self::GuardedAsciiWordBuild { .. } => {
+                stage == AggregateConstructionStage::GeneralFiniteExtraction
+            }
+            Self::FixedPredicateWord64Build { .. } => {
+                stage == AggregateConstructionStage::FixedPredicateWord64
+            }
+            Self::ContinuationCompile { .. } => stage == AggregateConstructionStage::Continuation,
+            Self::InternalInvariant { .. } => true,
+        }
+    }
+}
+
+/// Terminal whole-construction error with the same closed transaction receipt
+/// exposed by successful build reports.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the exact request must remain allocation-free on error; boxing after failure would add an unbudgeted effect"
+)]
+enum AggregateConstructionSourceOwner {
+    Request(fre_syntax::ParseRequest),
+    CacheKey(Arc<CacheKey>),
+}
+
+#[derive(Debug)]
+pub struct AggregateConstructionAttemptError {
+    source: AggregateBuildError,
+    receipt: AggregateConstructionReceipt,
+    source_owner: AggregateConstructionSourceOwner,
+    syntax_attempt: Option<fre_syntax::ParseAttemptReceipt>,
+    sealed_stage: crate::AggregateConstructionStage,
+}
+
+impl AggregateConstructionAttemptError {
+    fn new(
+        source: AggregateBuildError,
+        receipt: AggregateConstructionReceipt,
+        source_owner: AggregateConstructionSourceOwner,
+        syntax_attempt: Option<fre_syntax::ParseAttemptReceipt>,
+        sealed_stage: crate::AggregateConstructionStage,
+    ) -> Self {
+        Self {
+            source,
+            receipt,
+            source_owner,
+            syntax_attempt,
+            sealed_stage,
+        }
+    }
+
+    /// Legacy typed aggregate construction source.
+    #[must_use]
+    pub const fn source(&self) -> &AggregateBuildError {
+        &self.source
+    }
+
+    /// Closed request/P/A/stage terminal receipt.
+    #[must_use]
+    pub const fn receipt(&self) -> &AggregateConstructionReceipt {
+        &self.receipt
+    }
+
+    /// Nested syntax receipt, absent only for a terminal before parsing began.
+    #[must_use]
+    pub const fn syntax_attempt_receipt(&self) -> Option<&fre_syntax::ParseAttemptReceipt> {
+        self.syntax_attempt.as_ref()
+    }
+
+    /// Authenticate the private source/terminal pairing and closed failure
+    /// transaction.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        let request = self.receipt.identity.request_owner.request();
+        let syntax_identity = &request.syntax_request;
+        let (source_operation, source_selection) = self.source.construction_request_coordinates();
+        let source_owner_closes =
+            self.receipt.prospective.is_none() || syntax_identity.has_stable_source_owner();
+        let source_closes = match &self.source_owner {
+            AggregateConstructionSourceOwner::Request(request) => {
+                syntax_identity.authenticates_request(request)
+            }
+            AggregateConstructionSourceOwner::CacheKey(key) => {
+                syntax_identity.authenticates_key(key)
+            }
+        };
+        let syntax_closes = self.syntax_attempt.as_ref().map_or_else(
+            || {
+                self.sealed_stage
+                    == crate::AggregateConstructionStage::PreSyntaxForceExactLiteralSpans
+            },
+            |syntax| {
+                syntax.authenticates_canonical()
+                    && syntax.identity == *syntax_identity
+                    && match &self.source_owner {
+                        AggregateConstructionSourceOwner::Request(request) => {
+                            syntax.authenticates_request(request)
+                                && syntax.terminal == fre_syntax::ParseAttemptTerminal::Failure
+                        }
+                        AggregateConstructionSourceOwner::CacheKey(key) => {
+                            syntax.identity.authenticates_key(key)
+                                && syntax.terminal == fre_syntax::ParseAttemptTerminal::Success
+                        }
+                    }
+            },
+        );
+        self.receipt.closes(&self.receipt.identity, None)
+            && self.receipt.terminal == crate::AggregateConstructionTerminal::Failure
+            && self.receipt.identity.explain_schema_version == AGGREGATE_EXPLAIN_SCHEMA_VERSION
+            && source_owner_closes
+            && source_closes
+            && syntax_closes
+            && request.operation == source_operation
+            && request.selection == source_selection
+            && self
+                .source
+                .closes_construction_terminal_stage(self.sealed_stage)
+            && self
+                .receipt
+                .ledger
+                .get(self.receipt.ledger.len().saturating_sub(1))
+                .is_some_and(|entry| {
+                    entry.stage == self.sealed_stage
+                        && entry.disposition
+                            == crate::AggregateConstructionStageDisposition::HardTerminal
+                })
+    }
+
+    /// Consume the wrapper without allocating or changing the legacy source.
+    #[must_use]
+    pub fn into_source(self) -> AggregateBuildError {
+        self.source
+    }
+
+    /// Consume both exact terminal components.
+    #[must_use]
+    pub fn into_parts(self) -> (AggregateBuildError, AggregateConstructionReceipt) {
+        (self.source, self.receipt)
+    }
+}
+
+impl fmt::Display for AggregateConstructionAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for AggregateConstructionAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl fmt::Display for AggregateBuildError {
@@ -4429,9 +6422,27 @@ pub struct AggregateFixedAbsoluteDomainResidualReceipt {
 
 impl AggregateFixedAbsoluteDomainResidualReceipt {
     /// Check both nested receipts, their exact composition, and cumulative A≤P
-    /// against the enclosing attempt's sole continuation receipt.
+    /// against the enclosing attempt's sole canonically authenticated
+    /// continuation receipt. The enclosing success or error separately binds
+    /// the receipt's private terminal disposition and, on failure, its source.
     #[must_use]
     pub fn contains_actual_with(
+        &self,
+        continuation: &crate::AggregateOperationAttemptReceipt,
+    ) -> bool {
+        continuation.authenticates_canonical()
+            && self.contains_authenticated_actual_with(continuation)
+    }
+
+    fn contains_success_actual_with(
+        &self,
+        continuation: &crate::AggregateOperationAttemptReceipt,
+    ) -> bool {
+        continuation.authenticates_success()
+            && self.contains_authenticated_actual_with(continuation)
+    }
+
+    fn contains_authenticated_actual_with(
         &self,
         continuation: &crate::AggregateOperationAttemptReceipt,
     ) -> bool {
@@ -4823,7 +6834,7 @@ fn fixed_absolute_build_limit_allows_continuation(source: &FixedAbsoluteDomainBu
     matches!(
         source.kind,
         FixedAbsoluteDomainBuildErrorKind::ResourceLimit { .. }
-    )
+    ) && source.actual == FixedAbsoluteDomainBuildActual::default()
 }
 
 /// Execution also stays inside the existing finite-language quota envelope.
@@ -4956,33 +6967,396 @@ impl AggregateBuilder {
     /// [`AggregateCompileRegex::verify_count`] is deliberately separate so a
     /// compile benchmark can keep semantic verification outside its timer.
     pub fn build_compile(self) -> Result<AggregateCompileRegex, AggregateBuildError> {
-        self.build(AggregateOperation::Compile)
+        self.build_compile_attempt()
+            .map_err(AggregateConstructionAttemptError::into_source)
+    }
+
+    /// Receipt-bearing reusable compile construction.
+    pub fn build_compile_attempt(
+        self,
+    ) -> Result<AggregateCompileRegex, AggregateConstructionAttemptError> {
+        self.build_transaction(AggregateOperation::Compile)
             .map(AggregateCompileRegex)
     }
 
     /// Compile a complete non-overlapping span operation.
     pub fn build_spans(self) -> Result<AggregateSpansRegex, AggregateBuildError> {
-        self.build(AggregateOperation::Spans)
+        self.build_spans_attempt()
+            .map_err(AggregateConstructionAttemptError::into_source)
+    }
+
+    /// Receipt-bearing complete-span construction.
+    pub fn build_spans_attempt(
+        self,
+    ) -> Result<AggregateSpansRegex, AggregateConstructionAttemptError> {
+        self.build_transaction(AggregateOperation::Spans)
             .map(AggregateSpansRegex)
     }
 
     /// Compile a complete match-count operation.
     pub fn build_count(self) -> Result<AggregateCountRegex, AggregateBuildError> {
-        self.build(AggregateOperation::Count)
+        self.build_count_attempt()
+            .map_err(AggregateConstructionAttemptError::into_source)
+    }
+
+    /// Receipt-bearing complete-count construction.
+    pub fn build_count_attempt(
+        self,
+    ) -> Result<AggregateCountRegex, AggregateConstructionAttemptError> {
+        self.build_transaction(AggregateOperation::Count)
             .map(AggregateCountRegex)
     }
 
     /// Compile a complete matched-byte-sum (`count-spans`) operation.
     pub fn build_span_sum(self) -> Result<AggregateSpanSumRegex, AggregateBuildError> {
-        self.build(AggregateOperation::SpanSum)
+        self.build_span_sum_attempt()
+            .map_err(AggregateConstructionAttemptError::into_source)
+    }
+
+    /// Receipt-bearing matched-byte-sum construction.
+    pub fn build_span_sum_attempt(
+        self,
+    ) -> Result<AggregateSpanSumRegex, AggregateConstructionAttemptError> {
+        self.build_transaction(AggregateOperation::SpanSum)
             .map(AggregateSpanSumRegex)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transaction keeps pre-P, syntax ownership, publication, and terminal closure in one audit boundary"
+    )]
+    fn build_transaction(
+        mut self,
+        operation: AggregateOperation,
+    ) -> Result<AggregatePlan, AggregateConstructionAttemptError> {
+        let selection = self.selection;
+        let profile = CompatibilityProfile::RustBytes(self.profile.clone());
+        let request = fre_syntax::ParseRequest::rust(core::mem::take(&mut self.pattern), profile)
+            .with_admission(self.limits.admission)
+            .with_safety_envelope(self.limits.syntax_safety);
+        let prospective = aggregate_construction_prospective(&request, &self.limits);
+        let syntax_request = request.attempt_identity();
+        let request_inputs = AggregateConstructionRequest {
+            syntax_request: syntax_request.clone(),
+            operation,
+            selection,
+            strategy: self.strategy,
+            profile: self.profile.clone(),
+            build_limits: self.limits,
+        };
+        let request_owner = AggregateConstructionRequestOwnerSeal::from_owned(request_inputs);
+        let identity = AggregateConstructionAttemptIdentity::new(
+            request_owner,
+            AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+        );
+        let mut context = AggregateConstructionContext {
+            transaction: AggregateConstructionTransaction::new(identity),
+            source_owner: Some(AggregateConstructionSourceOwner::Request(request)),
+            syntax_attempt: None,
+            pending_terminal_effect: AggregateConstructionEffect::default(),
+            selected_success_effect: None,
+        };
+        if selection == AggregatePlanSelection::ForceExactLiteral
+            && operation == AggregateOperation::Spans
+        {
+            let stage = AggregateConstructionStage::PreSyntaxForceExactLiteralSpans;
+            if context
+                .transaction
+                .record_hard_terminal(stage, AggregateConstructionEffect::default())
+                .is_err()
+            {
+                unreachable!("pre-prospective hard terminal violated construction order");
+            }
+            let source = AggregateBuildError::ExactLiteralIneligible {
+                operation,
+                selection,
+                reason: AggregateLiteralIneligibility::SpanOperation,
+            };
+            return Err(finish_construction_failure(context, source, stage));
+        }
+        match prospective {
+            Ok(prospective) => {
+                if context
+                    .transaction
+                    .publish_prospective(prospective)
+                    .is_err()
+                {
+                    unreachable!("input-derived construction prospective was invalid");
+                }
+            }
+            Err(detail) => {
+                let stage = AggregateConstructionStage::PreSyntaxForceExactLiteralSpans;
+                if context
+                    .transaction
+                    .record_hard_terminal(stage, AggregateConstructionEffect::default())
+                    .is_err()
+                {
+                    unreachable!("pre-prospective terminal violated construction order");
+                }
+                let source = AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail,
+                };
+                return Err(finish_construction_failure(context, source, stage));
+            }
+        }
+
+        let Some(AggregateConstructionSourceOwner::Request(mut request)) =
+            context.source_owner.take()
+        else {
+            unreachable!("source-owner binding lost its exact request");
+        };
+        let owner_bytes = request.bind_attempt_source_owner().unwrap_or_else(|| {
+            unreachable!("aggregate source request was bound before P publication")
+        });
+        let bound_syntax_request = request.attempt_identity();
+        context
+            .transaction
+            .request_mut_after_prospective()
+            .unwrap_or_else(|_| {
+                unreachable!("stable source owner could not bind before the first ledger effect")
+            })
+            .syntax_request = bound_syntax_request;
+        context.source_owner = Some(AggregateConstructionSourceOwner::Request(request));
+        if context
+            .transaction
+            .record_completed(
+                AggregateConstructionStage::PreSyntaxForceExactLiteralSpans,
+                construction_request_owner_effect(owner_bytes),
+            )
+            .is_err()
+        {
+            unreachable!("pre-syntax completion violated construction order");
+        }
+
+        let Some(AggregateConstructionSourceOwner::Request(request)) = context.source_owner.take()
+        else {
+            unreachable!("syntax stage lost its exact request owner");
+        };
+        let parsed_attempt = match fre_syntax::parse_attempt(request) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let (request, source, syntax_attempt) = error.into_parts();
+                let effect = syntax_construction_effect(&syntax_attempt, false);
+                context.source_owner = Some(AggregateConstructionSourceOwner::Request(request));
+                context.syntax_attempt = Some(syntax_attempt);
+                let stage = AggregateConstructionStage::SyntaxParseAdmission;
+                if context
+                    .transaction
+                    .record_hard_terminal(stage, effect)
+                    .is_err()
+                {
+                    unreachable!("syntax hard terminal violated construction order");
+                }
+                let source = AggregateBuildError::Syntax {
+                    operation,
+                    selection,
+                    source,
+                };
+                return Err(finish_construction_failure(context, source, stage));
+            }
+        };
+        let (parsed, syntax_attempt) = parsed_attempt.into_parts();
+        let fre_syntax::ParseRecord {
+            key,
+            admission_status,
+            summary,
+            pattern,
+        } = parsed;
+        let syntax_key = Arc::new(key);
+        context.source_owner = Some(AggregateConstructionSourceOwner::CacheKey(Arc::clone(
+            &syntax_key,
+        )));
+        context.syntax_attempt = Some(syntax_attempt);
+        let CanonicalPattern::Rust(rust) = pattern else {
+            let stage = AggregateConstructionStage::SyntaxParseAdmission;
+            let effect = syntax_construction_effect(
+                context
+                    .syntax_attempt
+                    .as_ref()
+                    .expect("successful syntax receipt is retained"),
+                true,
+            );
+            let effect =
+                close_syntax_terminal_cache_key_owner_effect(effect).unwrap_or_else(|| {
+                    unreachable!("syntax terminal cache-key owner closure underflowed")
+                });
+            if context
+                .transaction
+                .record_hard_terminal(stage, effect)
+                .is_err()
+            {
+                unreachable!("canonical syntax mismatch violated construction order");
+            }
+            let source = AggregateBuildError::InternalInvariant {
+                operation,
+                selection,
+                detail: "Rust bytes request produced a non-Rust canonical pattern",
+            };
+            return Err(finish_construction_failure(context, source, stage));
+        };
+        let syntax_effect = syntax_construction_effect(
+            context
+                .syntax_attempt
+                .as_ref()
+                .expect("successful syntax receipt is retained"),
+            true,
+        );
+        if context
+            .transaction
+            .record_completed(
+                AggregateConstructionStage::SyntaxParseAdmission,
+                syntax_effect,
+            )
+            .is_err()
+        {
+            unreachable!("syntax completion violated construction order");
+        }
+
+        let result = self.build_inner(
+            operation,
+            syntax_key,
+            admission_status,
+            summary,
+            &rust,
+            &mut context,
+        );
+        let mut plan = match result {
+            Ok(plan) => plan,
+            Err(source) => {
+                let stage = context
+                    .transaction
+                    .selected_stage()
+                    .or_else(|| context.transaction.expected_stage())
+                    .unwrap_or(AggregateConstructionStage::Continuation);
+                let terminal_effect = hard_terminal_effect(context.pending_terminal_effect);
+                let terminal_effect = release_transient_cache_key_owner_effect(terminal_effect)
+                    .unwrap_or_else(|| unreachable!("terminal cache-key owner release overflowed"));
+                if context
+                    .transaction
+                    .terminate_current(terminal_effect)
+                    .is_err()
+                {
+                    unreachable!("construction terminal violated selector state");
+                }
+                return Err(finish_construction_failure(context, source, stage));
+            }
+        };
+        let selected =
+            match complete_construction_selector_ledger(&mut context.transaction, &plan.report) {
+                Ok(stage) => stage,
+                Err(_state) => unreachable!("selected plan could not close selector ledger"),
+            };
+        let selected_plan = AggregateConstructionSelectedPlanOwnerSeal::from_owned(
+            selected,
+            plan.report.plan_identity,
+        );
+        let unpublished_report_effect =
+            context.selected_success_effect.take().unwrap_or_else(|| {
+                unreachable!(
+                    "selected {:?} route did not retain its exact unpublished/publication effects",
+                    plan.report.plan
+                )
+            });
+        let publication_effect = include_published_report_seal_effect(unpublished_report_effect)
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "selected {:?} report seal exceeded its published prospective",
+                    plan.report.plan
+                )
+            });
+        let preflight_actual = context
+            .transaction
+            .actual()
+            .checked_apply(publication_effect)
+            .unwrap_or_else(|error| {
+                unreachable!(
+                    "selected {:?} report seal has invalid pre-effect accounting: {error:?}",
+                    plan.report.plan
+                )
+            });
+        if context
+            .transaction
+            .prospective()
+            .is_none_or(|prospective| !prospective.contains(preflight_actual))
+        {
+            unreachable!(
+                "selected {:?} report seal exceeds P before its controlled allocation",
+                plan.report.plan
+            );
+        }
+        if let Some(AggregateUrlOrFixedSeal::Fixed(owner)) =
+            plan.report.sealed_url_aggregate_identity.as_mut()
+        {
+            let preview = context
+                .transaction
+                .preview_success(publication_effect, selected_plan.clone())
+                .unwrap_or_else(|error| {
+                    unreachable!(
+                        "fixed-domain construction receipt preview failed before publication: {error:?}"
+                    )
+                });
+            if owner.attach_construction_attempt(preview).is_err() {
+                unreachable!(
+                    "fixed-domain construction receipt could not bind its unique owner before publication"
+                );
+            }
+        }
+        let Some(AggregateConstructionSourceOwner::CacheKey(transient_cache_owner)) =
+            context.source_owner.take()
+        else {
+            unreachable!("successful construction lost its transient cache-key owner");
+        };
+        drop(transient_cache_owner);
+        let report_seal = Arc::new(AggregatePublishedReportSeal::from_report(&plan.report));
+        if let Err(error) = context
+            .transaction
+            .publish_selected(publication_effect, selected_plan)
+        {
+            let actual = context.transaction.actual();
+            unreachable!(
+                "selected construction plan could not publish exactly once: {error:?}; actual={actual:?}; effect={publication_effect:?}"
+            );
+        }
+        let receipt = match context.transaction.finish_success() {
+            Ok(receipt) => receipt,
+            Err(_state) => unreachable!("published construction transaction did not close"),
+        };
+        plan.report.syntax_attempt.set(context.syntax_attempt);
+        if let Some(AggregateUrlOrFixedSeal::Fixed(owner)) =
+            plan.report.sealed_url_aggregate_identity.as_ref()
+            && owner.construction_attempt_receipt() != Some(&receipt)
+        {
+            unreachable!("fixed-domain preview differs from the published construction receipt");
+        }
+        plan.report
+            .published_artifact_owner
+            .set(Some(Arc::clone(&report_seal)));
+        plan.report
+            .construction_attempt
+            .set(Some(AggregateClosedConstructionEvidence {
+                receipt,
+                report_seal,
+            }));
+        debug_assert!(plan.report.has_closed_construction_attempt());
+        debug_assert!(plan.report.has_closed_fixed_absolute_domain_identity());
+        Ok(plan)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "construction keeps eligibility, no-fallback selection, and both auditable reports together"
     )]
-    fn build(self, operation: AggregateOperation) -> Result<AggregatePlan, AggregateBuildError> {
+    fn build_inner(
+        self,
+        operation: AggregateOperation,
+        syntax_key: Arc<CacheKey>,
+        admission: AdmissionStatus,
+        syntax: ParseSummary,
+        rust: &fre_syntax::RustParsed,
+        construction: &mut AggregateConstructionContext,
+    ) -> Result<AggregatePlan, AggregateBuildError> {
         let selection = self.selection;
         let strategy = self.strategy;
         let limits = self.limits;
@@ -4993,34 +7367,6 @@ impl AggregateBuilder {
         let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
         expected_fixed_absolute_profile.options.unicode = unicode;
         let fixed_absolute_profile = self.profile == expected_fixed_absolute_profile;
-        if selection == AggregatePlanSelection::ForceExactLiteral
-            && operation == AggregateOperation::Spans
-        {
-            return Err(AggregateBuildError::ExactLiteralIneligible {
-                operation,
-                selection,
-                reason: AggregateLiteralIneligibility::SpanOperation,
-            });
-        }
-        let profile = CompatibilityProfile::RustBytes(self.profile);
-        let request = fre_syntax::ParseRequest::rust(self.pattern, profile)
-            .with_admission(limits.admission)
-            .with_safety_envelope(limits.syntax_safety);
-        let parsed = fre_syntax::parse(request).map_err(|source| AggregateBuildError::Syntax {
-            operation,
-            selection,
-            source,
-        })?;
-        let syntax_key = Arc::new(parsed.key);
-        let admission = parsed.admission_status;
-        let syntax = parsed.summary;
-        let CanonicalPattern::Rust(rust) = parsed.pattern else {
-            return Err(AggregateBuildError::InternalInvariant {
-                operation,
-                selection,
-                detail: "Rust bytes request produced a non-Rust canonical pattern",
-            });
-        };
         let minimum_match_bytes = rust.hir.properties().minimum_len();
         let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
             AggregateBuildError::InternalInvariant {
@@ -5060,20 +7406,26 @@ impl AggregateBuilder {
                         LiteralInspectionMode::UnicodeOff
                     },
                 )
-                .map_err(|error| match error {
-                    LiteralInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::LiteralPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        LiteralInspectionError::WorkLimit { needed, limit, .. } => {
+                            AggregateBuildError::LiteralPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        LiteralInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "exact-literal inspection accounting overflow",
+                            }
                         }
                     }
-                    LiteralInspectionError::Overflow => AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "exact-literal inspection accounting overflow",
-                    },
                 })?,
             ),
         };
@@ -5084,6 +7436,17 @@ impl AggregateBuilder {
             captures,
         }) = inspection
         {
+            if construction
+                .transaction
+                .select_stage(AggregateConstructionStage::ExactLiteral)
+                .is_err()
+            {
+                unreachable!("exact-literal selection violated construction order");
+            }
+            construction.pending_terminal_effect = AggregateConstructionEffect {
+                work: u64::try_from(work).unwrap_or(u64::MAX),
+                ..AggregateConstructionEffect::default()
+            };
             if work != expected_nodes || captures != expected_captures {
                 return Err(AggregateBuildError::InternalInvariant {
                     operation,
@@ -5091,14 +7454,18 @@ impl AggregateBuilder {
                     detail: "syntax summary differs from exact-literal inspection",
                 });
             }
-            let mut engine =
-                LiteralAggregatePlan::build(needle, limits.exact_literal).map_err(|source| {
+            let attempt = LiteralAggregatePlan::build_attempt(needle, limits.exact_literal)
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::ExactLiteralBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+            let (mut engine, build_actual) = attempt.into_parts();
+            retain_direct_build_success(construction, work, build_actual);
             let Some(plan_origin) = LiteralAggregatePlanOrigin::from_external_address(
                 Arc::as_ptr(&syntax_key).cast::<()>().addr(),
             ) else {
@@ -5138,11 +7505,16 @@ impl AggregateBuilder {
                 });
             let report = AggregateBuildReport {
                 schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                construction_attempt: AggregateClosureEvidence::empty(),
+                published_artifact_owner: AggregateClosureEvidence::empty(),
+                syntax_attempt: AggregateClosureEvidence::empty(),
                 syntax_key,
                 admission,
                 syntax,
                 operation,
                 selection,
+                requested_strategy: strategy,
+                build_limits: limits,
                 plan: AggregatePlanKind::ExactLiteral,
                 continuation_strategy: None,
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5182,16 +7554,37 @@ impl AggregateBuilder {
 
         let planner_work = match inspection {
             Some(LiteralInspection::Ineligible { work, reason }) => {
+                let effect = AggregateConstructionEffect {
+                    work: u64::try_from(work).unwrap_or(u64::MAX),
+                    ..AggregateConstructionEffect::default()
+                };
                 if selection == AggregatePlanSelection::ForceExactLiteral {
+                    construction.pending_terminal_effect = effect;
                     return Err(AggregateBuildError::ExactLiteralIneligible {
                         operation,
                         selection,
                         reason,
                     });
                 }
+                if construction
+                    .transaction
+                    .record_semantic_ineligible(AggregateConstructionStage::ExactLiteral, effect)
+                    .is_err()
+                {
+                    unreachable!("exact-literal ineligibility violated construction order");
+                }
                 work
             }
-            None => 0,
+            None => {
+                if construction
+                    .transaction
+                    .record_policy_skip(AggregateConstructionStage::ExactLiteral)
+                    .is_err()
+                {
+                    unreachable!("exact-literal policy skip violated construction order");
+                }
+                0
+            }
             Some(LiteralInspection::Eligible { .. }) => {
                 return Err(AggregateBuildError::InternalInvariant {
                     operation,
@@ -5211,20 +7604,24 @@ impl AggregateBuilder {
                     limits.max_unicode_scalar_planner_work,
                     operation == AggregateOperation::SpanSum,
                 )
-                .map_err(|error| match error {
-                    UnicodeScalarInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::UnicodeScalarPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        UnicodeScalarInspectionError::WorkLimit { needed, limit, .. } => {
+                            AggregateBuildError::UnicodeScalarPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    UnicodeScalarInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "Unicode scalar inspection accounting overflow",
+                        UnicodeScalarInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "Unicode scalar inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -5243,6 +7640,11 @@ impl AggregateBuilder {
                 captures,
                 nullable_greedy_span_sum,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::UnicodeScalar,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -5266,26 +7668,26 @@ impl AggregateBuilder {
                         .iter()
                         .map(|range| (range.start(), range.end()))
                 };
-                let engine = match repetition {
+                let attempt = match repetition {
                     UnicodeScalarAggregateRepetition::ExactlyOne => {
-                        UnicodeScalarAggregatePlan::build(ranges(), limits.unicode_scalar)
+                        UnicodeScalarAggregatePlan::build_attempt(ranges(), limits.unicode_scalar)
                     }
                     UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
-                        UnicodeScalarAggregatePlan::build_one_or_more(
+                        UnicodeScalarAggregatePlan::build_one_or_more_attempt(
                             ranges(),
                             true,
                             limits.unicode_scalar,
                         )
                     }
                     UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
-                        UnicodeScalarAggregatePlan::build_one_or_more(
+                        UnicodeScalarAggregatePlan::build_one_or_more_attempt(
                             ranges(),
                             false,
                             limits.unicode_scalar,
                         )
                     }
                     UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated(
+                        UnicodeScalarAggregatePlan::build_repeated_attempt(
                             ranges(),
                             minimum,
                             maximum,
@@ -5294,7 +7696,7 @@ impl AggregateBuilder {
                         )
                     }
                     UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated(
+                        UnicodeScalarAggregatePlan::build_repeated_attempt(
                             ranges(),
                             minimum,
                             maximum,
@@ -5303,11 +7705,17 @@ impl AggregateBuilder {
                         )
                     }
                 }
-                .map_err(|source| AggregateBuildError::UnicodeScalarBuild {
-                    operation,
-                    selection,
-                    source,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
+                    AggregateBuildError::UnicodeScalarBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -5324,11 +7732,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::UnicodeScalarClass,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5375,16 +7788,34 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(UnicodeScalarInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(UnicodeScalarInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::UnicodeScalar,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::UnicodeScalar,
+                );
+                0
+            }
         };
         let word_run_inspection = if !case_insensitive
             && selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
         {
             Some(
-                unicode_word_run::inspect_aggregate(&rust.hir, limits.max_word_run_planner_work)
-                    .map_err(|error| match error {
+                unicode_word_run::inspect_aggregate_attempt(
+                    &rust.hir,
+                    limits.max_word_run_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
                         unicode_word_run::AggregateInspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::WordRunPlannerWorkLimit {
                                 operation,
@@ -5400,13 +7831,19 @@ impl AggregateBuilder {
                                 detail: "word-run inspection accounting overflow",
                             }
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
         };
         let word_run_planner_work = match word_run_inspection {
             Some(unicode_word_run::AggregateInspectionOutcome::Eligible(inspection)) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::WordRun,
+                    construction_work_effect(inspection.work),
+                );
                 if inspection.hir_nodes != expected_nodes
                     || inspection.captures != expected_captures
                 {
@@ -5417,14 +7854,19 @@ impl AggregateBuilder {
                     });
                 }
                 let engine = inspection.plan;
-                let build =
-                    engine
-                        .aggregate_build_accounting(limits.word_run)
-                        .map_err(|source| AggregateBuildError::WordRunBuild {
+                let attempt = engine
+                    .aggregate_build_attempt(limits.word_run)
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            direct_build_stage_effect(inspection.work, error.actual());
+                        AggregateBuildError::WordRunBuild {
                             operation,
                             selection,
-                            source,
-                        })?;
+                            source: error.into_source(),
+                        }
+                    })?;
+                let (build, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, inspection.work, build_actual);
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
                         engine.aggregate_count_identity()
@@ -5440,11 +7882,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::WordRun,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5488,16 +7935,31 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(unicode_word_run::AggregateInspectionOutcome::Ineligible { work }) => work,
-            None => 0,
+            Some(unicode_word_run::AggregateInspectionOutcome::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::WordRun,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(construction, AggregateConstructionStage::WordRun);
+                0
+            }
         };
         let literal_assertions_inspection = if !case_insensitive
             && selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
         {
             Some(
-                literal_assertions::inspect(&rust.hir, limits.max_literal_assertions_planner_work)
-                    .map_err(|error| match error {
+                literal_assertions::inspect_attempt(
+                    &rust.hir,
+                    limits.max_literal_assertions_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
                         literal_assertions::InspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::LiteralAssertionsPlannerWorkLimit {
                                 operation,
@@ -5513,13 +7975,19 @@ impl AggregateBuilder {
                                 detail: "literal-assertions inspection accounting overflow",
                             }
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
         };
         let literal_assertions_planner_work = match literal_assertions_inspection {
             Some(literal_assertions::InspectionOutcome::Eligible(inspection)) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::LiteralAssertions,
+                    construction_work_effect(inspection.work),
+                );
                 if inspection.hir_nodes != expected_nodes
                     || inspection.captures != expected_captures
                 {
@@ -5529,16 +7997,22 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from literal-assertions inspection",
                     });
                 }
-                let engine = LiteralAssertionsPlan::build(
+                let attempt = LiteralAssertionsPlan::build_attempt(
                     inspection.literal,
                     line_terminator,
                     limits.literal_assertions,
                 )
-                .map_err(|source| AggregateBuildError::LiteralAssertionsBuild {
-                    operation,
-                    selection,
-                    source,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(inspection.work, error.actual());
+                    AggregateBuildError::LiteralAssertionsBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, inspection.work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -5555,11 +8029,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::LiteralAssertions,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5605,8 +8084,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(literal_assertions::InspectionOutcome::Ineligible { work }) => work,
-            None => 0,
+            Some(literal_assertions::InspectionOutcome::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::LiteralAssertions,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::LiteralAssertions,
+                );
+                0
+            }
         };
         let blocking_delimiter_inspection = if !unicode
             && !case_insensitive
@@ -5614,8 +8106,13 @@ impl AggregateBuilder {
             && operation != AggregateOperation::Spans
         {
             Some(
-                blocking_delimiter::inspect(&rust.hir, limits.max_blocking_delimiter_planner_work)
-                    .map_err(|error| match error {
+                blocking_delimiter::inspect_attempt(
+                    &rust.hir,
+                    limits.max_blocking_delimiter_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
                         blocking_delimiter::InspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::BlockingDelimiterPlannerWorkLimit {
                                 operation,
@@ -5631,13 +8128,19 @@ impl AggregateBuilder {
                                 detail: "blocking-delimiter inspection accounting overflow",
                             }
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
         };
         let blocking_delimiter_planner_work = match blocking_delimiter_inspection {
             Some(blocking_delimiter::InspectionOutcome::Eligible(inspection)) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BlockingDelimiter,
+                    construction_work_effect(inspection.work),
+                );
                 if inspection.hir_nodes != expected_nodes
                     || inspection.captures != expected_captures
                 {
@@ -5647,17 +8150,23 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from blocking-delimiter inspection",
                     });
                 }
-                let engine = BlockingDelimiterPlan::build(
+                let attempt = BlockingDelimiterPlan::build_attempt(
                     inspection.delimiters,
                     inspection.terminal_words,
                     inspection.maximum_middle_bytes,
                     limits.blocking_delimiter,
                 )
-                .map_err(|source| AggregateBuildError::BlockingDelimiterBuild {
-                    operation,
-                    selection,
-                    source,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(inspection.work, error.actual());
+                    AggregateBuildError::BlockingDelimiterBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, inspection.work, build_actual);
                 let build = engine.build_accounting();
                 if build.terminal_members != inspection.terminal_members {
                     return Err(AggregateBuildError::InternalInvariant {
@@ -5681,11 +8190,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::BlockingDelimiter,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5727,8 +8241,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(blocking_delimiter::InspectionOutcome::Ineligible { work }) => work,
-            None => 0,
+            Some(blocking_delimiter::InspectionOutcome::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BlockingDelimiter,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::BlockingDelimiter,
+                );
+                0
+            }
         };
         let token_phrase_inspection = if !unicode
             && !case_insensitive
@@ -5736,31 +8263,39 @@ impl AggregateBuilder {
             && operation != AggregateOperation::Spans
         {
             Some(
-                token_phrase::inspect(&rust.hir, limits.max_token_phrase_planner_work).map_err(
-                    |error| match error {
-                        token_phrase::InspectionError::WorkLimit { needed, limit } => {
-                            AggregateBuildError::TokenPhrasePlannerWorkLimit {
-                                operation,
-                                selection,
-                                needed,
-                                limit,
+                token_phrase::inspect_attempt(&rust.hir, limits.max_token_phrase_planner_work)
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            construction_work_effect(error.work());
+                        match error.into_source() {
+                            token_phrase::InspectionError::WorkLimit { needed, limit } => {
+                                AggregateBuildError::TokenPhrasePlannerWorkLimit {
+                                    operation,
+                                    selection,
+                                    needed,
+                                    limit,
+                                }
+                            }
+                            token_phrase::InspectionError::Overflow => {
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "token-phrase inspection accounting overflow",
+                                }
                             }
                         }
-                        token_phrase::InspectionError::Overflow => {
-                            AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "token-phrase inspection accounting overflow",
-                            }
-                        }
-                    },
-                )?,
+                    })?,
             )
         } else {
             None
         };
         let token_phrase_planner_work = match token_phrase_inspection {
             Some(token_phrase::InspectionOutcome::Eligible(inspection)) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::TokenPhrase,
+                    construction_work_effect(inspection.work),
+                );
                 if inspection.hir_nodes != expected_nodes
                     || inspection.captures != expected_captures
                 {
@@ -5770,16 +8305,22 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from token-phrase inspection",
                     });
                 }
-                let engine = TokenPhrasePlan::build(
+                let attempt = TokenPhrasePlan::build_attempt(
                     inspection.literal,
                     inspection.outer_word_assertions,
                     limits.token_phrase,
                 )
-                .map_err(|source| AggregateBuildError::TokenPhraseBuild {
-                    operation,
-                    selection,
-                    source,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(inspection.work, error.actual());
+                    AggregateBuildError::TokenPhraseBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, inspection.work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -5796,11 +8337,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::TokenPhrase,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5843,8 +8389,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(token_phrase::InspectionOutcome::Ineligible { work }) => work,
-            None => 0,
+            Some(token_phrase::InspectionOutcome::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::TokenPhrase,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::TokenPhrase,
+                );
+                0
+            }
         };
         let fixed_class_inspection = if selection == AggregatePlanSelection::Auto
             && operation != AggregateOperation::Spans
@@ -5855,20 +8414,24 @@ impl AggregateBuilder {
                     unicode,
                     limits.max_fixed_class_sandwich_planner_work,
                 )
-                .map_err(|error| match error {
-                    FixedClassSandwichInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::FixedClassSandwichPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        FixedClassSandwichInspectionError::WorkLimit { needed, limit, .. } => {
+                            AggregateBuildError::FixedClassSandwichPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    FixedClassSandwichInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "fixed class-sandwich inspection accounting overflow",
+                        FixedClassSandwichInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed class-sandwich inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -5887,6 +8450,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::FixedClassSandwich,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -5894,7 +8462,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from fixed class-sandwich inspection",
                     });
                 }
-                let engine = FixedClassSandwichPlan::build_ranges(
+                let attempt = FixedClassSandwichPlan::build_ranges_attempt(
                     prefix.ranges(),
                     middle.ranges(),
                     suffix.ranges(),
@@ -5902,13 +8470,17 @@ impl AggregateBuilder {
                     middle_repetitions,
                     limits.fixed_class_sandwich,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::FixedClassSandwichBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -5925,11 +8497,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::FixedClassSandwich,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -5978,8 +8555,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(FixedClassSandwichInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(FixedClassSandwichInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::FixedClassSandwich,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::FixedClassSandwich,
+                );
+                0
+            }
         };
         let grapheme_scalar_inspection = if grapheme_profile
             && unicode
@@ -5988,8 +8578,13 @@ impl AggregateBuilder {
             && operation == AggregateOperation::Count
         {
             Some(
-                grapheme_scalar::inspect(&rust.hir, limits.max_grapheme_scalar_dfa_planner_work)
-                    .map_err(|error| match error {
+                grapheme_scalar::inspect_attempt(
+                    &rust.hir,
+                    limits.max_grapheme_scalar_dfa_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
                         grapheme_scalar::InspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::GraphemeScalarDfaPlannerWorkLimit {
                                 operation,
@@ -6005,7 +8600,8 @@ impl AggregateBuilder {
                                 detail: "ordered scalar-grammar inspection accounting overflow",
                             }
                         }
-                    })?,
+                    }
+                })?,
             )
         } else {
             None
@@ -6014,6 +8610,11 @@ impl AggregateBuilder {
             grapheme_scalar::InspectionOutcome::Eligible(inspection),
         ) = grapheme_scalar_inspection
         {
+            select_construction_stage(
+                construction,
+                AggregateConstructionStage::GraphemeScalarDfa,
+                construction_work_effect(inspection.work),
+            );
             if inspection.hir_nodes != expected_nodes || inspection.captures != expected_captures {
                 return Err(AggregateBuildError::InternalInvariant {
                     operation,
@@ -6107,24 +8708,35 @@ impl AggregateBuilder {
                     GraphemeScalarDfaRole::Any,
                     classes.any,
                 ));
-            let engine = GraphemeScalarDfaPlan::build_from_counted_iter(
+            let attempt = GraphemeScalarDfaPlan::build_from_counted_iter_attempt(
                 source_ranges,
                 ranges,
                 limits.grapheme_scalar_dfa,
             )
-            .map_err(|source| AggregateBuildError::GraphemeScalarDfaBuild {
-                operation,
-                selection,
-                source,
+            .map_err(|error| {
+                construction.pending_terminal_effect =
+                    direct_build_stage_effect(inspection.work, error.actual());
+                AggregateBuildError::GraphemeScalarDfaBuild {
+                    operation,
+                    selection,
+                    source: error.into_source(),
+                }
             })?;
+            let (engine, build_actual) = attempt.into_parts();
+            retain_direct_build_success(construction, inspection.work, build_actual);
             let build = engine.build_accounting();
             let report = AggregateBuildReport {
                 schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                construction_attempt: AggregateClosureEvidence::empty(),
+                published_artifact_owner: AggregateClosureEvidence::empty(),
+                syntax_attempt: AggregateClosureEvidence::empty(),
                 syntax_key,
                 admission,
                 syntax,
                 operation,
                 selection,
+                requested_strategy: strategy,
+                build_limits: limits,
                 plan: AggregatePlanKind::GraphemeScalarDfa,
                 continuation_strategy: None,
                 capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6171,6 +8783,11 @@ impl AggregateBuilder {
             captures,
         }) = grapheme_scalar_inspection
         {
+            record_construction_ineligible(
+                construction,
+                AggregateConstructionStage::GraphemeScalarDfa,
+                work,
+            );
             if hir_nodes != expected_nodes || captures != expected_captures {
                 return Err(AggregateBuildError::InternalInvariant {
                     operation,
@@ -6180,6 +8797,10 @@ impl AggregateBuilder {
             }
             work
         } else {
+            record_construction_policy_skip(
+                construction,
+                AggregateConstructionStage::GraphemeScalarDfa,
+            );
             0
         };
         let bounded_class_sequence_inspection = if !unicode
@@ -6191,20 +8812,24 @@ impl AggregateBuilder {
                     &rust.hir,
                     limits.max_bounded_class_sequence_planner_work,
                 )
-                .map_err(|error| match error {
-                    BoundedClassSequenceInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::BoundedClassSequencePlannerWorkLimit {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        BoundedClassSequenceInspectionError::WorkLimit {
+                            needed, limit, ..
+                        } => AggregateBuildError::BoundedClassSequencePlannerWorkLimit {
                             operation,
                             selection,
                             needed,
                             limit,
-                        }
-                    }
-                    BoundedClassSequenceInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "bounded class-sequence inspection accounting overflow",
+                        },
+                        BoundedClassSequenceInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded class-sequence inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -6223,6 +8848,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BoundedClassSequence,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -6230,7 +8860,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded class-sequence inspection",
                     });
                 }
-                let engine = BoundedClassSequencePlan::build(
+                let attempt = BoundedClassSequencePlan::build_attempt(
                     head.ranges(),
                     body.ranges(),
                     trail.ranges(),
@@ -6238,21 +8868,30 @@ impl AggregateBuilder {
                     maximum,
                     limits.bounded_class_sequence,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::BoundedClassSequenceBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::BoundedClassSequence,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6291,8 +8930,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(BoundedClassSequenceInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(BoundedClassSequenceInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedClassSequence,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::BoundedClassSequence,
+                );
+                0
+            }
         };
         let bounded_separated_fields_inspection = if !unicode
             && !case_insensitive
@@ -6300,24 +8952,27 @@ impl AggregateBuilder {
             && operation == AggregateOperation::Count
         {
             Some(
-                inspect_bounded_separated_fields(
+                inspect_bounded_separated_fields_attempt(
                     &rust.hir,
                     limits.max_bounded_separated_fields_planner_work,
                 )
-                .map_err(|error| match error {
-                    BoundedSeparatedFieldsInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
+                        BoundedSeparatedFieldsInspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::BoundedSeparatedFieldsPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    BoundedSeparatedFieldsInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "bounded separated-field inspection accounting overflow",
+                        BoundedSeparatedFieldsInspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded separated-field inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -6334,6 +8989,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BoundedSeparatedFields,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -6348,30 +9008,39 @@ impl AggregateBuilder {
                         detail: "eligible bounded separated-field source was not representable",
                     });
                 };
-                let engine = BoundedSeparatedFieldsPlan::build(
+                let attempt = BoundedSeparatedFieldsPlan::build_attempt(
                     field_source,
                     separator,
                     fields,
                     limits.bounded_separated_fields,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::BoundedSeparatedFieldsBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let plan_identity = AggregateBoundedSeparatedFieldsIdentity {
                     kernel: engine.count_identity(),
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::BoundedSeparatedFields,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6408,8 +9077,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(BoundedSeparatedFieldsInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(BoundedSeparatedFieldsInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedSeparatedFields,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::BoundedSeparatedFields,
+                );
+                0
+            }
         };
         let prefix_class_selection_bound = prefix_class_selection_work(&syntax);
         let prefix_class_inspection = if !unicode
@@ -6427,20 +9109,24 @@ impl AggregateBuilder {
                     &rust.hir,
                     limits.max_prefix_class_alternation_planner_work,
                 )
-                .map_err(|error| match error {
-                    PrefixClassInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::PrefixClassAlternationPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        PrefixClassInspectionError::WorkLimit { needed, limit, .. } => {
+                            AggregateBuildError::PrefixClassAlternationPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    PrefixClassInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "prefix/class alternation inspection accounting overflow",
+                        PrefixClassInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "prefix/class alternation inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -6457,6 +9143,11 @@ impl AggregateBuilder {
                 captures,
                 uniform_participating_capture_indices: _,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::PrefixClassAlternation,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -6464,7 +9155,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from prefix/class inspection",
                     });
                 }
-                let engine = PrefixClassAlternationPlan::build(
+                let attempt = PrefixClassAlternationPlan::build_attempt(
                     prefixes,
                     [
                         classes[0]
@@ -6480,21 +9171,30 @@ impl AggregateBuilder {
                     ],
                     limits.prefix_class_alternation,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::PrefixClassAlternationBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::PrefixClassAlternation,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6535,8 +9235,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(PrefixClassInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(PrefixClassInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::PrefixClassAlternation,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::PrefixClassAlternation,
+                );
+                0
+            }
         };
         let bounded_literal_pair_inspection = if !unicode
             && !case_insensitive
@@ -6548,24 +9261,27 @@ impl AggregateBuilder {
                     | AggregateOperation::SpanSum
             ) {
             Some(
-                bounded_literal_pair::inspect(
+                bounded_literal_pair::inspect_attempt(
                     &rust.hir,
                     limits.max_bounded_literal_pair_planner_work,
                 )
-                .map_err(|error| match error {
-                    bounded_literal_pair::InspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::BoundedLiteralPairPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
+                        bounded_literal_pair::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::BoundedLiteralPairPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    bounded_literal_pair::InspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "bounded literal-pair inspection accounting overflow",
+                        bounded_literal_pair::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded literal-pair inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -6583,6 +9299,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BoundedLiteralPair,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -6590,7 +9311,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded literal-pair inspection",
                     });
                 }
-                let engine = BoundedLiteralPairPlan::build(
+                let attempt = BoundedLiteralPairPlan::build_attempt(
                     left,
                     class
                         .ranges()
@@ -6600,13 +9321,17 @@ impl AggregateBuilder {
                     gap_max,
                     limits.bounded_literal_pair,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
                     AggregateBuildError::BoundedLiteralPairBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -6623,11 +9348,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::BoundedLiteralPair,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6666,8 +9396,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(bounded_literal_pair::Inspection::Ineligible { work }) => work,
-            None => 0,
+            Some(bounded_literal_pair::Inspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedLiteralPair,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::BoundedLiteralPair,
+                );
+                0
+            }
         };
         let literal_class_run_literal_inspection = if !unicode
             && !case_insensitive
@@ -6675,24 +9418,27 @@ impl AggregateBuilder {
             && operation != AggregateOperation::Spans
         {
             Some(
-                literal_class_run_literal::inspect(
+                literal_class_run_literal::inspect_attempt(
                     &rust.hir,
                     limits.max_literal_class_run_literal_planner_work,
                 )
-                .map_err(|error| match error {
-                    literal_class_run_literal::InspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::LiteralClassRunLiteralPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
+                        literal_class_run_literal::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::LiteralClassRunLiteralPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    literal_class_run_literal::InspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "literal/class-run/literal inspection accounting overflow",
+                        literal_class_run_literal::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "literal/class-run/literal inspection accounting overflow",
+                            }
                         }
                     }
                 })?,
@@ -6702,6 +9448,11 @@ impl AggregateBuilder {
         };
         let literal_class_run_literal_planner_work = match literal_class_run_literal_inspection {
             Some(literal_class_run_literal::InspectionOutcome::Eligible(inspection)) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                    construction_work_effect(inspection.work),
+                );
                 if inspection.hir_nodes != expected_nodes
                     || inspection.captures != expected_captures
                 {
@@ -6711,7 +9462,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from literal/class-run/literal inspection",
                     });
                 }
-                let engine = LiteralClassRunLiteralPlan::build(
+                let attempt = LiteralClassRunLiteralPlan::build_attempt(
                     inspection.prefix,
                     inspection
                         .class
@@ -6722,13 +9473,17 @@ impl AggregateBuilder {
                     inspection.suffix,
                     limits.literal_class_run_literal,
                 )
-                .map_err(|source| {
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(inspection.work, error.actual());
                     AggregateBuildError::LiteralClassRunLiteralBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, inspection.work, build_actual);
                 let build = engine.build_accounting();
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
@@ -6745,11 +9500,16 @@ impl AggregateBuilder {
                 };
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::LiteralClassRunLiteral,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6788,8 +9548,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(literal_class_run_literal::InspectionOutcome::Ineligible { work, .. }) => work,
-            None => 0,
+            Some(literal_class_run_literal::InspectionOutcome::Ineligible { work, .. }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                );
+                0
+            }
         };
         let bounded_affix_planner_work;
         if !unicode
@@ -6798,20 +9571,24 @@ impl AggregateBuilder {
             && operation == AggregateOperation::Count
         {
             let affix = inspect_bounded_affix(&rust.hir, limits.max_bounded_affix_planner_work)
-                .map_err(|error| match error {
-                    BoundedContextInspectionError::WorkLimit { needed, limit } => {
-                        AggregateBuildError::BoundedAffixPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        construction_work_effect(error.consumed_work());
+                    match error {
+                        BoundedContextInspectionError::WorkLimit { needed, limit, .. } => {
+                            AggregateBuildError::BoundedAffixPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
                         }
-                    }
-                    BoundedContextInspectionError::Overflow => {
-                        AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "bounded-affix inspection accounting overflow",
+                        BoundedContextInspectionError::Overflow { .. } => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "bounded-affix inspection accounting overflow",
+                            }
                         }
                     }
                 })?;
@@ -6825,6 +9602,11 @@ impl AggregateBuilder {
                     work,
                     hir_nodes,
                 } => {
+                    select_construction_stage(
+                        construction,
+                        AggregateConstructionStage::BoundedAffix,
+                        construction_work_effect(work),
+                    );
                     if hir_nodes != expected_nodes || expected_captures != 0 {
                         return Err(AggregateBuildError::InternalInvariant {
                             operation,
@@ -6832,7 +9614,7 @@ impl AggregateBuilder {
                             detail: "syntax summary differs from bounded-affix inspection",
                         });
                     }
-                    let engine = BoundedContextPlan::build_bounded_affix(
+                    let attempt = BoundedContextPlan::build_bounded_affix_attempt(
                         left.ranges()
                             .iter()
                             .map(|range| (range.start(), range.end())),
@@ -6848,21 +9630,30 @@ impl AggregateBuilder {
                         middle_max,
                         limits.bounded_context,
                     )
-                    .map_err(|source| {
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            direct_build_stage_effect(work, error.actual());
                         AggregateBuildError::BoundedContextBuild {
                             operation,
                             selection,
-                            source,
+                            source: error.into_source(),
                         }
                     })?;
+                    let (engine, build_actual) = attempt.into_parts();
+                    retain_direct_build_success(construction, work, build_actual);
                     let build = engine.build_accounting();
                     let report = AggregateBuildReport {
                         schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        construction_attempt: AggregateClosureEvidence::empty(),
+                        published_artifact_owner: AggregateClosureEvidence::empty(),
+                        syntax_attempt: AggregateClosureEvidence::empty(),
                         syntax_key,
                         admission,
                         syntax,
                         operation,
                         selection,
+                        requested_strategy: strategy,
+                        build_limits: limits,
                         plan: AggregatePlanKind::BoundedContext,
                         continuation_strategy: None,
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -6904,10 +9695,16 @@ impl AggregateBuilder {
                     });
                 }
                 BoundedAffixInspection::Ineligible { work } => {
+                    record_construction_ineligible(
+                        construction,
+                        AggregateConstructionStage::BoundedAffix,
+                        work,
+                    );
                     bounded_affix_planner_work = work;
                 }
             }
         } else {
+            record_construction_policy_skip(construction, AggregateConstructionStage::BoundedAffix);
             bounded_affix_planner_work = 0;
         }
         let bounded_context_inspection = if !unicode
@@ -6919,20 +9716,24 @@ impl AggregateBuilder {
             ) {
             Some(
                 inspect_bounded_context(&rust.hir, limits.max_bounded_context_planner_work)
-                    .map_err(|error| match error {
-                        BoundedContextInspectionError::WorkLimit { needed, limit } => {
-                            AggregateBuildError::BoundedContextPlannerWorkLimit {
-                                operation,
-                                selection,
-                                needed,
-                                limit,
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            construction_work_effect(error.consumed_work());
+                        match error {
+                            BoundedContextInspectionError::WorkLimit { needed, limit, .. } => {
+                                AggregateBuildError::BoundedContextPlannerWorkLimit {
+                                    operation,
+                                    selection,
+                                    needed,
+                                    limit,
+                                }
                             }
-                        }
-                        BoundedContextInspectionError::Overflow => {
-                            AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "bounded-context inspection accounting overflow",
+                            BoundedContextInspectionError::Overflow { .. } => {
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "bounded-context inspection accounting overflow",
+                                }
                             }
                         }
                     })?,
@@ -6954,6 +9755,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::BoundedContext,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -6961,7 +9767,7 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded-context inspection",
                     });
                 }
-                let engine = BoundedContextPlan::build(
+                let attempt = BoundedContextPlan::build_attempt(
                     prefix
                         .ranges()
                         .iter()
@@ -6980,19 +9786,30 @@ impl AggregateBuilder {
                     tail_width,
                     limits.bounded_context,
                 )
-                .map_err(|source| AggregateBuildError::BoundedContextBuild {
-                    operation,
-                    selection,
-                    source,
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
+                    AggregateBuildError::BoundedContextBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
                 })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
                 let build = engine.build_accounting();
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::BoundedContext,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -7033,8 +9850,21 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(BoundedContextInspection::Ineligible { work }) => work,
-            None => 0,
+            Some(BoundedContextInspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::BoundedContext,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::BoundedContext,
+                );
+                0
+            }
         };
         let fixed_absolute_candidate = if fixed_absolute_profile
             && selection == AggregatePlanSelection::Auto
@@ -7053,8 +9883,15 @@ impl AggregateBuilder {
         };
         let fixed_absolute_optional = fixed_absolute_candidate
             .is_some_and(|candidate| candidate.candidate == fixed_absolute::Candidate::Possible);
+        let mut fixed_absolute_optional_inspection_refusal = false;
         let fixed_absolute_inspection = if let Some(candidate) = fixed_absolute_candidate {
-            if candidate.exhausted || candidate.candidate == fixed_absolute::Candidate::Ineligible {
+            if candidate.exhausted {
+                fixed_absolute_optional_inspection_refusal =
+                    candidate.candidate == fixed_absolute::Candidate::Possible;
+                Some(fixed_absolute::Inspection::Ineligible {
+                    work: candidate.work,
+                })
+            } else if candidate.candidate == fixed_absolute::Candidate::Ineligible {
                 Some(fixed_absolute::Inspection::Ineligible {
                     work: candidate.work,
                 })
@@ -7067,7 +9904,7 @@ impl AggregateBuilder {
                         selection,
                         detail: "fixed absolute classifier exceeded its planner cap",
                     })?;
-                match fixed_absolute::inspect(&rust.hir, unicode, operation, remaining) {
+                match fixed_absolute::inspect_attempt(&rust.hir, unicode, operation, remaining) {
                     Ok(fixed_absolute::Inspection::Eligible {
                         shape,
                         work,
@@ -7096,54 +9933,75 @@ impl AggregateBuilder {
                             )?,
                         })
                     }
-                    Err(fixed_absolute::InspectionError::WorkLimit { consumed, .. })
-                        if candidate.candidate == fixed_absolute::Candidate::Possible =>
-                    {
-                        Some(fixed_absolute::Inspection::Ineligible {
-                            work: candidate.work.checked_add(consumed).ok_or(
-                                AggregateBuildError::InternalInvariant {
-                                    operation,
-                                    selection,
-                                    detail: "fixed absolute planner work overflow",
-                                },
-                            )?,
-                        })
-                    }
-                    Err(fixed_absolute::InspectionError::WorkLimit { needed, consumed }) => {
-                        let needed = candidate.work.checked_add(needed).ok_or(
-                            AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "fixed absolute planner refusal overflow",
-                            },
-                        )?;
-                        let consumed = candidate.work.checked_add(consumed).ok_or(
+                    Err(error) => {
+                        let inspected_work = error.work();
+                        let consumed = candidate.work.checked_add(inspected_work).ok_or(
                             AggregateBuildError::InternalInvariant {
                                 operation,
                                 selection,
                                 detail: "fixed absolute planner consumed work overflow",
                             },
                         )?;
-                        return Err(AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit {
-                            operation,
-                            selection,
-                            needed,
-                            limit: limits.max_fixed_absolute_planner_work,
-                            consumed,
-                        });
-                    }
-                    Err(fixed_absolute::InspectionError::Overflow) => {
-                        return Err(AggregateBuildError::InternalInvariant {
-                            operation,
-                            selection,
-                            detail: "fixed absolute-domain inspection accounting overflow",
-                        });
+                        match error.into_source() {
+                            fixed_absolute::InspectionError::WorkLimit { .. }
+                                if candidate.candidate == fixed_absolute::Candidate::Possible =>
+                            {
+                                fixed_absolute_optional_inspection_refusal = true;
+                                Some(fixed_absolute::Inspection::Ineligible { work: consumed })
+                            }
+                            fixed_absolute::InspectionError::WorkLimit { needed, .. } => {
+                                let needed = candidate.work.checked_add(needed).ok_or(
+                                    AggregateBuildError::InternalInvariant {
+                                        operation,
+                                        selection,
+                                        detail: "fixed absolute planner refusal overflow",
+                                    },
+                                )?;
+                                construction.pending_terminal_effect =
+                                    construction_work_effect(consumed);
+                                return Err(
+                                    AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit {
+                                        operation,
+                                        selection,
+                                        needed,
+                                        limit: limits.max_fixed_absolute_planner_work,
+                                        consumed,
+                                    },
+                                );
+                            }
+                            fixed_absolute::InspectionError::Overflow => {
+                                construction.pending_terminal_effect =
+                                    construction_work_effect(consumed);
+                                return Err(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed absolute-domain inspection accounting overflow",
+                                });
+                            }
+                        }
                     }
                 }
             }
         } else {
             None
         };
+        if fixed_absolute_optional_inspection_refusal {
+            let Some(fixed_absolute::Inspection::Ineligible { work }) = fixed_absolute_inspection
+            else {
+                unreachable!("optional fixed-absolute inspection refusal lost its work");
+            };
+            let effect = construction_work_effect(work);
+            select_construction_stage(
+                construction,
+                AggregateConstructionStage::FixedAbsolute,
+                effect,
+            );
+            resolve_construction_soft_refusal(
+                construction,
+                effect,
+                AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalInspectionResource,
+            );
+        }
         let fixed_absolute_planner_work = u32::try_from('fixed_absolute: {
             match fixed_absolute_inspection {
             Some(fixed_absolute::Inspection::Eligible {
@@ -7152,6 +10010,11 @@ impl AggregateBuilder {
                 hir_nodes,
                 captures,
             }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::FixedAbsolute,
+                    construction_work_effect(work),
+                );
                 if hir_nodes != expected_nodes || captures != expected_captures {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -7168,21 +10031,35 @@ impl AggregateBuilder {
                         detail: "fixed scalar census began outside its planner cap",
                     })?;
                 let (residual_prospective_allocations, census_work) =
-                    match shape.scalar_residual_compile_allocations(&rust.hir, census_limit) {
+                    match shape.scalar_residual_compile_allocations_attempt(&rust.hir, census_limit)
+                    {
                         Ok(Some((allocations, census_work))) => (Some(allocations), census_work),
                         Ok(None) => (None, 0),
-                        Err(fixed_absolute::InspectionError::WorkLimit { consumed, .. })
-                            if fixed_absolute_optional =>
-                        {
-                            break 'fixed_absolute work.checked_add(consumed).ok_or(
+                        Err(error)
+                            if fixed_absolute_optional
+                                && matches!(
+                                    error.source(),
+                                    fixed_absolute::InspectionError::WorkLimit { .. }
+                                ) => {
+                            let consumed = error.work();
+                            let work = work.checked_add(consumed).ok_or(
                                 AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "optional fixed scalar census work overflow",
                                 },
                             )?;
+                            resolve_construction_soft_refusal(
+                                construction,
+                                construction_work_effect(work),
+                                AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalInspectionResource,
+                            );
+                            break 'fixed_absolute work;
                         }
-                        Err(fixed_absolute::InspectionError::WorkLimit { needed, consumed }) => {
+                        Err(error) => {
+                            let consumed_work = error.work();
+                            match error.into_source() {
+                        fixed_absolute::InspectionError::WorkLimit { needed, .. } => {
                             let needed = work.checked_add(needed).ok_or(
                                 AggregateBuildError::InternalInvariant {
                                     operation,
@@ -7190,13 +10067,15 @@ impl AggregateBuilder {
                                     detail: "fixed scalar census refusal overflow",
                                 },
                             )?;
-                            let consumed = work.checked_add(consumed).ok_or(
+                            let consumed = work.checked_add(consumed_work).ok_or(
                                 AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "fixed scalar census consumed work overflow",
                                 },
                             )?;
+                            construction.pending_terminal_effect =
+                                construction_work_effect(consumed);
                             return Err(AggregateBuildError::FixedAbsoluteDomainPlannerWorkLimit {
                                 operation,
                                 selection,
@@ -7205,12 +10084,23 @@ impl AggregateBuilder {
                                 consumed,
                             });
                         }
-                        Err(fixed_absolute::InspectionError::Overflow) => {
+                        fixed_absolute::InspectionError::Overflow => {
+                            let consumed = work.checked_add(consumed_work).ok_or(
+                                AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed scalar census overflow work overflow",
+                                },
+                            )?;
+                            construction.pending_terminal_effect =
+                                construction_work_effect(consumed);
                             return Err(AggregateBuildError::InternalInvariant {
                                 operation,
                                 selection,
                                 detail: "fixed scalar residual allocation census overflow",
                             });
+                        }
+                            }
                         }
                     };
                 let work = work.checked_add(census_work).ok_or(
@@ -7220,6 +10110,7 @@ impl AggregateBuilder {
                         detail: "fixed scalar census work overflow",
                     },
                 )?;
+                construction.pending_terminal_effect = construction_work_effect(work);
                 let guard_prospective = shape.guard_prospective().map_err(|source| {
                     AggregateBuildError::FixedAbsoluteDomainBuild {
                         operation,
@@ -7272,6 +10163,11 @@ impl AggregateBuilder {
                             limits.fixed_absolute_residual,
                         ) {
                             if fixed_absolute_optional {
+                                resolve_construction_soft_refusal(
+                                    construction,
+                                    construction_work_effect(work),
+                                    AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalResidualResource,
+                                );
                                 break 'fixed_absolute work;
                             }
                             return Err(
@@ -7307,6 +10203,11 @@ impl AggregateBuilder {
                     limits.fixed_absolute,
                 ) {
                     if fixed_absolute_optional {
+                        resolve_construction_soft_refusal(
+                            construction,
+                            construction_work_effect(work),
+                            AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalGuardResource,
+                        );
                         break 'fixed_absolute work;
                     }
                     let source = fixed_guard_build_preflight_error(
@@ -7344,13 +10245,43 @@ impl AggregateBuilder {
                         if fixed_absolute_optional
                             && fixed_absolute_build_limit_allows_continuation(&source) =>
                     {
+                        let effect = fixed_absolute_construction_effect(
+                            work,
+                            source.actual,
+                            None,
+                            false,
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "optional fixed guard refusal effect overflow",
+                        })?;
+                        resolve_construction_soft_refusal(
+                            construction,
+                            effect,
+                            AggregateConstructionPrepublicationFallback::FixedAbsoluteOptionalBuildResource,
+                        );
                         break 'fixed_absolute work;
                     }
                     Err(source) => {
+                        construction.pending_terminal_effect =
+                            fixed_absolute_construction_effect(
+                                work,
+                                source.actual,
+                                None,
+                                false,
+                            )
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed guard terminal effect overflow",
+                            })?;
                         let source = bind_fixed_owner_to_guard_build_error(
                             source,
                             guard_with_owner_prospective,
                         );
+                        let guard_failure_actual =
+                            fixed_guard_build_failure_actual(source.actual);
                         return Err(scalar_build_prospective.map_or(
                             AggregateBuildError::FixedAbsoluteDomainBuild {
                                 operation,
@@ -7367,14 +10298,25 @@ impl AggregateBuilder {
                                     composite:
                                         AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
                                             prospective,
-                                            actual:
-                                                AggregateFixedAbsoluteDomainResidualBuildActual::default(),
+                                            actual: guard_failure_actual,
                                         },
                                 }
                             },
                         ));
                     }
                 };
+                let guard_build = guard.build_accounting();
+                construction.pending_terminal_effect = fixed_absolute_construction_effect(
+                    work,
+                    guard_build.actual,
+                    None,
+                    false,
+                )
+                .ok_or(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "fixed guard construction effect overflow",
+                })?;
                 let kernel = match operation {
                     AggregateOperation::Count => guard.count_identity(),
                     AggregateOperation::SpanSum => guard.span_sum_identity(),
@@ -7388,7 +10330,6 @@ impl AggregateBuilder {
                 };
                 let scalar = guard.descriptor_identity().kind()
                     == FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope;
-                let guard_build = guard.build_accounting();
                 let guard_with_owner = FixedAbsoluteDomainBuildAccounting {
                     prospective: guard_with_owner_prospective,
                     actual: include_fixed_absolute_owner_guard_actual(guard_build.actual).map_err(
@@ -7430,7 +10371,7 @@ impl AggregateBuilder {
                         selection,
                         detail: "fixed guard allocations exceed admitted composite cap",
                     })?;
-                let (residual, residual_actual_allocations) = if scalar {
+                let (residual, residual_construction_actual) = if scalar {
                     let prospective_allocations = residual_prospective_allocations.ok_or(
                         AggregateBuildError::InternalInvariant {
                             operation,
@@ -7438,31 +10379,55 @@ impl AggregateBuilder {
                             detail: "scalar fixed-domain route lacks residual allocation census",
                         },
                     )?;
-                    let (residual, actual_allocations) =
-                        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_allocation_receipt(
+                    let residual_attempt =
+                        CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_and_allocation_receipt(
                             &rust.hir,
                             continuation_profile,
                             limits.continuation,
                             residual_allocation_limit,
                             prospective_allocations,
-                        )
-                        .map_err(|source| {
+                        );
+                    let attempt = match residual_attempt {
+                        Ok(attempt) => attempt,
+                        Err(error) => {
+                            if !error.closes() {
+                                return Err(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail:
+                                        "fixed residual compiler terminal failed closure",
+                                });
+                            }
+                            let residual_actual = error.receipt().actual;
+                            construction.pending_terminal_effect =
+                                fixed_absolute_construction_effect(
+                                    work,
+                                    guard_build.actual,
+                                    Some(residual_actual),
+                                    false,
+                                )
+                                .ok_or(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "scalar compile failure construction effect overflow",
+                                })?;
+                            let source = error.into_legacy_attempt_error();
                             let Some(prospective) = scalar_build_prospective else {
-                                return AggregateBuildError::InternalInvariant {
+                                return Err(AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "scalar compile failure lacks composite P",
-                                };
+                                });
                             };
                             let Some(actual) = compose_fixed_residual_build_failure_actual(
                                 guard_build,
                                 &source.receipt,
                             ) else {
-                                return AggregateBuildError::InternalInvariant {
+                                return Err(AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "scalar compile failure composite A overflowed",
-                                };
+                                });
                             };
                             let composite =
                                 AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt {
@@ -7470,13 +10435,13 @@ impl AggregateBuilder {
                                     actual,
                                 };
                             if !composite.contains_actual() {
-                                return AggregateBuildError::InternalInvariant {
+                                return Err(AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "scalar compile failure A exceeds composite P",
-                                };
+                                });
                             }
-                            AggregateBuildError::FixedAbsoluteDomainResidualCompile {
+                            return Err(AggregateBuildError::FixedAbsoluteDomainResidualCompile {
                                 operation,
                                 selection,
                                 planner_work: work,
@@ -7484,12 +10449,25 @@ impl AggregateBuilder {
                                 guard: guard_build,
                                 composite,
                                 source,
-                            }
-                        })?;
-                    (Some(residual), Some(actual_allocations))
+                            });
+                        }
+                    };
+                    let (residual, actual) = attempt.into_parts();
+                    (Some(residual), Some(actual))
                 } else {
                     (None, None)
                 };
+                construction.pending_terminal_effect = fixed_absolute_construction_effect(
+                    work,
+                    guard_build.actual,
+                    residual_construction_actual,
+                    false,
+                )
+                .ok_or(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "fixed residual construction effect overflow",
+                })?;
                 let residual_compile = residual.as_ref().map(CompiledRegex::compile_accounting);
                 if let Some(compile) = residual_compile
                     && (compile.hir_nodes != expected_nodes
@@ -7586,7 +10564,9 @@ impl AggregateBuilder {
                 let actual_allocations = guard_build
                     .actual
                     .allocations
-                    .checked_add(residual_actual_allocations.unwrap_or(0))
+                    .checked_add(
+                        residual_construction_actual.map_or(0, |actual| actual.allocations),
+                    )
                     .and_then(|allocations| allocations.checked_add(1))
                     .ok_or(AggregateBuildError::InternalInvariant {
                         operation,
@@ -7649,12 +10629,15 @@ impl AggregateBuilder {
                     residual_strategy: scalar.then_some(strategy),
                 };
                 let seal = AggregateFixedAbsoluteDomainSeal {
+                    construction_attempt: None,
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
                     syntax_key: Arc::clone(&syntax_key),
                     admission,
                     syntax: syntax.clone(),
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::FixedAbsoluteDomain,
                     continuation_strategy: scalar.then_some(strategy),
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -7670,6 +10653,8 @@ impl AggregateBuilder {
                     bounded_class_sequence_planner_work,
                     bounded_separated_fields_planner_work,
                     prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work,
+                    bounded_literal_pair_planner_work,
                     bounded_context_planner_work,
                     fixed_absolute_planner_work: work,
                     max_fixed_absolute_planner_work: limits.max_fixed_absolute_planner_work,
@@ -7721,13 +10706,40 @@ impl AggregateBuilder {
                 };
                 let owner =
                     AggregateExecutionIdentity::fixed_absolute_domain(seal, error_identity);
+                let terminal_effect = fixed_absolute_construction_effect(
+                    work,
+                    guard_build.actual,
+                    residual_construction_actual,
+                    true,
+                )
+                .ok_or(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "fixed-domain construction effect overflow",
+                })?;
+                construction.pending_terminal_effect = terminal_effect;
+                let publication_effect = include_selected_plan_owner_effect(terminal_effect)
+                    .and_then(include_fixed_construction_receipt_copy_effect)
+                    .ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed-domain publication effect overflow",
+                        },
+                    )?;
+                construction.selected_success_effect = Some(publication_effect);
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::FixedAbsoluteDomain,
                     continuation_strategy: scalar.then_some(strategy),
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -7772,8 +10784,23 @@ impl AggregateBuilder {
                     report,
                 });
             }
-            Some(fixed_absolute::Inspection::Ineligible { work }) => work,
-            None => 0,
+            Some(fixed_absolute::Inspection::Ineligible { work })
+                if fixed_absolute_optional_inspection_refusal => work,
+            Some(fixed_absolute::Inspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::FixedAbsolute,
+                    work,
+                );
+                work
+            }
+            None => {
+                record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::FixedAbsolute,
+                );
+                0
+            }
             }
         })
         .map_err(|_| AggregateBuildError::InternalInvariant {
@@ -7784,9 +10811,18 @@ impl AggregateBuilder {
         let inspect_finite =
             selection == AggregatePlanSelection::Auto && operation != AggregateOperation::Spans;
         let root_finite = if inspect_finite {
-            Some(
-                finite_root::inspect(&rust.hir, unicode, limits.max_finite_planner_work).map_err(
-                    |error| match error {
+            match finite_root::inspect_attempt(&rust.hir, unicode, limits.max_finite_planner_work) {
+                Ok(attempt) => {
+                    debug_assert!(attempt.receipt.is_closed());
+                    Some(attempt.outcome)
+                }
+                Err(error) => {
+                    let actual = error.receipt().actual();
+                    construction.pending_terminal_effect = AggregateConstructionEffect {
+                        work: actual.work,
+                        ..AggregateConstructionEffect::default()
+                    };
+                    return Err(match error.source() {
                         finite_root::InspectionError::WorkLimit { needed, limit } => {
                             AggregateBuildError::FinitePlannerWorkLimit {
                                 operation,
@@ -7802,9 +10838,9 @@ impl AggregateBuilder {
                                 detail: "root finite-language inspection accounting overflow",
                             }
                         }
-                    },
-                )?,
-            )
+                    });
+                }
+            }
         } else {
             None
         };
@@ -7817,6 +10853,14 @@ impl AggregateBuilder {
         if let Some(finite_root::Inspection::Eligible(proof)) = &root_finite
             && proof.should_use_sparse(limits.finite_literal)
         {
+            select_construction_stage(
+                construction,
+                AggregateConstructionStage::SparseFiniteRoot,
+                AggregateConstructionEffect {
+                    work: proof.work,
+                    ..AggregateConstructionEffect::default()
+                },
+            );
             if proof.hir_nodes != expected_nodes || expected_captures != 0 {
                 return Err(AggregateBuildError::InternalInvariant {
                     operation,
@@ -7825,72 +10869,106 @@ impl AggregateBuilder {
                 });
             }
             let sparse_limits = sparse_finite_build_limits(limits.finite_literal);
-            let materialized = match proof.materialize_patterns(
+            let materialized = match proof.materialize_patterns_attempt(
                 limits.max_finite_planner_work,
                 sparse_limits.max_scratch_bytes,
                 sparse_limits.max_peak_bytes,
             ) {
                 Ok(materialized) => {
+                    debug_assert!(materialized.receipt.is_closed());
+                    debug_assert!(materialized.receipt.prospective().is_some());
                     finite_planner_work = materialized.work;
-                    Ok(materialized.patterns)
+                    Some(materialized)
                 }
-                Err(finite_root::MaterializationError::WorkLimit { needed, limit }) => {
-                    return Err(AggregateBuildError::FinitePlannerWorkLimit {
-                        operation,
-                        selection,
-                        needed,
-                        limit,
-                    });
-                }
-                Err(finite_root::MaterializationError::AllocationFailed { additional }) => {
-                    return Err(AggregateBuildError::FinitePlannerAllocationFailed {
-                        operation,
-                        selection,
-                        structure: "root literal pointer source",
-                        additional,
-                    });
-                }
-                Err(finite_root::MaterializationError::ScratchLimit { needed, limit }) => {
-                    Err(SparseOrderedLiteralAggregateBuildError::ScratchLimit { needed, limit })
-                }
-                Err(finite_root::MaterializationError::PeakLimit { needed, limit }) => {
-                    Err(SparseOrderedLiteralAggregateBuildError::PeakLimit { needed, limit })
-                }
-                Err(finite_root::MaterializationError::Overflow) => {
-                    return Err(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "root literal source materialization accounting overflow",
-                    });
+                Err(error) => {
+                    debug_assert!(error.receipt().is_closed());
+                    let actual = error.receipt().actual();
+                    let effect = root_materialization_effect(actual);
+                    construction.pending_terminal_effect = effect;
+                    match error.source() {
+                        finite_root::MaterializationError::ScratchLimit { needed, limit } => {
+                            let _ = (needed, limit);
+                            resolve_construction_soft_refusal_with_abandonment(
+                                construction,
+                                effect,
+                                root_materialization_abandonment(actual, effect),
+                                AggregateConstructionPrepublicationFallback::SparseFiniteMaterializationScratch,
+                            );
+                            sparse_refused = true;
+                            None
+                        }
+                        finite_root::MaterializationError::PeakLimit { needed, limit } => {
+                            let _ = (needed, limit);
+                            resolve_construction_soft_refusal_with_abandonment(
+                                construction,
+                                effect,
+                                root_materialization_abandonment(actual, effect),
+                                AggregateConstructionPrepublicationFallback::SparseFiniteMaterializationPeak,
+                            );
+                            sparse_refused = true;
+                            None
+                        }
+                        finite_root::MaterializationError::WorkLimit { needed, limit } => {
+                            return Err(AggregateBuildError::FinitePlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed: *needed,
+                                limit: *limit,
+                            });
+                        }
+                        finite_root::MaterializationError::AllocationFailed { additional } => {
+                            return Err(AggregateBuildError::FinitePlannerAllocationFailed {
+                                operation,
+                                selection,
+                                structure: "root literal pointer source",
+                                additional: *additional,
+                            });
+                        }
+                        finite_root::MaterializationError::Overflow => {
+                            return Err(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "root literal source materialization accounting overflow",
+                            });
+                        }
+                    }
                 }
             };
-            let sparse_build = match materialized {
-                Err(source) => Err(source),
-                Ok(patterns) => match operation {
+            if let Some(materialized) = materialized {
+                let materialization_actual = materialized.receipt.actual();
+                let sparse_build = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
-                        SparseOrderedLiteralCountPlan::build(patterns, sparse_limits).map(
-                            |engine| {
-                                let build = engine.build_accounting();
-                                (
-                                    AggregateEngine::SparseFiniteCount(engine),
-                                    build,
-                                    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-                                )
-                            },
+                        SparseOrderedLiteralCountPlan::build_attempt(
+                            materialized.patterns,
+                            sparse_limits,
                         )
+                        .map(|attempt| {
+                            debug_assert!(attempt.closes());
+                            let (engine, receipt) = attempt.into_parts();
+                            let build = engine.build_accounting();
+                            (
+                                AggregateEngine::SparseFiniteCount(engine),
+                                build,
+                                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                                receipt.actual(),
+                            )
+                        })
                     }
-                    AggregateOperation::SpanSum => {
-                        SparseOrderedLiteralSpanSumPlan::build(patterns, sparse_limits).map(
-                            |engine| {
-                                let build = engine.build_accounting();
-                                (
-                                    AggregateEngine::SparseFiniteSpanSum(engine),
-                                    build,
-                                    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-                                )
-                            },
+                    AggregateOperation::SpanSum => SparseOrderedLiteralSpanSumPlan::build_attempt(
+                        materialized.patterns,
+                        sparse_limits,
+                    )
+                    .map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        (
+                            AggregateEngine::SparseFiniteSpanSum(engine),
+                            build,
+                            SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                            receipt.actual(),
                         )
-                    }
+                    }),
                     AggregateOperation::Spans => {
                         return Err(AggregateBuildError::InternalInvariant {
                             operation,
@@ -7898,73 +10976,144 @@ impl AggregateBuilder {
                             detail: "span materialization selected sparse finite reducer",
                         });
                     }
-                },
-            };
-            match sparse_build {
-                Ok((engine, build, operation_id)) => {
-                    let report = AggregateBuildReport {
-                        schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
-                        syntax_key,
-                        admission,
-                        syntax,
-                        operation,
-                        selection,
-                        plan: AggregatePlanKind::FiniteLiteralDfa,
-                        continuation_strategy: None,
-                        capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
-                        planner_work,
-                        unicode_scalar_planner_work,
-                        word_run_planner_work,
-                        literal_assertions_planner_work,
-                        blocking_delimiter_planner_work,
-                        token_phrase_planner_work,
-                        fixed_class_sandwich_planner_work,
-                        bounded_affix_planner_work,
-                        grapheme_scalar_dfa_planner_work,
-                        bounded_class_sequence_planner_work,
-                        bounded_separated_fields_planner_work,
-                        prefix_class_alternation_planner_work,
-                        literal_class_run_literal_planner_work,
-                        bounded_literal_pair_planner_work,
-                        bounded_context_planner_work,
-                        fixed_absolute_planner_work,
-                        finite_planner_work,
-                        capture_erasure_work: 0,
-                        captures_erased: 0,
-                        build: AggregateBuildAccounting::SparseFiniteLiteral(build),
-                        plan_identity: AggregatePlanIdentity::FiniteLiteral(
-                            AggregateFiniteLiteralIdentity {
-                                semantics: if unicode {
-                                    AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
-                                } else {
-                                    AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+                };
+                match sparse_build {
+                    Ok((engine, build, operation_id, build_actual)) => {
+                        let terminal_effect =
+                            sparse_finite_construction_effect(materialization_actual, build_actual)
+                                .ok_or(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "sparse finite construction effect overflow",
+                                })?;
+                        construction.pending_terminal_effect = terminal_effect;
+                        let publication_effect = include_selected_plan_owner_effect(
+                            terminal_effect,
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "sparse finite publication effect overflow",
+                        })?;
+                        construction.selected_success_effect = Some(publication_effect);
+                        let report = AggregateBuildReport {
+                            schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                            construction_attempt: AggregateClosureEvidence::empty(),
+                            published_artifact_owner: AggregateClosureEvidence::empty(),
+                            syntax_attempt: AggregateClosureEvidence::empty(),
+                            syntax_key,
+                            admission,
+                            syntax,
+                            operation,
+                            selection,
+                            requested_strategy: strategy,
+                            build_limits: limits,
+                            plan: AggregatePlanKind::FiniteLiteralDfa,
+                            continuation_strategy: None,
+                            capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                            planner_work,
+                            unicode_scalar_planner_work,
+                            word_run_planner_work,
+                            literal_assertions_planner_work,
+                            blocking_delimiter_planner_work,
+                            token_phrase_planner_work,
+                            fixed_class_sandwich_planner_work,
+                            bounded_affix_planner_work,
+                            grapheme_scalar_dfa_planner_work,
+                            bounded_class_sequence_planner_work,
+                            bounded_separated_fields_planner_work,
+                            prefix_class_alternation_planner_work,
+                            literal_class_run_literal_planner_work,
+                            bounded_literal_pair_planner_work,
+                            bounded_context_planner_work,
+                            fixed_absolute_planner_work,
+                            finite_planner_work,
+                            capture_erasure_work: 0,
+                            captures_erased: 0,
+                            build: AggregateBuildAccounting::SparseFiniteLiteral(build),
+                            plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                                AggregateFiniteLiteralIdentity {
+                                    semantics: if unicode {
+                                        AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+                                    } else {
+                                        AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+                                    },
+                                    algorithm: SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                                    operation: operation_id,
                                 },
-                                algorithm: SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-                                operation: operation_id,
-                            },
-                        ),
-                        sealed_bounded_separated_fields_identity: None,
-                        sealed_required_internal_anchor_identity: None,
-                        sealed_url_aggregate_identity: None,
-                        retained_capacity_bytes: build.persistent_bytes,
-                    };
-                    return Ok(AggregatePlan {
-                        engine,
-                        minimum_match_bytes,
-                        limits,
-                        report,
-                    });
+                            ),
+                            sealed_bounded_separated_fields_identity: None,
+                            sealed_required_internal_anchor_identity: None,
+                            sealed_url_aggregate_identity: None,
+                            retained_capacity_bytes: build.persistent_bytes,
+                        };
+                        return Ok(AggregatePlan {
+                            engine,
+                            minimum_match_bytes,
+                            limits,
+                            report,
+                        });
+                    }
+                    Err(error) if sparse_finite_build_limit_allows_continuation(error.source()) => {
+                        let build_actual = error.receipt().actual();
+                        let effect =
+                            sparse_finite_construction_effect(materialization_actual, build_actual)
+                                .ok_or(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "sparse finite refusal effect overflow",
+                                })?;
+                        let abandonment = sparse_finite_abandonment(effect);
+                        resolve_construction_soft_refusal_with_abandonment(
+                            construction,
+                            effect,
+                            abandonment,
+                            AggregateConstructionPrepublicationFallback::SparseFiniteBuildResource,
+                        );
+                        sparse_refused = true;
+                    }
+                    Err(error) => {
+                        construction.pending_terminal_effect = sparse_finite_construction_effect(
+                            materialization_actual,
+                            error.receipt().actual(),
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "sparse finite terminal effect overflow",
+                        })?;
+                        return Err(AggregateBuildError::SparseFiniteLiteralBuild {
+                            operation,
+                            selection,
+                            source: error.into_source(),
+                        });
+                    }
                 }
-                Err(source) if sparse_finite_build_limit_allows_continuation(&source) => {
-                    sparse_refused = true;
+            }
+        }
+        if !sparse_refused
+            && construction.transaction.expected_stage()
+                == Some(AggregateConstructionStage::SparseFiniteRoot)
+        {
+            match &root_finite {
+                Some(finite_root::Inspection::Eligible(proof)) => {
+                    record_construction_ineligible(
+                        construction,
+                        AggregateConstructionStage::SparseFiniteRoot,
+                        usize::try_from(proof.work).unwrap_or(usize::MAX),
+                    );
                 }
-                Err(source) => {
-                    return Err(AggregateBuildError::SparseFiniteLiteralBuild {
-                        operation,
-                        selection,
-                        source,
-                    });
+                Some(finite_root::Inspection::Ineligible { work }) => {
+                    record_construction_ineligible(
+                        construction,
+                        AggregateConstructionStage::SparseFiniteRoot,
+                        usize::try_from(*work).unwrap_or(usize::MAX),
+                    );
                 }
+                None => record_construction_policy_skip(
+                    construction,
+                    AggregateConstructionStage::SparseFiniteRoot,
+                ),
             }
         }
         let finite = if inspect_finite && !sparse_refused {
@@ -7987,17 +11136,49 @@ impl AggregateBuilder {
             None
         };
         if let Some(outcome) = &finite {
+            debug_assert!(outcome.has_closed_receipt());
             finite_planner_work = outcome.work();
         }
         let mut fixed_predicate_refused = false;
         let mut dense_finite_refused = false;
-        let finite_words = match finite {
-            Some(finite::FiniteOutcome::Fits { words, .. }) => Some(words),
+        let mut fixed_predicate_prior_effect = None;
+        let mut general_finite_completed_effect = None;
+        let finite_words_candidate = match finite {
+            Some(finite::FiniteOutcome::Fits { words, receipt }) => {
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "general finite extraction effect overflow",
+                    },
+                )?;
+                if construction
+                    .transaction
+                    .record_completed(AggregateConstructionStage::GeneralFiniteExtraction, effect)
+                    .is_err()
+                {
+                    unreachable!("general finite completion violated construction order");
+                }
+                general_finite_completed_effect = Some(effect);
+                Some(words)
+            }
             Some(finite::FiniteOutcome::GuardedFiniteBody {
                 dictionary,
                 accounting,
-                ..
+                receipt,
             }) => {
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite extraction effect overflow",
+                    },
+                )?;
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                    effect,
+                );
                 let summary = accounting.summary(&dictionary).ok_or(
                     AggregateBuildError::InternalInvariant {
                         operation,
@@ -8006,21 +11187,21 @@ impl AggregateBuilder {
                     },
                 )?;
                 let dictionary_build = dictionary.build_accounting();
-                let dictionary_published = dictionary_build.published().ok_or(
-                    AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "guarded dictionary lost its exact publication receipt",
-                    },
-                )?;
-                let capture_erasure_work =
-                    expected_captures
-                        .checked_mul(2)
+                let dictionary_published =
+                    dictionary_build
+                        .published()
                         .ok_or(AggregateBuildError::InternalInvariant {
                             operation,
                             selection,
-                            detail: "guarded finite capture-erasure accounting overflow",
+                            detail: "guarded dictionary lost its exact publication receipt",
                         })?;
+                let capture_erasure_work = expected_captures.checked_mul(2).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite capture-erasure accounting overflow",
+                    },
+                )?;
                 let build = AggregateGuardedAsciiWordBuildAccounting {
                     dictionary: dictionary_published,
                     allocations_upper_bound: summary.allocations_upper_bound,
@@ -8030,13 +11211,27 @@ impl AggregateBuilder {
                     peak_bytes_upper_bound: summary.peak_bytes_upper_bound,
                     peak_bytes_actual_upper_bound: summary.peak_bytes_actual_upper_bound,
                 };
+                let publication_effect = include_selected_plan_owner_effect(effect).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite publication effect overflow",
+                    },
+                )?;
+                construction.pending_terminal_effect = effect;
+                construction.selected_success_effect = Some(publication_effect);
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
                     syntax_key,
                     admission,
                     syntax,
                     operation,
                     selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
                     plan: AggregatePlanKind::GuardedAsciiWordDictionary,
                     continuation_strategy: None,
                     capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -8079,8 +11274,7 @@ impl AggregateBuilder {
                                     return Err(AggregateBuildError::InternalInvariant {
                                         operation,
                                         selection,
-                                        detail:
-                                            "guarded finite span plan escaped operation eligibility",
+                                        detail: "guarded finite span plan escaped operation eligibility",
                                     });
                                 }
                             },
@@ -8099,10 +11293,36 @@ impl AggregateBuilder {
                 });
             }
             Some(finite::FiniteOutcome::GuardedResourceFailure {
-                error:
-                    finite::GuardedFiniteBuildError::Dictionary(source),
-                ..
-            }) if guarded_finite_build_limit_allows_continuation(&source) => None,
+                error: finite::GuardedFiniteBuildError::Dictionary(source),
+                receipt,
+            }) if guarded_finite_build_limit_allows_continuation(&source) => {
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite dictionary refusal effect overflow",
+                    },
+                )?;
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                    effect,
+                );
+                let abandonment = finite_extraction_abandonment(&receipt, effect).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite dictionary abandonment overflow",
+                    },
+                )?;
+                resolve_construction_soft_refusal_with_abandonment(
+                    construction,
+                    effect,
+                    abandonment,
+                    AggregateConstructionPrepublicationFallback::GuardedFiniteDictionaryResource,
+                );
+                None
+            }
             Some(finite::FiniteOutcome::GuardedResourceFailure {
                 error:
                     finite::GuardedFiniteBuildError::ConstructionLimit {
@@ -8110,22 +11330,66 @@ impl AggregateBuilder {
                         needed,
                         limit,
                     },
-                ..
+                receipt,
             }) => {
                 let _ = (resource, needed, limit);
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite construction refusal effect overflow",
+                    },
+                )?;
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                    effect,
+                );
+                let abandonment = finite_extraction_abandonment(&receipt, effect).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite construction abandonment overflow",
+                    },
+                )?;
+                resolve_construction_soft_refusal_with_abandonment(
+                    construction,
+                    effect,
+                    abandonment,
+                    AggregateConstructionPrepublicationFallback::GuardedFiniteConstructionResource,
+                );
                 None
             }
             Some(finite::FiniteOutcome::GuardedResourceFailure {
                 error: finite::GuardedFiniteBuildError::Dictionary(source),
-                ..
+                receipt,
             }) => {
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "guarded finite terminal effect overflow",
+                    },
+                )?;
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::GeneralFiniteExtraction,
+                    effect,
+                );
                 return Err(AggregateBuildError::GuardedAsciiWordBuild {
                     operation,
                     selection,
                     source,
                 });
             }
-            Some(finite::FiniteOutcome::ResourceFailure { error, .. }) => {
+            Some(finite::FiniteOutcome::ResourceFailure { error, receipt }) => {
+                construction.pending_terminal_effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "general finite terminal effect overflow",
+                    },
+                )?;
                 return Err(match error {
                     BuildError::PlannerWorkLimit { needed, limit } => {
                         AggregateBuildError::FinitePlannerWorkLimit {
@@ -8151,14 +11415,140 @@ impl AggregateBuilder {
                     },
                 });
             }
-            Some(finite::FiniteOutcome::TooLargeFixedSequence { .. }) => {
+            Some(finite::FiniteOutcome::TooLargeFixedSequence { receipt }) => {
+                let boundary =
+                    receipt
+                        .boundary_actual()
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "too-large fixed sequence boundary did not close",
+                        })?;
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "too-large fixed sequence effect overflow",
+                    },
+                )?;
                 fixed_predicate_refused = !unicode;
+                fixed_predicate_prior_effect =
+                    fixed_predicate_refused.then_some((effect, boundary.abandonable_bytes));
+                if fixed_predicate_refused {
+                    if construction
+                        .transaction
+                        .record_too_large_fixed_sequence(effect)
+                        .is_err()
+                    {
+                        unreachable!("too-large fixed sequence violated its typed edge");
+                    }
+                } else if construction
+                    .transaction
+                    .record_semantic_ineligible(
+                        AggregateConstructionStage::GeneralFiniteExtraction,
+                        effect,
+                    )
+                    .is_err()
+                {
+                    unreachable!("general finite semantic refusal violated construction order");
+                }
                 None
             }
-            Some(finite::FiniteOutcome::Unsupported { .. }) | None => None,
-        }
-            .filter(|words| !unicode || unicode_finite_words_preserve_scalar_boundaries(words));
+            Some(finite::FiniteOutcome::Unsupported { receipt }) => {
+                let effect = finite_extraction_effect(&receipt).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "unsupported finite extraction effect overflow",
+                    },
+                )?;
+                if construction
+                    .transaction
+                    .record_semantic_ineligible(
+                        AggregateConstructionStage::GeneralFiniteExtraction,
+                        effect,
+                    )
+                    .is_err()
+                {
+                    unreachable!("unsupported finite extraction violated construction order");
+                }
+                None
+            }
+            None => {
+                if construction.transaction.expected_stage()
+                    == Some(AggregateConstructionStage::GeneralFiniteExtraction)
+                {
+                    record_construction_policy_skip(
+                        construction,
+                        AggregateConstructionStage::GeneralFiniteExtraction,
+                    );
+                }
+                None
+            }
+        };
+        let finite_words = match finite_words_candidate {
+            Some(words) if unicode => {
+                let boundary_work = unicode_finite_boundary_prospective(&words).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "Unicode finite boundary work overflow",
+                    },
+                )?;
+                let boundary_work_u64 = u64::try_from(boundary_work).map_err(|_| {
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "Unicode finite boundary work does not fit u64",
+                    }
+                })?;
+                let needed = finite_planner_work.checked_add(boundary_work_u64).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "Unicode finite planner work overflow",
+                    },
+                )?;
+                if needed > limits.max_finite_planner_work {
+                    construction.pending_terminal_effect = construction_work_effect(boundary_work);
+                    return Err(AggregateBuildError::FinitePlannerWorkLimit {
+                        operation,
+                        selection,
+                        needed,
+                        limit: limits.max_finite_planner_work,
+                    });
+                }
+                finite_planner_work = needed;
+                if unicode_finite_words_preserve_scalar_boundaries(&words) {
+                    Some(words)
+                } else {
+                    record_construction_ineligible(
+                        construction,
+                        AggregateConstructionStage::DenseFinite,
+                        boundary_work,
+                    );
+                    None
+                }
+            }
+            words => words,
+        };
         if let Some(words) = finite_words {
+            let boundary_work = if unicode {
+                unicode_finite_boundary_prospective(&words).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "Unicode finite boundary work overflow",
+                    },
+                )?
+            } else {
+                0
+            };
+            select_construction_stage(
+                construction,
+                AggregateConstructionStage::DenseFinite,
+                construction_work_effect(boundary_work),
+            );
             let capture_erasure_work =
                 expected_captures
                     .checked_mul(2)
@@ -8169,24 +11559,34 @@ impl AggregateBuilder {
                     })?;
             let finite_build = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
-                    OrderedLiteralCountPlan::build(&words, limits.finite_literal).map(|engine| {
-                        let build = engine.build_accounting();
-                        (
-                            AggregateEngine::FiniteCount(engine),
-                            build,
-                            ORDERED_LITERAL_COUNT_PLAN_ID,
-                        )
-                    })
+                    OrderedLiteralCountPlan::build_attempt(&words, limits.finite_literal).map(
+                        |attempt| {
+                            debug_assert!(attempt.closes());
+                            let (engine, receipt) = attempt.into_parts();
+                            let build = engine.build_accounting();
+                            (
+                                AggregateEngine::FiniteCount(engine),
+                                build,
+                                ORDERED_LITERAL_COUNT_PLAN_ID,
+                                receipt.actual(),
+                            )
+                        },
+                    )
                 }
                 AggregateOperation::SpanSum => {
-                    OrderedLiteralSpanSumPlan::build(&words, limits.finite_literal).map(|engine| {
-                        let build = engine.build_accounting();
-                        (
-                            AggregateEngine::FiniteSpanSum(engine),
-                            build,
-                            ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-                        )
-                    })
+                    OrderedLiteralSpanSumPlan::build_attempt(&words, limits.finite_literal).map(
+                        |attempt| {
+                            debug_assert!(attempt.closes());
+                            let (engine, receipt) = attempt.into_parts();
+                            let build = engine.build_accounting();
+                            (
+                                AggregateEngine::FiniteSpanSum(engine),
+                                build,
+                                ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                                receipt.actual(),
+                            )
+                        },
+                    )
                 }
                 AggregateOperation::Spans => {
                     return Err(AggregateBuildError::InternalInvariant {
@@ -8197,14 +11597,40 @@ impl AggregateBuilder {
                 }
             };
             match finite_build {
-                Ok((engine, build, operation_id)) => {
+                Ok((engine, build, operation_id, build_actual)) => {
+                    let mut build_effect = include_construction_work(
+                        ordered_finite_build_effect(build_actual),
+                        boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "dense finite boundary/build effect overflow",
+                    })?;
+                    build_effect.released_persistent_bytes = general_finite_completed_effect
+                        .unwrap_or_default()
+                        .retained_persistent_bytes;
+                    construction.pending_terminal_effect = build_effect;
+                    let effect = include_selected_plan_owner_effect(build_effect).ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "dense finite publication effect overflow",
+                        },
+                    )?;
+                    construction.selected_success_effect = Some(effect);
                     let report = AggregateBuildReport {
                         schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        construction_attempt: AggregateClosureEvidence::empty(),
+                        published_artifact_owner: AggregateClosureEvidence::empty(),
+                        syntax_attempt: AggregateClosureEvidence::empty(),
                         syntax_key,
                         admission,
                         syntax,
                         operation,
                         selection,
+                        requested_strategy: strategy,
+                        build_limits: limits,
                         plan: AggregatePlanKind::FiniteLiteralDfa,
                         continuation_strategy: None,
                         capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -8251,51 +11677,133 @@ impl AggregateBuilder {
                         report,
                     });
                 }
-                Err(source) if finite_build_limit_allows_continuation(&source) => {
+                Err(error) if finite_build_limit_allows_continuation(error.source()) => {
+                    let prior = general_finite_completed_effect.unwrap_or_default();
+                    let build_actual = error.receipt().actual();
+                    let mut effect = include_construction_work(
+                        ordered_finite_build_effect(build_actual),
+                        boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "dense finite refusal boundary/build effect overflow",
+                    })?;
+                    effect.released_persistent_bytes = prior.retained_persistent_bytes;
+                    let abandonment = dense_finite_abandonment(prior, effect).ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "dense finite abandonment overflow",
+                        },
+                    )?;
+                    resolve_construction_soft_refusal_with_abandonment(
+                        construction,
+                        effect,
+                        abandonment,
+                        if unicode {
+                            AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToContinuation
+                        } else {
+                            AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToFixedPredicateWord64
+                        },
+                    );
                     fixed_predicate_refused = !unicode;
                     dense_finite_refused = !unicode;
                 }
-                Err(source) => {
+                Err(error) => {
+                    let mut effect = include_construction_work(
+                        ordered_finite_build_effect(error.receipt().actual()),
+                        boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "dense finite terminal boundary/build effect overflow",
+                    })?;
+                    effect.released_persistent_bytes = general_finite_completed_effect
+                        .unwrap_or_default()
+                        .retained_persistent_bytes;
+                    construction.pending_terminal_effect = effect;
                     return Err(AggregateBuildError::FiniteLiteralBuild {
                         operation,
                         selection,
-                        source,
+                        source: error.into_source(),
                     });
                 }
             }
         }
+        if construction.transaction.expected_stage()
+            == Some(AggregateConstructionStage::DenseFinite)
+        {
+            record_construction_policy_skip(construction, AggregateConstructionStage::DenseFinite);
+        }
         if fixed_predicate_refused {
-            let inspected = finite::inspect_fixed_predicate_word64_after_finite_refusal(
+            let inspected = finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
                 &rust.hir,
                 finite_planner_work,
                 limits.max_finite_planner_work,
-            )
-            .map_err(|error| match error {
-                BuildError::PlannerWorkLimit { needed, limit } => {
-                    AggregateBuildError::FinitePlannerWorkLimit {
+            );
+            debug_assert!(inspected.has_closed_receipt());
+            let inspection_receipt = inspected.receipt();
+            let inspection_effect = fixed_predicate_inspection_effect(inspection_receipt).ok_or(
+                AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "fixed-predicate inspection effect overflow",
+                },
+            )?;
+            finite_planner_work = inspection_receipt.actual().work;
+            let source = match inspected {
+                finite::FixedPredicateInspectionAttempt::Succeeded { source, .. } => Some(source),
+                finite::FixedPredicateInspectionAttempt::Refused { .. } => None,
+                finite::FixedPredicateInspectionAttempt::ResourceFailure { error, .. } => {
+                    construction.pending_terminal_effect = inspection_effect;
+                    return Err(match error {
+                        BuildError::PlannerWorkLimit { needed, limit } => {
+                            AggregateBuildError::FinitePlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        BuildError::AllocationFailed {
+                            structure,
+                            additional,
+                        } => AggregateBuildError::FinitePlannerAllocationFailed {
+                            operation,
+                            selection,
+                            structure,
+                            additional,
+                        },
+                        _ => AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "post-refusal fixed-predicate planner returned an unrelated facade error",
+                        },
+                    });
+                }
+            };
+            if let Some(source) = source {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::FixedPredicateWord64,
+                    inspection_effect,
+                );
+                if inspection_receipt.work_limit() != limits.max_finite_planner_work {
+                    return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        needed,
-                        limit,
-                    }
+                        detail: "fixed-predicate receipt lost its caller work limit",
+                    });
                 }
-                BuildError::AllocationFailed {
-                    structure,
-                    additional,
-                } => AggregateBuildError::FinitePlannerAllocationFailed {
-                    operation,
-                    selection,
-                    structure,
-                    additional,
-                },
-                _ => AggregateBuildError::InternalInvariant {
-                    operation,
-                    selection,
-                    detail: "post-refusal fixed-predicate planner returned an unrelated facade error",
-                },
-            })?;
-            finite_planner_work = inspected.work;
-            if let Some(source) = inspected.source {
+                if inspection_receipt.initial_work() > finite_planner_work {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "fixed-predicate inspection work moved backwards",
+                    });
+                }
                 if unicode || source.case_pairs() == 0 {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
@@ -8332,12 +11840,31 @@ impl AggregateBuilder {
                 for (slot, predicate) in positions.iter_mut().zip(normalized) {
                     *slot = predicate.ranges();
                 }
-                let fixed_build = FixedPredicateWord64Plan::build(
+                let fixed_build = FixedPredicateWord64Plan::build_attempt(
                     &positions[..normalized.len()],
                     fixed_predicate_word64_build_limits(limits.finite_literal),
                 );
                 match fixed_build {
-                    Ok(engine) => {
+                    Ok(attempt) => {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let terminal_effect =
+                            fixed_predicate_build_effect(receipt.actual(), inspection_effect)
+                                .ok_or(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "fixed-predicate construction effect overflow",
+                                })?;
+                        construction.pending_terminal_effect = terminal_effect;
+                        let publication_effect = include_selected_plan_owner_effect(
+                            terminal_effect,
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed-predicate publication effect overflow",
+                        })?;
+                        construction.selected_success_effect = Some(publication_effect);
                         let build = engine.build_accounting();
                         let kernel_operation = match operation {
                             AggregateOperation::Compile | AggregateOperation::Count => {
@@ -8362,11 +11889,16 @@ impl AggregateBuilder {
                             })?;
                         let report = AggregateBuildReport {
                             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                            construction_attempt: AggregateClosureEvidence::empty(),
+                            published_artifact_owner: AggregateClosureEvidence::empty(),
+                            syntax_attempt: AggregateClosureEvidence::empty(),
                             syntax_key,
                             admission,
                             syntax,
                             operation,
                             selection,
+                            requested_strategy: strategy,
+                            build_limits: limits,
                             plan: AggregatePlanKind::FixedPredicateWord64,
                             continuation_strategy: None,
                             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -8405,34 +11937,110 @@ impl AggregateBuilder {
                             report,
                         });
                     }
-                    Err(source)
-                        if fixed_predicate_word64_build_limit_allows_continuation(&source) => {}
-                    Err(source) => {
+                    Err(error)
+                        if fixed_predicate_word64_build_limit_allows_continuation(
+                            error.source(),
+                        ) =>
+                    {
+                        let build_actual = error.receipt().actual();
+                        let effect = fixed_predicate_build_effect(build_actual, inspection_effect)
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "fixed-predicate refusal effect overflow",
+                            })?;
+                        let abandonment = fixed_predicate_abandonment(
+                            fixed_predicate_prior_effect,
+                            effect,
+                            build_actual,
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed-predicate abandonment overflow",
+                        })?;
+                        resolve_construction_soft_refusal_with_abandonment(
+                            construction,
+                            effect,
+                            abandonment,
+                            AggregateConstructionPrepublicationFallback::FixedPredicateWord64BuildResource,
+                        );
+                    }
+                    Err(error) => {
+                        construction.pending_terminal_effect = fixed_predicate_build_effect(
+                            error.receipt().actual(),
+                            inspection_effect,
+                        )
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "fixed-predicate terminal effect overflow",
+                        })?;
                         return Err(AggregateBuildError::FixedPredicateWord64Build {
                             operation,
                             selection,
-                            source,
+                            source: error.into_source(),
                         });
                     }
                 }
+            } else if construction
+                .transaction
+                .record_semantic_ineligible(
+                    AggregateConstructionStage::FixedPredicateWord64,
+                    inspection_effect,
+                )
+                .is_err()
+            {
+                unreachable!("fixed-predicate ineligibility violated construction order");
             }
+        }
+        if construction.transaction.expected_stage()
+            == Some(AggregateConstructionStage::FixedPredicateWord64)
+        {
+            record_construction_policy_skip(
+                construction,
+                AggregateConstructionStage::FixedPredicateWord64,
+            );
         }
         let continuation_profile = if unicode {
             RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
         } else {
             RustByteProfile::PINNED_1_12_4
         };
-        let engine = CompiledRegex::from_hir_erasing_captures_for_whole_match(
-            &rust.hir,
-            continuation_profile,
-            limits.continuation,
-        )
-        .map_err(|source| AggregateBuildError::ContinuationCompile {
-            operation,
-            selection,
-            strategy,
-            source,
-        })?;
+        select_construction_stage(
+            construction,
+            AggregateConstructionStage::Continuation,
+            AggregateConstructionEffect::default(),
+        );
+        let compile_attempt =
+            match CompiledRegex::from_hir_erasing_captures_for_whole_match_with_construction_receipt(
+                &rust.hir,
+                continuation_profile,
+                limits.continuation,
+            ) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    if !error.closes() {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "continuation compiler terminal failed closure",
+                        });
+                    }
+                    let (source, receipt) = error.into_parts();
+                    construction.pending_terminal_effect =
+                        continuation_compile_effect(receipt.actual);
+                    return Err(AggregateBuildError::ContinuationCompile {
+                        operation,
+                        selection,
+                        strategy,
+                        source,
+                    });
+                }
+            };
+        let (engine, compile_actual) = compile_attempt.into_parts();
+        let terminal_effect = continuation_compile_effect(compile_actual);
+        construction.pending_terminal_effect = terminal_effect;
         let compile = engine.compile_accounting();
         if compile.hir_nodes != expected_nodes || compile.captures_erased != expected_captures {
             return Err(AggregateBuildError::InternalInvariant {
@@ -8441,6 +12049,14 @@ impl AggregateBuilder {
                 detail: "syntax summary differs from aggregate compiler traversal",
             });
         }
+        let publication_effect = include_selected_plan_owner_effect(terminal_effect).ok_or(
+            AggregateBuildError::InternalInvariant {
+                operation,
+                selection,
+                detail: "continuation publication effect overflow",
+            },
+        )?;
+        construction.selected_success_effect = Some(publication_effect);
         let program = engine.plan_id();
         let sealed_required_internal_anchor_identity = (compile.required_internal_anchors == 1)
             .then_some(AggregateRequiredInternalAnchorSeal { program, compile });
@@ -8449,11 +12065,16 @@ impl AggregateBuilder {
         );
         let report = AggregateBuildReport {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+            construction_attempt: AggregateClosureEvidence::empty(),
+            published_artifact_owner: AggregateClosureEvidence::empty(),
+            syntax_attempt: AggregateClosureEvidence::empty(),
             syntax_key,
             admission,
             syntax,
             operation,
             selection,
+            requested_strategy: strategy,
+            build_limits: limits,
             plan: AggregatePlanKind::ContinuationProgram,
             continuation_strategy: Some(strategy),
             capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
@@ -8504,6 +12125,12 @@ fn unicode_finite_words_preserve_scalar_boundaries(words: &[Vec<u8>]) -> bool {
         && words
             .iter()
             .all(|word| !word.is_empty() && core::str::from_utf8(word).is_ok())
+}
+
+fn unicode_finite_boundary_prospective(words: &[Vec<u8>]) -> Option<usize> {
+    words.iter().try_fold(1_usize, |work, word| {
+        work.checked_add(1)?.checked_add(word.len())
+    })
 }
 
 fn tagged_grapheme_ranges(
@@ -8616,9 +12243,17 @@ impl AggregatePlan {
     fn cache_identity(&self, execution_limits: &AggregateRunLimits) -> AggregateCacheIdentity {
         AggregateCacheIdentity {
             schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+            construction_attempt: AggregateClosureEvidence::from_option(
+                self.report.construction_attempt.as_ref().cloned(),
+            ),
+            artifact_owner: AggregateClosureEvidence::from_option(
+                self.report.published_artifact_owner.as_ref().cloned(),
+            ),
+            construction_stage: construction_stage_for_report(&self.report),
             syntax_key: Arc::clone(&self.report.syntax_key),
             operation: self.operation(),
             selection: self.report.selection,
+            requested_strategy: self.report.requested_strategy,
             plan: self.report.plan,
             continuation_strategy: self.report.continuation_strategy,
             capture_semantics: self.report.capture_semantics,
@@ -9140,20 +12775,16 @@ impl AggregatePlan {
         execution_limits: &AggregateRunLimits,
         attempt: OperationAttemptError,
     ) -> AggregateExecutionError {
+        if !attempt.closes() {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation terminal source did not close its operation receipt",
+                ),
+            );
+        }
         let OperationAttemptError { source, receipt } = attempt;
-        self.continuation_error_from_receipt(
-            execution_limits,
-            receipt,
-            AggregateExecutionSource::Continuation(source),
-        )
-    }
-
-    fn continuation_error_from_receipt(
-        &self,
-        execution_limits: &AggregateRunLimits,
-        receipt: OperationAttemptReceipt,
-        source: AggregateExecutionSource,
-    ) -> AggregateExecutionError {
+        let source = AggregateExecutionSource::Continuation(source);
         AggregateExecutionError {
             identity: AggregateExecutionAttemptIdentity::continuation(
                 Box::new(self.cache_identity(execution_limits)),
@@ -9545,7 +13176,7 @@ impl AggregatePlan {
                                 ),
                             )
                         })?;
-                        if !composite.contains_actual_with(&admitted.receipt) {
+                        if !composite.contains_success_actual_with(&admitted.receipt) {
                             return Err(self.execution_error(
                                 limits,
                                 AggregateExecutionSource::InternalInvariant(
@@ -9653,9 +13284,8 @@ impl AggregatePlan {
                     )
                     .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
                 let Ok(value) = u64::try_from(admitted.admitted.value()) else {
-                    return Err(self.continuation_error_from_receipt(
+                    return Err(self.execution_error(
                         limits,
-                        admitted.receipt,
                         AggregateExecutionSource::InternalInvariant(
                             "continuation count does not fit u64",
                         ),
@@ -9911,9 +13541,8 @@ impl AggregatePlan {
             )
             .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
         let Ok(value) = u64::try_from(admitted.admitted.value()) else {
-            return Err(self.continuation_error_from_receipt(
+            return Err(self.execution_error(
                 limits,
-                admitted.receipt,
                 AggregateExecutionSource::InternalInvariant(
                     "continuation span sum does not fit u64",
                 ),
@@ -10038,7 +13667,7 @@ impl AggregatePlan {
                             ),
                         )
                     })?;
-                    if !composite.contains_actual_with(&attempt.receipt) {
+                    if !composite.contains_success_actual_with(&attempt.receipt) {
                         return Err(self.execution_error(
                             limits,
                             AggregateExecutionSource::InternalInvariant(
@@ -10080,9 +13709,8 @@ impl AggregatePlan {
             .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
         match u64::try_from(attempt.value) {
             Ok(value) => Ok(value),
-            Err(_) => Err(self.continuation_error_from_receipt(
+            Err(_) => Err(self.execution_error(
                 limits,
-                attempt.receipt,
                 AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
             )),
         }
@@ -10116,9 +13744,8 @@ impl AggregatePlan {
             .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
         match u64::try_from(attempt.value) {
             Ok(value) => Ok(value),
-            Err(_) => Err(self.continuation_error_from_receipt(
+            Err(_) => Err(self.execution_error(
                 limits,
-                attempt.receipt,
                 AggregateExecutionSource::InternalInvariant(
                     "continuation span sum does not fit u64",
                 ),
@@ -10433,8 +14060,22 @@ enum LiteralInspectionMode {
 }
 
 enum LiteralInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl LiteralInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 enum UnicodeScalarInspection<'a> {
@@ -10454,8 +14095,22 @@ enum UnicodeScalarInspection<'a> {
 }
 
 enum UnicodeScalarInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl UnicodeScalarInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 enum BoundedContextInspection<'a> {
@@ -10493,8 +14148,22 @@ enum BoundedAffixInspection<'a> {
 }
 
 enum BoundedContextInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl BoundedContextInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 fn inspect_bounded_affix(
@@ -10507,7 +14176,7 @@ fn inspect_bounded_affix(
         charge_bounded_context_work(&mut work, limit)?;
         nodes = nodes
             .checked_add(1)
-            .ok_or(BoundedContextInspectionError::Overflow)?;
+            .ok_or(BoundedContextInspectionError::Overflow { consumed: work })?;
         Ok::<(), BoundedContextInspectionError>(())
     };
     charge()?;
@@ -10702,7 +14371,7 @@ fn inspect_bounded_context(
         .ranges()
         .len()
         .checked_add(right_separator.ranges().len())
-        .ok_or(BoundedContextInspectionError::Overflow)?;
+        .ok_or(BoundedContextInspectionError::Overflow { consumed: work })?;
     for _ in 0..separator_dedup_comparisons {
         charge_bounded_context_work(&mut work, limit)?;
     }
@@ -10827,13 +14496,13 @@ fn peel_bounded_context_captures<'a>(
         charge_bounded_context_work(work, limit)?;
         *hir_nodes = (*hir_nodes)
             .checked_add(1)
-            .ok_or(BoundedContextInspectionError::Overflow)?;
+            .ok_or(BoundedContextInspectionError::Overflow { consumed: *work })?;
         let HirKind::Capture(capture) = hir.kind() else {
             return Ok(hir);
         };
         *captures = (*captures)
             .checked_add(1)
-            .ok_or(BoundedContextInspectionError::Overflow)?;
+            .ok_or(BoundedContextInspectionError::Overflow { consumed: *work })?;
         hir = capture.sub.as_ref();
     }
 }
@@ -10844,9 +14513,13 @@ fn charge_bounded_context_work(
 ) -> Result<(), BoundedContextInspectionError> {
     let needed = work
         .checked_add(1)
-        .ok_or(BoundedContextInspectionError::Overflow)?;
+        .ok_or(BoundedContextInspectionError::Overflow { consumed: *work })?;
     if needed > limit {
-        return Err(BoundedContextInspectionError::WorkLimit { needed, limit });
+        return Err(BoundedContextInspectionError::WorkLimit {
+            needed,
+            limit,
+            consumed: *work,
+        });
     }
     *work = needed;
     Ok(())
@@ -11066,10 +14739,10 @@ impl BoundedSeparatedFieldsInspector {
         }
     }
 
-    fn inspect(
-        mut self,
-        hir: &Hir,
-    ) -> Result<BoundedSeparatedFieldsInspection<'_>, BoundedSeparatedFieldsInspectionError> {
+    fn inspect<'a>(
+        &mut self,
+        hir: &'a Hir,
+    ) -> Result<BoundedSeparatedFieldsInspection<'a>, BoundedSeparatedFieldsInspectionError> {
         let Some(root) = self.peel(hir)? else {
             return Ok(self.ineligible());
         };
@@ -11337,11 +15010,17 @@ fn push_bounded_separated_atom<'a>(
     Ok(true)
 }
 
-fn inspect_bounded_separated_fields(
+fn inspect_bounded_separated_fields_attempt(
     hir: &Hir,
     limit: usize,
-) -> Result<BoundedSeparatedFieldsInspection<'_>, BoundedSeparatedFieldsInspectionError> {
-    BoundedSeparatedFieldsInspector::new(limit).inspect(hir)
+) -> Result<
+    BoundedSeparatedFieldsInspection<'_>,
+    AggregateInspectionAttemptError<BoundedSeparatedFieldsInspectionError>,
+> {
+    let mut inspector = BoundedSeparatedFieldsInspector::new(limit);
+    inspector
+        .inspect(hir)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, inspector.work))
 }
 
 enum BoundedClassSequenceInspection<'a> {
@@ -11361,8 +15040,22 @@ enum BoundedClassSequenceInspection<'a> {
 }
 
 enum BoundedClassSequenceInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl BoundedClassSequenceInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 #[allow(
@@ -11449,13 +15142,13 @@ fn inspect_bounded_class_sequence(
     // needs at most left.len() + right.len() - 1 comparisons. Precharge all
     // three bounds before reading ranges; their sum is 2Q-3, keeping selection
     // linear in the retained source structure.
-    let head_body_comparisons = bounded_disjoint_comparison_bound(head, body)?;
-    let head_trail_comparisons = bounded_disjoint_comparison_bound(head, trail)?;
-    let body_trail_comparisons = bounded_disjoint_comparison_bound(body, trail)?;
+    let head_body_comparisons = bounded_disjoint_comparison_bound(head, body, work)?;
+    let head_trail_comparisons = bounded_disjoint_comparison_bound(head, trail, work)?;
+    let body_trail_comparisons = bounded_disjoint_comparison_bound(body, trail, work)?;
     let disjoint_comparisons = head_body_comparisons
         .checked_add(head_trail_comparisons)
         .and_then(|count| count.checked_add(body_trail_comparisons))
-        .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+        .ok_or(BoundedClassSequenceInspectionError::Overflow { consumed: work })?;
     for _ in 0..disjoint_comparisons {
         charge_bounded_sequence_inspection_work(&mut work, limit)?;
     }
@@ -11488,13 +15181,13 @@ fn peel_bounded_sequence_captures<'a>(
         charge_bounded_sequence_inspection_work(work, limit)?;
         *hir_nodes = (*hir_nodes)
             .checked_add(1)
-            .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+            .ok_or(BoundedClassSequenceInspectionError::Overflow { consumed: *work })?;
         let HirKind::Capture(capture) = hir.kind() else {
             return Ok(hir);
         };
         *captures = (*captures)
             .checked_add(1)
-            .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+            .ok_or(BoundedClassSequenceInspectionError::Overflow { consumed: *work })?;
         hir = capture.sub.as_ref();
     }
 }
@@ -11534,11 +15227,12 @@ fn bounded_byte_classes_overlap(
 fn bounded_disjoint_comparison_bound(
     left: BoundedByteClassAtom<'_>,
     right: BoundedByteClassAtom<'_>,
+    consumed: usize,
 ) -> Result<usize, BoundedClassSequenceInspectionError> {
     left.range_count()
         .checked_add(right.range_count())
         .and_then(|count| count.checked_sub(1))
-        .ok_or(BoundedClassSequenceInspectionError::Overflow)
+        .ok_or(BoundedClassSequenceInspectionError::Overflow { consumed })
 }
 
 fn charge_bounded_sequence_inspection_work(
@@ -11547,17 +15241,35 @@ fn charge_bounded_sequence_inspection_work(
 ) -> Result<(), BoundedClassSequenceInspectionError> {
     let needed = work
         .checked_add(1)
-        .ok_or(BoundedClassSequenceInspectionError::Overflow)?;
+        .ok_or(BoundedClassSequenceInspectionError::Overflow { consumed: *work })?;
     if needed > limit {
-        return Err(BoundedClassSequenceInspectionError::WorkLimit { needed, limit });
+        return Err(BoundedClassSequenceInspectionError::WorkLimit {
+            needed,
+            limit,
+            consumed: *work,
+        });
     }
     *work = needed;
     Ok(())
 }
 
 enum FixedClassSandwichInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl FixedClassSandwichInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 fn inspect_fixed_class_sandwich(
@@ -11643,13 +15355,13 @@ fn peel_fixed_class_captures<'a>(
         charge_fixed_class_inspection_work(work, limit)?;
         *hir_nodes = (*hir_nodes)
             .checked_add(1)
-            .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+            .ok_or(FixedClassSandwichInspectionError::Overflow { consumed: *work })?;
         let HirKind::Capture(capture) = hir.kind() else {
             return Ok(hir);
         };
         *captures = (*captures)
             .checked_add(1)
-            .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+            .ok_or(FixedClassSandwichInspectionError::Overflow { consumed: *work })?;
         hir = capture.sub.as_ref();
     }
 }
@@ -11685,9 +15397,13 @@ fn charge_fixed_class_inspection_work(
 ) -> Result<(), FixedClassSandwichInspectionError> {
     let needed = work
         .checked_add(1)
-        .ok_or(FixedClassSandwichInspectionError::Overflow)?;
+        .ok_or(FixedClassSandwichInspectionError::Overflow { consumed: *work })?;
     if needed > limit {
-        return Err(FixedClassSandwichInspectionError::WorkLimit { needed, limit });
+        return Err(FixedClassSandwichInspectionError::WorkLimit {
+            needed,
+            limit,
+            consumed: *work,
+        });
     }
     *work = needed;
     Ok(())
@@ -11711,8 +15427,22 @@ pub(crate) enum PrefixClassInspection<'a> {
 }
 
 pub(crate) enum PrefixClassInspectionError {
-    WorkLimit { needed: usize, limit: usize },
-    Overflow,
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+        consumed: usize,
+    },
+    Overflow {
+        consumed: usize,
+    },
+}
+
+impl PrefixClassInspectionError {
+    const fn consumed_work(&self) -> usize {
+        match *self {
+            Self::WorkLimit { consumed, .. } | Self::Overflow { consumed } => consumed,
+        }
+    }
 }
 
 struct PrefixClassBranch<'a> {
@@ -11794,7 +15524,7 @@ fn inspect_prefix_class_branch<'a>(
     let prefix_work = prefix
         .len()
         .checked_mul(2)
-        .ok_or(PrefixClassInspectionError::Overflow)?;
+        .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
     charge_prefix_class_work(work, prefix_work, limit)?;
     if prefix.is_empty() {
         return Ok(None);
@@ -11848,7 +15578,7 @@ fn peel_prefix_class_captures<'a>(
         charge_prefix_class_work(work, 1, limit)?;
         *hir_nodes = hir_nodes
             .checked_add(1)
-            .ok_or(PrefixClassInspectionError::Overflow)?;
+            .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
         let kind = hir.kind();
         let HirKind::Capture(capture) = kind else {
             return Ok(PrefixClassPeel {
@@ -11859,10 +15589,10 @@ fn peel_prefix_class_captures<'a>(
         };
         *captures = captures
             .checked_add(1)
-            .ok_or(PrefixClassInspectionError::Overflow)?;
+            .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
         local_captures = local_captures
             .checked_add(1)
-            .ok_or(PrefixClassInspectionError::Overflow)?;
+            .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
         single_capture_index = if local_captures == 1 {
             Some(capture.index)
         } else {
@@ -11879,9 +15609,13 @@ fn charge_prefix_class_work(
 ) -> Result<(), PrefixClassInspectionError> {
     let needed = work
         .checked_add(amount)
-        .ok_or(PrefixClassInspectionError::Overflow)?;
+        .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
     if needed > limit {
-        return Err(PrefixClassInspectionError::WorkLimit { needed, limit });
+        return Err(PrefixClassInspectionError::WorkLimit {
+            needed,
+            limit,
+            consumed: *work,
+        });
     }
     *work = needed;
     Ok(())
@@ -11919,12 +15653,12 @@ fn inspect_unicode_scalar_class(
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
             .checked_add(1)
-            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+            .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
         match hir.kind() {
             HirKind::Capture(capture) => {
                 captures = captures
                     .checked_add(1)
-                    .ok_or(UnicodeScalarInspectionError::Overflow)?;
+                    .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
                 hir = capture.sub.as_ref();
             }
             HirKind::Repetition(repeated) if !saw_repetition && repeated.min > 0 => {
@@ -12030,18 +15764,18 @@ fn inspect_uniform_captured_scalar_alternation(
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
             .checked_add(1)
-            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+            .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
         let HirKind::Capture(capture) = alternative.kind() else {
             return Ok(UnicodeScalarInspection::Ineligible { work });
         };
         captures = captures
             .checked_add(1)
-            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+            .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
 
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
             .checked_add(1)
-            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+            .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
         let HirKind::Repetition(repeated) = capture.sub.kind() else {
             return Ok(UnicodeScalarInspection::Ineligible { work });
         };
@@ -12060,7 +15794,7 @@ fn inspect_uniform_captured_scalar_alternation(
         charge_unicode_scalar_inspection_work(&mut work, limit)?;
         hir_nodes = hir_nodes
             .checked_add(1)
-            .ok_or(UnicodeScalarInspectionError::Overflow)?;
+            .ok_or(UnicodeScalarInspectionError::Overflow { consumed: work })?;
         let HirKind::Class(Class::Unicode(class)) = repeated.sub.kind() else {
             return Ok(UnicodeScalarInspection::Ineligible { work });
         };
@@ -12107,9 +15841,13 @@ fn charge_unicode_scalar_inspection_work(
 ) -> Result<(), UnicodeScalarInspectionError> {
     let needed = work
         .checked_add(1)
-        .ok_or(UnicodeScalarInspectionError::Overflow)?;
+        .ok_or(UnicodeScalarInspectionError::Overflow { consumed: *work })?;
     if needed > limit {
-        return Err(UnicodeScalarInspectionError::WorkLimit { needed, limit });
+        return Err(UnicodeScalarInspectionError::WorkLimit {
+            needed,
+            limit,
+            consumed: *work,
+        });
     }
     *work = needed;
     Ok(())
@@ -12125,9 +15863,13 @@ fn inspect_exact_literal(
     loop {
         let needed = work
             .checked_add(1)
-            .ok_or(LiteralInspectionError::Overflow)?;
+            .ok_or(LiteralInspectionError::Overflow { consumed: work })?;
         if needed > limit {
-            return Err(LiteralInspectionError::WorkLimit { needed, limit });
+            return Err(LiteralInspectionError::WorkLimit {
+                needed,
+                limit,
+                consumed: work,
+            });
         }
         work = needed;
         if matches!(mode, LiteralInspectionMode::UnicodeOnNonempty) {
@@ -12160,7 +15902,7 @@ fn inspect_exact_literal(
             HirKind::Capture(capture) => {
                 captures = captures
                     .checked_add(1)
-                    .ok_or(LiteralInspectionError::Overflow)?;
+                    .ok_or(LiteralInspectionError::Overflow { consumed: work })?;
                 hir = capture.sub.as_ref();
             }
             HirKind::Empty => {
@@ -12720,13 +16462,64 @@ impl AggregateSpanSumResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        AggregateBuilder, AggregateDirectReceiptSource, AggregateExactLiteralExecutionDetails,
-        AggregateExactLiteralReceiptSource, AggregateExecutionAttemptIdentity,
-        AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionReport,
-        AggregateExecutionSource, AggregatePlanSelection, AggregateRunLimits,
-        OrderedLiteralAggregateBuildError, UnicodeScalarInspectionError,
-        charge_unicode_scalar_inspection_work, finite_build_limit_allows_continuation,
+        AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildError, AggregateBuildLimits,
+        AggregateBuilder, AggregateConstructionAttemptError, AggregateConstructionEffect,
+        AggregateConstructionReceipt, AggregateConstructionStage, AggregateDirectReceiptSource,
+        AggregateExactLiteralExecutionDetails, AggregateExactLiteralReceiptSource,
+        AggregateExecutionAttemptIdentity, AggregateExecutionDetails, AggregateExecutionError,
+        AggregateExecutionIdentity, AggregateExecutionReport, AggregateExecutionSource,
+        AggregateOperation, AggregatePlanIdentity, AggregatePlanSelection, AggregateRunLimits,
+        DirectBuildAttemptActual, FixedAbsoluteDomainBuildActual,
+        OrderedLiteralAggregateBuildError, RustProfile, UnicodeScalarInspectionError,
+        charge_unicode_scalar_inspection_work, dense_finite_abandonment, direct_build_stage_effect,
+        finite_build_limit_allows_continuation, fixed_absolute_construction_effect,
+        fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
+        include_selected_plan_owner_effect, sparse_finite_abandonment,
     };
+
+    fn pre_syntax_exact_spans_failure() -> AggregateConstructionAttemptError {
+        AggregateBuilder::new("needle")
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_spans_attempt()
+            .unwrap_err()
+    }
+
+    fn assert_current_stage_is_released_at_hard_terminal(
+        error: &AggregateConstructionAttemptError,
+        expected_stage: AggregateConstructionStage,
+    ) -> AggregateConstructionEffect {
+        assert!(error.closes());
+        let receipt = error.receipt();
+        let terminal = receipt
+            .ledger
+            .get(receipt.ledger.len().checked_sub(1).unwrap())
+            .unwrap();
+        let before = receipt
+            .ledger
+            .get(receipt.ledger.len().checked_sub(2).unwrap())
+            .unwrap();
+        assert_eq!(terminal.stage, expected_stage);
+        assert_eq!(terminal.effect.retained_persistent_bytes, 0);
+        assert_eq!(
+            terminal.actual.live_persistent_bytes,
+            before
+                .actual
+                .live_persistent_bytes
+                .checked_sub(terminal.effect.released_persistent_bytes)
+                .unwrap()
+        );
+        assert_eq!(
+            terminal.actual.high_water_bytes,
+            before.actual.high_water_bytes.max(
+                before
+                    .actual
+                    .live_persistent_bytes
+                    .checked_add(terminal.effect.co_live_bytes)
+                    .unwrap()
+            )
+        );
+        terminal.effect
+    }
 
     fn exact_success_details(
         report: &AggregateExecutionReport,
@@ -12771,11 +16564,303 @@ mod tests {
     }
 
     #[test]
+    fn construction_error_closure_binds_request_coordinates_and_error_family() {
+        let mut schema_splice = pre_syntax_exact_spans_failure();
+        schema_splice.receipt.identity.explain_schema_version =
+            AGGREGATE_EXPLAIN_SCHEMA_VERSION - 1;
+        assert!(!schema_splice.closes());
+
+        let mut operation_splice = pre_syntax_exact_spans_failure();
+        assert!(operation_splice.closes());
+        let AggregateBuildError::ExactLiteralIneligible { operation, .. } =
+            &mut operation_splice.source
+        else {
+            panic!("expected pre-syntax exact-literal ineligibility");
+        };
+        *operation = AggregateOperation::Count;
+        assert!(!operation_splice.closes());
+
+        let mut selection_splice = pre_syntax_exact_spans_failure();
+        let AggregateBuildError::ExactLiteralIneligible { selection, .. } =
+            &mut selection_splice.source
+        else {
+            panic!("expected pre-syntax exact-literal ineligibility");
+        };
+        *selection = AggregatePlanSelection::Auto;
+        assert!(!selection_splice.closes());
+
+        let mut family_splice = pre_syntax_exact_spans_failure();
+        family_splice.source = AggregateBuildError::LiteralPlannerWorkLimit {
+            operation: AggregateOperation::Spans,
+            selection: AggregatePlanSelection::ForceExactLiteral,
+            needed: 1,
+            limit: 0,
+        };
+        assert!(!family_splice.closes());
+    }
+
+    #[test]
+    fn continuation_hard_terminal_releases_unpublished_compiler_bytes() {
+        let mut limits = AggregateBuildLimits::default();
+        limits.continuation.max_program_states = 0;
+        let error = AggregateBuilder::new("(?:ab|cd)+")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .limits(limits)
+            .build_count_attempt()
+            .unwrap_err();
+        assert!(matches!(
+            error.source(),
+            AggregateBuildError::ContinuationCompile { .. }
+        ));
+        let effect = assert_current_stage_is_released_at_hard_terminal(
+            &error,
+            AggregateConstructionStage::Continuation,
+        );
+        assert!(effect.allocations > 0);
+        assert!(effect.allocated_bytes > 0);
+        assert!(effect.initialized_bytes > 0);
+        assert!(effect.co_live_bytes > 0);
+    }
+
+    #[test]
+    fn fixed_guard_and_residual_hard_terminals_release_unpublished_bytes() {
+        let pattern = r"^.{249}$";
+
+        let mut guard_limits = AggregateBuildLimits::default();
+        guard_limits.fixed_absolute.max_items = 0;
+        let guard_error = AggregateBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .limits(guard_limits)
+            .build_count_attempt()
+            .unwrap_err();
+        assert!(matches!(
+            guard_error.source(),
+            AggregateBuildError::FixedAbsoluteDomainResidualGuardBuild { .. }
+        ));
+        let guard_effect = assert_current_stage_is_released_at_hard_terminal(
+            &guard_error,
+            AggregateConstructionStage::FixedAbsolute,
+        );
+        assert!(guard_effect.work > 0);
+        assert_eq!(guard_effect.allocations, 0);
+        assert_eq!(guard_effect.allocated_bytes, 0);
+
+        let mut residual_limits = AggregateBuildLimits::default();
+        residual_limits.continuation.max_program_states = 0;
+        let residual_error = AggregateBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .limits(residual_limits)
+            .build_count_attempt()
+            .unwrap_err();
+        assert!(matches!(
+            residual_error.source(),
+            AggregateBuildError::FixedAbsoluteDomainResidualCompile { .. }
+        ));
+        let residual_effect = assert_current_stage_is_released_at_hard_terminal(
+            &residual_error,
+            AggregateConstructionStage::FixedAbsolute,
+        );
+        assert!(residual_effect.allocations > 0);
+        assert!(residual_effect.allocated_bytes > 0);
+        assert!(residual_effect.initialized_bytes > 0);
+        assert!(residual_effect.co_live_bytes > 0);
+    }
+
+    #[test]
+    fn construction_report_rejects_same_length_receipt_syntax_and_key_splice() {
+        let needle = AggregateBuilder::new("needle")
+            .unicode(false)
+            .build_count_attempt()
+            .unwrap();
+        let banana = AggregateBuilder::new("banana")
+            .unicode(false)
+            .build_count_attempt()
+            .unwrap();
+        assert!(needle.build_report().has_closed_construction_attempt());
+        assert!(banana.build_report().has_closed_construction_attempt());
+        assert_eq!(
+            needle.build_report().plan_identity,
+            banana.build_report().plan_identity
+        );
+
+        let mut splice = needle.build_report().clone();
+        splice.construction_attempt = banana.build_report().construction_attempt.clone();
+        splice.syntax_attempt = banana.build_report().syntax_attempt.clone();
+        splice.syntax_key = std::sync::Arc::clone(&banana.build_report().syntax_key);
+        assert!(!splice.has_closed_construction_attempt());
+    }
+
+    #[test]
+    fn direct_build_stage_effect_preserves_exact_actual_and_composes_inspection_work() {
+        let actual = DirectBuildAttemptActual {
+            work: 11,
+            allocations: 2,
+            allocated_bytes: 37,
+            copied_bytes: 19,
+            initialized_bytes: 31,
+            live_persistent_bytes: 23,
+            peak_bytes: 29,
+        };
+        assert_eq!(
+            direct_build_stage_effect(7, actual),
+            AggregateConstructionEffect {
+                work: 18,
+                allocations: 2,
+                allocated_bytes: 37,
+                copied_bytes: 19,
+                initialized_bytes: 31,
+                retained_persistent_bytes: 23,
+                released_persistent_bytes: 0,
+                co_live_bytes: 29,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_build_publication_adds_only_the_inline_plan_owner() {
+        let terminal = direct_build_stage_effect(
+            5,
+            DirectBuildAttemptActual {
+                work: 13,
+                allocations: 1,
+                allocated_bytes: 41,
+                copied_bytes: 17,
+                initialized_bytes: 31,
+                live_persistent_bytes: 23,
+                peak_bytes: 41,
+            },
+        );
+        let published = include_selected_plan_owner_effect(terminal).unwrap();
+        let owner_bytes = core::mem::size_of::<AggregatePlanIdentity>();
+
+        assert_eq!(terminal.retained_persistent_bytes, 23);
+        assert_eq!(terminal.released_persistent_bytes, 0);
+        assert_eq!(terminal.co_live_bytes, 41);
+        assert_eq!(published.work, terminal.work);
+        assert_eq!(published.allocations, terminal.allocations);
+        assert_eq!(published.allocated_bytes, terminal.allocated_bytes);
+        assert_eq!(published.copied_bytes, terminal.copied_bytes + owner_bytes);
+        assert_eq!(
+            published.initialized_bytes,
+            terminal.initialized_bytes + owner_bytes
+        );
+        assert_eq!(
+            published.retained_persistent_bytes,
+            terminal.retained_persistent_bytes + owner_bytes
+        );
+        assert_eq!(published.released_persistent_bytes, 0);
+        assert_eq!(
+            published.co_live_bytes,
+            terminal.co_live_bytes.max(
+                (terminal.retained_persistent_bytes + owner_bytes)
+                    .saturating_sub(terminal.released_persistent_bytes)
+            )
+        );
+    }
+
+    #[test]
+    fn fixed_publication_charges_outer_owner_and_prepublication_receipt_copy() {
+        let base = fixed_absolute_construction_effect(
+            0,
+            FixedAbsoluteDomainBuildActual::default(),
+            None,
+            false,
+        )
+        .unwrap();
+        let fixed = fixed_absolute_construction_effect(
+            0,
+            FixedAbsoluteDomainBuildActual::default(),
+            None,
+            true,
+        )
+        .unwrap();
+        let allocation_bytes = fixed_absolute_owner_bytes().unwrap();
+        let handle_bytes = core::mem::size_of::<AggregateExecutionIdentity>();
+
+        assert_eq!(
+            fixed.work,
+            base.work + u64::try_from(allocation_bytes).unwrap()
+        );
+        assert_eq!(fixed.allocations, base.allocations + 1);
+        assert_eq!(
+            fixed.allocated_bytes,
+            base.allocated_bytes + allocation_bytes
+        );
+        assert_eq!(
+            fixed.copied_bytes,
+            base.copied_bytes + allocation_bytes + handle_bytes
+        );
+        assert_eq!(
+            fixed.initialized_bytes,
+            base.initialized_bytes + allocation_bytes + handle_bytes
+        );
+        assert_eq!(
+            fixed.retained_persistent_bytes,
+            base.retained_persistent_bytes + allocation_bytes + handle_bytes
+        );
+        assert_eq!(fixed.co_live_bytes, allocation_bytes + handle_bytes);
+
+        let copied = include_fixed_construction_receipt_copy_effect(fixed).unwrap();
+        let receipt_bytes = core::mem::size_of::<AggregateConstructionReceipt>();
+        assert_eq!(copied.copied_bytes, fixed.copied_bytes + receipt_bytes);
+        assert_eq!(
+            copied.initialized_bytes,
+            fixed.initialized_bytes + receipt_bytes
+        );
+        assert_eq!(
+            copied.retained_persistent_bytes,
+            fixed.retained_persistent_bytes
+        );
+        assert_eq!(copied.co_live_bytes, fixed.co_live_bytes);
+    }
+
+    #[test]
+    fn finite_fallback_abandons_cumulative_capacity_not_only_terminal_live_bytes() {
+        let prior = AggregateConstructionEffect {
+            work: 11,
+            allocations: 2,
+            allocated_bytes: 100,
+            copied_bytes: 40,
+            initialized_bytes: 60,
+            retained_persistent_bytes: 20,
+            released_persistent_bytes: 0,
+            co_live_bytes: 40,
+        };
+        let build = AggregateConstructionEffect {
+            work: 7,
+            allocations: 3,
+            allocated_bytes: 80,
+            copied_bytes: 30,
+            initialized_bytes: 50,
+            retained_persistent_bytes: 15,
+            released_persistent_bytes: 20,
+            co_live_bytes: 35,
+        };
+        let dense = dense_finite_abandonment(prior, build).unwrap();
+        assert_eq!(dense.work, 18);
+        assert_eq!(dense.allocations, 5);
+        assert_eq!(dense.bytes, 180);
+        assert!(dense.bytes > prior.retained_persistent_bytes + build.retained_persistent_bytes);
+        assert_eq!(dense.released_persistent_bytes, 15);
+
+        let sparse = sparse_finite_abandonment(build);
+        assert_eq!(sparse.work, build.work);
+        assert_eq!(sparse.allocations, build.allocations);
+        assert_eq!(sparse.bytes, build.allocated_bytes);
+        assert!(sparse.bytes > build.retained_persistent_bytes);
+        assert_eq!(
+            sparse.released_persistent_bytes,
+            build.retained_persistent_bytes
+        );
+    }
+
+    #[test]
     fn unicode_scalar_inspection_overflow_leaves_counter_unchanged() {
         let mut work = usize::MAX;
         assert!(matches!(
             charge_unicode_scalar_inspection_work(&mut work, usize::MAX),
-            Err(UnicodeScalarInspectionError::Overflow)
+            Err(UnicodeScalarInspectionError::Overflow { .. })
         ));
         assert_eq!(work, usize::MAX);
     }

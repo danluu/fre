@@ -14,6 +14,10 @@ pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.ascii.nonoverlap.v1"
 pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v1";
 /// Stable identity for the matched-byte-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v1";
+/// Version of the receipt-bearing fixed-predicate construction protocol.
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+/// Version of the partial-actual fixed-predicate construction ledger.
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 2;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -416,6 +420,314 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Immutable identity and caller envelope for one fixed-predicate build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptIdentity {
+    pub plan_id: &'static str,
+    pub limits: BuildLimits,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+}
+
+/// Exact effects committed through the last admitted mask-construction step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BuildAttemptActual {
+    pub mask_zero_writes: usize,
+    pub position_visits: usize,
+    pub range_inspections: usize,
+    pub member_writes: usize,
+    pub work: u64,
+    pub allocations: usize,
+    pub reserves: usize,
+    pub temporary_copies: usize,
+    pub copied_bytes: usize,
+    pub initialized_bytes: usize,
+    pub live_persistent_bytes: usize,
+    pub live_scratch_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// One success-or-failure fixed-predicate construction receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptReceipt {
+    identity: BuildAttemptIdentity,
+    actual: BuildAttemptActual,
+    accounting: Option<BuildAccounting>,
+    published: bool,
+}
+
+impl BuildAttemptReceipt {
+    #[must_use]
+    pub const fn identity(&self) -> BuildAttemptIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn actual(&self) -> BuildAttemptActual {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn accounting(&self) -> Option<BuildAccounting> {
+        self.accounting
+    }
+
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    #[must_use]
+    pub fn contains_actual(&self) -> bool {
+        self.identity.plan_id == PLAN_ID
+            && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
+            && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
+            && self.actual.work <= self.identity.limits.max_build_work
+            && self.actual.allocations == 0
+            && self.actual.reserves == 0
+            && self.actual.temporary_copies == 0
+            && self.actual.copied_bytes == 0
+            && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
+            && self.actual.live_scratch_bytes <= self.identity.limits.max_scratch_bytes
+            && self.actual.peak_bytes <= self.identity.limits.max_peak_bytes
+    }
+
+    fn closes_success(&self, accounting: BuildAccounting) -> bool {
+        self.published
+            && self.accounting == Some(accounting)
+            && self.contains_actual()
+            && self.actual.mask_zero_writes == accounting.mask_zero_writes
+            && self.actual.position_visits == accounting.position_visits
+            && self.actual.range_inspections == accounting.range_inspections
+            && self.actual.member_writes == accounting.member_writes
+            && self.actual.work == accounting.work_charged
+            && self.actual.allocations == accounting.allocations
+            && self.actual.reserves == accounting.reserves
+            && self.actual.temporary_copies == accounting.temporary_copies
+            && self.actual.live_persistent_bytes == accounting.persistent_bytes
+            && self.actual.live_scratch_bytes == accounting.scratch_bytes
+            && self.actual.peak_bytes == accounting.peak_bytes
+    }
+
+    fn closes_failure(&self) -> bool {
+        !self.published && self.accounting.is_none() && self.contains_actual()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildFailureKind {
+    WidthTooSmall,
+    WidthTooLarge,
+    PositionLimit,
+    SourceRangesLimit,
+    WorkLimit,
+    ScratchLimit,
+    PersistentLimit,
+    PeakLimit,
+    EmptyPosition,
+    ReversedRange,
+    NonAsciiRange,
+    ArithmeticOverflow,
+    InternalInvariant,
+}
+
+impl BuildFailureKind {
+    const fn from_error(error: &BuildError) -> Self {
+        match error {
+            BuildError::WidthTooSmall { .. } => Self::WidthTooSmall,
+            BuildError::WidthTooLarge { .. } => Self::WidthTooLarge,
+            BuildError::PositionLimit { .. } => Self::PositionLimit,
+            BuildError::SourceRangesLimit { .. } => Self::SourceRangesLimit,
+            BuildError::WorkLimit { .. } => Self::WorkLimit,
+            BuildError::ScratchLimit { .. } => Self::ScratchLimit,
+            BuildError::PersistentLimit { .. } => Self::PersistentLimit,
+            BuildError::PeakLimit { .. } => Self::PeakLimit,
+            BuildError::EmptyPosition { .. } => Self::EmptyPosition,
+            BuildError::ReversedRange { .. } => Self::ReversedRange,
+            BuildError::NonAsciiRange { .. } => Self::NonAsciiRange,
+            BuildError::ArithmeticOverflow { .. } => Self::ArithmeticOverflow,
+            BuildError::InternalInvariant(_) => Self::InternalInvariant,
+        }
+    }
+}
+
+/// Terminal fixed-predicate construction failure with partial actuals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildAttemptError {
+    source: BuildError,
+    receipt: BuildAttemptReceipt,
+    seal: BuildFailureKind,
+}
+
+impl BuildAttemptError {
+    fn new(source: BuildError, identity: BuildAttemptIdentity, actual: BuildAttemptActual) -> Self {
+        let seal = BuildFailureKind::from_error(&source);
+        Self {
+            source,
+            receipt: BuildAttemptReceipt {
+                identity,
+                actual,
+                accounting: None,
+                published: false,
+            },
+            seal,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &BuildError {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.seal == BuildFailureKind::from_error(&self.source) && self.receipt.closes_failure()
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> BuildError {
+        self.source
+    }
+}
+
+impl fmt::Display for BuildAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for BuildAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+struct BuildAttemptTracker {
+    limits: BuildLimits,
+    actual: BuildAttemptActual,
+}
+
+impl BuildAttemptTracker {
+    const fn new(limits: BuildLimits) -> Self {
+        Self {
+            limits,
+            actual: BuildAttemptActual {
+                mask_zero_writes: 0,
+                position_visits: 0,
+                range_inspections: 0,
+                member_writes: 0,
+                work: 0,
+                allocations: 0,
+                reserves: 0,
+                temporary_copies: 0,
+                copied_bytes: 0,
+                initialized_bytes: 0,
+                live_persistent_bytes: 0,
+                live_scratch_bytes: 0,
+                peak_bytes: 0,
+            },
+        }
+    }
+
+    fn charge(&mut self, units: usize) -> Result<(), BuildError> {
+        let units = u64::try_from(units).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual build work conversion",
+        })?;
+        let needed = self
+            .actual
+            .work
+            .checked_add(units)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual build work",
+            })?;
+        if needed > self.limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed,
+                limit: self.limits.max_build_work,
+            });
+        }
+        self.actual.work = needed;
+        Ok(())
+    }
+
+    fn initialize_masks(&mut self) -> Result<(), BuildError> {
+        self.charge(MASK_SLOTS)?;
+        self.actual.mask_zero_writes = MASK_SLOTS;
+        self.observe_initialization(MASK_SLOTS.checked_mul(size_of::<u64>()).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "mask zero initialized bytes",
+            },
+        )?)
+    }
+
+    fn visit_position(&mut self) -> Result<(), BuildError> {
+        self.charge(1)?;
+        self.actual.position_visits =
+            self.actual
+                .position_visits
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual position visits",
+                })?;
+        Ok(())
+    }
+
+    fn inspect_range(&mut self) -> Result<(), BuildError> {
+        self.charge(RANGE_FIXED_WORK)?;
+        self.actual.range_inspections =
+            self.actual
+                .range_inspections
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual range inspections",
+                })?;
+        Ok(())
+    }
+
+    fn write_member(&mut self) -> Result<(), BuildError> {
+        self.charge(1)?;
+        self.actual.member_writes =
+            self.actual
+                .member_writes
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual member writes",
+                })?;
+        self.observe_initialization(size_of::<u64>())
+    }
+
+    fn finish(&mut self, preflight: BuildPreflight) -> Result<(), BuildError> {
+        self.charge(BUILD_FIXED_WORK)?;
+        let mask_bytes =
+            MASK_SLOTS
+                .checked_mul(size_of::<u64>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "inline mask bytes",
+                })?;
+        let remaining_inline_bytes = preflight.persistent_bytes.checked_sub(mask_bytes).ok_or(
+            BuildError::InternalInvariant("inline plan is smaller than its mask table"),
+        )?;
+        self.observe_initialization(remaining_inline_bytes)?;
+        self.actual.live_persistent_bytes = preflight.persistent_bytes;
+        self.actual.peak_bytes = preflight.peak_bytes;
+        Ok(())
+    }
+
+    fn observe_initialization(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "actual initialized bytes",
+            },
+        )?;
+        Ok(())
+    }
+}
+
 /// Checked reduction failure. No partial aggregate is published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -513,6 +825,40 @@ pub struct FixedPredicateWord64Plan {
     build: BuildAccounting,
 }
 
+/// Successful fixed-predicate construction and its closed receipt.
+#[derive(Debug)]
+pub struct BuildAttempt {
+    plan: FixedPredicateWord64Plan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl BuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &FixedPredicateWord64Plan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt.closes_success(self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (FixedPredicateWord64Plan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> FixedPredicateWord64Plan {
+        self.plan
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BuildPreflight {
     width: usize,
@@ -603,10 +949,15 @@ fn preflight_build(
     })
 }
 
-fn compile_masks(positions: &[&[(u8, u8)]]) -> Result<([u64; MASK_SLOTS], usize), BuildError> {
+fn compile_masks(
+    positions: &[&[(u8, u8)]],
+    tracker: &mut BuildAttemptTracker,
+) -> Result<([u64; MASK_SLOTS], usize), BuildError> {
     let mut masks = [0_u64; MASK_SLOTS];
+    tracker.initialize_masks()?;
     let mut member_writes = 0_usize;
     for (position, ranges) in positions.iter().enumerate() {
+        tracker.visit_position()?;
         if ranges.is_empty() {
             return Err(BuildError::EmptyPosition { position });
         }
@@ -619,6 +970,7 @@ fn compile_masks(positions: &[&[(u8, u8)]]) -> Result<([u64; MASK_SLOTS], usize)
                 computation: "position mask",
             })?;
         for (range, &(start, end)) in ranges.iter().enumerate() {
+            tracker.inspect_range()?;
             if start > end {
                 return Err(BuildError::ReversedRange {
                     position,
@@ -646,6 +998,7 @@ fn compile_masks(positions: &[&[(u8, u8)]]) -> Result<([u64; MASK_SLOTS], usize)
                         .ok_or(BuildError::ArithmeticOverflow {
                             computation: "member write count",
                         })?;
+                tracker.write_member()?;
             }
         }
     }
@@ -691,49 +1044,100 @@ impl FixedPredicateWord64Plan {
     ///
     /// Returns a typed semantic, resource, arithmetic or invariant failure.
     pub fn build(positions: &[&[(u8, u8)]], limits: BuildLimits) -> Result<Self, BuildError> {
-        let preflight = preflight_build(positions, limits)?;
-        let (masks, member_writes) = compile_masks(positions)?;
-        let work_charged =
-            actual_build_work(preflight.width, preflight.source_ranges, member_writes)?;
-        if work_charged > preflight.work_upper_bound {
-            return Err(BuildError::InternalInvariant(
-                "actual build work exceeded admitted upper bound",
-            ));
-        }
-        let accepting_shift = u32::try_from(preflight.width.checked_sub(1).ok_or(
-            BuildError::InternalInvariant("validated width became empty"),
-        )?)
-        .map_err(|_| BuildError::ArithmeticOverflow {
-            computation: "accepting shift conversion",
-        })?;
-        let accepting_bit =
-            1_u64
-                .checked_shl(accepting_shift)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "accepting bit",
-                })?;
-        let build = BuildAccounting {
-            positions: preflight.width,
-            source_ranges: preflight.source_ranges,
-            mask_zero_writes: MASK_SLOTS,
-            position_visits: preflight.width,
-            range_inspections: preflight.source_ranges,
-            member_writes,
-            work_upper_bound: preflight.work_upper_bound,
-            work_charged,
-            allocations: 0,
-            reserves: 0,
-            temporary_copies: 0,
-            scratch_bytes: 0,
-            persistent_bytes: preflight.persistent_bytes,
-            peak_bytes: preflight.peak_bytes,
+        Self::build_attempt(positions, limits)
+            .map(BuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact success or partial-failure construction
+    /// effects.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_attempt(
+        positions: &[&[(u8, u8)]],
+        limits: BuildLimits,
+    ) -> Result<BuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            plan_id: PLAN_ID,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
         };
-        Ok(Self {
-            masks,
-            width: preflight.width,
-            accepting_bit,
-            build,
-        })
+        let mut tracker = BuildAttemptTracker::new(limits);
+        let result = (|| {
+            let preflight = preflight_build(positions, limits)?;
+            let (masks, member_writes) = compile_masks(positions, &mut tracker)?;
+            tracker.finish(preflight)?;
+            let independently_counted_work =
+                actual_build_work(preflight.width, preflight.source_ranges, member_writes)?;
+            if tracker.actual.work != independently_counted_work {
+                return Err(BuildError::InternalInvariant(
+                    "observed build work disagreed with independent exact count",
+                ));
+            }
+            if tracker.actual.work > preflight.work_upper_bound {
+                return Err(BuildError::InternalInvariant(
+                    "actual build work exceeded admitted upper bound",
+                ));
+            }
+            let accepting_shift = u32::try_from(preflight.width.checked_sub(1).ok_or(
+                BuildError::InternalInvariant("validated width became empty"),
+            )?)
+            .map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "accepting shift conversion",
+            })?;
+            let accepting_bit =
+                1_u64
+                    .checked_shl(accepting_shift)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "accepting bit",
+                    })?;
+            let build = BuildAccounting {
+                positions: preflight.width,
+                source_ranges: preflight.source_ranges,
+                mask_zero_writes: tracker.actual.mask_zero_writes,
+                position_visits: tracker.actual.position_visits,
+                range_inspections: tracker.actual.range_inspections,
+                member_writes: tracker.actual.member_writes,
+                work_upper_bound: preflight.work_upper_bound,
+                work_charged: tracker.actual.work,
+                allocations: tracker.actual.allocations,
+                reserves: tracker.actual.reserves,
+                temporary_copies: tracker.actual.temporary_copies,
+                scratch_bytes: tracker.actual.live_scratch_bytes,
+                persistent_bytes: tracker.actual.live_persistent_bytes,
+                peak_bytes: tracker.actual.peak_bytes,
+            };
+            Ok(Self {
+                masks,
+                width: preflight.width,
+                accepting_bit,
+                build,
+            })
+        })();
+        match result {
+            Ok(plan) => {
+                let receipt = BuildAttemptReceipt {
+                    identity,
+                    actual: tracker.actual,
+                    accounting: Some(plan.build),
+                    published: true,
+                };
+                if !receipt.closes_success(plan.build) {
+                    return Err(BuildAttemptError::new(
+                        BuildError::InternalInvariant(
+                            "fixed-predicate build success did not close its receipt",
+                        ),
+                        identity,
+                        tracker.actual,
+                    ));
+                }
+                Ok(BuildAttempt { plan, receipt })
+            }
+            Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
+        }
     }
 
     /// Exact word width.
@@ -1349,6 +1753,70 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn build_attempt_receipts_close_success_partial_failure_and_preflight_refusal() {
+        let attempt =
+            FixedPredicateWord64Plan::build_attempt(&[A, B], BuildLimits::unlimited()).unwrap();
+        assert!(attempt.closes());
+        let receipt = *attempt.receipt();
+        let accounting = attempt.plan().build_accounting();
+        let actual = receipt.actual();
+        assert!(receipt.published());
+        assert_eq!(receipt.accounting(), Some(accounting));
+        assert_eq!(actual.work, accounting.work_charged);
+        assert_eq!(actual.mask_zero_writes, MASK_SLOTS);
+        assert_eq!(actual.position_visits, 2);
+        assert_eq!(actual.range_inspections, 4);
+        assert_eq!(actual.member_writes, 4);
+        assert_eq!(actual.copied_bytes, 0);
+        assert_eq!(
+            actual.initialized_bytes,
+            accounting.persistent_bytes + actual.member_writes * size_of::<u64>()
+        );
+
+        let reversed: &[(u8, u8)] = &[(5, 4)];
+        let failure =
+            FixedPredicateWord64Plan::build_attempt(&[A, reversed], BuildLimits::unlimited())
+                .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::ReversedRange {
+                position: 1,
+                range: 0,
+                start: 5,
+                end: 4
+            }
+        ));
+        assert!(failure.closes());
+        let partial = failure.receipt().actual();
+        assert!(!failure.receipt().published());
+        assert_eq!(failure.receipt().accounting(), None);
+        assert_eq!(partial.mask_zero_writes, MASK_SLOTS);
+        assert_eq!(partial.position_visits, 2);
+        assert_eq!(partial.range_inspections, 3);
+        assert_eq!(partial.member_writes, 2);
+        assert_eq!(
+            partial.initialized_bytes,
+            (MASK_SLOTS + partial.member_writes) * size_of::<u64>()
+        );
+
+        let persistent_bytes = accounting.persistent_bytes;
+        let refusal = FixedPredicateWord64Plan::build_attempt(
+            &[A, B],
+            BuildLimits {
+                max_persistent_bytes: persistent_bytes - 1,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal.source(),
+            BuildError::PersistentLimit { .. }
+        ));
+        assert!(refusal.closes());
+        assert_eq!(refusal.receipt().actual(), BuildAttemptActual::default());
     }
 
     #[test]

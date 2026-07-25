@@ -18,6 +18,8 @@ use core::{fmt, mem::size_of};
 
 use memchr::memchr2;
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "blocking-delimiter.consecutive-pairs.v1";
 pub const COUNT_OPERATION_ID: &str = "blocking-delimiter.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "blocking-delimiter.span-sum.unicode-off.v1";
@@ -330,90 +332,148 @@ impl BlockingDelimiterPlan {
         maximum_middle_bytes: usize,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if delimiters[0] >= delimiters[1] {
-            return Err(BuildError::NonCanonicalDelimiters);
-        }
-        let delimiter_members = 2;
-        enforce_build(
-            delimiter_members,
-            limits.max_delimiter_members,
-            BuildResource::DelimiterMembers,
-        )?;
-        let terminal_members = terminal_words.iter().try_fold(0_usize, |total, word| {
-            total
-                .checked_add(usize::try_from(word.count_ones()).map_err(|_| {
+        Self::build_attempt(delimiters, terminal_words, maximum_middle_bytes, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps validation, exact accounting, and publication in one auditable transaction"
+    )]
+    pub fn build_attempt(
+        delimiters: [u8; 2],
+        terminal_words: [u64; 4],
+        maximum_middle_bytes: usize,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if delimiters[0] >= delimiters[1] {
+                return Err(BuildError::NonCanonicalDelimiters);
+            }
+            let delimiter_members = 2;
+            enforce_build(
+                delimiter_members,
+                limits.max_delimiter_members,
+                BuildResource::DelimiterMembers,
+            )?;
+            let terminal_members = terminal_words.iter().try_fold(0_usize, |total, word| {
+                let members = usize::try_from(word.count_ones()).map_err(|_| {
                     BuildError::ArithmeticOverflow {
                         computation: "terminal member word count",
                     }
+                })?;
+                let charged = members
+                    .checked_mul(TERMINAL_MEMBER_BUILD_WORK)
+                    .and_then(|work| work.checked_add(TERMINAL_WORD_BUILD_WORK))
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "terminal word build work",
+                    })?;
+                actual.work = actual
+                    .work
+                    .checked_add(u64::try_from(charged).map_err(|_| {
+                        BuildError::ArithmeticOverflow {
+                            computation: "terminal word build work conversion",
+                        }
+                    })?)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "terminal word build work",
+                    })?;
+                total
+                    .checked_add(members)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "terminal member count",
+                    })
+            })?;
+            if terminal_members == 0 {
+                return Err(BuildError::EmptyTerminalClass);
+            }
+            enforce_build(
+                terminal_members,
+                limits.max_terminal_members,
+                BuildResource::TerminalMembers,
+            )?;
+            enforce_build(
+                maximum_middle_bytes,
+                limits.max_middle_bytes,
+                BuildResource::MiddleBytes,
+            )?;
+            for delimiter in delimiters {
+                if class_contains(terminal_words, delimiter) {
+                    return Err(BuildError::TerminalContainsDelimiter { delimiter });
+                }
+            }
+            maximum_middle_bytes
+                .checked_add(2)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "maximum closing-delimiter distance",
+                })?;
+            let work_upper_bound = terminal_words
+                .len()
+                .checked_mul(TERMINAL_WORD_BUILD_WORK)
+                .and_then(|work| {
+                    terminal_members
+                        .checked_mul(TERMINAL_MEMBER_BUILD_WORK)
+                        .and_then(|members| work.checked_add(members))
+                })
+                .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "complete build work",
+                })?;
+            enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
+            let scratch_bytes = 0;
+            let persistent_bytes = size_of::<Self>();
+            let peak_bytes = persistent_bytes;
+            enforce_build(
+                scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            actual.work = actual
+                .work
+                .checked_add(u64::try_from(FIXED_BUILD_WORK).map_err(|_| {
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed build work conversion",
+                    }
                 })?)
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "terminal member count",
-                })
-        })?;
-        if terminal_members == 0 {
-            return Err(BuildError::EmptyTerminalClass);
-        }
-        enforce_build(
-            terminal_members,
-            limits.max_terminal_members,
-            BuildResource::TerminalMembers,
-        )?;
-        enforce_build(
-            maximum_middle_bytes,
-            limits.max_middle_bytes,
-            BuildResource::MiddleBytes,
-        )?;
-        for delimiter in delimiters {
-            if class_contains(terminal_words, delimiter) {
-                return Err(BuildError::TerminalContainsDelimiter { delimiter });
+                    computation: "complete build work",
+                })?;
+            debug_assert_eq!(usize::try_from(actual.work), Ok(work_upper_bound));
+            actual.copied_bytes = size_of::<[u8; 2]>() + size_of::<[u64; 4]>();
+            actual.initialized_bytes = persistent_bytes;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = persistent_bytes;
+            Ok(Self {
+                delimiters,
+                terminal_words,
+                maximum_middle_bytes,
+                build: BuildAccounting {
+                    delimiter_members,
+                    terminal_members,
+                    maximum_middle_bytes,
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
             }
         }
-        maximum_middle_bytes
-            .checked_add(2)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "maximum closing-delimiter distance",
-            })?;
-        let work_upper_bound = terminal_words
-            .len()
-            .checked_mul(TERMINAL_WORD_BUILD_WORK)
-            .and_then(|work| {
-                terminal_members
-                    .checked_mul(TERMINAL_MEMBER_BUILD_WORK)
-                    .and_then(|members| work.checked_add(members))
-            })
-            .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "complete build work",
-            })?;
-        enforce_build(work_upper_bound, limits.max_build_work, BuildResource::Work)?;
-        let scratch_bytes = 0;
-        let persistent_bytes = size_of::<Self>();
-        let peak_bytes = persistent_bytes;
-        enforce_build(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
-        Ok(Self {
-            delimiters,
-            terminal_words,
-            maximum_middle_bytes,
-            build: BuildAccounting {
-                delimiter_members,
-                terminal_members,
-                maximum_middle_bytes,
-                work_upper_bound,
-                scratch_bytes,
-                persistent_bytes,
-                peak_bytes,
-            },
-        })
     }
 
     #[must_use]
@@ -1157,5 +1217,43 @@ mod tests {
         for limits in cases {
             assert!(plan.span_sum(haystack, limits).is_err());
         }
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let attempt = BlockingDelimiterPlan::build_attempt(
+            DELIMITERS,
+            words(b"?!."),
+            30,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.allocated_bytes, 0);
+        assert_eq!(
+            actual.copied_bytes,
+            core::mem::size_of::<[u8; 2]>() + core::mem::size_of::<[u64; 4]>()
+        );
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error =
+            BlockingDelimiterPlan::build_attempt(DELIMITERS, [0; 4], 30, BuildLimits::default())
+                .unwrap_err();
+        assert!(matches!(error.source(), BuildError::EmptyTerminalClass));
+        assert_eq!(
+            error.actual().work,
+            u64::try_from(4 * TERMINAL_WORD_BUILD_WORK).unwrap()
+        );
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().initialized_bytes, 0);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, 0);
     }
 }

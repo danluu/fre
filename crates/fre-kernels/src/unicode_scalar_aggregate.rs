@@ -17,7 +17,7 @@
 
 use core::{fmt, mem::size_of};
 
-use crate::Window;
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
 /// Stable identity for the scalar-stream implementation.
 pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
@@ -533,7 +533,17 @@ impl UnicodeScalarAggregatePlan {
         ranges: impl IntoIterator<Item = (char, char)>,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build_with_repetition(ranges, Repetition::ExactlyOne, limits)
+        Self::build_attempt(ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Copy one canonical scalar class with exact observed construction effects.
+    pub fn build_attempt(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        Self::build_with_repetition_attempt(ranges, Repetition::ExactlyOne, limits)
     }
 
     /// Copy a canonical scalar class for a proved nonempty unbounded root
@@ -543,12 +553,23 @@ impl UnicodeScalarAggregatePlan {
         greedy: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        Self::build_one_or_more_attempt(ranges, greedy, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Copy a proved nonempty unbounded scalar repetition with exact effects.
+    pub fn build_one_or_more_attempt(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
         let repetition = if greedy {
             Repetition::OneOrMoreGreedy
         } else {
             Repetition::OneOrMoreLazy
         };
-        Self::build_with_repetition(ranges, repetition, limits)
+        Self::build_with_repetition_attempt(ranges, repetition, limits)
     }
 
     /// Copy a canonical scalar class for a proved non-nullable root
@@ -561,8 +582,24 @@ impl UnicodeScalarAggregatePlan {
         greedy: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        Self::build_repeated_attempt(ranges, minimum, maximum, greedy, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Copy a symbolic non-nullable repetition with exact observed effects.
+    pub fn build_repeated_attempt(
+        ranges: impl IntoIterator<Item = (char, char)>,
+        minimum: u32,
+        maximum: Option<u32>,
+        greedy: bool,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
         if minimum == 0 || maximum.is_some_and(|maximum| maximum < minimum) {
-            return Err(BuildError::InvalidRepetition { minimum, maximum });
+            return Err(DirectBuildAttemptError::new(
+                BuildError::InvalidRepetition { minimum, maximum },
+                DirectBuildAttemptActual::default(),
+            ));
         }
         let repetition = match (minimum, maximum, greedy) {
             (1, None, true) => Repetition::OneOrMoreGreedy,
@@ -570,140 +607,208 @@ impl UnicodeScalarAggregatePlan {
             (_, _, true) => Repetition::RepeatedGreedy { minimum, maximum },
             (_, _, false) => Repetition::RepeatedLazy { minimum, maximum },
         };
-        Self::build_with_repetition(ranges, repetition, limits)
+        Self::build_with_repetition_attempt(ranges, repetition, limits)
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "construction keeps canonical validation and all checked storage accounting in one auditable transaction"
     )]
-    fn build_with_repetition(
+    fn build_with_repetition_attempt(
         ranges: impl IntoIterator<Item = (char, char)>,
         repetition: Repetition,
         limits: BuildLimits,
-    ) -> Result<Self, BuildError> {
-        let mut ascii = [0_u64; 2];
-        let mut non_ascii = Vec::<ScalarRange>::new();
-        let mut source_ranges = 0_usize;
-        let mut ascii_scalars = 0_usize;
-        let mut work = 0_usize;
-        let mut previous_end = None::<u32>;
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let mut actual = DirectBuildAttemptActual::default();
+        let mut live_capacity_bytes = 0_usize;
+        let result = (|| {
+            let mut ascii = [0_u64; 2];
+            let mut non_ascii = Vec::<ScalarRange>::new();
+            let mut source_ranges = 0_usize;
+            let mut ascii_scalars = 0_usize;
+            let mut work = 0_usize;
+            let mut previous_end = None::<u32>;
 
-        for (start, end) in ranges {
-            if start > end {
-                return Err(BuildError::ReversedRange { start, end });
-            }
-            let start = u32::from(start);
-            let end = u32::from(end);
-            if previous_end.is_some_and(|previous| start <= previous.saturating_add(1)) {
-                return Err(BuildError::NonCanonicalRanges);
-            }
-            previous_end = Some(end);
-            source_ranges = checked_add(source_ranges, 1, "source range count")?;
-            enforce_build(
-                source_ranges,
-                limits.max_source_ranges,
-                BuildResource::Ranges,
-            )?;
-            work = checked_add(work, 1, "range validation work")?;
+            for (start, end) in ranges {
+                if start > end {
+                    return Err(BuildError::ReversedRange { start, end });
+                }
+                let start = u32::from(start);
+                let end = u32::from(end);
+                if previous_end.is_some_and(|previous| start <= previous.saturating_add(1)) {
+                    return Err(BuildError::NonCanonicalRanges);
+                }
+                previous_end = Some(end);
+                source_ranges = checked_add(source_ranges, 1, "source range count")?;
+                enforce_build(
+                    source_ranges,
+                    limits.max_source_ranges,
+                    BuildResource::Ranges,
+                )?;
+                work = checked_add(work, 1, "range validation work")?;
+                actual.work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "actual scalar build work as u64",
+                })?;
 
-            if start <= 0x7F {
-                let ascii_end = end.min(0x7F);
-                let mut scalar = start;
-                loop {
-                    let index = usize::try_from(scalar / 64).map_err(|_| {
-                        BuildError::ArithmeticOverflow {
-                            computation: "ASCII bitmap index",
+                if start <= 0x7F {
+                    let ascii_end = end.min(0x7F);
+                    let mut scalar = start;
+                    loop {
+                        let index = usize::try_from(scalar / 64).map_err(|_| {
+                            BuildError::ArithmeticOverflow {
+                                computation: "ASCII bitmap index",
+                            }
+                        })?;
+                        let shift = scalar % 64;
+                        ascii[index] |= 1_u64 << shift;
+                        ascii_scalars = checked_add(ascii_scalars, 1, "ASCII population")?;
+                        work = checked_add(work, 1, "ASCII bitmap build work")?;
+                        actual.work =
+                            u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+                                computation: "actual scalar build work as u64",
+                            })?;
+                        if scalar == ascii_end {
+                            break;
                         }
-                    })?;
-                    let shift = scalar % 64;
-                    ascii[index] |= 1_u64 << shift;
-                    ascii_scalars = checked_add(ascii_scalars, 1, "ASCII population")?;
-                    work = checked_add(work, 1, "ASCII bitmap build work")?;
-                    if scalar == ascii_end {
-                        break;
+                        scalar = scalar
+                            .checked_add(1)
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "ASCII scalar progression",
+                            })?;
                     }
-                    scalar = scalar
-                        .checked_add(1)
+                }
+                if end > 0x7F {
+                    let retained = ScalarRange {
+                        start: start.max(0x80),
+                        end,
+                    };
+                    let before_capacity = non_ascii.capacity();
+                    non_ascii
+                        .try_reserve(1)
+                        .map_err(|_| BuildError::AllocationFailed { additional: 1 })?;
+                    let after_capacity = non_ascii.capacity();
+                    if after_capacity > before_capacity {
+                        let allocation_bytes = after_capacity
+                            .checked_mul(size_of::<ScalarRange>())
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "observed non-ASCII allocation bytes",
+                            })?;
+                        actual.allocations = actual.allocations.checked_add(1).ok_or(
+                            BuildError::ArithmeticOverflow {
+                                computation: "actual scalar allocation count",
+                            },
+                        )?;
+                        actual.allocated_bytes = actual
+                            .allocated_bytes
+                            .checked_add(allocation_bytes)
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "cumulative scalar allocated bytes",
+                            })?;
+                        live_capacity_bytes = allocation_bytes;
+                        actual.peak_bytes = actual.peak_bytes.max(live_capacity_bytes);
+                    }
+                    non_ascii.push(retained);
+                    actual.copied_bytes = actual
+                        .copied_bytes
+                        .checked_add(size_of::<ScalarRange>())
                         .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "ASCII scalar progression",
+                            computation: "actual scalar copied bytes",
+                        })?;
+                    actual.initialized_bytes = actual
+                        .initialized_bytes
+                        .checked_add(size_of::<ScalarRange>())
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "actual scalar initialized bytes",
+                        })?;
+                    work = checked_add(work, 1, "range copy work")?;
+                    actual.work =
+                        u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+                            computation: "actual scalar build work as u64",
                         })?;
                 }
+                enforce_build(work, limits.max_build_work, BuildResource::Work)?;
             }
-            if end > 0x7F {
-                let retained = ScalarRange {
-                    start: start.max(0x80),
-                    end,
-                };
-                non_ascii
-                    .try_reserve(1)
-                    .map_err(|_| BuildError::AllocationFailed { additional: 1 })?;
-                non_ascii.push(retained);
-                work = checked_add(work, 1, "range copy work")?;
+            if source_ranges == 0 {
+                return Err(BuildError::EmptyClass);
             }
-            enforce_build(work, limits.max_build_work, BuildResource::Work)?;
-        }
-        if source_ranges == 0 {
-            return Err(BuildError::EmptyClass);
-        }
-        if repetition.is_run() {
-            work = checked_add(work, 1, "repetition configuration work")?;
-            enforce_build(work, limits.max_build_work, BuildResource::Work)?;
-        }
+            if repetition.is_run() {
+                work = checked_add(work, 1, "repetition configuration work")?;
+                actual.work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "actual scalar build work as u64",
+                })?;
+                enforce_build(work, limits.max_build_work, BuildResource::Work)?;
+            }
 
-        let range_payload_bytes = non_ascii
-            .len()
-            .checked_mul(size_of::<ScalarRange>())
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "range payload bytes",
-            })?;
-        let temporary_capacity_bytes = non_ascii
-            .capacity()
-            .checked_mul(size_of::<ScalarRange>())
-            .ok_or(BuildError::ArithmeticOverflow {
-            computation: "temporary range capacity bytes",
-        })?;
-        let persistent_bytes = size_of::<Self>().checked_add(range_payload_bytes).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "persistent scalar plan bytes",
-            },
-        )?;
-        let peak_bytes = persistent_bytes
-            .checked_add(temporary_capacity_bytes)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "scalar plan construction peak",
-            })?;
-        enforce_build(
-            temporary_capacity_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            let range_payload_bytes = non_ascii
+                .len()
+                .checked_mul(size_of::<ScalarRange>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "range payload bytes",
+                })?;
+            let temporary_capacity_bytes = non_ascii
+                .capacity()
+                .checked_mul(size_of::<ScalarRange>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "temporary range capacity bytes",
+                })?;
+            let persistent_bytes = size_of::<Self>().checked_add(range_payload_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent scalar plan bytes",
+                },
+            )?;
+            let peak_bytes = persistent_bytes
+                .checked_add(temporary_capacity_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "scalar plan construction peak",
+                })?;
+            enforce_build(
+                temporary_capacity_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
 
-        let retained_non_ascii_ranges = non_ascii.len();
-        let build = BuildAccounting {
-            source_ranges,
-            retained_non_ascii_ranges,
-            ascii_scalars,
-            repetition,
-            range_payload_bytes,
-            work,
-            temporary_capacity_bytes,
-            scratch_bytes: temporary_capacity_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            ascii,
-            non_ascii: non_ascii.into_boxed_slice(),
-            repetition,
-            build,
-        })
+            let retained_non_ascii_ranges = non_ascii.len();
+            let build = BuildAccounting {
+                source_ranges,
+                retained_non_ascii_ranges,
+                ascii_scalars,
+                repetition,
+                range_payload_bytes,
+                work,
+                temporary_capacity_bytes,
+                scratch_bytes: temporary_capacity_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            let plan = Self {
+                ascii,
+                non_ascii: non_ascii.into_boxed_slice(),
+                repetition,
+                build,
+            };
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "published scalar inline initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1795,6 +1900,58 @@ mod tests {
         UnicodeScalarAggregatePlan, binary_search_comparison_bound,
     };
     use crate::Window;
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_range_failure() {
+        let attempt = UnicodeScalarAggregatePlan::build_attempt(
+            [('a', 'c'), ('\u{80}', '\u{81}')],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let plan = attempt.into_plan();
+        let build = plan.build_accounting();
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(actual.copied_bytes, build.range_payload_bytes);
+        assert_eq!(
+            actual.initialized_bytes,
+            build
+                .range_payload_bytes
+                .checked_add(core::mem::size_of::<UnicodeScalarAggregatePlan>())
+                .unwrap()
+        );
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert!(actual.allocations > 0);
+        assert!(actual.allocated_bytes >= build.temporary_capacity_bytes);
+        assert!(actual.peak_bytes >= build.persistent_bytes);
+
+        let failure = UnicodeScalarAggregatePlan::build_attempt(
+            [('\u{80}', '\u{80}'), ('z', 'a')],
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::ReversedRange {
+                start: 'z',
+                end: 'a'
+            }
+        ));
+        let partial = failure.actual();
+        assert_eq!(partial.work, 2);
+        assert_eq!(partial.allocations, 1);
+        assert!(partial.allocated_bytes >= core::mem::size_of::<super::ScalarRange>());
+        assert_eq!(
+            partial.copied_bytes,
+            core::mem::size_of::<super::ScalarRange>()
+        );
+        assert_eq!(
+            partial.initialized_bytes,
+            core::mem::size_of::<super::ScalarRange>()
+        );
+        assert_eq!(partial.live_persistent_bytes, 0);
+        assert!(partial.peak_bytes > 0);
+    }
 
     fn dot_plan() -> UnicodeScalarAggregatePlan {
         UnicodeScalarAggregatePlan::build(

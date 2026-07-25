@@ -2,6 +2,8 @@
 
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 const ASCII_WORD_RANGES: [(u8, u8); 4] = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
 const ASCII_SPACE_RANGES: [(u8, u8); 2] = [(b'\t', b'\r'), (b' ', b' ')];
 
@@ -84,9 +86,25 @@ impl Budget {
 ///
 /// Captures may wrap any structural component because aggregate value
 /// operations erase them explicitly.
+#[cfg(test)]
 pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(crate) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<InspectionOutcome<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut budget = Budget::new(limit);
-    let root = transparent(hir, &mut budget)?;
+    inspect_with_budget(hir, &mut budget)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, budget.work))
+}
+
+fn inspect_with_budget<'a>(
+    hir: &'a Hir,
+    budget: &mut Budget,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    let root = transparent(hir, budget)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(budget.ineligible());
     };
@@ -102,8 +120,7 @@ pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
             final_word,
             right,
         ] => {
-            if !ascii_word_boundary(left, &mut budget)? || !ascii_word_boundary(right, &mut budget)?
-            {
+            if !ascii_word_boundary(left, budget)? || !ascii_word_boundary(right, budget)? {
                 return Ok(budget.ineligible());
             }
             (
@@ -118,14 +135,14 @@ pub(crate) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
         _ => return Ok(budget.ineligible()),
     };
 
-    if !greedy_nonempty_exact_class(body[0], &ASCII_WORD_RANGES, &mut budget)?
-        || !greedy_nonempty_exact_class(body[1], &ASCII_SPACE_RANGES, &mut budget)?
-        || !greedy_nonempty_exact_class(body[3], &ASCII_SPACE_RANGES, &mut budget)?
-        || !greedy_nonempty_exact_class(body[4], &ASCII_WORD_RANGES, &mut budget)?
+    if !greedy_nonempty_exact_class(body[0], &ASCII_WORD_RANGES, budget)?
+        || !greedy_nonempty_exact_class(body[1], &ASCII_SPACE_RANGES, budget)?
+        || !greedy_nonempty_exact_class(body[3], &ASCII_SPACE_RANGES, budget)?
+        || !greedy_nonempty_exact_class(body[4], &ASCII_WORD_RANGES, budget)?
     {
         return Ok(budget.ineligible());
     }
-    let Some(literal) = word_literal(body[2], &mut budget)? else {
+    let Some(literal) = word_literal(body[2], budget)? else {
         return Ok(budget.ineligible());
     };
 

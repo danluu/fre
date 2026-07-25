@@ -26,6 +26,10 @@ pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-dp.v1
 pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-dp.v1";
 /// Stable identity for the span-sum-specialized plan.
 pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.reverse-dense-ac-dp.v1";
+/// Version of the receipt-bearing dense construction protocol.
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+/// Version of the partial-actual dense construction ledger.
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 
 /// Whole-operation reducer selected at construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +390,357 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Immutable identity and caller envelope for one dense construction attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptIdentity {
+    pub algorithm_id: &'static str,
+    pub plan_id: &'static str,
+    pub operation: Operation,
+    pub limits: BuildLimits,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+}
+
+/// Exact effects committed through the last admitted dense construction step.
+///
+/// `allocated_bytes` is cumulative over successful capacity-changing reserve
+/// calls. `live_*` and `peak_bytes` use observed capacities and include the
+/// inline plan representation, while `work` is charged only at explicit
+/// construction visits. None of these fields is reconstructed from
+/// [`BuildAccounting::build_work_upper_bound`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BuildAttemptActual {
+    pub work: u64,
+    pub allocations: usize,
+    pub allocated_bytes: usize,
+    pub copied_bytes: usize,
+    pub initialized_bytes: usize,
+    pub live_persistent_bytes: usize,
+    pub live_scratch_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// One success-or-failure dense construction receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptReceipt {
+    identity: BuildAttemptIdentity,
+    actual: BuildAttemptActual,
+    accounting: Option<BuildAccounting>,
+    published: bool,
+}
+
+impl BuildAttemptReceipt {
+    #[must_use]
+    pub const fn identity(&self) -> BuildAttemptIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn actual(&self) -> BuildAttemptActual {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn accounting(&self) -> Option<BuildAccounting> {
+        self.accounting
+    }
+
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    #[must_use]
+    pub fn contains_actual(&self) -> bool {
+        self.identity.algorithm_id == ALGORITHM_ID
+            && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
+            && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
+            && self.actual.work <= self.identity.limits.max_build_work
+            && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
+            && self.actual.live_scratch_bytes <= self.identity.limits.max_scratch_bytes
+            && self.actual.peak_bytes <= self.identity.limits.max_peak_bytes
+            && self.actual.copied_bytes <= self.actual.initialized_bytes
+            && self.actual.peak_bytes
+                >= self
+                    .actual
+                    .live_persistent_bytes
+                    .saturating_add(self.actual.live_scratch_bytes)
+    }
+
+    fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
+        self.published
+            && self.identity.operation == operation
+            && self.identity.plan_id
+                == match operation {
+                    Operation::Count => COUNT_PLAN_ID,
+                    Operation::SpanSum => SPAN_SUM_PLAN_ID,
+                }
+            && self.accounting == Some(accounting)
+            && self.contains_actual()
+            && self.actual.work <= accounting.build_work_upper_bound
+            && self.actual.live_persistent_bytes == accounting.persistent_bytes
+            && self.actual.live_scratch_bytes == 0
+            && self.actual.peak_bytes <= accounting.peak_bytes
+    }
+
+    fn closes_failure(&self) -> bool {
+        !self.published && self.accounting.is_none() && self.contains_actual()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildFailureKind {
+    EmptyPatternSet,
+    PatternLimit,
+    PatternBytesLimit,
+    IdentityBytesLimit,
+    TrieStatesLimit,
+    DfaCellsLimit,
+    WorkLimit,
+    ScratchLimit,
+    PersistentLimit,
+    PeakLimit,
+    RepresentationLimit,
+    AllocationFailed,
+    InternalInvariant,
+    ArithmeticOverflow,
+}
+
+impl BuildFailureKind {
+    const fn from_error(error: &BuildError) -> Self {
+        match error {
+            BuildError::EmptyPatternSet => Self::EmptyPatternSet,
+            BuildError::PatternLimit { .. } => Self::PatternLimit,
+            BuildError::PatternBytesLimit { .. } => Self::PatternBytesLimit,
+            BuildError::IdentityBytesLimit { .. } => Self::IdentityBytesLimit,
+            BuildError::TrieStatesLimit { .. } => Self::TrieStatesLimit,
+            BuildError::DfaCellsLimit { .. } => Self::DfaCellsLimit,
+            BuildError::WorkLimit { .. } => Self::WorkLimit,
+            BuildError::ScratchLimit { .. } => Self::ScratchLimit,
+            BuildError::PersistentLimit { .. } => Self::PersistentLimit,
+            BuildError::PeakLimit { .. } => Self::PeakLimit,
+            BuildError::RepresentationLimit { .. } => Self::RepresentationLimit,
+            BuildError::AllocationFailed { .. } => Self::AllocationFailed,
+            BuildError::InternalInvariant { .. } => Self::InternalInvariant,
+            BuildError::ArithmeticOverflow { .. } => Self::ArithmeticOverflow,
+        }
+    }
+}
+
+/// Terminal dense construction failure with its immutable partial actuals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildAttemptError {
+    source: BuildError,
+    receipt: BuildAttemptReceipt,
+    seal: BuildFailureKind,
+}
+
+impl BuildAttemptError {
+    fn new(source: BuildError, identity: BuildAttemptIdentity, actual: BuildAttemptActual) -> Self {
+        let seal = BuildFailureKind::from_error(&source);
+        Self {
+            source,
+            receipt: BuildAttemptReceipt {
+                identity,
+                actual,
+                accounting: None,
+                published: false,
+            },
+            seal,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &BuildError {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.seal == BuildFailureKind::from_error(&self.source) && self.receipt.closes_failure()
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> BuildError {
+        self.source
+    }
+}
+
+impl fmt::Display for BuildAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for BuildAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BuildAllocationClass {
+    Persistent,
+    Scratch,
+}
+
+struct BuildAttemptTracker {
+    limits: BuildLimits,
+    actual: BuildAttemptActual,
+}
+
+impl BuildAttemptTracker {
+    fn new(limits: BuildLimits) -> Self {
+        Self {
+            limits,
+            actual: BuildAttemptActual::default(),
+        }
+    }
+
+    fn publish_inline(&mut self, bytes: usize) -> Result<(), BuildError> {
+        let live_persistent_bytes = self.actual.live_persistent_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "published inline plan bytes",
+            },
+        )?;
+        let initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "published inline initialized bytes",
+            },
+        )?;
+        self.actual.live_persistent_bytes = live_persistent_bytes;
+        self.actual.initialized_bytes = initialized_bytes;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(live_persistent_bytes);
+        Ok(())
+    }
+
+    fn charge(&mut self, units: usize) -> Result<(), BuildError> {
+        let units = u64::try_from(units).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual build work as u64",
+        })?;
+        let needed = self
+            .actual
+            .work
+            .checked_add(units)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual build work",
+            })?;
+        if needed > self.limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed,
+                limit: self.limits.max_build_work,
+            });
+        }
+        self.actual.work = needed;
+        Ok(())
+    }
+
+    fn observe_copy(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.copied_bytes =
+            self.actual
+                .copied_bytes
+                .checked_add(bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual copied bytes",
+                })?;
+        self.observe_initialization(bytes)
+    }
+
+    fn observe_initialization(&mut self, bytes: usize) -> Result<(), BuildError> {
+        self.actual.initialized_bytes = self.actual.initialized_bytes.checked_add(bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "actual initialized bytes",
+            },
+        )?;
+        Ok(())
+    }
+
+    fn observe_reserve<T>(
+        &mut self,
+        before_capacity: usize,
+        after_capacity: usize,
+        class: BuildAllocationClass,
+    ) -> Result<(), BuildError> {
+        if after_capacity <= before_capacity {
+            return Ok(());
+        }
+        let before =
+            before_capacity
+                .checked_mul(size_of::<T>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "previous allocation capacity bytes",
+                })?;
+        let after =
+            after_capacity
+                .checked_mul(size_of::<T>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed allocation capacity bytes",
+                })?;
+        self.actual.allocations =
+            self.actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual build allocation count",
+                })?;
+        self.actual.allocated_bytes = self.actual.allocated_bytes.checked_add(after).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative allocated bytes",
+            },
+        )?;
+        let live = match class {
+            BuildAllocationClass::Persistent => &mut self.actual.live_persistent_bytes,
+            BuildAllocationClass::Scratch => &mut self.actual.live_scratch_bytes,
+        };
+        *live = live
+            .checked_sub(before)
+            .and_then(|bytes| bytes.checked_add(after))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "observed live allocation bytes",
+            })?;
+        self.observe_peak()
+    }
+
+    fn release<T>(
+        &mut self,
+        capacity: usize,
+        class: BuildAllocationClass,
+    ) -> Result<(), BuildError> {
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "released allocation capacity bytes",
+            })?;
+        let live = match class {
+            BuildAllocationClass::Persistent => &mut self.actual.live_persistent_bytes,
+            BuildAllocationClass::Scratch => &mut self.actual.live_scratch_bytes,
+        };
+        *live = live
+            .checked_sub(bytes)
+            .ok_or(BuildError::InternalInvariant {
+                detail: "released build capacity was live",
+            })?;
+        Ok(())
+    }
+
+    fn observe_peak(&mut self) -> Result<(), BuildError> {
+        let live = self
+            .actual
+            .live_persistent_bytes
+            .checked_add(self.actual.live_scratch_bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual construction live bytes",
+            })?;
+        self.actual.peak_bytes = self.actual.peak_bytes.max(live);
+        Ok(())
+    }
+}
+
 /// Typed complete-operation refusal. No partial reducer value is returned.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -535,10 +890,108 @@ pub struct OrderedLiteralSpanSumPlan {
     core: PlanCore,
 }
 
+/// Successful dense count-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct CountBuildAttempt {
+    plan: OrderedLiteralCountPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl CountBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &OrderedLiteralCountPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::Count, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (OrderedLiteralCountPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> OrderedLiteralCountPlan {
+        self.plan
+    }
+}
+
+/// Successful dense span-sum-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct SpanSumBuildAttempt {
+    plan: OrderedLiteralSpanSumPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl SpanSumBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &OrderedLiteralSpanSumPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::SpanSum, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (OrderedLiteralSpanSumPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> OrderedLiteralSpanSumPlan {
+        self.plan
+    }
+}
+
 impl OrderedLiteralCountPlan {
     /// Build an ordered finite-byte-language count plan.
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(CountBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact success or partial-failure construction
+    /// effects.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            algorithm_id: ALGORITHM_ID,
+            plan_id: COUNT_PLAN_ID,
+            operation: Operation::Count,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        };
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
+            |(core, receipt)| CountBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -583,7 +1036,35 @@ impl OrderedLiteralCountPlan {
 impl OrderedLiteralSpanSumPlan {
     /// Build an ordered finite-byte-language span-sum plan.
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(SpanSumBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    /// Build while retaining exact success or partial-failure construction
+    /// effects.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    pub fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
+        let identity = BuildAttemptIdentity {
+            algorithm_id: ALGORITHM_ID,
+            plan_id: SPAN_SUM_PLAN_ID,
+            operation: Operation::SpanSum,
+            limits,
+            algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+            accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        };
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity).map(
+            |(core, receipt)| SpanSumBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -663,201 +1144,296 @@ impl PlanCore {
         clippy::too_many_lines,
         reason = "construction keeps allocation/capacity checks adjacent to every owned buffer"
     )]
-    fn build<P: AsRef<[u8]>>(
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so reporting a failed allocation never needs another allocation"
+    )]
+    fn build_attempt<P: AsRef<[u8]>>(
         patterns: &[P],
         limits: BuildLimits,
         inline_bytes: usize,
-    ) -> Result<Self, BuildError> {
-        let preflight = preflight_build(patterns, limits, inline_bytes)?;
-        let mut encoded_patterns = reserve_vec::<u8>(preflight.identity_bytes, "cache identity")?;
-        encode_patterns(patterns, preflight.identity_bytes, &mut encoded_patterns)?;
+        identity: BuildAttemptIdentity,
+    ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
+        let mut tracker = BuildAttemptTracker::new(limits);
+        let result = (|| -> Result<Self, BuildError> {
+            let preflight = preflight_build(patterns, limits, inline_bytes)?;
+            let mut encoded_patterns = reserve_build_vec::<u8>(
+                preflight.identity_bytes,
+                "cache identity",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            encode_patterns(patterns, preflight.identity_bytes, &mut encoded_patterns)?;
+            tracker.charge(preflight.identity_bytes)?;
+            tracker.observe_copy(preflight.identity_bytes)?;
 
-        let mut transitions =
-            reserve_vec::<u32>(preflight.dfa_cells_upper_bound, "DFA transitions")?;
-        let mut output_pattern =
-            reserve_vec::<u32>(preflight.trie_states_upper_bound, "DFA output patterns")?;
-        let mut output_length =
-            reserve_vec::<u32>(preflight.trie_states_upper_bound, "DFA output lengths")?;
-        let mut terminal = reserve_vec::<u32>(preflight.trie_states_upper_bound, "trie terminals")?;
-        let mut failure = reserve_vec::<u32>(preflight.trie_states_upper_bound, "failure links")?;
-        let mut queue = VecDeque::<u32>::new();
-        queue
-            .try_reserve_exact(preflight.trie_states_upper_bound)
-            .map_err(|_| BuildError::AllocationFailed {
-                structure: "failure-link queue",
-                additional: preflight.trie_states_upper_bound,
-            })?;
-        let mut pattern_lengths = reserve_vec::<u32>(patterns.len(), "pattern lengths")?;
+            let mut transitions = reserve_build_vec::<u32>(
+                preflight.dfa_cells_upper_bound,
+                "DFA transitions",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut output_pattern = reserve_build_vec::<u32>(
+                preflight.trie_states_upper_bound,
+                "DFA output patterns",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut output_length = reserve_build_vec::<u32>(
+                preflight.trie_states_upper_bound,
+                "DFA output lengths",
+                BuildAllocationClass::Persistent,
+                &mut tracker,
+            )?;
+            let mut terminal = reserve_build_vec::<u32>(
+                preflight.trie_states_upper_bound,
+                "trie terminals",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
+            let mut failure = reserve_build_vec::<u32>(
+                preflight.trie_states_upper_bound,
+                "failure links",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
+            let mut queue = VecDeque::<u32>::new();
+            let queue_before = queue.capacity();
+            build_allocation_probe::before(
+                "failure-link queue",
+                preflight.trie_states_upper_bound,
+            )?;
+            queue
+                .try_reserve_exact(preflight.trie_states_upper_bound)
+                .map_err(|_| BuildError::AllocationFailed {
+                    structure: "failure-link queue",
+                    additional: preflight.trie_states_upper_bound,
+                })?;
+            tracker.observe_reserve::<u32>(
+                queue_before,
+                queue.capacity(),
+                BuildAllocationClass::Scratch,
+            )?;
+            let mut pattern_lengths = reserve_build_vec::<u32>(
+                patterns.len(),
+                "pattern lengths",
+                BuildAllocationClass::Scratch,
+                &mut tracker,
+            )?;
 
-        let persistent_bytes = inline_bytes
-            .checked_add(capacity_bytes(&transitions)?)
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&output_pattern).ok()?))
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&output_length).ok()?))
-            .and_then(|bytes| bytes.checked_add(encoded_patterns.capacity()))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "observed persistent capacity",
-            })?;
-        let queue_bytes = queue.capacity().checked_mul(size_of::<u32>()).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "failure queue capacity bytes",
-            },
-        )?;
-        let scratch_bytes = capacity_bytes(&terminal)?
-            .checked_add(capacity_bytes(&failure)?)
-            .and_then(|bytes| bytes.checked_add(queue_bytes))
-            .and_then(|bytes| bytes.checked_add(capacity_bytes(&pattern_lengths).ok()?))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "observed build scratch",
-            })?;
-        let peak_bytes =
-            persistent_bytes
-                .checked_add(scratch_bytes)
+            let persistent_bytes = inline_bytes
+                .checked_add(capacity_bytes(&transitions)?)
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&output_pattern).ok()?))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&output_length).ok()?))
+                .and_then(|bytes| bytes.checked_add(encoded_patterns.capacity()))
                 .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed persistent capacity",
+                })?;
+            let queue_bytes = queue.capacity().checked_mul(size_of::<u32>()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "failure queue capacity bytes",
+                },
+            )?;
+            let scratch_bytes = capacity_bytes(&terminal)?
+                .checked_add(capacity_bytes(&failure)?)
+                .and_then(|bytes| bytes.checked_add(queue_bytes))
+                .and_then(|bytes| bytes.checked_add(capacity_bytes(&pattern_lengths).ok()?))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "observed build scratch",
+                })?;
+            let peak_bytes = persistent_bytes.checked_add(scratch_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
                     computation: "observed build peak",
-                })?;
-        check_observed_build_limits(persistent_bytes, scratch_bytes, peak_bytes, limits)?;
+                },
+            )?;
+            check_observed_build_limits(persistent_bytes, scratch_bytes, peak_bytes, limits)?;
 
-        add_state(
-            preflight.alphabet_classes,
-            &mut transitions,
-            &mut output_pattern,
-            &mut output_length,
-            &mut terminal,
-            &mut failure,
-        )?;
-        for (pattern_index, pattern) in patterns.iter().enumerate() {
-            let bytes = pattern.as_ref();
-            let pattern_id =
-                u32::try_from(pattern_index).map_err(|_| BuildError::RepresentationLimit {
-                    structure: "pattern identifiers",
-                    needed: patterns.len(),
-                })?;
-            let pattern_len =
-                u32::try_from(bytes.len()).map_err(|_| BuildError::RepresentationLimit {
-                    structure: "pattern length",
-                    needed: bytes.len(),
-                })?;
-            checked_push(&mut pattern_lengths, pattern_len, "pattern length capacity")?;
-            let mut state = 0_usize;
-            for &byte in bytes.iter().rev() {
-                let class = usize::from(preflight.byte_classes[usize::from(byte)]);
-                let cell = state
-                    .checked_mul(preflight.alphabet_classes)
-                    .and_then(|base| base.checked_add(class))
-                    .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "trie transition cell",
+            add_state(
+                preflight.alphabet_classes,
+                &mut transitions,
+                &mut output_pattern,
+                &mut output_length,
+                &mut terminal,
+                &mut failure,
+                &mut tracker,
+            )?;
+            for (pattern_index, pattern) in patterns.iter().enumerate() {
+                tracker.charge(1)?;
+                let bytes = pattern.as_ref();
+                let pattern_id =
+                    u32::try_from(pattern_index).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "pattern identifiers",
+                        needed: patterns.len(),
                     })?;
-                let next = transitions[cell];
-                if next == UNSET {
-                    let new_state = output_pattern.len();
-                    let new_state_u32 =
-                        u32::try_from(new_state).map_err(|_| BuildError::RepresentationLimit {
-                            structure: "trie states",
-                            needed: new_state,
+                let pattern_len =
+                    u32::try_from(bytes.len()).map_err(|_| BuildError::RepresentationLimit {
+                        structure: "pattern length",
+                        needed: bytes.len(),
+                    })?;
+                checked_push(&mut pattern_lengths, pattern_len, "pattern length capacity")?;
+                tracker.observe_initialization(size_of::<u32>())?;
+                let mut state = 0_usize;
+                for &byte in bytes.iter().rev() {
+                    tracker.charge(1)?;
+                    let class = usize::from(preflight.byte_classes[usize::from(byte)]);
+                    let cell = state
+                        .checked_mul(preflight.alphabet_classes)
+                        .and_then(|base| base.checked_add(class))
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "trie transition cell",
                         })?;
-                    add_state(
-                        preflight.alphabet_classes,
-                        &mut transitions,
-                        &mut output_pattern,
-                        &mut output_length,
-                        &mut terminal,
-                        &mut failure,
-                    )?;
-                    transitions[cell] = new_state_u32;
-                    state = new_state;
-                } else {
-                    state = usize::try_from(next).expect("u32 state always fits usize");
+                    let next = transitions[cell];
+                    if next == UNSET {
+                        let new_state = output_pattern.len();
+                        let new_state_u32 = u32::try_from(new_state).map_err(|_| {
+                            BuildError::RepresentationLimit {
+                                structure: "trie states",
+                                needed: new_state,
+                            }
+                        })?;
+                        add_state(
+                            preflight.alphabet_classes,
+                            &mut transitions,
+                            &mut output_pattern,
+                            &mut output_length,
+                            &mut terminal,
+                            &mut failure,
+                            &mut tracker,
+                        )?;
+                        transitions[cell] = new_state_u32;
+                        state = new_state;
+                    } else {
+                        state = usize::try_from(next).expect("u32 state always fits usize");
+                    }
                 }
+                terminal[state] = terminal[state].min(pattern_id);
             }
-            terminal[state] = terminal[state].min(pattern_id);
-        }
 
-        output_pattern[0] = terminal[0];
-        if output_pattern[0] != UNSET {
-            output_length[0] = pattern_lengths
-                [usize::try_from(output_pattern[0]).expect("u32 pattern ID fits usize")];
-        }
-        for root_cell in transitions.iter_mut().take(preflight.alphabet_classes) {
-            let next = *root_cell;
-            if next == UNSET {
-                *root_cell = 0;
-            } else if next != 0 {
-                let next_index = usize::try_from(next).expect("u32 state always fits usize");
-                failure[next_index] = 0;
-                checked_queue_push(&mut queue, next)?;
+            output_pattern[0] = terminal[0];
+            if output_pattern[0] != UNSET {
+                output_length[0] = pattern_lengths
+                    [usize::try_from(output_pattern[0]).expect("u32 pattern ID fits usize")];
             }
-        }
-
-        while let Some(state_u32) = queue.pop_front() {
-            let state = usize::try_from(state_u32).expect("u32 state always fits usize");
-            let fail = usize::try_from(failure[state]).expect("u32 state always fits usize");
-            let inherited = output_pattern[fail];
-            output_pattern[state] = terminal[state].min(inherited);
-            if output_pattern[state] != UNSET {
-                let pattern =
-                    usize::try_from(output_pattern[state]).expect("u32 pattern ID fits usize");
-                output_length[state] = pattern_lengths[pattern];
-            }
-            for class in 0..preflight.alphabet_classes {
-                let cell = state
-                    .checked_mul(preflight.alphabet_classes)
-                    .and_then(|base| base.checked_add(class))
-                    .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "failure transition cell",
-                    })?;
-                let next = transitions[cell];
-                let fail_cell = fail
-                    .checked_mul(preflight.alphabet_classes)
-                    .and_then(|base| base.checked_add(class))
-                    .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "failure target cell",
-                    })?;
+            for root_cell in transitions.iter_mut().take(preflight.alphabet_classes) {
+                tracker.charge(1)?;
+                let next = *root_cell;
                 if next == UNSET {
-                    transitions[cell] = transitions[fail_cell];
-                } else {
+                    *root_cell = 0;
+                } else if next != 0 {
                     let next_index = usize::try_from(next).expect("u32 state always fits usize");
-                    failure[next_index] = transitions[fail_cell];
-                    checked_queue_push(&mut queue, next)?;
+                    failure[next_index] = 0;
+                    checked_queue_push(&mut queue, next, &mut tracker)?;
                 }
             }
-        }
 
-        let trie_states_actual = output_pattern.len();
-        let dfa_cells_actual = trie_states_actual
-            .checked_mul(preflight.alphabet_classes)
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "actual DFA cells",
-            })?;
-        debug_assert_eq!(transitions.len(), dfa_cells_actual);
-        let build = BuildAccounting {
-            patterns: patterns.len(),
-            pattern_bytes: preflight.pattern_bytes,
-            identity_bytes: preflight.identity_bytes,
-            identity_capacity_bytes: encoded_patterns.capacity(),
-            alphabet_classes: preflight.alphabet_classes,
-            trie_states_upper_bound: preflight.trie_states_upper_bound,
-            trie_states_actual,
-            dfa_cells_upper_bound: preflight.dfa_cells_upper_bound,
-            dfa_cells_actual,
-            build_work_upper_bound: preflight.build_work_upper_bound,
-            max_pattern_bytes: preflight.max_pattern_bytes,
-            min_nonempty_pattern_bytes: preflight.min_nonempty_pattern_bytes,
-            has_empty_pattern: preflight.has_empty_pattern,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            dfa: DenseReverseDfa {
-                byte_classes: preflight.byte_classes,
+            while let Some(state_u32) = queue.pop_front() {
+                tracker.charge(1)?;
+                let state = usize::try_from(state_u32).expect("u32 state always fits usize");
+                let fail = usize::try_from(failure[state]).expect("u32 state always fits usize");
+                let inherited = output_pattern[fail];
+                output_pattern[state] = terminal[state].min(inherited);
+                if output_pattern[state] != UNSET {
+                    let pattern =
+                        usize::try_from(output_pattern[state]).expect("u32 pattern ID fits usize");
+                    output_length[state] = pattern_lengths[pattern];
+                }
+                for class in 0..preflight.alphabet_classes {
+                    tracker.charge(1)?;
+                    let cell = state
+                        .checked_mul(preflight.alphabet_classes)
+                        .and_then(|base| base.checked_add(class))
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "failure transition cell",
+                        })?;
+                    let next = transitions[cell];
+                    let fail_cell = fail
+                        .checked_mul(preflight.alphabet_classes)
+                        .and_then(|base| base.checked_add(class))
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "failure target cell",
+                        })?;
+                    if next == UNSET {
+                        transitions[cell] = transitions[fail_cell];
+                    } else {
+                        let next_index =
+                            usize::try_from(next).expect("u32 state always fits usize");
+                        failure[next_index] = transitions[fail_cell];
+                        checked_queue_push(&mut queue, next, &mut tracker)?;
+                    }
+                }
+            }
+
+            let trie_states_actual = output_pattern.len();
+            let dfa_cells_actual = trie_states_actual
+                .checked_mul(preflight.alphabet_classes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual DFA cells",
+                })?;
+            debug_assert_eq!(transitions.len(), dfa_cells_actual);
+            let build = BuildAccounting {
+                patterns: patterns.len(),
+                pattern_bytes: preflight.pattern_bytes,
+                identity_bytes: preflight.identity_bytes,
+                identity_capacity_bytes: encoded_patterns.capacity(),
                 alphabet_classes: preflight.alphabet_classes,
-                transitions,
-                output_pattern,
-                output_length,
-            },
-            encoded_patterns,
-            build,
-        })
+                trie_states_upper_bound: preflight.trie_states_upper_bound,
+                trie_states_actual,
+                dfa_cells_upper_bound: preflight.dfa_cells_upper_bound,
+                dfa_cells_actual,
+                build_work_upper_bound: preflight.build_work_upper_bound,
+                max_pattern_bytes: preflight.max_pattern_bytes,
+                min_nonempty_pattern_bytes: preflight.min_nonempty_pattern_bytes,
+                has_empty_pattern: preflight.has_empty_pattern,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            let terminal_capacity = terminal.capacity();
+            let failure_capacity = failure.capacity();
+            let queue_capacity = queue.capacity();
+            let pattern_lengths_capacity = pattern_lengths.capacity();
+            drop(terminal);
+            drop(failure);
+            drop(queue);
+            drop(pattern_lengths);
+            tracker.release::<u32>(terminal_capacity, BuildAllocationClass::Scratch)?;
+            tracker.release::<u32>(failure_capacity, BuildAllocationClass::Scratch)?;
+            tracker.release::<u32>(queue_capacity, BuildAllocationClass::Scratch)?;
+            tracker.release::<u32>(pattern_lengths_capacity, BuildAllocationClass::Scratch)?;
+            tracker.publish_inline(inline_bytes)?;
+            Ok(Self {
+                dfa: DenseReverseDfa {
+                    byte_classes: preflight.byte_classes,
+                    alphabet_classes: preflight.alphabet_classes,
+                    transitions,
+                    output_pattern,
+                    output_length,
+                },
+                encoded_patterns,
+                build,
+            })
+        })();
+        match result {
+            Ok(core) => {
+                let receipt = BuildAttemptReceipt {
+                    identity,
+                    actual: tracker.actual,
+                    accounting: Some(core.build),
+                    published: true,
+                };
+                if !receipt.closes_success(identity.operation, core.build) {
+                    return Err(BuildAttemptError::new(
+                        BuildError::InternalInvariant {
+                            detail: "dense build success did not close its receipt",
+                        },
+                        identity,
+                        tracker.actual,
+                    ));
+                }
+                Ok((core, receipt))
+            }
+            Err(source) => Err(BuildAttemptError::new(source, identity, tracker.actual)),
+        }
     }
 
     fn preflight_reduce<T>(
@@ -1465,6 +2041,7 @@ fn add_state(
     output_length: &mut Vec<u32>,
     terminal: &mut Vec<u32>,
     failure: &mut Vec<u32>,
+    tracker: &mut BuildAttemptTracker,
 ) -> Result<(), BuildError> {
     let transition_end =
         transitions
@@ -1483,6 +2060,21 @@ fn add_state(
             detail: "pre-reserved trie/DFA capacity dominates every state growth",
         });
     }
+    tracker.charge(
+        alphabet_classes
+            .checked_add(4)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dense state initialization work",
+            })?,
+    )?;
+    tracker.observe_initialization(
+        alphabet_classes
+            .checked_add(4)
+            .and_then(|items| items.checked_mul(size_of::<u32>()))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dense state initialized bytes",
+            })?,
+    )?;
     transitions.extend(std::iter::repeat_n(UNSET, alphabet_classes));
     output_pattern.push(UNSET);
     output_length.push(0);
@@ -1529,24 +2121,93 @@ fn checked_push<T>(values: &mut Vec<T>, value: T, detail: &'static str) -> Resul
     Ok(())
 }
 
-fn checked_queue_push(queue: &mut VecDeque<u32>, value: u32) -> Result<(), BuildError> {
+fn checked_queue_push(
+    queue: &mut VecDeque<u32>,
+    value: u32,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<(), BuildError> {
     if queue.len() >= queue.capacity() {
         return Err(BuildError::InternalInvariant {
             detail: "failure queue reservation covers all trie states",
         });
     }
+    tracker.charge(1)?;
+    tracker.observe_initialization(size_of::<u32>())?;
     queue.push_back(value);
     Ok(())
 }
 
-fn reserve_vec<T>(additional: usize, structure: &'static str) -> Result<Vec<T>, BuildError> {
+#[cfg(not(test))]
+mod build_allocation_probe {
+    use super::BuildError;
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "production and test probes intentionally share one fallible call-site contract"
+    )]
+    pub(super) const fn before(
+        _structure: &'static str,
+        _additional: usize,
+    ) -> Result<(), BuildError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod build_allocation_probe {
+    use std::cell::Cell;
+
+    use super::BuildError;
+
+    std::thread_local! {
+        static FAIL_AT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_AT.set(usize::MAX);
+            CALLS.set(0);
+        }
+    }
+
+    pub(crate) fn fail_at(ordinal: usize) -> Guard {
+        FAIL_AT.set(ordinal);
+        CALLS.set(0);
+        Guard
+    }
+
+    pub(super) fn before(structure: &'static str, additional: usize) -> Result<(), BuildError> {
+        let ordinal = CALLS.get();
+        CALLS.set(ordinal.saturating_add(1));
+        if ordinal == FAIL_AT.get() {
+            return Err(BuildError::AllocationFailed {
+                structure,
+                additional,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn reserve_build_vec<T>(
+    additional: usize,
+    structure: &'static str,
+    class: BuildAllocationClass,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<Vec<T>, BuildError> {
     let mut values = Vec::new();
+    build_allocation_probe::before(structure, additional)?;
+    let before = values.capacity();
     values
         .try_reserve_exact(additional)
         .map_err(|_| BuildError::AllocationFailed {
             structure,
             additional,
         })?;
+    tracker.observe_reserve::<T>(before, values.capacity(), class)?;
     Ok(values)
 }
 
@@ -1650,8 +2311,76 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, ReduceError,
-        ReduceLimits, checked_dp_target_slot, previous_dp_ring_slot,
+        ReduceLimits, build_allocation_probe, checked_dp_target_slot, previous_dp_ring_slot,
     };
+
+    #[test]
+    fn build_attempt_receipts_close_success_and_partial_allocation_failure() {
+        let patterns = [b"ab".as_slice(), b"a".as_slice()];
+        let attempt =
+            OrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited()).unwrap();
+        assert!(attempt.closes());
+        let accounting = attempt.plan().build_accounting();
+        let receipt = attempt.receipt();
+        let actual = receipt.actual();
+        assert!(receipt.published());
+        assert_eq!(receipt.accounting(), Some(accounting));
+        assert!(actual.work > 0);
+        assert!(actual.work <= accounting.build_work_upper_bound);
+        assert!(actual.allocations > 0);
+        assert!(actual.allocated_bytes >= accounting.identity_capacity_bytes);
+        assert!(actual.copied_bytes > 0);
+        assert!(actual.initialized_bytes >= actual.copied_bytes);
+        assert_eq!(actual.live_persistent_bytes, accounting.persistent_bytes);
+        assert_eq!(actual.live_scratch_bytes, 0);
+
+        let guard = build_allocation_probe::fail_at(1);
+        let failure = OrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+            .unwrap_err();
+        drop(guard);
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed {
+                structure: "DFA transitions",
+                ..
+            }
+        ));
+        assert!(failure.closes());
+        let partial = failure.receipt().actual();
+        assert!(!failure.receipt().published());
+        assert_eq!(failure.receipt().accounting(), None);
+        assert_eq!(partial.allocations, 1);
+        assert!(partial.allocated_bytes > 0);
+        assert!(partial.work > 0);
+        assert!(partial.copied_bytes > 0);
+        assert_eq!(partial.initialized_bytes, partial.copied_bytes);
+
+        let guard = build_allocation_probe::fail_at(1);
+        let legacy =
+            OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap_err();
+        drop(guard);
+        assert!(matches!(
+            legacy,
+            BuildError::AllocationFailed {
+                structure: "DFA transitions",
+                ..
+            }
+        ));
+
+        let refusal = OrderedLiteralCountPlan::build_attempt(
+            &patterns,
+            BuildLimits {
+                max_persistent_bytes: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal.source(),
+            BuildError::PersistentLimit { .. }
+        ));
+        assert!(refusal.closes());
+    }
 
     #[test]
     fn rolling_dp_slots_match_direct_remainders() {
@@ -2071,6 +2800,11 @@ mod tests {
             assert!(
                 OrderedLiteralCountPlan::build(&patterns, limits).is_err(),
                 "one-below {label} unexpectedly built"
+            );
+            let terminal = OrderedLiteralCountPlan::build_attempt(&patterns, limits).unwrap_err();
+            assert!(
+                terminal.closes(),
+                "one-below {label} returned an unclosed attempt receipt: {terminal:?}"
             );
         }
     }

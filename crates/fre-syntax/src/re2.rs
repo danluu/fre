@@ -92,7 +92,7 @@ pub fn re2_surface_inventory() -> &'static [Re2Capability] {
 }
 
 pub(crate) fn parse_re2(request: ParseRequest) -> Result<ParseRecord, ParseError> {
-    let (pattern, profile, admission, safety) = request.into_parts();
+    let (pattern, profile, admission, safety, attempt_source_owner) = request.into_parts();
     let CompatibilityProfile::Re2(re2) = &profile else {
         unreachable!("dispatch validated profile")
     };
@@ -125,6 +125,7 @@ pub(crate) fn parse_re2(request: ParseRequest) -> Result<ParseRecord, ParseError
                         profile,
                         admission,
                         safety,
+                        attempt_source_owner,
                     },
                     admission_status: AdmissionStatus::from_policy(admission),
                     summary,
@@ -170,6 +171,7 @@ pub(crate) fn parse_re2(request: ParseRequest) -> Result<ParseRecord, ParseError
             profile,
             admission,
             safety,
+            attempt_source_owner,
         },
         admission_status: AdmissionStatus::from_policy(admission),
         summary: ParseSummary {

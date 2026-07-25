@@ -1601,14 +1601,14 @@ fn build_prefix_class_participation(
     }
     let inspection =
         inspect_prefix_class_alternation(hir, selection_work).map_err(|error| match error {
-            PrefixClassInspectionError::WorkLimit { needed, limit } => {
+            PrefixClassInspectionError::WorkLimit { needed, limit, .. } => {
                 CaptureBuildError::HirResource {
                     resource: "prefix/class participation work",
                     required: needed,
                     limit,
                 }
             }
-            PrefixClassInspectionError::Overflow => CaptureBuildError::InternalInvariant(
+            PrefixClassInspectionError::Overflow { .. } => CaptureBuildError::InternalInvariant(
                 "prefix/class participation inspection overflowed",
             ),
         })?;

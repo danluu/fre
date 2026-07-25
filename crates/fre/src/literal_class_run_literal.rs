@@ -2,6 +2,8 @@
 
 use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Inspection<'a> {
     pub prefix: &'a [u8],
@@ -62,9 +64,26 @@ impl Accounting {
 /// transparent because the aggregate facade exposes whole-match values only.
 /// Every node, literal byte, range, repetition-role check and boundary
 /// membership comparison is charged before it is inspected.
+#[cfg(test)]
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(super) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<InspectionOutcome<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut accounting = Accounting::default();
-    let root = peel_captures(hir, limit, &mut accounting)?;
+    inspect_with_accounting(hir, limit, &mut accounting)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
+}
+
+fn inspect_with_accounting<'a>(
+    hir: &'a Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    let root = peel_captures(hir, limit, accounting)?;
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -73,7 +92,7 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
         return Ok(accounting.ineligible());
     };
 
-    let prefix_hir = peel_captures(prefix_hir, limit, &mut accounting)?;
+    let prefix_hir = peel_captures(prefix_hir, limit, accounting)?;
     let HirKind::Literal(prefix) = prefix_hir.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -82,7 +101,7 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
         return Ok(accounting.ineligible());
     }
 
-    let repeated_hir = peel_captures(repeated_hir, limit, &mut accounting)?;
+    let repeated_hir = peel_captures(repeated_hir, limit, accounting)?;
     let HirKind::Repetition(repetition) = repeated_hir.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -90,7 +109,7 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
     if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
         return Ok(accounting.ineligible());
     }
-    let class_hir = peel_captures(&repetition.sub, limit, &mut accounting)?;
+    let class_hir = peel_captures(&repetition.sub, limit, accounting)?;
     let HirKind::Class(Class::Bytes(class)) = class_hir.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -99,7 +118,7 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
         return Ok(accounting.ineligible());
     }
 
-    let suffix_hir = peel_captures(suffix_hir, limit, &mut accounting)?;
+    let suffix_hir = peel_captures(suffix_hir, limit, accounting)?;
     let HirKind::Literal(suffix) = suffix_hir.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -110,8 +129,8 @@ pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, 
 
     let prefix_last = *prefix.0.last().ok_or(InspectionError::Overflow)?;
     let suffix_first = *suffix.0.first().ok_or(InspectionError::Overflow)?;
-    if class_contains(class, prefix_last, limit, &mut accounting)?
-        || class_contains(class, suffix_first, limit, &mut accounting)?
+    if class_contains(class, prefix_last, limit, accounting)?
+        || class_contains(class, suffix_first, limit, accounting)?
     {
         return Ok(accounting.ineligible());
     }

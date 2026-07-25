@@ -23,6 +23,8 @@ use core::{fmt, mem::size_of};
 use fre_exact_alloc::{CopyError, copy_exact, zeroed_exact};
 use memchr::memmem::{Finder, FinderBuilder};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "bounded-context-count.literal-interval-stream.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-context-count.count.v1";
 pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
@@ -39,7 +41,7 @@ impl ByteClass {
     fn from_ranges<I>(
         ranges: I,
         role: &'static str,
-        budget: &mut BuildTraversalBudget,
+        budget: &mut BuildTraversalBudget<'_>,
     ) -> Result<(Self, usize), BuildError>
     where
         I: IntoIterator<Item = (u8, u8)>,
@@ -323,15 +325,20 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-struct BuildTraversalBudget {
+struct BuildTraversalBudget<'a> {
     source_ranges: usize,
     work: usize,
     max_source_ranges: usize,
     max_work: usize,
+    actual_work: &'a mut u64,
 }
 
-impl BuildTraversalBudget {
-    fn new(literal_bytes: usize, limits: BuildLimits) -> Result<Self, BuildError> {
+impl<'a> BuildTraversalBudget<'a> {
+    fn new(
+        literal_bytes: usize,
+        limits: BuildLimits,
+        actual_work: &'a mut u64,
+    ) -> Result<Self, BuildError> {
         let work = literal_bytes
             .checked_mul(8)
             .and_then(|value| value.checked_add(64))
@@ -344,11 +351,15 @@ impl BuildTraversalBudget {
                 limit: limits.max_build_work,
             });
         }
+        *actual_work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual bounded-context work as u64",
+        })?;
         Ok(Self {
             source_ranges: 0,
             work,
             max_source_ranges: limits.max_source_ranges,
             max_work: limits.max_build_work,
+            actual_work,
         })
     }
 
@@ -379,7 +390,14 @@ impl BuildTraversalBudget {
         }
         self.source_ranges = source_ranges;
         self.work = work;
+        *self.actual_work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual bounded-context work as u64",
+        })?;
         Ok(())
+    }
+
+    const fn into_totals(self) -> (usize, usize) {
+        (self.source_ranges, self.work)
     }
 }
 
@@ -463,131 +481,191 @@ impl BoundedContextPlan {
         Separator: IntoIterator<Item = (u8, u8)>,
         Tail: IntoIterator<Item = (u8, u8)>,
     {
-        if literal.is_empty() {
-            return Err(BuildError::EmptyLiteral);
-        }
-        for (role, width) in [("prefix", prefix_width), ("tail", tail_width)] {
-            if width < MIN_FIXED_WIDTH {
-                return Err(BuildError::FixedWidthTooSmall {
-                    role,
-                    needed: width,
-                    minimum: MIN_FIXED_WIDTH,
-                });
-            }
-            if width > limits.max_repeat_bound {
-                return Err(BuildError::RepeatLimit {
-                    needed: width,
-                    limit: limits.max_repeat_bound,
-                });
-            }
-        }
-        for gap in [left_gap_max, right_gap_max] {
-            if gap > limits.max_gap_bound {
-                return Err(BuildError::GapLimit {
-                    needed: gap,
-                    limit: limits.max_gap_bound,
-                });
-            }
-        }
-        if literal.len() > limits.max_literal_bytes {
-            return Err(BuildError::LiteralLimit {
-                needed: literal.len(),
-                limit: limits.max_literal_bytes,
-            });
-        }
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
-                })?;
-        let peak_bytes =
-            persistent_bytes
-                .checked_add(literal.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "construction peak bytes",
-                })?;
-        if literal.len() > limits.max_scratch_bytes {
-            return Err(BuildError::ScratchLimit {
-                needed: literal.len(),
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        if peak_bytes > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
-
-        // Each actual yielded range is charged before validation or bitmap
-        // mutation. In particular, a caller-provided iterator's `len` or size
-        // hint is never trusted for either admission or accounting.
-        let mut budget = BuildTraversalBudget::new(literal.len(), limits)?;
-        let (prefix_class, prefix_ranges) = ByteClass::from_ranges(prefix, "prefix", &mut budget)?;
-        let (separator_class, separator_ranges) =
-            ByteClass::from_ranges(separator, "separator", &mut budget)?;
-        let (tail_class, tail_ranges) = ByteClass::from_ranges(tail, "tail", &mut budget)?;
-        if prefix_class.is_empty() {
-            return Err(BuildError::EmptyClass { role: "prefix" });
-        }
-        if separator_class.is_empty() {
-            return Err(BuildError::EmptyClass { role: "separator" });
-        }
-        if tail_class.is_empty() {
-            return Err(BuildError::EmptyClass { role: "tail" });
-        }
-        let source_ranges = budget.source_ranges;
-        let work = budget.work;
-        if separator_class.overlaps(prefix_class) {
-            return Err(BuildError::OverlappingSeparator { role: "prefix" });
-        }
-        if separator_class.overlaps(tail_class) {
-            return Err(BuildError::OverlappingSeparator { role: "tail" });
-        }
-        if separator_class.contains(literal[0]) {
-            return Err(BuildError::LiteralStartsInSeparator { byte: literal[0] });
-        }
-        if literal[1..].contains(&literal[0]) {
-            return Err(BuildError::OverlappingLiteral {
-                repeated_first: literal[0],
-            });
-        }
-        let owned = copy_exact(literal)
-            .map_err(|error| allocation_build_error(error, "retained literal", literal.len()))?;
-        let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
-        Ok(Self {
-            prefix: prefix_class,
-            separator: separator_class,
-            tail: tail_class,
-            finder,
+        Self::build_attempt(
+            prefix,
+            separator,
+            tail,
+            literal,
             prefix_width,
             left_gap_max,
             right_gap_max,
             tail_width,
-            build: BuildAccounting {
-                prefix_ranges,
-                separator_ranges,
-                tail_ranges,
-                source_ranges,
-                literal_bytes: literal.len(),
+            limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the bounded-context route with exact observed construction effects.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "construction keeps the complete admitted shape, exact attempt accounting, and publication adjacent"
+    )]
+    pub fn build_attempt<Prefix, Separator, Tail>(
+        prefix: Prefix,
+        separator: Separator,
+        tail: Tail,
+        literal: &[u8],
+        prefix_width: u32,
+        left_gap_max: u32,
+        right_gap_max: u32,
+        tail_width: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Prefix: IntoIterator<Item = (u8, u8)>,
+        Separator: IntoIterator<Item = (u8, u8)>,
+        Tail: IntoIterator<Item = (u8, u8)>,
+    {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if literal.is_empty() {
+                return Err(BuildError::EmptyLiteral);
+            }
+            for (role, width) in [("prefix", prefix_width), ("tail", tail_width)] {
+                if width < MIN_FIXED_WIDTH {
+                    return Err(BuildError::FixedWidthTooSmall {
+                        role,
+                        needed: width,
+                        minimum: MIN_FIXED_WIDTH,
+                    });
+                }
+                if width > limits.max_repeat_bound {
+                    return Err(BuildError::RepeatLimit {
+                        needed: width,
+                        limit: limits.max_repeat_bound,
+                    });
+                }
+            }
+            for gap in [left_gap_max, right_gap_max] {
+                if gap > limits.max_gap_bound {
+                    return Err(BuildError::GapLimit {
+                        needed: gap,
+                        limit: limits.max_gap_bound,
+                    });
+                }
+            }
+            if literal.len() > limits.max_literal_bytes {
+                return Err(BuildError::LiteralLimit {
+                    needed: literal.len(),
+                    limit: limits.max_literal_bytes,
+                });
+            }
+            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+            )?;
+            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "construction peak bytes",
+                },
+            )?;
+            if literal.len() > limits.max_scratch_bytes {
+                return Err(BuildError::ScratchLimit {
+                    needed: literal.len(),
+                    limit: limits.max_scratch_bytes,
+                });
+            }
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+
+            // Each actual yielded range is charged before validation or bitmap
+            // mutation. In particular, a caller-provided iterator's `len` or size
+            // hint is never trusted for either admission or accounting.
+            let mut budget = BuildTraversalBudget::new(literal.len(), limits, &mut actual.work)?;
+            let (prefix_class, prefix_ranges) =
+                ByteClass::from_ranges(prefix, "prefix", &mut budget)?;
+            let (separator_class, separator_ranges) =
+                ByteClass::from_ranges(separator, "separator", &mut budget)?;
+            let (tail_class, tail_ranges) = ByteClass::from_ranges(tail, "tail", &mut budget)?;
+            if prefix_class.is_empty() {
+                return Err(BuildError::EmptyClass { role: "prefix" });
+            }
+            if separator_class.is_empty() {
+                return Err(BuildError::EmptyClass { role: "separator" });
+            }
+            if tail_class.is_empty() {
+                return Err(BuildError::EmptyClass { role: "tail" });
+            }
+            let (source_ranges, work) = budget.into_totals();
+            if separator_class.overlaps(prefix_class) {
+                return Err(BuildError::OverlappingSeparator { role: "prefix" });
+            }
+            if separator_class.overlaps(tail_class) {
+                return Err(BuildError::OverlappingSeparator { role: "tail" });
+            }
+            if separator_class.contains(literal[0]) {
+                return Err(BuildError::LiteralStartsInSeparator { byte: literal[0] });
+            }
+            if literal[1..].contains(&literal[0]) {
+                return Err(BuildError::OverlappingLiteral {
+                    repeated_first: literal[0],
+                });
+            }
+            let owned = copy_exact(literal).map_err(|error| {
+                allocation_build_error(error, "retained literal", literal.len())
+            })?;
+            actual.allocations = 1;
+            actual.allocated_bytes = literal.len();
+            actual.copied_bytes = literal.len();
+            actual.initialized_bytes = literal.len();
+            actual.peak_bytes = literal.len();
+            let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
+            let plan = Self {
+                prefix: prefix_class,
+                separator: separator_class,
+                tail: tail_class,
+                finder,
                 prefix_width,
                 left_gap_max,
                 right_gap_max,
                 tail_width,
-                work,
-                temporary_capacity_bytes: literal.len(),
-                persistent_bytes,
-                peak_bytes,
-            },
-            bounded_affix: false,
-        })
+                build: BuildAccounting {
+                    prefix_ranges,
+                    separator_ranges,
+                    tail_ranges,
+                    source_ranges,
+                    literal_bytes: literal.len(),
+                    prefix_width,
+                    left_gap_max,
+                    right_gap_max,
+                    tail_width,
+                    work,
+                    temporary_capacity_bytes: literal.len(),
+                    persistent_bytes,
+                    peak_bytes,
+                },
+                bounded_affix: false,
+            };
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "published bounded-context inline initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     /// Build `LEFT MIDDLE{0,max} LITERAL RIGHT` for byte-mode Count.
@@ -608,121 +686,171 @@ impl BoundedContextPlan {
         Middle: IntoIterator<Item = (u8, u8)>,
         Right: IntoIterator<Item = (u8, u8)>,
     {
-        if literal.is_empty() {
-            return Err(BuildError::EmptyLiteral);
-        }
-        if middle_max > limits.max_gap_bound {
-            return Err(BuildError::GapLimit {
-                needed: middle_max,
-                limit: limits.max_gap_bound,
-            });
-        }
-        if literal.len() > limits.max_literal_bytes {
-            return Err(BuildError::LiteralLimit {
-                needed: literal.len(),
-                limit: limits.max_literal_bytes,
-            });
-        }
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal.len())
-                .ok_or(BuildError::ArithmeticOverflow {
+        Self::build_bounded_affix_attempt(left, middle, right, literal, middle_max, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the bounded-affix route with exact observed construction effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fail-closed affix construction keeps exact attempt accounting with quota and publication"
+    )]
+    pub fn build_bounded_affix_attempt<Left, Middle, Right>(
+        left: Left,
+        middle: Middle,
+        right: Right,
+        literal: &[u8],
+        middle_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Left: IntoIterator<Item = (u8, u8)>,
+        Middle: IntoIterator<Item = (u8, u8)>,
+        Right: IntoIterator<Item = (u8, u8)>,
+    {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if literal.is_empty() {
+                return Err(BuildError::EmptyLiteral);
+            }
+            if middle_max > limits.max_gap_bound {
+                return Err(BuildError::GapLimit {
+                    needed: middle_max,
+                    limit: limits.max_gap_bound,
+                });
+            }
+            if literal.len() > limits.max_literal_bytes {
+                return Err(BuildError::LiteralLimit {
+                    needed: literal.len(),
+                    limit: limits.max_literal_bytes,
+                });
+            }
+            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
                     computation: "bounded-affix persistent bytes",
-                })?;
-        let peak_bytes =
-            persistent_bytes
-                .checked_add(literal.len())
-                .ok_or(BuildError::ArithmeticOverflow {
+                },
+            )?;
+            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
                     computation: "bounded-affix construction peak bytes",
+                },
+            )?;
+            if literal.len() > limits.max_scratch_bytes {
+                return Err(BuildError::ScratchLimit {
+                    needed: literal.len(),
+                    limit: limits.max_scratch_bytes,
+                });
+            }
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+            let mut budget = BuildTraversalBudget::new(literal.len(), limits, &mut actual.work)?;
+            let (left, left_ranges) = ByteClass::from_ranges(left, "left", &mut budget)?;
+            let (middle, middle_ranges) = ByteClass::from_ranges(middle, "middle", &mut budget)?;
+            let (right, right_ranges) = ByteClass::from_ranges(right, "right", &mut budget)?;
+            if left.is_empty() {
+                return Err(BuildError::EmptyClass { role: "left" });
+            }
+            if middle.is_empty() {
+                return Err(BuildError::EmptyClass { role: "middle" });
+            }
+            if right.is_empty() {
+                return Err(BuildError::EmptyClass { role: "right" });
+            }
+            if middle.overlaps(left) {
+                return Err(BuildError::OverlappingSeparator {
+                    role: "bounded-affix left/middle",
+                });
+            }
+            if middle.overlaps(right) {
+                return Err(BuildError::OverlappingSeparator {
+                    role: "bounded-affix right/middle",
+                });
+            }
+            if let Some(&byte) = literal.iter().find(|&&byte| !middle.contains(byte)) {
+                return Err(BuildError::LiteralOutsideMiddle { byte });
+            }
+            let copy_charged_work =
+                budget
+                    .work
+                    .checked_add(literal.len())
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "bounded-affix literal copy work",
+                    })?;
+            if copy_charged_work > limits.max_build_work {
+                return Err(BuildError::WorkLimit {
+                    needed: copy_charged_work,
+                    limit: limits.max_build_work,
+                });
+            }
+            budget.work = copy_charged_work;
+            *budget.actual_work =
+                u64::try_from(copy_charged_work).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "actual bounded-affix work as u64",
                 })?;
-        if literal.len() > limits.max_scratch_bytes {
-            return Err(BuildError::ScratchLimit {
-                needed: literal.len(),
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        if peak_bytes > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
-        let mut budget = BuildTraversalBudget::new(literal.len(), limits)?;
-        let (left, left_ranges) = ByteClass::from_ranges(left, "left", &mut budget)?;
-        let (middle, middle_ranges) = ByteClass::from_ranges(middle, "middle", &mut budget)?;
-        let (right, right_ranges) = ByteClass::from_ranges(right, "right", &mut budget)?;
-        if left.is_empty() {
-            return Err(BuildError::EmptyClass { role: "left" });
-        }
-        if middle.is_empty() {
-            return Err(BuildError::EmptyClass { role: "middle" });
-        }
-        if right.is_empty() {
-            return Err(BuildError::EmptyClass { role: "right" });
-        }
-        if middle.overlaps(left) {
-            return Err(BuildError::OverlappingSeparator {
-                role: "bounded-affix left/middle",
-            });
-        }
-        if middle.overlaps(right) {
-            return Err(BuildError::OverlappingSeparator {
-                role: "bounded-affix right/middle",
-            });
-        }
-        if let Some(&byte) = literal.iter().find(|&&byte| !middle.contains(byte)) {
-            return Err(BuildError::LiteralOutsideMiddle { byte });
-        }
-        let copy_charged_work =
-            budget
-                .work
-                .checked_add(literal.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "bounded-affix literal copy work",
-                })?;
-        if copy_charged_work > limits.max_build_work {
-            return Err(BuildError::WorkLimit {
-                needed: copy_charged_work,
-                limit: limits.max_build_work,
-            });
-        }
-        budget.work = copy_charged_work;
-        let owned = copy_exact(literal).map_err(|error| {
-            allocation_build_error(error, "bounded-affix literal", literal.len())
-        })?;
-        let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
-        Ok(Self {
-            prefix: left,
-            separator: middle,
-            tail: right,
-            finder,
-            prefix_width: 1,
-            left_gap_max: middle_max,
-            right_gap_max: 0,
-            tail_width: 1,
-            build: BuildAccounting {
-                prefix_ranges: left_ranges,
-                separator_ranges: middle_ranges,
-                tail_ranges: right_ranges,
-                source_ranges: budget.source_ranges,
-                literal_bytes: literal.len(),
+            let (source_ranges, work) = budget.into_totals();
+            let owned = copy_exact(literal).map_err(|error| {
+                allocation_build_error(error, "bounded-affix literal", literal.len())
+            })?;
+            actual.allocations = 1;
+            actual.allocated_bytes = literal.len();
+            actual.copied_bytes = literal.len();
+            actual.initialized_bytes = literal.len();
+            actual.peak_bytes = literal.len();
+            let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
+            let plan = Self {
+                prefix: left,
+                separator: middle,
+                tail: right,
+                finder,
                 prefix_width: 1,
                 left_gap_max: middle_max,
                 right_gap_max: 0,
                 tail_width: 1,
-                work: budget.work,
-                temporary_capacity_bytes: literal.len(),
-                persistent_bytes,
-                peak_bytes,
-            },
-            bounded_affix: true,
-        })
+                build: BuildAccounting {
+                    prefix_ranges: left_ranges,
+                    separator_ranges: middle_ranges,
+                    tail_ranges: right_ranges,
+                    source_ranges,
+                    literal_bytes: literal.len(),
+                    prefix_width: 1,
+                    left_gap_max: middle_max,
+                    right_gap_max: 0,
+                    tail_width: 1,
+                    work,
+                    temporary_capacity_bytes: literal.len(),
+                    persistent_bytes,
+                    peak_bytes,
+                },
+                bounded_affix: true,
+            };
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "published bounded-affix inline initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+            Ok(plan)
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1647,6 +1775,75 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{BoundedContextPlan, BuildError, BuildLimits, ReduceError, ReduceLimits};
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_traversal_failure() {
+        let attempt = BoundedContextPlan::build_attempt(
+            [(b'a', b'z')],
+            [(b' ', b' ')],
+            [(b'a', b'z')],
+            b"R",
+            2,
+            2,
+            2,
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let plan = attempt.into_plan();
+        let build = plan.build_accounting();
+        assert_eq!(actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(actual.allocated_bytes, build.literal_bytes);
+        assert_eq!(actual.copied_bytes, build.literal_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.persistent_bytes);
+
+        let failure = BoundedContextPlan::build_attempt(
+            [(b'a', b'z')],
+            [(b'z', b'a')],
+            [(b'a', b'z')],
+            b"R",
+            2,
+            2,
+            2,
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::ReversedRange {
+                role: "separator",
+                start: b'z',
+                end: b'a'
+            }
+        ));
+        let partial = failure.actual();
+        assert_eq!(partial.work, 84);
+        assert_eq!(partial.allocations, 0);
+        assert_eq!(partial.allocated_bytes, 0);
+        assert_eq!(partial.copied_bytes, 0);
+        assert_eq!(partial.initialized_bytes, 0);
+        assert_eq!(partial.live_persistent_bytes, 0);
+        assert_eq!(partial.peak_bytes, 0);
+
+        let affix = BoundedContextPlan::build_bounded_affix_attempt(
+            [(b' ', b' ')],
+            [(b'a', b'z')],
+            [(b' ', b' ')],
+            b"ing",
+            12,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            affix.actual().work,
+            u64::try_from(affix.into_plan().build_accounting().work).unwrap()
+        );
+    }
 
     #[derive(Clone)]
     struct DeceptiveRanges<'a> {

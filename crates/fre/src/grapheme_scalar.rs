@@ -5,6 +5,8 @@
 
 use regex_syntax::hir::{Class, ClassUnicode, ClassUnicodeRange, Hir, HirKind};
 
+use crate::aggregate_construction::AggregateInspectionAttemptError;
+
 #[derive(Clone, Debug)]
 pub(super) struct Classes<'a> {
     pub control: &'a ClassUnicode,
@@ -51,16 +53,33 @@ pub(super) enum InspectionError {
 /// transparent whole-match annotations. Every HIR/range visit and every
 /// structural comparison is charged before it runs. Near misses retain their
 /// complete attempted work for the later-plan report.
+#[cfg(test)]
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
+    inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
+}
+
+pub(super) fn inspect_attempt(
+    hir: &Hir,
+    limit: usize,
+) -> Result<InspectionOutcome<'_>, AggregateInspectionAttemptError<InspectionError>> {
     let mut accounting = InspectionAccounting::default();
-    account_hir(hir, limit, &mut accounting)?;
-    let Some(mut classes) = inspect_shape(hir, limit, &mut accounting)? else {
+    inspect_with_accounting(hir, limit, &mut accounting)
+        .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
+}
+
+fn inspect_with_accounting<'a>(
+    hir: &'a Hir,
+    limit: usize,
+    accounting: &mut InspectionAccounting,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    account_hir(hir, limit, accounting)?;
+    let Some(mut classes) = inspect_shape(hir, limit, accounting)? else {
         return Ok(accounting.ineligible());
     };
-    if !validate_class_relationships(&classes, limit, &mut accounting)? {
+    if !validate_class_relationships(&classes, limit, accounting)? {
         return Ok(accounting.ineligible());
     }
-    reserve_spacing_derivation(&classes, limit, &mut accounting)?;
+    reserve_spacing_derivation(&classes, limit, accounting)?;
     classes.spacing_mark_ranges = SpacingMarkRanges::new(&classes).count();
     if classes.spacing_mark_ranges == 0 {
         return Ok(accounting.ineligible());

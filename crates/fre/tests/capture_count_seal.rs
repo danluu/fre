@@ -69,7 +69,7 @@ fn selector_builder() -> fre::CaptureBuilder {
     reason = "one identity audit intentionally names every nested U0-A selector field and construction-provenance invariant"
 )]
 fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
-    assert_eq!(AGGREGATE_CONTINUATION_ACCOUNTING_VERSION, 3);
+    assert_eq!(AGGREGATE_CONTINUATION_ACCOUNTING_VERSION, 4);
     assert_eq!(CAPTURE_COUNT_ALGORITHM_VERSION, 3);
     let regex = selector_builder().build().expect("selector Count build");
     let cloned = regex.clone();

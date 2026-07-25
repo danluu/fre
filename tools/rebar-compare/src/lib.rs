@@ -175,7 +175,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v34-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v35-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -3855,6 +3855,7 @@ fn require_composite_build_source_identity(
     pattern: &str,
     operation: AggregateOperation,
 ) -> Result<(), ExecutionError> {
+    require_closed_construction_attempt(report)?;
     let mut profile = rebar_profile();
     profile.options.unicode = false;
     profile.options.case_insensitive = false;
@@ -8060,6 +8061,7 @@ fn aggregate_run_limits_with_fixed_absolute(
     require_closed_fixed_absolute_domain_identity(report)?;
     require_closed_required_internal_anchor_identity(report)?;
     require_closed_url_aggregate_identity(report)?;
+    require_closed_construction_attempt(report)?;
     if matches!(
         report.build,
         AggregateBuildAccounting::FixedAbsoluteDomain(_)
@@ -9438,6 +9440,17 @@ fn require_closed_bounded_separated_fields_identity(
     ))
 }
 
+fn require_closed_construction_attempt(
+    report: &AggregateBuildReport,
+) -> Result<(), ExecutionError> {
+    if report.has_closed_construction_attempt() {
+        return Ok(());
+    }
+    Err(ExecutionError::fault(
+        "FRE aggregate construction identity mismatch: public/private closure is open",
+    ))
+}
+
 fn require_closed_fixed_absolute_domain_identity(
     report: &AggregateBuildReport,
 ) -> Result<(), ExecutionError> {
@@ -9484,6 +9497,7 @@ fn require_unicode_plan_identity(
     require_closed_fixed_absolute_domain_identity(report)?;
     require_closed_required_internal_anchor_identity(report)?;
     require_closed_url_aggregate_identity(report)?;
+    require_closed_construction_attempt(report)?;
     if report.plan == AggregatePlanKind::WordRun
         || matches!(report.build, AggregateBuildAccounting::WordRun(_))
         || matches!(report.plan_identity, AggregatePlanIdentity::WordRun(_))
@@ -16968,6 +16982,17 @@ mod tests {
         );
     }
 
+    fn assert_aggregate_construction_identity_fault(result: Result<(), ExecutionError>) {
+        let error = result.expect_err("forged whole-construction identity must fail");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("aggregate construction identity mismatch"),
+            "unexpected construction identity error: {error:?}"
+        );
+    }
+
     fn assert_bounded_separated_closure_faults(report: &AggregateBuildReport) {
         assert!(!report.has_closed_bounded_separated_fields_identity());
         assert_bounded_separated_identity_fault(require_unicode_plan_identity(
@@ -17055,6 +17080,28 @@ mod tests {
             false,
             LiteralAggregateOperation::Count,
         ));
+    }
+
+    fn reject_aggregate_construction_report<F>(base: &AggregateBuildReport, mutate: F)
+    where
+        F: FnOnce(&mut AggregateBuildReport),
+    {
+        let mut report = base.clone();
+        mutate(&mut report);
+        assert_aggregate_construction_identity_fault(require_unicode_plan_identity(
+            &report,
+            false,
+            LiteralAggregateOperation::Count,
+        ));
+        let error = aggregate_run_limits(31, &report, &RunLimits::default())
+            .expect_err("forged whole-construction identity must fail before limit derivation");
+        assert_eq!(error.status, Status::Fault);
+        assert!(
+            error
+                .message
+                .contains("aggregate construction identity mismatch"),
+            "unexpected construction limit error: {error:?}"
+        );
     }
 
     fn reject_bounded_separated_coherent_forgery<F>(base: &AggregateBuildReport, mutate: F)
@@ -17248,13 +17295,13 @@ mod tests {
         reject_bounded_separated_report(base, |report| {
             report.retained_capacity_bytes = report.retained_capacity_bytes.saturating_add(1);
         });
-        reject_bounded_separated_report(base, |report| {
+        reject_aggregate_construction_report(base, |report| {
             report.selection = AggregatePlanSelection::ForceContinuation;
         });
-        reject_bounded_separated_report(base, |report| {
+        reject_aggregate_construction_report(base, |report| {
             report.continuation_strategy = Some(AggregateStrategy::ReverseSequentialRows);
         });
-        reject_bounded_separated_report(base, |report| {
+        reject_aggregate_construction_report(base, |report| {
             report.operation = AggregateOperation::SpanSum;
         });
         assert_bounded_separated_identity_fault(require_unicode_plan_identity(
@@ -17694,7 +17741,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v34-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v35-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));

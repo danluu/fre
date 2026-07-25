@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
-    AggregateBuilder, AggregateCompileAttemptKind, AggregateEngineError, AggregateExecutionDetails,
-    AggregateExecutionSource, AggregateFixedAbsoluteDomainExecutionDetails, AggregatePlanIdentity,
-    AggregatePlanKind, AggregatePlanSelection, AggregateResource, AggregateRunLimits,
-    CompatibilityProfile, FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildResource,
+    AggregateBuilder, AggregateCacheIdentity, AggregateCompileAttemptKind,
+    AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateEngineError,
+    AggregateExecutionDetails, AggregateExecutionSource,
+    AggregateFixedAbsoluteDomainExecutionDetails, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, CompatibilityProfile,
+    FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildResource,
     FixedAbsoluteDomainReduceLimits, FixedAbsoluteDomainReduceResource,
 };
 use fre_syntax::AdmissionStatus;
@@ -50,23 +52,29 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
         168
     );
     assert_eq!(fre::AGGREGATE_CONTINUATION_MAX_ALLOCATIONS, 9);
-    // Exact typed fixed failures retain owner provenance, route limits, and
-    // complete nested P/A without a terminal-path allocation. Schema 34 adds
-    // one compact three-word exact-literal construction seal (needle bytes,
-    // observed temporary capacity, and masked origin).
-    assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_584);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_624);
+    // Schema 36 keeps the fixed-capacity construction ledger, full request,
+    // typed source, terminal receipt, and exact inline terminal authentication
+    // snapshots. These gates make a post-failure Box or an unreviewed further
+    // inline copy visible rather than moving it outside construction accounting.
+    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 800);
+    assert_eq!(
+        core::mem::size_of::<AggregateConstructionAttemptError>(),
+        7_928
+    );
+    assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_312);
+    assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 9_096);
+    assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_496);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 9_688);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
     // Exact success retains the independent kernel receipt beside accounting;
     // this is the public allocation-free ceiling for the enlarged enum.
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 728);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 64);
-    // Full public build/run provenance plus schema 34's independent WordRun,
-    // LiteralAssertions, BlockingDelimiter, and TokenPhrase policies remains
-    // allocation-free and nonduplicated.
-    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_496);
-    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 3_496);
+    // Full public build/run provenance plus the closed construction
+    // evidence remains fixed-size and adds no operation-time allocation.
+    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 9_832);
+    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 9_832);
 }
 
 #[test]
@@ -1159,6 +1167,17 @@ fn endpoint_u1_limits_remain_exact_in_every_full_cache_identity() {
             baseline.build_report().retained_capacity_bytes,
             changed.build_report().retained_capacity_bytes
         );
+        assert!(baseline.build_report().has_closed_construction_attempt());
+        assert!(changed.build_report().has_closed_construction_attempt());
+        assert_eq!(
+            baseline.build_report().build_limits,
+            AggregateBuildLimits::default()
+        );
+        assert_eq!(changed.build_report().build_limits, changed_build);
+        assert_ne!(
+            baseline.build_report().build_limits,
+            changed.build_report().build_limits
+        );
         if baseline.build_report().plan == AggregatePlanKind::FixedAbsoluteDomain {
             assert!(
                 baseline
@@ -1170,10 +1189,11 @@ fn endpoint_u1_limits_remain_exact_in_every_full_cache_identity() {
                     .build_report()
                     .has_closed_fixed_absolute_domain_identity()
             );
-            assert_ne!(baseline.build_report(), changed.build_report());
-        } else {
-            assert_eq!(baseline.build_report(), changed.build_report());
         }
+        // The whole-construction request authenticates every caller-supplied
+        // build limit even when the selected route does not consume one
+        // route-specific sub-envelope.
+        assert_ne!(baseline.build_report(), changed.build_report());
 
         let default_run = AggregateRunLimits::default();
         let mut changed_run = default_run;
@@ -1209,17 +1229,27 @@ fn endpoint_fixed_report_seal_rejects_public_discriminator_and_receipt_mutation(
         assert!(!report.has_closed_fixed_absolute_domain_identity());
     }
 
+    #[inline(never)]
+    fn rejected_mutation(
+        report: &AggregateBuildReport,
+        mutate: impl FnOnce(&mut AggregateBuildReport),
+    ) {
+        let mut changed = report.clone();
+        mutate(&mut changed);
+        rejected(changed);
+    }
+
     fn rejected_build(
         report: &AggregateBuildReport,
         mutate: impl FnOnce(&mut fre::AggregateFixedAbsoluteDomainBuildSummary),
     ) {
-        let mut changed = report.clone();
-        let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-            panic!("fixed report lost its build receipt");
-        };
-        mutate(&mut build);
-        changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-        rejected(changed);
+        rejected_mutation(report, |changed| {
+            let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
+                panic!("fixed report lost its build receipt");
+            };
+            mutate(&mut build);
+            changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
+        });
     }
 
     let report = rebar_builder(r"^((aaa)|(aa))$")
@@ -1230,121 +1260,88 @@ fn endpoint_fixed_report_seal_rejects_public_discriminator_and_receipt_mutation(
         .clone();
     assert!(report.has_closed_fixed_absolute_domain_identity());
 
-    let mut changed = report.clone();
-    changed.schema_version = changed.schema_version.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.selection = AggregatePlanSelection::ForceContinuation;
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.admission = match changed.admission {
-        AdmissionStatus::UpstreamOraclePending => AdmissionStatus::QuotaChecked,
-        AdmissionStatus::QuotaChecked => AdmissionStatus::UpstreamOraclePending,
-    };
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.syntax.hir_nodes = changed.syntax.hir_nodes.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let key = Arc::make_mut(&mut changed.syntax_key);
-    let CompatibilityProfile::RustBytes(profile) = &mut key.profile else {
-        panic!("fixed route must retain Rust bytes profile identity");
-    };
-    profile.options.unicode = !profile.options.unicode;
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.fixed_absolute_planner_work =
-        changed.fixed_absolute_planner_work.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.capture_erasure_work = changed.capture_erasure_work.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.captures_erased = changed.captures_erased.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.finite_planner_work = 1;
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.operation = fre::AggregateOperation::SpanSum;
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.plan = AggregatePlanKind::ContinuationProgram;
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.continuation_strategy = Some(fre::AggregateStrategy::ReverseSequentialRows);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    changed.retained_capacity_bytes = changed.retained_capacity_bytes.checked_add(1).unwrap();
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
-        panic!("fixed report lost its identity");
-    };
-    identity.kernel.algorithm_version = identity.kernel.algorithm_version.checked_add(1).unwrap();
-    changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
-        panic!("fixed report lost its identity");
-    };
-    identity.kernel.accounting_version = identity.kernel.accounting_version.checked_add(1).unwrap();
-    changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
-        panic!("fixed report lost its identity");
-    };
-    identity.kernel.residual = fre::FixedAbsoluteDomainResidual::PrepublishedContinuation;
-    changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("fixed report lost its build receipt");
-    };
-    build.has_residual = true;
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("fixed report lost its build receipt");
-    };
-    build.actual.published = false;
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
-
-    let mut changed = report.clone();
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("fixed report lost its build receipt");
-    };
-    build.actual.persistent_bytes = build.actual.persistent_bytes.checked_add(1).unwrap();
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
-
-    let mut changed = report;
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("fixed report lost its build receipt");
-    };
-    build.actual.peak_bytes = build.actual.peak_bytes.checked_add(1).unwrap();
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
+    rejected_mutation(&report, |changed| {
+        changed.schema_version = changed.schema_version.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        changed.selection = AggregatePlanSelection::ForceContinuation;
+    });
+    rejected_mutation(&report, |changed| {
+        changed.admission = match changed.admission {
+            AdmissionStatus::UpstreamOraclePending => AdmissionStatus::QuotaChecked,
+            AdmissionStatus::QuotaChecked => AdmissionStatus::UpstreamOraclePending,
+        };
+    });
+    rejected_mutation(&report, |changed| {
+        changed.syntax.hir_nodes = changed.syntax.hir_nodes.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        let key = Arc::make_mut(&mut changed.syntax_key);
+        let CompatibilityProfile::RustBytes(profile) = &mut key.profile else {
+            panic!("fixed route must retain Rust bytes profile identity");
+        };
+        profile.options.unicode = !profile.options.unicode;
+    });
+    rejected_mutation(&report, |changed| {
+        changed.fixed_absolute_planner_work =
+            changed.fixed_absolute_planner_work.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        changed.capture_erasure_work = changed.capture_erasure_work.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        changed.captures_erased = changed.captures_erased.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        changed.finite_planner_work = 1;
+    });
+    rejected_mutation(&report, |changed| {
+        changed.operation = fre::AggregateOperation::SpanSum;
+    });
+    rejected_mutation(&report, |changed| {
+        changed.plan = AggregatePlanKind::ContinuationProgram;
+    });
+    rejected_mutation(&report, |changed| {
+        changed.continuation_strategy = Some(fre::AggregateStrategy::ReverseSequentialRows);
+    });
+    rejected_mutation(&report, |changed| {
+        changed.retained_capacity_bytes = changed.retained_capacity_bytes.checked_add(1).unwrap();
+    });
+    rejected_mutation(&report, |changed| {
+        let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
+            panic!("fixed report lost its identity");
+        };
+        identity.kernel.algorithm_version =
+            identity.kernel.algorithm_version.checked_add(1).unwrap();
+        changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
+    });
+    rejected_mutation(&report, |changed| {
+        let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
+            panic!("fixed report lost its identity");
+        };
+        identity.kernel.accounting_version =
+            identity.kernel.accounting_version.checked_add(1).unwrap();
+        changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
+    });
+    rejected_mutation(&report, |changed| {
+        let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
+            panic!("fixed report lost its identity");
+        };
+        identity.kernel.residual = fre::FixedAbsoluteDomainResidual::PrepublishedContinuation;
+        changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
+    });
+    rejected_build(&report, |build| {
+        build.has_residual = true;
+    });
+    rejected_build(&report, |build| {
+        build.actual.published = false;
+    });
+    rejected_build(&report, |build| {
+        build.actual.persistent_bytes = build.actual.persistent_bytes.checked_add(1).unwrap();
+    });
+    rejected_build(&report, |build| {
+        build.actual.peak_bytes = build.actual.peak_bytes.checked_add(1).unwrap();
+    });
 
     let scalar = rebar_builder(r"^.{249}$")
         .build_count()
@@ -1353,33 +1350,26 @@ fn endpoint_fixed_report_seal_rejects_public_discriminator_and_receipt_mutation(
         .clone();
     assert!(scalar.has_closed_fixed_absolute_domain_identity());
 
-    let mut changed = scalar.clone();
-    changed.continuation_strategy = None;
-    rejected(changed);
-
-    let mut changed = scalar.clone();
-    let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
-        panic!("scalar report lost its identity");
-    };
-    identity.residual = None;
-    changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
-    rejected(changed);
-
-    let mut changed = scalar.clone();
-    let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
-        panic!("scalar report lost its identity");
-    };
-    identity.residual_strategy = None;
-    changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
-    rejected(changed);
-
-    let mut changed = scalar.clone();
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("scalar report lost its build receipt");
-    };
-    build.has_residual = false;
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
+    rejected_mutation(&scalar, |changed| {
+        changed.continuation_strategy = None;
+    });
+    rejected_mutation(&scalar, |changed| {
+        let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
+            panic!("scalar report lost its identity");
+        };
+        identity.residual = None;
+        changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
+    });
+    rejected_mutation(&scalar, |changed| {
+        let AggregatePlanIdentity::FixedAbsoluteDomain(mut identity) = changed.plan_identity else {
+            panic!("scalar report lost its identity");
+        };
+        identity.residual_strategy = None;
+        changed.plan_identity = AggregatePlanIdentity::FixedAbsoluteDomain(identity);
+    });
+    rejected_build(&scalar, |build| {
+        build.has_residual = false;
+    });
 
     rejected_build(&scalar, |build| {
         build.prospective.work = build.prospective.work.checked_add(1).unwrap();
@@ -1408,13 +1398,9 @@ fn endpoint_fixed_report_seal_rejects_public_discriminator_and_receipt_mutation(
     });
     rejected_build(&scalar, |build| build.actual.published = false);
 
-    let mut changed = scalar;
-    let AggregateBuildAccounting::FixedAbsoluteDomain(mut build) = changed.build else {
-        panic!("scalar report lost its build receipt");
-    };
-    build.has_residual = false;
-    changed.build = AggregateBuildAccounting::FixedAbsoluteDomain(build);
-    rejected(changed);
+    rejected_build(&scalar, |build| {
+        build.has_residual = false;
+    });
 }
 
 #[test]

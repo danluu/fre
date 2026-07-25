@@ -17,6 +17,8 @@ use core::{fmt, mem::size_of};
 use fre_exact_alloc::CopyError;
 use memchr::memchr2;
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "bounded-literal-pair.memchr2-finite-horizon.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-literal-pair.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "bounded-literal-pair.span-sum.unicode-off.v1";
@@ -454,7 +456,12 @@ impl ByteClass {
         Self([0; 4])
     }
 
-    fn insert_range(&mut self, start: u8, end: u8, work: &mut BuildWork) -> Result<(), BuildError> {
+    fn insert_range(
+        &mut self,
+        start: u8,
+        end: u8,
+        work: &mut BuildWork<'_>,
+    ) -> Result<(), BuildError> {
         let first_word = usize::from(start) / 64;
         let last_word = usize::from(end) / 64;
         for word in first_word..=last_word {
@@ -494,7 +501,7 @@ pub struct BoundedLiteralPairPlan {
 impl BoundedLiteralPairPlan {
     pub fn build<I>(
         left: &[u8],
-        mut ranges: I,
+        ranges: I,
         right: &[u8],
         gap_max: u32,
         limits: BuildLimits,
@@ -502,67 +509,109 @@ impl BoundedLiteralPairPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        validate_literals(left, right, gap_max, limits)?;
-        let literal_bytes =
-            left.len()
-                .checked_add(right.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "literal byte total",
-                })?;
-        enforce_build_usize(
-            literal_bytes,
-            limits.max_literal_bytes,
-            BuildResource::LiteralBytes,
-        )?;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal_bytes)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
-                })?;
-        let scratch_bytes = 0;
-        let peak_bytes = persistent_bytes;
-        enforce_build_usize(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build_usize(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build_usize(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+        Self::build_attempt(left, ranges, right, gap_max, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
 
-        let literal_work = literal_bytes
-            .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
-            .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "literal build work",
-            })?;
-        let mut work = BuildWork::new(limits.max_build_work);
-        work.charge(literal_work)?;
-        let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
-        let left_owned = copy_literal(left, "left literal")?;
-        let right_owned = copy_literal(right, "right literal")?;
-        Ok(Self {
-            left: left_owned,
-            right: right_owned,
-            class,
-            gap_max,
-            build: BuildAccounting {
-                left_bytes: left.len(),
-                right_bytes: right.len(),
+    /// Build while retaining exact successful or partial terminal effects.
+    pub fn build_attempt<I>(
+        left: &[u8],
+        mut ranges: I,
+        right: &[u8],
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            validate_literals(left, right, gap_max, limits)?;
+            let literal_bytes =
+                left.len()
+                    .checked_add(right.len())
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "literal byte total",
+                    })?;
+            enforce_build_usize(
                 literal_bytes,
-                class_ranges,
-                class_members,
-                gap_max,
-                work_upper_bound: work.used,
+                limits.max_literal_bytes,
+                BuildResource::LiteralBytes,
+            )?;
+            let persistent_bytes = size_of::<Self>().checked_add(literal_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+            )?;
+            let scratch_bytes = 0;
+            let peak_bytes = persistent_bytes;
+            enforce_build_usize(
                 scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build_usize(
                 persistent_bytes,
-                peak_bytes,
-            },
-        })
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build_usize(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+
+            let literal_work = literal_bytes
+                .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "literal build work",
+                })?;
+            let mut work = BuildWork::new(limits.max_build_work, &mut actual);
+            work.charge(literal_work)?;
+            let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
+            let work_upper_bound = work.used;
+            let left_owned = copy_literal(left, "left literal")?;
+            record_literal_copy(&mut actual, left_owned.len())?;
+            let right_owned = copy_literal(right, "right literal")?;
+            record_literal_copy(&mut actual, right_owned.len())?;
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "plan initialized bytes",
+                })?;
+            actual.live_persistent_bytes = actual
+                .live_persistent_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "plan live persistent bytes",
+                })?;
+            actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
+            debug_assert_eq!(actual.live_persistent_bytes, persistent_bytes);
+            Ok(Self {
+                left: left_owned,
+                right: right_owned,
+                class,
+                gap_max,
+                build: BuildAccounting {
+                    left_bytes: left.len(),
+                    right_bytes: right.len(),
+                    literal_bytes,
+                    class_ranges,
+                    class_members,
+                    gap_max,
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1001,7 +1050,7 @@ fn validate_literals(
 fn build_class<I>(
     ranges: &mut I,
     limits: BuildLimits,
-    work: &mut BuildWork,
+    work: &mut BuildWork<'_>,
 ) -> Result<(ByteClass, usize, usize), BuildError>
 where
     I: Iterator<Item = (u8, u8)>,
@@ -1054,14 +1103,19 @@ where
     Ok((class, range_count, members))
 }
 
-struct BuildWork {
+struct BuildWork<'a> {
     used: usize,
     limit: usize,
+    actual: &'a mut DirectBuildAttemptActual,
 }
 
-impl BuildWork {
-    const fn new(limit: usize) -> Self {
-        Self { used: 0, limit }
+impl<'a> BuildWork<'a> {
+    const fn new(limit: usize, actual: &'a mut DirectBuildAttemptActual) -> Self {
+        Self {
+            used: 0,
+            limit,
+            actual,
+        }
     }
     fn charge(&mut self, amount: usize) -> Result<(), BuildError> {
         let needed = self
@@ -1077,6 +1131,17 @@ impl BuildWork {
             });
         }
         self.used = needed;
+        self.actual.work = self
+            .actual
+            .work
+            .checked_add(
+                u64::try_from(amount).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "exact build work conversion",
+                })?,
+            )
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact build work",
+            })?;
         Ok(())
     }
 }
@@ -1121,6 +1186,49 @@ fn copy_literal(source: &[u8], structure: &'static str) -> Result<Box<[u8]>, Bui
                 bytes: source.len(),
             },
         })
+}
+
+fn record_literal_copy(
+    actual: &mut DirectBuildAttemptActual,
+    bytes: usize,
+) -> Result<(), BuildError> {
+    actual.allocations =
+        actual
+            .allocations
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact allocation count",
+            })?;
+    actual.allocated_bytes =
+        actual
+            .allocated_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact allocated bytes",
+            })?;
+    actual.copied_bytes =
+        actual
+            .copied_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact copied bytes",
+            })?;
+    actual.initialized_bytes =
+        actual
+            .initialized_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact initialized bytes",
+            })?;
+    actual.live_persistent_bytes =
+        actual
+            .live_persistent_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact live persistent bytes",
+            })?;
+    actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
+    Ok(())
 }
 
 fn enforce_upper_bounds(upper: ReduceUpperBounds, limits: ReduceLimits) -> Result<(), ReduceError> {
@@ -1581,5 +1689,45 @@ mod tests {
             huge.derive_upper_bounds(usize::MAX, Operation::SpanSum),
             Err(ReduceError::ArithmeticOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let attempt = BoundedLiteralPairPlan::build_attempt(
+            b"a",
+            [(b'x', b'x')].into_iter(),
+            b"b",
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 2);
+        assert_eq!(actual.allocated_bytes, build.literal_bytes);
+        assert_eq!(actual.copied_bytes, build.literal_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error = BoundedLiteralPairPlan::build_attempt(
+            b"a",
+            [(b'z', b'a')].into_iter(),
+            b"b",
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error.source(), BuildError::NonCanonicalClass));
+        assert_eq!(error.actual().work, 49);
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().allocated_bytes, 0);
+        assert_eq!(error.actual().copied_bytes, 0);
+        assert_eq!(error.actual().initialized_bytes, 0);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, 0);
     }
 }

@@ -10,6 +10,8 @@
 
 use core::{fmt, mem::size_of};
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "bounded-separated-fields-count.inline-byte-bitsets.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-separated-fields-count.count.v1";
 
@@ -383,16 +385,29 @@ impl ByteClass {
         source: AtomSource<'_>,
         alternative: usize,
         index: usize,
+        actual: &mut DirectBuildAttemptActual,
     ) -> Result<(Self, usize), BuildError> {
         let mut result = Self::default();
         let mut writes = 0_usize;
         match source {
             AtomSource::Singleton(byte) => {
+                charge_attempt_work(actual, 1)?;
                 result.insert(byte);
+                charge_attempt_work(actual, 1)?;
                 writes = 1;
             }
             AtomSource::Range(start, end) => {
-                writes = result.insert_range(start, end, alternative, index)?;
+                charge_attempt_work(actual, 1)?;
+                charge_attempt_work(actual, 1)?;
+                if start > end {
+                    return Err(BuildError::ReversedRange {
+                        alternative,
+                        index,
+                        start,
+                        end,
+                    });
+                }
+                writes = result.insert_range(start, end, actual)?;
             }
             AtomSource::Ranges(ranges) => {
                 if ranges.is_empty() {
@@ -400,7 +415,9 @@ impl ByteClass {
                 }
                 let mut previous_end = None;
                 for &(start, end) in ranges {
+                    charge_attempt_work(actual, 1)?;
                     if start > end {
+                        charge_attempt_work(actual, 1)?;
                         return Err(BuildError::ReversedRange {
                             alternative,
                             index,
@@ -408,11 +425,15 @@ impl ByteClass {
                             end,
                         });
                     }
-                    if previous_end.is_some_and(|previous| previous >= start) {
-                        return Err(BuildError::NonCanonicalRanges { alternative, index });
+                    charge_attempt_work(actual, 1)?;
+                    if let Some(previous) = previous_end {
+                        charge_attempt_work(actual, 1)?;
+                        if previous >= start {
+                            return Err(BuildError::NonCanonicalRanges { alternative, index });
+                        }
                     }
                     previous_end = Some(end);
-                    let words = result.insert_range(start, end, alternative, index)?;
+                    let words = result.insert_range(start, end, actual)?;
                     writes = writes
                         .checked_add(words)
                         .ok_or(BuildError::ArithmeticOverflow {
@@ -428,17 +449,9 @@ impl ByteClass {
         &mut self,
         start: u8,
         end: u8,
-        alternative: usize,
-        index: usize,
+        actual: &mut DirectBuildAttemptActual,
     ) -> Result<usize, BuildError> {
-        if start > end {
-            return Err(BuildError::ReversedRange {
-                alternative,
-                index,
-                start,
-                end,
-            });
-        }
+        debug_assert!(start <= end);
         let first = usize::from(start) >> 6;
         let last = usize::from(end) >> 6;
         for word in first..=last {
@@ -468,6 +481,7 @@ impl ByteClass {
                     computation: "bitmap last shift",
                 })?;
             self.0[word] |= first_mask & last_mask;
+            charge_attempt_work(actual, 1)?;
         }
         last.checked_sub(first)
             .and_then(|words| words.checked_add(1))
@@ -484,6 +498,23 @@ impl ByteClass {
     fn contains(self, byte: u8) -> bool {
         self.0[usize::from(byte) >> 6] & (1_u64 << (u32::from(byte) & 63)) != 0
     }
+}
+
+fn charge_attempt_work(
+    actual: &mut DirectBuildAttemptActual,
+    amount: usize,
+) -> Result<(), BuildError> {
+    actual.work = actual
+        .work
+        .checked_add(
+            u64::try_from(amount).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "exact build work conversion",
+            })?,
+        )
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "exact build work",
+        })?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -615,224 +646,268 @@ impl BoundedSeparatedFieldsPlan {
         fields: u32,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        if STRUCTURAL_BUILD_WORK > limits.max_build_work {
-            return Err(BuildError::WorkLimit {
-                needed: STRUCTURAL_BUILD_WORK,
-                limit: limits.max_build_work,
-            });
-        }
-        if !(2..=MAX_FIELDS).contains(&fields) {
-            return Err(BuildError::InvalidFieldCount { fields });
-        }
-        let alternative_count = usize::from(source.alternative_count);
-        if alternative_count == 0 || alternative_count > MAX_ALTERNATIVES {
-            return Err(BuildError::InvalidAlternativeCount {
-                alternatives: source.alternative_count,
-            });
-        }
+        Self::build_attempt(source, separator, fields, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
 
-        let mut atoms = 0_usize;
-        let mut optional_atoms = 0_usize;
-        let mut source_ranges = 0_usize;
-        for alternative_index in 0..alternative_count {
-            let alternative =
-                source.alternatives[alternative_index].ok_or(BuildError::MissingAlternative {
-                    index: alternative_index,
-                })?;
-            let atom_count = usize::from(alternative.atom_count);
-            if atom_count == 0 || atom_count > MAX_ATOMS {
-                return Err(BuildError::InvalidAtomCount {
-                    alternative: alternative_index,
-                    atoms: alternative.atom_count,
+    /// Build while retaining exact successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all fixed-array preflight and exact observed writes remain adjacent"
+    )]
+    pub fn build_attempt(
+        source: FieldSource<'_>,
+        separator: u8,
+        fields: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let scratch_bytes = size_of::<FieldSource<'_>>();
+        let mut actual = DirectBuildAttemptActual {
+            copied_bytes: scratch_bytes,
+            initialized_bytes: scratch_bytes,
+            peak_bytes: scratch_bytes,
+            ..DirectBuildAttemptActual::default()
+        };
+        let result = (|| {
+            if STRUCTURAL_BUILD_WORK > limits.max_build_work {
+                return Err(BuildError::WorkLimit {
+                    needed: STRUCTURAL_BUILD_WORK,
+                    limit: limits.max_build_work,
                 });
             }
-            if let Some(optional) = alternative.optional_index {
-                if usize::from(optional) >= atom_count {
-                    return Err(BuildError::InvalidOptional {
-                        alternative: alternative_index,
-                        index: optional,
-                    });
-                }
-                optional_atoms =
-                    optional_atoms
-                        .checked_add(1)
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "optional atom count",
-                        })?;
+            if !(2..=MAX_FIELDS).contains(&fields) {
+                return Err(BuildError::InvalidFieldCount { fields });
             }
-            atoms = atoms
-                .checked_add(atom_count)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "atom count",
-                })?;
-            for atom_index in 0..atom_count {
-                let atom = alternative.atoms[atom_index].ok_or(BuildError::MissingAtom {
-                    alternative: alternative_index,
-                    index: atom_index,
-                })?;
-                source_ranges = source_ranges.checked_add(atom.range_count()).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "source range count",
+            let alternative_count = usize::from(source.alternative_count);
+            if alternative_count == 0 || alternative_count > MAX_ALTERNATIVES {
+                return Err(BuildError::InvalidAlternativeCount {
+                    alternatives: source.alternative_count,
+                });
+            }
+
+            let mut atoms = 0_usize;
+            let mut optional_atoms = 0_usize;
+            let mut source_ranges = 0_usize;
+            for alternative_index in 0..alternative_count {
+                let alternative = source.alternatives[alternative_index].ok_or(
+                    BuildError::MissingAlternative {
+                        index: alternative_index,
                     },
                 )?;
-            }
-        }
-        if source_ranges > limits.max_source_ranges {
-            return Err(BuildError::RangeLimit {
-                needed: source_ranges,
-                limit: limits.max_source_ranges,
-            });
-        }
-        let work_bound = source_ranges
-            .checked_mul(7)
-            .and_then(|work| work.checked_add(STRUCTURAL_BUILD_WORK))
-            .and_then(|work| work.checked_add(atoms))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "build work bound",
-            })?;
-        if work_bound > limits.max_build_work {
-            return Err(BuildError::WorkLimit {
-                needed: work_bound,
-                limit: limits.max_build_work,
-            });
-        }
-        let persistent_bytes = size_of::<Self>();
-        let scratch_bytes = size_of::<FieldSource<'_>>();
-        let peak_bytes =
-            persistent_bytes
-                .checked_add(scratch_bytes)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "build peak bytes",
-                })?;
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        if peak_bytes > limits.max_peak_bytes {
-            return Err(BuildError::PeakLimit {
-                needed: peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
-
-        let mut alternatives = [Alternative::EMPTY; MAX_ALTERNATIVES];
-        let mut minimum_field_width = usize::MAX;
-        let mut maximum_field_width = 0_usize;
-        let mut exact_field_checks = 0_usize;
-        let mut prefix_field_checks = 0_usize;
-        let mut bitmap_word_writes = 0_usize;
-        for (alternative_index, destination) in
-            alternatives.iter_mut().enumerate().take(alternative_count)
-        {
-            let source_alternative =
-                source.alternatives[alternative_index].ok_or(BuildError::MissingAlternative {
-                    index: alternative_index,
-                })?;
-            let atom_count = usize::from(source_alternative.atom_count);
-            let mut built = Alternative {
-                atom_count: source_alternative.atom_count,
-                optional_index: source_alternative.optional_index.unwrap_or(NO_OPTIONAL),
-                ..Alternative::EMPTY
-            };
-            for atom_index in 0..atom_count {
-                let atom_source =
-                    source_alternative.atoms[atom_index].ok_or(BuildError::MissingAtom {
+                let atom_count = usize::from(alternative.atom_count);
+                if atom_count == 0 || atom_count > MAX_ATOMS {
+                    return Err(BuildError::InvalidAtomCount {
+                        alternative: alternative_index,
+                        atoms: alternative.atom_count,
+                    });
+                }
+                if let Some(optional) = alternative.optional_index {
+                    if usize::from(optional) >= atom_count {
+                        return Err(BuildError::InvalidOptional {
+                            alternative: alternative_index,
+                            index: optional,
+                        });
+                    }
+                    optional_atoms =
+                        optional_atoms
+                            .checked_add(1)
+                            .ok_or(BuildError::ArithmeticOverflow {
+                                computation: "optional atom count",
+                            })?;
+                }
+                atoms = atoms
+                    .checked_add(atom_count)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "atom count",
+                    })?;
+                for atom_index in 0..atom_count {
+                    let atom = alternative.atoms[atom_index].ok_or(BuildError::MissingAtom {
                         alternative: alternative_index,
                         index: atom_index,
                     })?;
-                let (atom, writes) = ByteClass::build(atom_source, alternative_index, atom_index)?;
-                if atom.contains(separator) {
-                    return Err(BuildError::SeparatorInField {
-                        alternative: alternative_index,
-                        index: atom_index,
-                        separator,
-                    });
+                    source_ranges = source_ranges.checked_add(atom.range_count()).ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "source range count",
+                        },
+                    )?;
                 }
-                built.atoms[atom_index] = atom;
-                bitmap_word_writes = bitmap_word_writes.checked_add(writes).ok_or(
-                    BuildError::ArithmeticOverflow {
-                        computation: "bitmap word writes",
-                    },
-                )?;
             }
-            minimum_field_width = minimum_field_width.min(built.minimum_width());
-            maximum_field_width = maximum_field_width.max(built.maximum_width());
-            exact_field_checks = exact_field_checks.checked_add(atom_count).ok_or(
+            if source_ranges > limits.max_source_ranges {
+                return Err(BuildError::RangeLimit {
+                    needed: source_ranges,
+                    limit: limits.max_source_ranges,
+                });
+            }
+            let work_bound = source_ranges
+                .checked_mul(7)
+                .and_then(|work| work.checked_add(STRUCTURAL_BUILD_WORK))
+                .and_then(|work| work.checked_add(atoms))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "build work bound",
+                })?;
+            if work_bound > limits.max_build_work {
+                return Err(BuildError::WorkLimit {
+                    needed: work_bound,
+                    limit: limits.max_build_work,
+                });
+            }
+            let persistent_bytes = size_of::<Self>();
+            let peak_bytes = persistent_bytes.checked_add(scratch_bytes).ok_or(
                 BuildError::ArithmeticOverflow {
-                    computation: "exact field checks",
+                    computation: "build peak bytes",
                 },
             )?;
-            let absent_checks = if built.optional_index == NO_OPTIONAL {
-                0
-            } else {
-                atom_count
-                    .checked_sub(1)
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+
+            charge_attempt_work(&mut actual, STRUCTURAL_BUILD_WORK)?;
+            let mut alternatives = [Alternative::EMPTY; MAX_ALTERNATIVES];
+            let mut minimum_field_width = usize::MAX;
+            let mut maximum_field_width = 0_usize;
+            let mut exact_field_checks = 0_usize;
+            let mut prefix_field_checks = 0_usize;
+            let mut bitmap_word_writes = 0_usize;
+            for (alternative_index, destination) in
+                alternatives.iter_mut().enumerate().take(alternative_count)
+            {
+                let source_alternative = source.alternatives[alternative_index].ok_or(
+                    BuildError::MissingAlternative {
+                        index: alternative_index,
+                    },
+                )?;
+                let atom_count = usize::from(source_alternative.atom_count);
+                let mut built = Alternative {
+                    atom_count: source_alternative.atom_count,
+                    optional_index: source_alternative.optional_index.unwrap_or(NO_OPTIONAL),
+                    ..Alternative::EMPTY
+                };
+                for atom_index in 0..atom_count {
+                    let atom_source =
+                        source_alternative.atoms[atom_index].ok_or(BuildError::MissingAtom {
+                            alternative: alternative_index,
+                            index: atom_index,
+                        })?;
+                    let (atom, writes) =
+                        ByteClass::build(atom_source, alternative_index, atom_index, &mut actual)?;
+                    charge_attempt_work(&mut actual, 1)?;
+                    if atom.contains(separator) {
+                        return Err(BuildError::SeparatorInField {
+                            alternative: alternative_index,
+                            index: atom_index,
+                            separator,
+                        });
+                    }
+                    built.atoms[atom_index] = atom;
+                    bitmap_word_writes = bitmap_word_writes.checked_add(writes).ok_or(
+                        BuildError::ArithmeticOverflow {
+                            computation: "bitmap word writes",
+                        },
+                    )?;
+                }
+                minimum_field_width = minimum_field_width.min(built.minimum_width());
+                maximum_field_width = maximum_field_width.max(built.maximum_width());
+                exact_field_checks = exact_field_checks.checked_add(atom_count).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "exact field checks",
+                    },
+                )?;
+                let absent_checks = if built.optional_index == NO_OPTIONAL {
+                    0
+                } else {
+                    atom_count
+                        .checked_sub(1)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "optional alternative required atoms",
+                        })?
+                };
+                prefix_field_checks = prefix_field_checks
+                    .checked_add(atom_count)
+                    .and_then(|checks| checks.checked_add(absent_checks))
                     .ok_or(BuildError::ArithmeticOverflow {
-                        computation: "optional alternative required atoms",
-                    })?
-            };
-            prefix_field_checks = prefix_field_checks
-                .checked_add(atom_count)
-                .and_then(|checks| checks.checked_add(absent_checks))
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "prefix field checks",
+                        computation: "prefix field checks",
+                    })?;
+                *destination = built;
+            }
+            let minimum_field_width_u8 =
+                u8::try_from(minimum_field_width).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "minimum field width",
                 })?;
-            *destination = built;
-        }
-        let minimum_field_width_u8 =
-            u8::try_from(minimum_field_width).map_err(|_| BuildError::ArithmeticOverflow {
-                computation: "minimum field width",
-            })?;
-        let maximum_field_width_u8 =
-            u8::try_from(maximum_field_width).map_err(|_| BuildError::ArithmeticOverflow {
-                computation: "maximum field width",
-            })?;
-        let bitmap_zero_writes = MAX_ALTERNATIVES
-            .checked_mul(MAX_ATOMS)
-            .and_then(|writes| writes.checked_mul(BITMAP_WORDS))
-            .and_then(|writes| {
-                atoms
-                    .checked_mul(BITMAP_WORDS)
-                    .and_then(|atom_writes| writes.checked_add(atom_writes))
+            let maximum_field_width_u8 =
+                u8::try_from(maximum_field_width).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "maximum field width",
+                })?;
+            let bitmap_zero_writes = MAX_ALTERNATIVES
+                .checked_mul(MAX_ATOMS)
+                .and_then(|writes| writes.checked_mul(BITMAP_WORDS))
+                .and_then(|writes| {
+                    atoms
+                        .checked_mul(BITMAP_WORDS)
+                        .and_then(|atom_writes| writes.checked_add(atom_writes))
+                })
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "bitmap zero writes",
+                })?;
+            let build = BuildAccounting {
+                alternatives: alternative_count,
+                atoms,
+                optional_atoms,
+                source_ranges,
+                fields,
+                separator,
+                minimum_field_width,
+                maximum_field_width,
+                structural_work: STRUCTURAL_BUILD_WORK,
+                range_inspections: source_ranges,
+                bitmap_zero_writes,
+                bitmap_word_writes,
+                separator_comparisons: atoms,
+                work_bound,
+                allocations: 0,
+                reserves: 0,
+                temporary_copies: 1,
+                scratch_bytes,
+                persistent_bytes,
+                peak_bytes,
+            };
+            debug_assert!(actual.work <= u64::try_from(work_bound).unwrap_or(u64::MAX));
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(persistent_bytes)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "exact initialized bytes",
+                })?;
+            actual.live_persistent_bytes = persistent_bytes;
+            actual.peak_bytes = peak_bytes;
+            Ok(Self {
+                alternatives,
+                alternative_count: source.alternative_count,
+                separator,
+                fields,
+                minimum_field_width: minimum_field_width_u8,
+                maximum_field_width: maximum_field_width_u8,
+                exact_field_checks,
+                prefix_field_checks,
+                build,
             })
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "bitmap zero writes",
-            })?;
-        let build = BuildAccounting {
-            alternatives: alternative_count,
-            atoms,
-            optional_atoms,
-            source_ranges,
-            fields,
-            separator,
-            minimum_field_width,
-            maximum_field_width,
-            structural_work: STRUCTURAL_BUILD_WORK,
-            range_inspections: source_ranges,
-            bitmap_zero_writes,
-            bitmap_word_writes,
-            separator_comparisons: atoms,
-            work_bound,
-            allocations: 0,
-            reserves: 0,
-            temporary_copies: 1,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
-        Ok(Self {
-            alternatives,
-            alternative_count: source.alternative_count,
-            separator,
-            fields,
-            minimum_field_width: minimum_field_width_u8,
-            maximum_field_width: maximum_field_width_u8,
-            exact_field_checks,
-            prefix_field_checks,
-            build,
-        })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -1686,5 +1761,43 @@ mod tests {
             BoundedSeparatedFieldsPlan::build(too_many, b'.', 4, BuildLimits::default()),
             Err(BuildError::InvalidAlternativeCount { .. })
         ));
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let attempt =
+            BoundedSeparatedFieldsPlan::build_attempt(ip_source(), b'.', 4, BuildLimits::default())
+                .unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        let source_bytes = core::mem::size_of::<FieldSource<'static>>();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, 353);
+        assert!(actual.work < u64::try_from(build.work_bound).unwrap());
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.allocated_bytes, 0);
+        assert_eq!(actual.copied_bytes, source_bytes);
+        assert_eq!(
+            actual.initialized_bytes,
+            source_bytes + build.persistent_bytes
+        );
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error = BoundedSeparatedFieldsPlan::build_attempt(
+            one_atom_source(AtomSource::Range(b'z', b'a'), false),
+            b'.',
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error.source(), BuildError::ReversedRange { .. }));
+        assert_eq!(error.actual().work, 322);
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().copied_bytes, source_bytes);
+        assert_eq!(error.actual().initialized_bytes, source_bytes);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, source_bytes);
     }
 }

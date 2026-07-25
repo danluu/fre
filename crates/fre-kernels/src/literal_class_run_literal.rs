@@ -15,6 +15,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
 
+use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+
 pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v1";
 pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v1";
 pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v1";
@@ -316,7 +318,12 @@ impl ByteClass {
         Self([0; 4])
     }
 
-    fn insert_range(&mut self, start: u8, end: u8, work: &mut BuildWork) -> Result<(), BuildError> {
+    fn insert_range(
+        &mut self,
+        start: u8,
+        end: u8,
+        work: &mut BuildWork<'_>,
+    ) -> Result<(), BuildError> {
         let first = usize::from(start) >> 6;
         let last = usize::from(end) >> 6;
         for word in first..=last {
@@ -354,88 +361,129 @@ pub struct LiteralClassRunLiteralPlan {
 impl LiteralClassRunLiteralPlan {
     pub fn build<I>(
         prefix: &[u8],
-        mut ranges: I,
+        ranges: I,
         suffix: &[u8],
         limits: BuildLimits,
     ) -> Result<Self, BuildError>
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        if prefix.is_empty() {
-            return Err(BuildError::EmptyPrefix);
-        }
-        if suffix.is_empty() {
-            return Err(BuildError::EmptySuffix);
-        }
-        let literal_bytes =
-            prefix
-                .len()
-                .checked_add(suffix.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "literal byte total",
-                })?;
-        enforce_build(
-            literal_bytes,
-            limits.max_literal_bytes,
-            BuildResource::LiteralBytes,
-        )?;
-        let scratch_bytes = 0;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(literal_bytes)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
-                })?;
-        let peak_bytes = persistent_bytes;
-        enforce_build(
-            scratch_bytes,
-            limits.max_scratch_bytes,
-            BuildResource::Scratch,
-        )?;
-        enforce_build(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            BuildResource::Persistent,
-        )?;
-        enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+        Self::build_attempt(prefix, ranges, suffix, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
 
-        let literal_work = literal_bytes
-            .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
-            .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "fixed plus literal build work",
-            })?;
-        let mut work = BuildWork::new(limits.max_build_work);
-        work.charge(literal_work)?;
-        let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
-        work.charge(2)?;
-        if class.contains(*prefix.last().ok_or(BuildError::EmptyPrefix)?) {
-            return Err(BuildError::PrefixBoundaryInClass);
-        }
-        if class.contains(*suffix.first().ok_or(BuildError::EmptySuffix)?) {
-            return Err(BuildError::SuffixBoundaryInClass);
-        }
-
-        let prefix = copy_literal(prefix, "prefix")?;
-        let suffix = copy_literal(suffix, "suffix")?;
-        let prefix_bytes = prefix.len();
-        let suffix_bytes = suffix.len();
-        Ok(Self {
-            prefix,
-            suffix,
-            class,
-            build: BuildAccounting {
-                prefix_bytes,
-                suffix_bytes,
+    /// Build while retaining exact successful or partial terminal effects.
+    pub fn build_attempt<I>(
+        prefix: &[u8],
+        mut ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        let mut actual = DirectBuildAttemptActual::default();
+        let result = (|| {
+            if prefix.is_empty() {
+                return Err(BuildError::EmptyPrefix);
+            }
+            if suffix.is_empty() {
+                return Err(BuildError::EmptySuffix);
+            }
+            let literal_bytes =
+                prefix
+                    .len()
+                    .checked_add(suffix.len())
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "literal byte total",
+                    })?;
+            enforce_build(
                 literal_bytes,
-                class_ranges,
-                class_members,
-                work_upper_bound: work.used,
+                limits.max_literal_bytes,
+                BuildResource::LiteralBytes,
+            )?;
+            let scratch_bytes = 0;
+            let persistent_bytes = size_of::<Self>().checked_add(literal_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+            )?;
+            let peak_bytes = persistent_bytes;
+            enforce_build(
                 scratch_bytes,
+                limits.max_scratch_bytes,
+                BuildResource::Scratch,
+            )?;
+            enforce_build(
                 persistent_bytes,
-                peak_bytes,
-            },
-        })
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+
+            let literal_work = literal_bytes
+                .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed plus literal build work",
+                })?;
+            let mut work = BuildWork::new(limits.max_build_work, &mut actual);
+            work.charge(literal_work)?;
+            let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
+            work.charge(2)?;
+            if class.contains(*prefix.last().ok_or(BuildError::EmptyPrefix)?) {
+                return Err(BuildError::PrefixBoundaryInClass);
+            }
+            if class.contains(*suffix.first().ok_or(BuildError::EmptySuffix)?) {
+                return Err(BuildError::SuffixBoundaryInClass);
+            }
+            let work_upper_bound = work.used;
+
+            let prefix = copy_literal(prefix, "prefix")?;
+            record_literal_copy(&mut actual, prefix.len())?;
+            let suffix = copy_literal(suffix, "suffix")?;
+            record_literal_copy(&mut actual, suffix.len())?;
+            let prefix_bytes = prefix.len();
+            let suffix_bytes = suffix.len();
+            actual.initialized_bytes = actual
+                .initialized_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "plan initialized bytes",
+                })?;
+            actual.live_persistent_bytes = actual
+                .live_persistent_bytes
+                .checked_add(size_of::<Self>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "plan live persistent bytes",
+                })?;
+            actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
+            debug_assert_eq!(actual.live_persistent_bytes, persistent_bytes);
+            Ok(Self {
+                prefix,
+                suffix,
+                class,
+                build: BuildAccounting {
+                    prefix_bytes,
+                    suffix_bytes,
+                    literal_bytes,
+                    class_ranges,
+                    class_members,
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
+            })
+        })();
+        match result {
+            Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+            Err(source) => {
+                actual.live_persistent_bytes = 0;
+                Err(DirectBuildAttemptError::new(source, actual))
+            }
+        }
     }
 
     #[must_use]
@@ -700,7 +748,7 @@ enum Operation {
 fn build_class<I>(
     ranges: &mut I,
     limits: BuildLimits,
-    work: &mut BuildWork,
+    work: &mut BuildWork<'_>,
 ) -> Result<(ByteClass, usize, usize), BuildError>
 where
     I: Iterator<Item = (u8, u8)>,
@@ -901,14 +949,19 @@ fn copy_literal(source: &[u8], structure: &'static str) -> Result<Box<[u8]>, Bui
         })
 }
 
-struct BuildWork {
+struct BuildWork<'a> {
     used: usize,
     limit: usize,
+    actual: &'a mut DirectBuildAttemptActual,
 }
 
-impl BuildWork {
-    const fn new(limit: usize) -> Self {
-        Self { used: 0, limit }
+impl<'a> BuildWork<'a> {
+    const fn new(limit: usize, actual: &'a mut DirectBuildAttemptActual) -> Self {
+        Self {
+            used: 0,
+            limit,
+            actual,
+        }
     }
 
     fn charge(&mut self, units: usize) -> Result<(), BuildError> {
@@ -925,6 +978,17 @@ impl BuildWork {
             });
         }
         self.used = needed;
+        self.actual.work = self
+            .actual
+            .work
+            .checked_add(
+                u64::try_from(units).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "exact build work conversion",
+                })?,
+            )
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact build work",
+            })?;
         Ok(())
     }
 }
@@ -951,6 +1015,49 @@ fn enforce_build(needed: usize, limit: usize, resource: BuildResource) -> Result
         BuildResource::Persistent => BuildError::PersistentLimit { needed, limit },
         BuildResource::Peak => BuildError::PeakLimit { needed, limit },
     })
+}
+
+fn record_literal_copy(
+    actual: &mut DirectBuildAttemptActual,
+    bytes: usize,
+) -> Result<(), BuildError> {
+    actual.allocations =
+        actual
+            .allocations
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact allocation count",
+            })?;
+    actual.allocated_bytes =
+        actual
+            .allocated_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact allocated bytes",
+            })?;
+    actual.copied_bytes =
+        actual
+            .copied_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact copied bytes",
+            })?;
+    actual.initialized_bytes =
+        actual
+            .initialized_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact initialized bytes",
+            })?;
+    actual.live_persistent_bytes =
+        actual
+            .live_persistent_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "exact live persistent bytes",
+            })?;
+    actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1325,5 +1432,43 @@ mod tests {
             plan.preflight(usize::MAX, Operation::SpanSum, ReduceLimits::unlimited()),
             Err(ReduceError::ArithmeticOverflow { .. })
         ));
+    }
+
+    #[test]
+    fn build_attempt_reports_exact_success_and_partial_failure() {
+        let attempt = LiteralClassRunLiteralPlan::build_attempt(
+            b"ab",
+            RANGES.into_iter(),
+            b"cd",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let actual = attempt.actual();
+        let (plan, returned_actual) = attempt.into_parts();
+        let build = plan.build_accounting();
+        assert_eq!(returned_actual, actual);
+        assert_eq!(actual.work, u64::try_from(build.work_upper_bound).unwrap());
+        assert_eq!(actual.allocations, 2);
+        assert_eq!(actual.allocated_bytes, build.literal_bytes);
+        assert_eq!(actual.copied_bytes, build.literal_bytes);
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        assert_eq!(actual.peak_bytes, build.peak_bytes);
+
+        let error = LiteralClassRunLiteralPlan::build_attempt(
+            b"a",
+            [(b'a', b'b')].into_iter(),
+            b"c",
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert!(matches!(error.source(), BuildError::PrefixBoundaryInClass));
+        assert_eq!(error.actual().work, 56);
+        assert_eq!(error.actual().allocations, 0);
+        assert_eq!(error.actual().allocated_bytes, 0);
+        assert_eq!(error.actual().copied_bytes, 0);
+        assert_eq!(error.actual().initialized_bytes, 0);
+        assert_eq!(error.actual().live_persistent_bytes, 0);
+        assert_eq!(error.actual().peak_bytes, 0);
     }
 }
