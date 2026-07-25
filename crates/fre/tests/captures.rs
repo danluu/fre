@@ -2833,16 +2833,38 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
         .unicode(true)
         .build()
         .expect("overlapping Unicode-word selector fits the bounded default");
-    assert_eq!(regex.build_report().selector.program_states, 390);
-    assert_eq!(regex.build_report().selector.temporary_states_peak, 390);
-    // Exact-vector certification on the current URI frontier retains 542,600
-    // bytes; the fixed terminal-frontier proof adds 56 bytes and the retained
-    // minimum-match-width proof adds one 16-byte Option<usize>, the retained
-    // start-domain proof adds one byte, and the complete fixed state-byte
-    // SpanSum Option slot adds 208 bytes, even when this Unicode plan is
+    let report = regex.build_report();
+    assert_eq!(report.selector.program_states, 390);
+    assert_eq!(report.selector.temporary_states_peak, 390);
+    // Reconstruct the protected boundary from this composed report. Each
+    // instruction owns its pinned 56-byte encoding plus two `usize`
+    // certificate entries. Repetitions 5..=14 materialize 95 copies of each
+    // 677-range Unicode class. All retained suffix/proof/route storage is
+    // added from the report, including the required-literal proof and both
+    // complete inline theorem slots even though this Unicode plan is
     // ineligible for those compact routes.
-    assert_eq!(regex.build_report().selector.program_bytes, 542_881);
-    assert!(regex.build_report().selector.work >= 126_986);
+    const ONE_STATE_ENVELOPE_BYTES: usize = 56 + 2 * core::mem::size_of::<usize>();
+    const SCALAR_STORAGE_BYTES: usize = 95 * 677 * 2 * core::mem::size_of::<u32>();
+    const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
+    let required_suffix_storage = report.selector.required_suffix_bytes
+        + report.selector.required_suffixes * core::mem::size_of::<usize>();
+    let retained_components = required_suffix_storage
+        + TERMINAL_FRONTIER_SEED_BYTES
+        + report.selector.minimum_match_bytes_proof_bytes
+        + usize::from(report.selector.start_domain_proof_bytes)
+        + report.selector.required_literal_proof_bytes
+        + report.selector.required_internal_anchor_persistent_bytes
+        + report.selector.url_aggregate_persistent_bytes
+        + report.selector.candidate_bytes
+        + report.selector.state_byte_span_sum_persistent_bytes
+        + report.selector.ordered_bounded_span_sum_persistent_bytes;
+    let expected_program_bytes = report.selector.program_states * ONE_STATE_ENVELOPE_BYTES
+        + SCALAR_STORAGE_BYTES
+        + retained_components;
+    assert_eq!(retained_components, 505);
+    assert_eq!(expected_program_bytes, 543_105);
+    assert_eq!(report.selector.program_bytes, expected_program_bytes);
+    assert!(report.selector.work >= 126_986);
 
     for haystack in [
         "abcdefghijklmn абвгдежзийклмн",

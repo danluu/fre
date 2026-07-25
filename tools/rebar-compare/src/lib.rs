@@ -20237,7 +20237,7 @@ mod tests {
         const SCALAR_RANGES_PER_CLASS: usize = 677;
         const SCALAR_STATES: usize = (5 + 14) * ALTERNATIVES / 2;
         const SCALAR_RANGE_BYTES: usize = 2 * core::mem::size_of::<u32>();
-        const COMPOSED_PROGRAM_STATES: usize = 389;
+        const COMPOSED_PROGRAM_STATES: usize = 390;
         const PINNED_INSTRUCTION_BYTES: usize = 56;
         const CERTIFICATE_ENTRIES_PER_STATE: usize = 2;
         const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
@@ -20421,8 +20421,8 @@ mod tests {
         let incremental_one_below = incremental_program_bytes - 1;
         let full_one_below = full_program_bytes - 1;
         assert_eq!(retained_components, 505);
-        assert_eq!(incremental_program_bytes, 542_961);
-        assert_eq!(full_program_bytes, 543_033);
+        assert_eq!(incremental_program_bytes, 543_033);
+        assert_eq!(full_program_bytes, 543_105);
         assert_eq!(default_report.selector.program_bytes, full_program_bytes);
 
         let limits_at = |max_program_bytes| RunLimits {
