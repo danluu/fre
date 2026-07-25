@@ -746,6 +746,8 @@ pub(crate) struct RequiredSuffixes {
     ends: ExactVec<usize>,
 }
 
+const UNICODE_SUFFIX_DOMAIN_TAG: usize = 1_usize << (usize::BITS - 1);
+
 impl Default for RequiredSuffixes {
     fn default() -> Self {
         Self {
@@ -759,6 +761,7 @@ impl RequiredSuffixes {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &[u8]> {
         let mut start = 0_usize;
         self.ends.iter().map(move |&end| {
+            let end = end & !UNICODE_SUFFIX_DOMAIN_TAG;
             let suffix = &self.bytes[start..end];
             start = end;
             suffix
@@ -767,6 +770,12 @@ impl RequiredSuffixes {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ends.is_empty()
+    }
+
+    pub(crate) fn prefers_sparse_verification(&self) -> bool {
+        self.ends
+            .first()
+            .is_some_and(|end| end & UNICODE_SUFFIX_DOMAIN_TAG != 0)
     }
 
     fn retained_bytes(&self) -> Result<usize, Error> {
@@ -3852,6 +3861,11 @@ enum SuffixAnalysis<'a> {
     Literals(SuffixSet<'a>),
     /// Every match ends in one member of this small canonical byte class.
     TerminalBytes(TerminalByteSet),
+    /// Every match ends in one member of this small canonical Unicode-scalar
+    /// domain. The original continuation program remains the semantic
+    /// authority; these encodings only decide which reverse rows can become
+    /// live.
+    UnicodeDomains(UnicodeSuffixDomains),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3871,6 +3885,131 @@ impl TerminalByteSet {
     fn iter(self) -> impl Iterator<Item = u8> {
         self.bytes.into_iter().take(self.len)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EncodedUnicodeSuffix {
+    bytes: [u8; 4],
+    len: u8,
+}
+
+impl EncodedUnicodeSuffix {
+    const EMPTY: Self = Self {
+        bytes: [0; 4],
+        len: 0,
+    };
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnicodeSuffixDomains {
+    suffixes: [EncodedUnicodeSuffix; MAX_REQUIRED_SUFFIXES],
+    len: usize,
+    bytes: usize,
+}
+
+impl UnicodeSuffixDomains {
+    fn iter(&self) -> impl Iterator<Item = &[u8]> {
+        self.suffixes[..self.len]
+            .iter()
+            .map(EncodedUnicodeSuffix::as_bytes)
+    }
+}
+
+fn unicode_scalar_range_width(start: char, end: char) -> Result<usize, Error> {
+    let start = u32::from(start);
+    let end = u32::from(end);
+    let raw = end
+        .checked_sub(start)
+        .and_then(|width| width.checked_add(1))
+        .ok_or(Error::ArithmeticOverflow {
+            resource: Resource::CompileWork,
+        })?;
+    let surrogate_start = start.max(0xD800);
+    let surrogate_end = end.min(0xDFFF);
+    let surrogates = if surrogate_start <= surrogate_end {
+        surrogate_end
+            .checked_sub(surrogate_start)
+            .and_then(|width| width.checked_add(1))
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::CompileWork,
+            })?
+    } else {
+        0
+    };
+    usize::try_from(raw.checked_sub(surrogates).ok_or(Error::InternalInvariant(
+        "canonical Unicode range contains more surrogates than scalars",
+    ))?)
+    .map_err(|_| Error::ArithmeticOverflow {
+        resource: Resource::CompileWork,
+    })
+}
+
+fn unicode_suffix_domains(
+    class: &regex_syntax::hir::ClassUnicode,
+    budget: &mut CompileBudget,
+) -> Result<Option<UnicodeSuffixDomains>, Error> {
+    let mut members = 0_usize;
+    for range in class.ranges() {
+        // Range visit, endpoint reads, checked scalar-width arithmetic and
+        // admission comparison are charged before the range is inspected.
+        budget.charge(4)?;
+        members = add(
+            members,
+            unicode_scalar_range_width(range.start(), range.end())?,
+            Resource::CompileWork,
+        )?;
+        if members > MAX_REQUIRED_SUFFIXES {
+            return Ok(None);
+        }
+    }
+    budget.charge(1)?; // empty-domain branch
+    if members == 0 {
+        return Ok(None);
+    }
+
+    // Canonical regex-syntax classes contain sorted, disjoint ranges, so the
+    // scalar encodings are unique and require no data-dependent dedup pass.
+    // Charge every fixed slot before initializing the inline temporary.
+    budget.charge(MAX_REQUIRED_SUFFIXES)?;
+    let mut domains = UnicodeSuffixDomains {
+        suffixes: [EncodedUnicodeSuffix::EMPTY; MAX_REQUIRED_SUFFIXES],
+        len: 0,
+        bytes: 0,
+    };
+    for range in class.ranges() {
+        budget.charge(1)?; // materialization range visit
+        for scalar in range.start()..=range.end() {
+            // Precharge loop service, four-byte temporary initialization,
+            // UTF-8 encoding, length conversion, checked counters and the
+            // fixed-width inline copy before any of those operations.
+            budget.charge(12)?;
+            let mut encoded = [0_u8; 4];
+            let encoded = scalar.encode_utf8(&mut encoded).as_bytes();
+            let len = u8::try_from(encoded.len()).map_err(|_| {
+                Error::InternalInvariant("Unicode scalar encoding exceeds four bytes")
+            })?;
+            let slot = domains
+                .suffixes
+                .get_mut(domains.len)
+                .ok_or(Error::InternalInvariant(
+                    "Unicode suffix domain exceeded its admitted census",
+                ))?;
+            slot.bytes[..encoded.len()].copy_from_slice(encoded);
+            slot.len = len;
+            domains.len = add(domains.len, 1, Resource::CompileWork)?;
+            domains.bytes = add(domains.bytes, encoded.len(), Resource::CompileWork)?;
+        }
+    }
+    if domains.len != members {
+        return Err(Error::InternalInvariant(
+            "canonical Unicode suffix census changed during materialization",
+        ));
+    }
+    Ok(Some(domains))
 }
 
 fn execution_seeds(
@@ -3902,6 +4041,37 @@ fn required_suffixes(hir: &Hir, budget: &mut CompileBudget) -> Result<RequiredSu
     materialize_required_suffixes(hir, analysis, budget)
 }
 
+fn retain_unicode_suffix_domains(
+    domains: &UnicodeSuffixDomains,
+    bytes: &mut ExactVec<u8>,
+    ends: &mut ExactVec<usize>,
+    budget: &mut CompileBudget,
+) -> Result<(), Error> {
+    for (index, suffix) in domains.iter().enumerate() {
+        for &byte in suffix {
+            bytes.try_push(byte).map_err(|_| {
+                Error::InternalInvariant("Unicode required suffix exceeded exact byte allocation")
+            })?;
+            budget.record_items::<u8>(1, true)?;
+        }
+        let end = if index == 0 {
+            if bytes.len() >= UNICODE_SUFFIX_DOMAIN_TAG {
+                return Err(Error::InternalInvariant(
+                    "Unicode suffix endpoint overlaps its domain tag",
+                ));
+            }
+            bytes.len() | UNICODE_SUFFIX_DOMAIN_TAG
+        } else {
+            bytes.len()
+        };
+        ends.try_push(end).map_err(|_| {
+            Error::InternalInvariant("Unicode required suffix exceeded exact endpoint allocation")
+        })?;
+        budget.record_items::<usize>(1, false)?;
+    }
+    Ok(())
+}
+
 fn materialize_required_suffixes(
     hir: &Hir,
     analysis: SuffixAnalysis<'_>,
@@ -3920,6 +4090,7 @@ fn materialize_required_suffixes(
     let (suffix_count, suffix_bytes) = match &analysis {
         SuffixAnalysis::Literals(literals) => (literals.len, literals.bytes),
         SuffixAnalysis::TerminalBytes(terminals) => (terminals.len, terminals.len),
+        SuffixAnalysis::UnicodeDomains(domains) => (domains.len, domains.bytes),
         SuffixAnalysis::ZeroWidth | SuffixAnalysis::None => {
             return Ok(RequiredSuffixes::default());
         }
@@ -3982,6 +4153,9 @@ fn materialize_required_suffixes(
                 })?;
                 budget.record_items::<usize>(1, false)?;
             }
+        }
+        SuffixAnalysis::UnicodeDomains(domains) => {
+            retain_unicode_suffix_domains(&domains, &mut bytes, &mut ends, budget)?;
         }
         SuffixAnalysis::ZeroWidth | SuffixAnalysis::None => {
             return Err(Error::InternalInvariant(
@@ -4187,7 +4361,8 @@ fn analyze_required_suffixes<'a>(
                 Ok(SuffixAnalysis::TerminalBytes(terminals))
             }
         }
-        HirKind::Class(Class::Unicode(_)) => Ok(SuffixAnalysis::None),
+        HirKind::Class(Class::Unicode(class)) => Ok(unicode_suffix_domains(class, budget)?
+            .map_or(SuffixAnalysis::None, SuffixAnalysis::UnicodeDomains)),
         HirKind::Capture(capture) => analyze_required_suffixes(&capture.sub, budget),
         HirKind::Repetition(repetition) => {
             if repetition.min == 0 {
@@ -8431,6 +8606,124 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unicode_casefold_literal_suffix_domains_are_canonical_and_exactly_bounded() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .case_insensitive(true)
+            .build()
+            .parse("Шерлок Холмс")
+            .unwrap();
+        let mut census = suffix_budget(CompileLimits::default().max_work);
+        let suffixes = required_suffixes(&hir, &mut census).unwrap();
+        assert!(suffixes.prefers_sparse_verification());
+        assert_eq!(
+            suffixes.iter().collect::<Vec<_>>(),
+            ["С".as_bytes(), "с".as_bytes(), "ᲃ".as_bytes()]
+        );
+        assert_eq!(
+            suffixes.retained_bytes().unwrap(),
+            7 + 3 * size_of::<usize>()
+        );
+        let exact_work = census.accounting.work;
+
+        let mut exact = suffix_budget(exact_work);
+        assert_eq!(
+            required_suffixes(&hir, &mut exact)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            ["С".as_bytes(), "с".as_bytes(), "ᲃ".as_bytes()]
+        );
+        assert_eq!(exact.accounting.work, exact_work);
+
+        let mut one_below = suffix_budget(exact_work - 1);
+        assert_eq!(
+            required_suffixes(&hir, &mut one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: exact_work,
+                limit: exact_work - 1,
+            }
+        );
+
+        let retained = suffixes.retained_bytes().unwrap();
+        let mut exact_bytes = CompileBudget::new(CompileLimits {
+            max_program_bytes: retained,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            required_suffixes(&hir, &mut exact_bytes)
+                .unwrap()
+                .retained_bytes()
+                .unwrap(),
+            retained
+        );
+        let mut one_below_bytes = CompileBudget::new(CompileLimits {
+            max_program_bytes: retained - 1,
+            ..CompileLimits::default()
+        });
+        assert_eq!(
+            required_suffixes(&hir, &mut one_below_bytes).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: retained,
+                limit: retained - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn unicode_suffix_domains_cover_variable_width_and_keep_wide_fallbacks() {
+        let kelvin = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .case_insensitive(true)
+            .build()
+            .parse("k")
+            .unwrap();
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        assert_eq!(
+            required_suffixes(&kelvin, &mut budget)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            [b"K".as_slice(), b"k".as_slice(), "\u{212A}".as_bytes()]
+        );
+
+        let sigma = ParserBuilder::new()
+            .utf8(false)
+            .unicode(true)
+            .case_insensitive(true)
+            .build()
+            .parse("σ")
+            .unwrap();
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        assert_eq!(
+            required_suffixes(&sigma, &mut budget)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            ["Σ".as_bytes(), "ς".as_bytes(), "σ".as_bytes()]
+        );
+
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        assert!(
+            required_suffixes(&ascii_unicode_class(), &mut budget)
+                .unwrap()
+                .is_empty()
+        );
+        let literal = parse_bytes("ing");
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        let literal_suffixes = required_suffixes(&literal, &mut budget).unwrap();
+        assert_eq!(
+            literal_suffixes.iter().collect::<Vec<_>>(),
+            [b"ing".as_slice()]
+        );
+        assert!(!literal_suffixes.prefers_sparse_verification());
     }
 
     fn required_anchor_plan_id(

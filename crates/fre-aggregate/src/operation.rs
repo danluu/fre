@@ -2312,6 +2312,9 @@ impl CompiledRegex {
         } else {
             Some(SparseSeed::RequiredSuffixes(&self.required_suffixes))
         };
+        let prefer_unicode_suffix_domains = forced_generic_count_route.is_none()
+            && strategy == Strategy::ReverseSequentialRows
+            && self.required_suffixes.prefers_sparse_verification();
         let dense = || {
             Requirements::new::<OBSERVED_WORK>(
                 &self.program,
@@ -2364,6 +2367,21 @@ impl CompiledRegex {
                     strategy,
                     passes,
                     engine_limits,
+                    seed,
+                )?,
+                Some(seed),
+            )
+        } else if prefer_unicode_suffix_domains {
+            let seed = fallback_seed.ok_or(Error::InternalInvariant(
+                "Unicode suffix-domain verification lost its compiled HIR proof",
+            ))?;
+            (
+                Requirements::new_for_seed(
+                    &self.program,
+                    boundaries,
+                    strategy,
+                    passes,
+                    selection_limits,
                     seed,
                 )?,
                 Some(seed),
@@ -2563,6 +2581,8 @@ impl CompiledRegex {
             OperationPrepublicationFallback::None
         } else if terminal_seed.is_some() {
             OperationPrepublicationFallback::TerminalFrontierThenDense
+        } else if prefer_unicode_suffix_domains {
+            OperationPrepublicationFallback::None
         } else if fallback_seed.is_some() {
             OperationPrepublicationFallback::DenseThenRequiredSuffix
         } else if strategy == Strategy::ReverseSequentialRows {

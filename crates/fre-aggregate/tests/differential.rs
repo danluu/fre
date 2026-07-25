@@ -1060,6 +1060,154 @@ fn required_suffix_sparse_rows_meter_scalar_decode_and_replay() {
 }
 
 #[test]
+fn unicode_casefold_literal_domains_seed_semantic_scalar_verification() {
+    let pattern = "Шерлок Холмс";
+    let hir = regex_syntax::ParserBuilder::new()
+        .unicode(true)
+        .utf8(false)
+        .case_insensitive(true)
+        .build()
+        .parse(pattern)
+        .unwrap();
+    let regex = CompiledRegex::from_hir(
+        &hir,
+        RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+        CompileLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            regex.compile_accounting().required_suffixes,
+            regex.compile_accounting().required_suffix_bytes,
+        ),
+        (3, 7)
+    );
+
+    let mut haystack = vec![0xFF, 0x80];
+    haystack.extend_from_slice(
+        "ШЕРЛОК ХОЛМС|шерлок холмс|Шерлок Холмс|шЕрЛоК хОлМс|Шерлок Холм".as_bytes(),
+    );
+    haystack.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]);
+    let expected = regex::bytes::RegexBuilder::new(pattern)
+        .unicode(true)
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+        .find_iter(&haystack)
+        .count();
+    assert_eq!(expected, 4);
+
+    let dense = regex
+        .admit_count(
+            &haystack,
+            0..haystack.len(),
+            Strategy::FullTable,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(dense.value(), expected);
+    assert_eq!(
+        dense.certificate().physical_route,
+        OperationPhysicalRoute::DenseRows
+    );
+
+    let sparse = regex
+        .admit_count(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(sparse.value(), expected);
+    assert_eq!(
+        sparse.certificate().physical_route,
+        OperationPhysicalRoute::RequiredSuffixRows
+    );
+    assert_eq!(
+        sparse.certificate().row_storage,
+        Some(RowStorage::SplitDecisions)
+    );
+    assert!(sparse.accounting().work < dense.certificate().work_bound);
+
+    let exact_work = sparse.accounting().work;
+    let exact = regex
+        .admit_count(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: exact_work,
+                ..OperationLimits::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(exact.value(), expected);
+    assert_eq!(exact.accounting().work, exact_work);
+
+    assert!(matches!(
+        regex.admit_count(
+            &haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationLimits {
+                max_work: exact_work - 1,
+                ..OperationLimits::default()
+            },
+        ),
+        Err(Error::ResourceLimit {
+            resource: Resource::ExecutionWork,
+            required,
+            limit,
+        }) if required == limit + 1
+    ));
+}
+
+#[test]
+fn unicode_casefold_suffix_domains_cover_width_changes_and_wide_refusal() {
+    for (pattern, haystack) in [("k", "Kk\u{212A}!".as_bytes()), ("σ", "Σσς!".as_bytes())] {
+        let hir = regex_syntax::ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .case_insensitive(true)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let regex = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let expected = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(true)
+            .case_insensitive(true)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .count();
+        let actual = regex
+            .admit_count(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(actual.value(), expected, "{pattern}");
+        assert_eq!(
+            actual.certificate().physical_route,
+            OperationPhysicalRoute::RequiredSuffixRows,
+            "{pattern}"
+        );
+    }
+
+    let wide = compile_unicode("[a-z]");
+    assert_eq!(wide.compile_accounting().required_suffixes, 0);
+    assert_eq!(wide.compile_accounting().required_suffix_bytes, 0);
+}
+
+#[test]
 fn forced_suffix_ordinary_and_observed_publish_the_same_route_receipt() {
     let pattern = r"\b[a-z]+ing\b";
     let haystack = b"!wording! thing singing! wording?".repeat(64);
