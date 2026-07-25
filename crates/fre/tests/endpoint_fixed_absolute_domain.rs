@@ -56,16 +56,19 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     // typed source, terminal receipt, and exact inline terminal authentication
     // snapshots. These gates make a post-failure Box or an unreviewed further
     // inline copy visible rather than moving it outside construction accounting.
-    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 808);
+    // The one-byte start-domain proof must pack into existing accounting
+    // padding. Enlarging these heavily nested terminal values can exhaust a
+    // default test-thread stack when several large optional builds coexist.
+    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 800);
     assert_eq!(
         core::mem::size_of::<AggregateConstructionAttemptError>(),
-        7_936
+        7_928
     );
     assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_312);
     assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 9_096);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_496);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 9_712);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 312);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 9_688);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
     // Exact success retains the independent kernel receipt beside accounting;
     // this is the public allocation-free ceiling for the enlarged enum.

@@ -996,7 +996,8 @@ impl CompiledRegex {
             // starts passing the entire eight-byte prefix. The proof, not the
             // source, determines this route before the capture owner is sealed.
             OperationPhysicalRoute::Candidate
-        } else if self.start_domain.is_sparse() && candidate::executable_for(&self.program) {
+        } else if self.program.start_domain.is_sparse() && candidate::executable_for(&self.program)
+        {
             OperationPhysicalRoute::StartDomain
         } else if !self.terminal_frontier.is_empty() {
             OperationPhysicalRoute::TerminalFrontierRows
@@ -1993,7 +1994,7 @@ impl CompiledRegex {
             Some(GenericCountRoute::StartDomain)
                 if !OBSERVED_WORK
                     || strategy != Strategy::ReverseSequentialRows
-                    || !self.start_domain.is_sparse()
+                    || !self.program.start_domain.is_sparse()
                     || !candidate::executable_for(&self.program) =>
             {
                 return Err(Error::InternalInvariant(
@@ -2019,7 +2020,7 @@ impl CompiledRegex {
         ) && OBSERVED_WORK
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
-            && self.start_domain.is_sparse()
+            && self.program.start_domain.is_sparse()
             && candidate::executable_for(&self.program)
         {
             return self.execute_start_domain(
@@ -2795,7 +2796,7 @@ impl CompiledRegex {
             &self.program,
             haystack,
             range.clone(),
-            self.start_domain,
+            self.program.start_domain,
             kind == OperationKind::Sum,
             limits,
         ) {
@@ -7775,7 +7776,10 @@ mod tests {
         ];
         for (pattern, haystack) in cases {
             let compiled = start_domain_regex(pattern);
-            assert!(compiled.start_domain.is_sparse(), "pattern={pattern:?}");
+            assert!(
+                compiled.program.start_domain.is_sparse(),
+                "pattern={pattern:?}"
+            );
             for start in 0..=haystack.len() {
                 for end in start..=haystack.len() {
                     assert_start_domain_range_parity(&compiled, haystack, start..end);

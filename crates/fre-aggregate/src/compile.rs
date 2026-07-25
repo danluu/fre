@@ -621,8 +621,6 @@ pub struct CompiledRegex {
     /// matches without inspecting the source. Nullable and empty-language
     /// programs retain their exact `Some(0)` / `None` distinction.
     pub(crate) minimum_match_bytes: Option<usize>,
-    /// Mandatory match-start domain derived from the same canonical HIR.
-    pub(crate) start_domain: StartDomain,
     plan_id: PlanId,
     accounting: CompileAccounting,
 }
@@ -1124,8 +1122,10 @@ impl CompiledRegex {
             has_scalar_transition: certificate.has_scalar_transition,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
+            start_domain: StartDomain::AnyBoundary,
         };
         start_domain = partitioned_start_domain(start_domain, &program, budget)?;
+        program.start_domain = start_domain;
         let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, budget)?;
         plan_id = bind_start_domain_identity(plan_id, start_domain, budget)?;
         if let Some(candidate) = &candidate {
@@ -1151,7 +1151,6 @@ impl CompiledRegex {
             required_internal_anchor,
             terminal_frontier,
             minimum_match_bytes,
-            start_domain,
             plan_id,
             accounting,
         })
@@ -2698,7 +2697,10 @@ fn build_retained_components(
     budget.charge(1)?;
     let start_domain = mandatory_start_domain(hir);
     let start_domain_proof_bytes = core::mem::size_of::<StartDomain>();
-    budget.accounting.start_domain_proof_bytes = start_domain_proof_bytes;
+    budget.accounting.start_domain_proof_bytes =
+        u8::try_from(start_domain_proof_bytes).map_err(|_| Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        })?;
     if budget.receipt_scope {
         budget.preflight_receipt_construction_bytes(start_domain_proof_bytes)?;
         budget.acquire_checked_construction_bytes(start_domain_proof_bytes)?;
@@ -6408,9 +6410,9 @@ mod tests {
                 CompileLimits::default(),
             )
             .unwrap();
-            assert_eq!(compiled.start_domain, expected, "{pattern:?}");
+            assert_eq!(compiled.program.start_domain, expected, "{pattern:?}");
             assert_eq!(
-                compiled.compile_accounting().start_domain_proof_bytes,
+                compiled.compile_accounting().start_domain_proof_bytes(),
                 core::mem::size_of::<StartDomain>()
             );
             let accounting = compiled.compile_accounting();
@@ -6461,7 +6463,7 @@ mod tests {
                 CompileLimits::default(),
             )
             .unwrap();
-            assert_eq!(compiled.start_domain, expected, "{pattern:?}");
+            assert_eq!(compiled.program.start_domain, expected, "{pattern:?}");
         }
     }
 

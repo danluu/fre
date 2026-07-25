@@ -806,6 +806,10 @@ pub(crate) struct Program {
     pub(crate) has_scalar_transition: bool,
     pub(crate) max_scalar_search_checks: usize,
     pub(crate) has_unicode_word_boundary: bool,
+    /// Construction-proved match-start domain. Kept beside the compact
+    /// program flags so this optional execution hint occupies existing
+    /// structure padding instead of enlarging every compiled-regex owner.
+    pub(crate) start_domain: StartDomain,
 }
 
 impl Program {

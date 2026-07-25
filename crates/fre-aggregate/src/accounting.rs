@@ -60,7 +60,9 @@ pub struct CompileAccounting {
     ///
     /// The inline enum distinguishes unrestricted starts, absolute text start,
     /// and line-partitioned LF/CRLF-aware starts without retaining HIR data.
-    pub start_domain_proof_bytes: usize,
+    /// This exact count is compact because every supported representation is
+    /// statically bounded by the one-byte inline proof.
+    pub start_domain_proof_bytes: u8,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
@@ -85,6 +87,18 @@ pub struct CompileAccounting {
     /// haystack before evaluating Unicode word-boundary assertions.
     pub requires_utf8_validation: bool,
     pub work: usize,
+}
+
+impl CompileAccounting {
+    /// Exact retained bytes for the mandatory-start-domain proof.
+    ///
+    /// The public accessor keeps byte-count arithmetic in `usize` while the
+    /// stored counter remains object-size neutral for enclosing reports and
+    /// terminal error receipts.
+    #[must_use]
+    pub fn start_domain_proof_bytes(self) -> usize {
+        usize::from(self.start_domain_proof_bytes)
+    }
 }
 
 /// Exact observed execution counters. Storage fields are logical byte counts
