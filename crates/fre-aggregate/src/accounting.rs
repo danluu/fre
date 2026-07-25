@@ -56,6 +56,11 @@ pub struct CompileAccounting {
     /// The `Option<usize>` representation preserves the empty-language,
     /// nullable, and positive-width distinction used by operation admission.
     pub minimum_match_bytes_proof_bytes: usize,
+    /// Bytes in the retained mandatory-start-domain proof.
+    ///
+    /// The inline enum distinguishes unrestricted starts, absolute text start,
+    /// and line-partitioned LF/CRLF-aware starts without retaining HIR data.
+    pub start_domain_proof_bytes: usize,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,

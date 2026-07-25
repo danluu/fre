@@ -4,8 +4,8 @@
 )]
 
 use fre_aggregate::{
-    CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RowStorage, RustByteProfile,
-    Span, Strategy, Unsupported,
+    CompileLimits, CompiledRegex, Error, OperationLimits, OperationPhysicalRoute, Resource,
+    RowStorage, RustByteProfile, Span, Strategy, Unsupported,
 };
 use fre_iterator_lab::{Ast as LabAst, CompileLimits as LabLimits, Greed, GuardedRegex};
 use fre_reference::{
@@ -2295,6 +2295,104 @@ fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
         frontier = next;
     }
     all
+}
+
+#[test]
+fn sparse_start_count_and_sum_match_pinned_rust_at_every_byte_range() {
+    let patterns = [
+        r"\A(?:a|ab)*b?",
+        r"\A(?:a*?b|ab*)",
+        r"\A(?:|a)*",
+        r"(?m:^)(?:a|ab)*b?",
+        r"(?m:^)(?:a*?b|ab*)",
+        r"(?m:^)(?:)",
+        r"(?Rm:^)(?:a|ab)*?b?",
+        r"(?Rm:^)(?:)",
+        r"(?m:^)((?:a|ab)*)(b?)",
+    ];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"ab",
+        b"\r\n",
+        b"a\nab\rb\r\n",
+        &[0xFF, b'a', b'\n', 0x80, b'b'],
+    ];
+    let config = MetaRegex::config().utf8_empty(false);
+    let syntax = regex_automata::util::syntax::Config::new()
+        .unicode(false)
+        .utf8(false);
+    for pattern in patterns {
+        let hir = parse(pattern);
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let oracle = MetaRegex::builder()
+            .configure(config.clone())
+            .syntax(syntax)
+            .build(pattern)
+            .unwrap_or_else(|error| {
+                panic!("pinned sparse-start oracle rejected {pattern:?}: {error}")
+            });
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let range = start..end;
+                    let expected = oracle
+                        .find_iter(Input::new(haystack).span(range.clone()))
+                        .map(|matched| Span {
+                            start: matched.start(),
+                            end: matched.end(),
+                        })
+                        .collect::<Vec<_>>();
+                    let count = compiled
+                        .count_value_attempt(
+                            haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("count failed {pattern:?} {haystack:?} {range:?}: {error}")
+                        });
+                    assert_eq!(
+                        count.value,
+                        expected.len(),
+                        "{pattern:?} {haystack:?} {range:?}"
+                    );
+                    assert_eq!(
+                        count.receipt.identity.physical_route,
+                        Some(OperationPhysicalRoute::StartDomain)
+                    );
+                    let sum = compiled
+                        .span_sum_value_with_receipt(
+                            haystack,
+                            range.clone(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("sum failed {pattern:?} {haystack:?} {range:?}: {error}")
+                        });
+                    assert_eq!(
+                        sum.value,
+                        expected
+                            .iter()
+                            .map(|span| span.end.checked_sub(span.start).unwrap())
+                            .sum::<usize>(),
+                        "{pattern:?} {haystack:?} {range:?}"
+                    );
+                    assert_eq!(
+                        sum.receipt.identity.physical_route,
+                        Some(OperationPhysicalRoute::StartDomain)
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

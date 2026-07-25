@@ -966,6 +966,12 @@ fn retained_suffix_and_candidate_capture_routes_close_exact_and_one_below_work()
             AggregateOperationPhysicalRoute::Candidate,
             6,
         ),
+        (
+            r"(?m:^ *(\w+) +(\w+) +(\w+))",
+            b"one two three\nbad\na  bb   ccc\n",
+            AggregateOperationPhysicalRoute::StartDomain,
+            8,
+        ),
     ];
     for (pattern, haystack, route, expected) in cases {
         let regex = CaptureBuilder::new(pattern)

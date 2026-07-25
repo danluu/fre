@@ -494,7 +494,8 @@ impl CaptureCountAttemptReceipt {
                     SelectorOperationPhysicalRoute::DenseRows
                         | SelectorOperationPhysicalRoute::TerminalFrontierRows
                         | SelectorOperationPhysicalRoute::RequiredSuffixRows
-                        | SelectorOperationPhysicalRoute::Candidate,
+                        | SelectorOperationPhysicalRoute::Candidate
+                        | SelectorOperationPhysicalRoute::StartDomain,
                 ) | (
                     CapturePlanKind::UniformPrefixClassParticipation,
                     SelectorOperationPhysicalRoute::DenseRows,

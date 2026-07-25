@@ -12,7 +12,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 
 use crate::accounting::ExecutionAccounting;
 use crate::error::{add, enforce, mul};
-use crate::program::{Assertion, AssertionContext, ByteSet, Inst, Program};
+use crate::program::{Assertion, AssertionContext, ByteSet, Inst, Program, StartDomain};
 use crate::{Error, OperationLimits, Resource};
 
 pub(crate) const MAX_ENTRIES: usize = 128;
@@ -177,6 +177,25 @@ pub(crate) struct ReductionAttemptError {
     pub(crate) accounting: ExecutionAccounting,
     pub(crate) actual_allocations: usize,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartDomainResult {
+    pub(crate) matches: usize,
+    pub(crate) events: usize,
+    pub(crate) suppressed: usize,
+    pub(crate) span_sum: usize,
+    pub(crate) accounting: ExecutionAccounting,
+    pub(crate) actual_allocations: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StartDomainAttemptError {
+    pub(crate) source: Error,
+    pub(crate) accounting: ExecutionAccounting,
+    pub(crate) actual_allocations: usize,
+}
+
+pub(crate) const START_DOMAIN_EXECUTION_ALLOCATIONS: usize = 4;
 
 #[allow(
     clippy::too_many_lines,
@@ -612,6 +631,228 @@ pub(crate) fn shared_fixed_anchors(
     }))
 }
 
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    reason = "start-domain execution keeps range validation, exact metering, empty-match suppression and terminal accounting in one auditable scope"
+)]
+pub(crate) fn start_domain_attempt(
+    program: &Program,
+    haystack: &[u8],
+    range: Range<usize>,
+    start_domain: StartDomain,
+    enforce_span_sum: bool,
+    limits: OperationLimits,
+) -> Result<StartDomainResult, StartDomainAttemptError> {
+    if range.start > range.end || range.end > haystack.len() {
+        return Err(StartDomainAttemptError {
+            source: Error::InvalidRange {
+                start: range.start,
+                end: range.end,
+                haystack_len: haystack.len(),
+            },
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        });
+    }
+    if !start_domain.is_sparse() || !executable_for(program) {
+        return Err(StartDomainAttemptError {
+            source: Error::InternalInvariant(
+                "start-domain route requires a sparse byte-program proof",
+            ),
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        });
+    }
+    let local = &haystack[range.clone()];
+    let boundaries =
+        add(local.len(), 1, Resource::Boundaries).map_err(|source| StartDomainAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        })?;
+    enforce(boundaries, limits.max_boundaries, Resource::Boundaries).map_err(|source| {
+        StartDomainAttemptError {
+            source,
+            accounting: ExecutionAccounting::default(),
+            actual_allocations: 0,
+        }
+    })?;
+    let assertions =
+        AssertionContext::new(haystack, range.start, local.len()).map_err(|source| {
+            StartDomainAttemptError {
+                source,
+                accounting: ExecutionAccounting::default(),
+                actual_allocations: 0,
+            }
+        })?;
+    let mut meter = Meter::new(limits);
+    let mut allocations = AllocationLedger::default();
+    let mut root_probes = 0_usize;
+    let mut events = 0_usize;
+    let mut matches = 0_usize;
+    let mut suppressed = 0_usize;
+    let mut span_sum = 0_usize;
+    let result = (|| {
+        let mut workspace = Workspace::new(program.insts.len(), 0, &mut meter, &mut allocations)?;
+        let mut cursor = 0_usize;
+        let mut previous_end = None;
+        while cursor <= local.len() {
+            let Some(start) =
+                next_domain_start(start_domain, assertions, cursor, local.len(), &mut meter)?
+            else {
+                break;
+            };
+            meter.charge_work(1)?; // one admitted root service
+            root_probes = add(root_probes, 1, Resource::ExecutionWork)?;
+            let Some(end) = verify_entry_at(
+                program,
+                local,
+                assertions,
+                program.entry,
+                start,
+                &mut workspace,
+                &mut meter,
+            )?
+            else {
+                cursor = add(start, 1, Resource::Boundaries)?;
+                continue;
+            };
+            if end < start || end > local.len() {
+                return Err(Error::InternalInvariant(
+                    "start-domain verifier published an endpoint outside its range",
+                ));
+            }
+            meter.charge_work(1)?; // one match-event service
+            let required_events = add(events, 1, Resource::MatchEvents)?;
+            enforce(
+                required_events,
+                limits.max_match_events,
+                Resource::MatchEvents,
+            )?;
+            events = required_events;
+            if start == end && previous_end == Some(start) {
+                suppressed = add(suppressed, 1, Resource::MatchEvents)?;
+                cursor = add(start, 1, Resource::Boundaries)?;
+                continue;
+            }
+            let required_matches = add(matches, 1, Resource::OutputMatches)?;
+            enforce(
+                required_matches,
+                limits.max_output_matches,
+                Resource::OutputMatches,
+            )?;
+            matches = required_matches;
+            let width = end.checked_sub(start).ok_or(Error::InternalInvariant(
+                "start-domain endpoint precedes its start",
+            ))?;
+            let required_span_sum = add(span_sum, width, Resource::SpanSum)?;
+            if enforce_span_sum {
+                enforce(required_span_sum, limits.max_span_sum, Resource::SpanSum)?;
+            }
+            span_sum = required_span_sum;
+            previous_end = Some(end);
+            cursor = end;
+        }
+        if workspace.bytes != allocations.bytes {
+            return Err(Error::InternalInvariant(
+                "start-domain workspace diverged from allocation ledger",
+            ));
+        }
+        if allocations.count != START_DOMAIN_EXECUTION_ALLOCATIONS {
+            return Err(Error::InternalInvariant(
+                "start-domain workspace changed its allocation census",
+            ));
+        }
+        Ok(())
+    })();
+    let accounting = start_domain_attempt_accounting(
+        &meter,
+        allocations.bytes,
+        root_probes,
+        events,
+        matches,
+        suppressed,
+    );
+    match result {
+        Ok(()) => Ok(StartDomainResult {
+            matches,
+            events,
+            suppressed,
+            span_sum,
+            accounting,
+            actual_allocations: allocations.count,
+        }),
+        Err(source) => Err(StartDomainAttemptError {
+            source,
+            accounting,
+            actual_allocations: allocations.count,
+        }),
+    }
+}
+
+fn next_domain_start(
+    start_domain: StartDomain,
+    assertions: AssertionContext<'_>,
+    from: usize,
+    local_len: usize,
+    meter: &mut Meter,
+) -> Result<Option<usize>, Error> {
+    let assertion = start_domain.assertion().ok_or(Error::InternalInvariant(
+        "start-domain scan received the unrestricted domain",
+    ))?;
+    if start_domain == StartDomain::AbsoluteStart && from > 0 {
+        return Ok(None);
+    }
+    let mut position = from;
+    while position <= local_len {
+        meter.charge_work(1)?; // one proof-domain boundary visit
+        meter.charge_assertion()?;
+        let matched =
+            assertions.is_match_with_source_accesses(assertion, position, |source_bytes| {
+                meter.charge_random(source_bytes)
+            })?;
+        if matched {
+            return Ok(Some(position));
+        }
+        if start_domain == StartDomain::AbsoluteStart {
+            return Ok(None);
+        }
+        position = add(position, 1, Resource::Boundaries)?;
+    }
+    Ok(None)
+}
+
+fn start_domain_attempt_accounting(
+    meter: &Meter,
+    workspace_bytes: usize,
+    root_probes: usize,
+    events: usize,
+    matches: usize,
+    suppressed: usize,
+) -> ExecutionAccounting {
+    ExecutionAccounting {
+        root_probes,
+        successful_paths: events,
+        suppressed_empty: suppressed,
+        emitted_matches: matches,
+        sequential_bytes_read: meter.sequential,
+        random_access_bytes_read: meter.random,
+        random_access_peak_bytes: workspace_bytes,
+        scratch_peak_bytes: workspace_bytes,
+        peak_bytes: workspace_bytes,
+        state_evaluations: meter.states,
+        transition_checks: meter.transitions,
+        assertion_checks: meter.assertions,
+        work: meter.work,
+        ..ExecutionAccounting::default()
+    }
+}
+
+pub(crate) fn start_domain_workspace_bytes(program: &Program) -> Result<usize, Error> {
+    workspace_bytes(program.insts.len(), 0)
+}
+
 fn filter_matches(
     entry: &Entry,
     haystack: &[u8],
@@ -829,6 +1070,41 @@ struct Workspace {
     bytes: usize,
 }
 
+fn workspace_shape(states: usize, schedule: usize) -> Result<(usize, usize), Error> {
+    if states == 0 || states > usize::from(u16::MAX) {
+        return Err(Error::InternalInvariant(
+            "candidate verifier state count outside compact workspace",
+        ));
+    }
+    let stack = add(
+        mul(states, 2, Resource::ScratchBytes)?,
+        1,
+        Resource::ScratchBytes,
+    )?;
+    let bytes = add(
+        mul(schedule, size_of::<u128>(), Resource::ScratchBytes)?,
+        add(
+            mul(
+                add(
+                    stack,
+                    mul(states, 2, Resource::ScratchBytes)?,
+                    Resource::ScratchBytes,
+                )?,
+                size_of::<u16>(),
+                Resource::ScratchBytes,
+            )?,
+            mul(states, size_of::<u32>(), Resource::ScratchBytes)?,
+            Resource::ScratchBytes,
+        )?,
+        Resource::ScratchBytes,
+    )?;
+    Ok((stack, bytes))
+}
+
+fn workspace_bytes(states: usize, schedule: usize) -> Result<usize, Error> {
+    workspace_shape(states, schedule).map(|(_, bytes)| bytes)
+}
+
 impl Workspace {
     fn new(
         states: usize,
@@ -836,33 +1112,7 @@ impl Workspace {
         meter: &mut Meter,
         allocations: &mut AllocationLedger,
     ) -> Result<Self, Error> {
-        if states == 0 || states > usize::from(u16::MAX) {
-            return Err(Error::InternalInvariant(
-                "candidate verifier state count outside compact workspace",
-            ));
-        }
-        let stack = add(
-            mul(states, 2, Resource::ScratchBytes)?,
-            1,
-            Resource::ScratchBytes,
-        )?;
-        let bytes = add(
-            mul(schedule, size_of::<u128>(), Resource::ScratchBytes)?,
-            add(
-                mul(
-                    add(
-                        stack,
-                        mul(states, 2, Resource::ScratchBytes)?,
-                        Resource::ScratchBytes,
-                    )?,
-                    size_of::<u16>(),
-                    Resource::ScratchBytes,
-                )?,
-                mul(states, size_of::<u32>(), Resource::ScratchBytes)?,
-                Resource::ScratchBytes,
-            )?,
-            Resource::ScratchBytes,
-        )?;
+        let (stack, bytes) = workspace_shape(states, schedule)?;
         enforce(
             bytes,
             meter.limits.max_scratch_bytes,
@@ -1093,8 +1343,12 @@ fn add_closure(
             Inst::Assert { assertion, next } => {
                 meter.charge_assertion()?;
                 meter.charge_work(1)?; // predicate branch/publication
-                meter.charge_random(assertions.candidate_source_bytes(*assertion, position)?)?;
-                if assertions.is_match(*assertion, position)? {
+                let matched = assertions.is_match_with_source_accesses(
+                    *assertion,
+                    position,
+                    |source_bytes| meter.charge_random(source_bytes),
+                )?;
+                if matched {
                     push(stack, &mut stack_len, *next)?;
                 }
             }

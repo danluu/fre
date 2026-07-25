@@ -3218,6 +3218,7 @@ impl CaptureRegex {
                     | fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows
                     | fre_aggregate::OperationPhysicalRoute::RequiredSuffixRows
                     | fre_aggregate::OperationPhysicalRoute::Candidate
+                    | fre_aggregate::OperationPhysicalRoute::StartDomain
             ) && selector_route == self.selector.uniform_capture_count_route()
         };
         if !route_is_coherent {
@@ -3294,6 +3295,16 @@ impl CaptureRegex {
             fre_aggregate::OperationPhysicalRoute::Candidate if !ordered_root => self
                 .selector
                 .admit_count_observed_with_candidate_receipt_observer(
+                    haystack,
+                    0..haystack.len(),
+                    SelectorStrategy::ReverseSequentialRows,
+                    selector_limits,
+                    usize::MAX,
+                    &mut observer,
+                ),
+            fre_aggregate::OperationPhysicalRoute::StartDomain if !ordered_root => self
+                .selector
+                .admit_count_observed_with_start_domain_receipt_observer(
                     haystack,
                     0..haystack.len(),
                     SelectorStrategy::ReverseSequentialRows,

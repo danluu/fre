@@ -265,6 +265,47 @@ pub(crate) enum Assertion {
     WordEndHalfUnicode,
 }
 
+/// Construction-owned upper bound on the boundaries at which a complete
+/// match may start.
+///
+/// This is derived from mandatory HIR prefix assertions. Line-start variants
+/// additionally certify that no byte transition can consume the corresponding
+/// line separator, which bounds all verifier regions without overlapping
+/// suffix scans. It remains an execution hint: the continuation program is the
+/// semantic authority and evaluates the retained assertion again for every
+/// selected start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartDomain {
+    AnyBoundary,
+    AbsoluteStart,
+    LineStartLf,
+    LineStartCrlf,
+}
+
+impl StartDomain {
+    pub(crate) const fn is_sparse(self) -> bool {
+        !matches!(self, Self::AnyBoundary)
+    }
+
+    pub(crate) const fn assertion(self) -> Option<Assertion> {
+        match self {
+            Self::AnyBoundary => None,
+            Self::AbsoluteStart => Some(Assertion::StartText),
+            Self::LineStartLf => Some(Assertion::StartLf),
+            Self::LineStartCrlf => Some(Assertion::StartCrlf),
+        }
+    }
+
+    pub(crate) const fn identity_tag(self) -> u8 {
+        match self {
+            Self::AnyBoundary => 0,
+            Self::AbsoluteStart => 1,
+            Self::LineStartLf => 2,
+            Self::LineStartCrlf => 3,
+        }
+    }
+}
+
 impl Assertion {
     pub(crate) const fn from_look(look: Look) -> Self {
         match look {

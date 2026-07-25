@@ -74,6 +74,7 @@ enum OperationKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericCountRoute {
     Dense,
+    StartDomain,
     TerminalFrontier,
     OrderedRoot,
     RequiredSuffix,
@@ -318,6 +319,8 @@ pub enum OperationPhysicalRoute {
     UrlAggregate,
     /// Construction-retained byte candidate scheduler.
     Candidate,
+    /// Forward continuation execution at compiler-proved start boundaries.
+    StartDomain,
 }
 
 /// The only route-selection edge allowed before an attempt publishes its
@@ -993,6 +996,8 @@ impl CompiledRegex {
             // starts passing the entire eight-byte prefix. The proof, not the
             // source, determines this route before the capture owner is sealed.
             OperationPhysicalRoute::Candidate
+        } else if self.start_domain.is_sparse() && candidate::executable_for(&self.program) {
+            OperationPhysicalRoute::StartDomain
         } else if !self.terminal_frontier.is_empty() {
             OperationPhysicalRoute::TerminalFrontierRows
         } else if !self.required_suffixes.is_empty() {
@@ -1660,6 +1665,46 @@ impl CompiledRegex {
         })
     }
 
+    /// Observed-work Count forced onto the compiler-retained start-domain
+    /// executor, with a complete admitted result, P/A receipt, and outer
+    /// pre-source observer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_start_domain_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::StartDomain),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
     /// Observed-work Count for a compiler-proved ordered root alternation,
     /// retaining the complete admitted result and nested P/A receipt.
     #[doc(hidden)]
@@ -1945,6 +1990,16 @@ impl CompiledRegex {
                     "candidate Count requires its compiled HIR proof and observed reverse execution",
                 ));
             }
+            Some(GenericCountRoute::StartDomain)
+                if !OBSERVED_WORK
+                    || strategy != Strategy::ReverseSequentialRows
+                    || !self.start_domain.is_sparse()
+                    || !candidate::executable_for(&self.program) =>
+            {
+                return Err(Error::InternalInvariant(
+                    "start-domain Count requires its compiled HIR proof and observed reverse execution",
+                ));
+            }
             Some(GenericCountRoute::OrderedRoot)
                 if strategy != Strategy::ReverseSequentialRows
                     || self.program.root_alternation_arms() < 2
@@ -1958,6 +2013,28 @@ impl CompiledRegex {
             Some(_) | None => {}
         }
         let local = &haystack[range.clone()];
+        if matches!(
+            forced_generic_count_route,
+            None | Some(GenericCountRoute::StartDomain)
+        ) && OBSERVED_WORK
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
+            && strategy == Strategy::ReverseSequentialRows
+            && self.start_domain.is_sparse()
+            && candidate::executable_for(&self.program)
+        {
+            return self.execute_start_domain(
+                haystack,
+                range,
+                strategy,
+                kind,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
+        }
         if forced_generic_count_route.is_none()
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
@@ -2077,6 +2154,7 @@ impl CompiledRegex {
             }
             Some(
                 GenericCountRoute::Dense
+                | GenericCountRoute::StartDomain
                 | GenericCountRoute::OrderedRoot
                 | GenericCountRoute::RequiredSuffix
                 | GenericCountRoute::Candidate,
@@ -2677,6 +2755,111 @@ impl CompiledRegex {
         clippy::too_many_arguments,
         reason = "the specialized route receives the shared attempt publication and accounting state explicitly"
     )]
+    fn execute_start_domain(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+    ) -> Result<ExecutionResult, Error> {
+        let input_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(Error::InternalInvariant(
+                "start-domain range reversed before execution",
+            ))?;
+        let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+        if let Some(publication) = attempt.as_mut() {
+            let prospective = start_domain_prospective(&self.program, boundaries, kind, limits)?;
+            let physical_route = OperationPhysicalRoute::StartDomain;
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+            enforce(
+                prospective.allocations,
+                allocation_limit,
+                Resource::Allocations,
+            )?;
+            prospective.enforce_limits(limits)?;
+        }
+        let result = match candidate::start_domain_attempt(
+            &self.program,
+            haystack,
+            range.clone(),
+            self.start_domain,
+            kind == OperationKind::Sum,
+            limits,
+        ) {
+            Ok(result) => result,
+            Err(failure) => {
+                *attempt_accounting = failure.accounting;
+                *actual_allocations = failure.actual_allocations;
+                return Err(failure.source);
+            }
+        };
+        *attempt_accounting = result.accounting;
+        *actual_allocations = result.actual_allocations;
+        let span_sum = if kind == OperationKind::Sum {
+            result.span_sum
+        } else {
+            0
+        };
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_limits_id: operation_limits_identity(limits),
+            strategy,
+            operation: operation_attempt_kind(kind),
+            physical_route: OperationPhysicalRoute::StartDomain,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: compact_operation_allocation_count(
+                candidate::START_DOMAIN_EXECUTION_ALLOCATIONS,
+            )?,
+            actual_allocations: compact_operation_allocation_count(*actual_allocations)?,
+            range,
+            states: self.program.insts.len(),
+            table_cells: 0,
+            row_storage: None,
+            row_record_bytes: 0,
+            terminal_frontier: false,
+            work_bound: limits.max_work,
+            random_access_bytes: result.accounting.random_access_peak_bytes,
+            scratch_bytes: result.accounting.scratch_peak_bytes,
+            log_bytes: 0,
+            sequential_bytes_bound: 0,
+            match_events: result.events,
+            output_matches: result.matches,
+            output_bytes: 0,
+            span_sum,
+            peak_bytes: result.accounting.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting: result.accounting,
+            summary: ScanSummary {
+                matches: result.matches,
+                events: result.events,
+                suppressed: result.suppressed,
+                span_sum,
+            },
+            spans: Vec::new(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the specialized route receives the shared attempt publication and accounting state explicitly"
+    )]
     fn execute_required_internal_anchor(
         &self,
         plan: &RequiredInternalAnchorPlan,
@@ -2889,6 +3072,56 @@ impl CompiledRegex {
             spans: Vec::new(),
         })
     }
+}
+
+fn start_domain_prospective(
+    program: &Program,
+    boundaries: usize,
+    kind: OperationKind,
+    limits: OperationLimits,
+) -> Result<OperationProspective, Error> {
+    let scratch_bytes = candidate::start_domain_workspace_bytes(program)?;
+    let work_bound = limits.max_work;
+    let random_access_bytes_read = work_bound.saturating_mul(8);
+    let accounting = ExecutionAccounting {
+        state_evaluations: work_bound,
+        transition_checks: work_bound,
+        assertion_checks: work_bound,
+        root_probes: work_bound,
+        successful_paths: limits.max_match_events,
+        suppressed_empty: limits.max_match_events,
+        emitted_matches: limits.max_output_matches,
+        random_access_bytes_read,
+        random_access_peak_bytes: scratch_bytes,
+        scratch_peak_bytes: scratch_bytes,
+        peak_bytes: scratch_bytes,
+        work: work_bound,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states: program.insts.len(),
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound,
+        random_access_bytes: scratch_bytes,
+        scratch_bytes,
+        log_bytes: 0,
+        sequential_bytes: 0,
+        match_events: limits.max_match_events,
+        output_matches: limits.max_output_matches,
+        output_bytes: 0,
+        span_sum: if kind == OperationKind::Sum {
+            limits.max_span_sum
+        } else {
+            0
+        },
+        allocations: candidate::START_DOMAIN_EXECUTION_ALLOCATIONS,
+        peak_bytes: scratch_bytes,
+        accounting,
+    })
 }
 
 const CANDIDATE_EXECUTION_ALLOCATIONS: usize = 5;
@@ -7351,6 +7584,7 @@ fn operation_identity(
         OperationPhysicalRoute::RequiredInternalAnchor => 79,
         OperationPhysicalRoute::UrlAggregate => 97,
         OperationPhysicalRoute::Candidate => 113,
+        OperationPhysicalRoute::StartDomain => 149,
     };
     let mut bytes = plan.bytes();
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -7399,8 +7633,10 @@ fn operation_limits_identity(limits: OperationLimits) -> OperationLimitsId {
 mod tests {
     use regex::bytes::RegexBuilder;
     use regex_syntax::ParserBuilder;
+    use regex_syntax::hir::{Hir, Look};
 
     use crate::accounting::ExecutionAccounting;
+    use crate::candidate;
     use crate::program::AssertionContext;
     use crate::{
         CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Strategy,
@@ -7459,6 +7695,365 @@ mod tests {
         .unwrap();
         assert!(compiled.candidate.is_some());
         compiled
+    }
+
+    fn start_domain_regex(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn assert_start_domain_range_parity(
+        compiled: &CompiledRegex,
+        haystack: &[u8],
+        range: core::ops::Range<usize>,
+    ) {
+        let expected = compiled
+            .admit_spans(
+                haystack,
+                range.clone(),
+                Strategy::FullTable,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let expected_sum = expected
+            .as_slice()
+            .iter()
+            .map(|span| {
+                span.end
+                    .checked_sub(span.start)
+                    .expect("admitted span endpoints are ordered")
+            })
+            .sum::<usize>();
+        let count = compiled
+            .count_value_attempt(
+                haystack,
+                range.clone(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(count.value, expected.as_slice().len());
+        assert_eq!(
+            count.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StartDomain)
+        );
+        assert!(count.receipt.authenticates_success());
+        let sum = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                range,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(sum.value, expected_sum);
+        assert_eq!(
+            sum.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StartDomain)
+        );
+        assert!(sum.receipt.authenticates_success());
+    }
+
+    #[test]
+    fn start_domain_matches_dense_for_absolute_line_ranges_and_empty_languages() {
+        let cases: [(&str, &[u8]); 5] = [
+            (r"\A(?:ab|a)*?\z", b"aba"),
+            (r"\A(?:ab|a)*?\z", b"xaba"),
+            (r"(?m:^a*)", b"\r\naa\n\ra\r\n"),
+            (r"(?Rm:^a*)", b"\r\naa\n\ra\r\n"),
+            (r"(?m:^)(?:ab|a)+", b"ab\nx\naaa\n"),
+        ];
+        for (pattern, haystack) in cases {
+            let compiled = start_domain_regex(pattern);
+            assert!(compiled.start_domain.is_sparse(), "pattern={pattern:?}");
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    assert_start_domain_range_parity(&compiled, haystack, start..end);
+                }
+            }
+        }
+
+        let empty_hir = Hir::concat(vec![Hir::look(Look::Start), Hir::fail()]);
+        let empty = CompiledRegex::from_hir(
+            &empty_hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_start_domain_range_parity(&empty, b"", 0..0);
+        assert_start_domain_range_parity(&empty, b"abc", 0..3);
+        assert_start_domain_range_parity(&empty, b"abc", 1..3);
+    }
+
+    #[test]
+    fn start_domain_priority_and_empty_match_differential_is_exhaustive_on_small_inputs() {
+        let patterns = [
+            r"\A(?:a|ab)*b?",
+            r"\A(?:a*?b|ab*)",
+            r"\A(?:|a)*",
+            r"(?m:^)(?:a|ab)*b?",
+            r"(?m:^)(?:a*?b|ab*)",
+            r"(?Rm:^)(?:a|ab)*?b?",
+        ];
+        let alphabet = [b'a', b'b', b'\r', b'\n', 0xFF];
+        let mut haystack = Vec::new();
+        for pattern in patterns {
+            let compiled = start_domain_regex(pattern);
+            for encoded in 0_usize..512 {
+                haystack.clear();
+                let mut value = encoded;
+                let length = encoded % 7;
+                for _ in 0..length {
+                    haystack.push(alphabet[value % alphabet.len()]);
+                    value /= alphabet.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        assert_start_domain_range_parity(&compiled, &haystack, start..end);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captures_erased_selector_retains_and_executes_line_start_domain() {
+        let compiled = start_domain_regex(r"(?m:^ *(\w+) +(\w+) +(\w+))");
+        assert_eq!(
+            compiled.uniform_capture_count_route(),
+            OperationPhysicalRoute::StartDomain
+        );
+        let haystack = b"one two three\nbad\na  bb   ccc\n";
+        assert_start_domain_range_parity(&compiled, haystack, 0..haystack.len());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test audits every exact and one-below start-domain receipt dimension"
+    )]
+    fn start_domain_receipts_close_exact_and_one_below_limits() {
+        let compiled = start_domain_regex(r"(?m:^a*)");
+        let haystack = b"aa\nx\na\n";
+        let baseline = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let actual = baseline.receipt.actual;
+        let exact = OperationLimits {
+            max_boundaries: haystack.len() + 1,
+            max_random_access_bytes: actual.random_access_peak_bytes,
+            max_scratch_bytes: actual.scratch_peak_bytes,
+            max_log_bytes: 0,
+            max_sequential_bytes: 0,
+            max_match_events: actual.successful_paths,
+            max_output_matches: actual.emitted_matches,
+            max_output_bytes: 0,
+            max_span_sum: 0,
+            max_peak_bytes: actual.peak_bytes,
+            max_work: actual.work,
+            ..OperationLimits::default()
+        };
+        let exact_attempt = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact,
+            )
+            .unwrap();
+        assert_eq!(exact_attempt.value, baseline.value);
+        assert_eq!(exact_attempt.receipt.actual, actual);
+        assert!(exact_attempt.receipt.authenticates_success());
+        assert_eq!(
+            exact_attempt.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StartDomain)
+        );
+        let mut observed = None;
+        let allocation_exact = compiled
+            .admit_count_observed_with_start_domain_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                candidate::START_DOMAIN_EXECUTION_ALLOCATIONS,
+                |prospective| {
+                    observed = Some(prospective);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(allocation_exact.admitted.value(), baseline.value);
+        assert_eq!(
+            allocation_exact.receipt.actual_allocations,
+            candidate::START_DOMAIN_EXECUTION_ALLOCATIONS
+        );
+        assert_eq!(
+            observed.unwrap().allocations,
+            candidate::START_DOMAIN_EXECUTION_ALLOCATIONS
+        );
+        assert!(allocation_exact.receipt.authenticates_success());
+
+        let mut refusal_observed = None;
+        let allocation_refusal = compiled
+            .admit_count_observed_with_start_domain_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+                candidate::START_DOMAIN_EXECUTION_ALLOCATIONS - 1,
+                |prospective| {
+                    refusal_observed = Some(prospective);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            allocation_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::Allocations,
+                required: candidate::START_DOMAIN_EXECUTION_ALLOCATIONS,
+                limit,
+            } if limit == candidate::START_DOMAIN_EXECUTION_ALLOCATIONS - 1
+        ));
+        assert_eq!(
+            refusal_observed.unwrap().allocations,
+            candidate::START_DOMAIN_EXECUTION_ALLOCATIONS
+        );
+        assert_eq!(
+            allocation_refusal.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StartDomain)
+        );
+        assert_eq!(
+            allocation_refusal.receipt.actual,
+            ExecutionAccounting::default()
+        );
+        assert_eq!(allocation_refusal.receipt.actual_allocations, 0);
+        assert!(allocation_refusal.closes());
+        for (resource, one_below) in [
+            (
+                Resource::Boundaries,
+                OperationLimits {
+                    max_boundaries: exact.max_boundaries - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::RandomAccessBytes,
+                OperationLimits {
+                    max_random_access_bytes: exact.max_random_access_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::ScratchBytes,
+                OperationLimits {
+                    max_scratch_bytes: exact.max_scratch_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::MatchEvents,
+                OperationLimits {
+                    max_match_events: exact.max_match_events - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::OutputMatches,
+                OperationLimits {
+                    max_output_matches: exact.max_output_matches - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::PeakBytes,
+                OperationLimits {
+                    max_peak_bytes: exact.max_peak_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::ExecutionWork,
+                OperationLimits {
+                    max_work: exact.max_work - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            let failure = compiled
+                .count_value_attempt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    one_below,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    failure.source,
+                    Error::ResourceLimit {
+                        resource: got,
+                        ..
+                    } if got == resource
+                ),
+                "one-below {resource:?}: {:?}",
+                failure.source
+            );
+            assert!(failure.closes(), "one-below {resource:?}");
+            assert_eq!(
+                failure.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::StartDomain)
+            );
+        }
+
+        let sum = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert!(sum.value > 0);
+        let span_failure = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_span_sum: sum.value - 1,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            span_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::SpanSum,
+                required,
+                limit,
+            } if required == sum.value && limit == sum.value - 1
+        ));
+        assert!(span_failure.closes());
+        assert_eq!(
+            span_failure.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::StartDomain)
+        );
     }
 
     #[test]

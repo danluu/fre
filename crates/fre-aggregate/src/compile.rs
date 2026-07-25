@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 
 use fre_exact_alloc::{CopyError, ExactVec};
-use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
+use regex_syntax::hir::{Class, Hir, HirKind, Look, Repetition};
 use regex_syntax::utf8::Utf8Sequences;
 
 use crate::accounting::CompileAccounting;
 use crate::candidate::{self, Draft as CandidateDraft, Entry as CandidateEntry};
 use crate::error::{add, enforce, mul};
-use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet};
+use crate::program::{Assertion, ByteSet, Inst, NO_SPLIT_RANK, Program, ScalarSet, StartDomain};
 use crate::required_internal_anchor;
 use crate::{CompileLimits, Error, Resource, Unsupported};
 
@@ -621,6 +621,8 @@ pub struct CompiledRegex {
     /// matches without inspecting the source. Nullable and empty-language
     /// programs retain their exact `Some(0)` / `None` distinction.
     pub(crate) minimum_match_bytes: Option<usize>,
+    /// Mandatory match-start domain derived from the same canonical HIR.
+    pub(crate) start_domain: StartDomain,
     plan_id: PlanId,
     accounting: CompileAccounting,
 }
@@ -1031,6 +1033,7 @@ impl CompiledRegex {
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
+            mut start_domain,
             retained_program_bytes,
         ) = build_retained_components(hir, profile, limits, budget)?;
         let mut candidate = if ordered_root {
@@ -1122,7 +1125,9 @@ impl CompiledRegex {
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
         };
+        start_domain = partitioned_start_domain(start_domain, &program, budget)?;
         let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, budget)?;
+        plan_id = bind_start_domain_identity(plan_id, start_domain, budget)?;
         if let Some(candidate) = &candidate {
             plan_id = bind_candidate_identity(plan_id, candidate, budget)?;
         }
@@ -1146,6 +1151,7 @@ impl CompiledRegex {
             required_internal_anchor,
             terminal_frontier,
             minimum_match_bytes,
+            start_domain,
             plan_id,
             accounting,
         })
@@ -2671,6 +2677,7 @@ fn build_retained_components(
         RequiredSuffixes,
         Option<fre_kernels::RequiredInternalAnchorPlan>,
         TerminalFrontierSeed,
+        StartDomain,
         usize,
     ),
     Error,
@@ -2688,13 +2695,26 @@ fn build_retained_components(
         budget.acquire_checked_construction_bytes(minimum_match_bytes_proof_bytes)?;
     }
     budget.record_initialization(minimum_match_bytes_proof_bytes, false)?;
+    budget.charge(1)?;
+    let start_domain = mandatory_start_domain(hir);
+    let start_domain_proof_bytes = core::mem::size_of::<StartDomain>();
+    budget.accounting.start_domain_proof_bytes = start_domain_proof_bytes;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(start_domain_proof_bytes)?;
+        budget.acquire_checked_construction_bytes(start_domain_proof_bytes)?;
+    }
+    budget.record_initialization(start_domain_proof_bytes, false)?;
     let seed_program_bytes = add(
         add(
             required_suffixes.retained_bytes()?,
             TerminalFrontierSeed::retained_bytes(),
             Resource::ProgramBytes,
         )?,
-        minimum_match_bytes_proof_bytes,
+        add(
+            minimum_match_bytes_proof_bytes,
+            start_domain_proof_bytes,
+            Resource::ProgramBytes,
+        )?,
         Resource::ProgramBytes,
     )?;
     if budget.receipt_scope {
@@ -2781,8 +2801,53 @@ fn build_retained_components(
         required_suffixes,
         required_internal_anchor,
         terminal_frontier,
+        start_domain,
         retained_program_bytes,
     ))
+}
+
+fn mandatory_start_domain(hir: &Hir) -> StartDomain {
+    let prefix = hir.properties().look_set_prefix();
+    if prefix.contains(Look::Start) {
+        StartDomain::AbsoluteStart
+    } else if prefix.contains(Look::StartLF) {
+        StartDomain::LineStartLf
+    } else if prefix.contains(Look::StartCRLF) {
+        StartDomain::LineStartCrlf
+    } else {
+        StartDomain::AnyBoundary
+    }
+}
+
+fn partitioned_start_domain(
+    start_domain: StartDomain,
+    program: &Program,
+    budget: &mut CompileBudget,
+) -> Result<StartDomain, Error> {
+    let separators: &[u8] = match start_domain {
+        StartDomain::AnyBoundary | StartDomain::AbsoluteStart => return Ok(start_domain),
+        StartDomain::LineStartLf => b"\n",
+        StartDomain::LineStartCrlf => b"\r\n",
+    };
+    for inst in &*program.insts {
+        budget.charge(separators.len())?;
+        match inst {
+            Inst::Consume { bytes, .. }
+                if separators
+                    .iter()
+                    .copied()
+                    .any(|separator| bytes.contains(separator)) =>
+            {
+                return Ok(StartDomain::AnyBoundary);
+            }
+            // Scalar continuations are not eligible for the compact executor,
+            // but treating them as unpartitioned keeps this retained proof
+            // independently conservative.
+            Inst::ConsumeScalar { .. } => return Ok(StartDomain::AnyBoundary),
+            _ => {}
+        }
+    }
+    Ok(start_domain)
 }
 
 fn retain_required_internal_anchor(
@@ -2887,6 +2952,7 @@ impl CompileBudget {
                 candidate_entries: 0,
                 candidate_bytes: 0,
                 minimum_match_bytes_proof_bytes: 0,
+                start_domain_proof_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -5339,6 +5405,32 @@ fn finalize_program(
     Ok(PlanId(bytes))
 }
 
+fn bind_start_domain_identity(
+    program: PlanId,
+    start_domain: StartDomain,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = b"fre.aggregate.start-domain.v1";
+    let payload = add(
+        add(program.0.len(), domain.len(), Resource::CompileWork)?,
+        1,
+        Resource::CompileWork,
+    )?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0x2f93_70dc_5b18_64a1);
+    let mut second = StableHash::new(0xb248_6d3a_f165_09ce);
+    first.bytes(domain);
+    second.bytes(domain);
+    first.bytes(&program.0);
+    second.bytes(&program.0);
+    first.byte(start_domain.identity_tag());
+    second.byte(start_domain.identity_tag());
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "identity binding enumerates every resource-bearing candidate field explicitly"
@@ -6298,6 +6390,82 @@ mod tests {
     }
 
     #[test]
+    fn mandatory_start_domain_is_hir_derived_capture_transparent_and_bounded() {
+        let cases = [
+            (r"a", StartDomain::AnyBoundary),
+            (r"\Aa", StartDomain::AbsoluteStart),
+            (r"(?m:^a)", StartDomain::LineStartLf),
+            (r"(?Rm:^a)", StartDomain::LineStartCrlf),
+            (r"(?m:^(a))", StartDomain::LineStartLf),
+            (r"(?m:^a)|(?m:^b)", StartDomain::LineStartLf),
+        ];
+        for (pattern, expected) in cases {
+            let hir = parse_bytes(pattern);
+            assert_eq!(mandatory_start_domain(&hir), expected, "{pattern:?}");
+            let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(compiled.start_domain, expected, "{pattern:?}");
+            assert_eq!(
+                compiled.compile_accounting().start_domain_proof_bytes,
+                core::mem::size_of::<StartDomain>()
+            );
+            let accounting = compiled.compile_accounting();
+            let exact = CompileLimits {
+                max_program_bytes: accounting.program_bytes,
+                max_work: accounting.work,
+                ..CompileLimits::default()
+            };
+            let replay = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                exact,
+            )
+            .unwrap();
+            assert_eq!(replay.compile_accounting(), accounting);
+            assert_eq!(replay.plan_id(), compiled.plan_id());
+            assert!(matches!(
+                CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                    &hir,
+                    RustByteProfile::PINNED_1_12_4,
+                    CompileLimits {
+                        max_program_bytes: accounting.program_bytes - 1,
+                        ..exact
+                    },
+                ),
+                Err(Error::ResourceLimit {
+                    resource: Resource::ProgramBytes,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn line_start_domain_requires_a_line_partitioned_byte_program() {
+        let cases = [
+            (r"(?m:^[^\n]*Z)", StartDomain::LineStartLf),
+            (r"(?ms:^.*Z)", StartDomain::AnyBoundary),
+            (r"(?Rm:^[^\r\n]*Z)", StartDomain::LineStartCrlf),
+            (r"(?Rm:^[^\n]*Z)", StartDomain::AnyBoundary),
+            (r"(?Rms:^.*Z)", StartDomain::AnyBoundary),
+        ];
+        for (pattern, expected) in cases {
+            let hir = parse_bytes(pattern);
+            let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(compiled.start_domain, expected, "{pattern:?}");
+        }
+    }
+
+    #[test]
     fn candidate_allocation_failures_commit_only_successful_storage() {
         let hir = parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z");
         let HirKind::Alternation(branches) = hir.kind() else {
@@ -6764,7 +6932,12 @@ mod tests {
         .unwrap();
         assert!(inspection.plan.is_some());
         let exact_work = add(
-            add(prefix_work, seed_work, Resource::CompileWork).unwrap(),
+            add(
+                add(prefix_work, seed_work, Resource::CompileWork).unwrap(),
+                1,
+                Resource::CompileWork,
+            )
+            .unwrap(),
             inspection.inspection_work,
             Resource::CompileWork,
         )
@@ -6832,7 +7005,7 @@ mod tests {
         );
         assert_eq!(
             refusal.receipt.actual.work,
-            prefix_work + seed_work + local_attempt.inspection_work
+            prefix_work + seed_work + 1 + local_attempt.inspection_work
         );
         assert!(refusal.receipt.contains_actual());
     }

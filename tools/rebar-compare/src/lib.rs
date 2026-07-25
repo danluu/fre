@@ -19527,7 +19527,7 @@ mod tests {
 
         let selector_starved = RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 542_671,
+            fre_capture_selector_program_bytes: 542_672,
             ..RunLimits::default()
         };
         let refusal = current_fre(
@@ -19540,7 +19540,7 @@ mod tests {
         );
         assert!(
             matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 542672, limit is 542671")),
+                if reason.contains("ProgramBytes requires 542673, limit is 542672")),
             "capture selector byte quota must remain a typed refusal: {refusal:?}"
         );
     }
