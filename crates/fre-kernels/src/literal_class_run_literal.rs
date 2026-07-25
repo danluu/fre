@@ -1,10 +1,23 @@
 //! Whole-operation reduction for `LITERAL BYTE_CLASS+ LITERAL`.
 //!
 //! Admission proves that the byte immediately before and after the class run
-//! is outside the class. Therefore every match owns one maximal class run.
-//! Enumerating those runs once, checking their immediate literal borders and
-//! filtering starts behind the preceding selected end preserves greedy,
-//! leftmost-first, non-overlapping Rust byte semantics.
+//! is outside the class. Construction selects the longer fixed literal as a
+//! native `memmem` anchor. Anchor occurrences are visited monotonically,
+//! including overlaps; only their adjacent maximal class run and opposite
+//! literal are checked. Prefix-anchor order is match-start order. For a suffix
+//! anchor, the first suffix byte is a non-class barrier, so increasing suffix
+//! order is also increasing maximal-run start order. Filtering starts behind
+//! the preceding selected end therefore preserves greedy, leftmost-first,
+//! non-overlapping Rust byte semantics without classifying unrelated bytes.
+//!
+//! For haystack width `N`, anchor width `A`, at most
+//! `Q = max(0, N-A+1)` overlapping anchor starts exist. Restarting one byte
+//! after a rejection makes finder service at most `N + Q*(A-1)`. Adjacent
+//! class probes plus all disjoint maximal runs cost at most `N+Q` reads, and
+//! only the opposite literal is compared for at most `ceil(N/2)` run events.
+//! These bounds, every finder call/candidate, results, persistent owner bytes,
+//! and zero operation scratch are admitted before source access and checked
+//! against cumulative actual counters after execution.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -14,6 +27,7 @@
 use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
+use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
@@ -23,9 +37,14 @@ pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unic
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
+const FINDER_BUILD_WORK_PER_BYTE: usize = 4;
+const ANCHOR_SELECTION_WORK: usize = 2;
 const RANGE_BUILD_WORK: usize = 8;
 const RANGE_WORD_WORK: usize = 4;
 const FIXED_REDUCE_WORK: usize = 16;
+const FINDER_SCAN_WORK: usize = 1;
+const FINDER_CALL_WORK: usize = 4;
+const ANCHOR_CANDIDATE_WORK: usize = 4;
 const CLASSIFICATION_WORK: usize = 2;
 const LITERAL_COMPARISON_WORK: usize = 2;
 const RUN_WORK: usize = 12;
@@ -149,6 +168,9 @@ impl Default for ReduceLimits {
 pub struct ReduceUpperBounds {
     pub input_bytes: usize,
     pub source_reads: usize,
+    pub finder_scanned_bytes: usize,
+    pub finder_calls: usize,
+    pub anchor_candidates: usize,
     pub classifications: usize,
     pub literal_comparisons: usize,
     pub work: usize,
@@ -165,6 +187,9 @@ pub struct ReduceUpperBounds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub source_reads: usize,
+    pub finder_scanned_bytes: usize,
+    pub finder_calls: usize,
+    pub anchor_candidates: usize,
     pub classifications: usize,
     pub literal_comparisons: usize,
     pub runs: usize,
@@ -350,10 +375,17 @@ impl ByteClass {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Anchor {
+    Prefix,
+    Suffix,
+}
+
 #[derive(Debug)]
 pub struct LiteralClassRunLiteralPlan {
-    prefix: Box<[u8]>,
-    suffix: Box<[u8]>,
+    anchor: Finder<'static>,
+    opposite_literal: Box<[u8]>,
+    anchor_kind: Anchor,
     class: ByteClass,
     build: BuildAccounting,
 }
@@ -374,6 +406,10 @@ impl LiteralClassRunLiteralPlan {
     }
 
     /// Build while retaining exact successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps admission, exact allocation, finder publication, and the terminal receipt in one auditable transaction"
+    )]
     pub fn build_attempt<I>(
         prefix: &[u8],
         mut ranges: I,
@@ -398,6 +434,12 @@ impl LiteralClassRunLiteralPlan {
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal byte total",
                     })?;
+            let anchor_kind = if prefix.len() >= suffix.len() {
+                Anchor::Prefix
+            } else {
+                Anchor::Suffix
+            };
+            let anchor_bytes = prefix.len().max(suffix.len());
             enforce_build(
                 literal_bytes,
                 limits.max_literal_bytes,
@@ -424,9 +466,15 @@ impl LiteralClassRunLiteralPlan {
 
             let literal_work = literal_bytes
                 .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
+                .and_then(|value| {
+                    anchor_bytes
+                        .checked_mul(FINDER_BUILD_WORK_PER_BYTE)
+                        .and_then(|finder| value.checked_add(finder))
+                })
                 .and_then(|value| value.checked_add(FIXED_BUILD_WORK))
+                .and_then(|value| value.checked_add(ANCHOR_SELECTION_WORK))
                 .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "fixed plus literal build work",
+                    computation: "fixed, literal, and finder build work",
                 })?;
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
@@ -446,6 +494,10 @@ impl LiteralClassRunLiteralPlan {
             record_literal_copy(&mut actual, suffix.len())?;
             let prefix_bytes = prefix.len();
             let suffix_bytes = suffix.len();
+            let (anchor, opposite_literal) = match anchor_kind {
+                Anchor::Prefix => (FinderBuilder::new().build_forward_owned(prefix), suffix),
+                Anchor::Suffix => (FinderBuilder::new().build_forward_owned(suffix), prefix),
+            };
             actual.initialized_bytes = actual
                 .initialized_bytes
                 .checked_add(size_of::<Self>())
@@ -461,8 +513,9 @@ impl LiteralClassRunLiteralPlan {
             actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
             debug_assert_eq!(actual.live_persistent_bytes, persistent_bytes);
             Ok(Self {
-                prefix,
-                suffix,
+                anchor,
+                opposite_literal,
+                anchor_kind,
                 class,
                 build: BuildAccounting {
                     prefix_bytes,
@@ -514,6 +567,20 @@ impl LiteralClassRunLiteralPlan {
         }
     }
 
+    fn prefix(&self) -> &[u8] {
+        match self.anchor_kind {
+            Anchor::Prefix => self.anchor.needle(),
+            Anchor::Suffix => &self.opposite_literal,
+        }
+    }
+
+    fn suffix(&self) -> &[u8] {
+        match self.anchor_kind {
+            Anchor::Prefix => &self.opposite_literal,
+            Anchor::Suffix => self.anchor.needle(),
+        }
+    }
+
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
         let upper = self.preflight(haystack.len(), Operation::Count, limits)?;
         let actual = self.scan(haystack, Operation::Count, upper)?;
@@ -555,25 +622,56 @@ impl LiteralClassRunLiteralPlan {
         Ok(upper)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free preflight keeps every finder, class, literal, result, and resource bound adjacent"
+    )]
     fn derive_upper_bounds(
         &self,
         input_bytes: usize,
         operation: Operation,
     ) -> Result<ReduceUpperBounds, ReduceError> {
+        let anchor_bytes = self.anchor.needle().len();
+        let opposite_literal_bytes = self.opposite_literal.len();
+        let anchor_candidates = input_bytes
+            .checked_sub(anchor_bytes)
+            .and_then(|remaining| remaining.checked_add(1))
+            .unwrap_or(0);
+        let finder_calls = anchor_candidates;
+        let repeated_anchor_bytes =
+            anchor_candidates
+                .checked_mul(anchor_bytes.checked_sub(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "nonempty anchor overlap width",
+                    },
+                )?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "overlapping anchor finder service",
+                })?;
+        let finder_scanned_bytes = input_bytes.checked_add(repeated_anchor_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "complete anchor finder service",
+            },
+        )?;
         let run_events = input_bytes / 2 + input_bytes % 2;
-        let literal_bytes = self.build.literal_bytes;
-        let literal_reads =
-            run_events
-                .checked_mul(literal_bytes)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "run events times literal bytes",
-                })?;
-        let source_reads =
+        let classifications =
             input_bytes
-                .checked_add(literal_reads)
+                .checked_add(anchor_candidates)
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "classification plus literal source reads",
+                    computation: "class run plus adjacent class probes",
                 })?;
+        let literal_comparisons = run_events.checked_mul(opposite_literal_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "run events times opposite literal bytes",
+            },
+        )?;
+        let source_reads = finder_scanned_bytes
+            .checked_add(classifications)
+            .and_then(|value| value.checked_add(literal_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "finder, class, and literal source reads",
+            })?;
+        let literal_bytes = self.build.literal_bytes;
         let minimum_width =
             literal_bytes
                 .checked_add(1)
@@ -592,10 +690,25 @@ impl LiteralClassRunLiteralPlan {
                 })?
             }
         };
-        let work = input_bytes
-            .checked_mul(CLASSIFICATION_WORK)
+        let work = finder_scanned_bytes
+            .checked_mul(FINDER_SCAN_WORK)
             .and_then(|value| {
-                literal_reads
+                finder_calls
+                    .checked_mul(FINDER_CALL_WORK)
+                    .and_then(|calls| value.checked_add(calls))
+            })
+            .and_then(|value| {
+                anchor_candidates
+                    .checked_mul(ANCHOR_CANDIDATE_WORK)
+                    .and_then(|candidates| value.checked_add(candidates))
+            })
+            .and_then(|value| {
+                classifications
+                    .checked_mul(CLASSIFICATION_WORK)
+                    .and_then(|classifications| value.checked_add(classifications))
+            })
+            .and_then(|value| {
+                literal_comparisons
                     .checked_mul(LITERAL_COMPARISON_WORK)
                     .and_then(|literal| value.checked_add(literal))
             })
@@ -619,8 +732,11 @@ impl LiteralClassRunLiteralPlan {
         Ok(ReduceUpperBounds {
             input_bytes,
             source_reads,
-            classifications: input_bytes,
-            literal_comparisons: literal_reads,
+            finder_scanned_bytes,
+            finder_calls,
+            anchor_candidates,
+            classifications,
+            literal_comparisons,
             work,
             run_events,
             candidate_events: run_events,
@@ -633,6 +749,10 @@ impl LiteralClassRunLiteralPlan {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotone anchor traversal keeps cumulative actual accounting adjacent to every source operation"
+    )]
     fn scan(
         &self,
         haystack: &[u8],
@@ -641,6 +761,9 @@ impl LiteralClassRunLiteralPlan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         let mut actual = ReduceActualCounters {
             source_reads: 0,
+            finder_scanned_bytes: 0,
+            finder_calls: 0,
+            anchor_candidates: 0,
             classifications: 0,
             literal_comparisons: 0,
             runs: 0,
@@ -651,57 +774,114 @@ impl LiteralClassRunLiteralPlan {
             work: FIXED_REDUCE_WORK,
             scratch_bytes: 0,
         };
-        let mut position = 0_usize;
+        let anchor_bytes = self.anchor.needle().len();
+        if haystack.len() < anchor_bytes {
+            verify_actual(actual, upper)?;
+            return Ok(actual);
+        }
+        let mut cursor = 0_usize;
         let mut restart = 0_usize;
-        while position < haystack.len() {
-            let byte = read_classified(haystack, position, &mut actual)?;
-            if !self.class.contains(byte) {
-                position = position
+        loop {
+            let remaining =
+                haystack
+                    .len()
+                    .checked_sub(cursor)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "anchor search remaining bytes",
+                    })?;
+            if remaining < anchor_bytes {
+                break;
+            }
+            let search = haystack
+                .get(cursor..)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "anchor search window",
+                })?;
+            actual.finder_calls = checked_add(actual.finder_calls, 1, "actual finder calls")?;
+            actual.work = checked_add(actual.work, FINDER_CALL_WORK, "finder call work")?;
+            let Some(relative) = self.anchor.find(search) else {
+                charge_finder_scan(&mut actual, search.len())?;
+                break;
+            };
+            let finder_service =
+                relative
+                    .checked_add(anchor_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "successful finder service bytes",
+                    })?;
+            charge_finder_scan(&mut actual, finder_service)?;
+            let anchor_start =
+                cursor
+                    .checked_add(relative)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "absolute anchor start",
+                    })?;
+            let anchor_end =
+                anchor_start
+                    .checked_add(anchor_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "absolute anchor end",
+                    })?;
+            actual.anchor_candidates =
+                checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
+            actual.work = checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
+            let candidate = match self.anchor_kind {
+                Anchor::Prefix => self.prefix_anchor_candidate(
+                    haystack,
+                    anchor_start,
+                    anchor_end,
+                    restart,
+                    &mut actual,
+                )?,
+                Anchor::Suffix => self.suffix_anchor_candidate(
+                    haystack,
+                    anchor_start,
+                    anchor_end,
+                    restart,
+                    &mut actual,
+                )?,
+            };
+            if let Some((start, end)) = candidate {
+                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
+                actual.count =
+                    actual
+                        .count
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual count",
+                        })?;
+                if operation == Operation::SpanSum {
+                    let width = end
+                        .checked_sub(start)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual match width",
+                        })?;
+                    actual.span_sum = actual
+                        .span_sum
+                        .checked_add(u64::try_from(width).map_err(|_| {
+                            ReduceError::ArithmeticOverflow {
+                                computation: "actual match width as u64",
+                            }
+                        })?)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual span sum",
+                        })?;
+                }
+                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+                restart = end;
+                cursor = end;
+            } else {
+                cursor = anchor_start
                     .checked_add(1)
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "nonclass cursor advance",
-                    })?;
-                continue;
-            }
-            let run_start = position;
-            let run_end = scan_class_run(haystack, self.class, &mut position, &mut actual)?;
-            actual.runs = checked_add(actual.runs, 1, "actual run count")?;
-            actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
-            let Some((start, end)) =
-                self.candidate_span(haystack, run_start, run_end, restart, &mut actual)?
-            else {
-                continue;
-            };
-            actual.matches = checked_add(actual.matches, 1, "actual match count")?;
-            actual.count = actual
-                .count
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual count",
-                })?;
-            if operation == Operation::SpanSum {
-                let width = end
-                    .checked_sub(start)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual match width",
-                    })?;
-                actual.span_sum = actual
-                    .span_sum
-                    .checked_add(u64::try_from(width).map_err(|_| {
-                        ReduceError::ArithmeticOverflow {
-                            computation: "actual match width as u64",
-                        }
-                    })?)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual span sum",
+                        computation: "rejected overlapping anchor progress",
                     })?;
             }
-            actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
-            restart = end;
         }
         actual.source_reads = actual
-            .classifications
-            .checked_add(actual.literal_comparisons)
+            .finder_scanned_bytes
+            .checked_add(actual.classifications)
+            .and_then(|reads| reads.checked_add(actual.literal_comparisons))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual source reads",
             })?;
@@ -709,33 +889,61 @@ impl LiteralClassRunLiteralPlan {
         Ok(actual)
     }
 
-    fn candidate_span(
+    fn prefix_anchor_candidate(
         &self,
         haystack: &[u8],
-        run_start: usize,
-        run_end: usize,
+        anchor_start: usize,
+        anchor_end: usize,
         restart: usize,
         actual: &mut ReduceActualCounters,
     ) -> Result<Option<(usize, usize)>, ReduceError> {
-        let Some(start) = run_start.checked_sub(self.prefix.len()) else {
+        let Some(run_end) = scan_class_run_forward(haystack, self.class, anchor_end, actual)?
+        else {
             return Ok(None);
         };
+        actual.runs = checked_add(actual.runs, 1, "actual run count")?;
+        actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
         let end =
             run_end
-                .checked_add(self.suffix.len())
+                .checked_add(self.suffix().len())
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "candidate end",
+                    computation: "prefix-anchor candidate end",
                 })?;
-        if start < restart || end > haystack.len() {
+        if anchor_start < restart || end > haystack.len() {
             return Ok(None);
         }
         actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
-        if !literal_equals(haystack, start, &self.prefix, actual)?
-            || !literal_equals(haystack, run_end, &self.suffix, actual)?
-        {
+        if !literal_equals(haystack, run_end, self.suffix(), actual)? {
             return Ok(None);
         }
-        Ok(Some((start, end)))
+        Ok(Some((anchor_start, end)))
+    }
+
+    fn suffix_anchor_candidate(
+        &self,
+        haystack: &[u8],
+        anchor_start: usize,
+        anchor_end: usize,
+        restart: usize,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<Option<(usize, usize)>, ReduceError> {
+        let Some(run_start) = scan_class_run_backward(haystack, self.class, anchor_start, actual)?
+        else {
+            return Ok(None);
+        };
+        actual.runs = checked_add(actual.runs, 1, "actual run count")?;
+        actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
+        let Some(start) = run_start.checked_sub(self.prefix().len()) else {
+            return Ok(None);
+        };
+        if start < restart {
+            return Ok(None);
+        }
+        actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
+        if !literal_equals(haystack, start, self.prefix(), actual)? {
+            return Ok(None);
+        }
+        Ok(Some((start, anchor_end)))
     }
 }
 
@@ -802,37 +1010,66 @@ where
     Ok((class, class_ranges, class_members))
 }
 
-fn scan_class_run(
+fn scan_class_run_forward(
     haystack: &[u8],
     class: ByteClass,
-    position: &mut usize,
+    start: usize,
     actual: &mut ReduceActualCounters,
-) -> Result<usize, ReduceError> {
-    *position = position
-        .checked_add(1)
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "class cursor advance",
-        })?;
-    while *position < haystack.len() {
-        let byte = read_classified(haystack, *position, actual)?;
+) -> Result<Option<usize>, ReduceError> {
+    let mut end = start;
+    while end < haystack.len() {
+        let byte = read_classified(haystack, end, actual)?;
         if !class.contains(byte) {
             break;
         }
-        *position = position
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "class run cursor advance",
-            })?;
+        end = end.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+            computation: "forward class run cursor advance",
+        })?;
     }
-    let run_end = *position;
-    if *position < haystack.len() {
-        *position = position
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "known nonclass cursor advance",
-            })?;
+    if end == start {
+        return Ok(None);
     }
-    Ok(run_end)
+    Ok(Some(end))
+}
+
+fn scan_class_run_backward(
+    haystack: &[u8],
+    class: ByteClass,
+    end: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let mut start = end;
+    while start > 0 {
+        let previous = start
+            .checked_sub(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "backward class run previous position",
+            })?;
+        let byte = read_classified(haystack, previous, actual)?;
+        if !class.contains(byte) {
+            break;
+        }
+        start = previous;
+    }
+    if start == end {
+        return Ok(None);
+    }
+    Ok(Some(start))
+}
+
+fn charge_finder_scan(actual: &mut ReduceActualCounters, bytes: usize) -> Result<(), ReduceError> {
+    actual.finder_scanned_bytes = checked_add(
+        actual.finder_scanned_bytes,
+        bytes,
+        "actual finder scanned bytes",
+    )?;
+    let work = bytes
+        .checked_mul(FINDER_SCAN_WORK)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "finder scan work",
+        })?;
+    actual.work = checked_add(actual.work, work, "actual finder scan work")?;
+    Ok(())
 }
 
 fn read_classified(
@@ -886,6 +1123,17 @@ fn verify_actual(
     upper: ReduceUpperBounds,
 ) -> Result<(), ReduceError> {
     verify("source reads", actual.source_reads, upper.source_reads)?;
+    verify(
+        "finder scanned bytes",
+        actual.finder_scanned_bytes,
+        upper.finder_scanned_bytes,
+    )?;
+    verify("finder calls", actual.finder_calls, upper.finder_calls)?;
+    verify(
+        "anchor candidates",
+        actual.anchor_candidates,
+        upper.anchor_candidates,
+    )?;
     verify(
         "classifications",
         actual.classifications,
@@ -1184,6 +1432,48 @@ mod tests {
         (count, sum, spans)
     }
 
+    fn assert_exhaustive_matches(
+        plan: &LiteralClassRunLiteralPlan,
+        pattern: &str,
+        alphabet: &[u8],
+        maximum_length: usize,
+    ) {
+        let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        for length in 0_usize..=maximum_length {
+            let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0; length];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let spans: Vec<_> = oracle
+                    .find_iter(&haystack)
+                    .map(|matched| matched.start()..matched.end())
+                    .collect();
+                let count = u64::try_from(spans.len()).unwrap();
+                let sum = spans
+                    .iter()
+                    .map(|span| u64::try_from(span.end - span.start).unwrap())
+                    .sum();
+                assert_eq!(
+                    plan.count(&haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .count,
+                    count,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum(&haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .span_sum,
+                    sum,
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn matches_greedy_nonoverlap_reference() {
         let plan = plan();
@@ -1250,6 +1540,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn overlapping_prefix_anchor_candidates_are_not_skipped() {
+        let plan = LiteralClassRunLiteralPlan::build(
+            b"aaa",
+            [(b'x', b'x')].into_iter(),
+            b"b",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(plan.anchor_kind, Anchor::Prefix);
+        assert_eq!(plan.anchor.needle(), b"aaa");
+        let haystack = b"aaaaxxb--aaaxxb";
+        let (_, _, spans) = reference(r"aaax+b", haystack);
+        assert_eq!(spans, [1..7, 9..15]);
+        assert_exhaustive_matches(&plan, r"aaax+b", b"abx", 9);
+    }
+
+    #[test]
+    fn suffix_anchor_preserves_greedy_nonoverlap_and_overlap_restarts() {
+        let plan = LiteralClassRunLiteralPlan::build(
+            b"a",
+            [(b'x', b'x')].into_iter(),
+            b"aaaa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(plan.anchor_kind, Anchor::Suffix);
+        assert_eq!(plan.anchor.needle(), b"aaaa");
+        for haystack in [
+            b"axaaaaa".as_slice(),
+            b"aaxaaaa".as_slice(),
+            b"axaaaaxaaaa".as_slice(),
+            b"axaaaaxxxaaaa".as_slice(),
+            b"aaaaaxaaaa".as_slice(),
+        ] {
+            let (count, sum, _) = reference(r"ax+aaaa", haystack);
+            assert_eq!(
+                plan.count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                count,
+                "haystack={haystack:?}"
+            );
+            assert_eq!(
+                plan.span_sum(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .span_sum,
+                sum,
+                "haystack={haystack:?}"
+            );
+        }
+        assert_exhaustive_matches(&plan, r"ax+aaaa", b"axy", 9);
+    }
+
+    #[test]
+    fn overlapping_anchors_with_internal_class_bytes_preserve_run_barriers() {
+        let prefix_anchor = LiteralClassRunLiteralPlan::build(
+            b"abca",
+            [(b'b', b'b')].into_iter(),
+            b"z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let prefix_haystack = b"abcabcabbbz";
+        let (_, _, prefix_spans) = reference(r"abcab+z", prefix_haystack);
+        assert_eq!(prefix_spans.len(), 1);
+        assert_eq!(prefix_spans[0], 3..11);
+        let prefix_result = prefix_anchor
+            .span_sum(prefix_haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(prefix_result.span_sum, 8);
+        assert!(
+            prefix_result.accounting.actual.classifications
+                <= prefix_result.accounting.upper_bounds.classifications
+        );
+
+        let suffix_anchor = LiteralClassRunLiteralPlan::build(
+            b"b",
+            [(b'c', b'c')].into_iter(),
+            b"abca",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let suffix_haystack = b"abcabca";
+        let (_, _, suffix_spans) = reference(r"bc+abca", suffix_haystack);
+        assert_eq!(suffix_spans.len(), 1);
+        assert_eq!(suffix_spans[0], 1..7);
+        let suffix_result = suffix_anchor
+            .span_sum(suffix_haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(suffix_result.span_sum, 6);
+        assert!(
+            suffix_result.accounting.actual.classifications
+                <= suffix_result.accounting.upper_bounds.classifications
+        );
+    }
+
+    #[test]
+    fn dense_overlapping_anchor_accounting_is_preflighted_exactly() {
+        let plan = LiteralClassRunLiteralPlan::build(
+            b"a",
+            [(b'x', b'x')].into_iter(),
+            b"aaaa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = vec![b'a'; 4_096];
+        let baseline = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+        assert_eq!(baseline.span_sum, 0);
+        let upper = baseline.accounting.upper_bounds;
+        let actual = baseline.accounting.actual;
+        assert_eq!(upper.anchor_candidates, haystack.len() - 3);
+        assert_eq!(actual.anchor_candidates, haystack.len() - 3);
+        assert_eq!(actual.finder_calls, actual.anchor_candidates);
+        assert_eq!(
+            actual.finder_scanned_bytes,
+            actual.anchor_candidates * b"aaaa".len()
+        );
+        assert!(actual.finder_scanned_bytes <= upper.finder_scanned_bytes);
+        assert!(actual.classifications <= upper.classifications);
+        assert!(actual.source_reads <= upper.source_reads);
+        assert!(actual.work <= upper.work);
+
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(plan.span_sum(&haystack, exact).unwrap().span_sum, 0);
+
+        let mut below = exact;
+        below.max_source_reads -= 1;
+        assert!(matches!(
+            plan.span_sum(&haystack, below),
+            Err(ReduceError::SourceReadsLimit { needed, limit })
+                if needed == upper.source_reads && limit == upper.source_reads - 1
+        ));
+        below = exact;
+        below.max_work -= 1;
+        assert!(matches!(
+            plan.span_sum(&haystack, below),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == upper.work - 1
+        ));
     }
 
     #[test]
@@ -1463,7 +1906,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error.source(), BuildError::PrefixBoundaryInClass));
-        assert_eq!(error.actual().work, 56);
+        assert_eq!(error.actual().work, 62);
         assert_eq!(error.actual().allocations, 0);
         assert_eq!(error.actual().allocated_bytes, 0);
         assert_eq!(error.actual().copied_bytes, 0);

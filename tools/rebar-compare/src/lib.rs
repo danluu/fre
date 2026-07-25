@@ -553,7 +553,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; literal-class-run-literal-v1 authenticates count/span-sum for fixed byte literals bracketing one greedy nonempty byte-class run",
         );
         identity.availability.push_str(
-            "; the literal/class-run/literal reducer scans maximal byte-class runs once and verifies fixed boundary literals under prospective comparison bounds with zero execution scratch",
+            "; the literal/class-run/literal reducer selects the longer fixed literal as an overlap-complete monotone memmem anchor, then verifies only its adjacent maximal byte-class run and opposite literal under complete prospective bounds with zero execution scratch",
         );
         identity
             .availability
@@ -7295,27 +7295,59 @@ fn inactive_fixed_class_sandwich_operation_limits() -> FixedClassSandwichReduceL
     FixedClassSandwichReduceLimits::default()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the adapter mirrors every kernel preflight dimension in one auditable source-free calculation"
+)]
 fn literal_class_run_literal_operation_limits(
     haystack_len: usize,
     build: LiteralClassRunLiteralBuildAccounting,
     operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<LiteralClassRunLiteralReduceLimits, ExecutionError> {
+    let anchor_bytes = build.prefix_bytes.max(build.suffix_bytes);
+    let opposite_literal_bytes = build.prefix_bytes.min(build.suffix_bytes);
+    let anchor_candidates = if haystack_len < anchor_bytes {
+        0
+    } else {
+        let remaining = haystack_len.checked_sub(anchor_bytes).ok_or_else(|| {
+            ExecutionError::fault("literal/class-run/literal anchor subtraction underflow")
+        })?;
+        checked_aggregate_add(remaining, 1, "literal/class-run/literal anchor candidates")?
+    };
+    let anchor_overlap = anchor_bytes.checked_sub(1).ok_or_else(|| {
+        ExecutionError::fault("literal/class-run/literal retained an empty anchor")
+    })?;
+    let repeated_anchor_bytes = checked_aggregate_mul(
+        anchor_candidates,
+        anchor_overlap,
+        "literal/class-run/literal overlapping anchor service",
+    )?;
+    let finder_scanned_bytes = checked_aggregate_add(
+        haystack_len,
+        repeated_anchor_bytes,
+        "literal/class-run/literal finder service",
+    )?;
     let run_events = checked_aggregate_add(
         haystack_len / 2,
         haystack_len % 2,
         "literal/class-run/literal run events",
     )?;
+    let classifications = checked_aggregate_add(
+        haystack_len,
+        anchor_candidates,
+        "literal/class-run/literal class probes",
+    )?;
     let literal_reads = checked_aggregate_mul(
         run_events,
-        build.literal_bytes,
+        opposite_literal_bytes,
         "literal/class-run/literal boundary reads",
     )?;
-    let source_reads = checked_aggregate_add(
-        haystack_len,
-        literal_reads,
-        "literal/class-run/literal source reads",
-    )?;
+    let source_reads = [finder_scanned_bytes, classifications, literal_reads]
+        .into_iter()
+        .try_fold(0_usize, |total, term| {
+            checked_aggregate_add(total, term, "literal/class-run/literal source reads")
+        })?;
     let minimum_width = checked_aggregate_add(
         build.literal_bytes,
         1,
@@ -7338,8 +7370,18 @@ fn literal_class_run_literal_operation_limits(
             ));
         }
     };
+    let finder_call_work = checked_aggregate_mul(
+        anchor_candidates,
+        4,
+        "literal/class-run/literal finder call work",
+    )?;
+    let anchor_candidate_work = checked_aggregate_mul(
+        anchor_candidates,
+        4,
+        "literal/class-run/literal anchor candidate work",
+    )?;
     let classification_work = checked_aggregate_mul(
-        haystack_len,
+        classifications,
         2,
         "literal/class-run/literal classification work",
     )?;
@@ -7352,6 +7394,9 @@ fn literal_class_run_literal_operation_limits(
     let match_work =
         checked_aggregate_mul(match_events, 8, "literal/class-run/literal match work")?;
     let work = [
+        finder_scanned_bytes,
+        finder_call_work,
+        anchor_candidate_work,
         classification_work,
         comparison_work,
         run_work,
