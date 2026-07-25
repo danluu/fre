@@ -6887,6 +6887,50 @@ fn composed_continuation_storage_limits(
     })
 }
 
+#[derive(Clone, Copy)]
+struct ContinuationPrefixLimits {
+    sequential: usize,
+    work: usize,
+}
+
+fn continuation_prefix_limits(
+    haystack_len: usize,
+    shape: ContinuationProgramShape,
+) -> Result<ContinuationPrefixLimits, ExecutionError> {
+    let prevalidation = if shape.requires_utf8_validation {
+        haystack_len
+    } else {
+        0
+    };
+    let required_literal_source = if shape.required_literal_sets == 0 {
+        0
+    } else {
+        haystack_len
+    };
+    let required_literal_comparisons = checked_aggregate_mul(
+        required_literal_source,
+        shape.required_literal_sets,
+        "required-literal comparisons",
+    )?;
+    let required_literal_work = checked_aggregate_add(
+        required_literal_source,
+        required_literal_comparisons,
+        "required-literal source and comparison work",
+    )?;
+    Ok(ContinuationPrefixLimits {
+        sequential: checked_aggregate_add(
+            prevalidation,
+            required_literal_source,
+            "sequential UTF-8 and required-literal prefixes",
+        )?,
+        work: checked_aggregate_add(
+            prevalidation,
+            required_literal_work,
+            "UTF-8 and required-literal prefix work",
+        )?,
+    })
+}
+
 fn continuation_operation_limits(
     haystack_len: usize,
     shape: ContinuationProgramShape,
@@ -6916,38 +6960,14 @@ fn continuation_operation_limits(
     let terminal_frontier =
         terminal_frontier_resource_upper(haystack_len, shape, row_random_access)?;
     let (random_access_upper, route_source) = terminal_frontier.unwrap_or((row_random_access, 0));
-    let prevalidation = if shape.requires_utf8_validation {
-        haystack_len
-    } else {
-        0
-    };
-    let required_literal_source = if shape.required_literal_sets == 0 {
-        0
-    } else {
-        haystack_len
-    };
-    let required_literal_comparisons = checked_aggregate_mul(
-        required_literal_source,
-        shape.required_literal_sets,
-        "required-literal comparisons",
-    )?;
-    let required_literal_work = checked_aggregate_add(
-        required_literal_source,
-        required_literal_comparisons,
-        "required-literal source and comparison work",
-    )?;
-    let source_prefix = checked_aggregate_add(
-        prevalidation,
-        required_literal_source,
-        "sequential UTF-8 and required-literal prefixes",
-    )?;
+    let prefix = continuation_prefix_limits(haystack_len, shape)?;
     let sequential_upper = checked_aggregate_add(
         checked_aggregate_add(
             row_sequential_upper,
             route_source,
             "row plus frontier sequential bytes",
         )?,
-        source_prefix,
+        prefix.sequential,
         "sequential bytes including pre-engine source prefixes",
     )?;
     let row_peak_upper = checked_aggregate_add(log_upper, random_access_upper, "peak bytes")?;
@@ -6981,21 +7001,16 @@ fn continuation_operation_limits(
         replay_work,
         "operation work",
     )?;
-    let prefix_work = checked_aggregate_add(
-        prevalidation,
-        required_literal_work,
-        "UTF-8 and required-literal prefix work",
-    )?;
     let work_upper = checked_aggregate_add(
         engine_work_upper,
-        prefix_work,
+        prefix.work,
         "operation work with prefixes",
     )?;
     let available_work = work_upper.min(limits.fre_aggregate_operation_work);
     let storage = composed_continuation_storage_limits(
         program_states,
         boundaries,
-        source_prefix,
+        prefix.sequential,
         available_work,
         terminal_frontier.is_some(),
         row_storage,
@@ -7083,34 +7098,10 @@ fn continuation_spans_operation_limits(
     let sequential_passes = checked_aggregate_add(PASSES, 1, "span sequential passes")?;
     let row_sequential_upper =
         checked_aggregate_mul(log_upper, sequential_passes, "span row sequential bytes")?;
-    let prevalidation = if shape.requires_utf8_validation {
-        haystack_len
-    } else {
-        0
-    };
-    let required_literal_source = if shape.required_literal_sets == 0 {
-        0
-    } else {
-        haystack_len
-    };
-    let required_literal_comparisons = checked_aggregate_mul(
-        required_literal_source,
-        shape.required_literal_sets,
-        "span required-literal comparisons",
-    )?;
-    let required_literal_work = checked_aggregate_add(
-        required_literal_source,
-        required_literal_comparisons,
-        "span required-literal source and comparison work",
-    )?;
-    let source_prefix = checked_aggregate_add(
-        prevalidation,
-        required_literal_source,
-        "span sequential UTF-8 and required-literal prefixes",
-    )?;
+    let prefix = continuation_prefix_limits(haystack_len, shape)?;
     let sequential_upper = checked_aggregate_add(
         row_sequential_upper,
-        source_prefix,
+        prefix.sequential,
         "span sequential bytes including pre-engine source prefixes",
     )?;
 
@@ -7139,13 +7130,8 @@ fn continuation_spans_operation_limits(
         replay_work,
         "span operation work",
     )?;
-    let prefix_work = checked_aggregate_add(
-        prevalidation,
-        required_literal_work,
-        "span UTF-8 and required-literal prefix work",
-    )?;
     let work_upper =
-        checked_aggregate_add(engine_work_upper, prefix_work, "span work with prefixes")?;
+        checked_aggregate_add(engine_work_upper, prefix.work, "span work with prefixes")?;
 
     let reducer_matches = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
@@ -20266,33 +20252,6 @@ mod tests {
         .unwrap();
         assert_eq!(unicode.max_sequential_bytes, 32);
 
-        let required_literal_shape = ContinuationProgramShape {
-            required_literal_sets: 2,
-            ..conservative_continuation_shape(5).unwrap()
-        };
-        let required_literal =
-            continuation_operation_limits(10, required_literal_shape, &run).unwrap();
-        // The pre-engine proof reads the source once and compares every byte
-        // against both retained sets: N sequential units and N * (sets + 1)
-        // work units, independently of the incumbent continuation envelope.
-        assert_eq!(required_literal.max_sequential_bytes, 32);
-        assert_eq!(required_literal.max_work, 459);
-
-        let span_baseline = continuation_spans_operation_limits(
-            10,
-            conservative_continuation_shape(5).unwrap(),
-            1,
-            &run,
-        )
-        .unwrap();
-        let span_required =
-            continuation_spans_operation_limits(10, required_literal_shape, 1, &run).unwrap();
-        assert_eq!(
-            span_required.max_sequential_bytes,
-            span_baseline.max_sequential_bytes + 10
-        );
-        assert_eq!(span_required.max_work, span_baseline.max_work + 30);
-
         let one_below = continuation_operation_limits(
             10,
             conservative_continuation_shape(5).unwrap(),
@@ -20345,6 +20304,36 @@ mod tests {
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn continuation_required_literal_prefix_limits_are_fully_derived() {
+        let run = RunLimits::default();
+        let baseline_shape = conservative_continuation_shape(5).unwrap();
+        let required_literal_shape = ContinuationProgramShape {
+            required_literal_sets: 2,
+            ..baseline_shape
+        };
+        let baseline = continuation_operation_limits(10, baseline_shape, &run).unwrap();
+        let required = continuation_operation_limits(10, required_literal_shape, &run).unwrap();
+        // The pre-engine proof reads the source once and compares every byte
+        // against both retained sets: N sequential units and N * (sets + 1)
+        // work units, independently of the incumbent continuation envelope.
+        assert_eq!(
+            required.max_sequential_bytes,
+            baseline.max_sequential_bytes + 10
+        );
+        assert_eq!(required.max_work, baseline.max_work + 30);
+
+        let span_baseline =
+            continuation_spans_operation_limits(10, baseline_shape, 1, &run).unwrap();
+        let span_required =
+            continuation_spans_operation_limits(10, required_literal_shape, 1, &run).unwrap();
+        assert_eq!(
+            span_required.max_sequential_bytes,
+            span_baseline.max_sequential_bytes + 10
+        );
+        assert_eq!(span_required.max_work, span_baseline.max_work + 30);
     }
 
     #[test]
