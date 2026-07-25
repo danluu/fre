@@ -270,8 +270,106 @@ pub(crate) fn reduce_attempt(
         let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
         let mut workspace =
             Workspace::new(program.insts.len(), schedule, &mut meter, &mut allocations)?;
-        let mut next_start = 0_usize;
         let mut cursor = 0_usize;
+
+        if let Some(fixed) = shared_fixed_anchors(plan, &mut meter)? {
+            // The whole source scan is admitted before memchr can touch the
+            // source. Each returned position then retains the same fixed
+            // filter, assertion, candidate-event and verifier accounting as
+            // the generic scheduler. Owners sharing a fixed offset and at
+            // most three anchor bytes also share monotonically increasing
+            // starts, so absent starts are never materialized or drained.
+            meter.charge_work(local.len())?;
+            meter.charge_sequential(local.len())?;
+            let mut scan = 0_usize;
+            while let Some(position) = fixed.find(local, scan)? {
+                scan = add(position, 1, Resource::Boundaries)?;
+                let byte = *local.get(position).ok_or(Error::InternalInvariant(
+                    "shared fixed anchor outside source",
+                ))?;
+                let mut owners =
+                    *plan
+                        .buckets
+                        .get(usize::from(byte))
+                        .ok_or(Error::InternalInvariant(
+                            "shared fixed anchor outside bucket table",
+                        ))?
+                        & fixed.owners;
+                let mut scheduled_owners = 0_u128;
+                while owners != 0 {
+                    meter.charge_work(1)?; // one owner selection
+                    let ordinal = take_owner(&mut owners)?;
+                    let entry = plan.entries.get(ordinal).ok_or(Error::InternalInvariant(
+                        "shared fixed candidate owner outside entries",
+                    ))?;
+                    if !filter_matches(entry, local, position, &mut meter)?
+                        || position < entry.min_offset
+                    {
+                        continue;
+                    }
+                    meter.charge_work(1)?; // one fixed candidate publication
+                    let start =
+                        position
+                            .checked_sub(entry.min_offset)
+                            .ok_or(Error::InternalInvariant(
+                                "shared fixed candidate offset underflow",
+                            ))?;
+                    if let Some(assertion) = entry.leading_assertion {
+                        meter.charge_assertion()?;
+                        meter
+                            .charge_random(assertions.candidate_source_bytes(assertion, start)?)?;
+                        if !assertions.is_match(assertion, start)? {
+                            continue;
+                        }
+                    }
+                    let required = add(candidates, 1, Resource::MatchEvents)?;
+                    enforce(required, limits.max_match_events, Resource::MatchEvents)?;
+                    candidates = required;
+                    scheduled_owners |= owner_bit(ordinal)?;
+                }
+                if scheduled_owners == 0 {
+                    continue;
+                }
+                let start = position
+                    .checked_sub(fixed.offset)
+                    .ok_or(Error::InternalInvariant(
+                        "shared fixed candidate offset underflow",
+                    ))?;
+                let slot = ring_slot(start, workspace.schedule.len())?;
+                let scheduled =
+                    workspace
+                        .schedule
+                        .get_mut(slot)
+                        .ok_or(Error::InternalInvariant(
+                            "shared fixed candidate schedule slot outside ring",
+                        ))?;
+                if *scheduled != 0 {
+                    return Err(Error::InternalInvariant(
+                        "shared fixed candidate reused a live schedule slot",
+                    ));
+                }
+                *scheduled = scheduled_owners;
+                process_start(
+                    plan,
+                    program,
+                    local,
+                    assertions,
+                    start,
+                    &mut cursor,
+                    &mut matches,
+                    &mut workspace,
+                    &mut meter,
+                )?;
+            }
+            if workspace.bytes != allocations.bytes {
+                return Err(Error::InternalInvariant(
+                    "shared fixed candidate workspace diverged from allocation ledger",
+                ));
+            }
+            return Ok(());
+        }
+
+        let mut next_start = 0_usize;
         let eligible = globally_present_owners(plan, local, &mut meter)?;
 
         for position in 0..local.len() {
@@ -394,6 +492,83 @@ pub(crate) fn reduce_attempt(
             actual_allocations: allocations.count,
         }),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SharedFixedAnchors {
+    bytes: [u8; 3],
+    len: usize,
+    offset: usize,
+    owners: u128,
+}
+
+impl SharedFixedAnchors {
+    fn find(self, haystack: &[u8], start: usize) -> Result<Option<usize>, Error> {
+        let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
+            "shared fixed scan cursor outside source",
+        ))?;
+        let relative = match self.len {
+            1 => memchr::memchr(self.bytes[0], remaining),
+            2 => memchr::memchr2(self.bytes[0], self.bytes[1], remaining),
+            3 => memchr::memchr3(self.bytes[0], self.bytes[1], self.bytes[2], remaining),
+            _ => {
+                return Err(Error::InternalInvariant(
+                    "shared fixed anchor count outside memchr support",
+                ));
+            }
+        };
+        relative
+            .map(|relative| add(start, relative, Resource::Boundaries))
+            .transpose()
+    }
+}
+
+fn shared_fixed_anchors(
+    plan: &Plan,
+    meter: &mut Meter,
+) -> Result<Option<SharedFixedAnchors>, Error> {
+    let Some(entry) = plan.entries.first() else {
+        return Ok(None);
+    };
+    let fixed_offset = entry.min_offset;
+    meter.charge_work(plan.entries.len())?;
+    if plan
+        .entries
+        .iter()
+        .any(|entry| entry.min_offset != fixed_offset || entry.max_offset != fixed_offset)
+    {
+        return Ok(None);
+    }
+    let all = if plan.entries.len() == MAX_ENTRIES {
+        u128::MAX
+    } else {
+        owner_bit(plan.entries.len())?.saturating_sub(1)
+    };
+    meter.charge_work(plan.buckets.len())?;
+    let mut bytes = [0_u8; 3];
+    let mut len = 0_usize;
+    let mut observed_owners = 0_u128;
+    for (byte, &owners) in plan.buckets.iter().enumerate() {
+        if owners == 0 {
+            continue;
+        }
+        if owners & !all != 0 || len == bytes.len() {
+            return Ok(None);
+        }
+        bytes[len] = u8::try_from(byte)
+            .map_err(|_| Error::InternalInvariant("candidate bucket byte exceeds u8"))?;
+        len = add(len, 1, Resource::ExecutionWork)?;
+        observed_owners |= owners;
+    }
+    if observed_owners != all || len == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SharedFixedAnchors {
+        bytes,
+        len,
+        offset: fixed_offset,
+        owners: all,
+    }))
 }
 
 fn filter_matches(
@@ -1403,6 +1578,107 @@ mod tests {
         let mut meter = Meter::new(OperationLimits::default());
         assert!(!filter_matches(&entry, b"z", 0, &mut meter).unwrap());
         assert_eq!(meter.random, 0);
+    }
+
+    #[test]
+    fn single_fixed_candidate_scans_once_and_skips_absent_starts() {
+        let pattern = r"cargo/registry/src/[^/]+/([a-z]+)-([0-9]+\.[0-9]+\.[0-9]+)/";
+        let compiled = compiled(pattern);
+        assert_eq!(compiled.candidate.as_ref().unwrap().entries.len(), 1);
+        let mut haystack = vec![b'x'; 32_768];
+        haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2.3/");
+        let plan = compiled.candidate.as_ref().unwrap();
+        let result = count(
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.value, reference(pattern, &haystack));
+        assert!((1..=16).contains(&result.candidates));
+        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+        assert!(
+            result.accounting.work < haystack.len().checked_mul(2).unwrap(),
+            "single fixed scheduling must not drain every absent start"
+        );
+    }
+
+    #[test]
+    fn ordered_fixed_owners_share_one_monotone_anchor_scan() {
+        let pattern = r"cargo/registry/src/[^/]+/([a-z]+)-([0-9]+\.[0-9]+\.[0-9]+)/|cargo\\registry\\src\\[^\\]+\\([a-z]+)-([0-9]+\.[0-9]+\.[0-9]+)\\";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        let mut proof_meter = Meter::new(OperationLimits::default());
+        assert!(
+            shared_fixed_anchors(plan, &mut proof_meter)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut haystack = vec![b'x'; 32_768];
+        haystack.extend_from_slice(
+            b" cargo\\registry\\src\\hash\\win-2.0.1\\ cargo/registry/src/hash/unix-1.2.3/",
+        );
+        let result = count(
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.value, reference(pattern, &haystack));
+        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+        assert!(
+            result.accounting.work < haystack.len().checked_mul(2).unwrap(),
+            "shared fixed scheduling must not drain every absent start"
+        );
+    }
+
+    #[test]
+    fn shared_fixed_anchor_ranges_match_ordered_byte_oracle_exhaustively() {
+        let pattern = r"abx|acy";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        let mut proof_meter = Meter::new(OperationLimits::default());
+        assert!(
+            shared_fixed_anchors(plan, &mut proof_meter)
+                .unwrap()
+                .is_some()
+        );
+        let reference = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let alphabet = [b'a', b'b', b'c', b'x', b'y', 0xFF];
+        let mut haystack = Vec::new();
+        for encoded in 0_usize..4_000 {
+            haystack.clear();
+            let mut value = encoded;
+            let length = encoded % 7;
+            for _ in 0..length {
+                haystack.push(alphabet[value % alphabet.len()]);
+                value /= alphabet.len();
+            }
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = reference.find_iter(&haystack[start..end]).count();
+                    let actual = count(
+                        plan,
+                        &compiled.program,
+                        &haystack,
+                        start..end,
+                        OperationLimits::default(),
+                    )
+                    .unwrap()
+                    .value;
+                    assert_eq!(
+                        actual, expected,
+                        "range={start}..{end} haystack={haystack:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

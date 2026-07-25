@@ -118,6 +118,7 @@ dependencies = [
  "fre-iterator-lab",
  "fre-kernels",
  "fre-reference",
+ "memchr",
  "regex",
  "regex-automata",
  "regex-syntax",
