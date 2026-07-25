@@ -6107,15 +6107,11 @@ impl RowStore {
         // `Option` discriminant check in the Q-by-N construction loop.
         //
         // Keep the overwhelmingly common byte-only, assertion-free row
-        // transition in a compact kernel. This decision is made once per
-        // table construction instead of rediscovering the same program shape
-        // at every input boundary.
-        let byte_only_rows = !ORDERED_ROOT
-            && !program.contains_scalar_transition()
-            && program
-                .insts
-                .iter()
-                .all(|inst| !matches!(inst, Inst::Assert { .. }));
+        // transition in a compact kernel. The program shape was classified
+        // by the existing charged certification traversal, and dispatch is
+        // performed once per table construction.
+        let byte_only_rows =
+            !ORDERED_ROOT && !program.contains_scalar_transition() && !program.contains_assertion();
         let mut write_offset = requirements.record_bytes;
         {
             let terminal_record = store
@@ -6147,49 +6143,43 @@ impl RowStore {
         )?;
         rows[..row_count].rotate_right(1);
 
-        for (position, input) in haystack.iter().copied().enumerate().rev() {
-            record_source_accesses(accounting, 1, track_source)?;
-            let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
-            let record = store
-                .get_mut(write_offset..end)
-                .ok_or(Error::InternalInvariant("row-log write outside store"))?;
-            let (row, future_rows) = rows[..row_count]
-                .split_first_mut()
-                .ok_or(Error::InternalInvariant("row ring is empty"))?;
-            if byte_only_rows {
-                let next_row = future_rows
-                    .first()
-                    .map(ExactVec::as_slice)
-                    .unwrap_or_default();
-                match storage {
-                    RowStorage::SplitDecisions => {
-                        Self::build_byte_row::<OBSERVED_WORK, true>(
-                            program,
-                            position,
-                            input,
-                            row,
-                            next_row,
-                            record,
-                            accounting,
-                            requirements.work_bound,
-                            limits.max_work,
-                        )?;
-                    }
-                    RowStorage::ReachableEndpoints => {
-                        Self::build_byte_row::<OBSERVED_WORK, false>(
-                            program,
-                            position,
-                            input,
-                            row,
-                            next_row,
-                            record,
-                            accounting,
-                            requirements.work_bound,
-                            limits.max_work,
-                        )?;
-                    }
-                }
-            } else {
+        if byte_only_rows {
+            write_offset = match storage {
+                RowStorage::SplitDecisions => Self::build_byte_rows::<OBSERVED_WORK, true>(
+                    program,
+                    haystack,
+                    &mut rows[..row_count],
+                    &mut store,
+                    write_offset,
+                    requirements.record_bytes,
+                    accounting,
+                    requirements.work_bound,
+                    limits.max_work,
+                    track_source,
+                )?,
+                RowStorage::ReachableEndpoints => Self::build_byte_rows::<OBSERVED_WORK, false>(
+                    program,
+                    haystack,
+                    &mut rows[..row_count],
+                    &mut store,
+                    write_offset,
+                    requirements.record_bytes,
+                    accounting,
+                    requirements.work_bound,
+                    limits.max_work,
+                    track_source,
+                )?,
+            };
+        } else {
+            for (position, input) in haystack.iter().copied().enumerate().rev() {
+                record_source_accesses(accounting, 1, track_source)?;
+                let end = add(write_offset, requirements.record_bytes, Resource::LogBytes)?;
+                let record = store
+                    .get_mut(write_offset..end)
+                    .ok_or(Error::InternalInvariant("row-log write outside store"))?;
+                let (row, future_rows) = rows[..row_count]
+                    .split_first_mut()
+                    .ok_or(Error::InternalInvariant("row ring is empty"))?;
                 Self::build_row::<true, OBSERVED_WORK, ORDERED_ROOT>(
                     program,
                     haystack,
@@ -6205,14 +6195,14 @@ impl RowStore {
                     limits.max_work,
                     track_source,
                 )?;
+                accounting.sequential_bytes_written = add(
+                    accounting.sequential_bytes_written,
+                    requirements.record_bytes,
+                    Resource::SequentialBytes,
+                )?;
+                write_offset = end;
+                rows[..row_count].rotate_right(1);
             }
-            accounting.sequential_bytes_written = add(
-                accounting.sequential_bytes_written,
-                requirements.record_bytes,
-                Resource::SequentialBytes,
-            )?;
-            write_offset = end;
-            rows[..row_count].rotate_right(1);
         }
         if write_offset != store.len() {
             return Err(Error::InternalInvariant("row-log store length mismatch"));
@@ -6228,6 +6218,57 @@ impl RowStore {
             build_scratch_bytes: build_scratch,
             root_rank: program.split_count,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the byte-row driver keeps exact source, log, and work accounting explicit"
+    )]
+    fn build_byte_rows<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        program: &Program,
+        haystack: &[u8],
+        rows: &mut [ExactVec<usize>],
+        store: &mut [u8],
+        mut write_offset: usize,
+        record_bytes: usize,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+        caller_work_limit: usize,
+        track_source: bool,
+    ) -> Result<usize, Error> {
+        for (position, input) in haystack.iter().copied().enumerate().rev() {
+            record_source_accesses(accounting, 1, track_source)?;
+            let end = add(write_offset, record_bytes, Resource::LogBytes)?;
+            let record = store
+                .get_mut(write_offset..end)
+                .ok_or(Error::InternalInvariant("row-log write outside store"))?;
+            let (row, future_rows) = rows
+                .split_first_mut()
+                .ok_or(Error::InternalInvariant("row ring is empty"))?;
+            let next_row = future_rows
+                .first()
+                .map(ExactVec::as_slice)
+                .unwrap_or_default();
+            Self::build_byte_row::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                program,
+                position,
+                input,
+                row,
+                next_row,
+                record,
+                accounting,
+                admitted_work_bound,
+                caller_work_limit,
+            )?;
+            accounting.sequential_bytes_written = add(
+                accounting.sequential_bytes_written,
+                record_bytes,
+                Resource::SequentialBytes,
+            )?;
+            write_offset = end;
+            rows.rotate_right(1);
+        }
+        Ok(write_offset)
     }
 
     #[allow(
@@ -6530,8 +6571,9 @@ impl RowStore {
         caller_work_limit: usize,
     ) -> Result<(), Error> {
         for &pc in &program.epsilon_order {
+            let inst = program.instruction(pc)?;
             charge_state::<OBSERVED_WORK>(accounting, admitted_work_bound, caller_work_limit)?;
-            let value = match program.instruction(pc)? {
+            let value = match inst {
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant("unfilled execution state"));
                 }
@@ -7782,10 +7824,147 @@ mod tests {
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
         OperationPhysicalRoute, OperationProspective, Requirements, RowReader, RowStorage,
-        UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
+        RowStore, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol, cached_compute_row,
         cached_frontier_words, cached_program_assertion_mask, compact_operation_allocation_count,
         decode, encoded_width, exact_filled, operation_identity, read_encoded, write_encoded,
     };
+
+    fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        compiled: &CompiledRegex,
+        haystack: &[u8],
+        position: usize,
+        input: u8,
+        future_live: bool,
+        caller_work_limit: usize,
+    ) -> (usize, usize) {
+        let program = &compiled.program;
+        let states = program.insts.len();
+        let mut future =
+            exact_filled(states, 0_usize, Resource::RandomAccessBytes).expect("future row");
+        if future_live {
+            for (index, value) in future.iter_mut().enumerate() {
+                *value = (index % 2).saturating_add(1);
+            }
+        }
+        let future_rows = [future];
+        let mut incumbent_row = vec![0_usize; states];
+        let mut byte_row = incumbent_row.clone();
+        let record_bytes = if SPLIT_DECISIONS {
+            program.split_count.saturating_add(8) / 8
+        } else {
+            encoded_width(haystack.len().saturating_add(1))
+        };
+        let mut incumbent_record = vec![0_u8; record_bytes];
+        let mut byte_record = incumbent_record.clone();
+        let mut incumbent_accounting = ExecutionAccounting::default();
+        let mut byte_accounting = ExecutionAccounting::default();
+        let assertions =
+            AssertionContext::new(haystack, 0, haystack.len()).expect("assertion context");
+        let storage = if SPLIT_DECISIONS {
+            RowStorage::SplitDecisions
+        } else {
+            RowStorage::ReachableEndpoints
+        };
+        let incumbent = RowStore::build_row::<true, OBSERVED_WORK, false>(
+            program,
+            haystack,
+            assertions,
+            position,
+            input,
+            &mut incumbent_row,
+            &future_rows,
+            &mut incumbent_record,
+            storage,
+            &mut incumbent_accounting,
+            usize::MAX,
+            caller_work_limit,
+            false,
+        );
+        let specialized = RowStore::build_byte_row::<OBSERVED_WORK, SPLIT_DECISIONS>(
+            program,
+            position,
+            input,
+            &mut byte_row,
+            &future_rows[0],
+            &mut byte_record,
+            &mut byte_accounting,
+            usize::MAX,
+            caller_work_limit,
+        );
+        assert_eq!(specialized, incumbent);
+        assert_eq!(byte_row, incumbent_row);
+        assert_eq!(byte_record, incumbent_record);
+        assert_eq!(byte_accounting, incumbent_accounting);
+        (byte_accounting.work, byte_row[program.entry])
+    }
+
+    fn assert_byte_row_mode_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        compiled: &CompiledRegex,
+    ) {
+        let haystack = b"acz";
+        let mut saw_root_success = false;
+        let mut saw_root_failure = false;
+        for future_live in [false, true] {
+            for (position, input) in haystack.iter().copied().enumerate() {
+                let (exact_work, root) =
+                    assert_byte_row_case_parity::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                        compiled,
+                        haystack,
+                        position,
+                        input,
+                        future_live,
+                        usize::MAX,
+                    );
+                saw_root_success |= root != 0;
+                saw_root_failure |= root == 0;
+                let _ = assert_byte_row_case_parity::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                    compiled,
+                    haystack,
+                    position,
+                    input,
+                    future_live,
+                    exact_work,
+                );
+                if OBSERVED_WORK && exact_work > 0 {
+                    let _ = assert_byte_row_case_parity::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                        compiled,
+                        haystack,
+                        position,
+                        input,
+                        future_live,
+                        exact_work.saturating_sub(1),
+                    );
+                }
+            }
+        }
+        assert!(saw_root_success);
+        assert!(saw_root_failure);
+    }
+
+    #[test]
+    fn dense_byte_row_kernel_matches_incumbent_modes_and_work_boundaries() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"(?:ab|ac|d)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(!compiled.program.contains_scalar_transition());
+        assert!(!compiled.program.contains_assertion());
+        assert!(compiled.program.split_count > 0);
+        let asserted = start_domain_regex(r"^a");
+        assert!(asserted.program.contains_assertion());
+        assert_byte_row_mode_parity::<false, false>(&compiled);
+        assert_byte_row_mode_parity::<false, true>(&compiled);
+        assert_byte_row_mode_parity::<true, false>(&compiled);
+        assert_byte_row_mode_parity::<true, true>(&compiled);
+    }
 
     fn endpoint_scalar_repeat() -> CompiledRegex {
         let hir = ParserBuilder::new().build().parse(r"^.{249}$").unwrap();

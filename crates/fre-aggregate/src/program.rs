@@ -804,6 +804,7 @@ pub(crate) struct Program {
     pub(crate) execution_state_work: usize,
     pub(crate) predecessor_edges: usize,
     pub(crate) has_scalar_transition: bool,
+    pub(crate) has_assertion: bool,
     pub(crate) max_scalar_search_checks: usize,
     pub(crate) has_unicode_word_boundary: bool,
     /// Construction-proved match-start domain. Kept beside the compact
@@ -841,6 +842,10 @@ impl Program {
 
     pub(crate) const fn contains_scalar_transition(&self) -> bool {
         self.has_scalar_transition
+    }
+
+    pub(crate) const fn contains_assertion(&self) -> bool {
+        self.has_assertion
     }
 
     pub(crate) const fn max_scalar_search_checks(&self) -> usize {

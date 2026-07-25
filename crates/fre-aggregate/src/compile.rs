@@ -1120,6 +1120,7 @@ impl CompiledRegex {
             execution_state_work: certificate.execution_state_work,
             predecessor_edges: certificate.predecessor_edges,
             has_scalar_transition: certificate.has_scalar_transition,
+            has_assertion: certificate.has_assertion,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
             start_domain: StartDomain::AnyBoundary,
@@ -4980,6 +4981,7 @@ struct ProgramCertificate {
     execution_state_work: usize,
     predecessor_edges: usize,
     has_scalar_transition: bool,
+    has_assertion: bool,
     max_scalar_search_checks: usize,
 }
 
@@ -5212,6 +5214,7 @@ fn certify_program_admitted(
         execution_state_work: metadata.state_work,
         predecessor_edges: metadata.predecessor_edges,
         has_scalar_transition: metadata.has_scalar_transition,
+        has_assertion: metadata.has_assertion,
         max_scalar_search_checks: metadata.max_scalar_search_checks,
     })
 }
@@ -5253,6 +5256,7 @@ struct ExecutionMetadata {
     state_work: usize,
     predecessor_edges: usize,
     has_scalar_transition: bool,
+    has_assertion: bool,
     max_scalar_search_checks: usize,
 }
 
@@ -5267,6 +5271,7 @@ fn certify_execution_metadata(
         state_work: 0,
         predecessor_edges: 0,
         has_scalar_transition: false,
+        has_assertion: false,
         max_scalar_search_checks: 0,
     };
     for (rank, inst) in split_rank.iter_mut().zip(insts) {
@@ -5280,6 +5285,7 @@ fn certify_execution_metadata(
         if matches!(inst, Inst::RootSplit { .. }) {
             metadata.root_split_count = add(metadata.root_split_count, 1, Resource::ProgramStates)?;
         }
+        metadata.has_assertion |= matches!(inst, Inst::Assert { .. });
         let transitions = execution_transitions(
             inst,
             &mut metadata.has_scalar_transition,
