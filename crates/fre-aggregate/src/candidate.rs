@@ -1606,6 +1606,35 @@ mod tests {
     }
 
     #[test]
+    fn equal_weight_class_anchor_retains_the_stronger_fixed_filter() {
+        let pattern = r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([a-z]+)-([0-9.]+)[\\/]";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].check_len, MAX_FILTER_CHECKS);
+        let mut proof_meter = Meter::new(OperationLimits::default());
+        assert!(
+            shared_fixed_anchors(plan, &mut proof_meter)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut haystack = vec![b'\\'; 32_768];
+        haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2/");
+        let result = count(
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.value, reference(pattern, &haystack));
+        assert_eq!(result.candidates, 1);
+        assert_eq!(result.accounting.sequential_bytes_read, haystack.len());
+    }
+
+    #[test]
     fn ordered_fixed_owners_share_one_monotone_anchor_scan() {
         let pattern = r"cargo/registry/src/[^/]+/([a-z]+)-([0-9]+\.[0-9]+\.[0-9]+)/|cargo\\registry\\src\\[^\\]+\\([a-z]+)-([0-9]+\.[0-9]+\.[0-9]+)\\";
         let compiled = compiled(pattern);

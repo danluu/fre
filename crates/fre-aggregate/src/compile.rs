@@ -2481,12 +2481,30 @@ fn choose_candidate(
     };
     let selected_score = candidate_score(&selected, budget)?;
     let candidate_score = candidate_score(&candidate, budget)?;
-    budget.charge(1)?;
-    Ok(Some(if candidate_score < selected_score {
-        candidate
+    budget.charge(2)?; // score comparison and tie dispatch
+    let tied_stronger_filter = if candidate_score == selected_score {
+        budget.charge(3)?; // offset pair and filter-length comparisons
+        let same_minimum = candidate.min_offset == selected.min_offset;
+        let same_maximum = candidate.max_offset == selected.max_offset;
+        let stronger_filter = candidate.check_len > selected.check_len;
+        let mut same_bytes = same_minimum && same_maximum;
+        for word in 0..candidate.bytes.0.len() {
+            budget.charge(1)?;
+            if candidate.bytes.0[word] != selected.bytes.0[word] {
+                same_bytes = false;
+            }
+        }
+        same_bytes && stronger_filter
     } else {
-        selected
-    }))
+        false
+    };
+    Ok(Some(
+        if candidate_score < selected_score || tied_stronger_filter {
+            candidate
+        } else {
+            selected
+        },
+    ))
 }
 
 fn candidate_score(candidate: &CandidateDraft, budget: &mut CompileBudget) -> Result<usize, Error> {
