@@ -12,6 +12,9 @@ pub const UNICODE_PLAN_ID: &str = "unicode-word-run-linear-v1";
 pub const ASCII_PLAN_ID: &str = "ascii-word-run-linear-v1";
 pub const AGGREGATE_COUNT_OPERATION_ID: &str = "word-run.count.v1";
 pub const AGGREGATE_SPAN_SUM_OPERATION_ID: &str = "word-run.span-sum.v1";
+pub const FIXED_CLASS_CHUNKS_PLAN_ID: &str = "fixed-byte-class-chunks-linear-v1";
+pub const FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID: &str = "fixed-byte-class-chunks.count.v1";
+pub const FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID: &str = "fixed-byte-class-chunks.span-sum.v1";
 
 const FIXED_BUILD_WORK: usize = 1;
 const FIXED_REDUCE_WORK: usize = 8;
@@ -24,15 +27,21 @@ const UNICODE_WORD_RANGE_COUNT: usize = 796;
 const ASCII_WORD_RANGES: [(u8, u8); 4] = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WordMode {
+pub(crate) enum WordMode {
     Ascii,
     Unicode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Plan {
-    minimum_scalars: usize,
-    mode: WordMode,
+pub(crate) enum Plan {
+    Word {
+        minimum_scalars: usize,
+        mode: WordMode,
+    },
+    FixedClassChunks {
+        chunk_bytes: usize,
+        class_words: [u64; 4],
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,10 +60,13 @@ pub struct AggregateOperationIdentity {
     pub plan_id: &'static str,
     pub operation_id: &'static str,
     pub minimum_scalars: usize,
+    pub fixed_chunk_bytes: Option<usize>,
+    pub canonical_class_words: [u64; 4],
     pub unicode: bool,
     pub greedy: bool,
     pub complete_word_boundaries: bool,
     pub invalid_bytes_are_non_word: bool,
+    pub arbitrary_bytes_are_classified: bool,
     pub non_overlapping: bool,
 }
 
@@ -391,16 +403,50 @@ impl std::error::Error for Error {}
 
 impl Plan {
     const fn new(minimum_scalars: usize, mode: WordMode) -> Self {
-        Self {
+        Self::Word {
             minimum_scalars,
             mode,
         }
     }
 
+    const fn fixed_class_chunks(chunk_bytes: usize, class_words: [u64; 4]) -> Self {
+        Self::FixedClassChunks {
+            chunk_bytes,
+            class_words,
+        }
+    }
+
     pub(crate) const fn plan_id(self) -> &'static str {
-        match self.mode {
-            WordMode::Ascii => ASCII_PLAN_ID,
-            WordMode::Unicode => UNICODE_PLAN_ID,
+        match self {
+            Self::Word {
+                mode: WordMode::Ascii,
+                ..
+            } => ASCII_PLAN_ID,
+            Self::Word {
+                mode: WordMode::Unicode,
+                ..
+            } => UNICODE_PLAN_ID,
+            Self::FixedClassChunks { .. } => FIXED_CLASS_CHUNKS_PLAN_ID,
+        }
+    }
+
+    const fn minimum_match_units(self) -> usize {
+        match self {
+            Self::Word {
+                minimum_scalars, ..
+            } => minimum_scalars,
+            Self::FixedClassChunks { chunk_bytes, .. } => chunk_bytes,
+        }
+    }
+
+    fn word_minimum_scalars(self) -> usize {
+        match self {
+            Self::Word {
+                minimum_scalars, ..
+            } => minimum_scalars,
+            Self::FixedClassChunks { .. } => {
+                unreachable!("fixed-class chunk plans never enter word search")
+            }
         }
     }
 
@@ -460,22 +506,57 @@ impl Plan {
     }
 
     pub(crate) const fn aggregate_count_identity(self) -> AggregateOperationIdentity {
-        self.aggregate_identity(AGGREGATE_COUNT_OPERATION_ID)
+        self.aggregate_identity(match self {
+            Self::Word { .. } => AGGREGATE_COUNT_OPERATION_ID,
+            Self::FixedClassChunks { .. } => FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID,
+        })
     }
 
     pub(crate) const fn aggregate_span_sum_identity(self) -> AggregateOperationIdentity {
-        self.aggregate_identity(AGGREGATE_SPAN_SUM_OPERATION_ID)
+        self.aggregate_identity(match self {
+            Self::Word { .. } => AGGREGATE_SPAN_SUM_OPERATION_ID,
+            Self::FixedClassChunks { .. } => FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID,
+        })
     }
 
     const fn aggregate_identity(self, operation_id: &'static str) -> AggregateOperationIdentity {
+        let (
+            minimum_scalars,
+            fixed_chunk_bytes,
+            canonical_class_words,
+            unicode,
+            complete_word_boundaries,
+            invalid_bytes_are_non_word,
+            arbitrary_bytes_are_classified,
+        ) = match self {
+            Self::Word {
+                minimum_scalars,
+                mode,
+            } => (
+                minimum_scalars,
+                None,
+                [0; 4],
+                matches!(mode, WordMode::Unicode),
+                true,
+                true,
+                false,
+            ),
+            Self::FixedClassChunks {
+                chunk_bytes,
+                class_words,
+            } => (0, Some(chunk_bytes), class_words, false, false, false, true),
+        };
         AggregateOperationIdentity {
             plan_id: self.plan_id(),
             operation_id,
-            minimum_scalars: self.minimum_scalars,
-            unicode: matches!(self.mode, WordMode::Unicode),
+            minimum_scalars,
+            fixed_chunk_bytes,
+            canonical_class_words,
+            unicode,
             greedy: true,
-            complete_word_boundaries: true,
-            invalid_bytes_are_non_word: true,
+            complete_word_boundaries,
+            invalid_bytes_are_non_word,
+            arbitrary_bytes_are_classified,
             non_overlapping: true,
         }
     }
@@ -533,9 +614,9 @@ impl Plan {
     ) -> Result<AggregateReduceUpperBounds, AggregateReduceError> {
         let unit_events = input_bytes;
         let run_events = input_bytes;
-        let match_events = input_bytes.checked_div(self.minimum_scalars).ok_or(
+        let match_events = input_bytes.checked_div(self.minimum_match_units()).ok_or(
             AggregateReduceError::ArithmeticOverflow {
-                computation: "input bytes divided by minimum word scalars",
+                computation: "input bytes divided by minimum match units",
             },
         )?;
         let count =
@@ -602,21 +683,29 @@ impl Plan {
         let mut run_start = 0_usize;
         let mut run_scalars = 0_usize;
         while position < haystack.len() {
-            let (word, width) = match self.mode {
-                WordMode::Ascii => (is_ascii_word(haystack[position]), 1),
-                WordMode::Unicode => decode_first(&haystack[position..])
-                    .map_or((false, 1), |(scalar, width)| {
-                        (is_unicode_word(scalar), width)
-                    }),
+            let (admitted, width) = match self {
+                Self::Word {
+                    mode: WordMode::Ascii,
+                    ..
+                } => (is_ascii_word(haystack[position]), 1),
+                Self::Word {
+                    mode: WordMode::Unicode,
+                    ..
+                } => decode_first(&haystack[position..]).map_or((false, 1), |(scalar, width)| {
+                    (is_unicode_word(scalar), width)
+                }),
+                Self::FixedClassChunks { class_words, .. } => {
+                    (class_contains(class_words, haystack[position]), 1)
+                }
             };
             actual.source_reads = checked_add(actual.source_reads, width, "actual source reads")?;
             actual.units = checked_add(actual.units, 1, "actual decoded units")?;
             actual.work = checked_add(actual.work, UNIT_WORK, "actual unit work")?;
-            if word {
+            if admitted {
                 if run_scalars == 0 {
                     run_start = position;
                 }
-                run_scalars = checked_add(run_scalars, 1, "actual word-run scalar length")?;
+                run_scalars = checked_add(run_scalars, 1, "actual admitted-run unit length")?;
             } else if run_scalars != 0 {
                 self.aggregate_finish_run(
                     run_start,
@@ -652,24 +741,50 @@ impl Plan {
     ) -> Result<(), AggregateReduceError> {
         actual.runs = checked_add(actual.runs, 1, "actual word-run events")?;
         actual.work = checked_add(actual.work, RUN_WORK, "actual word-run work")?;
-        if scalars < self.minimum_scalars {
+        let matches = match self {
+            Self::Word {
+                minimum_scalars, ..
+            } => usize::from(scalars >= minimum_scalars),
+            Self::FixedClassChunks { chunk_bytes, .. } => scalars.checked_div(chunk_bytes).ok_or(
+                AggregateReduceError::ArithmeticOverflow {
+                    computation: "admitted run divided by fixed chunk width",
+                },
+            )?,
+        };
+        if matches == 0 {
             return Ok(());
         }
-        actual.matches = checked_add(actual.matches, 1, "actual match events")?;
-        actual.count =
-            actual
-                .count
-                .checked_add(1)
+        actual.matches = checked_add(actual.matches, matches, "actual match events")?;
+        let matches_u64 =
+            u64::try_from(matches).map_err(|_| AggregateReduceError::ArithmeticOverflow {
+                computation: "actual match count as u64",
+            })?;
+        actual.count = actual.count.checked_add(matches_u64).ok_or(
+            AggregateReduceError::ArithmeticOverflow {
+                computation: "actual match count",
+            },
+        )?;
+        let match_work =
+            matches
+                .checked_mul(MATCH_WORK)
                 .ok_or(AggregateReduceError::ArithmeticOverflow {
-                    computation: "actual match count",
+                    computation: "actual match work",
                 })?;
-        actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+        actual.work = checked_add(actual.work, match_work, "actual match work")?;
         if operation == AggregateOperation::SpanSum {
-            let width = end
-                .checked_sub(start)
-                .ok_or(AggregateReduceError::ArithmeticOverflow {
-                    computation: "actual match width",
-                })?;
+            let width = match self {
+                Self::Word { .. } => {
+                    end.checked_sub(start)
+                        .ok_or(AggregateReduceError::ArithmeticOverflow {
+                            computation: "actual word-run match width",
+                        })?
+                }
+                Self::FixedClassChunks { chunk_bytes, .. } => matches
+                    .checked_mul(chunk_bytes)
+                    .ok_or(AggregateReduceError::ArithmeticOverflow {
+                        computation: "actual fixed-class chunk span sum",
+                    })?,
+            };
             actual.span_sum = actual
                 .span_sum
                 .checked_add(u64::try_from(width).map_err(|_| {
@@ -697,9 +812,18 @@ impl Plan {
                 haystack_len: haystack.len(),
             });
         }
-        match self.mode {
-            WordMode::Ascii => self.find_ascii_window(haystack, window, limits),
-            WordMode::Unicode => self.find_unicode_window(haystack, window, limits),
+        match self {
+            Self::Word {
+                mode: WordMode::Ascii,
+                ..
+            } => self.find_ascii_window(haystack, window, limits),
+            Self::Word {
+                mode: WordMode::Unicode,
+                ..
+            } => self.find_unicode_window(haystack, window, limits),
+            Self::FixedClassChunks { .. } => {
+                self.find_fixed_class_chunk_window(haystack, window, limits)
+            }
         }
     }
 
@@ -709,6 +833,7 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, Accounting), Error> {
+        let minimum_scalars = self.word_minimum_scalars();
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -746,7 +871,7 @@ impl Plan {
                     limit: limits.max_work,
                 })?;
             }
-            if position.saturating_sub(start) >= self.minimum_scalars
+            if position.saturating_sub(start) >= minimum_scalars
                 && !haystack
                     .get(position)
                     .is_some_and(|&byte| is_ascii_word(byte))
@@ -769,6 +894,7 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, Accounting), Error> {
+        let minimum_scalars = self.word_minimum_scalars();
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -824,7 +950,7 @@ impl Plan {
                         limit: limits.max_work,
                     })?;
             }
-            if count >= self.minimum_scalars && !unicode_word_after(haystack, position) {
+            if count >= minimum_scalars && !unicode_word_after(haystack, position) {
                 return Ok((
                     Some(Match {
                         start,
@@ -832,6 +958,61 @@ impl Plan {
                     }),
                     accounting,
                 ));
+            }
+        }
+        Ok((None, accounting))
+    }
+
+    fn find_fixed_class_chunk_window(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, Accounting), Error> {
+        let Self::FixedClassChunks {
+            chunk_bytes,
+            class_words,
+        } = self
+        else {
+            unreachable!("word plans never enter fixed-class chunk search");
+        };
+        let mut accounting = Accounting {
+            work: 0,
+            bytes_examined: 0,
+            scalars_decoded: 0,
+        };
+        let mut position = window.start();
+        while position < window.end() {
+            charge(&mut accounting, limits)?;
+            accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+            accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+            if !class_contains(class_words, haystack[position]) {
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+                continue;
+            }
+            let start = position;
+            while position < window.end() && class_contains(class_words, haystack[position]) {
+                if position != start {
+                    charge(&mut accounting, limits)?;
+                    accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+                    accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+                }
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+                if position.saturating_sub(start) == chunk_bytes {
+                    return Ok((
+                        Some(Match {
+                            start,
+                            end: position,
+                        }),
+                        accounting,
+                    ));
+                }
             }
         }
         Ok((None, accounting))
@@ -881,6 +1062,45 @@ fn inspect_aggregate_with_accounting(
     accounting: &mut InspectionAccounting,
 ) -> Result<AggregateInspectionOutcome, AggregateInspectionError> {
     let root = peel_captures_accounted(hir, limit, accounting)?;
+    if let HirKind::Repetition(repetition) = root.kind() {
+        accounting.charge(3, limit)?;
+        let exact = repetition.max == Some(repetition.min);
+        let chunk_bytes =
+            usize::try_from(repetition.min).map_err(|_| AggregateInspectionError::Overflow)?;
+        // Widths up to 64 retain the established finite/fixed-predicate route
+        // ordering. This run reducer is the general fallback for exact class
+        // repetitions that otherwise expand into continuation states.
+        if !exact || chunk_bytes <= 64 {
+            return Ok(accounting.ineligible());
+        }
+        let class_hir = peel_captures_accounted(&repetition.sub, limit, accounting)?;
+        let HirKind::Class(Class::Bytes(class)) = class_hir.kind() else {
+            return Ok(accounting.ineligible());
+        };
+        accounting.charge(class.ranges().len(), limit)?;
+        let mut class_words = [0_u64; 4];
+        for range in class.ranges() {
+            let mut byte = range.start();
+            loop {
+                accounting.charge(1, limit)?;
+                let word = usize::from(byte) / 64;
+                let bit = usize::from(byte) % 64;
+                class_words[word] |= 1_u64 << bit;
+                if byte == range.end() {
+                    break;
+                }
+                byte = byte
+                    .checked_add(1)
+                    .ok_or(AggregateInspectionError::Overflow)?;
+            }
+        }
+        return Ok(AggregateInspectionOutcome::Eligible(AggregateInspection {
+            plan: Plan::fixed_class_chunks(chunk_bytes, class_words),
+            work: accounting.work,
+            hir_nodes: accounting.hir_nodes,
+            captures: accounting.captures,
+        }));
+    }
     let HirKind::Concat(parts) = root.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -1105,6 +1325,12 @@ fn is_ascii_word(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
+fn class_contains(class_words: [u64; 4], byte: u8) -> bool {
+    let word = usize::from(byte) / 64;
+    let bit = usize::from(byte) % 64;
+    class_words[word] & (1_u64 << bit) != 0
+}
+
 fn is_unicode_word(scalar: char) -> bool {
     if scalar.is_ascii() {
         return scalar == '_' || scalar.is_ascii_alphanumeric();
@@ -1277,4 +1503,97 @@ where
         actual: actual.try_into().unwrap_or(u64::MAX),
         upper: upper.try_into().unwrap_or(u64::MAX),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use regex::bytes::RegexBuilder;
+
+    use super::{AggregateReduceLimits, Plan};
+
+    fn class_words(bytes: &[u8]) -> [u64; 4] {
+        let mut words = [0_u64; 4];
+        for &byte in bytes {
+            words[usize::from(byte) / 64] |= 1_u64 << (usize::from(byte) % 64);
+        }
+        words
+    }
+
+    fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
+        let regex = RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("oracle pattern");
+        regex
+            .find_iter(haystack)
+            .map(|matched| {
+                (
+                    1_u64,
+                    u64::try_from(
+                        matched
+                            .end()
+                            .checked_sub(matched.start())
+                            .expect("ordered match"),
+                    )
+                    .expect("match width"),
+                )
+            })
+            .fold((0_u64, 0_u64), |(count, sum), (one, width)| {
+                (
+                    count.checked_add(one).expect("count"),
+                    sum.checked_add(width).expect("span sum"),
+                )
+            })
+    }
+
+    fn assert_plan_matches(pattern: &str, plan: Plan, haystack: &[u8]) {
+        let expected = oracle(pattern, haystack);
+        let counted = plan
+            .aggregate_count(haystack, AggregateReduceLimits::unlimited())
+            .expect("count");
+        let summed = plan
+            .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
+            .expect("span sum");
+        assert_eq!((counted.count, summed.span_sum), expected, "{haystack:?}");
+        assert_eq!(counted.accounting.actual.source_reads, haystack.len());
+        assert_eq!(summed.accounting.actual.source_reads, haystack.len());
+        assert_eq!(counted.accounting.actual.scratch_bytes, 0);
+        assert_eq!(summed.accounting.actual.scratch_bytes, 0);
+    }
+
+    #[test]
+    fn fixed_class_chunks_exhaust_small_alphabet_and_widths() {
+        for (width, pattern) in [(1, "[ab]{1}"), (2, "[ab]{2}"), (4, "[ab]{4}")] {
+            let plan = Plan::fixed_class_chunks(width, class_words(b"ab"));
+            for len in 0_u32..=8 {
+                let cases = 3_usize.pow(len);
+                for mut encoded in 0..cases {
+                    let mut haystack =
+                        Vec::with_capacity(usize::try_from(len).expect("small length"));
+                    for _ in 0..len {
+                        haystack.push(match encoded % 3 {
+                            0 => b'a',
+                            1 => b'b',
+                            _ => b'x',
+                        });
+                        encoded /= 3;
+                    }
+                    assert_plan_matches(pattern, plan, &haystack);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_class_chunks_preserve_ranges_and_malformed_bytes() {
+        let plan = Plan::fixed_class_chunks(3, class_words(&[b'a', b'b', b'c', 0x80, 0xFF]));
+        for haystack in [
+            b"abcabcxabc".as_slice(),
+            &[0x80, 0xFF, b'a', b'b', b'x', 0x80, 0x80, 0x80],
+            &[0xFF; 13],
+            &[0xC3, 0x28, 0xFF, b'a', b'c', b'x'],
+        ] {
+            assert_plan_matches(r"[\x61-\x63\x80\xff]{3}", plan, haystack);
+        }
+    }
 }

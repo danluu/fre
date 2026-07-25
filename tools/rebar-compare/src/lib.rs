@@ -526,6 +526,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs once with zero execution scratch",
         );
         identity.identity.push_str(
+            "; fixed-class-chunks-v1 authenticates arbitrary canonical Unicode-off byte classes and nonzero exact widths with operation-specific count/span-sum identities",
+        );
+        identity.availability.push_str(
+            "; the fixed-class chunk reducer scans each maximal admitted byte run once and emits every leftmost non-overlapping exact-width chunk with zero execution scratch",
+        );
+        identity.identity.push_str(
             "; literal-assertions-v1 authenticates ordered (?m:^L)|(?m:L$) count/span-sum with overlap-complete candidate discovery and complete pre-source bounds",
         );
         identity.availability.push_str(
@@ -1750,6 +1756,18 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-bounded-affix"
         } else {
             "aggregate-bounded-affix"
+        };
+    }
+    if matches!(
+        report.plan_identity,
+        AggregatePlanIdentity::WordRun(identity)
+            if identity.semantics
+                == fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
+    ) {
+        return if model == "compile" {
+            "compile-aggregate-fixed-class-chunks-v1"
+        } else {
+            "aggregate-fixed-class-chunks-v1"
         };
     }
     let sparse = matches!(
@@ -8760,10 +8778,6 @@ fn word_run_plan_identity_matches(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> bool {
-    let expected_operation_id = match operation {
-        LiteralAggregateOperation::Count => fre::WORD_RUN_COUNT_OPERATION_ID,
-        LiteralAggregateOperation::SpanSum => fre::WORD_RUN_SPAN_SUM_OPERATION_ID,
-    };
     let operation_matches = matches!(
         (report.operation, operation),
         (
@@ -8774,28 +8788,61 @@ fn word_run_plan_identity_matches(
             LiteralAggregateOperation::SpanSum
         )
     );
-    let expected_semantics = if identity.kernel.unicode {
-        fre::AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord
-    } else {
-        fre::AggregateWordRunSemantics::AsciiWordBytes
+    let semantic_identity = match identity.semantics {
+        fre::AggregateWordRunSemantics::AsciiWordBytes => {
+            identity.kernel.plan_id == fre::ASCII_WORD_RUN_PLAN_ID
+                && identity.kernel.minimum_scalars > 0
+                && identity.kernel.fixed_chunk_bytes.is_none()
+                && identity.kernel.canonical_class_words == [0; 4]
+                && !identity.kernel.unicode
+                && identity.kernel.complete_word_boundaries
+                && identity.kernel.invalid_bytes_are_non_word
+                && !identity.kernel.arbitrary_bytes_are_classified
+        }
+        fre::AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord => {
+            identity.kernel.plan_id == fre::UNICODE_WORD_RUN_PLAN_ID
+                && identity.kernel.minimum_scalars > 0
+                && identity.kernel.fixed_chunk_bytes.is_none()
+                && identity.kernel.canonical_class_words == [0; 4]
+                && identity.kernel.unicode
+                && identity.kernel.complete_word_boundaries
+                && identity.kernel.invalid_bytes_are_non_word
+                && !identity.kernel.arbitrary_bytes_are_classified
+        }
+        fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks => {
+            identity.kernel.plan_id == fre::FIXED_CLASS_CHUNKS_PLAN_ID
+                && identity.kernel.minimum_scalars == 0
+                && identity
+                    .kernel
+                    .fixed_chunk_bytes
+                    .is_some_and(|width| width > 64)
+                && identity.kernel.canonical_class_words != [0; 4]
+                && !identity.kernel.unicode
+                && !identity.kernel.complete_word_boundaries
+                && !identity.kernel.invalid_bytes_are_non_word
+                && identity.kernel.arbitrary_bytes_are_classified
+        }
     };
-    let expected_plan_id = if identity.kernel.unicode {
-        fre::UNICODE_WORD_RUN_PLAN_ID
-    } else {
-        fre::ASCII_WORD_RUN_PLAN_ID
+    let expected_operation_id = match (identity.semantics, operation) {
+        (
+            fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
+            LiteralAggregateOperation::Count,
+        ) => fre::FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID,
+        (
+            fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
+            LiteralAggregateOperation::SpanSum,
+        ) => fre::FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID,
+        (_, LiteralAggregateOperation::Count) => fre::WORD_RUN_COUNT_OPERATION_ID,
+        (_, LiteralAggregateOperation::SpanSum) => fre::WORD_RUN_SPAN_SUM_OPERATION_ID,
     };
     operation_matches
         && report.selection == AggregatePlanSelection::Auto
         && report.plan == AggregatePlanKind::WordRun
         && report.continuation_strategy.is_none()
         && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
-        && identity.semantics == expected_semantics
-        && identity.kernel.plan_id == expected_plan_id
+        && semantic_identity
         && identity.kernel.operation_id == expected_operation_id
-        && identity.kernel.minimum_scalars > 0
         && identity.kernel.greedy
-        && identity.kernel.complete_word_boundaries
-        && identity.kernel.invalid_bytes_are_non_word
         && identity.kernel.non_overlapping
         && (unicode || !identity.kernel.unicode)
         && build.work_upper_bound == 1

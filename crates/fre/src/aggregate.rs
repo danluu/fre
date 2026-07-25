@@ -174,8 +174,8 @@ pub enum AggregatePlanKind {
     /// Direct Unicode scalar class/run stream over compact canonical ranges.
     /// This is not the continuation state engine.
     UnicodeScalarClass,
-    /// Single-pass maximal ASCII/Unicode word-run reducer for canonical
-    /// `\b\w{m,}\b`.
+    /// Single-pass maximal run reducer for canonical `\b\w{m,}\b` or a
+    /// Unicode-off exact repetition of one canonical byte class.
     WordRun,
     /// One monotone literal-candidate stream for the exact ordered
     /// `(?m:^L)|(?m:L$)` shape.
@@ -232,7 +232,8 @@ pub enum AggregatePlanIdentity {
     ExactLiteral(AggregateExactLiteralIdentity),
     /// Root Unicode scalar-class proof plus native reducer identity.
     UnicodeScalar(AggregateUnicodeScalarIdentity),
-    /// Complete-boundary ASCII/Unicode word-run proof and operation identity.
+    /// Complete word-run or fixed byte-class chunk proof and operation
+    /// identity.
     WordRun(AggregateWordRunIdentity),
     /// Ordered line-assertion/literal proof and native operation identity.
     LiteralAssertions(AggregateLiteralAssertionsIdentity),
@@ -376,6 +377,10 @@ pub enum AggregateWordRunSemantics {
     /// Unicode word scalars under `utf8(false)`; malformed bytes are
     /// individual non-word units.
     UnicodeWordScalarsInvalidBytesNonWord,
+    /// Unicode-off raw bytes admitted by one canonical 256-bit class. Every
+    /// maximal admitted run emits its leftmost non-overlapping exact-width
+    /// chunks; a final shorter remainder is not a match.
+    UnicodeOffFixedWidthByteClassChunks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3516,6 +3521,62 @@ fn direct_operation_id_closes(
     }
 }
 
+fn word_run_direct_identity_closes(
+    operation: AggregateOperation,
+    identity: AggregateWordRunIdentity,
+) -> bool {
+    let kernel = identity.kernel;
+    let shared = kernel.greedy && kernel.non_overlapping;
+    let semantic = match identity.semantics {
+        AggregateWordRunSemantics::AsciiWordBytes => {
+            kernel.plan_id == unicode_word_run::ASCII_PLAN_ID
+                && kernel.minimum_scalars > 0
+                && kernel.fixed_chunk_bytes.is_none()
+                && kernel.canonical_class_words == [0; 4]
+                && !kernel.unicode
+                && kernel.complete_word_boundaries
+                && kernel.invalid_bytes_are_non_word
+                && !kernel.arbitrary_bytes_are_classified
+        }
+        AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord => {
+            kernel.plan_id == unicode_word_run::UNICODE_PLAN_ID
+                && kernel.minimum_scalars > 0
+                && kernel.fixed_chunk_bytes.is_none()
+                && kernel.canonical_class_words == [0; 4]
+                && kernel.unicode
+                && kernel.complete_word_boundaries
+                && kernel.invalid_bytes_are_non_word
+                && !kernel.arbitrary_bytes_are_classified
+        }
+        AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks => {
+            kernel.plan_id == unicode_word_run::FIXED_CLASS_CHUNKS_PLAN_ID
+                && kernel.minimum_scalars == 0
+                && kernel.fixed_chunk_bytes.is_some_and(|width| width > 64)
+                && kernel.canonical_class_words != [0; 4]
+                && !kernel.unicode
+                && !kernel.complete_word_boundaries
+                && !kernel.invalid_bytes_are_non_word
+                && kernel.arbitrary_bytes_are_classified
+        }
+    };
+    let operation_closes = if kernel.plan_id == unicode_word_run::FIXED_CLASS_CHUNKS_PLAN_ID {
+        direct_operation_id_closes(
+            operation,
+            kernel.operation_id,
+            unicode_word_run::FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID,
+            Some(unicode_word_run::FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID),
+        )
+    } else {
+        direct_operation_id_closes(
+            operation,
+            kernel.operation_id,
+            unicode_word_run::AGGREGATE_COUNT_OPERATION_ID,
+            Some(unicode_word_run::AGGREGATE_SPAN_SUM_OPERATION_ID),
+        )
+    };
+    shared && semantic && operation_closes
+}
+
 const fn exact_literal_operation(
     operation: AggregateOperation,
 ) -> Option<LiteralAggregateOperation> {
@@ -3567,12 +3628,9 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
         AggregatePlanIdentity::UnicodeScalar(identity) => {
             unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
         }
-        AggregatePlanIdentity::WordRun(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            unicode_word_run::AGGREGATE_COUNT_OPERATION_ID,
-            Some(unicode_word_run::AGGREGATE_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::WordRun(identity) => {
+            word_run_direct_identity_closes(cache.operation, identity)
+        }
         AggregatePlanIdentity::LiteralAssertions(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -3741,12 +3799,7 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::WordRun(accounting),
         ) => {
             identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    unicode_word_run::AGGREGATE_COUNT_OPERATION_ID,
-                    Some(unicode_word_run::AGGREGATE_SPAN_SUM_OPERATION_ID),
-                )
+                && word_run_direct_identity_closes(cache.operation, *identity)
         }
         (
             AggregatePlanIdentity::LiteralAssertions(identity),
@@ -7916,10 +7969,23 @@ impl AggregateBuilder {
                     captures_erased: inspection.captures,
                     build: AggregateBuildAccounting::WordRun(build),
                     plan_identity: AggregatePlanIdentity::WordRun(AggregateWordRunIdentity {
-                        semantics: if kernel.unicode {
-                            AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord
-                        } else {
-                            AggregateWordRunSemantics::AsciiWordBytes
+                        semantics: match kernel.plan_id {
+                            unicode_word_run::UNICODE_PLAN_ID => {
+                                AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord
+                            }
+                            unicode_word_run::ASCII_PLAN_ID => {
+                                AggregateWordRunSemantics::AsciiWordBytes
+                            }
+                            unicode_word_run::FIXED_CLASS_CHUNKS_PLAN_ID => {
+                                AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
+                            }
+                            _ => {
+                                return Err(AggregateBuildError::InternalInvariant {
+                                    operation,
+                                    selection,
+                                    detail: "word-run plan published an unknown semantic identity",
+                                });
+                            }
                         },
                         kernel,
                     }),

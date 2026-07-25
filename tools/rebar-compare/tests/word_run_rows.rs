@@ -92,3 +92,71 @@ fn adapter_identity_names_the_operation_owned_word_run() {
     assert!(identity.identity.contains("direct aggregate word-run"));
     assert!(identity.availability.contains("direct word-run"));
 }
+
+#[test]
+fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
+    let pattern = r"[0-9A-Za-z_]{256}";
+    let haystack = vec![b'b'; 256];
+    assert_eq!(
+        CurrentFreAdapter.execute(
+            CandidateRequest {
+                job_id: "reported/i1095-word-repetition/ascii-search",
+                model: "count-spans",
+                patterns: &[pattern.to_owned()],
+                haystack: &haystack,
+                unicode: false,
+                case_insensitive: false,
+            },
+            &RunLimits::default(),
+        ),
+        CandidateOutcome::ExecutedWithPlan {
+            actual: 256,
+            plan: "aggregate-fixed-class-chunks-v1".to_owned(),
+        }
+    );
+
+    let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+        "count-spans",
+        &[pattern.to_owned()],
+        false,
+        false,
+        haystack.len(),
+    )
+    .unwrap();
+    assert_eq!(lifecycle.plan(), "aggregate-fixed-class-chunks-v1");
+    assert_eq!(lifecycle.execute(&haystack).unwrap(), 256);
+
+    let compile = current_fre_rebar_aggregate_compile_lifecycle(
+        &[pattern.to_owned()],
+        false,
+        false,
+        haystack.len(),
+    )
+    .unwrap();
+    let artifact = compile.construct().unwrap();
+    assert_eq!(
+        artifact.plan(&compile).unwrap(),
+        "compile-aggregate-fixed-class-chunks-v1"
+    );
+    assert_eq!(artifact.verify(&compile, &haystack).unwrap(), 1);
+
+    let regex = current_fre_rebar_aggregate_builder(pattern, false, false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(regex.build_report().plan, AggregatePlanKind::WordRun);
+    let fre::AggregatePlanIdentity::WordRun(identity) = regex.build_report().plan_identity else {
+        panic!("i1095 ASCII search retained another identity");
+    };
+    assert_eq!(
+        identity.semantics,
+        fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
+    );
+    assert_eq!(identity.kernel.fixed_chunk_bytes, Some(256));
+    assert_eq!(identity.kernel.plan_id, fre::FIXED_CLASS_CHUNKS_PLAN_ID);
+    current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
+        .unwrap();
+
+    let adapter = CurrentFreAdapter.identity();
+    assert!(adapter.identity.contains("fixed-class-chunks-v1"));
+    assert!(adapter.availability.contains("fixed-class chunk reducer"));
+}

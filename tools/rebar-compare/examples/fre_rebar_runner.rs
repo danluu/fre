@@ -514,6 +514,18 @@ fn aggregate_many_builder(benchmark: &Benchmark) -> AggregateManyBuilder<'_> {
 }
 
 fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
+    if matches!(
+        report.plan_identity,
+        fre::AggregatePlanIdentity::WordRun(identity)
+            if identity.semantics
+                == fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
+    ) {
+        return if model == "compile" {
+            "compile-aggregate-fixed-class-chunks-v1"
+        } else {
+            "aggregate-fixed-class-chunks-v1"
+        };
+    }
     let sparse = matches!(
         report.build,
         AggregateBuildAccounting::SparseFiniteLiteral(_)
