@@ -20224,6 +20224,36 @@ mod tests {
         reason = "one mapping gate keeps direct cardinality, selector ceilings, and exact refusal behavior together"
     )]
     fn capture_limits_preserve_facade_cardinality_and_selector_ceilings() {
+        // This scalar-planner-disabled path is a versioned exact construction
+        // boundary, but its golden is derived from retained layout rather than
+        // copied from an error string. The ten `\p{L}` classes each have 677
+        // scalar ranges. Repetitions 5..=14 materialize 95 scalar states. The
+        // composed report supplies the final instruction count; every
+        // instruction owns two `usize` certificate entries. Fixed storage is
+        // rederived below from the
+        // terminal-frontier seed, minimum-width proof, start-domain proof,
+        // required-literal proof, and both complete inline theorem slots.
+        const ALTERNATIVES: usize = 10;
+        const SCALAR_RANGES_PER_CLASS: usize = 677;
+        const SCALAR_STATES: usize = (5 + 14) * ALTERNATIVES / 2;
+        const SCALAR_RANGE_BYTES: usize = 2 * core::mem::size_of::<u32>();
+        const COMPOSED_PROGRAM_STATES: usize = 389;
+        const PINNED_INSTRUCTION_BYTES: usize = 56;
+        const CERTIFICATE_ENTRIES_PER_STATE: usize = 2;
+        const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
+        const MINIMUM_MATCH_PROOF_BYTES: usize = core::mem::size_of::<Option<usize>>();
+        const START_DOMAIN_PROOF_BYTES: usize = 1;
+        const COMPLETE_REQUIRED_LITERAL_PROOF_BYTES: usize = 80;
+        const COMPLETE_STATE_BYTE_SLOT_BYTES: usize = 208;
+        const COMPLETE_ORDERED_BOUNDED_SPAN_SUM_SLOT_BYTES: usize = 144;
+        const DEFAULT_SELECTOR_PROGRAM_BYTES: usize = 32 * 1_048_576;
+        const ONE_STATE_ENVELOPE_BYTES: usize = PINNED_INSTRUCTION_BYTES
+            + CERTIFICATE_ENTRIES_PER_STATE * core::mem::size_of::<usize>();
+        const SCALAR_STORAGE_BYTES: usize =
+            SCALAR_STATES * SCALAR_RANGES_PER_CLASS * SCALAR_RANGE_BYTES;
+        const FIXED_PROOF_BYTES: usize =
+            TERMINAL_FRONTIER_SEED_BYTES + MINIMUM_MATCH_PROOF_BYTES + START_DOMAIN_PROOF_BYTES;
+
         let run = RunLimits {
             pattern_bytes_per_job: 31,
             fre_aggregate_compile_work: 17,
@@ -20234,6 +20264,14 @@ mod tests {
             ..RunLimits::default()
         };
         let defaults = CaptureBuildLimits::default();
+        assert_eq!(
+            defaults.selector.max_program_bytes,
+            DEFAULT_SELECTOR_PROGRAM_BYTES
+        );
+        assert_eq!(
+            RunLimits::default().fre_capture_selector_program_bytes,
+            DEFAULT_SELECTOR_PROGRAM_BYTES
+        );
         let mapped = capture_build_limits(&run);
         assert_eq!(mapped.max_hir_work, 17);
         assert_eq!(mapped.engine.max_compile_work, 17);
@@ -20321,23 +20359,141 @@ mod tests {
             CURRENT_FRE_CAPTURE_SCALAR_PLAN,
         );
 
-        let selector_starved = RunLimits {
+        assert_eq!(SCALAR_STATES, 95);
+        assert_eq!(SCALAR_RANGE_BYTES, 8);
+        assert_eq!(ONE_STATE_ENVELOPE_BYTES, 72);
+        assert_eq!(SCALAR_STORAGE_BYTES, 514_520);
+        assert_eq!(FIXED_PROOF_BYTES, 73);
+
+        let default_fallback =
+            capture_regex_one(overlapping, true, false, &RunLimits::default()).unwrap();
+        let default_report = default_fallback.build_report();
+        assert_eq!(
+            default_report.selector.required_literal_proof_bytes,
+            COMPLETE_REQUIRED_LITERAL_PROOF_BYTES
+        );
+        assert_eq!(
+            default_report.selector.state_byte_span_sum_persistent_bytes,
+            COMPLETE_STATE_BYTE_SLOT_BYTES
+        );
+        assert_eq!(
+            default_report
+                .selector
+                .ordered_bounded_span_sum_persistent_bytes,
+            COMPLETE_ORDERED_BOUNDED_SPAN_SUM_SLOT_BYTES
+        );
+        assert_eq!(
+            default_report.selector.class_ranges,
+            ALTERNATIVES * SCALAR_RANGES_PER_CLASS
+        );
+        assert_eq!(
+            default_report.selector.program_states,
+            COMPOSED_PROGRAM_STATES
+        );
+        assert_eq!(default_report.selector.state_byte_span_sum_plans, 0);
+        assert_eq!(default_report.selector.ordered_bounded_span_sum_plans, 0);
+        assert_eq!(
+            default_report.selector.minimum_match_bytes_proof_bytes,
+            MINIMUM_MATCH_PROOF_BYTES
+        );
+        assert_eq!(
+            usize::from(default_report.selector.start_domain_proof_bytes),
+            START_DOMAIN_PROOF_BYTES
+        );
+        let required_suffix_storage = default_report.selector.required_suffix_bytes
+            + default_report.selector.required_suffixes * core::mem::size_of::<usize>();
+        let retained_components = required_suffix_storage
+            + FIXED_PROOF_BYTES
+            + default_report.selector.required_literal_proof_bytes
+            + default_report
+                .selector
+                .required_internal_anchor_persistent_bytes
+            + default_report.selector.url_aggregate_persistent_bytes
+            + default_report.selector.candidate_bytes
+            + default_report.selector.state_byte_span_sum_persistent_bytes
+            + default_report
+                .selector
+                .ordered_bounded_span_sum_persistent_bytes;
+        let full_program_bytes = default_report.selector.program_states * ONE_STATE_ENVELOPE_BYTES
+            + SCALAR_STORAGE_BYTES
+            + retained_components;
+        let incremental_program_bytes = full_program_bytes - ONE_STATE_ENVELOPE_BYTES;
+        let incremental_one_below = incremental_program_bytes - 1;
+        let full_one_below = full_program_bytes - 1;
+        assert_eq!(retained_components, 505);
+        assert_eq!(incremental_program_bytes, 542_961);
+        assert_eq!(full_program_bytes, 543_033);
+        assert_eq!(default_report.selector.program_bytes, full_program_bytes);
+
+        let limits_at = |max_program_bytes| RunLimits {
             fre_capture_scalar_planner_work: 0,
-            fre_capture_selector_program_bytes: 542_680,
+            fre_capture_selector_program_bytes: max_program_bytes,
             ..RunLimits::default()
         };
-        let refusal = current_fre(
-            "count-captures",
-            &[overlapping.to_string()],
-            b"abcdefghijklmn",
-            true,
-            false,
-            &selector_starved,
+        let refusal_at = |max_program_bytes| {
+            let outcome = current_fre(
+                "count-captures",
+                &[overlapping.to_string()],
+                b"abcdefghijklmn",
+                true,
+                false,
+                &limits_at(max_program_bytes),
+            );
+            match outcome {
+                CandidateOutcome::Unsupported(reason) => reason,
+                other => {
+                    panic!("capture selector byte quota {max_program_bytes} must refuse: {other:?}")
+                }
+            }
+        };
+
+        let one_below = refusal_at(incremental_one_below);
+        let incremental_one_below_message = format!(
+            "ProgramBytes requires {incremental_program_bytes}, limit is {incremental_one_below}"
         );
         assert!(
-            matches!(refusal, CandidateOutcome::Unsupported(ref reason)
-                if reason.contains("ProgramBytes requires 542681, limit is 542680")),
-            "capture selector byte quota must remain a typed refusal: {refusal:?}"
+            one_below.contains(&incremental_one_below_message),
+            "complete inline slot must move the protected incremental boundary: {one_below}"
+        );
+        let incremental_exact = refusal_at(incremental_program_bytes);
+        let incremental_exact_message = format!(
+            "ProgramBytes requires {full_program_bytes}, limit is {incremental_program_bytes}"
+        );
+        assert!(
+            incremental_exact.contains(&incremental_exact_message),
+            "exact incremental admission must advance to the full retained boundary: \
+             {incremental_exact}"
+        );
+        let full_one_below_refusal = refusal_at(full_one_below);
+        let full_one_below_message =
+            format!("ProgramBytes requires {full_program_bytes}, limit is {full_one_below}");
+        assert!(
+            full_one_below_refusal.contains(&full_one_below_message),
+            "full selector ProgramBytes must retain its own one-below refusal: \
+             {full_one_below_refusal}"
+        );
+
+        let exact_limits = limits_at(full_program_bytes);
+        let exact_fallback = capture_regex_one(overlapping, true, false, &exact_limits).unwrap();
+        assert_eq!(
+            exact_fallback.build_report().selector,
+            default_report.selector
+        );
+        assert_eq!(
+            exact_fallback.build_report().plan_identity,
+            default_report.plan_identity
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-captures",
+                &[overlapping.to_string()],
+                b"abcdefghijklmn",
+                true,
+                false,
+                &exact_limits,
+            ),
+            2,
+            CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN,
         );
     }
 
