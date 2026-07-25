@@ -28,6 +28,7 @@ use regex_syntax::hir::{Hir, HirKind};
 mod aggregate;
 mod aggregate_construction;
 mod aggregate_many;
+mod anchored_line_capture;
 mod blocking_delimiter;
 mod bounded_literal_pair;
 mod capture_count_seal;
@@ -120,6 +121,12 @@ pub use aggregate_many::{
     AggregateManySpanIter, AggregateManySpanSumRegex, AggregateManySpanSumResult,
     AggregateManySpans, AggregateManySpansRegex,
 };
+pub use anchored_line_capture::{
+    ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION, ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION,
+    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuildReport,
+    AnchoredLineCaptureBuilder, AnchoredLineCaptureHirAccounting, AnchoredLineCapturePlan,
+    AnchoredLineCapturePlanIdentity,
+};
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
     CaptureCountAttemptReceipt, CaptureCountBranch, CaptureCountDeclaredFallback,
@@ -192,6 +199,11 @@ pub use fre_capture_lab::{
     SearchError as CaptureSearchError, SearchKind as CaptureSearchKind,
     SearchLimits as CaptureSearchLimits, SearchOutcome as CaptureSearchOutcome,
     Span as CaptureSpan, Window as CaptureWindow,
+};
+pub use fre_kernels::{
+    ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_MAX_ATOMS,
+    ANCHORED_LINE_CAPTURE_PLAN_ID, AnchoredLineCaptureCountResult, AnchoredLineCaptureRunActual,
+    AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredLineCaptureRunUpperBounds,
 };
 pub use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,

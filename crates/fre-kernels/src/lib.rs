@@ -12,6 +12,7 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+mod anchored_line_capture;
 mod blocking_delimiter;
 mod bounded_class_sequence;
 mod bounded_context;
@@ -42,6 +43,19 @@ mod url_aggregate;
 
 pub use direct_build_attempt::{
     DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError,
+};
+
+pub use anchored_line_capture::{
+    AnchoredLineCapturePlan, Atom as AnchoredLineCaptureAtom,
+    BuildAccounting as AnchoredLineCaptureBuildAccounting,
+    BuildError as AnchoredLineCaptureBuildError, BuildLimits as AnchoredLineCaptureBuildLimits,
+    ByteMask as AnchoredLineCaptureByteMask,
+    COUNT_OPERATION_ID as ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID,
+    CountResult as AnchoredLineCaptureCountResult, MAX_ATOMS as ANCHORED_LINE_CAPTURE_MAX_ATOMS,
+    OperationIdentity as AnchoredLineCaptureOperationIdentity,
+    PLAN_ID as ANCHORED_LINE_CAPTURE_PLAN_ID, RunActual as AnchoredLineCaptureRunActual,
+    RunError as AnchoredLineCaptureRunError, RunLimits as AnchoredLineCaptureRunLimits,
+    RunUpperBounds as AnchoredLineCaptureRunUpperBounds,
 };
 
 pub use bounded_class_sequence::{

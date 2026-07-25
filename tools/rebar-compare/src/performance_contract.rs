@@ -5960,6 +5960,7 @@ mod tests {
             fre::STRING_QUOTE_PREFIX_OPERATION_ID,
             fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
             crate::CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN,
+            crate::CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
         ] {
             assert!(crate::is_current_fre_capture_plan(plan));
             assert_eq!(
