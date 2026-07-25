@@ -1987,7 +1987,7 @@ impl CompiledRegex {
             forced_generic_count_route,
             None | Some(GenericCountRoute::Candidate)
         ) && OBSERVED_WORK
-            && kind == OperationKind::Count
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.candidate
             && candidate::executable_for(&self.program)
@@ -1997,6 +1997,7 @@ impl CompiledRegex {
                 haystack,
                 range,
                 strategy,
+                kind,
                 limits,
                 attempt.as_mut(),
                 accounting,
@@ -2768,6 +2769,7 @@ impl CompiledRegex {
         haystack: &[u8],
         range: Range<usize>,
         strategy: Strategy,
+        kind: OperationKind,
         limits: OperationLimits,
         mut attempt: Option<&mut AttemptPublication<'_>>,
         attempt_accounting: &mut ExecutionAccounting,
@@ -2792,7 +2794,7 @@ impl CompiledRegex {
                         "candidate range reversed before publication",
                     ))?;
             let prospective =
-                candidate_prospective(plan, &self.program, input_bytes, boundaries, limits)?;
+                candidate_prospective(plan, &self.program, input_bytes, boundaries, kind, limits)?;
             let physical_route = OperationPhysicalRoute::Candidate;
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
@@ -2807,22 +2809,37 @@ impl CompiledRegex {
             )?;
             prospective.enforce_limits(limits)?;
         }
-        let result =
-            match candidate::count_attempt(plan, &self.program, haystack, range.clone(), limits) {
-                Ok(result) => result,
-                Err(failure) => {
-                    *attempt_accounting = failure.accounting;
-                    *actual_allocations = failure.actual_allocations;
-                    return Err(failure.source);
-                }
-            };
+        let reduction = match kind {
+            OperationKind::Count => candidate::ReductionKind::Count,
+            OperationKind::Sum => candidate::ReductionKind::SpanSum,
+            OperationKind::Spans => {
+                return Err(Error::InternalInvariant(
+                    "candidate reducer cannot materialize spans",
+                ));
+            }
+        };
+        let result = match candidate::reduce_attempt(
+            reduction,
+            plan,
+            &self.program,
+            haystack,
+            range.clone(),
+            limits,
+        ) {
+            Ok(result) => result,
+            Err(failure) => {
+                *attempt_accounting = failure.accounting;
+                *actual_allocations = failure.actual_allocations;
+                return Err(failure.source);
+            }
+        };
         *attempt_accounting = result.accounting;
         *actual_allocations = CANDIDATE_EXECUTION_ALLOCATIONS;
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
             operation_limits_id: operation_limits_identity(limits),
             strategy,
-            operation: OperationAttemptKind::Count,
+            operation: operation_attempt_kind(kind),
             physical_route: OperationPhysicalRoute::Candidate,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
@@ -2842,20 +2859,20 @@ impl CompiledRegex {
             scratch_bytes: result.accounting.scratch_peak_bytes,
             log_bytes: 0,
             sequential_bytes_bound: result.accounting.sequential_bytes_read,
-            match_events: result.value,
-            output_matches: result.value,
+            match_events: result.matches,
+            output_matches: result.matches,
             output_bytes: 0,
-            span_sum: 0,
+            span_sum: result.span_sum,
             peak_bytes: result.accounting.peak_bytes,
         };
         Ok(ExecutionResult {
             certificate,
             accounting: result.accounting,
             summary: ScanSummary {
-                matches: result.value,
-                events: result.value,
+                matches: result.matches,
+                events: result.matches,
                 suppressed: 0,
-                span_sum: 0,
+                span_sum: result.span_sum,
             },
             spans: Vec::new(),
         })
@@ -2869,6 +2886,7 @@ fn candidate_prospective(
     program: &Program,
     input_bytes: usize,
     boundaries: usize,
+    kind: OperationKind,
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
     let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
@@ -2906,6 +2924,14 @@ fn candidate_prospective(
     // pre-source bound even though candidate density is source-dependent.
     let work_bound = limits.max_work;
     let random_access_bytes_read = work_bound.saturating_mul(8);
+    // The candidate verifier admits only nonempty spans and advances its
+    // cursor to each accepted end, so accepted widths are disjoint and their
+    // checked sum cannot exceed the operation range.
+    let span_sum = if kind == OperationKind::Sum {
+        input_bytes
+    } else {
+        0
+    };
     let accounting = ExecutionAccounting {
         state_evaluations: work_bound,
         transition_checks: work_bound,
@@ -2936,7 +2962,7 @@ fn candidate_prospective(
         match_events: limits.max_match_events,
         output_matches: limits.max_output_matches,
         output_bytes: 0,
-        span_sum: 0,
+        span_sum,
         allocations: CANDIDATE_EXECUTION_ALLOCATIONS,
         peak_bytes: scratch_bytes,
         accounting,
@@ -9214,6 +9240,73 @@ mod tests {
         assert!(terminal.receipt.actual.work > 0);
         assert!(terminal.receipt.actual.sequential_bytes_read > 0);
         assert!(terminal_p.contains(terminal.receipt.actual));
+    }
+
+    #[test]
+    fn observed_candidate_span_sum_has_typed_receipts_and_exact_prospective_limit() {
+        let compiled = candidate_count();
+        let haystack = b"ab xxz q0r 123-x a";
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let limits = OperationLimits::default();
+        let count = compiled
+            .count_value_attempt(haystack, range.clone(), strategy, limits)
+            .unwrap();
+        let expected_span_sum = RegexBuilder::new(r"a|ab|x{1,3}z|q.r|[0-9]+-x")
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
+            .sum();
+
+        let exact_span_sum_limits = OperationLimits {
+            max_span_sum: haystack.len(),
+            ..limits
+        };
+        let span_sum = compiled
+            .span_sum_value_with_receipt(haystack, range.clone(), strategy, exact_span_sum_limits)
+            .unwrap();
+        assert_eq!(span_sum.value, expected_span_sum);
+        assert_eq!(
+            span_sum.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::Candidate)
+        );
+        assert_eq!(
+            span_sum.receipt.identity.operation,
+            OperationAttemptKind::SpanSum
+        );
+        assert_ne!(
+            span_sum.receipt.identity.operation_id(),
+            count.receipt.identity.operation_id()
+        );
+        let prospective = span_sum.receipt.prospective.unwrap();
+        assert_eq!(prospective.span_sum, haystack.len());
+        assert_eq!(
+            span_sum.receipt.actual_allocations,
+            CANDIDATE_EXECUTION_ALLOCATIONS
+        );
+        assert!(prospective.contains(span_sum.receipt.actual));
+        assert_eq!(span_sum.receipt.actual, count.receipt.actual);
+
+        let one_below = OperationLimits {
+            max_span_sum: haystack.len() - 1,
+            ..exact_span_sum_limits
+        };
+        let refusal = compiled
+            .span_sum_value_with_receipt(haystack, range, strategy, one_below)
+            .unwrap_err();
+        assert_eq!(
+            refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::SpanSum,
+                required: haystack.len(),
+                limit: haystack.len() - 1,
+            }
+        );
+        assert_eq!(refusal.receipt.prospective, Some(prospective));
+        assert_eq!(refusal.receipt.actual, ExecutionAccounting::default());
+        assert_eq!(refusal.receipt.actual_allocations, 0);
     }
 
     #[test]

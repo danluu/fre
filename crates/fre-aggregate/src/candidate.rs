@@ -139,14 +139,21 @@ fn ring_slot(index: usize, length: usize) -> Result<usize, Error> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CountResult {
-    pub(crate) value: usize,
+pub(crate) enum ReductionKind {
+    Count,
+    SpanSum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReductionResult {
+    pub(crate) matches: usize,
+    pub(crate) span_sum: usize,
     pub(crate) candidates: usize,
     pub(crate) accounting: ExecutionAccounting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CountAttemptError {
+pub(crate) struct ReductionAttemptError {
     pub(crate) source: Error,
     pub(crate) accounting: ExecutionAccounting,
     pub(crate) actual_allocations: usize,
@@ -169,14 +176,20 @@ pub(crate) fn count(
     haystack: &[u8],
     range: Range<usize>,
     limits: OperationLimits,
-) -> Result<CountResult, Error> {
+) -> Result<ReductionResult, Error> {
     count_attempt(plan, program, haystack, range, limits).map_err(|error| error.source)
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Count-specific internal entry point remains as a compatibility delegate"
+    )
+)]
 #[allow(
     clippy::result_large_err,
-    clippy::too_many_lines,
-    reason = "candidate execution and its deliberate full-ledger error keep validation, metering, scheduling, ordered draining and terminal accounting visible"
+    reason = "the compatibility entry point preserves the complete terminal execution ledger"
 )]
 pub(crate) fn count_attempt(
     plan: &Plan,
@@ -184,9 +197,25 @@ pub(crate) fn count_attempt(
     haystack: &[u8],
     range: Range<usize>,
     limits: OperationLimits,
-) -> Result<CountResult, CountAttemptError> {
+) -> Result<ReductionResult, ReductionAttemptError> {
+    reduce_attempt(ReductionKind::Count, plan, program, haystack, range, limits)
+}
+
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    reason = "candidate execution and its deliberate full-ledger error keep validation, metering, scheduling, ordered draining and terminal accounting visible"
+)]
+pub(crate) fn reduce_attempt(
+    kind: ReductionKind,
+    plan: &Plan,
+    program: &Program,
+    haystack: &[u8],
+    range: Range<usize>,
+    limits: OperationLimits,
+) -> Result<ReductionResult, ReductionAttemptError> {
     if range.start > range.end || range.end > haystack.len() {
-        return Err(CountAttemptError {
+        return Err(ReductionAttemptError {
             source: Error::InvalidRange {
                 start: range.start,
                 end: range.end,
@@ -202,7 +231,7 @@ pub(crate) fn count_attempt(
         || plan.global_buckets.len() != BUCKETS
         || !executable_for(program)
     {
-        return Err(CountAttemptError {
+        return Err(ReductionAttemptError {
             source: Error::InternalInvariant(
                 "candidate plan no longer matches its byte-program proof",
             ),
@@ -212,13 +241,13 @@ pub(crate) fn count_attempt(
     }
     let local = &haystack[range.clone()];
     let boundaries =
-        add(local.len(), 1, Resource::Boundaries).map_err(|source| CountAttemptError {
+        add(local.len(), 1, Resource::Boundaries).map_err(|source| ReductionAttemptError {
             source,
             accounting: ExecutionAccounting::default(),
             actual_allocations: 0,
         })?;
     enforce(boundaries, limits.max_boundaries, Resource::Boundaries).map_err(|source| {
-        CountAttemptError {
+        ReductionAttemptError {
             source,
             accounting: ExecutionAccounting::default(),
             actual_allocations: 0,
@@ -226,7 +255,7 @@ pub(crate) fn count_attempt(
     })?;
     let assertions =
         AssertionContext::new(haystack, range.start, local.len()).map_err(|source| {
-            CountAttemptError {
+            ReductionAttemptError {
                 source,
                 accounting: ExecutionAccounting::default(),
                 actual_allocations: 0,
@@ -235,6 +264,7 @@ pub(crate) fn count_attempt(
     let mut meter = Meter::new(limits);
     let mut allocations = AllocationLedger::default();
     let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
     let mut candidates = 0_usize;
     let result = (|| {
         let schedule = add(plan.max_offset, 1, Resource::ScratchBytes)?;
@@ -318,6 +348,8 @@ pub(crate) fn count_attempt(
                         next_start,
                         &mut cursor,
                         &mut matches,
+                        &mut span_sum,
+                        kind,
                         &mut workspace,
                         &mut meter,
                     )?;
@@ -334,6 +366,8 @@ pub(crate) fn count_attempt(
                 next_start,
                 &mut cursor,
                 &mut matches,
+                &mut span_sum,
+                kind,
                 &mut workspace,
                 &mut meter,
             )?;
@@ -348,12 +382,13 @@ pub(crate) fn count_attempt(
     })();
     let accounting = candidate_attempt_accounting(&meter, allocations.bytes, candidates, matches);
     match result {
-        Ok(()) => Ok(CountResult {
-            value: matches,
+        Ok(()) => Ok(ReductionResult {
+            matches,
+            span_sum,
             candidates,
             accounting,
         }),
-        Err(source) => Err(CountAttemptError {
+        Err(source) => Err(ReductionAttemptError {
             source,
             accounting,
             actual_allocations: allocations.count,
@@ -461,6 +496,8 @@ fn process_start(
     start: usize,
     cursor: &mut usize,
     matches: &mut usize,
+    span_sum: &mut usize,
+    kind: ReductionKind,
     workspace: &mut Workspace,
     meter: &mut Meter,
 ) -> Result<(), Error> {
@@ -502,7 +539,19 @@ fn process_start(
                 meter.limits.max_output_matches,
                 Resource::OutputMatches,
             )?;
+            let required_span_sum = match kind {
+                ReductionKind::Count => *span_sum,
+                ReductionKind::SpanSum => {
+                    let width = end.checked_sub(start).ok_or(Error::InternalInvariant(
+                        "candidate match endpoint precedes start",
+                    ))?;
+                    let required = add(*span_sum, width, Resource::SpanSum)?;
+                    enforce(required, meter.limits.max_span_sum, Resource::SpanSum)?;
+                    required
+                }
+            };
             *matches = required;
+            *span_sum = required_span_sum;
             *cursor = end;
             return Ok(());
         }
@@ -956,6 +1005,16 @@ mod tests {
             .count()
     }
 
+    fn reference_span_sum(pattern: &str, haystack: &[u8]) -> usize {
+        RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
+            .sum()
+    }
+
     #[test]
     fn candidate_intervals_preserve_priority_and_invalid_byte_semantics() {
         let patterns = [
@@ -976,8 +1035,17 @@ mod tests {
                     haystack.push(alphabet[value % alphabet.len()]);
                     value /= alphabet.len();
                 }
-                let expected = reference.find_iter(&haystack).count();
-                let actual = compiled
+                let (expected_count, expected_span_sum) = reference.find_iter(&haystack).fold(
+                    (0_usize, 0_usize),
+                    |(count, sum), matched| {
+                        let width = matched.end().checked_sub(matched.start()).unwrap();
+                        (
+                            count.checked_add(1).unwrap(),
+                            sum.checked_add(width).unwrap(),
+                        )
+                    },
+                );
+                let actual_count = compiled
                     .count_value(
                         &haystack,
                         0..haystack.len(),
@@ -986,7 +1054,19 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(
-                    actual, expected,
+                    actual_count, expected_count,
+                    "Count pattern={pattern:?} haystack={haystack:?}"
+                );
+                let actual_span_sum = compiled
+                    .span_sum_value(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual_span_sum, expected_span_sum,
                     "pattern={pattern:?} haystack={haystack:?}"
                 );
             }
@@ -1049,10 +1129,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            exact.value,
+            exact.matches,
             reference(r"\bprefix.{0,4}Z|[0-9]{1,3}-x|ab+", haystack)
         );
-        assert!(exact.candidates > exact.value);
+        assert!(exact.candidates > exact.matches);
         assert!(exact.accounting.state_evaluations > 0);
         assert!(exact.accounting.transition_checks > 0);
         assert!(exact.accounting.assertion_checks > 0);
@@ -1069,7 +1149,7 @@ mod tests {
             max_scratch_bytes: exact.accounting.scratch_peak_bytes,
             max_sequential_bytes: exact.accounting.sequential_bytes_read,
             max_match_events: exact.candidates,
-            max_output_matches: exact.value,
+            max_output_matches: exact.matches,
             max_peak_bytes: exact.accounting.peak_bytes,
             max_work: exact.accounting.work,
             ..OperationLimits::default()
@@ -1085,6 +1165,61 @@ mod tests {
             .unwrap(),
             exact
         );
+
+        let exact_span_sum = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(exact_span_sum.matches, exact.matches);
+        assert_eq!(exact_span_sum.candidates, exact.candidates);
+        assert_eq!(exact_span_sum.accounting, exact.accounting);
+        assert_eq!(
+            exact_span_sum.span_sum,
+            reference_span_sum(r"\bprefix.{0,4}Z|[0-9]{1,3}-x|ab+", haystack)
+        );
+        let exact_span_sum_limits = OperationLimits {
+            max_span_sum: exact_span_sum.span_sum,
+            ..exact_limits
+        };
+        assert_eq!(
+            reduce_attempt(
+                ReductionKind::SpanSum,
+                plan,
+                &compiled.program,
+                haystack,
+                0..haystack.len(),
+                exact_span_sum_limits,
+            )
+            .unwrap(),
+            exact_span_sum
+        );
+        let span_sum_one_below = OperationLimits {
+            max_span_sum: exact_span_sum.span_sum - 1,
+            ..exact_span_sum_limits
+        };
+        assert!(matches!(
+            reduce_attempt(
+                ReductionKind::SpanSum,
+                plan,
+                &compiled.program,
+                haystack,
+                0..haystack.len(),
+                span_sum_one_below,
+            ),
+            Err(ReductionAttemptError {
+                source: Error::ResourceLimit {
+                    resource: Resource::SpanSum,
+                    required,
+                    limit,
+                },
+                ..
+            }) if required == exact_span_sum.span_sum && limit == exact_span_sum.span_sum - 1
+        ));
 
         for (resource, limits) in [
             (
@@ -1125,7 +1260,7 @@ mod tests {
             (
                 Resource::OutputMatches,
                 OperationLimits {
-                    max_output_matches: exact.value - 1,
+                    max_output_matches: exact.matches - 1,
                     ..exact_limits
                 },
             ),
@@ -1215,7 +1350,7 @@ mod tests {
                     limits,
                 )
                 .unwrap(),
-            observed.value
+            observed.matches
         );
         assert!(matches!(
             compiled.admit_count(
@@ -1243,7 +1378,7 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, 1);
+        assert_eq!(result.matches, 1);
         assert!(result.accounting.state_evaluations > 0);
         assert!(result.accounting.transition_checks > 0);
         assert!(result.accounting.work > result.accounting.state_evaluations);
@@ -1283,7 +1418,7 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, 0);
+        assert_eq!(result.matches, 0);
         assert_eq!(result.candidates, 0);
         assert_eq!(
             result.accounting.sequential_bytes_read,
@@ -1299,7 +1434,7 @@ mod tests {
             OperationLimits::default(),
         )
         .unwrap();
-        assert_eq!(result.value, reference(pattern, present_but_not_matching));
+        assert_eq!(result.matches, reference(pattern, present_but_not_matching));
     }
 
     #[allow(
@@ -1396,7 +1531,7 @@ mod tests {
             run_limits,
         )
         .unwrap();
-        assert_eq!(multi_result.value, 55);
+        assert_eq!(multi_result.matches, 55);
 
         let single_source = sources
             .iter()
