@@ -57,27 +57,29 @@ use fre_kernels::{
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaCountResult, GraphemeScalarDfaOperationIdentity, GraphemeScalarDfaPlan,
     GraphemeScalarDfaReduceAccounting, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    GraphemeScalarDfaRole, LITERAL_AGGREGATE_COUNT_OPERATION_ID,
-    LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID, LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
+    GraphemeScalarDfaRole, LITERAL_ASSERTIONS_COUNT_OPERATION_ID,
     LITERAL_ASSERTIONS_SPAN_SUM_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LiteralAggregateBuildAccounting,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateCountResult,
-    LiteralAggregateOperationIdentity, LiteralAggregatePlan, LiteralAggregateReduceAccounting,
-    LiteralAggregateReduceError, LiteralAggregateReduceLimits, LiteralAggregateSpanSumResult,
-    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
-    LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity, LiteralAssertionsPlan,
-    LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
-    LiteralAssertionsSpanSumResult, LiteralClassRunLiteralBuildAccounting,
-    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
-    LiteralClassRunLiteralCountResult, LiteralClassRunLiteralOperationIdentity,
-    LiteralClassRunLiteralPlan, LiteralClassRunLiteralReduceAccounting,
-    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
-    LiteralClassRunLiteralSpanSumResult, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateCountAttempt,
+    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregatePlan,
+    LiteralAggregatePlanOrigin, LiteralAggregateReduceAccounting,
+    LiteralAggregateReduceAttemptError, LiteralAggregateReduceAttemptReceipt,
+    LiteralAggregateReduceError, LiteralAggregateReduceInvocation, LiteralAggregateReduceLimits,
+    LiteralAggregateSpanSumAttempt, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
+    LiteralAssertionsBuildLimits, LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity,
+    LiteralAssertionsPlan, LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError,
+    LiteralAssertionsReduceLimits, LiteralAssertionsSpanSumResult,
+    LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
+    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralCountResult,
+    LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
+    LiteralClassRunLiteralReduceAccounting, LiteralClassRunLiteralReduceError,
+    LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PrefixClassAlternationBuildAccounting,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
@@ -121,7 +123,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 33;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 34;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
@@ -2037,6 +2039,27 @@ fn direct_operation_id_closes(
     }
 }
 
+const fn exact_literal_operation(
+    operation: AggregateOperation,
+) -> Option<LiteralAggregateOperation> {
+    match operation {
+        AggregateOperation::Compile | AggregateOperation::Count => {
+            Some(LiteralAggregateOperation::Count)
+        }
+        AggregateOperation::SpanSum => Some(LiteralAggregateOperation::SpanSum),
+        AggregateOperation::Spans => None,
+    }
+}
+
+fn exact_literal_direct_operation_closes(
+    operation: AggregateOperation,
+    identity: LiteralAggregateOperationIdentity,
+) -> bool {
+    exact_literal_operation(operation).is_some_and(|operation| {
+        identity == LiteralAggregateOperationIdentity::for_operation(operation)
+    })
+}
+
 fn unicode_scalar_direct_operation_closes(
     operation: AggregateOperation,
     identity: UnicodeScalarAggregateOperationIdentity,
@@ -2061,12 +2084,9 @@ fn unicode_scalar_direct_operation_closes(
 )]
 fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
     match cache.plan_identity {
-        AggregatePlanIdentity::ExactLiteral(identity) => direct_operation_id_closes(
-            cache.operation,
-            identity.kernel.operation_id,
-            LITERAL_AGGREGATE_COUNT_OPERATION_ID,
-            Some(LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID),
-        ),
+        AggregatePlanIdentity::ExactLiteral(identity) => {
+            exact_literal_direct_operation_closes(cache.operation, identity.kernel)
+        }
         AggregatePlanIdentity::UnicodeScalar(identity) => {
             unicode_scalar_direct_operation_closes(cache.operation, identity.kernel)
         }
@@ -2179,6 +2199,50 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
     clippy::too_many_lines,
     reason = "one exhaustive closure boundary keeps all direct route identities adjacent"
 )]
+fn exact_literal_details_close_cache(
+    cache: &AggregateCacheIdentity,
+    identity: AggregateExactLiteralIdentity,
+    details: &AggregateExactLiteralExecutionDetails,
+) -> bool {
+    let accounting = &details.accounting;
+    let Some(construction_build) = details.construction.build_accounting() else {
+        return false;
+    };
+    let expected_origin = LiteralAggregatePlanOrigin::from_external_address(
+        Arc::as_ptr(&cache.syntax_key).cast::<()>().addr(),
+    );
+    let expected_invocation = LiteralAggregateReduceInvocation {
+        haystack_bytes: accounting.upper_bounds.haystack_bytes,
+        build: construction_build,
+        plan_origin: details.construction.origin,
+        limits: cache.execution_limits.exact_literal,
+    };
+    Weak::ptr_eq(
+        &details.syntax_provenance,
+        &Arc::downgrade(&cache.syntax_key),
+    ) && expected_origin == Some(details.construction.origin)
+        && details.construction.origin.is_bound()
+        && accounting.authenticates(identity.kernel, expected_invocation)
+        && exact_literal_direct_operation_closes(cache.operation, accounting.identity)
+        && accounting.closes_receipt(&details.receipt)
+        && details.receipt.authenticates_canonical()
+        && details.receipt.prospective == Some(accounting.upper_bounds)
+        && accounting.invocation.haystack_bytes == accounting.upper_bounds.haystack_bytes
+        && accounting.invocation.build.needle_bytes == accounting.upper_bounds.needle_bytes
+        && accounting.invocation.build.persistent_bytes == accounting.upper_bounds.persistent_bytes
+        && accounting.upper_bounds.operation_allocations == 0
+        && accounting.actual.operation_allocations == 0
+        && accounting.actual_allocations == 0
+        && details.receipt.actual.operation_allocations == 0
+        && details.receipt.actual_allocations == 0
+        && accounting.retains_bounded_actual()
+        && details.receipt.retains_bounded_actual()
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive closure boundary keeps all direct route identities adjacent"
+)]
 fn direct_details_close_cache(
     cache: &AggregateCacheIdentity,
     details: &AggregateExecutionDetails,
@@ -2186,16 +2250,8 @@ fn direct_details_close_cache(
     match (&cache.plan_identity, details) {
         (
             AggregatePlanIdentity::ExactLiteral(identity),
-            AggregateExecutionDetails::ExactLiteral(accounting),
-        ) => {
-            identity.kernel == accounting.identity
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.kernel.operation_id,
-                    LITERAL_AGGREGATE_COUNT_OPERATION_ID,
-                    Some(LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID),
-                )
-        }
+            AggregateExecutionDetails::ExactLiteral(details),
+        ) => exact_literal_details_close_cache(cache, *identity, details),
         (
             AggregatePlanIdentity::UnicodeScalar(identity),
             AggregateExecutionDetails::UnicodeScalar(accounting),
@@ -2485,19 +2541,81 @@ pub enum AggregateDirectAttemptTerminal {
 /// The public guarded-word source is boxed to keep the outer execution error
 /// compact. Keeping its receipt copy unboxed avoids a second allocation while
 /// every other direct source can retain its existing representation exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AggregateExactLiteralConstructionSeal {
+    needle_bytes: usize,
+    temporary_capacity_bytes: usize,
+    origin: LiteralAggregatePlanOrigin,
+}
+
+impl AggregateExactLiteralConstructionSeal {
+    fn new(
+        build: LiteralAggregateBuildAccounting,
+        origin: LiteralAggregatePlanOrigin,
+    ) -> Option<Self> {
+        let seal = Self {
+            needle_bytes: build.needle_bytes,
+            temporary_capacity_bytes: build.temporary_capacity_bytes,
+            origin,
+        };
+        (seal.build_accounting()? == build).then_some(seal)
+    }
+
+    fn build_accounting(self) -> Option<LiteralAggregateBuildAccounting> {
+        if self.needle_bytes == 0 && self.temporary_capacity_bytes != 0 {
+            return None;
+        }
+        let work_upper_bound = u64::try_from(self.needle_bytes).ok()?.checked_add(1)?;
+        let persistent_bytes =
+            core::mem::size_of::<LiteralAggregatePlan>().checked_add(self.needle_bytes)?;
+        let peak_bytes = persistent_bytes.checked_add(self.temporary_capacity_bytes)?;
+        Some(LiteralAggregateBuildAccounting {
+            needle_bytes: self.needle_bytes,
+            temporary_capacity_bytes: self.temporary_capacity_bytes,
+            work_upper_bound,
+            scratch_bytes: self.temporary_capacity_bytes,
+            persistent_bytes,
+            peak_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AggregateExactLiteralReceiptSource {
+    attempt: LiteralAggregateReduceAttemptError,
+    syntax_provenance: Weak<CacheKey>,
+    construction: AggregateExactLiteralConstructionSeal,
+}
+
+impl PartialEq for AggregateExactLiteralReceiptSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.attempt == other.attempt
+            && Weak::ptr_eq(&self.syntax_provenance, &other.syntax_provenance)
+            && self.construction == other.construction
+    }
+}
+
+impl Eq for AggregateExactLiteralReceiptSource {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "exact terminals retain one inline receipt and construction seal; boxing would add a forbidden second allocation"
+)]
 enum AggregateDirectReceiptSource {
     Execution(AggregateExecutionSource),
+    ExactLiteral(AggregateExactLiteralReceiptSource),
     GuardedAsciiWord(guarded_ascii_word::ReduceError),
 }
 
 impl AggregateDirectReceiptSource {
-    fn capture(source: &AggregateExecutionSource) -> Self {
+    fn capture(source: &AggregateExecutionSource) -> Option<Self> {
         match source {
+            AggregateExecutionSource::ExactLiteral(_) => None,
             AggregateExecutionSource::GuardedAsciiWord(source) => {
-                Self::GuardedAsciiWord(source.as_ref().clone())
+                Some(Self::GuardedAsciiWord(source.as_ref().clone()))
             }
-            source => Self::Execution(source.clone()),
+            source => Some(Self::Execution(source.clone())),
         }
     }
 
@@ -2505,11 +2623,72 @@ impl AggregateDirectReceiptSource {
         match (self, source) {
             (Self::Execution(receipt), source) => receipt == source,
             (
+                Self::ExactLiteral(AggregateExactLiteralReceiptSource { attempt, .. }),
+                AggregateExecutionSource::ExactLiteral(source),
+            ) => attempt.source() == source,
+            (
                 Self::GuardedAsciiWord(receipt),
                 AggregateExecutionSource::GuardedAsciiWord(source),
             ) => receipt == source.as_ref(),
-            (Self::GuardedAsciiWord(_), _) => false,
+            (Self::ExactLiteral(_) | Self::GuardedAsciiWord(_), _) => false,
         }
+    }
+
+    const fn exact_literal_receipt(&self) -> Option<&LiteralAggregateReduceAttemptReceipt> {
+        match self {
+            Self::ExactLiteral(source) => Some(source.attempt.receipt()),
+            Self::Execution(_) | Self::GuardedAsciiWord(_) => None,
+        }
+    }
+
+    fn exact_literal_closes(
+        &self,
+        owner: &AggregateDirectOwnerSeal,
+        cache: &AggregateCacheIdentity,
+        invocation: &AggregateDirectInvocation,
+    ) -> bool {
+        let Self::ExactLiteral(source) = self else {
+            return owner.identity.route != AggregateDirectRoute::ExactLiteral;
+        };
+        let receipt = source.attempt.receipt();
+        let Some(construction_build) = source.construction.build_accounting() else {
+            return false;
+        };
+        let AggregatePlanIdentity::ExactLiteral(identity) = cache.plan_identity else {
+            return false;
+        };
+        let Some(operation) = exact_literal_operation(cache.operation) else {
+            return false;
+        };
+        let prospective_closes = receipt.prospective.is_none_or(|prospective| {
+            prospective.haystack_bytes == receipt.invocation.haystack_bytes
+                && prospective.needle_bytes == receipt.invocation.build.needle_bytes
+                && prospective.persistent_bytes == receipt.invocation.build.persistent_bytes
+                && prospective.operation_allocations == 0
+        });
+        let expected_origin = LiteralAggregatePlanOrigin::from_external_address(
+            owner.syntax_provenance.as_ptr().cast::<()>().addr(),
+        );
+        Weak::ptr_eq(&source.syntax_provenance, &owner.syntax_provenance)
+            && owner.identity.route == AggregateDirectRoute::ExactLiteral
+            && identity.kernel == LiteralAggregateOperationIdentity::for_operation(operation)
+            && expected_origin == Some(source.construction.origin)
+            && receipt.authenticates(
+                identity.kernel,
+                LiteralAggregateReduceInvocation {
+                    haystack_bytes: invocation.haystack_len,
+                    build: construction_build,
+                    plan_origin: source.construction.origin,
+                    limits: cache.execution_limits.exact_literal,
+                },
+            )
+            && receipt.invocation.haystack_bytes == invocation.haystack_len
+            && receipt.invocation.limits == cache.execution_limits.exact_literal
+            && prospective_closes
+            && source.attempt.closes()
+            && receipt.actual.operation_allocations == 0
+            && receipt.actual_allocations == 0
+            && receipt.retains_bounded_actual()
     }
 }
 
@@ -2550,6 +2729,12 @@ impl AggregateDirectAttemptReceipt {
         self.source.authenticates(source)
     }
 
+    /// Exact-literal kernel receipt nested under this construction owner.
+    #[must_use]
+    pub const fn exact_literal_receipt(&self) -> Option<&LiteralAggregateReduceAttemptReceipt> {
+        self.source.exact_literal_receipt()
+    }
+
     fn closes(&self, cache: &AggregateCacheIdentity, source: &AggregateExecutionSource) -> bool {
         self.authenticated_terminal == AggregateDirectAttemptTerminal::Failure
             && self.terminal == self.authenticated_terminal
@@ -2558,6 +2743,9 @@ impl AggregateDirectAttemptReceipt {
             && self.invocation.operation == cache.operation
             && self.invocation.range == (0..self.invocation.haystack_len)
             && source.direct_route() == Some(self.owner.identity.route)
+            && self
+                .source
+                .exact_literal_closes(&self.owner, cache, &self.invocation)
             && self.owner.closes_cache_identity(cache)
     }
 }
@@ -3942,6 +4130,15 @@ impl AggregateExecutionError {
         self.identity.direct_receipt()
     }
 
+    /// Exact-literal kernel attempt nested under the generic direct owner.
+    #[must_use]
+    pub const fn exact_literal_receipt(&self) -> Option<&LiteralAggregateReduceAttemptReceipt> {
+        match self.direct_receipt() {
+            Some(receipt) => receipt.exact_literal_receipt(),
+            None => None,
+        }
+    }
+
     /// Complete selected-route continuation receipt retained on a
     /// continuation terminal outcome.
     #[must_use]
@@ -4034,11 +4231,58 @@ impl std::error::Error for AggregateExecutionError {
     }
 }
 
+/// Exact-literal success accounting closed against the independent kernel
+/// attempt receipt and the facade construction that published the plan.
+#[derive(Clone, Debug)]
+pub struct AggregateExactLiteralExecutionDetails {
+    accounting: LiteralAggregateReduceAccounting,
+    receipt: LiteralAggregateReduceAttemptReceipt,
+    syntax_provenance: Weak<CacheKey>,
+    construction: AggregateExactLiteralConstructionSeal,
+}
+
+impl PartialEq for AggregateExactLiteralExecutionDetails {
+    fn eq(&self, other: &Self) -> bool {
+        self.accounting == other.accounting
+            && self.receipt == other.receipt
+            && Weak::ptr_eq(&self.syntax_provenance, &other.syntax_provenance)
+            && self.construction == other.construction
+    }
+}
+
+impl Eq for AggregateExactLiteralExecutionDetails {}
+
+impl core::ops::Deref for AggregateExactLiteralExecutionDetails {
+    type Target = LiteralAggregateReduceAccounting;
+
+    fn deref(&self) -> &Self::Target {
+        &self.accounting
+    }
+}
+
+impl AggregateExactLiteralExecutionDetails {
+    /// Kernel success accounting retained by the facade.
+    #[must_use]
+    pub const fn accounting(&self) -> &LiteralAggregateReduceAccounting {
+        &self.accounting
+    }
+
+    /// Independent kernel receipt for this exact success.
+    #[must_use]
+    pub const fn receipt(&self) -> &LiteralAggregateReduceAttemptReceipt {
+        &self.receipt
+    }
+}
+
 /// Selected-plan execution details.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "exact audited success retains its independent receipt inline so the operation remains allocation-free"
+)]
 pub enum AggregateExecutionDetails {
-    /// Exact-literal upper bounds, counters, and operation identity.
-    ExactLiteral(LiteralAggregateReduceAccounting),
+    /// Exact-literal accounting, independent receipt, and construction seal.
+    ExactLiteral(AggregateExactLiteralExecutionDetails),
     /// Direct scalar stream's complete bounds and structural counters.
     UnicodeScalar(UnicodeScalarAggregateReduceAccounting),
     /// Direct word-run prospective and actual counters.
@@ -4847,7 +5091,7 @@ impl AggregateBuilder {
                     detail: "syntax summary differs from exact-literal inspection",
                 });
             }
-            let engine =
+            let mut engine =
                 LiteralAggregatePlan::build(needle, limits.exact_literal).map_err(|source| {
                     AggregateBuildError::ExactLiteralBuild {
                         operation,
@@ -4855,6 +5099,22 @@ impl AggregateBuilder {
                         source,
                     }
                 })?;
+            let Some(plan_origin) = LiteralAggregatePlanOrigin::from_external_address(
+                Arc::as_ptr(&syntax_key).cast::<()>().addr(),
+            ) else {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "exact-literal syntax construction origin was null",
+                });
+            };
+            if !engine.bind_external_origin(plan_origin) {
+                return Err(AggregateBuildError::InternalInvariant {
+                    operation,
+                    selection,
+                    detail: "exact-literal plan could not bind its syntax construction origin",
+                });
+            }
             let build = engine.build_accounting();
             let kernel_identity = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => engine.count_identity(),
@@ -8418,6 +8678,169 @@ impl AggregatePlan {
         AggregateDirectOwnerSeal::from_cache_identity(cache, route)
     }
 
+    fn exact_literal_construction(
+        &self,
+    ) -> Option<(
+        LiteralAggregateOperationIdentity,
+        AggregateExactLiteralConstructionSeal,
+        Weak<CacheKey>,
+    )> {
+        let AggregateEngine::ExactLiteral(engine) = &self.engine else {
+            return None;
+        };
+        let AggregatePlanIdentity::ExactLiteral(identity) = self.report.plan_identity else {
+            return None;
+        };
+        let AggregateBuildAccounting::ExactLiteral(report_build) = self.report.build else {
+            return None;
+        };
+        let operation = exact_literal_operation(self.operation())?;
+        let expected_identity = LiteralAggregateOperationIdentity::for_operation(operation);
+        let expected_origin = LiteralAggregatePlanOrigin::from_external_address(
+            Arc::as_ptr(&self.report.syntax_key).cast::<()>().addr(),
+        )?;
+        let build = engine.build_accounting();
+        if self.report.plan != AggregatePlanKind::ExactLiteral
+            || identity.kernel != expected_identity
+            || report_build != build
+            || engine.external_origin() != expected_origin
+            || !expected_origin.is_bound()
+        {
+            return None;
+        }
+        let construction = AggregateExactLiteralConstructionSeal::new(build, expected_origin)?;
+        Some((
+            expected_identity,
+            construction,
+            Arc::downgrade(&self.report.syntax_key),
+        ))
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the Copy accounting and receipt are consumed into the allocation-free exact success details"
+    )]
+    fn exact_literal_success_details(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        accounting: LiteralAggregateReduceAccounting,
+        receipt: LiteralAggregateReduceAttemptReceipt,
+    ) -> Result<AggregateExactLiteralExecutionDetails, AggregateExecutionError> {
+        let Some((identity, construction, syntax_provenance)) = self.exact_literal_construction()
+        else {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal success lacks its authenticated live construction",
+                ),
+            ));
+        };
+        let Some(construction_build) = construction.build_accounting() else {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal construction seal did not reconstruct its full build",
+                ),
+            ));
+        };
+        let invocation = LiteralAggregateReduceInvocation {
+            haystack_bytes: haystack_len,
+            build: construction_build,
+            plan_origin: construction.origin,
+            limits: execution_limits.exact_literal,
+        };
+        let prospective_closes = receipt.prospective == Some(accounting.upper_bounds)
+            && accounting.upper_bounds.haystack_bytes == haystack_len
+            && accounting.upper_bounds.needle_bytes == construction_build.needle_bytes
+            && accounting.upper_bounds.persistent_bytes == construction_build.persistent_bytes
+            && accounting.upper_bounds.operation_allocations == 0;
+        if !accounting.authenticates(identity, invocation)
+            || !receipt.authenticates(identity, invocation)
+            || !accounting.closes_receipt(&receipt)
+            || !receipt.authenticates_canonical()
+            || !prospective_closes
+            || accounting.actual.operation_allocations != 0
+            || accounting.actual_allocations != 0
+            || receipt.actual.operation_allocations != 0
+            || receipt.actual_allocations != 0
+            || !accounting.retains_bounded_actual()
+            || !receipt.retains_bounded_actual()
+        {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal success did not authenticate its live construction/invocation/P/A",
+                ),
+            ));
+        }
+        Ok(AggregateExactLiteralExecutionDetails {
+            accounting,
+            receipt,
+            syntax_provenance,
+            construction,
+        })
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the complete Copy attempt is consumed into the allocation-free facade result"
+    )]
+    fn exact_literal_count_execution(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        attempt: LiteralAggregateCountAttempt,
+    ) -> Result<AggregateCountExecution, AggregateExecutionError> {
+        if !attempt.closes() || attempt.result().count != attempt.receipt().actual.count {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal count success did not close its kernel attempt",
+                ),
+            ));
+        }
+        let (result, receipt) = attempt.into_parts();
+        let value = result.count;
+        let details = self.exact_literal_success_details(
+            haystack_len,
+            execution_limits,
+            result.accounting,
+            receipt,
+        )?;
+        Ok(AggregateCountExecution::ExactLiteral { value, details })
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the complete Copy attempt is consumed into the allocation-free facade result"
+    )]
+    fn exact_literal_span_sum_execution(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        attempt: LiteralAggregateSpanSumAttempt,
+    ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
+        if !attempt.closes() || attempt.result().span_sum != attempt.receipt().actual.matched_bytes
+        {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal span-sum success did not close its kernel attempt",
+                ),
+            ));
+        }
+        let (result, receipt) = attempt.into_parts();
+        let value = result.span_sum;
+        let details = self.exact_literal_success_details(
+            haystack_len,
+            execution_limits,
+            result.accounting,
+            receipt,
+        )?;
+        Ok(AggregateSpanSumExecution::ExactLiteral { value, details })
+    }
+
     /// Return the exact fixed-domain guard envelope for a complete original
     /// haystack without borrowing or inspecting that haystack.
     ///
@@ -8549,6 +8972,115 @@ impl AggregatePlan {
         }
     }
 
+    fn direct_exact_execution_error(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        attempt: LiteralAggregateReduceAttemptError,
+    ) -> AggregateExecutionError {
+        if !attempt.closes() {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal source did not close its kernel P/A receipt",
+                ),
+            );
+        }
+        let source = attempt.source().clone();
+        let receipt = *attempt.receipt();
+        let Some((identity, construction, syntax_provenance)) = self.exact_literal_construction()
+        else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal kernel receipt lacks its authenticated live construction",
+                ),
+            );
+        };
+        let Some(construction_build) = construction.build_accounting() else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal construction seal did not reconstruct its full build",
+                ),
+            );
+        };
+        let invocation = LiteralAggregateReduceInvocation {
+            haystack_bytes: haystack_len,
+            build: construction_build,
+            plan_origin: construction.origin,
+            limits: execution_limits.exact_literal,
+        };
+        let prospective_closes = receipt.prospective.is_none_or(|prospective| {
+            prospective.haystack_bytes == haystack_len
+                && prospective.needle_bytes == invocation.build.needle_bytes
+                && prospective.persistent_bytes == invocation.build.persistent_bytes
+                && prospective.operation_allocations == 0
+        });
+        if !receipt.authenticates(identity, invocation)
+            || !prospective_closes
+            || receipt.actual.operation_allocations != 0
+            || receipt.actual_allocations != 0
+            || !receipt.retains_bounded_actual()
+        {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal did not authenticate its live construction/invocation/P/A",
+                ),
+            );
+        }
+
+        let cache = self.cache_identity(execution_limits);
+        let Some(owner) = self.direct_owner_seal(&cache) else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal lacks its construction-owned route seal",
+                ),
+            );
+        };
+        if owner.identity.route != AggregateDirectRoute::ExactLiteral {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal differs from its published physical route",
+                ),
+            );
+        }
+        let public_source = AggregateExecutionSource::ExactLiteral(source.clone());
+        let direct_receipt = AggregateDirectAttemptReceipt {
+            owner,
+            invocation: AggregateDirectInvocation {
+                haystack_len,
+                range: 0..haystack_len,
+                operation: self.operation(),
+            },
+            source: AggregateDirectReceiptSource::ExactLiteral(
+                AggregateExactLiteralReceiptSource {
+                    attempt,
+                    syntax_provenance,
+                    construction,
+                },
+            ),
+            authenticated_terminal: AggregateDirectAttemptTerminal::Failure,
+            terminal: AggregateDirectAttemptTerminal::Failure,
+        };
+        if !direct_receipt.closes(&cache, &public_source) {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal failed its complete pre-publication closure",
+                ),
+            );
+        }
+        let identity = AggregateExecutionAttemptIdentity::direct(cache, direct_receipt);
+        AggregateExecutionError {
+            identity,
+            source: public_source,
+        }
+    }
+
     fn direct_execution_error(
         &self,
         haystack_len: usize,
@@ -8572,6 +9104,14 @@ impl AggregatePlan {
                 ),
             );
         }
+        let Some(receipt_source) = AggregateDirectReceiptSource::capture(&source) else {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal terminal bypassed its required nested kernel receipt",
+                ),
+            );
+        };
         let receipt = AggregateDirectAttemptReceipt {
             owner,
             invocation: AggregateDirectInvocation {
@@ -8579,10 +9119,18 @@ impl AggregatePlan {
                 range: 0..haystack_len,
                 operation: self.operation(),
             },
-            source: AggregateDirectReceiptSource::capture(&source),
+            source: receipt_source,
             authenticated_terminal: AggregateDirectAttemptTerminal::Failure,
             terminal: AggregateDirectAttemptTerminal::Failure,
         };
+        if !receipt.closes(&cache, &source) {
+            return self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "direct terminal failed its complete pre-publication closure",
+                ),
+            );
+        }
         let identity = AggregateExecutionAttemptIdentity::direct(cache, receipt);
         AggregateExecutionError { identity, source }
     }
@@ -8651,9 +9199,69 @@ impl AggregatePlan {
         &self,
         execution_limits: &AggregateRunLimits,
         details: AggregateExecutionDetails,
-    ) -> AggregateExecutionReport {
+    ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
+        if matches!(details, AggregateExecutionDetails::ExactLiteral(_)) {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal success bypassed its specialized receipt publisher",
+                ),
+            ));
+        }
         let identity = self.cache_identity(execution_limits);
-        AggregateExecutionReport { identity, details }
+        Ok(AggregateExecutionReport { identity, details })
+    }
+
+    fn direct_exact_execution_report(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        details: AggregateExactLiteralExecutionDetails,
+    ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
+        let Some((_, construction, syntax_provenance)) = self.exact_literal_construction() else {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal report lacks its authenticated live construction",
+                ),
+            ));
+        };
+        let identity = self.cache_identity(execution_limits);
+        let AggregatePlanIdentity::ExactLiteral(plan_identity) = identity.plan_identity else {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal report differs from its published plan identity",
+                ),
+            ));
+        };
+        if construction != details.construction
+            || !Weak::ptr_eq(&syntax_provenance, &details.syntax_provenance)
+            || !exact_literal_details_close_cache(&identity, plan_identity, &details)
+        {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "exact-literal report did not close its live construction/receipt",
+                ),
+            ));
+        }
+        Ok(AggregateExecutionReport {
+            identity,
+            details: AggregateExecutionDetails::ExactLiteral(details),
+        })
+    }
+
+    fn publish_execution_report(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        details: AggregateExecutionDetails,
+    ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
+        match details {
+            AggregateExecutionDetails::ExactLiteral(details) => {
+                self.direct_exact_execution_report(execution_limits, details)
+            }
+            details => self.execution_report(execution_limits, details),
+        }
     }
 
     fn fixed_residual_persistent_bytes(
@@ -8685,16 +9293,16 @@ impl AggregatePlan {
         limits: &AggregateRunLimits,
     ) -> Result<AggregateCountExecution, AggregateExecutionError> {
         match &self.engine {
-            AggregateEngine::ExactLiteral(engine) => engine
-                .count(haystack, limits.exact_literal)
-                .map(AggregateCountExecution::ExactLiteral)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::ExactLiteral(source),
-                    )
-                }),
+            AggregateEngine::ExactLiteral(engine) => {
+                match engine.count_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => {
+                        self.exact_literal_count_execution(haystack.len(), limits, attempt)
+                    }
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
             AggregateEngine::UnicodeScalar(engine) => engine
                 .count(haystack, limits.unicode_scalar)
                 .map(AggregateCountExecution::UnicodeScalar)
@@ -9068,16 +9676,16 @@ impl AggregatePlan {
         limits: &AggregateRunLimits,
     ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
         match &self.engine {
-            AggregateEngine::ExactLiteral(engine) => engine
-                .span_sum(haystack, limits.exact_literal)
-                .map(AggregateSpanSumExecution::ExactLiteral)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::ExactLiteral(source),
-                    )
-                }),
+            AggregateEngine::ExactLiteral(engine) => {
+                match engine.span_sum_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => {
+                        self.exact_literal_span_sum_execution(haystack.len(), limits, attempt)
+                    }
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
             AggregateEngine::UnicodeScalar(engine) => engine
                 .span_sum(haystack, limits.unicode_scalar)
                 .map(AggregateSpanSumExecution::UnicodeScalar)
@@ -9524,7 +10132,10 @@ impl AggregatePlan {
     reason = "execution variants retain already-budgeted result receipts inline without a new allocation"
 )]
 enum AggregateCountExecution {
-    ExactLiteral(LiteralAggregateCountResult),
+    ExactLiteral {
+        value: u64,
+        details: AggregateExactLiteralExecutionDetails,
+    },
     UnicodeScalar(UnicodeScalarAggregateCountResult),
     WordRun(unicode_word_run::AggregateCountResult),
     LiteralAssertions(LiteralAssertionsCountResult),
@@ -9568,7 +10179,6 @@ enum AggregateCountExecution {
 impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
-            Self::ExactLiteral(result) => result.count,
             Self::UnicodeScalar(result) => result.count,
             Self::WordRun(result) => result.count,
             Self::LiteralAssertions(result) => result.count,
@@ -9585,7 +10195,8 @@ impl AggregateCountExecution {
             Self::FixedAbsoluteDirect { value, .. } | Self::FixedAbsoluteResidual { value, .. } => {
                 *value
             }
-            Self::FiniteLiteral { value, .. }
+            Self::ExactLiteral { value, .. }
+            | Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
             Self::GuardedAsciiWord(result) => result.count,
@@ -9595,9 +10206,7 @@ impl AggregateCountExecution {
 
     fn into_details(self) -> AggregateExecutionDetails {
         match self {
-            Self::ExactLiteral(result) => {
-                AggregateExecutionDetails::ExactLiteral(result.accounting)
-            }
+            Self::ExactLiteral { details, .. } => AggregateExecutionDetails::ExactLiteral(details),
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
@@ -9691,7 +10300,10 @@ impl AggregateCountExecution {
     reason = "boxing would add an allocation to the operation whose complete accounting is retained inline"
 )]
 enum AggregateSpanSumExecution {
-    ExactLiteral(LiteralAggregateSpanSumResult),
+    ExactLiteral {
+        value: u64,
+        details: AggregateExactLiteralExecutionDetails,
+    },
     UnicodeScalar(UnicodeScalarAggregateSpanSumResult),
     WordRun(unicode_word_run::AggregateSpanSumResult),
     LiteralAssertions(LiteralAssertionsSpanSumResult),
@@ -9722,7 +10334,6 @@ enum AggregateSpanSumExecution {
 impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
-            Self::ExactLiteral(result) => result.span_sum,
             Self::UnicodeScalar(result) => result.span_sum,
             Self::WordRun(result) => result.span_sum,
             Self::LiteralAssertions(result) => result.span_sum,
@@ -9734,7 +10345,8 @@ impl AggregateSpanSumExecution {
             Self::BoundedLiteralPair(result) => result.span_sum,
             Self::GuardedAsciiWord(result) => result.span_sum,
             Self::FixedPredicateWord64(result) => result.span_sum,
-            Self::FiniteLiteral { value, .. }
+            Self::ExactLiteral { value, .. }
+            | Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
         }
@@ -9742,9 +10354,7 @@ impl AggregateSpanSumExecution {
 
     fn into_details(self) -> AggregateExecutionDetails {
         match self {
-            Self::ExactLiteral(result) => {
-                AggregateExecutionDetails::ExactLiteral(result.accounting)
-            }
+            Self::ExactLiteral { details, .. } => AggregateExecutionDetails::ExactLiteral(details),
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
             }
@@ -11641,7 +12251,7 @@ impl AggregateCompileRegex {
         let execution = self.0.execute_count(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.publish_execution_report(limits, details)?;
         Ok(AggregateCountResult { value, report })
     }
 }
@@ -11713,7 +12323,7 @@ impl AggregateSpansRegex {
             certificate,
             accounting,
         };
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.execution_report(limits, details)?;
         Ok(AggregateSpans {
             admitted,
             report,
@@ -11971,7 +12581,7 @@ impl AggregateCountRegex {
         let execution = self.0.execute_count(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.publish_execution_report(limits, details)?;
         Ok(AggregateCountResult { value, report })
     }
 
@@ -12067,7 +12677,7 @@ impl AggregateSpanSumRegex {
         let execution = self.0.execute_span_sum(haystack, limits)?;
         let value = execution.value();
         let details = execution.into_details();
-        let report = self.0.execution_report(limits, details);
+        let report = self.0.publish_execution_report(limits, details)?;
         Ok(AggregateSpanSumResult { value, report })
     }
 
@@ -12110,9 +12720,55 @@ impl AggregateSpanSumResult {
 #[cfg(test)]
 mod tests {
     use super::{
+        AggregateBuilder, AggregateDirectReceiptSource, AggregateExactLiteralExecutionDetails,
+        AggregateExactLiteralReceiptSource, AggregateExecutionAttemptIdentity,
+        AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionReport,
+        AggregateExecutionSource, AggregatePlanSelection, AggregateRunLimits,
         OrderedLiteralAggregateBuildError, UnicodeScalarInspectionError,
         charge_unicode_scalar_inspection_work, finite_build_limit_allows_continuation,
     };
+
+    fn exact_success_details(
+        report: &AggregateExecutionReport,
+    ) -> &AggregateExactLiteralExecutionDetails {
+        let AggregateExecutionDetails::ExactLiteral(details) = report.details() else {
+            panic!("expected exact-literal success details");
+        };
+        details
+    }
+
+    fn exact_success_details_mut(
+        report: &mut AggregateExecutionReport,
+    ) -> &mut AggregateExactLiteralExecutionDetails {
+        let AggregateExecutionDetails::ExactLiteral(details) = &mut report.details else {
+            panic!("expected exact-literal success details");
+        };
+        details
+    }
+
+    fn exact_terminal_source(
+        error: &AggregateExecutionError,
+    ) -> &AggregateExactLiteralReceiptSource {
+        let AggregateExecutionAttemptIdentity::Direct(attempt) = &error.identity else {
+            panic!("expected direct terminal identity");
+        };
+        let AggregateDirectReceiptSource::ExactLiteral(source) = &attempt.receipt.source else {
+            panic!("expected exact-literal nested receipt");
+        };
+        source
+    }
+
+    fn exact_terminal_source_mut(
+        error: &mut AggregateExecutionError,
+    ) -> &mut AggregateExactLiteralReceiptSource {
+        let AggregateExecutionAttemptIdentity::Direct(attempt) = &mut error.identity else {
+            panic!("expected direct terminal identity");
+        };
+        let AggregateDirectReceiptSource::ExactLiteral(source) = &mut attempt.receipt.source else {
+            panic!("expected exact-literal nested receipt");
+        };
+        source
+    }
 
     #[test]
     fn unicode_scalar_inspection_overflow_leaves_counter_unchanged() {
@@ -12184,5 +12840,254 @@ mod tests {
         ] {
             assert!(!finite_build_limit_allows_continuation(&hard_error));
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one mutation matrix keeps receipt-only splices and every sealed construction field adjacent"
+    )]
+    fn exact_success_receipts_reject_same_length_splices_and_all_build_mutations() {
+        let limits = AggregateRunLimits::default();
+        let haystack = b"zzzzzzzzzzzz";
+        let first_regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let second_regex = AggregateBuilder::new("banana")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let first = first_regex.count(haystack, limits).unwrap();
+        let second = second_regex.count(haystack, limits).unwrap();
+        assert!(first.report().has_closed_direct_attempt());
+        assert!(second.report().has_closed_direct_attempt());
+
+        let first_details = exact_success_details(first.report());
+        let second_details = exact_success_details(second.report());
+        assert_eq!(
+            first_details.accounting.upper_bounds,
+            second_details.accounting.upper_bounds
+        );
+        assert_eq!(
+            first_details.construction.build_accounting(),
+            second_details.construction.build_accounting()
+        );
+
+        let mut receipt_splice = first.report().clone();
+        exact_success_details_mut(&mut receipt_splice).receipt = second_details.receipt;
+        assert!(!receipt_splice.has_closed_direct_attempt());
+
+        let mut provenance_splice = first.report().clone();
+        exact_success_details_mut(&mut provenance_splice).syntax_provenance =
+            second_details.syntax_provenance.clone();
+        assert!(!provenance_splice.has_closed_direct_attempt());
+
+        let mut origin_splice = first.report().clone();
+        let details = exact_success_details_mut(&mut origin_splice);
+        details.accounting.invocation.plan_origin = second_details.construction.origin;
+        details.receipt.invocation.plan_origin = second_details.construction.origin;
+        assert!(!origin_splice.has_closed_direct_attempt());
+
+        let mut sealed_needle = first.report().clone();
+        exact_success_details_mut(&mut sealed_needle)
+            .construction
+            .needle_bytes += 1;
+        assert!(!sealed_needle.has_closed_direct_attempt());
+        let mut sealed_capacity = first.report().clone();
+        exact_success_details_mut(&mut sealed_capacity)
+            .construction
+            .temporary_capacity_bytes += 1;
+        assert!(!sealed_capacity.has_closed_direct_attempt());
+
+        let empty = AggregateBuilder::new("")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap()
+            .count(b"", limits)
+            .unwrap();
+        let mut empty_capacity = empty.report().clone();
+        exact_success_details_mut(&mut empty_capacity)
+            .construction
+            .temporary_capacity_bytes = 1;
+        assert!(!empty_capacity.has_closed_direct_attempt());
+
+        let base = first_details.construction.build_accounting().unwrap();
+        let mut needle_bytes = base;
+        needle_bytes.needle_bytes += 1;
+        let mut temporary_capacity_bytes = base;
+        temporary_capacity_bytes.temporary_capacity_bytes += 1;
+        let mut work_upper_bound = base;
+        work_upper_bound.work_upper_bound += 1;
+        let mut scratch_bytes = base;
+        scratch_bytes.scratch_bytes += 1;
+        let mut persistent_bytes = base;
+        persistent_bytes.persistent_bytes += 1;
+        let mut peak_bytes = base;
+        peak_bytes.peak_bytes += 1;
+        for forged_build in [
+            needle_bytes,
+            temporary_capacity_bytes,
+            work_upper_bound,
+            scratch_bytes,
+            persistent_bytes,
+            peak_bytes,
+        ] {
+            let mut forged = first.report().clone();
+            let details = exact_success_details_mut(&mut forged);
+            details.accounting.invocation.build = forged_build;
+            details.receipt.invocation.build = forged_build;
+            assert!(!forged.has_closed_direct_attempt());
+        }
+
+        let shorter = first_regex.count(b"zzzzzz", limits).unwrap();
+        let mut haystack_splice = first.report().clone();
+        exact_success_details_mut(&mut haystack_splice).receipt =
+            exact_success_details(shorter.report()).receipt;
+        assert!(!haystack_splice.has_closed_direct_attempt());
+
+        let generic_error = first_regex
+            .0
+            .execution_report(&limits, first.report().details().clone())
+            .unwrap_err();
+        assert!(matches!(
+            generic_error.source,
+            AggregateExecutionSource::InternalInvariant(
+                "exact-literal success bypassed its specialized receipt publisher"
+            )
+        ));
+
+        let first_span = AggregateBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_span_sum()
+            .unwrap()
+            .span_sum(haystack, limits)
+            .unwrap();
+        let second_span = AggregateBuilder::new("banana")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_span_sum()
+            .unwrap()
+            .span_sum(haystack, limits)
+            .unwrap();
+        let mut span_splice = first_span.report().clone();
+        exact_success_details_mut(&mut span_splice).receipt =
+            exact_success_details(second_span.report()).receipt;
+        assert!(!span_splice.has_closed_direct_attempt());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one mutation matrix keeps terminal source/receipt/provenance forgeries adjacent"
+    )]
+    fn exact_terminal_receipts_reject_splices_and_every_construction_mutation() {
+        let mut limits = AggregateRunLimits::default();
+        limits.exact_literal.max_linear_terms = 0;
+        let haystack = b"zzzzzzzzzzzz";
+        let first_regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let second_regex = AggregateBuilder::new("banana")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let first = first_regex.count(haystack, limits).unwrap_err();
+        let second = second_regex.count(haystack, limits).unwrap_err();
+        assert!(first.has_closed_direct_attempt());
+        assert!(second.has_closed_direct_attempt());
+        let first_source = exact_terminal_source(&first);
+        let second_source = exact_terminal_source(&second);
+        assert_eq!(
+            first_source.construction.build_accounting(),
+            second_source.construction.build_accounting()
+        );
+
+        let mut receipt_splice = first.clone();
+        exact_terminal_source_mut(&mut receipt_splice).attempt = second_source.attempt.clone();
+        assert!(!receipt_splice.has_closed_direct_attempt());
+
+        let mut provenance_splice = first.clone();
+        exact_terminal_source_mut(&mut provenance_splice).syntax_provenance =
+            second_source.syntax_provenance.clone();
+        assert!(!provenance_splice.has_closed_direct_attempt());
+
+        let mut event_limits = AggregateRunLimits::default();
+        event_limits.exact_literal.max_match_events = 0;
+        let event = first_regex.count(haystack, event_limits).unwrap_err();
+        assert!(event.has_closed_direct_attempt());
+        let mut invocation_splice = first.clone();
+        exact_terminal_source_mut(&mut invocation_splice).attempt =
+            exact_terminal_source(&event).attempt.clone();
+        invocation_splice.source = event.source.clone();
+        assert!(!invocation_splice.has_closed_direct_attempt());
+
+        let span = AggregateBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_span_sum()
+            .unwrap()
+            .span_sum(haystack, limits)
+            .unwrap_err();
+        assert!(span.has_closed_direct_attempt());
+        let mut operation_splice = first.clone();
+        exact_terminal_source_mut(&mut operation_splice).attempt =
+            exact_terminal_source(&span).attempt.clone();
+        operation_splice.source = span.source.clone();
+        assert!(!operation_splice.has_closed_direct_attempt());
+
+        let shorter = first_regex.count(b"zzzzzz", limits).unwrap_err();
+        assert!(shorter.has_closed_direct_attempt());
+        let mut haystack_splice = first.clone();
+        exact_terminal_source_mut(&mut haystack_splice).attempt =
+            exact_terminal_source(&shorter).attempt.clone();
+        haystack_splice.source = shorter.source.clone();
+        assert!(!haystack_splice.has_closed_direct_attempt());
+
+        let mut sealed_needle = first.clone();
+        exact_terminal_source_mut(&mut sealed_needle)
+            .construction
+            .needle_bytes += 1;
+        assert!(!sealed_needle.has_closed_direct_attempt());
+        let mut sealed_capacity = first.clone();
+        exact_terminal_source_mut(&mut sealed_capacity)
+            .construction
+            .temporary_capacity_bytes += 1;
+        assert!(!sealed_capacity.has_closed_direct_attempt());
+
+        let mut empty_limits = AggregateRunLimits::default();
+        empty_limits.exact_literal.max_match_events = 0;
+        let empty = AggregateBuilder::new("")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap()
+            .count(b"", empty_limits)
+            .unwrap_err();
+        assert!(empty.has_closed_direct_attempt());
+        let mut empty_capacity = empty;
+        exact_terminal_source_mut(&mut empty_capacity)
+            .construction
+            .temporary_capacity_bytes = 1;
+        assert!(!empty_capacity.has_closed_direct_attempt());
+
+        let mut source_variant = first.clone();
+        let forged_source = super::LiteralAggregateReduceError::MatchEventsLimit {
+            needed: 1,
+            limit: 0,
+        };
+        source_variant.source = AggregateExecutionSource::ExactLiteral(forged_source);
+        assert!(!source_variant.has_closed_direct_attempt());
+
+        let public_source =
+            AggregateExecutionSource::ExactLiteral(first_source.attempt.source().clone());
+        assert!(AggregateDirectReceiptSource::capture(&public_source).is_none());
     }
 }

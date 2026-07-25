@@ -1,13 +1,17 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
-    AggregateContinuationSemantics, AggregateEngineError, AggregateExactLiteralSemantics,
-    AggregateExecutionDetails, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
+    AggregateContinuationSemantics, AggregateCountRegex, AggregateCountResult,
+    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
+    AggregateExecutionError, AggregateExecutionSource, AggregateFiniteLiteralSemantics,
     AggregateFixedClassSandwichSemantics, AggregateGuardedAsciiWordSemantics,
     AggregateLiteralIneligibility, AggregateOperation, AggregateOperationAttemptKind,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection, AggregateResource,
-    AggregateRunLimits, AggregateStrategy, AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID,
-    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateOperation,
+    AggregateRunLimits, AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
+    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
+    LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
     LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
     RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
     guarded_ascii_word,
@@ -19,6 +23,16 @@ const STRATEGIES: [AggregateStrategy; 2] = [
 
 fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
     AggregateBuilder::new(pattern).profile(RustProfile::rebar_1_12_4())
+}
+
+#[test]
+fn aggregate_exact_receipt_publication_remains_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AggregateCountRegex>();
+    assert_send_sync::<AggregateSpanSumRegex>();
+    assert_send_sync::<AggregateCountResult>();
+    assert_send_sync::<AggregateSpanSumResult>();
+    assert_send_sync::<AggregateExecutionError>();
 }
 
 #[test]
@@ -3293,6 +3307,39 @@ fn unicode_exact_count_error(
     assert_eq!(value.source, audited.source);
     assert!(audited.has_closed_direct_attempt());
     assert!(value.has_closed_direct_attempt());
+    let audited_nested = *audited
+        .exact_literal_receipt()
+        .expect("Unicode exact refusal nested kernel receipt");
+    let value_nested = *value
+        .exact_literal_receipt()
+        .expect("Unicode exact value refusal nested kernel receipt");
+    assert_eq!(value_nested, audited_nested);
+    assert_eq!(
+        audited_nested.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::Count)
+    );
+    assert_eq!(
+        audited_nested.identity.declared_fallback,
+        LiteralAggregateDeclaredFallback::None
+    );
+    assert_eq!(
+        audited_nested.identity.algorithm_version,
+        LITERAL_AGGREGATE_ALGORITHM_VERSION
+    );
+    assert_eq!(
+        audited_nested.identity.accounting_version,
+        LITERAL_AGGREGATE_ACCOUNTING_VERSION
+    );
+    assert_eq!(audited_nested.invocation.haystack_bytes, haystack.len());
+    assert_eq!(audited_nested.invocation.limits, limits.exact_literal);
+    assert!(audited_nested.invocation.plan_origin.is_bound());
+    assert!(audited_nested.prospective.is_some());
+    assert_eq!(
+        audited_nested.actual,
+        LiteralAggregateActualCounters::default()
+    );
+    assert_eq!(audited_nested.actual_allocations, 0);
+    assert!(audited_nested.retains_bounded_actual());
     assert!(
         audited
             .direct_receipt()
@@ -3313,6 +3360,40 @@ fn unicode_exact_count_error(
         AggregateExecutionSource::ExactLiteral(source) => source,
         source => panic!("Unicode exact literal attempted another engine: {source:?}"),
     }
+}
+
+fn assert_exact_success_receipt(
+    report: &fre::AggregateExecutionReport,
+    operation: LiteralAggregateOperation,
+    haystack_len: usize,
+) {
+    let AggregateExecutionDetails::ExactLiteral(details) = report.details() else {
+        panic!("forced exact literal executed another plan");
+    };
+    assert_eq!(
+        details.identity,
+        LiteralAggregateOperationIdentity::for_operation(operation)
+    );
+    assert_eq!(
+        details.identity.declared_fallback,
+        LiteralAggregateDeclaredFallback::None
+    );
+    assert_eq!(
+        details.identity.algorithm_version,
+        LITERAL_AGGREGATE_ALGORITHM_VERSION
+    );
+    assert_eq!(
+        details.identity.accounting_version,
+        LITERAL_AGGREGATE_ACCOUNTING_VERSION
+    );
+    assert_eq!(details.invocation.haystack_bytes, haystack_len);
+    assert!(details.invocation.plan_origin.is_bound());
+    assert_eq!(details.receipt().prospective, Some(details.upper_bounds));
+    assert!(details.accounting().closes_receipt(details.receipt()));
+    assert_eq!(details.actual.operation_allocations, 0);
+    assert_eq!(details.actual_allocations, 0);
+    assert!(details.retains_bounded_actual());
+    assert!(report.has_closed_direct_attempt());
 }
 
 #[test]
@@ -3419,6 +3500,21 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
         2
     );
     let upper = accounting.upper_bounds;
+    assert_eq!(
+        accounting.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::Count)
+    );
+    assert_eq!(accounting.invocation.haystack_bytes, haystack.len());
+    assert!(accounting.invocation.plan_origin.is_bound());
+    assert_eq!(
+        accounting.invocation.limits,
+        AggregateRunLimits::default().exact_literal
+    );
+    assert_eq!(accounting.actual_allocations, 0);
+    assert!(accounting.retains_bounded_actual());
+    assert!(accounting.accounting().closes_receipt(accounting.receipt()));
+    assert!(audited.report().direct_owner().is_some());
+    assert!(audited.report().has_closed_direct_attempt());
     assert!(upper.linear_terms > 0);
     assert!(upper.match_events > 0);
     assert!(upper.count > 0);
@@ -3473,7 +3569,22 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
         .limits(exact_build)
         .build_span_sum()
         .unwrap();
-    assert_eq!(sum.span_sum(&haystack, exact_run).unwrap().value(), 6);
+    let sum_result = sum.span_sum(&haystack, exact_run).unwrap();
+    assert_eq!(sum_result.value(), 6);
+    let AggregateExecutionDetails::ExactLiteral(sum_accounting) = sum_result.report().details()
+    else {
+        panic!("forced Unicode span-sum executed another plan")
+    };
+    assert_eq!(
+        sum_accounting.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::SpanSum)
+    );
+    assert!(
+        sum_accounting
+            .accounting()
+            .closes_receipt(sum_accounting.receipt())
+    );
+    assert!(sum_result.report().has_closed_direct_attempt());
     assert_eq!(sum.span_sum_value(&haystack, exact_run).unwrap(), 6);
     one_below_run = exact_run;
     one_below_run.exact_literal.max_span_sum -= 1;
@@ -3481,10 +3592,104 @@ fn unicode_nonempty_exact_literal_limits_are_exact_and_one_below() {
     let value_error = sum.span_sum_value(&haystack, one_below_run).unwrap_err();
     assert_eq!(value_error.identity, audited_error.identity);
     assert_eq!(value_error.source, audited_error.source);
+    assert_eq!(
+        value_error.exact_literal_receipt(),
+        audited_error.exact_literal_receipt()
+    );
+    let nested = audited_error
+        .exact_literal_receipt()
+        .expect("Unicode exact span-sum nested receipt");
+    assert_eq!(
+        nested.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::SpanSum)
+    );
+    assert_eq!(nested.actual, LiteralAggregateActualCounters::default());
+    assert!(nested.retains_bounded_actual());
     assert!(matches!(
         audited_error.source,
         AggregateExecutionSource::ExactLiteral(LiteralAggregateReduceError::SpanSumLimit { .. })
     ));
+}
+
+#[test]
+fn exact_success_and_refusal_receipts_cover_empty_arbitrary_and_malformed_bytes() {
+    for (pattern, haystack, expected_count, expected_span_sum) in [
+        ("", b"\xFFa\x80".as_slice(), 4, 0),
+        (r"\xFF\x00", b"\xFF\x00\xFF\x00\x80".as_slice(), 2, 4),
+    ] {
+        let count = aggregate_builder(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .unwrap();
+        let span_sum = aggregate_builder(pattern)
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_span_sum()
+            .unwrap();
+
+        let mut count_limits = AggregateRunLimits::default();
+        count_limits.exact_literal.max_span_sum = 0;
+        let count_result = count.count(haystack, count_limits).unwrap();
+        assert_eq!(count_result.value(), expected_count);
+        assert_eq!(
+            count.count_value(haystack, count_limits).unwrap(),
+            expected_count
+        );
+        assert_exact_success_receipt(
+            count_result.report(),
+            LiteralAggregateOperation::Count,
+            haystack.len(),
+        );
+
+        let span_result = span_sum
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(span_result.value(), expected_span_sum);
+        assert_eq!(
+            span_sum
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_span_sum
+        );
+        assert_exact_success_receipt(
+            span_result.report(),
+            LiteralAggregateOperation::SpanSum,
+            haystack.len(),
+        );
+
+        let mut refused = AggregateRunLimits::default();
+        refused.exact_literal.max_linear_terms = 0;
+        let count_audited = count.count(haystack, refused).unwrap_err();
+        let count_value = count.count_value(haystack, refused).unwrap_err();
+        assert_eq!(
+            count_audited.exact_literal_receipt(),
+            count_value.exact_literal_receipt()
+        );
+        assert!(count_audited.has_closed_direct_attempt());
+        assert!(count_value.has_closed_direct_attempt());
+        let count_receipt = count_audited.exact_literal_receipt().unwrap();
+        assert!(count_receipt.prospective.is_some());
+        assert_eq!(
+            count_receipt.actual,
+            LiteralAggregateActualCounters::default()
+        );
+
+        let span_audited = span_sum.span_sum(haystack, refused).unwrap_err();
+        let span_value = span_sum.span_sum_value(haystack, refused).unwrap_err();
+        assert_eq!(
+            span_audited.exact_literal_receipt(),
+            span_value.exact_literal_receipt()
+        );
+        assert!(span_audited.has_closed_direct_attempt());
+        assert!(span_value.has_closed_direct_attempt());
+        let span_receipt = span_audited.exact_literal_receipt().unwrap();
+        assert!(span_receipt.prospective.is_some());
+        assert_eq!(
+            span_receipt.actual,
+            LiteralAggregateActualCounters::default()
+        );
+    }
 }
 
 #[test]
@@ -4162,6 +4367,20 @@ fn exact_reduce_error(
     assert_eq!(receipt.run_limits(), *limits);
     assert_eq!(receipt.invocation.haystack_len, 19);
     assert_eq!(receipt.invocation.range, 0..19);
+    let nested = error
+        .exact_literal_receipt()
+        .expect("exact refusal nested kernel receipt");
+    assert_eq!(
+        nested.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::Count)
+    );
+    assert_eq!(nested.invocation.haystack_bytes, 19);
+    assert_eq!(nested.invocation.limits, limits.exact_literal);
+    assert!(nested.invocation.plan_origin.is_bound());
+    assert!(nested.prospective.is_some());
+    assert_eq!(nested.actual, LiteralAggregateActualCounters::default());
+    assert_eq!(nested.actual_allocations, 0);
+    assert!(nested.retains_bounded_actual());
     assert!(
         error
             .identity
@@ -4188,6 +4407,13 @@ fn exact_reduce_value_error(
             .expect("value refusal must retain its direct terminal receipt")
             .authenticates_source(&error.source)
     );
+    let nested = error
+        .exact_literal_receipt()
+        .expect("value refusal nested kernel receipt");
+    assert_eq!(nested.invocation.limits, limits.exact_literal);
+    assert_eq!(nested.actual, LiteralAggregateActualCounters::default());
+    assert_eq!(nested.actual_allocations, 0);
+    assert!(nested.retains_bounded_actual());
     assert!(
         error
             .identity
@@ -4334,6 +4560,10 @@ fn direct_terminal_public_source_and_identity_splices_fail_closed() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact and one-below matrix covers every independently enforced resource"
+)]
 fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let count = aggregate_builder("needle")
         .unicode(false)
@@ -4432,6 +4662,19 @@ fn every_nonzero_exact_literal_reduce_quota_is_checked_at_and_one_below() {
     let value_error = sum.span_sum_value(haystack, one_below).unwrap_err();
     assert_eq!(value_error.identity, error.identity);
     assert_eq!(value_error.source, error.source);
+    assert_eq!(
+        value_error.exact_literal_receipt(),
+        error.exact_literal_receipt()
+    );
+    let nested = error
+        .exact_literal_receipt()
+        .expect("span-sum refusal nested kernel receipt");
+    assert_eq!(
+        nested.identity,
+        LiteralAggregateOperationIdentity::for_operation(LiteralAggregateOperation::SpanSum)
+    );
+    assert_eq!(nested.actual, LiteralAggregateActualCounters::default());
+    assert!(nested.retains_bounded_actual());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::ExactLiteral(LiteralAggregateReduceError::SpanSumLimit { .. })

@@ -79,7 +79,7 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
             .build_span_sum()
             .unwrap();
         assert_eq!(regex.build_report().plan, AggregatePlanKind::WordRun);
-        assert_eq!(regex.build_report().schema_version, 33);
+        assert_eq!(regex.build_report().schema_version, 34);
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count-spans")
             .unwrap();
     }

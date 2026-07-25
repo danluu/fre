@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{alloc::System, sync::Mutex};
+use std::alloc::System;
 
 use fre::{
     AggregateBuilder, AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanKind,
@@ -10,7 +10,6 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
-static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn aggregate_builder(pattern: impl Into<String>) -> AggregateBuilder {
     AggregateBuilder::new(pattern).profile(RustProfile::rebar_1_12_4())
@@ -28,9 +27,11 @@ fn allocation_count<T>(operation: impl FnOnce() -> T) -> (T, usize, usize, usize
     )
 }
 
-#[test]
-fn direct_terminal_receipts_preserve_existing_error_allocation_counts() {
-    let _serial = ALLOCATION_TEST_LOCK.lock().unwrap();
+#[allow(
+    clippy::too_many_lines,
+    reason = "one serialized allocation census covers exact, guarded-word, and fixed-predicate terminal paths"
+)]
+fn assert_direct_terminal_receipts_preserve_existing_error_allocation_counts() {
     let exact = aggregate_builder("needle")
         .unicode(false)
         .build_count()
@@ -44,6 +45,37 @@ fn direct_terminal_receipts_preserve_existing_error_allocation_counts() {
     assert_eq!(reallocations, 0);
     assert_eq!(deallocations, 0);
     assert!(exact_error.has_closed_direct_attempt());
+
+    let empty_count = aggregate_builder("")
+        .unicode(false)
+        .build_count()
+        .expect("empty exact count build");
+    let empty_span = aggregate_builder("")
+        .unicode(false)
+        .build_span_sum()
+        .expect("empty exact span build");
+    let byte_count = aggregate_builder(r"\xFF\x00")
+        .unicode(false)
+        .build_count()
+        .expect("byte exact count build");
+    let byte_span = aggregate_builder(r"\xFF\x00")
+        .unicode(false)
+        .build_span_sum()
+        .expect("byte exact span build");
+    macro_rules! assert_exact_terminal_census {
+        ($operation:expr) => {{
+            let (error, allocations, reallocations, deallocations) =
+                allocation_count(|| $operation.unwrap_err());
+            assert_eq!(allocations, 1, "only the pre-existing boxed identity");
+            assert_eq!(reallocations, 0);
+            assert_eq!(deallocations, 0);
+            assert!(error.has_closed_direct_attempt());
+        }};
+    }
+    assert_exact_terminal_census!(empty_count.count(b"\xFFa\x80", exact_limits));
+    assert_exact_terminal_census!(empty_span.span_sum(b"\xFFa\x80", exact_limits));
+    assert_exact_terminal_census!(byte_count.count(b"\xFF\x00\x80", exact_limits));
+    assert_exact_terminal_census!(byte_span.span_sum(b"\xFF\x00\x80", exact_limits));
 
     let guarded = aggregate_builder(r"\b(?:as|break|Self|ab|ba)\b")
         .unicode(false)
@@ -63,7 +95,11 @@ fn direct_terminal_receipts_preserve_existing_error_allocation_counts() {
     };
     let guarded_limits = AggregateRunLimits {
         finite_literal: OrderedLiteralAggregateReduceLimits {
-            max_transitions: accounting.upper_bounds.haystack_bytes - 1,
+            max_transitions: accounting
+                .upper_bounds
+                .haystack_bytes
+                .checked_sub(1)
+                .expect("non-empty guarded haystack"),
             ..OrderedLiteralAggregateReduceLimits::default()
         },
         ..AggregateRunLimits::default()
@@ -105,7 +141,11 @@ fn direct_terminal_receipts_preserve_existing_error_allocation_counts() {
     };
     let fixed_limits = AggregateRunLimits {
         finite_literal: OrderedLiteralAggregateReduceLimits {
-            max_transitions: accounting.upper_bounds.transitions - 1,
+            max_transitions: accounting
+                .upper_bounds
+                .transitions
+                .checked_sub(1)
+                .expect("non-zero fixed-predicate transition bound"),
             ..OrderedLiteralAggregateReduceLimits::default()
         },
         ..AggregateRunLimits::default()
@@ -123,9 +163,7 @@ fn direct_terminal_receipts_preserve_existing_error_allocation_counts() {
     assert!(fixed_error.has_closed_direct_attempt());
 }
 
-#[test]
-fn direct_success_reports_remain_allocation_free() {
-    let _serial = ALLOCATION_TEST_LOCK.lock().unwrap();
+fn assert_direct_success_reports_remain_allocation_free() {
     let exact = aggregate_builder("needle")
         .unicode(false)
         .build_count()
@@ -137,6 +175,37 @@ fn direct_success_reports_remain_allocation_free() {
     });
     assert_eq!((allocations, reallocations, deallocations), (0, 0, 0));
     assert!(exact_result.report().has_closed_direct_attempt());
+
+    let empty_count = aggregate_builder("")
+        .unicode(false)
+        .build_count()
+        .expect("empty exact count build");
+    let empty_span = aggregate_builder("")
+        .unicode(false)
+        .build_span_sum()
+        .expect("empty exact span build");
+    let byte_count = aggregate_builder(r"\xFF\x00")
+        .unicode(false)
+        .build_count()
+        .expect("byte exact count build");
+    let byte_span = aggregate_builder(r"\xFF\x00")
+        .unicode(false)
+        .build_span_sum()
+        .expect("byte exact span build");
+    macro_rules! assert_exact_success_census {
+        ($operation:expr) => {{
+            let (result, allocations, reallocations, deallocations) =
+                allocation_count(|| $operation.unwrap());
+            assert_eq!((allocations, reallocations, deallocations), (0, 0, 0));
+            assert!(result.report().has_closed_direct_attempt());
+        }};
+    }
+    assert_exact_success_census!(empty_count.count(b"\xFFa\x80", AggregateRunLimits::default()));
+    assert_exact_success_census!(empty_span.span_sum(b"\xFFa\x80", AggregateRunLimits::default()));
+    assert_exact_success_census!(byte_count.count(b"\xFF\x00\x80", AggregateRunLimits::default()));
+    assert_exact_success_census!(
+        byte_span.span_sum(b"\xFF\x00\x80", AggregateRunLimits::default())
+    );
 
     let guarded = aggregate_builder(r"\b(?:as|break|Self|ab|ba)\b")
         .unicode(false)
@@ -162,4 +231,10 @@ fn direct_success_reports_remain_allocation_free() {
     });
     assert_eq!((allocations, reallocations, deallocations), (0, 0, 0));
     assert!(fixed_result.report().has_closed_direct_attempt());
+}
+
+#[test]
+fn direct_receipts_preserve_existing_allocation_counts() {
+    assert_direct_success_reports_remain_allocation_free();
+    assert_direct_terminal_receipts_preserve_existing_error_allocation_counts();
 }

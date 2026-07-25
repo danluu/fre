@@ -219,17 +219,25 @@ pub use grapheme_scalar_dfa::{
 };
 
 pub use literal_aggregate::{
+    ACCOUNTING_VERSION as LITERAL_AGGREGATE_ACCOUNTING_VERSION,
+    ALGORITHM_VERSION as LITERAL_AGGREGATE_ALGORITHM_VERSION,
     BoundarySemantics as LiteralAggregateBoundarySemantics,
     BuildAccounting as LiteralAggregateBuildAccounting, BuildError as LiteralAggregateBuildError,
     BuildLimits as LiteralAggregateBuildLimits,
     COUNT_OPERATION_ID as LITERAL_AGGREGATE_COUNT_OPERATION_ID,
-    CountResult as LiteralAggregateCountResult, LiteralAggregatePlan,
+    CountAttempt as LiteralAggregateCountAttempt, CountResult as LiteralAggregateCountResult,
+    DeclaredFallback as LiteralAggregateDeclaredFallback, LiteralAggregatePlan,
     Operation as LiteralAggregateOperation, OperationIdentity as LiteralAggregateOperationIdentity,
-    PLAN_ID as LITERAL_AGGREGATE_PLAN_ID, ReduceAccounting as LiteralAggregateReduceAccounting,
+    PLAN_ID as LITERAL_AGGREGATE_PLAN_ID, PlanOrigin as LiteralAggregatePlanOrigin,
+    ReduceAccounting as LiteralAggregateReduceAccounting,
     ReduceActualCounters as LiteralAggregateActualCounters,
-    ReduceError as LiteralAggregateReduceError, ReduceLimits as LiteralAggregateReduceLimits,
-    ReduceUpperBounds as LiteralAggregateUpperBounds,
+    ReduceAttemptError as LiteralAggregateReduceAttemptError,
+    ReduceAttemptReceipt as LiteralAggregateReduceAttemptReceipt,
+    ReduceError as LiteralAggregateReduceError,
+    ReduceInvocation as LiteralAggregateReduceInvocation,
+    ReduceLimits as LiteralAggregateReduceLimits, ReduceUpperBounds as LiteralAggregateUpperBounds,
     SPAN_SUM_OPERATION_ID as LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID,
+    SpanSumAttempt as LiteralAggregateSpanSumAttempt,
     SpanSumResult as LiteralAggregateSpanSumResult,
 };
 

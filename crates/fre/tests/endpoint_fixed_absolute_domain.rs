@@ -51,18 +51,22 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     );
     assert_eq!(fre::AGGREGATE_CONTINUATION_MAX_ALLOCATIONS, 9);
     // Exact typed fixed failures retain owner provenance, route limits, and
-    // complete nested P/A without a terminal-path allocation.
-    assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_560);
+    // complete nested P/A without a terminal-path allocation. Schema 34 adds
+    // one compact three-word exact-literal construction seal (needle bytes,
+    // observed temporary capacity, and masked origin).
+    assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 1_584);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 1_624);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
     assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 216);
-    assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 504);
-    assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 48);
-    // Full public build/run provenance plus schema 33's independent WordRun,
+    // Exact success retains the independent kernel receipt beside accounting;
+    // this is the public allocation-free ceiling for the enlarged enum.
+    assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 728);
+    assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 64);
+    // Full public build/run provenance plus schema 34's independent WordRun,
     // LiteralAssertions, BlockingDelimiter, and TokenPhrase policies remains
     // allocation-free and nonduplicated.
-    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_272);
-    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 3_272);
+    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 3_496);
+    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 3_496);
 }
 
 #[test]

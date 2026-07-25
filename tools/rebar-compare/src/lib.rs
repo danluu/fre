@@ -175,7 +175,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v33-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v34-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -4402,8 +4402,8 @@ fn execute_composite_count_stage(
     let result = regex
         .count(&state.sequence, operation_limits)
         .map_err(|error| {
-            aggregate_execution_error(
-                &error.source,
+            aggregate_attempt_error(
+                &error,
                 format!("regex-redux count execution failed: {error}"),
             )
         })?;
@@ -5772,8 +5772,8 @@ fn execute_uniform_capture_scalar(
             operation_limits.unicode_scalar.max_work.min(remaining_work);
     }
     let result = regex.count(haystack, operation_limits).map_err(|error| {
-        aggregate_execution_error(
-            &error.source,
+        aggregate_attempt_error(
+            &error,
             format!("FRE uniform capture scalar count refused execution: {error}"),
         )
     })?;
@@ -9764,6 +9764,18 @@ fn require_unicode_plan_identity(
         )));
     }
     if !unicode {
+        if let AggregatePlanIdentity::ExactLiteral(identity) = report.plan_identity {
+            if identity.semantics == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
+                && identity.kernel
+                    == fre::LiteralAggregateOperationIdentity::for_operation(operation)
+            {
+                return Ok(());
+            }
+            return Err(ExecutionError::fault(format!(
+                "Unicode-off exact-literal aggregate identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        }
         if let AggregatePlanIdentity::GraphemeScalarDfa(_) = report.plan_identity {
             return Err(ExecutionError::fault(format!(
                 "grapheme scalar DFA identity is not valid for Unicode-off execution: {:?}",
@@ -9836,7 +9848,8 @@ fn require_unicode_plan_identity(
         AggregatePlanIdentity::ExactLiteral(identity)
             if identity.semantics
                 == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
-                && identity.kernel.operation == operation
+                && identity.kernel
+                    == fre::LiteralAggregateOperationIdentity::for_operation(operation)
     ) || matches!(
         report.plan_identity,
         AggregatePlanIdentity::FixedClassSandwich(identity)
@@ -10813,7 +10826,6 @@ fn token_phrase_reduce_error(source: &TokenPhraseReduceError, message: String) -
 
 fn aggregate_execution_error(source: &AggregateExecutionSource, message: String) -> ExecutionError {
     match source {
-        AggregateExecutionSource::ExactLiteral(source) => literal_reduce_error(source, message),
         AggregateExecutionSource::UnicodeScalar(source) => {
             unicode_scalar_reduce_error(source, message)
         }
@@ -10849,7 +10861,11 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         AggregateExecutionSource::BoundedContext(source) => {
             bounded_context_reduce_error(source, message)
         }
-        AggregateExecutionSource::FixedAbsoluteDomain
+        // Exact-literal resource refusals are unsupported only when the full
+        // construction-owned direct attempt closes. A detached source cannot
+        // carry that proof and must fail closed.
+        AggregateExecutionSource::ExactLiteral(_)
+        | AggregateExecutionSource::FixedAbsoluteDomain
         | AggregateExecutionSource::FixedAbsoluteDomainResidual
         | AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
         AggregateExecutionSource::FiniteLiteral(source) => {
@@ -10879,6 +10895,13 @@ fn aggregate_attempt_error(
     message: String,
 ) -> ExecutionError {
     match &error.source {
+        AggregateExecutionSource::ExactLiteral(source) => {
+            if error.has_closed_direct_attempt() {
+                literal_reduce_error(source, message)
+            } else {
+                ExecutionError::fault(message)
+            }
+        }
         AggregateExecutionSource::FixedAbsoluteDomain => {
             let Some(attempt) = error.identity.as_fixed_absolute_domain_attempt() else {
                 return ExecutionError::fault(message);
@@ -17671,7 +17694,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v33-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v34-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -19131,6 +19154,88 @@ mod tests {
         // zero, so a larger policy quota is represented by the tight bound.
         assert_eq!(capped.max_scratch_bytes, 0);
         assert_eq!(capped.max_peak_bytes, 7);
+    }
+
+    #[test]
+    fn exact_literal_receipt_invariants_and_actual_escape_are_faults_without_fallback() {
+        for source in [
+            LiteralAggregateReduceError::ReceiptInvariant {
+                detail: "injected receipt invariant",
+            },
+            LiteralAggregateReduceError::ActualEscapedProspective {
+                dimension: "match events",
+                actual: 2,
+                prospective: 1,
+            },
+        ] {
+            let error = literal_reduce_error(&source, source.to_string());
+            assert_eq!(error.status, Status::Fault);
+            assert_ne!(error.status, Status::Unsupported);
+        }
+    }
+
+    #[test]
+    fn exact_literal_resource_refusal_requires_a_closed_direct_attempt() {
+        let regex = AggregateBuilder::new("needle")
+            .unicode(false)
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .expect("exact-literal count");
+        let haystack = b"needle";
+
+        let mut linear_limits = AggregateRunLimits::default();
+        linear_limits.exact_literal.max_linear_terms = 0;
+        let linear_refusal = regex
+            .count(haystack, linear_limits)
+            .expect_err("linear-term refusal");
+        assert!(linear_refusal.has_closed_direct_attempt());
+        assert!(matches!(
+            linear_refusal.source,
+            AggregateExecutionSource::ExactLiteral(
+                LiteralAggregateReduceError::LinearTermsLimit { .. }
+            )
+        ));
+        let classified =
+            aggregate_attempt_error(&linear_refusal, "valid exact refusal".to_string());
+        assert_eq!(classified.status, Status::Unsupported);
+
+        let mut event_limits = AggregateRunLimits::default();
+        event_limits.exact_literal.max_match_events = 0;
+        let event_refusal = regex
+            .count(haystack, event_limits)
+            .expect_err("match-event refusal");
+        assert!(event_refusal.has_closed_direct_attempt());
+        assert!(matches!(
+            event_refusal.source,
+            AggregateExecutionSource::ExactLiteral(
+                LiteralAggregateReduceError::MatchEventsLimit { .. }
+            )
+        ));
+
+        let mut nested_receipt_splice = linear_refusal.clone();
+        nested_receipt_splice.identity = event_refusal.identity.clone();
+        assert!(!nested_receipt_splice.has_closed_direct_attempt());
+        let classified =
+            aggregate_attempt_error(&nested_receipt_splice, "spliced receipt".to_string());
+        assert_eq!(classified.status, Status::Fault);
+
+        let mut source_splice = linear_refusal.clone();
+        source_splice.source = event_refusal.source.clone();
+        assert!(!source_splice.has_closed_direct_attempt());
+        let classified = aggregate_attempt_error(&source_splice, "spliced source".to_string());
+        assert_eq!(classified.status, Status::Fault);
+
+        let mut identity_splice = linear_refusal;
+        let cache = identity_splice
+            .identity
+            .as_cache_identity()
+            .expect("exact direct cache")
+            .clone();
+        identity_splice.identity =
+            fre::AggregateExecutionAttemptIdentity::Incumbent(Box::new(cache));
+        assert!(!identity_splice.has_closed_direct_attempt());
+        let classified = aggregate_attempt_error(&identity_splice, "spliced identity".to_string());
+        assert_eq!(classified.status, Status::Fault);
     }
 
     #[test]
