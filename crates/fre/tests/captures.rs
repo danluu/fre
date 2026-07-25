@@ -122,7 +122,7 @@ fn required_ascii_class_prefilter_does_not_bypass_aggregate_result_limits() {
         .expect("nonuniform mandatory-class capture plan");
     assert_eq!(
         regex.build_report().plan_identity.plan,
-        fre::CapturePlanKind::LinearSelectorPersistentHistory
+        fre::CapturePlanKind::LinearSelectorParticipationQuotientV1
     );
     let prefilter = regex
         .required_literal_plan()
@@ -1592,7 +1592,7 @@ fn uniform_participation_uses_direct_or_selector_without_history() {
             .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
         assert_eq!(
             regex.build_report().plan_identity.plan,
-            fre::CapturePlanKind::LinearSelectorPersistentHistory,
+            fre::CapturePlanKind::LinearSelectorParticipationQuotientV1,
             "pattern={pattern:?}"
         );
     }
@@ -2930,7 +2930,408 @@ fn operation_wide_selector_removes_quadratic_restart_work() {
 }
 
 #[test]
-fn persistent_history_reports_fanout_and_refuses_node_starvation() {
+fn participation_quotient_preserves_priority_repetition_and_receipts() {
+    let cases: &[(&str, &[u8])] = &[
+        (r"(?:(a())|(a))", b"a"),
+        (r"(?:(a)|(a()))", b"a"),
+        (r"(?:(a)|b)+", b"ab"),
+        (r"(a)?b", b"b"),
+    ];
+    for &(pattern, haystack) in cases {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        let build = regex.build_report();
+        assert_eq!(
+            build.plan_identity.plan,
+            fre::CapturePlanKind::LinearSelectorParticipationQuotientV1,
+            "pattern={pattern:?}"
+        );
+        let proof = build
+            .participation_quotient_proof()
+            .expect("quotient construction proof");
+        assert_eq!(usize::from(proof.user_captures), build.engine.captures);
+        assert_eq!(proof.mask_bits, fre::PARTICIPATION_QUOTIENT_MASK_BITS);
+        assert_eq!(proof.reserved_overall_bits, 1);
+        assert_eq!(proof.state_masks, 2);
+        assert_eq!(proof.retained_offsets, 0);
+        assert_eq!(
+            proof.algorithm_version,
+            fre::PARTICIPATION_QUOTIENT_ALGORITHM_VERSION
+        );
+        assert_eq!(
+            proof.accounting_version,
+            fre::PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION
+        );
+        assert_eq!(
+            proof.declared_prepublication_fallback,
+            fre::CaptureParticipationQuotientFallback::PersistentHistory
+        );
+
+        let result = regex
+            .count_captures(haystack, CaptureRunLimits::default())
+            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+        assert_eq!(result.accounting.count, reference_count(pattern, haystack));
+        assert_eq!(result.accounting.total_history_nodes, 0);
+        assert_eq!(result.accounting.total_history_walk, 0);
+        assert_eq!(
+            result.capture_events,
+            result.accounting.matches * (build.engine.captures + 1)
+        );
+        assert!(result.selector_certificate.is_some());
+        assert!(result.selector_accounting.is_some());
+        assert!(result.selector_receipt.is_none());
+        // The new physical replay preserves the existing nonuniform Count
+        // publication contract: selector evidence and immutable plan identity
+        // are retained, while the positive-width uniform owner seal remains
+        // inapplicable.
+        assert!(result.identity.count_seal.is_none());
+        assert!(result.count_receipt.is_none());
+        assert!(!result.has_closed_count_attempt());
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one focused audit binds quotient P/A, aggregate exact limits, and terminal no-fallback behavior"
+)]
+fn participation_quotient_exact_limits_refuse_without_runtime_fallback() {
+    let pattern = r"(?:(a())|(a))";
+    let haystack = b"a";
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("quotient build");
+    let span = fre::CaptureSpan { start: 0, end: 1 };
+    let prospective = regex
+        .participation_quotient_prospective(span)
+        .expect("valid quotient prospective")
+        .expect("quotient plan");
+    let baseline = regex
+        .count_captures(haystack, CaptureRunLimits::default())
+        .expect("quotient baseline");
+    assert_eq!(baseline.accounting.matches, 1);
+    assert_eq!(baseline.accounting.count, 3);
+    assert_eq!(baseline.capture_events, 4);
+    assert_eq!(baseline.accounting.total_history_nodes, 0);
+    assert_eq!(baseline.accounting.total_history_walk, 0);
+
+    let exact = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_state_visits: prospective.state_visits,
+                max_slot_copies: 0,
+                max_history_nodes: 0,
+                max_history_walk: 0,
+                max_scratch_bytes: prospective.scratch_bytes,
+            },
+            max_searches: 1,
+            max_results: 1,
+            max_total_state_visits: prospective.state_visits,
+            max_total_slot_copies: 0,
+            max_total_history_nodes: 0,
+            max_total_history_walk: 0,
+            max_capture_events: 4,
+            max_capture_count: 3,
+            ..CaptureAggregateLimits::default()
+        },
+        max_combined_peak_bytes: baseline.combined_peak_bytes,
+        ..CaptureRunLimits::default()
+    };
+    let admitted = regex
+        .count_captures(haystack, exact)
+        .expect("exact quotient limits");
+    assert_eq!(admitted.accounting, baseline.accounting);
+    assert_eq!(admitted.capture_events, baseline.capture_events);
+    assert!(admitted.selector_receipt.is_none());
+
+    let one_below_state = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_state_visits: prospective.state_visits - 1,
+                ..exact.aggregate.per_search
+            },
+            ..exact.aggregate
+        },
+        ..exact
+    };
+    assert_eq!(
+        regex
+            .count_captures(haystack, one_below_state)
+            .expect_err("state prospective one below")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::StateVisits,
+            required: prospective.state_visits,
+            limit: prospective.state_visits - 1,
+        })
+    );
+
+    let one_below_scratch = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_scratch_bytes: prospective.scratch_bytes - 1,
+                // Full history remains permissive. This must still be a
+                // terminal quotient refusal, never a runtime fallback.
+                max_history_nodes: usize::MAX,
+                max_history_walk: usize::MAX,
+                ..exact.aggregate.per_search
+            },
+            ..exact.aggregate
+        },
+        ..exact
+    };
+    assert_eq!(
+        regex
+            .count_captures(haystack, one_below_scratch)
+            .expect_err("scratch prospective one below")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::ScratchBytes,
+            required: prospective.scratch_bytes,
+            limit: prospective.scratch_bytes - 1,
+        })
+    );
+
+    for (limits, resource) in [
+        (
+            CaptureRunLimits {
+                aggregate: CaptureAggregateLimits {
+                    max_searches: 0,
+                    ..exact.aggregate
+                },
+                ..exact
+            },
+            CaptureResource::Searches,
+        ),
+        (
+            CaptureRunLimits {
+                aggregate: CaptureAggregateLimits {
+                    max_results: 0,
+                    ..exact.aggregate
+                },
+                ..exact
+            },
+            CaptureResource::Results,
+        ),
+    ] {
+        assert_eq!(
+            regex
+                .count_captures(haystack, limits)
+                .expect_err("aggregate scalar one below")
+                .source,
+            CaptureExecutionSource::History(CaptureSearchError::Resource {
+                kind: resource,
+                required: 1,
+                limit: 0,
+            })
+        );
+    }
+
+    let total_visits_one_below = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_total_state_visits: prospective.state_visits - 1,
+            ..exact.aggregate
+        },
+        ..exact
+    };
+    assert_eq!(
+        regex
+            .count_captures(haystack, total_visits_one_below)
+            .expect_err("aggregate state visits one below")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::StateVisits,
+            required: prospective.state_visits,
+            limit: prospective.state_visits - 1,
+        })
+    );
+
+    let combined_one_below = CaptureRunLimits {
+        max_combined_peak_bytes: baseline.combined_peak_bytes - 1,
+        ..exact
+    };
+    assert_eq!(
+        regex
+            .count_captures(haystack, combined_one_below)
+            .expect_err("combined replay peak one below")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::ScratchBytes,
+            required: prospective.scratch_bytes,
+            limit: prospective.scratch_bytes - 1,
+        })
+    );
+
+    for (limits, resource, required) in [
+        (
+            CaptureRunLimits {
+                aggregate: CaptureAggregateLimits {
+                    max_capture_events: 3,
+                    ..exact.aggregate
+                },
+                ..exact
+            },
+            CaptureResource::CaptureEvents,
+            4,
+        ),
+        (
+            CaptureRunLimits {
+                aggregate: CaptureAggregateLimits {
+                    max_capture_count: 2,
+                    ..exact.aggregate
+                },
+                ..exact
+            },
+            CaptureResource::CaptureCount,
+            3,
+        ),
+    ] {
+        assert_eq!(
+            regex
+                .count_captures(haystack, limits)
+                .expect_err("aggregate one below")
+                .source,
+            CaptureExecutionSource::History(CaptureSearchError::Resource {
+                kind: resource,
+                required,
+                limit: required - 1,
+            })
+        );
+    }
+}
+
+#[test]
+fn participation_quotient_preserves_interleaved_resource_terminal_priority() {
+    let regex = CaptureBuilder::new(r"(a)(b)?")
+        .unicode(false)
+        .build()
+        .expect("quotient build");
+    assert_eq!(
+        regex.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorParticipationQuotientV1
+    );
+    let limits = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_capture_events: 1,
+            max_capture_count: 0,
+            ..CaptureAggregateLimits::default()
+        },
+        ..CaptureRunLimits::default()
+    };
+    assert_eq!(
+        regex
+            .count_captures(b"a", limits)
+            .expect_err("group-zero count must precede group-one event")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::CaptureCount,
+            required: 1,
+            limit: 0,
+        })
+    );
+}
+
+#[test]
+fn participation_quotient_cap_selects_generic_history_before_source_access() {
+    let admitted_groups = fre::PARTICIPATION_QUOTIENT_CAPTURE_BITS;
+    let mut admitted_pattern = "(a)?".repeat(admitted_groups);
+    admitted_pattern.push('z');
+    let admitted = CaptureBuilder::new(&admitted_pattern)
+        .unicode(false)
+        .build()
+        .expect("at-cap quotient build");
+    assert_eq!(
+        admitted.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorParticipationQuotientV1
+    );
+    assert_eq!(
+        admitted
+            .build_report()
+            .participation_quotient_proof()
+            .expect("at-cap proof")
+            .user_captures,
+        u8::try_from(admitted_groups).expect("test cap fits identity")
+    );
+    let zero_history = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            per_search: CaptureSearchLimits {
+                max_history_nodes: 0,
+                max_history_walk: 0,
+                ..CaptureSearchLimits::default()
+            },
+            max_total_history_nodes: 0,
+            max_total_history_walk: 0,
+            ..CaptureAggregateLimits::default()
+        },
+        ..CaptureRunLimits::default()
+    };
+    assert_eq!(
+        admitted
+            .count_captures(b"z", zero_history)
+            .expect("at-cap quotient execution")
+            .accounting
+            .count,
+        1
+    );
+
+    let mut fallback_pattern = "(a)?".repeat(admitted_groups + 1);
+    fallback_pattern.push('z');
+    let fallback = CaptureBuilder::new(&fallback_pattern)
+        .unicode(false)
+        .build()
+        .expect("over-cap generic fallback build");
+    assert_eq!(
+        fallback.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorPersistentHistory
+    );
+    assert!(
+        fallback
+            .build_report()
+            .participation_quotient_proof()
+            .is_none()
+    );
+    assert!(
+        fallback
+            .participation_quotient_prospective(fre::CaptureSpan { start: 0, end: 1 })
+            .expect("fallback prospective query")
+            .is_none()
+    );
+    assert!(matches!(
+        fallback
+            .count_captures(b"z", zero_history)
+            .expect_err("zero history must refuse the published generic fallback")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::HistoryNodes,
+            ..
+        })
+    ));
+    let simultaneous_tight = CaptureRunLimits {
+        aggregate: CaptureAggregateLimits {
+            max_capture_events: 1,
+            max_capture_count: 0,
+            ..CaptureAggregateLimits::default()
+        },
+        ..CaptureRunLimits::default()
+    };
+    assert_eq!(
+        fallback
+            .count_captures(b"z", simultaneous_tight)
+            .expect_err("full fallback must preserve interleaved terminal priority")
+            .source,
+        CaptureExecutionSource::History(CaptureSearchError::Resource {
+            kind: CaptureResource::CaptureCount,
+            required: 1,
+            limit: 0,
+        })
+    );
+}
+
+#[test]
+fn aggregate_capture_routes_report_fanout_and_prepublication_history_fallback() {
     let pattern = r"(?:(a+)|(b+)|(c+)|(d+)|(e+)|(f+)|(g+)|(h+)|(i+)|(j+)|(k+)|(l+)|(m+)|(n+)|(o+)|(p+)|(q+)|(r+)|(s+)|(t+)|(u+)|(v+)|(w+)|(x+)|(y+)|(z+))";
     let regex = CaptureBuilder::new(pattern)
         .unicode(false)
@@ -2946,24 +3347,53 @@ fn persistent_history_reports_fanout_and_refuses_node_starvation() {
     );
     assert_eq!(result.accounting.total_history_nodes, 0);
 
-    let history = CaptureBuilder::new(r"(a)(b)?")
+    let quotient = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)
         .build()
         .expect("variable-participation build");
-    let starved = CaptureRunLimits {
+    assert_eq!(
+        quotient.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorParticipationQuotientV1
+    );
+    let zero_history = CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
                 max_history_nodes: 0,
+                max_history_walk: 0,
                 ..CaptureSearchLimits::default()
             },
             max_total_history_nodes: 0,
+            max_total_history_walk: 0,
             ..CaptureAggregateLimits::default()
         },
         ..CaptureRunLimits::default()
     };
+    let result = quotient
+        .count_captures(b"ab", zero_history)
+        .expect("quotient must not consume persistent history");
+    assert_eq!(result.accounting.count, 3);
+    assert_eq!(result.accounting.total_history_nodes, 0);
+    assert_eq!(result.accounting.total_history_walk, 0);
+
+    let mut pattern = "(a)?".repeat(fre::PARTICIPATION_QUOTIENT_CAPTURE_BITS + 1);
+    pattern.push('z');
+    let history = CaptureBuilder::new(&pattern)
+        .unicode(false)
+        .build()
+        .expect("over-cap variable-participation build");
+    assert_eq!(
+        history.build_report().plan_identity.plan,
+        fre::CapturePlanKind::LinearSelectorPersistentHistory
+    );
+    assert!(
+        history
+            .build_report()
+            .participation_quotient_proof()
+            .is_none()
+    );
     let error = history
-        .count_captures(b"ab", starved)
-        .expect_err("history starvation must refuse");
+        .count_captures(b"z", zero_history)
+        .expect_err("published generic history fallback must charge nodes");
     assert!(matches!(
         error.source,
         CaptureExecutionSource::History(CaptureSearchError::Resource {
@@ -2985,7 +3415,7 @@ fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
     let selector_peak = admitted
         .selector_accounting
         .as_ref()
-        .expect("history selector accounting")
+        .expect("quotient selector accounting")
         .peak_bytes;
     assert!(
         admitted.combined_peak_bytes > selector_peak,

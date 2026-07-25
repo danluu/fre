@@ -8,19 +8,33 @@ use crate::error::{BuildError, ResourceKind, SearchError};
 use crate::limits::{AggregateLimits, BuildLimits, SearchLimits};
 use crate::model::{
     AggregateOutcome, CandidateKind, CaptureCountOutcome, HistoryProgramShape,
-    HistorySearchProspective, MatchKind, RestartedHistoryProspective, RunReport, SearchConfig,
-    SearchKind, SearchOutcome, Span, Window,
+    HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
+    RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 use crate::runtime::HISTORY_CHUNK_CAPACITY;
 use crate::runtime::{
-    admit_history, admit_history_exact, assertion_matches, canonicalize, check, checked_add,
-    validate_window,
+    admit_history, admit_history_exact, admit_participation_exact, assertion_matches, canonicalize,
+    check, checked_add, participation_exact_prospective, validate_window,
 };
+
+/// Version of the exact-span capture-participation history quotient.
+pub const PARTICIPATION_QUOTIENT_ALGORITHM_VERSION: u32 = 1;
+
+/// Version of the quotient state-visit, scratch, and zero-history ledger.
+pub const PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
 struct Thread {
     pc: usize,
     history: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParticipationThread {
+    pc: usize,
+    open: u64,
+    participated: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -331,6 +345,197 @@ impl HistoryRegex {
                 admitted_scratch_bytes: admission.scratch_bytes,
             },
         })
+    }
+
+    /// Derive the source-independent envelope for one aggregate-only exact
+    /// span replay.
+    ///
+    /// This is available only when every user capture fits the fixed
+    /// participation quotient. Larger schemas must select the full
+    /// persistent-history route before source access.
+    pub fn participation_exact_prospective(
+        &self,
+        span: Span,
+    ) -> Result<ParticipationSearchProspective, SearchError> {
+        self.validate_participation_quotient()?;
+        participation_exact_prospective(
+            &self.program,
+            span,
+            core::mem::size_of::<ParticipationThread>(),
+        )
+    }
+
+    /// Replay one exact span while retaining only capture participation.
+    ///
+    /// The ordered frontier and first-arrival state quotient are identical to
+    /// [`Self::captures_exact`]. Capture tags never affect control. Each
+    /// well-nested start/end pair therefore projects homomorphically to one
+    /// transient `open` bit and one persistent `participated` bit. Group zero
+    /// is retained in the masks to authenticate exact-span acceptance, then
+    /// excluded from the returned scalar.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the aggregate-only exact-span transition mirrors captures_exact so priority and accounting remain locally auditable"
+    )]
+    pub fn captures_participation_exact(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        span: Span,
+        limits: SearchLimits,
+    ) -> Result<ParticipationSearchOutcome, SearchError> {
+        validate_window(haystack, window, span.start)?;
+        if span.start > span.end || span.start < window.start || span.end > window.end {
+            return Err(SearchError::InvalidWindow);
+        }
+        self.validate_participation_quotient()?;
+        let prospective = admit_participation_exact(
+            &self.program,
+            span,
+            core::mem::size_of::<ParticipationThread>(),
+            limits,
+        )?;
+        let state_count = self.program.states.len();
+        let mut current = reserve_participation_threads(state_count)?;
+        let mut next = reserve_participation_threads(state_count)?;
+        let mut stack = reserve_participation_threads(state_count)?;
+        let mut seen = Vec::new();
+        seen.try_reserve_exact(state_count)
+            .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+        seen.resize(state_count, 0_usize);
+        let mut generation = 1_usize;
+        let mut counters = Counters {
+            state_visits: 0,
+            history_walk: 0,
+            starts_injected: 1,
+            bytes_examined: 0,
+            peak_threads: 0,
+        };
+        let mut pos = span.start;
+        add_participation_thread(
+            &self.program,
+            &mut current,
+            &mut stack,
+            &mut seen,
+            generation,
+            ParticipationThread {
+                pc: self.program.start,
+                open: 0,
+                participated: 0,
+            },
+            pos,
+            haystack,
+            window,
+            &mut counters,
+            limits,
+        )?;
+
+        while pos < span.end {
+            current
+                .retain(|thread| !matches!(self.program.states.get(thread.pc), Some(State::Match)));
+            next.clear();
+            generation = generation
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+            let next_pos = pos
+                .checked_add(1)
+                .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+            let byte = *haystack.get(pos).ok_or(SearchError::InvalidWindow)?;
+            for thread in current.drain(..) {
+                let State::Byte {
+                    ranges,
+                    next: target,
+                } = self
+                    .program
+                    .states
+                    .get(thread.pc)
+                    .ok_or(SearchError::InvalidProgram)?
+                else {
+                    return Err(SearchError::InvalidProgram);
+                };
+                if ranges
+                    .iter()
+                    .any(|&(start, end)| start <= byte && byte <= end)
+                {
+                    add_participation_thread(
+                        &self.program,
+                        &mut next,
+                        &mut stack,
+                        &mut seen,
+                        generation,
+                        ParticipationThread {
+                            pc: *target,
+                            open: thread.open,
+                            participated: thread.participated,
+                        },
+                        next_pos,
+                        haystack,
+                        window,
+                        &mut counters,
+                        limits,
+                    )?;
+                }
+            }
+            counters.bytes_examined =
+                checked_add(counters.bytes_examined, 1, ResourceKind::StateVisits)?;
+            std::mem::swap(&mut current, &mut next);
+            pos = next_pos;
+        }
+
+        counters.peak_threads = counters.peak_threads.max(current.len());
+        let (participating_captures, participation_mask) = if let Some(thread) = current
+            .iter()
+            .find(|thread| matches!(self.program.states.get(thread.pc), Some(State::Match)))
+        {
+            if thread.open != 0 || thread.participated & 1 == 0 {
+                return Err(SearchError::InvalidProgram);
+            }
+            let participating = usize::try_from((thread.participated & !1_u64).count_ones())
+                .map_err(|_| SearchError::InvalidProgram)?;
+            (Some(participating), Some(thread.participated))
+        } else {
+            (None, None)
+        };
+        let report = RunReport {
+            candidate: CandidateKind::ParticipationQuotient,
+            state_visits: counters.state_visits,
+            slot_copies: 0,
+            history_nodes: 0,
+            history_walk: 0,
+            starts_injected: counters.starts_injected,
+            bytes_examined: counters.bytes_examined,
+            peak_threads: counters.peak_threads,
+            admitted_scratch_bytes: prospective.scratch_bytes,
+        };
+        if !prospective.closes_report(&report) {
+            return Err(SearchError::InvalidProgram);
+        }
+        Ok(ParticipationSearchOutcome {
+            participating_captures,
+            participation_mask,
+            prospective,
+            report,
+        })
+    }
+
+    fn validate_participation_quotient(&self) -> Result<(), SearchError> {
+        let group_count = self.program.groups.len();
+        let user_captures = group_count
+            .checked_sub(1)
+            .ok_or(SearchError::InvalidProgram)?;
+        let expected_slots = self
+            .program
+            .groups
+            .len()
+            .checked_mul(2)
+            .ok_or(SearchError::BoundOverflow(ResourceKind::Captures))?;
+        if group_count > usize::from(PARTICIPATION_QUOTIENT_MASK_BITS)
+            || user_captures > PARTICIPATION_QUOTIENT_CAPTURE_BITS
+            || self.program.slot_count != expected_slots
+        {
+            return Err(SearchError::InvalidProgram);
+        }
+        Ok(())
     }
 
     /// Bounded repeated-search iterator with Rust byte-regex empty suppression.
@@ -710,6 +915,14 @@ fn reserve_threads(capacity: usize) -> Result<Vec<Thread>, SearchError> {
     Ok(threads)
 }
 
+fn reserve_participation_threads(capacity: usize) -> Result<Vec<ParticipationThread>, SearchError> {
+    let mut threads = Vec::new();
+    threads
+        .try_reserve_exact(capacity)
+        .map_err(|_| SearchError::Allocation(ResourceKind::ScratchBytes))?;
+    Ok(threads)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "closure resources are explicit laboratory inputs"
@@ -773,6 +986,98 @@ fn add_thread(
                 stack.push(Thread {
                     pc: *second,
                     history: thread.history,
+                });
+                thread.pc = *first;
+                stack.push(thread);
+            }
+        }
+    }
+    counters.peak_threads = counters.peak_threads.max(output.len());
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "closure resources are explicit laboratory inputs"
+)]
+fn add_participation_thread(
+    program: &Program,
+    output: &mut Vec<ParticipationThread>,
+    stack: &mut Vec<ParticipationThread>,
+    seen: &mut [usize],
+    generation: usize,
+    initial: ParticipationThread,
+    pos: usize,
+    haystack: &[u8],
+    window: Window,
+    counters: &mut Counters,
+    limits: SearchLimits,
+) -> Result<(), SearchError> {
+    stack.clear();
+    stack.push(initial);
+    while let Some(mut thread) = stack.pop() {
+        counters.state_visits = checked_add(counters.state_visits, 1, ResourceKind::StateVisits)?;
+        check(
+            ResourceKind::StateVisits,
+            counters.state_visits,
+            limits.max_state_visits,
+        )?;
+        let mark = seen.get_mut(thread.pc).ok_or(SearchError::InvalidProgram)?;
+        if *mark == generation {
+            continue;
+        }
+        *mark = generation;
+        match program
+            .states
+            .get(thread.pc)
+            .ok_or(SearchError::InvalidProgram)?
+        {
+            State::Byte { .. } | State::Match => output.push(thread),
+            State::Fail => {}
+            State::Epsilon { next } => {
+                thread.pc = *next;
+                stack.push(thread);
+            }
+            State::Assert { assertion, next } => {
+                if assertion_matches(*assertion, haystack, window, pos)? {
+                    thread.pc = *next;
+                    stack.push(thread);
+                }
+            }
+            State::Save { slot, next } => {
+                if *slot >= program.slot_count {
+                    return Err(SearchError::InvalidProgram);
+                }
+                let group = slot / 2;
+                if group >= program.groups.len()
+                    || group >= usize::from(PARTICIPATION_QUOTIENT_MASK_BITS)
+                {
+                    return Err(SearchError::InvalidProgram);
+                }
+                let shift = u32::try_from(group).map_err(|_| SearchError::InvalidProgram)?;
+                let bit = 1_u64
+                    .checked_shl(shift)
+                    .ok_or(SearchError::InvalidProgram)?;
+                if slot.is_multiple_of(2) {
+                    if thread.open & bit != 0 {
+                        return Err(SearchError::InvalidProgram);
+                    }
+                    thread.open |= bit;
+                } else {
+                    if thread.open & bit == 0 {
+                        return Err(SearchError::InvalidProgram);
+                    }
+                    thread.open &= !bit;
+                    thread.participated |= bit;
+                }
+                thread.pc = *next;
+                stack.push(thread);
+            }
+            State::Split { first, second } => {
+                stack.push(ParticipationThread {
+                    pc: *second,
+                    open: thread.open,
+                    participated: thread.participated,
                 });
                 thread.pc = *first;
                 stack.push(thread);

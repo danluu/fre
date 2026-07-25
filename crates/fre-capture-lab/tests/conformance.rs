@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     AggregateLimits, Assertion, Ast, BuildError, BuildLimits, CaptureProfile, CaptureRecord, Greed,
-    GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind, Program, ResourceKind,
-    SearchConfig, SearchError, SearchLimits, Span, Window,
+    GroupRecord, HistoryRegex, InlineRegex, MatchKind as CaptureMatchKind,
+    PARTICIPATION_QUOTIENT_CAPTURE_BITS, Program, ResourceKind, SearchConfig, SearchError,
+    SearchLimits, Span, Window,
 };
 use regex::bytes::Regex;
 use regex_automata::{Anchored, Input, MatchKind, meta, util::syntax};
@@ -181,6 +182,201 @@ fn exact_span_query_returns_long_nongreedy_history_and_clean_nonmatch() {
         )
         .unwrap();
     assert!(nonmatch.captures.is_none());
+}
+
+#[test]
+fn participation_quotient_matches_prioritized_tagged_histories() {
+    fn assert_projection(ast: &Ast, haystack: &[u8], span: Span) {
+        let regex = HistoryRegex::compile(ast, BuildLimits::default()).expect("history build");
+        let full = regex
+            .captures_exact(
+                haystack,
+                Window::all(haystack),
+                span,
+                SearchLimits::default(),
+            )
+            .expect("full exact replay");
+        let projected = regex
+            .captures_participation_exact(
+                haystack,
+                Window::all(haystack),
+                span,
+                SearchLimits::default(),
+            )
+            .expect("quotient exact replay");
+        let expected = full.captures.as_ref().map(|captures| {
+            captures
+                .groups
+                .iter()
+                .skip(1)
+                .filter(|group| group.span.is_some())
+                .count()
+        });
+        let expected_mask = full.captures.as_ref().map(|captures| {
+            captures
+                .groups
+                .iter()
+                .enumerate()
+                .fold(0_u64, |mask, (index, group)| {
+                    if group.span.is_some() {
+                        mask | (1_u64 << index)
+                    } else {
+                        mask
+                    }
+                })
+        });
+        assert_eq!(projected.participating_captures, expected);
+        assert_eq!(projected.participation_mask, expected_mask);
+        assert!(projected.prospective.closes_report(&projected.report));
+        assert_eq!(projected.report.slot_copies, 0);
+        assert_eq!(projected.report.history_nodes, 0);
+        assert_eq!(projected.report.history_walk, 0);
+    }
+
+    let first_arm_has_two = Ast::alt([
+        Ast::Byte(b'a').capture(2).capture(1),
+        Ast::Byte(b'a').capture(3),
+    ]);
+    assert_projection(&first_arm_has_two, b"a", Span { start: 0, end: 1 });
+
+    let first_arm_has_one = Ast::alt([
+        Ast::Byte(b'a').capture(1),
+        Ast::Byte(b'a').capture(3).capture(2),
+    ]);
+    assert_projection(&first_arm_has_one, b"a", Span { start: 0, end: 1 });
+
+    // The higher-priority arm opens capture 1 and shares the first byte with
+    // the winner, but then dies. Its partial tag state must not leak into the
+    // lower-priority arm's same-span winner.
+    let higher_priority_open_then_dies = Ast::alt([
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).capture(1),
+        Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'c')]).capture(2),
+    ]);
+    assert_projection(
+        &higher_priority_open_then_dies,
+        b"ac",
+        Span { start: 0, end: 2 },
+    );
+
+    // A capture completed by an earlier repetition remains the canonical
+    // participating slot even when the last repetition takes another arm.
+    let repeated_prior =
+        Ast::alt([Ast::Byte(b'a').capture(1), Ast::Byte(b'b')]).repeat(1, None, Greed::Greedy);
+    assert_projection(&repeated_prior, b"ab", Span { start: 0, end: 2 });
+
+    let optional = Ast::concat([
+        Ast::Byte(b'a').capture(1).repeat(0, Some(1), Greed::Greedy),
+        Ast::Byte(b'b'),
+    ]);
+    assert_projection(&optional, b"b", Span { start: 0, end: 1 });
+
+    assert_projection(
+        &Ast::Empty.named(1, "empty"),
+        b"",
+        Span { start: 0, end: 0 },
+    );
+    assert_projection(&Ast::Byte(b'a').capture(1), b"b", Span { start: 0, end: 1 });
+}
+
+#[test]
+fn participation_quotient_has_exact_limits_and_zero_history_ledger() {
+    let ast = Ast::alt([
+        Ast::Byte(b'a').capture(2).capture(1),
+        Ast::Byte(b'a').capture(3),
+    ]);
+    let regex = HistoryRegex::compile(&ast, BuildLimits::default()).expect("history build");
+    let span = Span { start: 0, end: 1 };
+    let prospective = regex
+        .participation_exact_prospective(span)
+        .expect("quotient prospective");
+    assert_eq!(prospective.starts_injected, 1);
+    assert_eq!(prospective.bytes_examined, 1);
+    assert_eq!(prospective.slot_copies, 0);
+    assert_eq!(prospective.history_nodes, 0);
+    assert_eq!(prospective.history_walk, 0);
+    let exact = SearchLimits {
+        max_state_visits: prospective.state_visits,
+        max_slot_copies: 0,
+        max_history_nodes: 0,
+        max_history_walk: 0,
+        max_scratch_bytes: prospective.scratch_bytes,
+    };
+    let outcome = regex
+        .captures_participation_exact(b"a", Window::all(b"a"), span, exact)
+        .expect("exact quotient limits");
+    assert_eq!(outcome.participating_captures, Some(2));
+    assert_eq!(outcome.participation_mask, Some(0b111));
+    assert_eq!(outcome.prospective, prospective);
+    assert!(prospective.closes_report(&outcome.report));
+
+    let one_below_visits = SearchLimits {
+        max_state_visits: prospective.state_visits - 1,
+        ..exact
+    };
+    assert_eq!(
+        regex.captures_participation_exact(b"a", Window::all(b"a"), span, one_below_visits),
+        Err(SearchError::Resource {
+            kind: ResourceKind::StateVisits,
+            required: prospective.state_visits,
+            limit: prospective.state_visits - 1,
+        })
+    );
+
+    let one_below_scratch = SearchLimits {
+        max_scratch_bytes: prospective.scratch_bytes - 1,
+        ..exact
+    };
+    assert_eq!(
+        regex.captures_participation_exact(b"a", Window::all(b"a"), span, one_below_scratch),
+        Err(SearchError::Resource {
+            kind: ResourceKind::ScratchBytes,
+            required: prospective.scratch_bytes,
+            limit: prospective.scratch_bytes - 1,
+        })
+    );
+    assert_eq!(
+        regex.participation_exact_prospective(Span { start: 1, end: 0 }),
+        Err(SearchError::InvalidWindow)
+    );
+}
+
+#[test]
+fn participation_quotient_boundary_has_generic_history_fallback() {
+    assert_eq!(PARTICIPATION_QUOTIENT_CAPTURE_BITS, 63);
+    let admitted =
+        HistoryRegex::compile(&Ast::Byte(b'a').capture(63), BuildLimits::default()).unwrap();
+    let admitted_outcome = admitted
+        .captures_participation_exact(
+            b"a",
+            Window::all(b"a"),
+            Span { start: 0, end: 1 },
+            SearchLimits::default(),
+        )
+        .expect("63-user-capture quotient");
+    assert_eq!(admitted_outcome.participating_captures, Some(1));
+    assert_eq!(
+        admitted_outcome.participation_mask,
+        Some(1_u64 | (1_u64 << 63))
+    );
+
+    let fallback =
+        HistoryRegex::compile(&Ast::Byte(b'a').capture(64), BuildLimits::default()).unwrap();
+    assert_eq!(
+        fallback.participation_exact_prospective(Span { start: 0, end: 1 }),
+        Err(SearchError::InvalidProgram)
+    );
+    assert!(
+        fallback
+            .captures_exact(
+                b"a",
+                Window::all(b"a"),
+                Span { start: 0, end: 1 },
+                SearchLimits::default()
+            )
+            .expect("full history remains available")
+            .captures
+            .is_some()
+    );
 }
 
 #[test]

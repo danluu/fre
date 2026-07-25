@@ -111,6 +111,9 @@ pub const REGEX_AUTOMATA_VERSION: &str = "0.4.14";
 pub const RE2_VERSION: &str = "2025-11-05";
 /// Stable plan label emitted by the authenticated current-FRE capture adapter.
 pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-history";
+/// Stable plan label for aggregate-only capture-history quotient replay.
+pub const CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN: &str =
+    "capture-linear-selector-participation-quotient-v1";
 /// Stable plan label for capture-erased selection with proved participation.
 pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-uniform-participation";
 /// Stable plan label for one-pass source-ordered root capture-many counting.
@@ -142,6 +145,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
         plan,
         CURRENT_FRE_CAPTURE_PLAN
+            | CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
             | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
             | CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN
             | CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN
@@ -184,7 +188,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v37-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v38-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -534,6 +538,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         identity
             .identity
             .push_str("; fixed-absolute-domain-v1 canonical-HIR generic reducers with sealed exact P/A accounting");
+        identity.identity.push_str(
+            "; persistent-capture-participation-quotient-v1 projects prioritized exact-span tagged histories to fixed open/completed group masks, authenticates group zero, retains no offsets/history nodes, and binds source-independent state/scratch accounting",
+        );
+        identity.availability.push_str(
+            "; nonuniform capture Count schemas fitting the fixed participation mask publish the quotient before source access, while larger schemas publish unchanged persistent-history replay and no execution-time fallback is permitted",
+        );
         identity.identity.push_str(
             "; anchored-line-capture-v1 lowers generic Unicode-off absolute-start deterministic byte HIRs to fixed inline masks and counts mandatory capture participation in one raw LF/CRLF pass",
         );
@@ -5031,6 +5041,7 @@ fn capture_regex_one_with_build_limits(
             CapturePlanKind::UniformPrefixClassParticipation
                 | CapturePlanKind::OrderedRootCaptureManyCount
                 | CapturePlanKind::LinearSelectorUniformParticipation
+                | CapturePlanKind::LinearSelectorParticipationQuotientV1
                 | CapturePlanKind::LinearSelectorPersistentHistory
         )
     {
@@ -5091,6 +5102,9 @@ fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
         CapturePlanKind::OrderedRootCaptureManyCount => CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN,
         CapturePlanKind::UniformPrefixClassParticipation => CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN,
         CapturePlanKind::LinearSelectorUniformParticipation => CURRENT_FRE_CAPTURE_UNIFORM_PLAN,
+        CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+            CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
+        }
         CapturePlanKind::LinearSelectorPersistentHistory => CURRENT_FRE_CAPTURE_PLAN,
     }
 }
@@ -15670,7 +15684,7 @@ mod tests {
         )
         .expect("FRE capture count");
         assert_eq!(count.actual, 5);
-        assert_eq!(count.plan, "capture-linear-selector-persistent-history");
+        assert_eq!(count.plan, CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN);
 
         let grep_patterns = vec![r"([a-z][a-z])([a-z])([\r\n])?".to_string()];
         let grep = fre_reducer(
@@ -16150,7 +16164,10 @@ mod tests {
             current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
                 .expect("count-captures lifecycle");
         assert_eq!(count.model(), "count-captures");
-        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_PLAN);
+        assert_eq!(
+            count.plan(),
+            CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
+        );
         assert_eq!(count.execute(b"a ab").expect("first count operation"), 5);
         assert_eq!(count.execute(b"a ab").expect("steady count operation"), 5);
         assert!(count.execute(b"a").is_err());
@@ -18252,7 +18269,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v37-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v38-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -18417,7 +18434,7 @@ mod tests {
                 &limits,
             ),
             5,
-            "capture-linear-selector-persistent-history",
+            CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN,
         );
         assert_current_fre_execution(
             current_fre(

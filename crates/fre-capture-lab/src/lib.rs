@@ -30,12 +30,16 @@ mod runtime;
 pub use ast::{Assertion, Ast, Greed};
 pub use compile::{BuildReport, Program};
 pub use error::{BuildError, ResourceKind, SearchError};
-pub use history::HistoryRegex;
+pub use history::{
+    HistoryRegex, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+};
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
 pub use model::{
     AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord,
-    HistoryProgramShape, HistorySearchProspective, MatchKind, RestartedHistoryProspective,
-    RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
+    HistoryProgramShape, HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchOutcome, ParticipationSearchProspective,
+    RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;

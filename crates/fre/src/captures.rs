@@ -18,10 +18,13 @@ use fre_capture_lab::{
     AggregateLimits, Assertion as CaptureAssertion, Ast, BuildError as EngineBuildError,
     BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
     CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureProfile, CaptureRecord,
-    Greed, HistoryRegex, HistorySearchProspective, Program, ResourceKind as EngineResource,
-    RunReport as EngineSearchAccounting, SearchConfig as CaptureSearchConfig,
-    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
-    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
+    Greed, HistoryRegex, HistorySearchProspective, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
+    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
+    ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
+    SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
+    SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
+    Window,
 };
 use fre_kernels::{
     LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
@@ -84,6 +87,10 @@ pub enum CapturePlanKind {
     LinearSelectorUniformParticipation,
     /// One operation-wide span selector plus exact-span persistent-history replay.
     LinearSelectorPersistentHistory,
+    /// One operation-wide span selector plus exact-span paired-side
+    /// participation masks. Tagged offsets are erased because the aggregate
+    /// observes only whether each group participated.
+    LinearSelectorParticipationQuotientV1,
 }
 
 /// Typed compatibility receipt for HIR forms outside the certified capture compiler.
@@ -124,6 +131,35 @@ pub struct OrderedRootCaptureManyProof {
     pub groups_per_match: usize,
     /// Exact work charged while classifying the canonical capture HIR.
     pub proof_work: usize,
+}
+
+/// Only permitted construction-time action when the fixed participation
+/// quotient cannot represent the complete capture schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureParticipationQuotientFallback {
+    /// Retain exact-span full tagged-history replay.
+    PersistentHistory,
+}
+
+/// Construction proof for aggregate-only tagged-history quotienting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureParticipationQuotientProof {
+    /// User capture groups represented by the state masks.
+    pub user_captures: u8,
+    /// Fixed bit width of each state mask, including group zero.
+    pub mask_bits: u8,
+    /// Bits reserved for authenticating overall-match participation.
+    pub reserved_overall_bits: u8,
+    /// Number of inline masks: open groups and completed participation.
+    pub state_masks: u8,
+    /// Tagged byte offsets retained by this aggregate-only route.
+    pub retained_offsets: u8,
+    /// Version of the quotient transition and winner projection.
+    pub algorithm_version: u32,
+    /// Version of its state-visit, scratch, and zero-history ledger.
+    pub accounting_version: u32,
+    /// Generic construction-time fallback for larger schemas.
+    pub declared_prepublication_fallback: CaptureParticipationQuotientFallback,
 }
 
 /// Construction limits whose exact values participate in cache identity.
@@ -279,6 +315,32 @@ pub struct CaptureBuildReport {
     pub prefix_class_participation: Option<PrefixClassUniformParticipationBuildAccounting>,
     /// Complete immutable plan identity.
     pub plan_identity: CapturePlanIdentity,
+}
+
+impl CaptureBuildReport {
+    /// Reconstruct the fixed quotient theorem from the immutable selected plan
+    /// and compiled capture schema. No proof bytes are duplicated in the
+    /// artifact or execution identity.
+    #[must_use]
+    pub fn participation_quotient_proof(&self) -> Option<CaptureParticipationQuotientProof> {
+        if self.plan_identity.plan != CapturePlanKind::LinearSelectorParticipationQuotientV1
+            || self.engine.captures > PARTICIPATION_QUOTIENT_CAPTURE_BITS
+        {
+            return None;
+        }
+        let user_captures = u8::try_from(self.engine.captures).ok()?;
+        Some(CaptureParticipationQuotientProof {
+            user_captures,
+            mask_bits: PARTICIPATION_QUOTIENT_MASK_BITS,
+            reserved_overall_bits: 1,
+            state_masks: 2,
+            retained_offsets: 0,
+            algorithm_version: PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+            accounting_version: PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+            declared_prepublication_fallback:
+                CaptureParticipationQuotientFallback::PersistentHistory,
+        })
+    }
 }
 
 /// Execution/cache identity for a capture reducer invocation.
@@ -1859,6 +1921,29 @@ impl CaptureBuilder {
                 "capture compiler schema differs from parsed HIR",
             ));
         }
+        let participation_quotient = if ordered_root_capture_many.is_none()
+            && prefix_class_participation.plan.is_none()
+            && uniform_participating_captures.is_none()
+            && engine_report.captures <= PARTICIPATION_QUOTIENT_CAPTURE_BITS
+        {
+            Some(CaptureParticipationQuotientProof {
+                user_captures: u8::try_from(engine_report.captures).map_err(|_| {
+                    CaptureBuildError::InternalInvariant(
+                        "quotient capture schema did not fit its published identity",
+                    )
+                })?,
+                mask_bits: PARTICIPATION_QUOTIENT_MASK_BITS,
+                reserved_overall_bits: 1,
+                state_masks: 2,
+                retained_offsets: 0,
+                algorithm_version: PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+                accounting_version: PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
+                declared_prepublication_fallback:
+                    CaptureParticipationQuotientFallback::PersistentHistory,
+            })
+        } else {
+            None
+        };
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
@@ -1868,6 +1953,8 @@ impl CaptureBuilder {
                 CapturePlanKind::UniformPrefixClassParticipation
             } else if uniform_participating_captures.is_some() {
                 CapturePlanKind::LinearSelectorUniformParticipation
+            } else if participation_quotient.is_some() {
+                CapturePlanKind::LinearSelectorParticipationQuotientV1
             } else {
                 CapturePlanKind::LinearSelectorPersistentHistory
             },
@@ -1930,9 +2017,10 @@ impl CaptureBuilder {
                                 CaptureCountPrepublicationFallback::SelectorUniformParticipation,
                             )
                         }
-                        CapturePlanKind::LinearSelectorPersistentHistory => {
+                        CapturePlanKind::LinearSelectorPersistentHistory
+                        | CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
                             return Err(CaptureBuildError::InternalInvariant(
-                                "uniform positive-width plan selected persistent history",
+                                "uniform positive-width plan selected a nonuniform replay",
                             ));
                         }
                     };
@@ -1949,7 +2037,8 @@ impl CaptureBuilder {
                                 selector.uniform_capture_count_route()
                             }
                             CapturePlanKind::UniformPrefixClassParticipation
-                            | CapturePlanKind::LinearSelectorPersistentHistory => {
+                            | CapturePlanKind::LinearSelectorPersistentHistory
+                            | CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
                                 fre_aggregate::OperationPhysicalRoute::DenseRows
                             }
                         },
@@ -2065,6 +2154,20 @@ impl CaptureRegex {
                     .uniform_participation_prospective(haystack_len, plan.schema)
             })
             .transpose()
+    }
+
+    /// Recompute the exact source-independent envelope for one quotient
+    /// replay. Plans that retained full persistent history return `Ok(None)`.
+    pub fn participation_quotient_prospective(
+        &self,
+        span: EngineSpan,
+    ) -> Result<Option<ParticipationSearchProspective>, EngineSearchError> {
+        if self.report.plan_identity.plan == CapturePlanKind::LinearSelectorParticipationQuotientV1
+        {
+            self.engine.participation_exact_prospective(span).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Optional generic line-candidate proof built from this exact capture HIR.
@@ -2586,6 +2689,87 @@ impl CaptureRegex {
                 combined_peak_bytes: selector_accounting.peak_bytes,
             });
         }
+        self.count_nonuniform_captures(haystack, &limits, selector_limits, identity)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "the nonuniform selector and exact-span replay retain one contiguous checked accounting transaction"
+    )]
+    fn count_nonuniform_captures(
+        &self,
+        haystack: &[u8],
+        limits: &CaptureRunLimits,
+        selector_limits: SelectorOperationLimits,
+        identity: CaptureCacheIdentity,
+    ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        let use_participation_quotient = match identity.plan.plan {
+            CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+                let Some(proof) = self.report.participation_quotient_proof() else {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient lost its construction proof",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                };
+                if usize::from(proof.user_captures) != self.report.engine.captures
+                    || usize::from(proof.user_captures) > PARTICIPATION_QUOTIENT_CAPTURE_BITS
+                    || proof.mask_bits != PARTICIPATION_QUOTIENT_MASK_BITS
+                    || proof.reserved_overall_bits != 1
+                    || proof.state_masks != 2
+                    || proof.retained_offsets != 0
+                    || proof.algorithm_version != PARTICIPATION_QUOTIENT_ALGORITHM_VERSION
+                    || proof.accounting_version != PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION
+                    || proof.declared_prepublication_fallback
+                        != CaptureParticipationQuotientFallback::PersistentHistory
+                {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient proof diverged from its compiled schema",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                true
+            }
+            CapturePlanKind::LinearSelectorPersistentHistory => {
+                if self.report.participation_quotient_proof().is_some()
+                    || self.report.engine.captures <= PARTICIPATION_QUOTIENT_CAPTURE_BITS
+                {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "persistent-history fallback diverged from quotient eligibility",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                false
+            }
+            CapturePlanKind::OrderedRootCaptureManyCount
+            | CapturePlanKind::UniformPrefixClassParticipation
+            | CapturePlanKind::LinearSelectorUniformParticipation => {
+                return Err(CaptureExecutionError {
+                    identity,
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "nonuniform Count reached an incompatible compiled plan",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                });
+            }
+        };
         let selected = self
             .selector
             .admit_spans(
@@ -2625,6 +2809,20 @@ impl CaptureRegex {
             peak_threads: 0,
         };
         let mut capture_events = 0_usize;
+        let all_groups =
+            self.report
+                .engine
+                .captures
+                .checked_add(1)
+                .ok_or_else(|| CaptureExecutionError {
+                    identity: identity.clone(),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "capture schema overflowed usize",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                })?;
         let window = Window::all(haystack);
         for selected_span in selected.as_slice() {
             if selected_span.start == selected_span.end {
@@ -2671,13 +2869,151 @@ impl CaptureRegex {
                 start: selected_span.start,
                 end: selected_span.end,
             };
-            let replay = self
-                .engine
-                .captures_exact(haystack, window, span, per_search)
-                .map_err(|source| Self::history_error(&identity, source))?;
+            let (participation_mask, capture_groups, replay_report) = if use_participation_quotient
+            {
+                let replay = self
+                    .engine
+                    .captures_participation_exact(haystack, window, span, per_search)
+                    .map_err(|source| Self::history_error(&identity, source))?;
+                if !replay.prospective.closes_report(&replay.report) {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient report did not close its prospective",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                let participating =
+                    replay
+                        .participating_captures
+                        .ok_or_else(|| CaptureExecutionError {
+                            identity: identity.clone(),
+                            source: CaptureExecutionSource::InternalInvariant(
+                                "selector-certified span produced no quotient winner",
+                            ),
+                            selector_receipt: None,
+                            prefix_class_participation_receipt: None,
+                            count_receipt: None,
+                        })?;
+                if participating > self.report.engine.captures {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient exceeded the compiled capture schema",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                let participation_mask =
+                    replay
+                        .participation_mask
+                        .ok_or_else(|| CaptureExecutionError {
+                            identity: identity.clone(),
+                            source: CaptureExecutionSource::InternalInvariant(
+                                "selector-certified span produced no quotient mask",
+                            ),
+                            selector_receipt: None,
+                            prefix_class_participation_receipt: None,
+                            count_receipt: None,
+                        })?;
+                if all_groups > usize::from(PARTICIPATION_QUOTIENT_MASK_BITS) {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient exceeded its fixed mask width",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                let allowed_mask = if all_groups == usize::from(PARTICIPATION_QUOTIENT_MASK_BITS) {
+                    u64::MAX
+                } else {
+                    let shift = u32::try_from(all_groups).map_err(|_| CaptureExecutionError {
+                        identity: identity.clone(),
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient mask shift exceeded u32",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    })?;
+                    1_u64
+                        .checked_shl(shift)
+                        .and_then(|value| value.checked_sub(1))
+                        .ok_or_else(|| CaptureExecutionError {
+                            identity: identity.clone(),
+                            source: CaptureExecutionSource::InternalInvariant(
+                                "participation quotient mask construction overflowed",
+                            ),
+                            selector_receipt: None,
+                            prefix_class_participation_receipt: None,
+                            count_receipt: None,
+                        })?
+                };
+                let mask_participating =
+                    usize::try_from((participation_mask & !1_u64).count_ones()).map_err(|_| {
+                        CaptureExecutionError {
+                            identity: identity.clone(),
+                            source: CaptureExecutionSource::InternalInvariant(
+                                "participation quotient mask count exceeded usize",
+                            ),
+                            selector_receipt: None,
+                            prefix_class_participation_receipt: None,
+                            count_receipt: None,
+                        }
+                    })?;
+                if participation_mask & 1 == 0
+                    || participation_mask & !allowed_mask != 0
+                    || mask_participating != participating
+                {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "participation quotient mask diverged from the compiled schema",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                (Some(participation_mask), None, replay.report)
+            } else {
+                let replay = self
+                    .engine
+                    .captures_exact(haystack, window, span, per_search)
+                    .map_err(|source| Self::history_error(&identity, source))?;
+                let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
+                    identity: identity.clone(),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "selector-certified span produced no tagged winner",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                })?;
+                if captures.groups.len() != all_groups {
+                    return Err(CaptureExecutionError {
+                        identity,
+                        source: CaptureExecutionSource::InternalInvariant(
+                            "persistent-history replay diverged from the capture schema",
+                        ),
+                        selector_receipt: None,
+                        prefix_class_participation_receipt: None,
+                        count_receipt: None,
+                    });
+                }
+                (None, Some(captures.groups), replay.report)
+            };
             let replay_combined_peak = selector_accounting
                 .output_bytes
-                .checked_add(replay.report.admitted_scratch_bytes)
+                .checked_add(replay_report.admitted_scratch_bytes)
                 .ok_or_else(|| CaptureExecutionError {
                     identity: identity.clone(),
                     source: CaptureExecutionSource::InternalInvariant(
@@ -2688,53 +3024,74 @@ impl CaptureRegex {
                     count_receipt: None,
                 })?;
             combined_peak_bytes = combined_peak_bytes.max(replay_combined_peak);
-            let captures = replay.captures.ok_or_else(|| CaptureExecutionError {
-                identity: identity.clone(),
-                source: CaptureExecutionSource::InternalInvariant(
-                    "selector-certified span produced no tagged winner",
-                ),
-                selector_receipt: None,
-                prefix_class_participation_receipt: None,
-                count_receipt: None,
-            })?;
             accounting.total_state_visits = checked_capture_add(
                 &identity,
                 accounting.total_state_visits,
-                replay.report.state_visits,
+                replay_report.state_visits,
                 EngineResource::AggregateStateVisits,
                 limits.aggregate.max_total_state_visits,
             )?;
             accounting.total_history_nodes = checked_capture_add(
                 &identity,
                 accounting.total_history_nodes,
-                replay.report.history_nodes,
+                replay_report.history_nodes,
                 EngineResource::AggregateHistoryNodes,
                 limits.aggregate.max_total_history_nodes,
             )?;
             accounting.total_history_walk = checked_capture_add(
                 &identity,
                 accounting.total_history_walk,
-                replay.report.history_walk,
+                replay_report.history_walk,
                 EngineResource::AggregateHistoryWalk,
                 limits.aggregate.max_total_history_walk,
             )?;
-            accounting.peak_threads = accounting.peak_threads.max(replay.report.peak_threads);
-            for group in captures.groups {
-                capture_events = checked_capture_add(
-                    &identity,
-                    capture_events,
-                    1,
-                    EngineResource::CaptureEvents,
-                    limits.aggregate.max_capture_events,
-                )?;
-                if group.span.is_some() {
-                    accounting.count = checked_capture_add(
+            accounting.peak_threads = accounting.peak_threads.max(replay_report.peak_threads);
+            if let Some(mask) = participation_mask {
+                for group_index in 0..all_groups {
+                    capture_events = checked_capture_add(
                         &identity,
-                        accounting.count,
+                        capture_events,
                         1,
-                        EngineResource::CaptureCount,
-                        limits.aggregate.max_capture_count,
+                        EngineResource::CaptureEvents,
+                        limits.aggregate.max_capture_events,
                     )?;
+                    if mask & (1_u64 << group_index) != 0 {
+                        accounting.count = checked_capture_add(
+                            &identity,
+                            accounting.count,
+                            1,
+                            EngineResource::CaptureCount,
+                            limits.aggregate.max_capture_count,
+                        )?;
+                    }
+                }
+            } else {
+                let groups = capture_groups.ok_or_else(|| CaptureExecutionError {
+                    identity: identity.clone(),
+                    source: CaptureExecutionSource::InternalInvariant(
+                        "persistent-history replay lost its group participation",
+                    ),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                })?;
+                for group in groups {
+                    capture_events = checked_capture_add(
+                        &identity,
+                        capture_events,
+                        1,
+                        EngineResource::CaptureEvents,
+                        limits.aggregate.max_capture_events,
+                    )?;
+                    if group.span.is_some() {
+                        accounting.count = checked_capture_add(
+                            &identity,
+                            accounting.count,
+                            1,
+                            EngineResource::CaptureCount,
+                            limits.aggregate.max_capture_count,
+                        )?;
+                    }
                 }
             }
         }

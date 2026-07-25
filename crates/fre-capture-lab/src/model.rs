@@ -1,5 +1,14 @@
 //! Canonical capture records and execution reports.
 
+/// Maximum user-capture schema admitted by the fixed participation quotient.
+///
+/// One bit is reserved for group zero in each 64-bit state mask. Larger
+/// schemas retain the generic persistent-history route.
+pub const PARTICIPATION_QUOTIENT_CAPTURE_BITS: usize = 63;
+
+/// Fixed width of each capture-participation state mask.
+pub const PARTICIPATION_QUOTIENT_MASK_BITS: u8 = 64;
+
 /// A half-open byte span in the original haystack.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Span {
@@ -131,6 +140,9 @@ pub enum CandidateKind {
     InlineSlots,
     /// Ordered Pike-style threads with persistent capture histories.
     PersistentHistory,
+    /// Ordered Pike-style threads retaining only the quotient of tagged
+    /// histories observable by capture-participation aggregation.
+    ParticipationQuotient,
 }
 
 /// Checked resource accounting for one search.
@@ -161,6 +173,65 @@ pub struct RunReport {
 pub struct SearchOutcome {
     /// Canonical captures, or `None` when there is no match.
     pub captures: Option<CaptureRecord>,
+    /// Exact logical accounting plus the conservative scratch bound.
+    pub report: RunReport,
+}
+
+/// Source-independent envelope for one aggregate-only exact-span replay.
+///
+/// The executor retains one fixed-width participation mask per live thread.
+/// It never allocates tag-history nodes or materializes capture offsets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParticipationSearchProspective {
+    /// Maximum Thompson state visits.
+    pub state_visits: usize,
+    /// Exact number of roots injected by an exact-span replay.
+    pub starts_injected: usize,
+    /// Maximum input bytes advanced over.
+    pub bytes_examined: usize,
+    /// Maximum simultaneously live consuming/match threads.
+    pub peak_threads: usize,
+    /// Capture-slot copies retained by the quotient.
+    pub slot_copies: usize,
+    /// Persistent history nodes retained by the quotient.
+    pub history_nodes: usize,
+    /// Persistent history nodes walked by the quotient.
+    pub history_walk: usize,
+    /// Conservative dynamic scratch bound.
+    pub scratch_bytes: usize,
+}
+
+impl ParticipationSearchProspective {
+    /// Whether an exact replay report closes this source-independent
+    /// prospective envelope.
+    #[must_use]
+    pub const fn closes_report(self, report: &RunReport) -> bool {
+        matches!(report.candidate, CandidateKind::ParticipationQuotient)
+            && report.state_visits <= self.state_visits
+            && report.slot_copies == self.slot_copies
+            && report.history_nodes == self.history_nodes
+            && report.history_walk == self.history_walk
+            && report.starts_injected == self.starts_injected
+            && report.bytes_examined == self.bytes_examined
+            && report.peak_threads <= self.peak_threads
+            && report.admitted_scratch_bytes == self.scratch_bytes
+    }
+}
+
+/// Result of one aggregate-only exact-span replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipationSearchOutcome {
+    /// Number of participating user captures, excluding group zero, or
+    /// `None` when the requested span is not in the pattern's language.
+    pub participating_captures: Option<usize>,
+    /// Exact participating-group mask, including group zero in bit zero, or
+    /// `None` when the requested span is not in the pattern's language.
+    ///
+    /// This retains numeric group order so aggregate accounting can preserve
+    /// the full-history route's interleaved event/count failure priority.
+    pub participation_mask: Option<u64>,
+    /// Source-independent envelope admitted before source execution.
+    pub prospective: ParticipationSearchProspective,
     /// Exact logical accounting plus the conservative scratch bound.
     pub report: RunReport,
 }

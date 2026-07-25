@@ -920,7 +920,7 @@ fn nullable_and_history_count_routes_remain_outside_the_owner_seal() {
         .expect("history build");
     assert_eq!(
         history.build_report().plan_identity.plan,
-        CapturePlanKind::LinearSelectorPersistentHistory
+        CapturePlanKind::LinearSelectorParticipationQuotientV1
     );
     let history_report = history
         .count_captures(b"ab a", CaptureRunLimits::default())

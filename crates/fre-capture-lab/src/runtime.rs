@@ -8,7 +8,7 @@ use crate::error::{ResourceKind, SearchError};
 use crate::limits::SearchLimits;
 use crate::model::{
     CaptureRecord, GroupRecord, HistoryProgramShape, HistorySearchProspective,
-    RestartedHistoryProspective, Span, Window,
+    ParticipationSearchProspective, RestartedHistoryProspective, Span, Window,
 };
 
 pub(crate) const HISTORY_CHUNK_CAPACITY: usize = 16_384;
@@ -496,6 +496,74 @@ pub(crate) fn admit_history_exact(
         .and_then(|length| length.checked_add(1))
         .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
     admit_history_boundaries(program, boundaries, limits)
+}
+
+pub(crate) fn participation_exact_prospective(
+    program: &Program,
+    span: Span,
+    thread_bytes: usize,
+) -> Result<ParticipationSearchProspective, SearchError> {
+    if span.start > span.end {
+        return Err(SearchError::InvalidWindow);
+    }
+    let boundaries = span
+        .end
+        .checked_sub(span.start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::StateVisits))?;
+    let state_visits = state_visit_bound(program, boundaries)?;
+    let thread_cells = program
+        .states
+        .len()
+        .checked_mul(3)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let threads = thread_cells
+        .checked_mul(thread_bytes)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let seen = program
+        .states
+        .len()
+        .checked_mul(size_of::<usize>())
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    // `current`, `next`, `stack`, and `seen` are the only dynamic
+    // containers. Participation masks live inline in each thread.
+    let container_headers = size_of::<Vec<usize>>()
+        .checked_mul(4)
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    let scratch_bytes = threads
+        .checked_add(seen)
+        .and_then(|bytes| bytes.checked_add(container_headers))
+        .ok_or(SearchError::BoundOverflow(ResourceKind::ScratchBytes))?;
+    Ok(ParticipationSearchProspective {
+        state_visits,
+        starts_injected: 1,
+        bytes_examined: boundaries.saturating_sub(1),
+        peak_threads: program.states.len(),
+        slot_copies: 0,
+        history_nodes: 0,
+        history_walk: 0,
+        scratch_bytes,
+    })
+}
+
+pub(crate) fn admit_participation_exact(
+    program: &Program,
+    span: Span,
+    thread_bytes: usize,
+    limits: SearchLimits,
+) -> Result<ParticipationSearchProspective, SearchError> {
+    let prospective = participation_exact_prospective(program, span, thread_bytes)?;
+    check(
+        ResourceKind::StateVisits,
+        prospective.state_visits,
+        limits.max_state_visits,
+    )?;
+    check(
+        ResourceKind::ScratchBytes,
+        prospective.scratch_bytes,
+        limits.max_scratch_bytes,
+    )?;
+    Ok(prospective)
 }
 
 fn admit_history_boundaries(
