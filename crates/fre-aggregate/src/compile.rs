@@ -614,6 +614,7 @@ pub struct CompiledRegex {
     pub(crate) url_aggregate: Option<fre_kernels::UrlAggregatePlan>,
     pub(crate) state_byte_span_sum: Option<StateByteSpanSumPlan>,
     pub(crate) required_suffixes: RequiredSuffixes,
+    pub(crate) required_literals: RequiredLiteralSets,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     pub(crate) terminal_frontier: TerminalFrontierSeed,
     /// Authenticated whole-match byte minimum from the same canonical HIR.
@@ -675,6 +676,63 @@ impl StateByteSpanSumPlan {
         match self.topology {
             StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 1,
             StateByteSpanSumTopology::DisjointRunsLiteral => 2,
+        }
+    }
+}
+
+const MAX_REQUIRED_LITERAL_SETS: usize = 4;
+
+/// Bounded canonical-HIR proof used only to reject a source that cannot match.
+///
+/// Each nonzero set is an independent theorem: every match consumes at least
+/// one ASCII byte in that set. Concatenation retains independent theorems in
+/// source order; alternation conservatively unions one theorem from every
+/// arm. Unsupported or non-ASCII forms simply retain no theorem.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredLiteralSets {
+    sets: [u128; MAX_REQUIRED_LITERAL_SETS],
+    len: u8,
+}
+
+impl RequiredLiteralSets {
+    const fn empty() -> Self {
+        Self {
+            sets: [0; MAX_REQUIRED_LITERAL_SETS],
+            len: 0,
+        }
+    }
+
+    const fn retained_bytes() -> usize {
+        core::mem::size_of::<Self>()
+    }
+
+    pub(crate) fn len(self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub(crate) const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = u128> {
+        self.sets.into_iter().take(self.len())
+    }
+
+    fn push(&mut self, set: u128) {
+        if set == 0 || self.iter().any(|existing| existing == set) {
+            return;
+        }
+        let index = self.len();
+        if index == MAX_REQUIRED_LITERAL_SETS {
+            return;
+        }
+        self.sets[index] = set;
+        self.len = self.len.saturating_add(1);
+    }
+
+    fn append(&mut self, other: Self) {
+        for set in other.iter() {
+            self.push(set);
         }
     }
 }
@@ -1083,6 +1141,7 @@ impl CompiledRegex {
         };
         let (
             required_suffixes,
+            required_literals,
             required_internal_anchor,
             terminal_frontier,
             mut start_domain,
@@ -1194,6 +1253,7 @@ impl CompiledRegex {
         program.start_domain = start_domain;
         let mut plan_id = finalize_program(&mut program, profile, terminal_frontier, budget)?;
         plan_id = bind_start_domain_identity(plan_id, start_domain, budget)?;
+        plan_id = bind_required_literal_identity(plan_id, required_literals, budget)?;
         if let Some(candidate) = &candidate {
             plan_id = bind_candidate_identity(plan_id, candidate, budget)?;
         }
@@ -1218,6 +1278,7 @@ impl CompiledRegex {
             url_aggregate,
             state_byte_span_sum,
             required_suffixes,
+            required_literals,
             required_internal_anchor,
             terminal_frontier,
             minimum_match_bytes,
@@ -2967,6 +3028,15 @@ const fn candidate_byte_weight(byte: u8) -> u8 {
     }
 }
 
+type RetainedComponents = (
+    RequiredSuffixes,
+    RequiredLiteralSets,
+    Option<fre_kernels::RequiredInternalAnchorPlan>,
+    TerminalFrontierSeed,
+    StartDomain,
+    usize,
+);
+
 #[allow(
     clippy::too_many_lines,
     reason = "retained execution seeds are constructed and charged in one auditable accounting scope"
@@ -2976,20 +3046,14 @@ fn build_retained_components(
     profile: RustByteProfile,
     limits: CompileLimits,
     budget: &mut CompileBudget,
-) -> Result<
-    (
-        RequiredSuffixes,
-        Option<fre_kernels::RequiredInternalAnchorPlan>,
-        TerminalFrontierSeed,
-        StartDomain,
-        usize,
-    ),
-    Error,
-> {
+) -> Result<RetainedComponents, Error> {
     let seed_start_bytes = budget.current_construction_bytes;
     let (required_suffixes, terminal_frontier) = execution_seeds(hir, profile, budget)?;
+    let required_literals = analyze_required_literal_sets(hir, budget)?;
     budget.accounting.required_suffixes = required_suffixes.ends.len();
     budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
+    budget.accounting.required_literal_sets = required_literals.len();
+    budget.accounting.required_literal_proof_bytes = RequiredLiteralSets::retained_bytes();
     budget.accounting.terminal_frontier_prefix_bytes = terminal_frontier.prefix_len;
     budget.accounting.terminal_frontier_bytes = terminal_frontier.terminals.len;
     let minimum_match_bytes_proof_bytes = core::mem::size_of::<Option<usize>>();
@@ -3000,6 +3064,16 @@ fn build_retained_components(
     }
     budget.record_initialization(minimum_match_bytes_proof_bytes, false)?;
     budget.charge(1)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(RequiredLiteralSets::retained_bytes())?;
+        budget.acquire_checked_construction_bytes(RequiredLiteralSets::retained_bytes())?;
+    }
+    budget.record_initialization(RequiredLiteralSets::retained_bytes(), false)?;
+    budget.record_copy(mul(
+        required_literals.len(),
+        core::mem::size_of::<u128>(),
+        Resource::ProgramBytes,
+    )?)?;
     let start_domain = mandatory_start_domain(hir);
     let start_domain_proof_bytes = core::mem::size_of::<StartDomain>();
     budget.accounting.start_domain_proof_bytes =
@@ -3019,7 +3093,11 @@ fn build_retained_components(
         )?,
         add(
             minimum_match_bytes_proof_bytes,
-            start_domain_proof_bytes,
+            add(
+                start_domain_proof_bytes,
+                RequiredLiteralSets::retained_bytes(),
+                Resource::ProgramBytes,
+            )?,
             Resource::ProgramBytes,
         )?,
         Resource::ProgramBytes,
@@ -3106,11 +3184,96 @@ fn build_retained_components(
     )?;
     Ok((
         required_suffixes,
+        required_literals,
         required_internal_anchor,
         terminal_frontier,
         start_domain,
         retained_program_bytes,
     ))
+}
+
+fn analyze_required_literal_sets(
+    hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<RequiredLiteralSets, Error> {
+    budget.charge(1)?;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => Ok(RequiredLiteralSets::empty()),
+        HirKind::Literal(regex_syntax::hir::Literal(bytes)) => {
+            let mut proof = RequiredLiteralSets::empty();
+            budget.charge(bytes.len())?;
+            if let Some(&byte) = bytes.iter().find(|&&byte| byte.is_ascii()) {
+                proof.push(1_u128 << byte);
+            }
+            Ok(proof)
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            let mut set = 0_u128;
+            for range in class.ranges() {
+                budget.charge(1)?;
+                if !range.end().is_ascii() {
+                    return Ok(RequiredLiteralSets::empty());
+                }
+                for byte in range.start()..=range.end() {
+                    budget.charge(1)?;
+                    set |= 1_u128 << byte;
+                }
+            }
+            let mut proof = RequiredLiteralSets::empty();
+            proof.push(set);
+            Ok(proof)
+        }
+        HirKind::Class(Class::Unicode(class)) => {
+            let mut set = 0_u128;
+            for range in class.ranges() {
+                budget.charge(1)?;
+                if !range.end().is_ascii() {
+                    return Ok(RequiredLiteralSets::empty());
+                }
+                for scalar in u32::from(range.start())..=u32::from(range.end()) {
+                    budget.charge(1)?;
+                    let byte = u8::try_from(scalar).map_err(|_| {
+                        Error::InternalInvariant(
+                            "ASCII required-literal scalar did not fit one byte",
+                        )
+                    })?;
+                    set |= 1_u128 << byte;
+                }
+            }
+            let mut proof = RequiredLiteralSets::empty();
+            proof.push(set);
+            Ok(proof)
+        }
+        HirKind::Capture(capture) => analyze_required_literal_sets(&capture.sub, budget),
+        HirKind::Repetition(repetition) => {
+            if repetition.min == 0 {
+                Ok(RequiredLiteralSets::empty())
+            } else {
+                analyze_required_literal_sets(&repetition.sub, budget)
+            }
+        }
+        HirKind::Concat(parts) => {
+            let mut proof = RequiredLiteralSets::empty();
+            for part in parts {
+                proof.append(analyze_required_literal_sets(part, budget)?);
+            }
+            Ok(proof)
+        }
+        HirKind::Alternation(branches) => {
+            let mut union = 0_u128;
+            for branch in branches {
+                budget.charge(1)?;
+                let branch = analyze_required_literal_sets(branch, budget)?;
+                let Some(set) = branch.iter().min_by_key(|set| set.count_ones()) else {
+                    return Ok(RequiredLiteralSets::empty());
+                };
+                union |= set;
+            }
+            let mut proof = RequiredLiteralSets::empty();
+            proof.push(union);
+            Ok(proof)
+        }
+    }
 }
 
 fn mandatory_start_domain(hir: &Hir) -> StartDomain {
@@ -3243,6 +3406,8 @@ impl CompileBudget {
                 look_assertions: 0,
                 required_suffixes: 0,
                 required_suffix_bytes: 0,
+                required_literal_sets: 0,
+                required_literal_proof_bytes: 0,
                 required_internal_anchors: 0,
                 required_internal_anchor_bytes: 0,
                 required_internal_anchor_optional_stages: 0,
@@ -5747,6 +5912,45 @@ fn bind_start_domain_identity(
     Ok(PlanId(bytes))
 }
 
+fn bind_required_literal_identity(
+    program: PlanId,
+    proof: RequiredLiteralSets,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    if proof.is_empty() {
+        return Ok(program);
+    }
+    let domain = b"fre.aggregate.required-literal-sets.v1";
+    let payload = add(
+        add(program.0.len(), domain.len(), Resource::CompileWork)?,
+        add(
+            1,
+            mul(
+                proof.len(),
+                core::mem::size_of::<u128>(),
+                Resource::CompileWork,
+            )?,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0xf194_6c72_a083_5deb);
+    let mut second = StableHash::new(0x3ad8_b501_7e6c_942f);
+    for hash in [&mut first, &mut second] {
+        hash.bytes(domain);
+        hash.bytes(&program.0);
+        hash.byte(proof.len);
+        for set in proof.iter() {
+            hash.bytes(&set.to_le_bytes());
+        }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "identity binding enumerates every resource-bearing candidate field explicitly"
@@ -6361,6 +6565,45 @@ mod tests {
             .build()
             .parse(pattern)
             .unwrap()
+    }
+
+    #[test]
+    fn required_literal_sets_are_canonical_bounded_and_work_exact() {
+        let hir = parse_bytes(r".(?P<head>[A-Z])[a-z]+(?:efgh|efij)");
+        let mut census = suffix_budget(CompileLimits::default().max_work);
+        let proof = analyze_required_literal_sets(&hir, &mut census).unwrap();
+        assert_eq!(proof.len(), 3);
+        let sets = proof.iter().collect::<Vec<_>>();
+        assert!(sets[0] & (1_u128 << b'A') != 0);
+        assert!(sets[0] & (1_u128 << b'Z') != 0);
+        assert!(sets[0] & (1_u128 << b'a') == 0);
+        assert!(sets[1] & (1_u128 << b'a') != 0);
+        assert!(sets[1] & (1_u128 << b'z') != 0);
+        assert_eq!(sets[2], 1_u128 << b'e');
+
+        let exact_work = census.accounting.work;
+        let mut exact = suffix_budget(exact_work);
+        assert_eq!(
+            analyze_required_literal_sets(&hir, &mut exact).unwrap(),
+            proof
+        );
+        let mut one_below = suffix_budget(exact_work - 1);
+        assert_eq!(
+            analyze_required_literal_sets(&hir, &mut one_below).unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                required: exact_work,
+                limit: exact_work - 1,
+            }
+        );
+
+        let nullable_arm = parse_bytes(r"(?:[A-Z]x|)");
+        let mut budget = suffix_budget(CompileLimits::default().max_work);
+        assert!(
+            analyze_required_literal_sets(&nullable_arm, &mut budget)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct TestUrlTlds<'a>(&'a [&'a [u8]]);
@@ -7283,6 +7526,9 @@ mod tests {
         let mut seed_budget = CompileBudget::new_receipt(default_limits, None);
         let _seeds = execution_seeds(&hir, profile, &mut seed_budget).unwrap();
         let seed_work = seed_budget.accounting.work;
+        let mut literal_budget = CompileBudget::new_receipt(default_limits, None);
+        let _literal_proof = analyze_required_literal_sets(&hir, &mut literal_budget).unwrap();
+        let literal_work = literal_budget.accounting.work;
         let inspection = required_internal_anchor::inspect(
             &hir,
             default_limits.max_work,
@@ -7293,7 +7539,12 @@ mod tests {
         assert!(inspection.plan.is_some());
         let exact_work = add(
             add(
-                add(prefix_work, seed_work, Resource::CompileWork).unwrap(),
+                add(
+                    add(prefix_work, seed_work, Resource::CompileWork).unwrap(),
+                    literal_work,
+                    Resource::CompileWork,
+                )
+                .unwrap(),
                 1,
                 Resource::CompileWork,
             )
@@ -7365,7 +7616,7 @@ mod tests {
         );
         assert_eq!(
             refusal.receipt.actual.work,
-            prefix_work + seed_work + 1 + local_attempt.inspection_work
+            prefix_work + seed_work + literal_work + 1 + local_attempt.inspection_work
         );
         assert!(refusal.receipt.contains_actual());
     }

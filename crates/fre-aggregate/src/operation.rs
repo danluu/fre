@@ -281,9 +281,9 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 4;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 5;
 
-/// Maximum allocation count representable by every route in accounting v4.
+/// Maximum allocation count representable by every route in accounting v5.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -479,6 +479,8 @@ impl OperationProspective {
             transition_checks,
             assertion_checks,
             root_probes,
+            required_literal_source_bytes,
+            required_literal_comparisons,
             required_anchor_candidates,
             required_anchor_scan_windows,
             required_anchor_anchor_comparisons,
@@ -529,6 +531,8 @@ impl OperationProspective {
             transition_checks,
             assertion_checks,
             root_probes,
+            required_literal_source_bytes,
+            required_literal_comparisons,
             required_anchor_candidates,
             required_anchor_scan_windows,
             required_anchor_anchor_comparisons,
@@ -1342,12 +1346,12 @@ impl CompiledRegex {
             })?;
         let requirements =
             Requirements::new::<false>(&self.program, boundaries, strategy, 1, engine_limits)?
-                .with_prefix::<false>(utf8_validation, prospective_limits)?;
+                .with_prefix::<false>(utf8_validation, utf8_validation, prospective_limits)?;
         requirements.operation_prospective(
             &self.program,
-            haystack_len,
             boundaries,
             utf8_validation,
+            RequiredLiteralScan::default(),
             OperationKind::Count,
             self.minimum_match_bytes,
         )
@@ -2222,6 +2226,26 @@ impl CompiledRegex {
         };
         let utf8_validation =
             preflight_unicode_word_utf8_bytes(&self.program, haystack.len(), prospective_limits)?;
+        let required_literal_scan_enabled = receipt_bearing
+            && forced_generic_count_route.is_none()
+            && strategy == Strategy::ReverseSequentialRows
+            && !self.required_literals.is_empty();
+        let required_literal_scan = if required_literal_scan_enabled {
+            RequiredLiteralScan::prospective(local.len(), self.required_literals.len())?
+        } else {
+            RequiredLiteralScan::default()
+        };
+        let required_literal_work = required_literal_scan.work()?;
+        let prefix_work = add(
+            utf8_validation,
+            required_literal_work,
+            Resource::ExecutionWork,
+        )?;
+        let prefix_sequential_bytes = add(
+            utf8_validation,
+            required_literal_scan.source_bytes,
+            Resource::SequentialBytes,
+        )?;
         if !receipt_bearing {
             // Preserve the incumbent continuation's established refusal
             // ordering. Only the new receipt-bearing entry point delays this
@@ -2230,14 +2254,16 @@ impl CompiledRegex {
             validate_unicode_word_utf8(haystack, utf8_validation, accounting)?;
         }
         let mut engine_limits = prospective_limits;
-        engine_limits.max_work = engine_limits.max_work.checked_sub(utf8_validation).ok_or(
-            Error::ArithmeticOverflow {
-                resource: Resource::ExecutionWork,
-            },
-        )?;
+        engine_limits.max_work =
+            engine_limits
+                .max_work
+                .checked_sub(prefix_work)
+                .ok_or(Error::ArithmeticOverflow {
+                    resource: Resource::ExecutionWork,
+                })?;
         engine_limits.max_sequential_bytes = engine_limits
             .max_sequential_bytes
-            .checked_sub(utf8_validation)
+            .checked_sub(prefix_sequential_bytes)
             .ok_or(Error::ArithmeticOverflow {
                 resource: Resource::SequentialBytes,
             })?;
@@ -2245,10 +2271,10 @@ impl CompiledRegex {
         if receipt_bearing {
             // Selection predicates may observe the caller's remaining budget,
             // but they cannot reject before the selected route publishes P.
-            selection_limits.max_work = selection_limits.max_work.saturating_sub(utf8_validation);
+            selection_limits.max_work = selection_limits.max_work.saturating_sub(prefix_work);
             selection_limits.max_sequential_bytes = selection_limits
                 .max_sequential_bytes
-                .saturating_sub(utf8_validation);
+                .saturating_sub(prefix_sequential_bytes);
         } else {
             selection_limits = engine_limits;
         }
@@ -2491,8 +2517,11 @@ impl CompiledRegex {
                 Err(error) => return Err(error),
             }
         };
-        let mut requirements =
-            requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
+        let mut requirements = requirements.with_prefix::<OBSERVED_WORK>(
+            prefix_work,
+            prefix_sequential_bytes,
+            prospective_limits,
+        )?;
         // Capture the complete structural proof before receipt publication
         // clamps P to the caller's observed-work ceiling. After that clamp,
         // comparing P to the caller limit cannot distinguish full admission
@@ -2504,14 +2533,14 @@ impl CompiledRegex {
             // cached builders whose internal meters use `Requirements`
             // directly rather than the generic per-charge caller argument.
             //
-            // UTF-8 validation is a mandatory pre-engine prefix. Preserve it
-            // in P even when the caller cannot admit it, so the limit refuses
-            // before validation reads source bytes. Only the residual engine
-            // work is clamped to the caller's residual quota.
-            let engine_work = requirements.work_bound.checked_sub(utf8_validation).ok_or(
+            // UTF-8 validation and the required-literal census are mandatory
+            // pre-engine prefixes. Preserve them in P even when the caller
+            // cannot admit them, so every represented limit refuses before
+            // either prefix reads source bytes.
+            let engine_work = requirements.work_bound.checked_sub(prefix_work).ok_or(
                 Error::InternalInvariant("operation work prefix exceeds its prospective total"),
             )?;
-            let caller_engine_work = limits.max_work.saturating_sub(utf8_validation);
+            let caller_engine_work = limits.max_work.saturating_sub(prefix_work);
             let mandatory_engine_work = requirements
                 .frontier
                 .map_or(0, terminal_frontier::FrontierRequirements::minimum_work);
@@ -2527,11 +2556,8 @@ impl CompiledRegex {
                 requirements.frontier =
                     Some(frontier.with_observed_work_limit(admitted_engine_work));
             }
-            requirements.work_bound = add(
-                utf8_validation,
-                admitted_engine_work,
-                Resource::ExecutionWork,
-            )?;
+            requirements.work_bound =
+                add(prefix_work, admitted_engine_work, Resource::ExecutionWork)?;
         }
         let prepublication_fallback = if forced_generic_count_route.is_some() {
             OperationPrepublicationFallback::None
@@ -2544,26 +2570,25 @@ impl CompiledRegex {
         } else {
             OperationPrepublicationFallback::None
         };
+        let physical_route = if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
+            OperationPhysicalRoute::OrderedRootRows
+        } else if requirements.terminal_frontier {
+            OperationPhysicalRoute::TerminalFrontierRows
+        } else if requirements.cached_frontier.is_some() {
+            OperationPhysicalRoute::CachedFrontier
+        } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
+            OperationPhysicalRoute::RequiredSuffixRows
+        } else {
+            OperationPhysicalRoute::DenseRows
+        };
         if let Some(publication) = attempt.as_mut() {
-            let physical_route =
-                if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
-                    OperationPhysicalRoute::OrderedRootRows
-                } else if requirements.terminal_frontier {
-                    OperationPhysicalRoute::TerminalFrontierRows
-                } else if requirements.cached_frontier.is_some() {
-                    OperationPhysicalRoute::CachedFrontier
-                } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
-                    OperationPhysicalRoute::RequiredSuffixRows
-                } else {
-                    OperationPhysicalRoute::DenseRows
-                };
             publication.identity.physical_route = Some(physical_route);
             publication.identity.prepublication_fallback = prepublication_fallback;
             let prospective = requirements.operation_prospective(
                 &self.program,
-                local.len(),
                 boundaries,
                 utf8_validation,
+                required_literal_scan,
                 kind,
                 self.minimum_match_bytes,
             )?;
@@ -2580,6 +2605,48 @@ impl CompiledRegex {
         }
         if receipt_bearing {
             validate_unicode_word_utf8(haystack, utf8_validation, accounting)?;
+        }
+        if required_literal_scan_enabled {
+            let observed = scan_required_literals(self, local, accounting)?;
+            if !observed.all_present {
+                validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
+                let certificate = OperationCertificate {
+                    regex_plan_id: self.plan_id(),
+                    operation_limits_id: operation_limits_identity(limits),
+                    strategy,
+                    operation: operation_attempt_kind(kind),
+                    physical_route,
+                    algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+                    accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+                    prepublication_fallback,
+                    prospective_allocations: compact_operation_allocation_count(
+                        requirements.operation_allocation_bound(kind)?,
+                    )?,
+                    actual_allocations: 0,
+                    range,
+                    states: self.program.insts.len(),
+                    table_cells: requirements.table_cells,
+                    row_storage: requirements.row_storage,
+                    row_record_bytes: requirements.record_bytes,
+                    terminal_frontier: requirements.terminal_frontier,
+                    work_bound: requirements.work_bound,
+                    random_access_bytes: 0,
+                    scratch_bytes: 0,
+                    log_bytes: 0,
+                    sequential_bytes_bound: requirements.sequential_bound,
+                    match_events: 0,
+                    output_matches: 0,
+                    output_bytes: 0,
+                    span_sum: 0,
+                    peak_bytes: 0,
+                };
+                return Ok(ExecutionResult {
+                    certificate,
+                    accounting: *accounting,
+                    summary: ScanSummary::empty(),
+                    spans: Vec::new(),
+                });
+            }
         }
         let mut engine = if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
             Engine::build_ordered_root::<OBSERVED_WORK>(
@@ -2704,17 +2771,6 @@ impl CompiledRegex {
         }
         validate_admitted_work(accounting, requirements.work_bound, limits.max_work)?;
         accounting.emitted_matches = summary.matches;
-        let physical_route = if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
-            OperationPhysicalRoute::OrderedRootRows
-        } else if requirements.terminal_frontier {
-            OperationPhysicalRoute::TerminalFrontierRows
-        } else if requirements.cached_frontier.is_some() {
-            OperationPhysicalRoute::CachedFrontier
-        } else if matches!(sparse_seed, Some(SparseSeed::RequiredSuffixes(_))) {
-            OperationPhysicalRoute::RequiredSuffixRows
-        } else {
-            OperationPhysicalRoute::DenseRows
-        };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
             operation_limits_id: operation_limits_identity(limits),
@@ -4024,6 +4080,79 @@ fn validate_unicode_word_utf8(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RequiredLiteralScan {
+    source_bytes: usize,
+    comparisons: usize,
+    all_present: bool,
+}
+
+impl RequiredLiteralScan {
+    fn prospective(source_bytes: usize, sets: usize) -> Result<Self, Error> {
+        Ok(Self {
+            source_bytes,
+            comparisons: mul(source_bytes, sets, Resource::ExecutionWork)?,
+            all_present: false,
+        })
+    }
+
+    fn work(self) -> Result<usize, Error> {
+        add(self.source_bytes, self.comparisons, Resource::ExecutionWork)
+    }
+}
+
+fn scan_required_literals(
+    compiled: &CompiledRegex,
+    haystack: &[u8],
+    accounting: &mut ExecutionAccounting,
+) -> Result<RequiredLiteralScan, Error> {
+    let set_count = compiled.required_literals.len();
+    if set_count == 0 {
+        return Ok(RequiredLiteralScan {
+            all_present: true,
+            ..RequiredLiteralScan::default()
+        });
+    }
+    let all_seen = (1_u8 << set_count).wrapping_sub(1);
+    let mut seen = 0_u8;
+    let mut source_bytes = 0_usize;
+    let mut comparisons = 0_usize;
+    for &byte in haystack {
+        source_bytes = add(source_bytes, 1, Resource::SequentialBytes)?;
+        for (index, set) in compiled.required_literals.iter().enumerate() {
+            comparisons = add(comparisons, 1, Resource::ExecutionWork)?;
+            if byte.is_ascii() && set & (1_u128 << byte) != 0 {
+                seen |= 1_u8 << index;
+            }
+        }
+        if seen == all_seen {
+            break;
+        }
+    }
+    let work = add(source_bytes, comparisons, Resource::ExecutionWork)?;
+    accounting.required_literal_source_bytes = add(
+        accounting.required_literal_source_bytes,
+        source_bytes,
+        Resource::ExecutionWork,
+    )?;
+    accounting.required_literal_comparisons = add(
+        accounting.required_literal_comparisons,
+        comparisons,
+        Resource::ExecutionWork,
+    )?;
+    accounting.sequential_bytes_read = add(
+        accounting.sequential_bytes_read,
+        source_bytes,
+        Resource::SequentialBytes,
+    )?;
+    accounting.work = add(accounting.work, work, Resource::ExecutionWork)?;
+    Ok(RequiredLiteralScan {
+        source_bytes,
+        comparisons,
+        all_present: seen == all_seen,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ScanSummary {
     matches: usize,
@@ -4090,12 +4219,15 @@ impl Requirements {
     fn operation_prospective(
         self,
         program: &Program,
-        input_bytes: usize,
         boundaries: usize,
         utf8_validation: usize,
+        required_literal_scan: RequiredLiteralScan,
         kind: OperationKind,
         minimum_match_bytes: Option<usize>,
     ) -> Result<OperationProspective, Error> {
+        let input_bytes = boundaries.checked_sub(1).ok_or(Error::InternalInvariant(
+            "operation prospective requires the terminal input boundary",
+        ))?;
         let event_passes = if kind == OperationKind::Spans { 2 } else { 1 };
         let nonempty_span_matches = match (kind, minimum_match_bytes) {
             (OperationKind::Spans, Some(minimum)) if minimum > 0 => Some(
@@ -4168,6 +4300,8 @@ impl Requirements {
             transition_checks: work,
             assertion_checks: work,
             root_probes: work,
+            required_literal_source_bytes: required_literal_scan.source_bytes,
+            required_literal_comparisons: required_literal_scan.comparisons,
             required_anchor_candidates: 0,
             required_anchor_scan_windows: 0,
             required_anchor_anchor_comparisons: 0,
@@ -4257,13 +4391,18 @@ impl Requirements {
     fn with_prefix<const OBSERVED_WORK: bool>(
         mut self,
         work: usize,
+        sequential_bytes: usize,
         limits: OperationLimits,
     ) -> Result<Self, Error> {
         self.work_bound = add(self.work_bound, work, Resource::ExecutionWork)?;
         if !OBSERVED_WORK {
             enforce(self.work_bound, limits.max_work, Resource::ExecutionWork)?;
         }
-        self.sequential_bound = add(self.sequential_bound, work, Resource::SequentialBytes)?;
+        self.sequential_bound = add(
+            self.sequential_bound,
+            sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
         enforce(
             self.sequential_bound,
             limits.max_sequential_bytes,
@@ -8068,21 +8207,29 @@ fn validate_admitted_work(
         accounting.utf8_validation_work,
         add(
             add(
-                add(
-                    accounting.state_evaluations,
-                    accounting.transition_checks,
-                    Resource::ExecutionWork,
-                )?,
-                accounting.root_probes,
+                accounting.required_literal_source_bytes,
+                accounting.required_literal_comparisons,
                 Resource::ExecutionWork,
             )?,
             add(
                 add(
-                    accounting.replay_steps,
-                    accounting.successful_paths,
+                    add(
+                        accounting.state_evaluations,
+                        accounting.transition_checks,
+                        Resource::ExecutionWork,
+                    )?,
+                    accounting.root_probes,
                     Resource::ExecutionWork,
                 )?,
-                accounting.frontier_bookkeeping,
+                add(
+                    add(
+                        accounting.replay_steps,
+                        accounting.successful_paths,
+                        Resource::ExecutionWork,
+                    )?,
+                    accounting.frontier_bookkeeping,
+                    Resource::ExecutionWork,
+                )?,
                 Resource::ExecutionWork,
             )?,
             Resource::ExecutionWork,
@@ -8780,6 +8927,174 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn required_literal_regex(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(compiled.required_literals.len() >= 2);
+        compiled
+    }
+
+    #[test]
+    fn required_literal_miss_precedes_reverse_rows_with_complete_receipts() {
+        let haystack = b"bcdefghijklmnopq".repeat(500);
+        for pattern in [r".[A-Z][a-z]+efghijklmnopq", r".[a-z]+[A-Z]efghijklmnopq"] {
+            let compiled = required_literal_regex(pattern);
+            let admitted = compiled
+                .span_sum_value_with_receipt(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(admitted.value, 0);
+            assert!(admitted.receipt.authenticates_success());
+            assert_eq!(admitted.receipt.actual_allocations, 0);
+            assert_eq!(
+                admitted.receipt.actual.required_literal_source_bytes,
+                haystack.len()
+            );
+            assert!(
+                admitted.receipt.actual.required_literal_comparisons
+                    >= haystack.len().checked_mul(2).unwrap()
+            );
+            assert_eq!(admitted.receipt.actual.state_evaluations, 0);
+            assert_eq!(admitted.receipt.actual.random_access_bytes_read, 0);
+            assert_eq!(admitted.receipt.actual.log_bytes, 0);
+            let prospective = admitted.receipt.prospective.unwrap();
+            assert!(prospective.contains(admitted.receipt.actual));
+            assert_eq!(
+                prospective.accounting.required_literal_source_bytes,
+                haystack.len()
+            );
+
+            let work_one_below = compiled
+                .span_sum_value_with_receipt(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_work: admitted.receipt.actual.work - 1,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                work_one_below.source,
+                Error::ResourceLimit {
+                    resource: Resource::ExecutionWork,
+                    ..
+                }
+            ));
+            assert_eq!(
+                work_one_below.receipt.actual,
+                ExecutionAccounting::default()
+            );
+            assert!(
+                work_one_below
+                    .receipt
+                    .authenticates_source(&work_one_below.source)
+            );
+
+            let sequential_one_below = compiled
+                .span_sum_value_with_receipt(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_sequential_bytes: prospective.sequential_bytes - 1,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                sequential_one_below.source,
+                Error::ResourceLimit {
+                    resource: Resource::SequentialBytes,
+                    ..
+                }
+            ));
+            assert_eq!(
+                sequential_one_below.receipt.actual,
+                ExecutionAccounting::default()
+            );
+            assert!(
+                sequential_one_below
+                    .receipt
+                    .authenticates_source(&sequential_one_below.source)
+            );
+        }
+    }
+
+    #[test]
+    fn required_literal_hit_preserves_count_span_sum_and_span_priority() {
+        let pattern = r".[A-Z][a-z]+efghijklmnopq";
+        let haystack = b"--_Qzzefghijklmnopq--_Axyefghijklmnopq--";
+        let compiled = required_literal_regex(pattern);
+        let reference = RegexBuilder::new(pattern).build().unwrap();
+        let expected = reference
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let expected_sum = expected
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+
+        let count = compiled
+            .admit_count_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(count.admitted.value(), expected.len());
+        assert!(count.receipt.authenticates_success());
+        assert!(count.receipt.actual.required_literal_source_bytes > 0);
+        assert!(count.receipt.actual.state_evaluations > 0);
+
+        let sum = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(sum.value, expected_sum);
+        assert!(sum.receipt.authenticates_success());
+
+        let spans = compiled
+            .admit_spans_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            spans
+                .admitted
+                .as_slice()
+                .iter()
+                .map(|span| (span.start, span.end))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(spans.receipt.authenticates_success());
     }
 
     fn assert_start_domain_range_parity(
@@ -9488,7 +9803,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v4_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+    fn accounting_v5_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
         let compiled = terminal_frontier_count();
         let haystack = b"no terminal prefix here";
         let limits = OperationLimits::default();
@@ -9590,7 +9905,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v4_allocation_encoding_is_checked_at_its_route_maximum() {
+    fn accounting_v5_allocation_encoding_is_checked_at_its_route_maximum() {
         for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
             assert_eq!(
                 compact_operation_allocation_count(allocations).unwrap(),
@@ -10172,7 +10487,7 @@ mod tests {
             Some(OperationPhysicalRoute::RequiredSuffixRows)
         );
         let prospective = failure.receipt.prospective.expect("published prospective");
-        assert_eq!(prospective.work_bound, 0);
+        assert_eq!(prospective.work_bound, 2);
         assert!(prospective.contains(failure.receipt.actual), "{failure:#?}");
     }
 

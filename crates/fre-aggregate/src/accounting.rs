@@ -24,6 +24,10 @@ pub struct CompileAccounting {
     pub required_suffixes: usize,
     /// Total bytes across `required_suffixes`.
     pub required_suffix_bytes: usize,
+    /// Canonical HIR-derived ASCII byte sets that every match must intersect.
+    pub required_literal_sets: usize,
+    /// Complete fixed inline storage retained for the required-literal proof.
+    pub required_literal_proof_bytes: usize,
     /// Structurally derived internal-anchor candidate stream retained for a
     /// bounded count verifier. Zero means the dense continuation route.
     pub required_internal_anchors: usize,
@@ -117,6 +121,10 @@ pub struct ExecutionAccounting {
     /// table/row construction and sequential-row replay.
     pub assertion_checks: usize,
     pub root_probes: usize,
+    /// Source bytes visited by the required-literal pre-continuation proof.
+    pub required_literal_source_bytes: usize,
+    /// Membership comparisons against retained required byte sets.
+    pub required_literal_comparisons: usize,
     pub required_anchor_candidates: usize,
     pub required_anchor_scan_windows: usize,
     pub required_anchor_anchor_comparisons: usize,
