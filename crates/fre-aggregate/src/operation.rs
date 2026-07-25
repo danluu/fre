@@ -2377,6 +2377,11 @@ impl CompiledRegex {
         };
         let mut requirements =
             requirements.with_prefix::<OBSERVED_WORK>(utf8_validation, prospective_limits)?;
+        // Capture the complete structural proof before receipt publication
+        // clamps P to the caller's observed-work ceiling. After that clamp,
+        // comparing P to the caller limit cannot distinguish full admission
+        // from an intentionally partial observed execution.
+        let fully_admitted_work = !OBSERVED_WORK || requirements.work_bound <= limits.max_work;
         if receipt_bearing && OBSERVED_WORK {
             // Every receipt-bearing observed route executes against the same
             // work ceiling it publishes. This includes sparse, terminal, and
@@ -2469,6 +2474,7 @@ impl CompiledRegex {
                 requirements,
                 limits,
                 receipt_bearing,
+                fully_admitted_work,
                 accounting,
                 actual_allocations,
             )?
@@ -2482,6 +2488,7 @@ impl CompiledRegex {
                 sparse_seed,
                 limits,
                 receipt_bearing,
+                fully_admitted_work,
                 accounting,
                 actual_allocations,
             )?
@@ -4622,6 +4629,7 @@ impl Engine {
         sparse_seed: Option<SparseSeed<'_>>,
         limits: OperationLimits,
         track_source: bool,
+        fully_admitted_work: bool,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
@@ -4692,6 +4700,7 @@ impl Engine {
                     requirements,
                     limits,
                     track_source,
+                    fully_admitted_work,
                     accounting,
                     actual_allocations,
                 )
@@ -4712,6 +4721,7 @@ impl Engine {
         requirements: Requirements,
         limits: OperationLimits,
         track_source: bool,
+        fully_admitted_work: bool,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
@@ -4732,6 +4742,7 @@ impl Engine {
             requirements,
             limits,
             track_source,
+            fully_admitted_work,
             accounting,
             actual_allocations,
         )
@@ -6052,6 +6063,7 @@ impl RowStore {
         requirements: Requirements,
         limits: OperationLimits,
         track_source: bool,
+        fully_admitted_work: bool,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
@@ -6145,30 +6157,36 @@ impl RowStore {
 
         if byte_only_rows {
             write_offset = match storage {
-                RowStorage::SplitDecisions => Self::build_byte_rows::<OBSERVED_WORK, true>(
-                    program,
-                    haystack,
-                    &mut rows[..row_count],
-                    &mut store,
-                    write_offset,
-                    requirements.record_bytes,
-                    accounting,
-                    requirements.work_bound,
-                    limits.max_work,
-                    track_source,
-                )?,
-                RowStorage::ReachableEndpoints => Self::build_byte_rows::<OBSERVED_WORK, false>(
-                    program,
-                    haystack,
-                    &mut rows[..row_count],
-                    &mut store,
-                    write_offset,
-                    requirements.record_bytes,
-                    accounting,
-                    requirements.work_bound,
-                    limits.max_work,
-                    track_source,
-                )?,
+                RowStorage::SplitDecisions => {
+                    Self::build_admitted_byte_rows::<OBSERVED_WORK, true>(
+                        program,
+                        haystack,
+                        &mut rows[..row_count],
+                        &mut store,
+                        write_offset,
+                        requirements.record_bytes,
+                        accounting,
+                        requirements.work_bound,
+                        limits.max_work,
+                        track_source,
+                        fully_admitted_work,
+                    )?
+                }
+                RowStorage::ReachableEndpoints => {
+                    Self::build_admitted_byte_rows::<OBSERVED_WORK, false>(
+                        program,
+                        haystack,
+                        &mut rows[..row_count],
+                        &mut store,
+                        write_offset,
+                        requirements.record_bytes,
+                        accounting,
+                        requirements.work_bound,
+                        limits.max_work,
+                        track_source,
+                        fully_admitted_work,
+                    )?
+                }
             };
         } else {
             for (position, input) in haystack.iter().copied().enumerate().rev() {
@@ -6220,6 +6238,54 @@ impl RowStore {
         })
     }
 
+    #[inline]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one admission gate removes redundant per-state work checks only when the complete bound fits"
+    )]
+    fn build_admitted_byte_rows<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        program: &Program,
+        haystack: &[u8],
+        rows: &mut [ExactVec<usize>],
+        store: &mut [u8],
+        write_offset: usize,
+        record_bytes: usize,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+        caller_work_limit: usize,
+        track_source: bool,
+        fully_admitted_work: bool,
+    ) -> Result<usize, Error> {
+        debug_assert!(!fully_admitted_work || admitted_work_bound <= caller_work_limit);
+        if OBSERVED_WORK && !fully_admitted_work {
+            Self::build_byte_rows::<true, SPLIT_DECISIONS>(
+                program,
+                haystack,
+                rows,
+                store,
+                write_offset,
+                record_bytes,
+                accounting,
+                admitted_work_bound,
+                caller_work_limit,
+                track_source,
+            )
+        } else {
+            Self::build_byte_rows::<false, SPLIT_DECISIONS>(
+                program,
+                haystack,
+                rows,
+                store,
+                write_offset,
+                record_bytes,
+                accounting,
+                admitted_work_bound,
+                caller_work_limit,
+                track_source,
+            )
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the byte-row driver keeps exact source, log, and work accounting explicit"
@@ -6236,19 +6302,20 @@ impl RowStore {
         caller_work_limit: usize,
         track_source: bool,
     ) -> Result<usize, Error> {
+        let (row, future_rows) = rows
+            .split_first_mut()
+            .ok_or(Error::InternalInvariant("row ring is empty"))?;
+        let next_row = future_rows
+            .first_mut()
+            .ok_or(Error::InternalInvariant("row ring has no future row"))?;
+        let mut row = row.as_mut_slice();
+        let mut next_row = next_row.as_mut_slice();
         for (position, input) in haystack.iter().copied().enumerate().rev() {
             record_source_accesses(accounting, 1, track_source)?;
             let end = add(write_offset, record_bytes, Resource::LogBytes)?;
             let record = store
                 .get_mut(write_offset..end)
                 .ok_or(Error::InternalInvariant("row-log write outside store"))?;
-            let (row, future_rows) = rows
-                .split_first_mut()
-                .ok_or(Error::InternalInvariant("row ring is empty"))?;
-            let next_row = future_rows
-                .first()
-                .map(ExactVec::as_slice)
-                .unwrap_or_default();
             Self::build_byte_row::<OBSERVED_WORK, SPLIT_DECISIONS>(
                 program,
                 position,
@@ -6266,7 +6333,7 @@ impl RowStore {
                 Resource::SequentialBytes,
             )?;
             write_offset = end;
-            rows.rotate_right(1);
+            core::mem::swap(&mut row, &mut next_row);
         }
         Ok(write_offset)
     }
@@ -7941,6 +8008,161 @@ mod tests {
         assert!(saw_root_failure);
     }
 
+    fn run_byte_rows_case<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        compiled: &CompiledRegex,
+        haystack: &[u8],
+        caller_work_limit: usize,
+        specialized: bool,
+    ) -> (Result<usize, Error>, Vec<u8>, ExecutionAccounting) {
+        let program = &compiled.program;
+        let states = program.insts.len();
+        let first = exact_filled(states, 0_usize, Resource::RandomAccessBytes).unwrap();
+        let second = exact_filled(states, 0_usize, Resource::RandomAccessBytes).unwrap();
+        let mut rows = [first, second];
+        let storage = if SPLIT_DECISIONS {
+            RowStorage::SplitDecisions
+        } else {
+            RowStorage::ReachableEndpoints
+        };
+        let record_bytes = if SPLIT_DECISIONS {
+            program.split_count.saturating_add(8) / 8
+        } else {
+            encoded_width(haystack.len().saturating_add(1))
+        };
+        let store_bytes = record_bytes
+            .checked_mul(haystack.len().saturating_add(1))
+            .expect("tiny test row log fits usize");
+        let mut store = vec![0_u8; store_bytes];
+        let mut accounting = ExecutionAccounting::default();
+        let assertions =
+            AssertionContext::new(haystack, 0, haystack.len()).expect("assertion context");
+        let result = (|| {
+            let terminal_record = store
+                .get_mut(..record_bytes)
+                .ok_or(Error::InternalInvariant("terminal row outside row log"))?;
+            let (row, future_rows) = rows
+                .split_first_mut()
+                .ok_or(Error::InternalInvariant("row ring is empty"))?;
+            RowStore::build_row::<false, OBSERVED_WORK, false>(
+                program,
+                haystack,
+                assertions,
+                haystack.len(),
+                0,
+                row,
+                future_rows,
+                terminal_record,
+                storage,
+                &mut accounting,
+                usize::MAX,
+                caller_work_limit,
+                true,
+            )?;
+            accounting.sequential_bytes_written = super::add(
+                accounting.sequential_bytes_written,
+                record_bytes,
+                Resource::SequentialBytes,
+            )?;
+            rows.rotate_right(1);
+
+            if specialized {
+                return RowStore::build_byte_rows::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                    program,
+                    haystack,
+                    &mut rows,
+                    &mut store,
+                    record_bytes,
+                    record_bytes,
+                    &mut accounting,
+                    usize::MAX,
+                    caller_work_limit,
+                    true,
+                );
+            }
+
+            let mut write_offset = record_bytes;
+            for (position, input) in haystack.iter().copied().enumerate().rev() {
+                super::record_source_accesses(&mut accounting, 1, true)?;
+                let end = super::add(write_offset, record_bytes, Resource::LogBytes)?;
+                let record = store
+                    .get_mut(write_offset..end)
+                    .ok_or(Error::InternalInvariant("row-log write outside store"))?;
+                let (row, future_rows) = rows
+                    .split_first_mut()
+                    .ok_or(Error::InternalInvariant("row ring is empty"))?;
+                RowStore::build_row::<true, OBSERVED_WORK, false>(
+                    program,
+                    haystack,
+                    assertions,
+                    position,
+                    input,
+                    row,
+                    future_rows,
+                    record,
+                    storage,
+                    &mut accounting,
+                    usize::MAX,
+                    caller_work_limit,
+                    true,
+                )?;
+                accounting.sequential_bytes_written = super::add(
+                    accounting.sequential_bytes_written,
+                    record_bytes,
+                    Resource::SequentialBytes,
+                )?;
+                write_offset = end;
+                rows.rotate_right(1);
+            }
+            Ok(write_offset)
+        })();
+        (result, store, accounting)
+    }
+
+    fn assert_byte_rows_mode_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
+        compiled: &CompiledRegex,
+        haystack: &[u8],
+    ) {
+        let specialized = run_byte_rows_case::<OBSERVED_WORK, SPLIT_DECISIONS>(
+            compiled,
+            haystack,
+            usize::MAX,
+            true,
+        );
+        let incumbent = run_byte_rows_case::<OBSERVED_WORK, SPLIT_DECISIONS>(
+            compiled,
+            haystack,
+            usize::MAX,
+            false,
+        );
+        assert_eq!(specialized, incumbent);
+        assert!(specialized.0.is_ok());
+        let exact_work = specialized.2.work;
+        let one_below_work = exact_work
+            .checked_sub(1)
+            .expect("nonzero test work has a predecessor");
+
+        for caller_work_limit in [exact_work, one_below_work] {
+            let specialized = run_byte_rows_case::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                compiled,
+                haystack,
+                caller_work_limit,
+                true,
+            );
+            let incumbent = run_byte_rows_case::<OBSERVED_WORK, SPLIT_DECISIONS>(
+                compiled,
+                haystack,
+                caller_work_limit,
+                false,
+            );
+            assert_eq!(specialized, incumbent);
+            if OBSERVED_WORK && caller_work_limit < exact_work {
+                assert!(specialized.0.is_err());
+            } else {
+                assert!(specialized.0.is_ok());
+            }
+        }
+    }
+
     #[test]
     fn dense_byte_row_kernel_matches_incumbent_modes_and_work_boundaries() {
         let hir = ParserBuilder::new()
@@ -7964,6 +8186,134 @@ mod tests {
         assert_byte_row_mode_parity::<false, true>(&compiled);
         assert_byte_row_mode_parity::<true, false>(&compiled);
         assert_byte_row_mode_parity::<true, true>(&compiled);
+    }
+
+    #[test]
+    fn dense_byte_rows_ping_pong_matches_generic_odd_even_modes_and_work_boundaries() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"(?:ab|ac|d)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(!compiled.program.contains_scalar_transition());
+        assert!(!compiled.program.contains_assertion());
+        assert!(compiled.program.split_count > 0);
+        for haystack in [b"acz".as_slice(), b"dacadz".as_slice()] {
+            assert_byte_rows_mode_parity::<false, false>(&compiled, haystack);
+            assert_byte_rows_mode_parity::<false, true>(&compiled, haystack);
+            assert_byte_rows_mode_parity::<true, false>(&compiled, haystack);
+            assert_byte_rows_mode_parity::<true, true>(&compiled, haystack);
+        }
+    }
+
+    #[test]
+    fn dense_byte_rows_keep_preclamp_work_admission_and_partial_receipt_exact() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"(?:ab|ac|d)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(!compiled.program.contains_scalar_transition());
+        assert!(!compiled.program.contains_assertion());
+        let haystack = b"dacadzacz";
+        let boundaries = haystack.len() + 1;
+        let limits = OperationLimits::default();
+        let structural = Requirements::new::<true>(
+            &compiled.program,
+            boundaries,
+            Strategy::ReverseSequentialRows,
+            1,
+            limits,
+        )
+        .unwrap();
+        assert!(structural.work_bound <= limits.max_work);
+
+        let admitted = compiled
+            .count_value_with_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+                usize::MAX,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            admitted.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+        let exact_work = admitted.receipt.actual.work;
+        assert!(exact_work < structural.work_bound);
+
+        let exact = compiled
+            .count_value_with_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: exact_work,
+                    ..limits
+                },
+                usize::MAX,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(exact.value, admitted.value);
+        assert_eq!(exact.receipt.actual, admitted.receipt.actual);
+        assert_eq!(exact.receipt.prospective.unwrap().work_bound, exact_work);
+
+        // The terminal row consumes one complete program-state charge set.
+        // Admit one further charge so refusal occurs inside the first input
+        // row, where the fully-admitted specialization must remain disabled.
+        let partial_limit = compiled
+            .program
+            .execution_state_work()
+            .checked_add(1)
+            .unwrap();
+        assert!(partial_limit < exact_work);
+        let partial = compiled
+            .count_value_with_receipt_observer(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: partial_limit,
+                    ..limits
+                },
+                usize::MAX,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            partial.source,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: partial_limit + 1,
+                limit: partial_limit,
+            }
+        );
+        assert_eq!(
+            partial.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::DenseRows)
+        );
+        let prospective = partial.receipt.prospective.unwrap();
+        assert_eq!(prospective.work_bound, partial_limit);
+        assert_eq!(partial.receipt.actual.work, partial_limit);
+        assert!(prospective.contains(partial.receipt.actual));
     }
 
     fn endpoint_scalar_repeat() -> CompiledRegex {
