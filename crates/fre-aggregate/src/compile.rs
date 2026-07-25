@@ -612,6 +612,7 @@ pub struct CompiledRegex {
     pub(crate) program: Program,
     pub(crate) candidate: Option<candidate::Plan>,
     pub(crate) url_aggregate: Option<fre_kernels::UrlAggregatePlan>,
+    pub(crate) state_byte_span_sum: Option<StateByteSpanSumPlan>,
     pub(crate) required_suffixes: RequiredSuffixes,
     pub(crate) required_internal_anchor: Option<fre_kernels::RequiredInternalAnchorPlan>,
     pub(crate) terminal_frontier: TerminalFrontierSeed,
@@ -623,6 +624,59 @@ pub struct CompiledRegex {
     pub(crate) minimum_match_bytes: Option<usize>,
     plan_id: PlanId,
     accounting: CompileAccounting,
+}
+
+const MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES: usize = 64;
+
+/// Source-independent proof for a compact byte-topology `SpanSum` executor.
+///
+/// Each variant is an exact canonical-HIR theorem, not a candidate filter:
+/// the executor may therefore publish it as the terminal physical route
+/// without a continuation-program fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StateByteSpanSumPlan {
+    topology: StateByteSpanSumTopology,
+    first: ByteSet,
+    second: ByteSet,
+    literal: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
+    literal_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StateByteSpanSumTopology {
+    /// Exact greedy `C* L D*`, with nonempty `L`, `L ⊆ C`, and `C ⊆ D`.
+    GreedyPrefixLiteralSuffix,
+    /// Exact greedy `W+ S+ L`, with disjoint `W`/`S`, `L[0] ∈ W`.
+    DisjointRunsLiteral,
+}
+
+impl StateByteSpanSumPlan {
+    pub(crate) const fn topology(&self) -> StateByteSpanSumTopology {
+        self.topology
+    }
+
+    pub(crate) const fn first(&self) -> ByteSet {
+        self.first
+    }
+
+    pub(crate) const fn second(&self) -> ByteSet {
+        self.second
+    }
+
+    pub(crate) fn literal(&self) -> &[u8] {
+        &self.literal[..self.literal_len]
+    }
+
+    const fn retained_bytes() -> usize {
+        core::mem::size_of::<Self>()
+    }
+
+    const fn topology_tag(&self) -> u8 {
+        match self.topology {
+            StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 1,
+            StateByteSpanSumTopology::DisjointRunsLiteral => 2,
+        }
+    }
 }
 
 /// A small construction-proved set: every match ends with one of these
@@ -1034,6 +1088,11 @@ impl CompiledRegex {
             mut start_domain,
             retained_program_bytes,
         ) = build_retained_components(hir, profile, limits, budget)?;
+        let state_byte_span_sum = if ordered_root {
+            None
+        } else {
+            build_state_byte_span_sum_plan(hir, profile, capture_policy, budget)?
+        };
         let mut candidate = if ordered_root {
             None
         } else {
@@ -1044,8 +1103,14 @@ impl CompiledRegex {
             .map_or(Ok(0), candidate::Plan::retained_bytes)?;
         let retained_program_bytes = add(
             add(
-                retained_program_bytes,
-                candidate_bytes,
+                add(
+                    retained_program_bytes,
+                    candidate_bytes,
+                    Resource::ProgramBytes,
+                )?,
+                state_byte_span_sum
+                    .as_ref()
+                    .map_or(0, |_| StateByteSpanSumPlan::retained_bytes()),
                 Resource::ProgramBytes,
             )?,
             url_aggregate
@@ -1138,6 +1203,9 @@ impl CompiledRegex {
         if let Some(plan) = &url_aggregate {
             plan_id = bind_url_aggregate_identity(plan_id, plan, budget)?;
         }
+        if let Some(plan) = &state_byte_span_sum {
+            plan_id = bind_state_byte_span_sum_identity(plan_id, plan, budget)?;
+        }
         if budget.current_construction_bytes != program_bytes {
             return Err(Error::InternalInvariant(
                 "compiler retained bytes differ from construction accounting",
@@ -1148,6 +1216,7 @@ impl CompiledRegex {
             program,
             candidate,
             url_aggregate,
+            state_byte_span_sum,
             required_suffixes,
             required_internal_anchor,
             terminal_frontier,
@@ -1299,6 +1368,176 @@ impl fre_kernels::UrlAggregateBuildAuthority for UrlBuildAuthority<'_> {
     fn release_bytes(&mut self, amount: usize) -> Result<(), fre_kernels::UrlAggregateBuildError> {
         let result = self.budget.release_construction_bytes(amount);
         self.record(result)
+    }
+}
+
+fn build_state_byte_span_sum_plan(
+    hir: &Hir,
+    profile: RustByteProfile,
+    capture_policy: CapturePolicy,
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteSpanSumPlan>, Error> {
+    let start_work = budget.accounting.work;
+    budget.charge(1)?;
+    if profile.unicode || capture_policy != CapturePolicy::EraseForWholeMatch {
+        return Ok(None);
+    }
+    let Some(parts) = state_byte_concat_parts(hir, budget)? else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    if parts.len() != 3 {
+        return Ok(None);
+    }
+    let mut proof = None;
+    if let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
+        && let Some(literal) = state_byte_literal(&parts[1], budget)?
+        && !literal.is_empty()
+        && literal.len() <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
+        && let Some((second_min, second)) = state_byte_unbounded_class(&parts[2], budget)?
+    {
+        budget.charge(add(literal.len(), 4, Resource::CompileWork)?)?;
+        if first_min == 0
+            && second_min == 0
+            && literal.iter().copied().all(|byte| first.contains(byte))
+            && first
+                .0
+                .iter()
+                .zip(second.0)
+                .all(|(&left, right)| left & !right == 0)
+        {
+            proof = Some((
+                StateByteSpanSumTopology::GreedyPrefixLiteralSuffix,
+                first,
+                second,
+                literal,
+            ));
+        }
+    }
+    if proof.is_none()
+        && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
+        && let Some((second_min, second)) = state_byte_unbounded_class(&parts[1], budget)?
+        && let Some(literal) = state_byte_literal(&parts[2], budget)?
+        && !literal.is_empty()
+        && literal.len() <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
+    {
+        budget.charge(add(literal.len(), 4, Resource::CompileWork)?)?;
+        if first_min == 1
+            && second_min == 1
+            && first
+                .0
+                .iter()
+                .zip(second.0)
+                .all(|(&left, right)| left & right == 0)
+            && first.contains(literal[0])
+        {
+            proof = Some((
+                StateByteSpanSumTopology::DisjointRunsLiteral,
+                first,
+                second,
+                literal,
+            ));
+        }
+    }
+    let Some((topology, first, second, literal)) = proof else {
+        return Ok(None);
+    };
+
+    let retained_bytes = StateByteSpanSumPlan::retained_bytes();
+    budget.preflight_receipt_construction_bytes(retained_bytes)?;
+    budget.acquire_checked_construction_bytes(retained_bytes)?;
+    budget.charge(add(retained_bytes, literal.len(), Resource::CompileWork)?)?;
+    let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
+    retained_literal[..literal.len()].copy_from_slice(literal);
+    budget.record_initialization(retained_bytes, false)?;
+    budget.record_copy(literal.len())?;
+    let plan = StateByteSpanSumPlan {
+        topology,
+        first,
+        second,
+        literal: retained_literal,
+        literal_len: literal.len(),
+    };
+    budget.accounting.state_byte_span_sum_plans = 1;
+    budget.accounting.state_byte_span_sum_literal_bytes = literal.len();
+    budget.accounting.state_byte_span_sum_build_work = budget
+        .accounting
+        .work
+        .checked_sub(start_work)
+        .ok_or(Error::InternalInvariant(
+            "state-byte SpanSum build work underflow",
+        ))?;
+    budget.accounting.state_byte_span_sum_persistent_bytes = retained_bytes;
+    Ok(Some(plan))
+}
+
+fn state_byte_concat_parts<'a>(
+    mut hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a [Hir]>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Concat(parts) => return Ok(Some(parts)),
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn state_byte_unbounded_class(
+    mut hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<(u32, ByteSet)>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Repetition(repetition)
+                if repetition.greedy
+                    && repetition.max.is_none()
+                    && matches!(repetition.min, 0 | 1) =>
+            {
+                let mut sub = &*repetition.sub;
+                loop {
+                    budget.charge(1)?;
+                    match sub.kind() {
+                        HirKind::Capture(capture) => sub = &capture.sub,
+                        HirKind::Class(Class::Bytes(class)) => {
+                            let mut bytes = ByteSet::empty();
+                            for range in class.ranges() {
+                                let width = inclusive_byte_width(range.start(), range.end())?;
+                                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                                bytes.insert_range(range.start(), range.end());
+                            }
+                            return Ok(Some((repetition.min, bytes)));
+                        }
+                        HirKind::Literal(regex_syntax::hir::Literal(bytes)) if bytes.len() == 1 => {
+                            budget.charge(1)?;
+                            let mut class = ByteSet::empty();
+                            class.insert(bytes[0]);
+                            return Ok(Some((repetition.min, class)));
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn state_byte_literal<'a>(
+    mut hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<&'a [u8]>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Literal(regex_syntax::hir::Literal(bytes)) => return Ok(Some(bytes)),
+            _ => return Ok(None),
+        }
     }
 }
 
@@ -3015,6 +3254,10 @@ impl CompileBudget {
                 url_aggregate_tld_bytes: 0,
                 url_aggregate_build_work: 0,
                 url_aggregate_persistent_bytes: 0,
+                state_byte_span_sum_plans: 0,
+                state_byte_span_sum_literal_bytes: 0,
+                state_byte_span_sum_build_work: 0,
+                state_byte_span_sum_persistent_bytes: 0,
                 terminal_frontier_prefix_bytes: 0,
                 terminal_frontier_bytes: 0,
                 candidate_entries: 0,
@@ -5732,6 +5975,50 @@ fn bind_url_aggregate_identity(
         for field in fields {
             hash_usize(hash, field);
         }
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&first.finish().to_le_bytes());
+    bytes[8..].copy_from_slice(&second.finish().to_le_bytes());
+    Ok(PlanId(bytes))
+}
+
+fn bind_state_byte_span_sum_identity(
+    program: PlanId,
+    plan: &StateByteSpanSumPlan,
+    budget: &mut CompileBudget,
+) -> Result<PlanId, Error> {
+    let domain = b"fre.aggregate.state-byte-span-sum-plan.v1";
+    let operation = b"fre.aggregate.state-byte-span-sum-operation.v1";
+    let class_bytes = mul(8, core::mem::size_of::<u64>(), Resource::CompileWork)?;
+    let payload = add(
+        add(
+            add(program.0.len(), domain.len(), Resource::CompileWork)?,
+            operation.len(),
+            Resource::CompileWork,
+        )?,
+        add(
+            add(class_bytes, plan.literal().len(), Resource::CompileWork)?,
+            add(1, core::mem::size_of::<usize>(), Resource::CompileWork)?,
+            Resource::CompileWork,
+        )?,
+        Resource::CompileWork,
+    )?;
+    budget.charge(mul(2, payload, Resource::CompileWork)?)?;
+    let mut first = StableHash::new(0x91f7_2a64_c38d_05be);
+    let mut second = StableHash::new(0x05be_c38d_2a64_91f7);
+    for hash in [&mut first, &mut second] {
+        hash.bytes(&program.0);
+        hash.bytes(domain);
+        hash.bytes(operation);
+        hash.byte(plan.topology_tag());
+        for word in plan.first.0 {
+            hash.bytes(&word.to_le_bytes());
+        }
+        for word in plan.second.0 {
+            hash.bytes(&word.to_le_bytes());
+        }
+        hash_usize(hash, plan.literal().len());
+        hash.bytes(plan.literal());
     }
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());

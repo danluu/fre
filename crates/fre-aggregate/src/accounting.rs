@@ -41,6 +41,12 @@ pub struct CompileAccounting {
     pub url_aggregate_tld_bytes: usize,
     pub url_aggregate_build_work: usize,
     pub url_aggregate_persistent_bytes: usize,
+    /// Structurally certified byte-topology plans retained exclusively for
+    /// allocation-free whole-match `SpanSum` reduction.
+    pub state_byte_span_sum_plans: usize,
+    pub state_byte_span_sum_literal_bytes: usize,
+    pub state_byte_span_sum_build_work: usize,
+    pub state_byte_span_sum_persistent_bytes: usize,
     /// Bytes in the mandatory leading literal retained by the unbounded
     /// terminal-frontier certificate.
     pub terminal_frontier_prefix_bytes: usize,

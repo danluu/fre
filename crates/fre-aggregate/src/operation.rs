@@ -8,11 +8,15 @@ use fre_kernels::{
     RequiredInternalAnchorPlan, UrlAggregatePlan, UrlAggregateReduceAccounting,
     UrlAggregateReduceError, UrlAggregateReduceLimits, UrlAggregateReduceUpperBounds,
 };
+use memchr::memmem;
 use sha2::{Digest, Sha256};
 
 use crate::accounting::ExecutionAccounting;
 use crate::candidate;
-use crate::compile::{CompiledRegex, PlanId, RequiredSuffixes, TerminalFrontierSeed};
+use crate::compile::{
+    CompiledRegex, PlanId, RequiredSuffixes, StateByteSpanSumPlan, StateByteSpanSumTopology,
+    TerminalFrontierSeed,
+};
 use crate::error::{add, enforce, mul};
 use crate::program::{
     Assertion, AssertionContext, Inst, NO_SPLIT_RANK, Program, ScalarSet, decode_first_scalar,
@@ -317,6 +321,8 @@ pub enum OperationPhysicalRoute {
     RequiredInternalAnchor,
     /// Certified URL aggregate executor.
     UrlAggregate,
+    /// Certified allocation-free byte-topology `SpanSum` reducer.
+    StateByteSpanSum,
     /// Construction-retained byte candidate scheduler.
     Candidate,
     /// Forward continuation execution at compiler-proved start boundaries.
@@ -1931,6 +1937,98 @@ impl CompiledRegex {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the certified route receives the shared publication and accounting state explicitly"
+    )]
+    fn execute_state_byte_span_sum(
+        &self,
+        plan: &StateByteSpanSumPlan,
+        local: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+    ) -> Result<ExecutionResult, Error> {
+        let prospective = state_byte_span_sum_prospective(&self.program, plan, local.len())?;
+        if let Some(publication) = attempt.as_mut() {
+            let physical_route = OperationPhysicalRoute::StateByteSpanSum;
+            publication.identity.physical_route = Some(physical_route);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+        }
+        enforce(
+            prospective.allocations,
+            allocation_limit,
+            Resource::Allocations,
+        )?;
+        prospective.enforce_limits(limits)?;
+
+        // The complete input-only envelope is now admitted. The compact
+        // executor owns no allocation and publishes no fallback after source
+        // access begins.
+        *actual_allocations = 0;
+        let (matches, span_sum) = match plan.topology() {
+            StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
+                reduce_greedy_prefix_literal_suffix(plan, local, attempt_accounting)?
+            }
+            StateByteSpanSumTopology::DisjointRunsLiteral => {
+                reduce_disjoint_runs_literal(plan, local, attempt_accounting)?
+            }
+        };
+        if !prospective.contains(*attempt_accounting) {
+            return Err(Error::InternalInvariant(
+                "state-byte SpanSum actual accounting exceeds its prospective",
+            ));
+        }
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_limits_id: operation_limits_identity(limits),
+            strategy,
+            operation: OperationAttemptKind::SpanSum,
+            physical_route: OperationPhysicalRoute::StateByteSpanSum,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: 0,
+            actual_allocations: 0,
+            range,
+            states: prospective.states,
+            table_cells: prospective.table_cells,
+            row_storage: prospective.row_storage,
+            row_record_bytes: prospective.row_record_bytes,
+            terminal_frontier: prospective.terminal_frontier,
+            work_bound: prospective.work_bound,
+            random_access_bytes: prospective.random_access_bytes,
+            scratch_bytes: prospective.scratch_bytes,
+            log_bytes: prospective.log_bytes,
+            sequential_bytes_bound: prospective.sequential_bytes,
+            match_events: prospective.match_events,
+            output_matches: prospective.output_matches,
+            output_bytes: prospective.output_bytes,
+            span_sum: prospective.span_sum,
+            peak_bytes: prospective.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting: *attempt_accounting,
+            summary: ScanSummary {
+                matches,
+                events: matches,
+                suppressed: 0,
+                span_sum,
+            },
+            spans: Vec::new(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "whole-operation admission keeps failure-before-publication ordering auditable"
     )]
@@ -2014,6 +2112,24 @@ impl CompiledRegex {
             Some(_) | None => {}
         }
         let local = &haystack[range.clone()];
+        if forced_generic_count_route.is_none()
+            && kind == OperationKind::Sum
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.state_byte_span_sum
+        {
+            return self.execute_state_byte_span_sum(
+                plan,
+                local,
+                range,
+                strategy,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
+        }
         if matches!(
             forced_generic_count_route,
             None | Some(GenericCountRoute::StartDomain)
@@ -3080,6 +3196,296 @@ impl CompiledRegex {
             spans: Vec::new(),
         })
     }
+}
+
+fn state_byte_span_sum_prospective(
+    program: &Program,
+    plan: &StateByteSpanSumPlan,
+    input_bytes: usize,
+) -> Result<OperationProspective, Error> {
+    let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+    let work_factor = match plan.topology() {
+        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 6,
+        StateByteSpanSumTopology::DisjointRunsLiteral => {
+            add(plan.literal().len(), 7, Resource::ExecutionWork)?
+        }
+    };
+    let work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
+    let random_access_bytes_read = match plan.topology() {
+        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
+            mul(input_bytes, 2, Resource::ExecutionWork)?
+        }
+        StateByteSpanSumTopology::DisjointRunsLiteral => mul(
+            input_bytes,
+            add(plan.literal().len(), 1, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+    };
+    let accounting = ExecutionAccounting {
+        state_evaluations: work_bound,
+        transition_checks: work_bound,
+        root_probes: work_bound,
+        successful_paths: input_bytes,
+        emitted_matches: input_bytes,
+        sequential_bytes_read: input_bytes,
+        random_access_bytes_read,
+        work: work_bound,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states: program.insts.len(),
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound,
+        random_access_bytes: 0,
+        scratch_bytes: 0,
+        log_bytes: 0,
+        sequential_bytes: input_bytes,
+        match_events: input_bytes,
+        output_matches: input_bytes,
+        output_bytes: 0,
+        span_sum: input_bytes,
+        allocations: 0,
+        peak_bytes: 0,
+        accounting,
+    })
+}
+
+fn reduce_greedy_prefix_literal_suffix(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let prefix = plan.first();
+    let suffix = plan.second();
+    let literal = plan.literal();
+    let mut cursor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while cursor < haystack.len() {
+        if !state_byte_classify(
+            suffix,
+            haystack[cursor],
+            StateByteSourceAccess::Sequential,
+            accounting,
+        )? {
+            cursor = add(cursor, 1, Resource::Boundaries)?;
+            continue;
+        }
+        let suffix_start = cursor;
+        cursor = add(cursor, 1, Resource::Boundaries)?;
+        while cursor < haystack.len()
+            && state_byte_classify(
+                suffix,
+                haystack[cursor],
+                StateByteSourceAccess::Sequential,
+                accounting,
+            )?
+        {
+            cursor = add(cursor, 1, Resource::Boundaries)?;
+        }
+        let suffix_end = cursor;
+        let mut scan = suffix_start;
+        let mut selected_start = None;
+        while scan < suffix_end {
+            if !state_byte_classify(
+                prefix,
+                haystack[scan],
+                StateByteSourceAccess::Random,
+                accounting,
+            )? {
+                scan = add(scan, 1, Resource::Boundaries)?;
+                continue;
+            }
+            let prefix_start = scan;
+            scan = add(scan, 1, Resource::Boundaries)?;
+            while scan < suffix_end
+                && state_byte_classify(
+                    prefix,
+                    haystack[scan],
+                    StateByteSourceAccess::Random,
+                    accounting,
+                )?
+            {
+                scan = add(scan, 1, Resource::Boundaries)?;
+            }
+            let prefix_end = scan;
+            let window = &haystack[prefix_start..prefix_end];
+            state_byte_probe(accounting, window.len())?;
+            if window.len() >= literal.len() && memmem::find(window, literal).is_some() {
+                selected_start = Some(prefix_start);
+                break;
+            }
+            if scan < suffix_end {
+                // The prefix-run loop already classified this byte outside
+                // `prefix`; advance without charging the same predicate twice.
+                scan = add(scan, 1, Resource::Boundaries)?;
+            }
+        }
+        if let Some(start) = selected_start {
+            state_byte_event(accounting)?;
+            matches = add(matches, 1, Resource::OutputMatches)?;
+            span_sum = add(
+                span_sum,
+                suffix_end
+                    .checked_sub(start)
+                    .ok_or(Error::InternalInvariant(
+                        "state-byte SpanSum selected a reversed span",
+                    ))?,
+                Resource::SpanSum,
+            )?;
+        }
+        // `cursor`, when not at EOF, is the already-classified byte outside
+        // the maximal suffix run. Since `prefix ⊆ suffix`, it cannot start a
+        // match and need not be classified a second time.
+        if cursor < haystack.len() {
+            cursor = add(cursor, 1, Resource::Boundaries)?;
+        }
+    }
+    Ok((matches, span_sum))
+}
+
+fn reduce_disjoint_runs_literal(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let first = plan.first();
+    let second = plan.second();
+    let literal = plan.literal();
+    let mut cursor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while cursor < haystack.len() {
+        if !state_byte_classify(
+            first,
+            haystack[cursor],
+            StateByteSourceAccess::Sequential,
+            accounting,
+        )? {
+            cursor = add(cursor, 1, Resource::Boundaries)?;
+            continue;
+        }
+        let start = cursor;
+        cursor = add(cursor, 1, Resource::Boundaries)?;
+        while cursor < haystack.len()
+            && state_byte_classify(
+                first,
+                haystack[cursor],
+                StateByteSourceAccess::Sequential,
+                accounting,
+            )?
+        {
+            cursor = add(cursor, 1, Resource::Boundaries)?;
+        }
+        let first_end = cursor;
+        let mut second_end = first_end;
+        while second_end < haystack.len()
+            && state_byte_classify(
+                second,
+                haystack[second_end],
+                StateByteSourceAccess::Random,
+                accounting,
+            )?
+        {
+            second_end = add(second_end, 1, Resource::Boundaries)?;
+        }
+        if second_end == first_end {
+            // The first byte after the run was already proved outside
+            // `first`, so it cannot begin the next match.
+            cursor = if first_end < haystack.len() {
+                add(first_end, 1, Resource::Boundaries)?
+            } else {
+                first_end
+            };
+            continue;
+        }
+        let available = haystack.len().saturating_sub(second_end);
+        let compared = available.min(literal.len());
+        let mut literal_matches = available >= literal.len();
+        for (offset, &literal_byte) in literal.iter().take(compared).enumerate() {
+            state_byte_probe(accounting, 1)?;
+            let index = add(second_end, offset, Resource::Boundaries)?;
+            if haystack[index] != literal_byte {
+                literal_matches = false;
+                break;
+            }
+        }
+        if literal_matches {
+            let end = add(second_end, literal.len(), Resource::Boundaries)?;
+            state_byte_event(accounting)?;
+            matches = add(matches, 1, Resource::OutputMatches)?;
+            span_sum = add(
+                span_sum,
+                end.checked_sub(start).ok_or(Error::InternalInvariant(
+                    "state-byte SpanSum selected a reversed span",
+                ))?,
+                Resource::SpanSum,
+            )?;
+            cursor = end;
+        } else {
+            // Every byte in the second run is disjoint from `first`, while
+            // the proved first literal byte is in `first`. Resume exactly at
+            // that literal candidate without rescanning the second run.
+            cursor = second_end;
+        }
+    }
+    Ok((matches, span_sum))
+}
+
+fn state_byte_classify(
+    class: crate::program::ByteSet,
+    byte: u8,
+    access: StateByteSourceAccess,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    accounting.state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
+    accounting.transition_checks = add(accounting.transition_checks, 1, Resource::ExecutionWork)?;
+    accounting.work = add(accounting.work, 2, Resource::ExecutionWork)?;
+    match access {
+        StateByteSourceAccess::Sequential => {
+            accounting.sequential_bytes_read = add(
+                accounting.sequential_bytes_read,
+                1,
+                Resource::SequentialBytes,
+            )?;
+        }
+        StateByteSourceAccess::Random => {
+            accounting.random_access_bytes_read = add(
+                accounting.random_access_bytes_read,
+                1,
+                Resource::RandomAccessBytes,
+            )?;
+        }
+    }
+    Ok(class.contains(byte))
+}
+
+fn state_byte_probe(accounting: &mut ExecutionAccounting, amount: usize) -> Result<(), Error> {
+    accounting.root_probes = add(accounting.root_probes, amount, Resource::ExecutionWork)?;
+    accounting.random_access_bytes_read = add(
+        accounting.random_access_bytes_read,
+        amount,
+        Resource::RandomAccessBytes,
+    )?;
+    accounting.work = add(accounting.work, amount, Resource::ExecutionWork)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StateByteSourceAccess {
+    Sequential,
+    Random,
+}
+
+fn state_byte_event(accounting: &mut ExecutionAccounting) -> Result<(), Error> {
+    accounting.successful_paths = add(accounting.successful_paths, 1, Resource::MatchEvents)?;
+    accounting.emitted_matches = add(accounting.emitted_matches, 1, Resource::OutputMatches)?;
+    accounting.work = add(accounting.work, 1, Resource::ExecutionWork)?;
+    Ok(())
 }
 
 fn start_domain_prospective(
@@ -7826,6 +8232,7 @@ fn operation_identity(
         OperationPhysicalRoute::CachedFrontier => 61,
         OperationPhysicalRoute::RequiredInternalAnchor => 79,
         OperationPhysicalRoute::UrlAggregate => 97,
+        OperationPhysicalRoute::StateByteSpanSum => 167,
         OperationPhysicalRoute::Candidate => 113,
         OperationPhysicalRoute::StartDomain => 149,
     };
@@ -11855,5 +12262,342 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    fn state_byte_span_sum_fixture(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn upstream_span_sum(pattern: &str, haystack: &[u8]) -> usize {
+        RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
+            .sum()
+    }
+
+    fn exact_state_byte_limits(prospective: &OperationProspective) -> OperationLimits {
+        OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: prospective.work_bound,
+        }
+    }
+
+    #[test]
+    fn state_byte_span_sum_structural_variants_match_upstream() {
+        let cases: [(&str, &[u8]); 6] = [
+            (
+                r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*",
+                b"\xffno\npre ABCDEFGHIJKLMNOPQRSTUVWXYZ tail\n\
+                  againABCDEFGHIJKLMNOPQRSTUVWXYZ!\nshortABC",
+            ),
+            (
+                r"([ -~]*)(ABCDEFGHIJKLMNOPQRSTUVWXYZ)(.*)",
+                b"xxABCDEFGHIJKLMNOPQRSTUVWXYZyy\n---ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            ),
+            (r"[a-c]*ab[a-z]*", b"ccababzzz\ncabq---abz\xffabab"),
+            (
+                r"\w+\s+Holmes",
+                b"one Holmes two\t \r\nHolmes bad-Holmes x\n\nHolmes \xff z Holmes",
+            ),
+            (
+                r"([0-9A-Za-z_]+)([\t-\r ]+)(Holmes)",
+                b"a1\tHolmes -- Z_\r\nHolmes\nHolmes 0 Holmes",
+            ),
+            (r"[ab]+[ ]+a", b"abba  a b a aba   a\nba a"),
+        ];
+        for (pattern, haystack) in cases {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let compile = compiled.compile_accounting();
+            assert_eq!(compile.state_byte_span_sum_plans, 1, "{pattern:?}");
+            assert!(compile.state_byte_span_sum_build_work > 0);
+            assert!(compile.state_byte_span_sum_persistent_bytes > 0);
+            let expected = upstream_span_sum(pattern, haystack);
+            let attempt = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap_or_else(|error| panic!("{pattern:?}: {error:?}"));
+            assert_eq!(attempt.value, expected, "{pattern:?}");
+            assert_eq!(
+                attempt.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::StateByteSpanSum)
+            );
+            assert_eq!(attempt.receipt.actual_allocations, 0);
+            assert_eq!(attempt.receipt.actual.scratch_peak_bytes, 0);
+            assert_eq!(attempt.receipt.actual.random_access_peak_bytes, 0);
+            assert!(attempt.receipt.authenticates_success());
+
+            // The retained theorem is route-specific; other operation and
+            // strategy combinations preserve their established executors.
+            assert_eq!(
+                compiled
+                    .span_sum_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::FullTable,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                expected,
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_byte_span_sum_exhaustive_small_differential() {
+        let cases: [(&str, &[u8]); 2] = [(r"[ab]*ab[abc]*", b"abc\n"), (r"[ab]+[ ]+a", b"ab \n")];
+        for (pattern, alphabet) in cases {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut haystack = Vec::new();
+            for encoded in 0_u32..16_384 {
+                haystack.clear();
+                let mut value = encoded;
+                for _ in 0..7 {
+                    haystack.push(alphabet[usize::try_from(value & 3).unwrap()]);
+                    value >>= 2;
+                }
+                let expected: usize = oracle
+                    .find_iter(&haystack)
+                    .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
+                    .sum();
+                let actual = compiled
+                    .span_sum_value(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(actual, expected, "{pattern:?}, haystack={haystack:?}");
+                let ranged_expected: usize = oracle
+                    .find_iter(&haystack[1..6])
+                    .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
+                    .sum();
+                let ranged_actual = compiled
+                    .span_sum_value(
+                        &haystack,
+                        1..6,
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    ranged_actual, ranged_expected,
+                    "{pattern:?}, range haystack={haystack:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_span_sum_refuses_inexact_topologies() {
+        for pattern in [
+            r"[a-c]*ab[a-z]*?",
+            r"[a-c]*az[a-z]*",
+            r"[a-c]+[b-d]+a",
+            r"[a-c]+[ ]*a",
+            r"\A[a-c]+[ ]+a",
+            r"(?:[a-c]*ab[a-z]*)|x",
+            r"[a-c]{1,3}[ ]+a",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled.compile_accounting().state_byte_span_sum_plans,
+                0,
+                "{pattern:?}"
+            );
+        }
+        let hir = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\w+\s+Holmes")
+            .unwrap();
+        let unicode = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(unicode.compile_accounting().state_byte_span_sum_plans, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single audit test checks every positive prospective dimension and both compile ceilings"
+    )]
+    fn state_byte_span_sum_exact_limits_and_one_below_refuse_before_source() {
+        let pattern = r"\w+\s+Holmes";
+        let haystack = b"alpha Holmes beta\r\nHolmes gamma\tHolmes";
+        let compiled = state_byte_span_sum_fixture(pattern);
+        let baseline = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let prospective = baseline.receipt.prospective.unwrap();
+        let exact = exact_state_byte_limits(&prospective);
+        let exact_attempt = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact,
+            )
+            .unwrap();
+        assert_eq!(exact_attempt.value, upstream_span_sum(pattern, haystack));
+        assert!(exact_attempt.receipt.authenticates_success());
+        for (resource, lower) in [
+            (
+                Resource::Boundaries,
+                OperationLimits {
+                    max_boundaries: prospective.boundaries - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::SequentialBytes,
+                OperationLimits {
+                    max_sequential_bytes: prospective.sequential_bytes - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::MatchEvents,
+                OperationLimits {
+                    max_match_events: prospective.match_events - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::OutputMatches,
+                OperationLimits {
+                    max_output_matches: prospective.output_matches - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::SpanSum,
+                OperationLimits {
+                    max_span_sum: prospective.span_sum - 1,
+                    ..exact
+                },
+            ),
+            (
+                Resource::ExecutionWork,
+                OperationLimits {
+                    max_work: prospective.work_bound - 1,
+                    ..exact
+                },
+            ),
+        ] {
+            let failure = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    lower,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                &failure.source,
+                Error::ResourceLimit {
+                    resource: got,
+                    ..
+                } if *got == resource
+            ));
+            assert!(failure.closes());
+            assert_eq!(
+                failure.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::StateByteSpanSum)
+            );
+            assert_eq!(failure.receipt.actual, ExecutionAccounting::default());
+            assert_eq!(failure.receipt.actual_allocations, 0);
+            assert!(failure.receipt.prospective.is_some());
+        }
+
+        let compile = compiled.compile_accounting();
+        let exact_compile = CompileLimits {
+            max_program_bytes: compile.program_bytes,
+            max_work: compile.work,
+            ..CompileLimits::default()
+        };
+        state_byte_span_sum_fixture_with_limits(pattern, exact_compile).unwrap();
+        assert!(matches!(
+            state_byte_span_sum_fixture_with_limits(
+                pattern,
+                CompileLimits {
+                    max_program_bytes: compile.program_bytes - 1,
+                    ..exact_compile
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            state_byte_span_sum_fixture_with_limits(
+                pattern,
+                CompileLimits {
+                    max_work: compile.work - 1,
+                    ..exact_compile
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+    }
+
+    fn state_byte_span_sum_fixture_with_limits(
+        pattern: &str,
+        limits: CompileLimits,
+    ) -> Result<CompiledRegex, Error> {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            limits,
+        )
     }
 }
