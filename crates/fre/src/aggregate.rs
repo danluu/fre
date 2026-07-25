@@ -9,23 +9,24 @@ use fre_aggregate::{
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
     BOUNDED_AFFIX_PLAN_ID, BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID,
-    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
-    BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID,
-    BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES, BOUNDED_SEPARATED_FIELDS_MAX_ATOMS,
-    BOUNDED_SEPARATED_FIELDS_MAX_FIELDS, BlockingDelimiterBuildAccounting,
-    BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterCountResult,
-    BlockingDelimiterOperationIdentity, BlockingDelimiterPlan, BlockingDelimiterReduceAccounting,
-    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BlockingDelimiterSpanSumResult,
-    BoundedClassSequenceBuildAccounting, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceCountResult,
-    BoundedClassSequenceOperationIdentity, BoundedClassSequencePlan,
-    BoundedClassSequenceReduceAccounting, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedContextBuildAccounting, BoundedContextBuildError,
-    BoundedContextBuildLimits, BoundedContextCountResult, BoundedContextOperationIdentity,
-    BoundedContextPlan, BoundedContextReduceAccounting, BoundedContextReduceError,
-    BoundedContextReduceLimits, BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError,
-    BoundedLiteralPairBuildLimits, BoundedLiteralPairCountResult,
-    BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
+    BOUNDED_CONTEXT_COUNT_OPERATION_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
+    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    BOUNDED_SEPARATED_FIELDS_COUNT_OPERATION_ID, BOUNDED_SEPARATED_FIELDS_MAX_ALTERNATIVES,
+    BOUNDED_SEPARATED_FIELDS_MAX_ATOMS, BOUNDED_SEPARATED_FIELDS_MAX_FIELDS,
+    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
+    BlockingDelimiterCountResult, BlockingDelimiterOperationIdentity, BlockingDelimiterPlan,
+    BlockingDelimiterReduceAccounting, BlockingDelimiterReduceError, BlockingDelimiterReduceLimits,
+    BlockingDelimiterSpanSumResult, BoundedClassSequenceBuildAccounting,
+    BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceCountResult, BoundedClassSequenceOperationIdentity,
+    BoundedClassSequencePlan, BoundedClassSequenceReduceAccounting,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedContextBuildAccounting, BoundedContextBuildError, BoundedContextBuildLimits,
+    BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
+    BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
+    BoundedContextSpanSumAccounting, BoundedContextSpanSumLimits, BoundedContextSpanSumResult,
+    BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
+    BoundedLiteralPairCountResult, BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
     BoundedLiteralPairReduceAccounting, BoundedLiteralPairReduceError,
     BoundedLiteralPairReduceLimits, BoundedLiteralPairSpanSumResult,
     BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
@@ -131,7 +132,7 @@ use crate::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 36;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 37;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
@@ -1314,7 +1315,10 @@ pub struct AggregateRunLimits {
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
     /// Direct swapped bounded literal-pair count/span-sum limits.
     pub bounded_literal_pair: BoundedLiteralPairReduceLimits,
-    /// Direct bounded-context literal interval-stream limits.
+    /// Direct bounded-context limits. The selected operation interprets the
+    /// scalar `max_count` slot as either `Count`'s count cap or `SpanSum`'s
+    /// matched-byte-sum cap; the operation identity keeps those receipts
+    /// distinct without enlarging this shared run-limit record.
     pub bounded_context: BoundedContextReduceLimits,
     /// Fixed absolute-domain guard limits. Scalar residuals additionally use
     /// the unchanged continuation limits below.
@@ -3695,7 +3699,7 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             cache.operation,
             identity.kernel.operation_id,
             BOUNDED_CONTEXT_COUNT_OPERATION_ID,
-            None,
+            Some(BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID),
         ),
         AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
             ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => direct_operation_id_closes(
@@ -3932,6 +3936,14 @@ fn direct_details_close_cache(
                     BOUNDED_CONTEXT_COUNT_OPERATION_ID,
                     None,
                 )
+        }
+        (
+            AggregatePlanIdentity::BoundedContext(identity),
+            AggregateExecutionDetails::BoundedContextSpanSum(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && cache.operation == AggregateOperation::SpanSum
+                && identity.kernel.operation_id == BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
@@ -6355,6 +6367,8 @@ pub enum AggregateExecutionDetails {
     BoundedLiteralPair(BoundedLiteralPairReduceAccounting),
     /// Bounded-context bounds, counters, and operation identity.
     BoundedContext(BoundedContextReduceAccounting),
+    /// Bounded-context span-sum bounds, exact output, and operation identity.
+    BoundedContextSpanSum(BoundedContextSpanSumAccounting),
     /// Fixed absolute-domain guard proof and, when the scalar envelope admits
     /// its residual, the nested continuation certificate/accounting.
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainExecutionDetails),
@@ -6396,7 +6410,9 @@ impl AggregateExecutionDetails {
             Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
             Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
-            Self::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            Self::BoundedContext(_) | Self::BoundedContextSpanSum(_) => {
+                Some(AggregateDirectRoute::BoundedContext)
+            }
             Self::FiniteLiteral { .. } => Some(AggregateDirectRoute::DenseFiniteLiteral),
             Self::SparseFiniteLiteral { .. } => Some(AggregateDirectRoute::SparseFiniteLiteral),
             Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
@@ -9634,7 +9650,10 @@ impl AggregateBuilder {
         if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
-            && operation == AggregateOperation::Count
+            && matches!(
+                operation,
+                AggregateOperation::Count | AggregateOperation::SpanSum
+            )
         {
             let affix = inspect_bounded_affix(&rust.hir, limits.max_bounded_affix_planner_work)
                 .map_err(|error| {
@@ -9745,7 +9764,17 @@ impl AggregateBuilder {
                         build: AggregateBuildAccounting::BoundedContext(build),
                         plan_identity: AggregatePlanIdentity::BoundedContext(
                             AggregateBoundedContextIdentity {
-                                kernel: engine.count_identity(),
+                                kernel: match operation {
+                                    AggregateOperation::Count => engine.count_identity(),
+                                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                                    AggregateOperation::Compile | AggregateOperation::Spans => {
+                                        return Err(AggregateBuildError::InternalInvariant {
+                                            operation,
+                                            selection,
+                                            detail: "bounded-affix selected an unsupported operation",
+                                        });
+                                    }
+                                },
                             },
                         ),
                         sealed_bounded_separated_fields_identity: None,
@@ -13486,12 +13515,19 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedLiteralPair(source),
                     )
                 }),
-            AggregateEngine::BoundedContext(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span-sum operation retained a bounded-context count plan",
-                ),
-            )),
+            AggregateEngine::BoundedContext(engine) => engine
+                .span_sum(
+                    haystack,
+                    BoundedContextSpanSumLimits::from_shared(limits.bounded_context),
+                )
+                .map(AggregateSpanSumExecution::BoundedContext)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedContext(source),
+                    )
+                }),
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 if engine.residual.is_some() {
                     return Err(self.execution_error(
@@ -14006,6 +14042,7 @@ enum AggregateSpanSumExecution {
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
     BoundedLiteralPair(BoundedLiteralPairSpanSumResult),
+    BoundedContext(BoundedContextSpanSumResult),
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -14036,6 +14073,7 @@ impl AggregateSpanSumExecution {
             Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::LiteralClassRunLiteral(result) => result.span_sum,
             Self::BoundedLiteralPair(result) => result.span_sum,
+            Self::BoundedContext(result) => result.span_sum,
             Self::GuardedAsciiWord(result) => result.span_sum,
             Self::FixedPredicateWord64(result) => result.span_sum,
             Self::ExactLiteral { value, .. }
@@ -14072,6 +14110,9 @@ impl AggregateSpanSumExecution {
             }
             Self::BoundedLiteralPair(result) => {
                 AggregateExecutionDetails::BoundedLiteralPair(result.accounting)
+            }
+            Self::BoundedContext(result) => {
+                AggregateExecutionDetails::BoundedContextSpanSum(result.accounting)
             }
             Self::FiniteLiteral {
                 upper_bounds,
@@ -16542,6 +16583,17 @@ mod tests {
         fixed_absolute_owner_bytes, include_fixed_construction_receipt_copy_effect,
         include_selected_plan_owner_effect, sparse_finite_abandonment,
     };
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn bounded_context_span_sum_keeps_private_execution_envelopes_fixed() {
+        assert_eq!(
+            core::mem::size_of::<super::AggregateSpanSumExecution>(),
+            2_312
+        );
+        assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 728);
+        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
+    }
 
     fn pre_syntax_exact_spans_failure() -> AggregateConstructionAttemptError {
         AggregateBuilder::new("needle")

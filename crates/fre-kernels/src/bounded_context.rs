@@ -1,4 +1,4 @@
-//! Linear whole-match counting for a literal with bounded byte context.
+//! Linear whole-match count and span-sum reduction for bounded byte context.
 //!
 //! The admitted byte language is
 //! `HEAD{H} SEP+ ANY{0,A} LITERAL ANY{0,B} SEP+ TAIL{T}`. `HEAD`, `SEP`, and
@@ -27,6 +27,7 @@ use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptErro
 
 pub const PLAN_ID: &str = "bounded-context-count.literal-interval-stream.v1";
 pub const COUNT_OPERATION_ID: &str = "bounded-context-count.count.v1";
+pub const SPAN_SUM_OPERATION_ID: &str = "bounded-context-count.span-sum.v1";
 pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
 
 const INTERVAL_BYTES: usize = 12;
@@ -197,6 +198,53 @@ impl Default for ReduceLimits {
     }
 }
 
+/// Operation-specific limits for checked whole-match span summation.
+///
+/// This has the same layout as [`ReduceLimits`], but gives the output bound
+/// its correct semantic name instead of overloading the Count limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumLimits {
+    pub max_input_bytes: usize,
+    pub max_work: usize,
+    pub max_match_events: usize,
+    pub max_span_sum: u64,
+    pub max_scratch_bytes: usize,
+    pub max_peak_bytes: usize,
+}
+
+impl SpanSumLimits {
+    /// Project the shared facade limit record into its operation-specific
+    /// interpretation without changing the retained record's layout.
+    #[must_use]
+    pub const fn from_shared(limits: ReduceLimits) -> Self {
+        Self {
+            max_input_bytes: limits.max_input_bytes,
+            max_work: limits.max_work,
+            max_match_events: limits.max_match_events,
+            max_span_sum: limits.max_count,
+            max_scratch_bytes: limits.max_scratch_bytes,
+            max_peak_bytes: limits.max_peak_bytes,
+        }
+    }
+
+    const fn count_preflight(self) -> ReduceLimits {
+        ReduceLimits {
+            max_input_bytes: self.max_input_bytes,
+            max_work: self.max_work,
+            max_match_events: self.max_match_events,
+            max_count: u64::MAX,
+            max_scratch_bytes: self.max_scratch_bytes,
+            max_peak_bytes: self.max_peak_bytes,
+        }
+    }
+}
+
+impl Default for SpanSumLimits {
+    fn default() -> Self {
+        Self::from_shared(ReduceLimits::default())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceUpperBounds {
     pub input_bytes: usize,
@@ -239,9 +287,50 @@ pub struct ReduceAccounting {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumUpperBounds {
+    pub input_bytes: usize,
+    pub literal_bytes: usize,
+    pub interval_records: usize,
+    pub interval_bytes: usize,
+    pub inspections: usize,
+    pub branches: usize,
+    pub comparisons: usize,
+    pub state_writes: usize,
+    pub work: usize,
+    pub match_events: usize,
+    pub span_sum: u64,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumActualCounters {
+    pub suffix_intervals: usize,
+    pub literal_attempts: usize,
+    pub successful_literals: usize,
+    pub prefix_candidates: usize,
+    pub match_events: usize,
+    pub span_sum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumAccounting {
+    pub identity: OperationIdentity,
+    pub upper_bounds: SpanSumUpperBounds,
+    pub actual: SpanSumActualCounters,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CountResult {
     pub count: u64,
     pub accounting: ReduceAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: SpanSumAccounting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -417,6 +506,10 @@ pub enum ReduceError {
         limit: usize,
     },
     CountLimit {
+        needed: u64,
+        limit: u64,
+    },
+    SpanSumLimit {
         needed: u64,
         limit: u64,
     },
@@ -668,7 +761,7 @@ impl BoundedContextPlan {
         }
     }
 
-    /// Build `LEFT MIDDLE{0,max} LITERAL RIGHT` for byte-mode Count.
+    /// Build `LEFT MIDDLE{0,max} LITERAL RIGHT` for byte-mode Count/SpanSum.
     #[allow(
         clippy::too_many_lines,
         reason = "fail-closed affix construction keeps quota, class, copy, and identity checks together"
@@ -860,13 +953,22 @@ impl BoundedContextPlan {
 
     #[must_use]
     pub const fn count_identity(&self) -> OperationIdentity {
+        self.identity(COUNT_OPERATION_ID)
+    }
+
+    #[must_use]
+    pub const fn span_sum_identity(&self) -> OperationIdentity {
+        self.identity(SPAN_SUM_OPERATION_ID)
+    }
+
+    const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
         OperationIdentity {
             plan_id: if self.bounded_affix {
                 BOUNDED_AFFIX_PLAN_ID
             } else {
                 PLAN_ID
             },
-            operation_id: COUNT_OPERATION_ID,
+            operation_id,
             prefix_width: self.prefix_width,
             left_gap_max: self.left_gap_max,
             right_gap_max: self.right_gap_max,
@@ -891,6 +993,54 @@ impl BoundedContextPlan {
                 identity: self.count_identity(),
                 upper_bounds,
                 actual,
+            },
+        })
+    }
+
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: SpanSumLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        if self.bounded_affix {
+            return self.span_sum_bounded_affix(haystack, limits);
+        }
+        let upper_bounds = self.span_sum_preflight(haystack.len(), limits)?;
+        let scratch = zeroed_exact(upper_bounds.scratch_bytes).map_err(|error| {
+            allocation_reduce_error(error, "suffix interval table", upper_bounds.scratch_bytes)
+        })?;
+        let mut span_sum = 0_u64;
+        let mut span_error = None;
+        let actual = self.execute_with(haystack, scratch, |start, end| {
+            if span_error.is_none() {
+                match checked_span_sum(span_sum, start, end, "bounded-context span sum") {
+                    Ok(next) => span_sum = next,
+                    Err(error) => span_error = Some(error),
+                }
+            }
+        })?;
+        if let Some(error) = span_error {
+            return Err(error);
+        }
+        if span_sum > limits.max_span_sum {
+            return Err(ReduceError::SpanSumLimit {
+                needed: span_sum,
+                limit: limits.max_span_sum,
+            });
+        }
+        Ok(SpanSumResult {
+            span_sum,
+            accounting: SpanSumAccounting {
+                identity: self.span_sum_identity(),
+                upper_bounds,
+                actual: SpanSumActualCounters {
+                    suffix_intervals: actual.suffix_intervals,
+                    literal_attempts: actual.literal_attempts,
+                    successful_literals: actual.successful_literals,
+                    prefix_candidates: actual.prefix_candidates,
+                    match_events: actual.match_events,
+                    span_sum,
+                },
             },
         })
     }
@@ -1044,6 +1194,148 @@ impl BoundedContextPlan {
 
     #[allow(
         clippy::too_many_lines,
+        reason = "the operation-specific endpoint scan preserves Count's exact frame while sealing SpanSum into its own receipt"
+    )]
+    fn span_sum_bounded_affix(
+        &self,
+        haystack: &[u8],
+        limits: SpanSumLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        if haystack.len() > limits.max_input_bytes {
+            return Err(ReduceError::InputLimit {
+                needed: haystack.len(),
+                limit: limits.max_input_bytes,
+            });
+        }
+        if self.build.persistent_bytes > limits.max_peak_bytes {
+            return Err(ReduceError::PeakLimit {
+                needed: self.build.persistent_bytes,
+                limit: limits.max_peak_bytes,
+            });
+        }
+        let literal = self.finder.needle();
+        let upper_bounds =
+            self.bounded_affix_span_sum_preflight(haystack.len(), literal.len(), limits)?;
+        let middle_max =
+            usize::try_from(self.left_gap_max).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix middle maximum",
+            })?;
+        let mut cursor = 0_usize;
+        let mut middle_run = 0_usize;
+        let mut next_match_start = 0_usize;
+        let mut literal_attempts = 0_usize;
+        let mut successful_literals = 0_usize;
+        let mut prefix_candidates = 0_usize;
+        let mut match_events = 0_usize;
+        let mut span_sum = 0_u64;
+        while cursor < haystack.len() {
+            let byte = haystack[cursor];
+            if self.separator.contains(byte) {
+                middle_run = middle_run
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix middle run",
+                    })?;
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix scan cursor",
+                    })?;
+                continue;
+            }
+            let mut selected_start = None;
+            if self.tail.contains(byte) && middle_run >= literal.len() {
+                literal_attempts =
+                    literal_attempts
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix literal attempts",
+                        })?;
+                let literal_start =
+                    cursor
+                        .checked_sub(literal.len())
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix literal start",
+                        })?;
+                if haystack[literal_start..cursor] == *literal {
+                    successful_literals = successful_literals.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix successful literal count",
+                        },
+                    )?;
+                    let middle_len = middle_run.checked_sub(literal.len()).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix middle length",
+                        },
+                    )?;
+                    let start = cursor
+                        .checked_sub(middle_run)
+                        .and_then(|value| value.checked_sub(1));
+                    if middle_len <= middle_max
+                        && start.is_some_and(|start| self.prefix.contains(haystack[start]))
+                    {
+                        prefix_candidates = prefix_candidates.checked_add(1).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "bounded-affix prefix candidate count",
+                            },
+                        )?;
+                        selected_start = start.filter(|&start| start >= next_match_start);
+                    }
+                }
+            }
+            if let Some(start) = selected_start {
+                match_events =
+                    match_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix match events",
+                        })?;
+                if match_events > limits.max_match_events {
+                    return Err(ReduceError::MatchEventsLimit {
+                        needed: match_events,
+                        limit: limits.max_match_events,
+                    });
+                }
+                let end = cursor
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-affix next match start",
+                    })?;
+                span_sum = checked_span_sum(span_sum, start, end, "bounded-affix span sum")?;
+                if span_sum > limits.max_span_sum {
+                    return Err(ReduceError::SpanSumLimit {
+                        needed: span_sum,
+                        limit: limits.max_span_sum,
+                    });
+                }
+                next_match_start = end;
+            }
+            middle_run = 0;
+            cursor = cursor
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-affix candidate cursor",
+                })?;
+        }
+        Ok(SpanSumResult {
+            span_sum,
+            accounting: SpanSumAccounting {
+                identity: self.span_sum_identity(),
+                upper_bounds,
+                actual: SpanSumActualCounters {
+                    suffix_intervals: 0,
+                    literal_attempts,
+                    successful_literals,
+                    prefix_candidates,
+                    match_events,
+                    span_sum,
+                },
+            },
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
         reason = "the prospective certificate derives and enforces every named dimension before execution"
     )]
     fn bounded_affix_preflight(
@@ -1156,6 +1448,17 @@ impl BoundedContextPlan {
             persistent_bytes: self.build.persistent_bytes,
             peak_bytes: self.build.persistent_bytes,
         })
+    }
+
+    fn bounded_affix_span_sum_preflight(
+        &self,
+        input_bytes: usize,
+        literal_bytes: usize,
+        limits: SpanSumLimits,
+    ) -> Result<SpanSumUpperBounds, ReduceError> {
+        let count =
+            self.bounded_affix_preflight(input_bytes, literal_bytes, limits.count_preflight())?;
+        span_sum_upper_bounds(count, limits.max_span_sum)
     }
 
     #[allow(
@@ -1312,6 +1615,15 @@ impl BoundedContextPlan {
             persistent_bytes: self.build.persistent_bytes,
             peak_bytes,
         })
+    }
+
+    fn span_sum_preflight(
+        &self,
+        input_bytes: usize,
+        limits: SpanSumLimits,
+    ) -> Result<SpanSumUpperBounds, ReduceError> {
+        let count = self.preflight(input_bytes, limits.count_preflight())?;
+        span_sum_upper_bounds(count, limits.max_span_sum)
     }
 
     #[allow(
@@ -1592,9 +1904,61 @@ impl BoundedContextPlan {
             allocation_reduce_error(error, "test suffix interval table", upper.scratch_bytes)
         })?;
         let mut spans = Vec::new();
-        self.execute_with(haystack, scratch, |start, end| spans.push((start, end)))?;
+        let _ = self.execute_with(haystack, scratch, |start, end| {
+            spans.push((start, end));
+        })?;
         Ok(spans)
     }
+}
+
+fn span_sum_upper_bounds(
+    count: ReduceUpperBounds,
+    max_span_sum: u64,
+) -> Result<SpanSumUpperBounds, ReduceError> {
+    // Selected matches are non-overlapping, so their total width cannot
+    // exceed the complete input width. This is known before source access.
+    let span_sum =
+        u64::try_from(count.input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "span-sum upper bound",
+        })?;
+    if span_sum > max_span_sum {
+        return Err(ReduceError::SpanSumLimit {
+            needed: span_sum,
+            limit: max_span_sum,
+        });
+    }
+    Ok(SpanSumUpperBounds {
+        input_bytes: count.input_bytes,
+        literal_bytes: count.literal_bytes,
+        interval_records: count.interval_records,
+        interval_bytes: count.interval_bytes,
+        inspections: count.inspections,
+        branches: count.branches,
+        comparisons: count.comparisons,
+        state_writes: count.state_writes,
+        work: count.work,
+        match_events: count.match_events,
+        span_sum,
+        scratch_bytes: count.scratch_bytes,
+        persistent_bytes: count.persistent_bytes,
+        peak_bytes: count.peak_bytes,
+    })
+}
+
+fn checked_span_sum(
+    prior: u64,
+    start: usize,
+    end: usize,
+    computation: &'static str,
+) -> Result<u64, ReduceError> {
+    let width = end
+        .checked_sub(start)
+        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
+    let width =
+        u64::try_from(width).map_err(|_| ReduceError::ArithmeticOverflow { computation })?;
+    prior
+        .checked_add(width)
+        .ok_or(ReduceError::ArithmeticOverflow { computation })
 }
 
 #[derive(Clone, Copy)]
@@ -1774,7 +2138,27 @@ fn enforce_reduce(
 mod tests {
     use regex::bytes::RegexBuilder;
 
-    use super::{BoundedContextPlan, BuildError, BuildLimits, ReduceError, ReduceLimits};
+    use super::{
+        BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildError, BuildLimits, ReduceError,
+        ReduceLimits, SPAN_SUM_OPERATION_ID, SpanSumLimits,
+    };
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn count_and_span_sum_records_preserve_the_fixed_frame_envelope() {
+        assert_eq!(core::mem::size_of::<ReduceLimits>(), 48);
+        assert_eq!(core::mem::size_of::<super::ReduceUpperBounds>(), 112);
+        assert_eq!(core::mem::size_of::<super::ReduceActualCounters>(), 48);
+        assert_eq!(core::mem::size_of::<super::ReduceAccounting>(), 216);
+        assert_eq!(core::mem::size_of::<super::CountResult>(), 224);
+        assert_eq!(core::mem::size_of::<BoundedContextPlan>(), 352);
+
+        assert_eq!(core::mem::size_of::<SpanSumLimits>(), 48);
+        assert_eq!(core::mem::size_of::<super::SpanSumUpperBounds>(), 112);
+        assert_eq!(core::mem::size_of::<super::SpanSumActualCounters>(), 48);
+        assert_eq!(core::mem::size_of::<super::SpanSumAccounting>(), 216);
+        assert_eq!(core::mem::size_of::<super::SpanSumResult>(), 224);
+    }
 
     #[test]
     fn build_attempt_reports_exact_success_and_partial_traversal_failure() {
@@ -1955,6 +2339,103 @@ mod tests {
         ));
     }
 
+    fn assert_span_sum_limit_boundaries(
+        plan: &BoundedContextPlan,
+        haystack: &[u8],
+        expected_span_sum: u64,
+    ) {
+        let span = plan.span_sum(haystack, SpanSumLimits::default()).unwrap();
+        assert_eq!(span.accounting.actual.span_sum, expected_span_sum);
+        assert_eq!(span.accounting.actual.match_events, 1);
+        assert_eq!(span.accounting.identity.plan_id, super::PLAN_ID);
+        assert_eq!(span.accounting.identity.operation_id, SPAN_SUM_OPERATION_ID);
+        let upper = span.accounting.upper_bounds;
+        let exact = SpanSumLimits {
+            max_input_bytes: upper.input_bytes,
+            max_work: upper.work,
+            max_match_events: upper.match_events,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        let below_input = upper.input_bytes.checked_sub(1).unwrap();
+        let below_work = upper.work.checked_sub(1).unwrap();
+        let below_events = upper.match_events.checked_sub(1).unwrap();
+        let below_span_sum = upper.span_sum.checked_sub(1).unwrap();
+        let below_scratch = upper.scratch_bytes.checked_sub(1).unwrap();
+        let below_peak = upper.peak_bytes.checked_sub(1).unwrap();
+        assert_eq!(
+            plan.span_sum(haystack, exact).unwrap().span_sum,
+            expected_span_sum
+        );
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_input_bytes: below_input,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::InputLimit { needed, limit })
+                if needed == upper.input_bytes && limit == below_input
+        ));
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_work: below_work,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == below_work
+        ));
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_match_events: below_events,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::MatchEventsLimit { needed, limit })
+                if needed == upper.match_events && limit == below_events
+        ));
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_span_sum: below_span_sum,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::SpanSumLimit { needed, limit })
+                if needed == upper.span_sum && limit == below_span_sum
+        ));
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_scratch_bytes: below_scratch,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::ScratchLimit { needed, limit })
+                if needed == upper.scratch_bytes && limit == below_scratch
+        ));
+        assert!(matches!(
+            plan.span_sum(
+                haystack,
+                SpanSumLimits {
+                    max_peak_bytes: below_peak,
+                    ..exact
+                }
+            ),
+            Err(ReduceError::PeakLimit { needed, limit })
+                if needed == upper.peak_bytes && limit == below_peak
+        ));
+    }
+
     #[test]
     fn rebar_row_curated_10_bounded_repeat_context_exact_limit_and_one_below() {
         // rebar-row:curated/10-bounded-repeat/context@rust/regex
@@ -1987,6 +2468,14 @@ mod tests {
         assert_eq!(exact.count, 1);
         assert_eq!(
             witness
+                .span_sum(haystack, SpanSumLimits::default())
+                .unwrap()
+                .span_sum,
+            7
+        );
+        assert_span_sum_limit_boundaries(&witness, haystack, 7);
+        assert_eq!(
+            witness
                 .spans_for_test(haystack, ReduceLimits::default())
                 .unwrap(),
             vec![(0, 7)]
@@ -2014,10 +2503,20 @@ mod tests {
             b"aaaa 12R345 bbbb".as_slice(),
             b"aaaa 12R34 bbb".as_slice(),
         ] {
+            let expected = oracle(pattern, haystack);
             assert_eq!(
                 plan.spans_for_test(haystack, ReduceLimits::default())
                     .unwrap(),
-                oracle(pattern, haystack)
+                expected
+            );
+            assert_eq!(
+                plan.span_sum(haystack, SpanSumLimits::default())
+                    .unwrap()
+                    .span_sum,
+                expected
+                    .iter()
+                    .map(|(start, end)| u64::try_from(end - start).unwrap())
+                    .sum::<u64>()
             );
         }
     }
@@ -2045,6 +2544,57 @@ mod tests {
         )
     }
 
+    fn assert_bounded_affix_count_and_build_limits(
+        plan: &BoundedContextPlan,
+        haystack: &[u8],
+        expected_count: u64,
+    ) {
+        let count = plan.count(haystack, ReduceLimits::default()).unwrap();
+        let exact_work = count.accounting.upper_bounds.work;
+        let below_work = exact_work.checked_sub(1).unwrap();
+        assert_eq!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_work,
+                    ..ReduceLimits::default()
+                }
+            )
+            .unwrap()
+            .count,
+            expected_count
+        );
+        assert!(matches!(
+            plan.count(
+                haystack,
+                ReduceLimits {
+                    max_work: below_work,
+                    ..ReduceLimits::default()
+                }
+            ),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == exact_work && limit == below_work
+        ));
+
+        let exact_build = plan.build_accounting().work;
+        let below_build = exact_build.checked_sub(1).unwrap();
+        assert!(
+            bounded_affix(BuildLimits {
+                max_build_work: exact_build,
+                ..BuildLimits::default()
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            bounded_affix(BuildLimits {
+                max_build_work: below_build,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == exact_build && limit == below_build
+        ));
+    }
+
     #[test]
     fn bounded_affix_matches_oracle_and_precharges_exact_limits() {
         let plan = bounded_affix(BuildLimits::default()).unwrap();
@@ -2054,8 +2604,24 @@ mod tests {
             .unwrap();
         let haystack = b" ing  walking\t thing\n012ing x \xFFing\r";
         let expected = u64::try_from(oracle.find_iter(haystack).count()).unwrap();
+        let expected_span_sum = oracle
+            .find_iter(haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
         let default = plan.count(haystack, ReduceLimits::default()).unwrap();
         assert_eq!(default.count, expected);
+        let span_sum = plan.span_sum(haystack, SpanSumLimits::default()).unwrap();
+        assert_eq!(span_sum.span_sum, expected_span_sum);
+        assert_eq!(span_sum.accounting.actual.span_sum, expected_span_sum);
+        assert_eq!(
+            span_sum.accounting.actual.match_events,
+            usize::try_from(expected).unwrap()
+        );
+        assert_eq!(
+            span_sum.accounting.identity.operation_id,
+            SPAN_SUM_OPERATION_ID
+        );
+        assert_eq!(span_sum.accounting.identity.plan_id, BOUNDED_AFFIX_PLAN_ID);
         let shared_delimiter = b" ing ing ";
         let shared = plan
             .count(shared_delimiter, ReduceLimits::default())
@@ -2068,6 +2634,50 @@ mod tests {
         assert_eq!(shared.accounting.actual.successful_literals, 2);
         assert_eq!(shared.accounting.actual.prefix_candidates, 2);
         assert_eq!(shared.accounting.actual.match_events, 1);
+        let shared_span = plan
+            .span_sum(shared_delimiter, SpanSumLimits::default())
+            .unwrap();
+        assert_eq!(shared_span.span_sum, 5);
+        assert_eq!(shared_span.accounting.actual.match_events, 1);
+        assert_eq!(shared_span.accounting.actual.span_sum, 5);
+
+        let adjacent = b" ing \ting ";
+        let adjacent_span = plan.span_sum(adjacent, SpanSumLimits::default()).unwrap();
+        assert_eq!(adjacent_span.span_sum, 10);
+        assert_eq!(adjacent_span.accounting.actual.match_events, 2);
+        assert_eq!(adjacent_span.accounting.actual.span_sum, 10);
+
+        let covered = b" ing  walking\t";
+        let covered_span = plan
+            .span_sum(
+                covered,
+                SpanSumLimits {
+                    max_input_bytes: covered.len(),
+                    max_work: usize::MAX,
+                    max_match_events: 2,
+                    max_span_sum: 14,
+                    max_scratch_bytes: 0,
+                    max_peak_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(covered_span.span_sum, 14);
+        assert_eq!(covered_span.accounting.upper_bounds.span_sum, 14);
+        assert_eq!(covered_span.accounting.actual.span_sum, 14);
+        assert_eq!(covered_span.accounting.actual.match_events, 2);
+        assert!(matches!(
+            plan.span_sum(
+                covered,
+                SpanSumLimits {
+                    max_span_sum: 13,
+                    ..SpanSumLimits::default()
+                }
+            ),
+            Err(ReduceError::SpanSumLimit {
+                needed: 14,
+                limit: 13
+            })
+        ));
         assert!(
             default.accounting.actual.literal_attempts
                 >= default.accounting.actual.successful_literals
@@ -2087,47 +2697,57 @@ mod tests {
             default.accounting.upper_bounds.inspections,
             default.accounting.upper_bounds.branches
         );
-        let exact_work = default.accounting.upper_bounds.work;
-        assert_eq!(
-            plan.count(
-                haystack,
-                ReduceLimits {
-                    max_work: exact_work,
-                    ..ReduceLimits::default()
-                }
-            )
-            .unwrap()
-            .count,
-            expected
-        );
-        assert!(matches!(
-            plan.count(
-                haystack,
-                ReduceLimits {
-                    max_work: exact_work - 1,
-                    ..ReduceLimits::default()
-                }
-            ),
-            Err(ReduceError::WorkLimit { needed, limit })
-                if needed == exact_work && limit == exact_work - 1
-        ));
+        assert_bounded_affix_count_and_build_limits(&plan, haystack, expected);
+        assert!(span_sum.span_sum <= u64::try_from(haystack.len()).unwrap());
+    }
 
-        let exact_build = plan.build_accounting().work;
-        assert!(
-            bounded_affix(BuildLimits {
-                max_build_work: exact_build,
-                ..BuildLimits::default()
-            })
-            .is_ok()
-        );
-        assert!(matches!(
-            bounded_affix(BuildLimits {
-                max_build_work: exact_build - 1,
-                ..BuildLimits::default()
-            }),
-            Err(BuildError::WorkLimit { needed, limit })
-                if needed == exact_build && limit == exact_build - 1
-        ));
+    #[test]
+    fn bounded_affix_count_and_span_sum_match_exhaustive_byte_oracle() {
+        let plan = BoundedContextPlan::build_bounded_affix(
+            [(b'x', b'x')],
+            [(b'a', b'b')],
+            [(b'y', b'y')],
+            b"ab",
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let oracle = RegexBuilder::new(r"x[ab]{0,2}aby")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let alphabet = [b'x', b'a', b'b', b'y', b'z', 0xFF];
+        for length in 0..=6_u32 {
+            for mut ordinal in 0..alphabet.len().pow(length) {
+                let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = oracle.find_iter(&haystack).collect::<Vec<_>>();
+                let expected_count = u64::try_from(expected.len()).unwrap();
+                let expected_span_sum = expected
+                    .iter()
+                    .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+                    .sum::<u64>();
+                let count = plan.count(&haystack, ReduceLimits::default()).unwrap();
+                let span_sum = plan.span_sum(&haystack, SpanSumLimits::default()).unwrap();
+                assert_eq!(count.count, expected_count, "haystack={haystack:?}");
+                assert_eq!(
+                    span_sum.span_sum, expected_span_sum,
+                    "haystack={haystack:?}"
+                );
+                assert_eq!(
+                    span_sum.accounting.actual.span_sum, expected_span_sum,
+                    "haystack={haystack:?}"
+                );
+                assert_eq!(
+                    span_sum.accounting.actual.match_events,
+                    usize::try_from(expected_count).unwrap(),
+                    "haystack={haystack:?}"
+                );
+            }
+        }
     }
 
     #[test]

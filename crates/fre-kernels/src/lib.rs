@@ -80,6 +80,11 @@ pub use bounded_context::{
     PLAN_ID as BOUNDED_CONTEXT_PLAN_ID, ReduceAccounting as BoundedContextReduceAccounting,
     ReduceActualCounters as BoundedContextActualCounters, ReduceError as BoundedContextReduceError,
     ReduceLimits as BoundedContextReduceLimits, ReduceUpperBounds as BoundedContextUpperBounds,
+    SPAN_SUM_OPERATION_ID as BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
+    SpanSumAccounting as BoundedContextSpanSumAccounting,
+    SpanSumActualCounters as BoundedContextSpanSumActualCounters,
+    SpanSumLimits as BoundedContextSpanSumLimits, SpanSumResult as BoundedContextSpanSumResult,
+    SpanSumUpperBounds as BoundedContextSpanSumUpperBounds,
 };
 pub use bounded_literal_pair::{
     BoundedLiteralPairPlan, BuildAccounting as BoundedLiteralPairBuildAccounting,

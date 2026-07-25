@@ -16,8 +16,8 @@ use std::{
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanKind, PlanKind,
-    PortableSearchSession, SearchLimits, SearchSessionLimits,
+    AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
+    BOUNDED_AFFIX_PLAN_ID, PlanKind, PortableSearchSession, SearchLimits, SearchSessionLimits,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
@@ -72,7 +72,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v36-anchored-line-capture-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1 report={REPORT_SCHEMA} aggregate-explain=35 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v37-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1 report={REPORT_SCHEMA} aggregate-explain=37 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -524,6 +524,17 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
             "compile-aggregate-fixed-class-chunks-v1"
         } else {
             "aggregate-fixed-class-chunks-v1"
+        };
+    }
+    if matches!(
+        report.plan_identity,
+        AggregatePlanIdentity::BoundedContext(identity)
+            if identity.kernel.plan_id == BOUNDED_AFFIX_PLAN_ID
+    ) {
+        return if model == "compile" {
+            "compile-aggregate-bounded-affix"
+        } else {
+            "aggregate-bounded-affix"
         };
     }
     let sparse = matches!(
@@ -2201,5 +2212,44 @@ mod tests {
         );
         current_fre_rebar_validate_aggregate_identity(compile.build_report(), true, "compile")
             .expect("Unicode scalar compile identity");
+    }
+
+    #[test]
+    fn bounded_affix_count_spans_uses_the_formal_adapter_plan_name() {
+        let benchmark = Benchmark {
+            name: "test/bounded-affix-span-sum".to_owned(),
+            model: "count-spans".to_owned(),
+            patterns: vec![r"\s[A-Za-z]{0,12}ing\s".to_owned()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: b" ing  walking\t".to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_secs(1),
+            max_warmup_time: Duration::ZERO,
+        };
+        let span_sum = aggregate_builder(&benchmark)
+            .build_span_sum()
+            .expect("bounded-affix span-sum plan");
+        assert_eq!(
+            aggregate_plan("count-spans", span_sum.build_report()),
+            "aggregate-bounded-affix"
+        );
+        current_fre_rebar_validate_aggregate_identity(
+            span_sum.build_report(),
+            false,
+            "count-spans",
+        )
+        .expect("bounded-affix span-sum identity");
+        require_aggregate_plan(
+            "count-spans",
+            span_sum.build_report(),
+            false,
+            &Expectations {
+                plan: Some("aggregate-bounded-affix".to_owned()),
+                ..Expectations::default()
+            },
+        )
+        .expect("formal expected plan");
     }
 }

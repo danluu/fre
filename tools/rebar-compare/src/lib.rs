@@ -184,7 +184,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v36-anchored-line-capture-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v37-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -533,6 +533,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; grep-captures admits bounded absolute-start literal/byte-class/greedy-single-byte-repeat sequences whose variable boundaries are disjoint, with mandatory positive-width root captures and zero execution allocation/scratch/output",
+        );
+        identity.identity.push_str(
+            "; bounded-affix-span-sum-v1 extends the HIR-derived LEFT MIDDLE{0,max} LITERAL RIGHT reducer with checked non-overlapping match-width accumulation",
+        );
+        identity.availability.push_str(
+            "; Unicode-off bounded-affix count/span-sum scans maximal middle-byte runs once, verifies only suffix literals at disjoint right endpoints, and uses zero execution scratch",
         );
         identity.identity.push_str(
             "; aggregate-word-run-v1 is a direct aggregate word-run with independent pre-source prospective limits and checked actual counters",
@@ -8124,13 +8130,23 @@ fn bounded_context_operation_limits(
     let match_events = haystack_len
         .checked_div(minimum_match)
         .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match is zero"))?;
+    let operation_value = if identity.kernel.operation_id == fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID
+    {
+        u64::try_from(match_events)
+            .map_err(|_| ExecutionError::fault("FRE bounded-context count does not fit u64"))?
+    } else if identity.kernel.operation_id == fre::BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID {
+        u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE bounded-context span sum does not fit u64"))?
+    } else {
+        return Err(ExecutionError::fault(
+            "FRE bounded-context accounting has unknown operation identity",
+        ));
+    };
     Ok(fre::BoundedContextReduceLimits {
         max_input_bytes: haystack_len,
         max_work: work.min(limits.fre_aggregate_operation_work),
         max_match_events: match_events,
-        max_count: u64::try_from(match_events)
-            .map_err(|_| ExecutionError::fault("FRE bounded-context count does not fit u64"))?
-            .min(limits.reducer_steps),
+        max_count: operation_value.min(limits.reducer_steps),
         max_scratch_bytes: interval_bytes.min(limits.fre_aggregate_scratch_bytes),
         max_peak_bytes: limits.fre_aggregate_peak_bytes,
     })
@@ -10207,12 +10223,14 @@ fn require_unicode_plan_identity(
             )));
         }
         if let AggregatePlanIdentity::BoundedContext(identity) = report.plan_identity {
-            if operation == LiteralAggregateOperation::Count
-                && matches!(
-                    identity.kernel.plan_id,
-                    fre::BOUNDED_CONTEXT_PLAN_ID | fre::BOUNDED_AFFIX_PLAN_ID
-                )
-                && identity.kernel.operation_id == fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID
+            let operation_id = match operation {
+                LiteralAggregateOperation::Count => fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID,
+                LiteralAggregateOperation::SpanSum => fre::BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
+            };
+            if matches!(
+                identity.kernel.plan_id,
+                fre::BOUNDED_CONTEXT_PLAN_ID | fre::BOUNDED_AFFIX_PLAN_ID
+            ) && identity.kernel.operation_id == operation_id
             {
                 return Ok(());
             }
@@ -10962,6 +10980,7 @@ fn bounded_context_reduce_error(
         | fre::BoundedContextReduceError::WorkLimit { .. }
         | fre::BoundedContextReduceError::MatchEventsLimit { .. }
         | fre::BoundedContextReduceError::CountLimit { .. }
+        | fre::BoundedContextReduceError::SpanSumLimit { .. }
         | fre::BoundedContextReduceError::ScratchLimit { .. }
         | fre::BoundedContextReduceError::PeakLimit { .. } => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
@@ -17257,16 +17276,30 @@ mod tests {
 
     #[test]
     fn current_fre_bounded_affix_receipt_label_binds_kernel_route() {
+        let pattern = r"\s[A-Za-z]{0,12}ing\s".to_string();
+        let haystack = b" ing  walking\t";
         assert_current_fre_execution(
             current_fre(
                 "count",
-                &[r"\s[A-Za-z]{0,12}ing\s".to_string()],
-                b" ing  walking\t",
+                std::slice::from_ref(&pattern),
+                haystack,
                 false,
                 false,
                 &RunLimits::default(),
             ),
             2,
+            "aggregate-bounded-affix",
+        );
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &[pattern],
+                haystack,
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            14,
             "aggregate-bounded-affix",
         );
     }
@@ -18175,7 +18208,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v36-anchored-line-capture-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v37-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-required-literal-v2-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v3-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(identity.identity.contains("fixed class-sandwich"));
@@ -18192,6 +18225,8 @@ mod tests {
                 .contains("finite nonempty ASCII-word bodies")
         );
         assert!(identity.identity.contains("aggregate-word-run-v1"));
+        assert!(identity.identity.contains("anchored-line-capture-v1"));
+        assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
         assert!(identity.identity.contains("literal-class-run-literal-v1"));
         assert!(identity.identity.contains("bounded-literal-pair-v1"));
         assert!(

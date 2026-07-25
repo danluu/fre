@@ -8,13 +8,14 @@ use fre::{
     AggregateOperationAttemptKind, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    BOUNDED_AFFIX_PLAN_ID, BoundedContextReduceError, FixedClassSandwichOperation,
-    FixedClassSandwichReduceError, LITERAL_AGGREGATE_ACCOUNTING_VERSION,
-    LITERAL_AGGREGATE_ALGORITHM_VERSION, LiteralAggregateActualCounters,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateDeclaredFallback,
-    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceError,
-    PlanKind, PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError, guarded_ascii_word,
+    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
+    LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
+    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
+    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
+    guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -35,11 +36,126 @@ fn aggregate_exact_receipt_publication_remains_send_and_sync() {
     assert_send_sync::<AggregateExecutionError>();
 }
 
+fn assert_bounded_affix_span_limit_closure(span_regex: &AggregateSpanSumRegex) {
+    let AggregatePlanIdentity::BoundedContext(span_identity) =
+        span_regex.build_report().plan_identity
+    else {
+        panic!("bounded-affix span-sum identity");
+    };
+    let covered = b" ing  walking\t";
+    let mut exact_span_limits = AggregateRunLimits::default();
+    exact_span_limits.bounded_context.max_count = 14;
+    let covered_result = span_regex.span_sum(covered, exact_span_limits).unwrap();
+    assert_eq!(covered_result.value(), 14);
+    let AggregateExecutionDetails::BoundedContextSpanSum(accounting) =
+        covered_result.report().details()
+    else {
+        panic!("bounded-affix span-sum execution accounting");
+    };
+    assert_eq!(accounting.identity, span_identity.kernel);
+    assert_eq!(accounting.upper_bounds.span_sum, 14);
+    assert_eq!(accounting.actual.span_sum, 14);
+    assert_eq!(accounting.actual.match_events, 2);
+    assert!(
+        accounting.actual.span_sum <= accounting.upper_bounds.span_sum,
+        "the exact result must close inside its prospective receipt"
+    );
+    assert_eq!(
+        span_regex
+            .span_sum_value(covered, exact_span_limits)
+            .unwrap(),
+        14
+    );
+    let mut one_below_span_limits = exact_span_limits;
+    one_below_span_limits.bounded_context.max_count = 13;
+    assert_ne!(
+        span_regex.cache_identity(exact_span_limits),
+        span_regex.cache_identity(one_below_span_limits)
+    );
+    let audited_error = span_regex
+        .span_sum(covered, one_below_span_limits)
+        .unwrap_err();
+    let value_error = span_regex
+        .span_sum_value(covered, one_below_span_limits)
+        .unwrap_err();
+    assert_eq!(value_error.identity, audited_error.identity);
+    assert_eq!(value_error.source, audited_error.source);
+    assert!(audited_error.has_closed_direct_attempt());
+    assert!(matches!(
+        audited_error.source,
+        AggregateExecutionSource::BoundedContext(BoundedContextReduceError::SpanSumLimit {
+            needed: 14,
+            limit: 13
+        })
+    ));
+}
+
+fn assert_bounded_affix_planner_limits(pattern: &str, planner_work: usize) {
+    let below_planner_work = planner_work.checked_sub(1).unwrap();
+    assert!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(AggregateBuildLimits {
+                max_bounded_affix_planner_work: planner_work,
+                ..AggregateBuildLimits::default()
+            })
+            .build_count()
+            .is_ok()
+    );
+    assert!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(AggregateBuildLimits {
+                max_bounded_affix_planner_work: planner_work,
+                ..AggregateBuildLimits::default()
+            })
+            .build_span_sum()
+            .is_ok()
+    );
+    assert!(matches!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(AggregateBuildLimits {
+                max_bounded_affix_planner_work: below_planner_work,
+                ..AggregateBuildLimits::default()
+            })
+            .build_count(),
+        Err(AggregateBuildError::BoundedAffixPlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit == below_planner_work
+    ));
+    assert!(matches!(
+        aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .limits(AggregateBuildLimits {
+                max_bounded_affix_planner_work: below_planner_work,
+                ..AggregateBuildLimits::default()
+            })
+            .build_span_sum(),
+        Err(AggregateBuildError::BoundedAffixPlannerWorkLimit {
+            needed,
+            limit,
+            ..
+        }) if needed == planner_work && limit == below_planner_work
+    ));
+}
+
 #[test]
 fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
     let pattern = r"\s[A-Za-z]{0,12}ing\s";
     let haystack = b" ing  walking\t thing\n012ing x \xFFing\r";
-    let expected = upstream(pattern, haystack, false).len();
+    let expected_spans = upstream(pattern, haystack, false);
+    let expected = expected_spans.len();
+    let expected_span_sum = expected_spans
+        .iter()
+        .map(|(start, end)| u64::try_from(end - start).unwrap())
+        .sum::<u64>();
     let regex = aggregate_builder(pattern)
         .unicode(false)
         .case_insensitive(false)
@@ -65,32 +181,33 @@ fn unicode_off_bounded_affix_routes_and_matches_greedy_oracle() {
             .unwrap(),
         1
     );
-    assert!(
-        aggregate_builder(pattern)
-            .unicode(false)
-            .case_insensitive(false)
-            .limits(AggregateBuildLimits {
-                max_bounded_affix_planner_work: planner_work,
-                ..AggregateBuildLimits::default()
-            })
-            .build_count()
-            .is_ok()
+    let span_regex = aggregate_builder(pattern)
+        .unicode(false)
+        .case_insensitive(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        span_regex.build_report().plan,
+        AggregatePlanKind::BoundedContext
     );
-    assert!(matches!(
-        aggregate_builder(pattern)
-            .unicode(false)
-            .case_insensitive(false)
-            .limits(AggregateBuildLimits {
-                max_bounded_affix_planner_work: planner_work - 1,
-                ..AggregateBuildLimits::default()
-            })
-            .build_count(),
-        Err(AggregateBuildError::BoundedAffixPlannerWorkLimit {
-            needed,
-            limit,
-            ..
-        }) if needed == planner_work && limit == planner_work - 1
-    ));
+    let AggregatePlanIdentity::BoundedContext(span_identity) =
+        span_regex.build_report().plan_identity
+    else {
+        panic!("bounded-affix span-sum identity");
+    };
+    assert_eq!(span_identity.kernel.plan_id, BOUNDED_AFFIX_PLAN_ID);
+    assert_eq!(
+        span_identity.kernel.operation_id,
+        BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID
+    );
+    assert_eq!(
+        span_regex
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected_span_sum
+    );
+    assert_bounded_affix_span_limit_closure(&span_regex);
+    assert_bounded_affix_planner_limits(pattern, planner_work);
 }
 
 #[test]
@@ -118,6 +235,27 @@ fn bounded_affix_generalizes_to_classes_shared_endpoints_and_malformed_bytes() {
                 .count_value(haystack, AggregateRunLimits::default())
                 .unwrap(),
             u64::try_from(expected).unwrap()
+        );
+        let expected_span_sum = upstream(pattern, haystack, false)
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>();
+        let span_regex = aggregate_builder(pattern)
+            .unicode(false)
+            .case_insensitive(false)
+            .build_span_sum()
+            .unwrap();
+        let AggregatePlanIdentity::BoundedContext(identity) =
+            span_regex.build_report().plan_identity
+        else {
+            panic!("bounded-affix span-sum route for {pattern:?}");
+        };
+        assert_eq!(identity.kernel.plan_id, BOUNDED_AFFIX_PLAN_ID);
+        assert_eq!(
+            span_regex
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected_span_sum
         );
     }
 }
@@ -460,6 +598,7 @@ fn continuation_details(
         | AggregateExecutionDetails::LiteralClassRunLiteral(_)
         | AggregateExecutionDetails::BoundedLiteralPair(_)
         | AggregateExecutionDetails::BoundedContext(_)
+        | AggregateExecutionDetails::BoundedContextSpanSum(_)
         | AggregateExecutionDetails::FixedAbsoluteDomain(_)
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. }

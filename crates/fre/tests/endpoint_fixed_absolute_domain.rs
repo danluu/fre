@@ -52,7 +52,7 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
         168
     );
     assert_eq!(fre::AGGREGATE_CONTINUATION_MAX_ALLOCATIONS, 9);
-    // Schema 36 keeps the fixed-capacity construction ledger, full request,
+    // Schema 37 keeps the fixed-capacity construction ledger, full request,
     // typed source, terminal receipt, and exact inline terminal authentication
     // snapshots. These gates make a post-failure Box or an unreviewed further
     // inline copy visible rather than moving it outside construction accounting.
@@ -66,6 +66,7 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     );
     assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_312);
     assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 9_096);
+    assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_496);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 9_688);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 304);
