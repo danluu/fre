@@ -211,7 +211,10 @@ fn selector_owner_is_immutable_and_binds_the_complete_u0a_identity() {
 
 #[test]
 fn terminal_frontier_is_bound_before_source_and_declares_no_fallback() {
-    let pattern = r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)[\\/]";
+    // This shorter fixed prefix deliberately cannot retain the candidate
+    // scheduler's complete eight-byte filter. It therefore continues to
+    // exercise the independently valid terminal-frontier owner.
+    let pattern = r"(cargo[\\/].*[\\/])";
     let regex = CaptureBuilder::new(pattern)
         .unicode(false)
         .build()
@@ -939,6 +942,10 @@ fn nullable_and_history_count_routes_remain_outside_the_owner_seal() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one route matrix audits success, exact admission, and one-below closure together"
+)]
 fn retained_suffix_and_candidate_capture_routes_close_exact_and_one_below_work() {
     let cases = [
         (
@@ -949,6 +956,12 @@ fn retained_suffix_and_candidate_capture_routes_close_exact_and_one_below_work()
         ),
         (
             r"cargo/registry/src/[^/]+/([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)/|cargo\\registry\\src\\[^\\]+\\([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)\\",
+            b"cargo\\registry\\src\\hash\\win-2.0.1\\ cargo/registry/src/hash/unix-1.2.3/ \xFF",
+            AggregateOperationPhysicalRoute::Candidate,
+            6,
+        ),
+        (
+            r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)[\\/]",
             b"cargo\\registry\\src\\hash\\win-2.0.1\\ cargo/registry/src/hash/unix-1.2.3/ \xFF",
             AggregateOperationPhysicalRoute::Candidate,
             6,

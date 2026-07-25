@@ -84,6 +84,24 @@ impl Plan {
     }
 }
 
+/// Whether a one-owner plan has the complete fixed-prefix proof needed by the
+/// shared `memchr` scheduler.
+///
+/// Uniform capture Count uses this construction-retained shape to choose
+/// between otherwise valid executors before source access. Requiring the full
+/// filter window keeps that choice limited to plans whose candidate density is
+/// bounded by a strong eight-byte prefix. The construction-retained shared
+/// anchor descriptor already proves the scheduler's one-to-three-byte anchor
+/// requirement, so route selection does not repeat the bucket census.
+pub(crate) fn has_complete_shared_fixed_filter(plan: &Plan) -> bool {
+    let [entry] = &*plan.entries else {
+        return false;
+    };
+    entry.min_offset == entry.max_offset
+        && entry.check_len == MAX_FILTER_CHECKS
+        && plan.shared_fixed.is_some()
+}
+
 pub(crate) fn exact_drafts(capacity: usize) -> Result<ExactVec<Draft>, Error> {
     ExactVec::try_with_capacity(capacity)
         .map_err(|error| allocation_error(error, Resource::ProgramBytes, capacity))
@@ -1634,6 +1652,7 @@ mod tests {
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].check_len, MAX_FILTER_CHECKS);
         assert!(plan.shared_fixed.is_some());
+        assert!(has_complete_shared_fixed_filter(plan));
 
         let mut haystack = vec![b'\\'; 32_768];
         haystack.extend_from_slice(b" cargo/registry/src/hash/name-1.2/");
@@ -1670,6 +1689,7 @@ mod tests {
         let plan = compiled.candidate.as_ref().unwrap();
         assert_eq!(plan.entries.len(), 2);
         assert!(plan.shared_fixed.is_some());
+        assert!(!has_complete_shared_fixed_filter(plan));
 
         let mut haystack = vec![b'x'; 32_768];
         haystack.extend_from_slice(

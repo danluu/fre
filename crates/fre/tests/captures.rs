@@ -1599,7 +1599,7 @@ fn uniform_participation_uses_direct_or_selector_without_history() {
 }
 
 #[test]
-fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
+fn strong_fixed_candidate_preempts_terminal_frontier_and_preserves_both_slash_bytes() {
     let pattern = r"cargo[\\/]registry[\\/]src[\\/][^\\/]+[\\/]([0-9A-Za-z_-]+)-([0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z+.-]*)[\\/]";
     let haystack = b"xcargo/registry/src/hash/name-1.2.3/ cargo\\registry\\src\\hash\\other-2.0.1\\ cargcargo/registry/src/hash/no-3.4.5/ \xFF";
     let regex = CaptureBuilder::new(pattern)
@@ -1621,22 +1621,30 @@ fn terminal_class_frontier_preserves_uniform_captures_and_both_slash_bytes() {
     let certificate = result
         .selector_certificate
         .as_ref()
-        .expect("terminal selector certificate");
+        .expect("candidate selector certificate");
     let selector_accounting = result
         .selector_accounting
         .as_ref()
-        .expect("terminal selector accounting");
-    assert!(certificate.terminal_frontier);
-    assert!(selector_accounting.frontier_peak_states > 0);
+        .expect("candidate selector accounting");
+    assert_eq!(
+        certificate.physical_route,
+        fre::AggregateOperationPhysicalRoute::Candidate
+    );
+    assert!(!certificate.terminal_frontier);
+    assert_eq!(selector_accounting.frontier_peak_states, 0);
     assert_eq!(selector_accounting.output_bytes, 0);
     let receipt = result
         .selector_receipt
         .as_ref()
-        .expect("uniform terminal Count receipt");
+        .expect("uniform candidate Count receipt");
     let prospective = receipt
         .prospective
-        .expect("uniform terminal Count prospective");
-    assert!(prospective.terminal_frontier);
+        .expect("uniform candidate Count prospective");
+    assert_eq!(
+        receipt.identity.physical_route,
+        Some(fre::AggregateOperationPhysicalRoute::Candidate)
+    );
+    assert!(!prospective.terminal_frontier);
     assert_eq!(&receipt.actual, selector_accounting);
     assert_eq!(
         usize::from(certificate.prospective_allocations),

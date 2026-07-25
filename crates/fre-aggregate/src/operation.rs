@@ -981,7 +981,19 @@ impl CompiledRegex {
     #[doc(hidden)]
     #[must_use]
     pub fn uniform_capture_count_route(&self) -> OperationPhysicalRoute {
-        if !self.terminal_frontier.is_empty() {
+        let strong_fixed_candidate = self.minimum_match_bytes.is_some_and(|minimum| minimum > 1)
+            && self.candidate.as_ref().is_some_and(|plan| {
+                candidate::executable_for(&self.program)
+                    && candidate::has_complete_shared_fixed_filter(plan)
+            });
+        if strong_fixed_candidate {
+            // A complete fixed-prefix candidate proof is strictly more
+            // selective than the retained terminal class frontier: it scans
+            // the source once for at most three anchor bytes and verifies only
+            // starts passing the entire eight-byte prefix. The proof, not the
+            // source, determines this route before the capture owner is sealed.
+            OperationPhysicalRoute::Candidate
+        } else if !self.terminal_frontier.is_empty() {
             OperationPhysicalRoute::TerminalFrontierRows
         } else if !self.required_suffixes.is_empty() {
             if self.minimum_match_bytes.is_some_and(|minimum| minimum > 1)
