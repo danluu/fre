@@ -2825,6 +2825,10 @@ fn sixty_five_user_captures_match_pinned_rust_and_remain_bounded() {
 
 #[test]
 fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
+    const ONE_STATE_ENVELOPE_BYTES: usize = 56 + 2 * core::mem::size_of::<usize>();
+    const SCALAR_STORAGE_BYTES: usize = 95 * 677 * 2 * core::mem::size_of::<u32>();
+    const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
+
     // Authenticated Rebar obligations:
     // - unicode/overlapping-words/english@rust/regex
     // - unicode/overlapping-words/russian@rust/regex
@@ -2843,9 +2847,6 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     // added from the report, including the required-literal proof and both
     // complete inline theorem slots even though this Unicode plan is
     // ineligible for those compact routes.
-    const ONE_STATE_ENVELOPE_BYTES: usize = 56 + 2 * core::mem::size_of::<usize>();
-    const SCALAR_STORAGE_BYTES: usize = 95 * 677 * 2 * core::mem::size_of::<u32>();
-    const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
     let required_suffix_storage = report.selector.required_suffix_bytes
         + report.selector.required_suffixes * core::mem::size_of::<usize>();
     let retained_components = required_suffix_storage

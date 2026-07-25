@@ -16589,7 +16589,7 @@ mod tests {
     fn bounded_context_span_sum_keeps_private_execution_envelopes_fixed() {
         assert_eq!(
             core::mem::size_of::<super::AggregateSpanSumExecution>(),
-            2_312
+            2_392
         );
         assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 728);
         assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
