@@ -35,9 +35,10 @@ fn without_allocations<T>(operation: impl FnOnce() -> T) -> T {
 )]
 fn direct_terminal_packaging_has_a_zero_allocation_census() {
     // The complete inline cache identity, ordered-root proof slot, route
-    // receipt, owner receipt, and the two expanded aggregate construction
-    // receipts remain bounded without restoring an error-path Box.
-    assert_eq!(size_of::<CaptureExecutionError>(), 7_552);
+    // receipt, owner receipt, composed selector accounting, and the two
+    // expanded aggregate construction receipts remain bounded without
+    // restoring an error-path Box.
+    assert_eq!(size_of::<CaptureExecutionError>(), 7_712);
 
     let pattern = r"fn is_(\w+)|fn as_(\w+)";
     let haystack = b"fn is_alpha fn as_beta";
