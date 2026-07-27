@@ -10,6 +10,15 @@
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        clippy::ignored_unit_patterns,
+        clippy::unit_arg,
+        clippy::unused_unit,
+        reason = "static selection tables intentionally replace every retained function pointer with zero-sized metadata"
+    )
+)]
 
 use core::fmt;
 
@@ -26,8 +35,22 @@ pub use fre_target_features::{
 mod aarch64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 mod aarch64_sve2;
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "compiler-fixed vector profiles retain only scalar helpers reached by the selected leaf"
+    )
+)]
 mod scalar;
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "compiler-fixed x86 profiles deliberately prune unselected SSE/AVX leaves"
+    )
+)]
 mod x86_64;
 
 #[cfg(test)]
@@ -395,6 +418,13 @@ impl AsciiMasks32 {
         Self { ascii, members }
     }
 
+    #[cfg_attr(
+        feature = "static-dispatch",
+        allow(
+            dead_code,
+            reason = "a compiler-fixed native wide leaf does not retain the split fallback"
+        )
+    )]
     fn from_halves(first: AsciiMasks16, second: AsciiMasks16) -> Self {
         let ascii = u32::from(first.ascii) | (u32::from(second.ascii) << 16);
         let members = u32::from(first.members) | (u32::from(second.members) << 16);
@@ -478,12 +508,22 @@ impl AsciiSelection {
 #[derive(Clone, Copy, Debug)]
 struct AsciiRunTables {
     set: AsciiByteSet,
-    columns: [u8; ASCII_NARROW_BYTES],
     #[cfg_attr(
-        not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little")),
+        all(feature = "static-dispatch", not(target_arch = "aarch64")),
         allow(
             dead_code,
-            reason = "the compiled MATCH table is retained on every target so scanner layout and construction accounting remain target-independent"
+            reason = "non-AArch64 compiler-fixed run profiles select the scalar leaf and retain columns only for profile-independent construction accounting"
+        )
+    )]
+    columns: [u8; ASCII_NARROW_BYTES],
+    #[cfg_attr(
+        any(
+            feature = "static-dispatch",
+            not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))
+        ),
+        allow(
+            dead_code,
+            reason = "the MATCH table remains layout/accounting metadata in compiler-fixed profiles that select another run leaf"
         )
     )]
     match_values: [u8; ASCII_NARROW_BYTES],
@@ -493,13 +533,47 @@ struct AsciiRunTables {
     unsafe_code,
     reason = "the private function-pointer type represents a target-feature proof retained by a successfully constructed run scanner"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 type ScanRunEntry = unsafe fn(&AsciiRunTables, &[u8]) -> AsciiRunResult;
 
+#[cfg(feature = "static-dispatch")]
+type ScanRunEntry = ();
+
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "static selection tables retain zero-sized metadata fields without reading them at execution time"
+    )
+)]
 struct AsciiRunEntries {
     forward: ScanRunEntry,
     backward: ScanRunEntry,
 }
+
+macro_rules! scan_run_entry {
+    ($entry:path) => {{
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            $entry
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            ()
+        }
+    }};
+}
+
+const SCALAR_RUN_VARIANT_ID: &str = "ascii-byte-set.run.scalar.v1";
+#[cfg(target_arch = "aarch64")]
+const NEON_RUN_VARIANT_ID: &str = "ascii-byte-set.run.neon.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE_RUN_VARIANT_ID: &str = "ascii-byte-set.run.sve.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_MATCH16_RUN_VARIANT_ID: &str = "ascii-byte-set.run.sve2-match16.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID: &str = "ascii-byte-set.run.neon-sve2.arm-41-d84.v1";
 
 /// A compiled ASCII byte-set run scanner with immutable one-time dispatch.
 ///
@@ -509,7 +583,10 @@ struct AsciiRunEntries {
 #[derive(Clone, Copy)]
 pub struct AsciiByteSetRunScanner {
     tables: AsciiRunTables,
+    #[cfg(not(feature = "static-dispatch"))]
     entries: AsciiRunEntries,
+    #[cfg(feature = "static-dispatch")]
+    match_eligible: bool,
     selection: SelectionReceipt,
 }
 
@@ -532,6 +609,9 @@ impl AsciiByteSetRunScanner {
     }
 
     /// Build a run scanner under an authentic host-feature policy.
+    ///
+    /// In a static profile, the policy must select the compiler-fixed leaf;
+    /// policies that would retarget the scanner return an error.
     pub fn with_policy(
         set: AsciiByteSet,
         policy: DispatchPolicy,
@@ -552,9 +632,18 @@ impl AsciiByteSetRunScanner {
         // resource-accounted callers can charge exactly 128 membership probes.
         let (tables, match_eligible) = set.run_tables();
         let selected = select_run(capabilities, policy, match_eligible)?;
+        #[cfg(feature = "static-dispatch")]
+        require_static_selection(
+            selected.receipt(),
+            select_run(*host(), DispatchPolicy::Auto, match_eligible)?.receipt(),
+            static_run_variant_id(match_eligible),
+        )?;
         Ok(Self {
             tables,
+            #[cfg(not(feature = "static-dispatch"))]
             entries: selected.entry(),
+            #[cfg(feature = "static-dispatch")]
+            match_eligible,
             selection: selected.receipt(),
         })
     }
@@ -583,10 +672,19 @@ impl AsciiByteSetRunScanner {
         reason = "construction retained this private entry only after proving every required target feature against immutable host facts"
     )]
     pub fn scan_forward(&self, bytes: &[u8]) -> AsciiRunResult {
-        // SAFETY: callers cannot forge or replace the retained entry or tables.
-        // The slice proves the source extent for every scalar, fixed-width, or
-        // predicated load performed by the selected private leaf.
-        unsafe { (self.entries.forward)(&self.tables, bytes) }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            // SAFETY: callers cannot forge or replace the retained entry or
+            // tables. The slice proves the source extent for every scalar,
+            // fixed-width, or predicated load performed by the selected leaf.
+            unsafe { (self.entries.forward)(&self.tables, bytes) }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: construction rejected every snapshot or policy that
+            // selected a leaf other than this compiler-fixed implementation.
+            unsafe { static_scan_run_forward(&self.tables, self.match_eligible, bytes) }
+        }
     }
 
     /// Scan the maximal member suffix.
@@ -599,9 +697,17 @@ impl AsciiByteSetRunScanner {
         reason = "construction retained this private entry only after proving every required target feature against immutable host facts"
     )]
     pub fn scan_backward(&self, bytes: &[u8]) -> AsciiRunResult {
-        // SAFETY: identical retained-entry and source-extent proof to the
-        // forward operation.
-        unsafe { (self.entries.backward)(&self.tables, bytes) }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            // SAFETY: identical retained-entry and source-extent proof to the
+            // forward operation.
+            unsafe { (self.entries.backward)(&self.tables, bytes) }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: identical compiler-fixed selection proof to forward.
+            unsafe { static_scan_run_backward(&self.tables, self.match_eligible, bytes) }
+        }
     }
 }
 
@@ -609,19 +715,69 @@ impl AsciiByteSetRunScanner {
     unsafe_code,
     reason = "the private function-pointer type represents a target-feature proof retained by a successfully constructed classifier"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 type Classify16Entry =
     unsafe fn(&[u8; ASCII_NARROW_BYTES], &[u8; ASCII_NARROW_BYTES]) -> AsciiMasks16;
+
+#[cfg(feature = "static-dispatch")]
+type Classify16Entry = ();
 
 #[allow(
     unsafe_code,
     reason = "the private function-pointer type represents a target-feature proof retained by a successfully constructed classifier"
 )]
 #[cfg(any(
+    all(
+        not(feature = "static-dispatch"),
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+        )
+    ),
+    feature = "static-dispatch"
+))]
+#[cfg(not(feature = "static-dispatch"))]
+type Classify32Entry =
+    unsafe fn(&[u8; ASCII_NARROW_BYTES], &[u8; ASCII_WIDE_BYTES]) -> AsciiMasks32;
+
+#[cfg(all(
+    feature = "static-dispatch",
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+    )
+))]
+type Classify32Entry = ();
+
+macro_rules! classify_16_entry {
+    ($entry:path) => {{
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            $entry
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            ()
+        }
+    }};
+}
+
+#[cfg(any(
     target_arch = "x86_64",
     all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
 ))]
-type Classify32Entry =
-    unsafe fn(&[u8; ASCII_NARROW_BYTES], &[u8; ASCII_WIDE_BYTES]) -> AsciiMasks32;
+macro_rules! classify_32_entry {
+    ($entry:path) => {{
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            $entry
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            ()
+        }
+    }};
+}
 
 #[derive(Clone, Copy, Debug)]
 enum WideEntry {
@@ -634,12 +790,33 @@ enum WideEntry {
     Avx512(Classify32Entry),
 }
 
+const SCALAR_MASK16_VARIANT_ID: &str = "ascii-byte-set.mask16.scalar.v1";
+#[cfg(target_arch = "aarch64")]
+const NEON_MASK16_VARIANT_ID: &str = "ascii-byte-set.mask16.neon.v1";
+#[cfg(target_arch = "x86_64")]
+const SSE2_MASK16_VARIANT_ID: &str = "ascii-byte-set.mask16.sse2.v1";
+#[cfg(target_arch = "x86_64")]
+const SSSE3_MASK16_VARIANT_ID: &str = "ascii-byte-set.mask16.ssse3.v1";
+const SPLIT_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.split16.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SPLIT_NEON_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.split16-neon.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.sve2.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_ARM_41_D84_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.sve2.arm-41-d84.v1";
+#[cfg(target_arch = "x86_64")]
+const AVX2_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.avx2.v1";
+#[cfg(target_arch = "x86_64")]
+const AVX512_MASK32_VARIANT_ID: &str = "ascii-byte-set.mask32.avx512f-bw-vl.v1";
+
 /// A compiled ASCII byte-set classifier with immutable one-time dispatch.
 #[derive(Clone, Copy)]
 pub struct AsciiByteSetClassifier {
     set: AsciiByteSet,
     columns: [u8; ASCII_NARROW_BYTES],
+    #[cfg(not(feature = "static-dispatch"))]
     narrow_entry: Classify16Entry,
+    #[cfg(not(feature = "static-dispatch"))]
     wide_entry: WideEntry,
     selection: AsciiSelection,
 }
@@ -664,6 +841,9 @@ impl AsciiByteSetClassifier {
 
     /// Build a classifier under a policy that can only remove real host
     /// features or require that real host features are present.
+    ///
+    /// In a static profile, the policy must select the compiler-fixed leaves;
+    /// policies that would retarget either operation return an error.
     pub fn with_policy(
         set: AsciiByteSet,
         policy: DispatchPolicy,
@@ -708,10 +888,19 @@ impl AsciiByteSetClassifier {
             #[cfg(target_arch = "x86_64")]
             WideEntry::Avx512(_) => wide.receipt(),
         };
+        #[cfg(feature = "static-dispatch")]
+        {
+            let expected_narrow = select_narrow(*host(), DispatchPolicy::Auto)?.receipt();
+            let expected_wide = select_wide(*host(), DispatchPolicy::Auto)?.receipt();
+            require_static_selection(narrow_receipt, expected_narrow, static_narrow_variant_id())?;
+            require_static_selection(wide.receipt(), expected_wide, static_wide_variant_id())?;
+        }
         Ok(Self {
             set,
             columns: set.nibble_columns(),
+            #[cfg(not(feature = "static-dispatch"))]
             narrow_entry: narrow.entry(),
+            #[cfg(not(feature = "static-dispatch"))]
             wide_entry,
             selection: AsciiSelection {
                 narrow: narrow_receipt,
@@ -739,11 +928,19 @@ impl AsciiByteSetClassifier {
         reason = "the private entry is retained only after construction proved its exact target features against the immutable host snapshot"
     )]
     pub fn classify_16(&self, bytes: &[u8; ASCII_NARROW_BYTES]) -> AsciiMasks16 {
-        // SAFETY: no caller can provide or replace `narrow_entry`.
-        // Construction selected it only when its feature requirements were a
-        // subset of OS-usable host facts, and policy application cannot add
-        // features. The fixed-array argument proves the leaf's load width.
-        unsafe { (self.narrow_entry)(&self.columns, bytes) }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            // SAFETY: no caller can provide or replace `narrow_entry`.
+            // Construction selected it only when its feature requirements were
+            // a subset of OS-usable host facts. The fixed array proves width.
+            unsafe { (self.narrow_entry)(&self.columns, bytes) }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: construction rejected every snapshot or policy that
+            // selected a leaf other than this compiler-fixed implementation.
+            unsafe { static_classify_16(&self.columns, bytes) }
+        }
     }
 
     /// Classify exactly 32 bytes.
@@ -753,39 +950,42 @@ impl AsciiByteSetClassifier {
         reason = "each private direct wide entry is retained only after construction proved its exact target features; the split fallback calls the already-qualified narrow entry"
     )]
     pub fn classify_32(&self, bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiMasks32 {
-        match self.wide_entry {
-            WideEntry::SplitNarrow => {
-                let first: &[u8; ASCII_NARROW_BYTES] = bytes[..ASCII_NARROW_BYTES]
-                    .try_into()
-                    .expect("the first half has exactly 16 bytes");
-                let second: &[u8; ASCII_NARROW_BYTES] = bytes[ASCII_NARROW_BYTES..]
-                    .try_into()
-                    .expect("the second half has exactly 16 bytes");
-                AsciiMasks32::from_halves(self.classify_16(first), self.classify_16(second))
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            match self.wide_entry {
+                WideEntry::SplitNarrow => {
+                    let first: &[u8; ASCII_NARROW_BYTES] = bytes[..ASCII_NARROW_BYTES]
+                        .try_into()
+                        .expect("the first half has exactly 16 bytes");
+                    let second: &[u8; ASCII_NARROW_BYTES] = bytes[ASCII_NARROW_BYTES..]
+                        .try_into()
+                        .expect("the second half has exactly 16 bytes");
+                    AsciiMasks32::from_halves(self.classify_16(first), self.classify_16(second))
+                }
+                #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+                WideEntry::Sve2(entry) => {
+                    // SAFETY: construction retained this variant only after
+                    // proving SVE and SVE2 OS-usable. The array proves extent.
+                    unsafe { entry(&self.columns, bytes) }
+                }
+                #[cfg(target_arch = "x86_64")]
+                WideEntry::Avx2(entry) => {
+                    // SAFETY: construction proved AVX2 OS-usable and the array
+                    // argument proves the exact 32-byte load width.
+                    unsafe { entry(&self.columns, bytes) }
+                }
+                #[cfg(target_arch = "x86_64")]
+                WideEntry::Avx512(entry) => {
+                    // SAFETY: construction proved AVX-512F, BW, and VL
+                    // OS-usable; VL keeps every operation at 32 bytes.
+                    unsafe { entry(&self.columns, bytes) }
+                }
             }
-            #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
-            WideEntry::Sve2(entry) => {
-                // SAFETY: no caller can provide or replace `wide_entry`.
-                // Construction retained this variant only after proving both
-                // SVE and SVE2 OS-usable. The array argument proves the exact
-                // 32-byte input extent for every predicated load.
-                unsafe { entry(&self.columns, bytes) }
-            }
-            #[cfg(target_arch = "x86_64")]
-            WideEntry::Avx2(entry) => {
-                // SAFETY: no caller can provide or replace `wide_entry`.
-                // Construction retained this variant only after proving AVX2
-                // OS-usable. The array argument proves the 32-byte load width.
-                unsafe { entry(&self.columns, bytes) }
-            }
-            #[cfg(target_arch = "x86_64")]
-            WideEntry::Avx512(entry) => {
-                // SAFETY: no caller can provide or replace `wide_entry`.
-                // Construction retained this variant only after proving
-                // AVX-512F, AVX-512BW and AVX-512VL OS-usable. AVX-512VL keeps
-                // every data operation at the exact 32-byte array width.
-                unsafe { entry(&self.columns, bytes) }
-            }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: identical compiler-fixed selection proof to classify_16.
+            unsafe { static_classify_32(&self.columns, bytes) }
         }
     }
 
@@ -828,21 +1028,53 @@ impl AsciiWordSpaceTables {
     unsafe_code,
     reason = "the private function-pointer type represents a retained target-feature proof"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 type ClassifyWordSpace16Entry =
     unsafe fn(&AsciiWordSpaceTables, &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16;
+
+#[cfg(feature = "static-dispatch")]
+type ClassifyWordSpace16Entry = ();
 
 #[allow(
     unsafe_code,
     reason = "the private function-pointer type represents a retained target-feature proof"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 type ClassifyWordSpace32Entry =
     unsafe fn(&AsciiWordSpaceTables, &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32;
 
+#[cfg(feature = "static-dispatch")]
+type ClassifyWordSpace32Entry = ();
+
+macro_rules! classify_word_space_entry {
+    ($entry:path) => {{
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            $entry
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            ()
+        }
+    }};
+}
+
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "static selection tables retain zero-sized metadata fields without reading them at execution time"
+    )
+)]
 struct AsciiWordSpaceEntries {
     narrow: ClassifyWordSpace16Entry,
     wide: ClassifyWordSpace32Entry,
 }
+
+const SCALAR_WORD_SPACE_VARIANT_ID: &str = "ascii-word-space.mask16x32.scalar.v1";
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const SVE2_FIXED16_WORD_SPACE_VARIANT_ID: &str = "ascii-word-space.mask16x32.sve2-vl16.v1";
 
 /// Retained fixed-block classifier for token-phrase byte classes.
 ///
@@ -851,7 +1083,15 @@ struct AsciiWordSpaceEntries {
 /// handle automatically; callers must opt into the block path explicitly.
 #[derive(Clone, Copy)]
 pub struct AsciiWordSpaceClassifier {
+    #[cfg_attr(
+        feature = "static-dispatch",
+        allow(
+            dead_code,
+            reason = "static scalar-only targets retain the fixed tables for a profile-independent handle layout"
+        )
+    )]
     tables: AsciiWordSpaceTables,
+    #[cfg(not(feature = "static-dispatch"))]
     entries: AsciiWordSpaceEntries,
     selection: SelectionReceipt,
 }
@@ -867,6 +1107,9 @@ impl fmt::Debug for AsciiWordSpaceClassifier {
 
 impl AsciiWordSpaceClassifier {
     /// Build under a policy that can only remove or require authentic features.
+    ///
+    /// In a static profile, the policy must select the compiler-fixed leaf;
+    /// policies that would retarget the classifier return an error.
     pub fn with_policy(policy: DispatchPolicy) -> Result<Self, UnsupportedRequiredFeatures> {
         SimdDispatchContext::capture().ascii_word_space_classifier(policy)
     }
@@ -877,8 +1120,15 @@ impl AsciiWordSpaceClassifier {
         policy: DispatchPolicy,
     ) -> Result<Self, UnsupportedRequiredFeatures> {
         let selected = select_word_space(capabilities, policy)?;
+        #[cfg(feature = "static-dispatch")]
+        require_static_selection(
+            selected.receipt(),
+            select_word_space(*host(), DispatchPolicy::Auto)?.receipt(),
+            static_word_space_variant_id(),
+        )?;
         Ok(Self {
             tables: AsciiWordSpaceTables::new(),
+            #[cfg(not(feature = "static-dispatch"))]
             entries: selected.entry(),
             selection: selected.receipt(),
         })
@@ -906,9 +1156,18 @@ impl AsciiWordSpaceClassifier {
         reason = "construction retained the private entry only after proving its feature requirements against authentic host facts"
     )]
     pub fn classify_16(&self, bytes: &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16 {
-        // SAFETY: callers cannot replace the entry or fixed tables, and the
-        // exact array proves every source load extent.
-        unsafe { (self.entries.narrow)(&self.tables, bytes) }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            // SAFETY: callers cannot replace the entry or fixed tables, and
+            // the exact array proves every source load extent.
+            unsafe { (self.entries.narrow)(&self.tables, bytes) }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: construction proved this compiler-fixed leaf is exactly
+            // the one authorized by the supplied snapshot and policy.
+            unsafe { static_classify_word_space_16(&self.tables, bytes) }
+        }
     }
 
     /// Classify exactly 32 bytes as two fixed active-16 groups.
@@ -918,16 +1177,771 @@ impl AsciiWordSpaceClassifier {
         reason = "construction retained the private entry only after proving its feature requirements against authentic host facts"
     )]
     pub fn classify_32(&self, bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32 {
-        // SAFETY: the retained entry and exact source extent establish the
-        // same invariants as `classify_16`.
-        unsafe { (self.entries.wide)(&self.tables, bytes) }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            // SAFETY: the retained entry and exact source extent establish the
+            // same invariants as `classify_16`.
+            unsafe { (self.entries.wide)(&self.tables, bytes) }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            // SAFETY: identical compiler-fixed selection proof to classify_16.
+            unsafe { static_classify_word_space_32(&self.tables, bytes) }
+        }
     }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn static_narrow_variant_id() -> &'static str {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        NEON_MASK16_VARIANT_ID
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    {
+        SSSE3_MASK16_VARIANT_ID
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "ssse3"),
+        target_feature = "sse2"
+    ))]
+    {
+        SSE2_MASK16_VARIANT_ID
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "ssse3"),
+            target_feature = "sse2"
+        )
+    )))]
+    {
+        SCALAR_MASK16_VARIANT_ID
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn static_wide_variant_id() -> &'static str {
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2",
+        feature = "static-dispatch-arm-41-d84"
+    ))]
+    {
+        SVE2_ARM_41_D84_MASK32_VARIANT_ID
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "neon",
+        not(feature = "static-dispatch-arm-41-d84")
+    ))]
+    {
+        SPLIT_NEON_MASK32_VARIANT_ID
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2",
+        not(feature = "static-dispatch-arm-41-d84"),
+        not(target_feature = "neon")
+    ))]
+    {
+        SVE2_MASK32_VARIANT_ID
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        AVX2_MASK32_VARIANT_ID
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "avx2"),
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))]
+    {
+        AVX512_MASK32_VARIANT_ID
+    }
+    #[cfg(not(any(
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "neon",
+            not(feature = "static-dispatch-arm-41-d84")
+        ),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2",
+            any(feature = "static-dispatch-arm-41-d84", not(target_feature = "neon"))
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        )
+    )))]
+    {
+        SPLIT_MASK32_VARIANT_ID
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn static_word_space_variant_id() -> &'static str {
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    {
+        SVE2_FIXED16_WORD_SPACE_VARIANT_ID
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    )))]
+    {
+        SCALAR_WORD_SPACE_VARIANT_ID
+    }
+}
+
+#[cfg(all(feature = "static-dispatch-arm-41-d84", feature = "static-dispatch"))]
+const fn static_run_variant_id(match_eligible: bool) -> &'static str {
+    if match_eligible {
+        NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID
+    } else {
+        NEON_RUN_VARIANT_ID
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_feature = "neon"
+))]
+const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+    NEON_RUN_VARIANT_ID
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+const fn static_run_variant_id(match_eligible: bool) -> &'static str {
+    if match_eligible {
+        SVE2_MATCH16_RUN_VARIANT_ID
+    } else {
+        SVE_RUN_VARIANT_ID
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    not(target_feature = "sve2")
+))]
+const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+    SVE_RUN_VARIANT_ID
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        feature = "static-dispatch-arm-41-d84",
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            not(target_feature = "neon"),
+            target_feature = "sve"
+        )
+    ))
+))]
+const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
+    SCALAR_RUN_VARIANT_ID
+}
+
+#[cfg(feature = "static-dispatch")]
+fn require_static_selection(
+    selected: SelectionReceipt,
+    compiler_fixed: SelectionReceipt,
+    direct_variant_id: &'static str,
+) -> Result<(), UnsupportedRequiredFeatures> {
+    assert_eq!(
+        compiler_fixed.variant_id, direct_variant_id,
+        "compiler-fixed direct leaf drifted from automatic selection"
+    );
+    if selected.variant_id == direct_variant_id {
+        Ok(())
+    } else {
+        Err(UnsupportedRequiredFeatures {
+            required: compiler_fixed.required,
+            usable: selected.policy_usable,
+        })
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "aarch64",
+    target_feature = "neon"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed NEON receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_16(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiMasks16 {
+    // SAFETY: this function is compiled only when NEON is globally enabled,
+    // and construction rejects snapshots or policies that remove it.
+    unsafe { aarch64::classify_16_neon(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "ssse3"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed SSSE3 receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_16(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiMasks16 {
+    // SAFETY: this function is compiled only when SSSE3 is globally enabled,
+    // and construction rejects snapshots or policies that remove it.
+    unsafe { x86_64::classify_16_ssse3(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "ssse3"),
+    target_feature = "sse2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed SSE2 receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_16(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiMasks16 {
+    // SAFETY: this function is compiled only when SSE2 is globally enabled,
+    // and construction rejects snapshots or policies that remove it.
+    unsafe { x86_64::classify_16_sse2(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "ssse3"),
+            target_feature = "sse2"
+        )
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the uniform compiler-fixed classifier boundary is unsafe only in vector configurations"
+)]
+unsafe fn static_classify_16(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiMasks16 {
+    scalar::classify_16(columns, bytes)
+}
+
+#[cfg(feature = "static-dispatch")]
+#[allow(
+    unsafe_code,
+    dead_code,
+    reason = "the split static leaf delegates only to the already compiler-fixed narrow leaf"
+)]
+unsafe fn static_classify_32_split(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiMasks32 {
+    let first: &[u8; ASCII_NARROW_BYTES] = bytes[..ASCII_NARROW_BYTES]
+        .try_into()
+        .expect("the first half has exactly 16 bytes");
+    let second: &[u8; ASCII_NARROW_BYTES] = bytes[ASCII_NARROW_BYTES..]
+        .try_into()
+        .expect("the second half has exactly 16 bytes");
+    // SAFETY: the outer static constructor proved the same fixed narrow leaf.
+    let (first, second) = unsafe {
+        (
+            static_classify_16(columns, first),
+            static_classify_16(columns, second),
+        )
+    };
+    AsciiMasks32::from_halves(first, second)
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    target_feature = "sve",
+    target_feature = "sve2",
+    any(feature = "static-dispatch-arm-41-d84", not(target_feature = "neon"))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed SVE2 receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_32(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiMasks32 {
+    // SAFETY: SVE and SVE2 are globally enabled and independently required by
+    // the receipt accepted during construction.
+    unsafe { aarch64_sve2::classify_32_sve2(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "avx2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed AVX2 receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_32(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiMasks32 {
+    // SAFETY: AVX2 is globally enabled and required by the accepted receipt.
+    unsafe { x86_64::classify_32_avx2(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "avx2"),
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed AVX-512 receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_32(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiMasks32 {
+    // SAFETY: every AVX-512 feature required by this leaf is globally enabled
+    // and independently recorded by the accepted receipt.
+    unsafe { x86_64::classify_32_avx512(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2",
+            any(feature = "static-dispatch-arm-41-d84", not(target_feature = "neon"))
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        )
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the compiler-fixed wide fallback delegates only to the compiler-fixed narrow leaf"
+)]
+unsafe fn static_classify_32(
+    columns: &[u8; ASCII_NARROW_BYTES],
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiMasks32 {
+    // SAFETY: construction authenticated the split receipt and its exact
+    // compiler-fixed narrow delegate.
+    unsafe { static_classify_32_split(columns, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed SVE2 word-space receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_word_space_16(
+    tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiWordSpaceMasks16 {
+    // SAFETY: SVE and SVE2 are globally enabled and required by the receipt.
+    unsafe { aarch64_sve2::classify_word_space_16_sve2(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed SVE2 word-space receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_classify_word_space_32(
+    tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiWordSpaceMasks32 {
+    // SAFETY: SVE and SVE2 are globally enabled and required by the receipt.
+    unsafe { aarch64_sve2::classify_word_space_32_sve2(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the uniform compiler-fixed word-space boundary is unsafe only in vector configurations"
+)]
+unsafe fn static_classify_word_space_16(
+    _tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiWordSpaceMasks16 {
+    scalar::classify_word_space_16(bytes)
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the uniform compiler-fixed word-space boundary is unsafe only in vector configurations"
+)]
+unsafe fn static_classify_word_space_32(
+    _tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiWordSpaceMasks32 {
+    scalar::classify_word_space_32(bytes)
+}
+
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the V3 static profile requires NEON, SVE, and SVE2 before either compiler-fixed run leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    if match_eligible {
+        // SAFETY: the profile and accepted receipt prove NEON, SVE, and SVE2,
+        // and construction produced an exact MATCH table for this set.
+        unsafe { aarch64_sve2::scan_run_forward_neon_sve2(tables, bytes) }
+    } else {
+        // SAFETY: the same profile independently proves NEON.
+        unsafe { aarch64::scan_run_forward_neon(tables, bytes) }
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the V3 static profile requires NEON, SVE, and SVE2 before either compiler-fixed run leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    if match_eligible {
+        // SAFETY: the profile and accepted receipt prove NEON, SVE, and SVE2,
+        // and construction produced an exact MATCH table for this set.
+        unsafe { aarch64_sve2::scan_run_backward_neon_sve2(tables, bytes) }
+    } else {
+        // SAFETY: the same profile independently proves NEON.
+        unsafe { aarch64::scan_run_backward_neon(tables, bytes) }
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_feature = "neon"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed NEON run receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: NEON is globally enabled and required by the accepted receipt.
+    unsafe { aarch64::scan_run_forward_neon(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_feature = "neon"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed NEON run receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: NEON is globally enabled and required by the accepted receipt.
+    unsafe { aarch64::scan_run_backward_neon(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed SVE/SVE2 run receipt before either private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    if match_eligible {
+        // SAFETY: construction proved the MATCH representation and SVE2.
+        unsafe { aarch64_sve2::scan_run_forward_sve2(tables, bytes) }
+    } else {
+        // SAFETY: construction independently proved base SVE.
+        unsafe { aarch64_sve2::scan_run_forward_sve(tables, bytes) }
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed SVE/SVE2 run receipt before either private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    if match_eligible {
+        // SAFETY: construction proved the MATCH representation and SVE2.
+        unsafe { aarch64_sve2::scan_run_backward_sve2(tables, bytes) }
+    } else {
+        // SAFETY: construction independently proved base SVE.
+        unsafe { aarch64_sve2::scan_run_backward_sve(tables, bytes) }
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    not(target_feature = "sve2")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed SVE run receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: SVE is globally enabled and required by the accepted receipt.
+    unsafe { aarch64_sve2::scan_run_forward_sve(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    not(target_feature = "sve2")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the generic static constructor requires the compiler-fixed SVE run receipt before this private direct leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: SVE is globally enabled and required by the accepted receipt.
+    unsafe { aarch64_sve2::scan_run_backward_sve(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        feature = "static-dispatch-arm-41-d84",
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            not(target_feature = "neon"),
+            target_feature = "sve"
+        )
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the uniform compiler-fixed run boundary is unsafe only in vector configurations"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    scalar::scan_run_forward(tables.set, bytes)
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        feature = "static-dispatch-arm-41-d84",
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            not(target_feature = "neon"),
+            target_feature = "sve"
+        )
+    ))
+))]
+#[allow(
+    unsafe_code,
+    reason = "the uniform compiler-fixed run boundary is unsafe only in vector configurations"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    _match_eligible: bool,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    scalar::scan_run_backward(tables.set, bytes)
 }
 
 #[allow(
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 unsafe fn scan_run_forward_scalar_entry(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
     scalar::scan_run_forward(tables.set, bytes)
 }
@@ -936,17 +1950,18 @@ unsafe fn scan_run_forward_scalar_entry(tables: &AsciiRunTables, bytes: &[u8]) -
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 unsafe fn scan_run_backward_scalar_entry(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
     scalar::scan_run_backward(tables.set, bytes)
 }
 
 const SCALAR_RUN_ENTRIES: AsciiRunEntries = AsciiRunEntries {
-    forward: scan_run_forward_scalar_entry,
-    backward: scan_run_backward_scalar_entry,
+    forward: scan_run_entry!(scan_run_forward_scalar_entry),
+    backward: scan_run_entry!(scan_run_backward_scalar_entry),
 };
 
 const SCALAR_RUN: KernelVariant<AsciiRunEntries> = KernelVariant::new(
-    "ascii-byte-set.run.scalar.v1",
+    SCALAR_RUN_VARIANT_ID,
     ArchitectureRequirement::Any,
     FeatureSet::EMPTY,
     VectorKind::Scalar,
@@ -962,19 +1977,19 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
     // Generic automatic policy retains NEON until paired direct-run and
     // end-to-end consumer measurements justify a narrower tuning promotion.
     KernelVariant::new(
-        "ascii-byte-set.run.sve.v1",
+        SVE_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmSve),
         VectorKind::Scalable,
         ASCII_NARROW_BYTES,
         50,
         AsciiRunEntries {
-            forward: aarch64_sve2::scan_run_forward_sve,
-            backward: aarch64_sve2::scan_run_backward_sve,
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve),
         },
     ),
     KernelVariant::new(
-        "ascii-byte-set.run.neon.v1",
+        NEON_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmNeon),
         VectorKind::Fixed {
@@ -983,8 +1998,8 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
         ASCII_NARROW_BYTES,
         100,
         AsciiRunEntries {
-            forward: aarch64::scan_run_forward_neon,
-            backward: aarch64::scan_run_backward_neon,
+            forward: scan_run_entry!(aarch64::scan_run_forward_neon),
+            backward: scan_run_entry!(aarch64::scan_run_backward_neon),
         },
     ),
 ];
@@ -993,19 +2008,19 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
 const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
     SCALAR_RUN,
     KernelVariant::new(
-        "ascii-byte-set.run.sve.v1",
+        SVE_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmSve),
         VectorKind::Scalable,
         ASCII_NARROW_BYTES,
         50,
         AsciiRunEntries {
-            forward: aarch64_sve2::scan_run_forward_sve,
-            backward: aarch64_sve2::scan_run_backward_sve,
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve),
         },
     ),
     KernelVariant::new(
-        "ascii-byte-set.run.sve2-match16.v1",
+        SVE2_MATCH16_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::EMPTY
             .with(Feature::ArmSve)
@@ -1014,14 +2029,14 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
         ASCII_NARROW_BYTES,
         60,
         AsciiRunEntries {
-            forward: aarch64_sve2::scan_run_forward_sve2,
-            backward: aarch64_sve2::scan_run_backward_sve2,
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_sve2),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_sve2),
         },
     ),
     // See RUN_VARIANTS: unqualified hardware availability authorizes entry but
     // does not itself establish that either SVE implementation beats NEON.
     KernelVariant::new(
-        "ascii-byte-set.run.neon.v1",
+        NEON_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmNeon),
         VectorKind::Fixed {
@@ -1030,8 +2045,8 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
         ASCII_NARROW_BYTES,
         100,
         AsciiRunEntries {
-            forward: aarch64::scan_run_forward_neon,
-            backward: aarch64::scan_run_backward_neon,
+            forward: scan_run_entry!(aarch64::scan_run_forward_neon),
+            backward: scan_run_entry!(aarch64::scan_run_backward_neon),
         },
     ),
     // Neoverse V3 qualification found SVE2 decisively ahead once a run
@@ -1039,7 +2054,7 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
     // cost. This composite keeps NEON's exact recovery for short runs and
     // hands only sustained runs to the fixed-16 SVE2 leaf.
     KernelVariant::new(
-        "ascii-byte-set.run.neon-sve2.arm-41-d84.v1",
+        NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::EMPTY
             .with(Feature::ArmNeon)
@@ -1049,8 +2064,8 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
         ASCII_NARROW_BYTES,
         150,
         AsciiRunEntries {
-            forward: aarch64_sve2::scan_run_forward_neon_sve2,
-            backward: aarch64_sve2::scan_run_backward_neon_sve2,
+            forward: scan_run_entry!(aarch64_sve2::scan_run_forward_neon_sve2),
+            backward: scan_run_entry!(aarch64_sve2::scan_run_backward_neon_sve2),
         },
     )
     .when_tuning(is_neoverse_v3),
@@ -1063,7 +2078,7 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
 const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = [
     SCALAR_RUN,
     KernelVariant::new(
-        "ascii-byte-set.run.neon.v1",
+        NEON_RUN_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmNeon),
         VectorKind::Fixed {
@@ -1072,8 +2087,8 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = [
         ASCII_NARROW_BYTES,
         100,
         AsciiRunEntries {
-            forward: aarch64::scan_run_forward_neon,
-            backward: aarch64::scan_run_backward_neon,
+            forward: scan_run_entry!(aarch64::scan_run_forward_neon),
+            backward: scan_run_entry!(aarch64::scan_run_backward_neon),
         },
     ),
 ];
@@ -1094,6 +2109,7 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 unsafe fn classify_16_scalar_entry(
     columns: &[u8; ASCII_NARROW_BYTES],
     bytes: &[u8; ASCII_NARROW_BYTES],
@@ -1105,6 +2121,7 @@ unsafe fn classify_16_scalar_entry(
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 unsafe fn classify_word_space_16_scalar_entry(
     _tables: &AsciiWordSpaceTables,
     bytes: &[u8; ASCII_NARROW_BYTES],
@@ -1116,6 +2133,7 @@ unsafe fn classify_word_space_16_scalar_entry(
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+#[cfg(not(feature = "static-dispatch"))]
 unsafe fn classify_word_space_32_scalar_entry(
     _tables: &AsciiWordSpaceTables,
     bytes: &[u8; ASCII_WIDE_BYTES],
@@ -1124,15 +2142,15 @@ unsafe fn classify_word_space_32_scalar_entry(
 }
 
 const SCALAR_WORD_SPACE: KernelVariant<AsciiWordSpaceEntries> = KernelVariant::new(
-    "ascii-word-space.mask16x32.scalar.v1",
+    SCALAR_WORD_SPACE_VARIANT_ID,
     ArchitectureRequirement::Any,
     FeatureSet::EMPTY,
     VectorKind::Scalar,
     ASCII_NARROW_BYTES,
     0,
     AsciiWordSpaceEntries {
-        narrow: classify_word_space_16_scalar_entry,
-        wide: classify_word_space_32_scalar_entry,
+        narrow: classify_word_space_entry!(classify_word_space_16_scalar_entry),
+        wide: classify_word_space_entry!(classify_word_space_32_scalar_entry),
     },
 );
 
@@ -1140,7 +2158,7 @@ const SCALAR_WORD_SPACE: KernelVariant<AsciiWordSpaceEntries> = KernelVariant::n
 const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 2] = [
     SCALAR_WORD_SPACE,
     KernelVariant::new(
-        "ascii-word-space.mask16x32.sve2-vl16.v1",
+        SVE2_FIXED16_WORD_SPACE_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::EMPTY
             .with(Feature::ArmSve)
@@ -1149,8 +2167,8 @@ const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 2] = [
         ASCII_NARROW_BYTES,
         100,
         AsciiWordSpaceEntries {
-            narrow: aarch64_sve2::classify_word_space_16_sve2,
-            wide: aarch64_sve2::classify_word_space_32_sve2,
+            narrow: classify_word_space_entry!(aarch64_sve2::classify_word_space_16_sve2),
+            wide: classify_word_space_entry!(aarch64_sve2::classify_word_space_32_sve2),
         },
     ),
 ];
@@ -1159,20 +2177,20 @@ const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 2] = [
 const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 1] = [SCALAR_WORD_SPACE];
 
 const SCALAR_16: KernelVariant<Classify16Entry> = KernelVariant::new(
-    "ascii-byte-set.mask16.scalar.v1",
+    SCALAR_MASK16_VARIANT_ID,
     ArchitectureRequirement::Any,
     FeatureSet::EMPTY,
     VectorKind::Scalar,
     ASCII_NARROW_BYTES,
     0,
-    classify_16_scalar_entry,
+    classify_16_entry!(classify_16_scalar_entry),
 );
 
 #[cfg(target_arch = "aarch64")]
 const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 2] = [
     SCALAR_16,
     KernelVariant::new(
-        "ascii-byte-set.mask16.neon.v1",
+        NEON_MASK16_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmNeon),
         VectorKind::Fixed {
@@ -1180,7 +2198,7 @@ const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 2] = [
         },
         ASCII_NARROW_BYTES,
         100,
-        aarch64::classify_16_neon,
+        classify_16_entry!(aarch64::classify_16_neon),
     ),
 ];
 
@@ -1188,7 +2206,7 @@ const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 2] = [
 const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 3] = [
     SCALAR_16,
     KernelVariant::new(
-        "ascii-byte-set.mask16.sse2.v1",
+        SSE2_MASK16_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::X86_64),
         FeatureSet::of(Feature::X86Sse2),
         VectorKind::Fixed {
@@ -1196,10 +2214,10 @@ const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 3] = [
         },
         ASCII_NARROW_BYTES,
         50,
-        x86_64::classify_16_sse2,
+        classify_16_entry!(x86_64::classify_16_sse2),
     ),
     KernelVariant::new(
-        "ascii-byte-set.mask16.ssse3.v1",
+        SSSE3_MASK16_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::X86_64),
         FeatureSet::of(Feature::X86Ssse3),
         VectorKind::Fixed {
@@ -1207,7 +2225,7 @@ const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 3] = [
         },
         ASCII_NARROW_BYTES,
         100,
-        x86_64::classify_16_ssse3,
+        classify_16_entry!(x86_64::classify_16_ssse3),
     ),
 ];
 
@@ -1215,7 +2233,7 @@ const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 3] = [
 const NARROW_VARIANTS: [KernelVariant<Classify16Entry>; 1] = [SCALAR_16];
 
 const SPLIT_32: KernelVariant<WideEntry> = KernelVariant::new(
-    "ascii-byte-set.mask32.split16.v1",
+    SPLIT_MASK32_VARIANT_ID,
     ArchitectureRequirement::Any,
     FeatureSet::EMPTY,
     VectorKind::Fixed {
@@ -1242,7 +2260,7 @@ fn is_neoverse_v3(tuning: TuningClass) -> bool {
 const WIDE_VARIANTS: [KernelVariant<WideEntry>; 4] = [
     SPLIT_32,
     KernelVariant::new(
-        "ascii-byte-set.mask32.sve2.v1",
+        SVE2_MASK32_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::EMPTY
             .with(Feature::ArmSve)
@@ -1250,10 +2268,10 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 4] = [
         VectorKind::Scalable,
         ASCII_WIDE_BYTES,
         50,
-        WideEntry::Sve2(aarch64_sve2::classify_32_sve2),
+        WideEntry::Sve2(classify_32_entry!(aarch64_sve2::classify_32_sve2)),
     ),
     KernelVariant::new(
-        "ascii-byte-set.mask32.split16-neon.v1",
+        SPLIT_NEON_MASK32_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::of(Feature::ArmNeon),
         VectorKind::Fixed {
@@ -1268,7 +2286,7 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 4] = [
     // preference: SVE and SVE2 remain independent mandatory authorization
     // facts, and every other Arm server retains the conservative NEON winner.
     KernelVariant::new(
-        "ascii-byte-set.mask32.sve2.arm-41-d84.v1",
+        SVE2_ARM_41_D84_MASK32_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::Aarch64),
         FeatureSet::EMPTY
             .with(Feature::ArmSve)
@@ -1276,7 +2294,7 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 4] = [
         VectorKind::Scalable,
         ASCII_WIDE_BYTES,
         150,
-        WideEntry::Sve2(aarch64_sve2::classify_32_sve2),
+        WideEntry::Sve2(classify_32_entry!(aarch64_sve2::classify_32_sve2)),
     )
     .when_tuning(is_neoverse_v3),
 ];
@@ -1295,7 +2313,7 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 3] = [
     // conservatively retains AVX2 until fresh hardware measurements justify a
     // narrower tuning predicate with a higher preference.
     KernelVariant::new(
-        "ascii-byte-set.mask32.avx512f-bw-vl.v1",
+        AVX512_MASK32_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::X86_64),
         X86_AVX512_MASK_FEATURES,
         VectorKind::Fixed {
@@ -1303,10 +2321,10 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 3] = [
         },
         ASCII_WIDE_BYTES,
         50,
-        WideEntry::Avx512(x86_64::classify_32_avx512),
+        WideEntry::Avx512(classify_32_entry!(x86_64::classify_32_avx512)),
     ),
     KernelVariant::new(
-        "ascii-byte-set.mask32.avx2.v1",
+        AVX2_MASK32_VARIANT_ID,
         ArchitectureRequirement::Exact(Architecture::X86_64),
         FeatureSet::of(Feature::X86Avx2),
         VectorKind::Fixed {
@@ -1314,7 +2332,7 @@ const WIDE_VARIANTS: [KernelVariant<WideEntry>; 3] = [
         },
         ASCII_WIDE_BYTES,
         100,
-        WideEntry::Avx2(x86_64::classify_32_avx2),
+        WideEntry::Avx2(classify_32_entry!(x86_64::classify_32_avx2)),
     ),
 ];
 

@@ -63,9 +63,11 @@
 use core::{fmt, mem::size_of, ops::Range};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+#[cfg(not(feature = "static-dispatch"))]
+use fre_simd_kernels::FeatureSet;
 use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, FeatureSet, SelectionReceipt, SimdDispatchContext,
+    Feature, SelectionReceipt, SimdDispatchContext,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
@@ -2325,11 +2327,18 @@ fn run_scanner_policy(dispatch: SimdDispatchContext) -> Option<DispatchPolicy> {
     if !usable.contains(Feature::ArmSve) {
         return None;
     }
-    let mut allowed = FeatureSet::of(Feature::ArmSve);
-    if usable.contains(Feature::ArmSve2) {
-        allowed = allowed.with(Feature::ArmSve2);
+    #[cfg(feature = "static-dispatch")]
+    {
+        Some(DispatchPolicy::Auto)
     }
-    Some(DispatchPolicy::AllowOnly(allowed))
+    #[cfg(not(feature = "static-dispatch"))]
+    {
+        let mut allowed = FeatureSet::of(Feature::ArmSve);
+        if usable.contains(Feature::ArmSve2) {
+            allowed = allowed.with(Feature::ArmSve2);
+        }
+        Some(DispatchPolicy::AllowOnly(allowed))
+    }
 }
 
 fn extend_greedy_class(
@@ -3008,6 +3017,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "static-dispatch"))]
     fn shared_class_extension_preserves_every_alignment_and_exact_boundary() {
         let established = plan();
         let class = established.alternatives[0].class;

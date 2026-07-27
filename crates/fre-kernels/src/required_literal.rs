@@ -1214,6 +1214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "static-dispatch"))]
     fn backward_scanner_path_preserves_anchors_and_charges_physical_work() {
         let class = ascii_class();
         let plan =
@@ -1316,6 +1317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "static-dispatch"))]
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "the bounded base-four corpus has at most five bytes"

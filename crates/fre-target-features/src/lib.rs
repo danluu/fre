@@ -1066,6 +1066,10 @@ fn x86_tuning() -> TuningClass {
 }
 
 /// Policy applied to real host facts before selecting a kernel.
+///
+/// Runtime-dispatch consumers may retain the resulting implementation.
+/// Compiler-specialized consumers use the same policy to authenticate their
+/// fixed implementation and reject a policy that would select another leaf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DispatchPolicy {

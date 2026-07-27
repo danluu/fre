@@ -1,3 +1,11 @@
+#![cfg_attr(
+    feature = "static-dispatch",
+    allow(
+        dead_code,
+        reason = "compiler-fixed profiles deliberately prune SVE/SVE2 leaves that are not selected by their tuning policy"
+    )
+)]
+
 use super::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables,
     AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, AsciiWordSpaceTables, aarch64, scalar,
@@ -482,11 +490,25 @@ unsafe extern "C" {
         space_values: *const u8,
         bytes: *const u8,
     ) -> u64;
+    #[cfg_attr(
+        feature = "static-dispatch-arm-41-d84",
+        allow(
+            dead_code,
+            reason = "the compiler-fixed V3 run profile uses the qualified NEON/SVE2 hybrid instead of the base-SVE leaf"
+        )
+    )]
     fn fre_ascii_run_forward_sve_asm(
         columns: *const u8,
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
+    #[cfg_attr(
+        feature = "static-dispatch-arm-41-d84",
+        allow(
+            dead_code,
+            reason = "the compiler-fixed V3 run profile uses the qualified NEON/SVE2 hybrid instead of the base-SVE leaf"
+        )
+    )]
     fn fre_ascii_run_backward_sve_asm(
         columns: *const u8,
         bytes: *const u8,
@@ -578,6 +600,13 @@ pub(super) unsafe fn classify_32_sve2(
     unsafe_code,
     reason = "this private leaf calls reviewed base-SVE assembly only after retained dispatch proved SVE usable"
 )]
+#[cfg_attr(
+    feature = "static-dispatch-arm-41-d84",
+    allow(
+        dead_code,
+        reason = "the compiler-fixed V3 run profile uses the qualified NEON/SVE2 hybrid instead of the base-SVE leaf"
+    )
+)]
 #[inline(never)]
 pub(super) unsafe fn scan_run_forward_sve(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
     // SAFETY: the table has exactly 16 initialized bytes, the slice pointer and
@@ -589,6 +618,13 @@ pub(super) unsafe fn scan_run_forward_sve(tables: &AsciiRunTables, bytes: &[u8])
 #[allow(
     unsafe_code,
     reason = "this private leaf calls reviewed base-SVE assembly only after retained dispatch proved SVE usable"
+)]
+#[cfg_attr(
+    feature = "static-dispatch-arm-41-d84",
+    allow(
+        dead_code,
+        reason = "the compiler-fixed V3 run profile uses the qualified NEON/SVE2 hybrid instead of the base-SVE leaf"
+    )
 )]
 #[inline(never)]
 pub(super) unsafe fn scan_run_backward_sve(

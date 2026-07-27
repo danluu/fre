@@ -17,6 +17,55 @@ fn expected_sve2_variant(tuning: TuningClass) -> &'static str {
     }
 }
 
+#[cfg(feature = "static-dispatch")]
+#[test]
+fn compiler_fixed_direct_leaves_match_automatic_receipts() {
+    let classifier = AsciiByteSetClassifier::new(AsciiByteSet::ALL);
+    assert_eq!(
+        classifier.selection().narrow().variant_id,
+        static_narrow_variant_id()
+    );
+    assert_eq!(
+        classifier.selection().wide().variant_id,
+        static_wide_variant_id()
+    );
+
+    let word_space =
+        AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Auto).expect("static auto leaf");
+    assert_eq!(
+        word_space.selection().variant_id,
+        static_word_space_variant_id()
+    );
+
+    for set in [singleton(b'x'), AsciiByteSet::ALL] {
+        let (_, match_eligible) = set.run_tables();
+        let scanner = AsciiByteSetRunScanner::new(set);
+        assert_eq!(
+            scanner.selection().variant_id,
+            static_run_variant_id(match_eligible)
+        );
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+#[test]
+fn static_profile_rejects_policies_that_would_retarget_a_direct_leaf() {
+    if static_narrow_variant_id() != SCALAR_MASK16_VARIANT_ID {
+        let error =
+            AsciiByteSetClassifier::with_policy(AsciiByteSet::ALL, DispatchPolicy::Portable)
+                .expect_err("portable policy cannot retarget a compiler-fixed vector classifier");
+        assert!(!error.required.is_empty());
+        assert!(error.usable.is_empty());
+    }
+
+    if static_run_variant_id(true) != SCALAR_RUN_VARIANT_ID {
+        let error = AsciiByteSetRunScanner::with_policy(singleton(b'x'), DispatchPolicy::Portable)
+            .expect_err("portable policy cannot retarget a compiler-fixed vector scanner");
+        assert!(!error.required.is_empty());
+        assert!(error.usable.is_empty());
+    }
+}
+
 fn singleton(byte: u8) -> AsciiByteSet {
     assert!(byte.is_ascii());
     let mut words = [0_u64; 2];
@@ -150,8 +199,13 @@ fn word_space_classifier_partitions_every_byte_exactly() {
             matches!(byte, b'\t'..=b'\r' | b' ')
         );
     }
+    #[cfg(not(feature = "static-dispatch"))]
     let classifier =
         AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Portable).expect("scalar classifier");
+    #[cfg(feature = "static-dispatch")]
+    let classifier =
+        AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Auto).expect("static direct leaf");
+    #[cfg(not(feature = "static-dispatch"))]
     assert_eq!(
         classifier.selection().variant_id,
         "ascii-word-space.mask16x32.scalar.v1"
@@ -386,6 +440,7 @@ fn arbitrary_bytes_and_sets_match_the_scalar_definition() {
 }
 
 #[test]
+#[cfg(not(feature = "static-dispatch"))]
 fn portable_policy_forces_scalar_and_split_narrow() {
     let classifier = AsciiByteSetClassifier::with_policy(
         AsciiByteSet::from_words([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]),
@@ -417,6 +472,7 @@ fn portable_policy_forces_scalar_and_split_narrow() {
 }
 
 #[test]
+#[cfg(not(feature = "static-dispatch"))]
 fn portable_run_scanner_exhausts_ascii_members_lanes_lengths_and_alignments() {
     for selected in 0_u8..=0x7f {
         let scanner =
@@ -472,6 +528,7 @@ fn portable_run_scanner_exhausts_ascii_members_lanes_lengths_and_alignments() {
 }
 
 #[test]
+#[cfg(not(feature = "static-dispatch"))]
 fn portable_run_scanner_random_sets_and_arbitrary_bytes_match_reference() {
     let mut state = 0x0f42_68bd_e315_97ac;
     for _ in 0..10_000 {
@@ -503,10 +560,9 @@ fn run_scanner_empty_full_clone_context_and_non_ascii_semantics_are_stable() {
     let context = SimdDispatchContext::capture();
     for set in [AsciiByteSet::EMPTY, AsciiByteSet::ALL] {
         let explicit = context
-            .ascii_byte_set_run_scanner(set, DispatchPolicy::Portable)
+            .ascii_byte_set_run_scanner(set, DispatchPolicy::Auto)
             .unwrap();
-        let convenience =
-            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).unwrap();
+        let convenience = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Auto).unwrap();
         assert_eq!(explicit.selection(), convenience.selection());
         assert_eq!(explicit.set(), set);
         let cloned = explicit;
@@ -761,8 +817,7 @@ fn requiring_an_absent_cross_architecture_feature_fails_before_execution() {
 
 #[test]
 fn masks_preserve_lane_order_prefixes_and_full_width_boundaries() {
-    let narrow_classifier =
-        AsciiByteSetClassifier::with_policy(AsciiByteSet::ALL, DispatchPolicy::Portable).unwrap();
+    let narrow_classifier = AsciiByteSetClassifier::new(AsciiByteSet::ALL);
     for boundary in 0..ASCII_NARROW_BYTES {
         let mut bytes = [b'a'; ASCII_NARROW_BYTES];
         bytes[boundary] = 0x80;
@@ -838,6 +893,7 @@ fn fixed_array_references_work_at_every_common_input_alignment() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -895,6 +951,7 @@ fn forced_neon_and_direct_leaf_match_scalar() {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -975,6 +1032,7 @@ fn forced_neon_run_scanner_exhausts_boundaries_and_reports_recovery_work() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1059,6 +1117,7 @@ fn forced_sve2_vl_agnostic_leaf_matches_scalar_and_tuned_auto_policy() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
 fn expected_sve_forward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
     if member_run_len == input_len {
         return AsciiRunResult::new(input_len, input_len);
@@ -1074,6 +1133,7 @@ fn expected_sve_forward_result(member_run_len: usize, input_len: usize) -> Ascii
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
 fn expected_sve_backward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
     if member_run_len == input_len {
         return AsciiRunResult::new(input_len, input_len);
@@ -1088,6 +1148,7 @@ fn expected_sve_backward_result(member_run_len: usize, input_len: usize) -> Asci
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1146,6 +1207,7 @@ fn forced_base_sve_run_scanner_exhausts_fixed_sixteen_lane_boundaries() {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1636,6 +1698,7 @@ fn benchmark_sve2_against_split_neon() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1691,6 +1754,7 @@ fn forced_sse2_and_direct_leaf_match_scalar() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 fn forced_x86_feature_sets_preserve_the_non_linear_dispatch_lattice() {
     let usable = host().usable();
@@ -1748,6 +1812,7 @@ fn forced_x86_feature_sets_preserve_the_non_linear_dispatch_lattice() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1801,6 +1866,7 @@ fn forced_ssse3_and_direct_leaf_match_scalar() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,
@@ -1855,6 +1921,7 @@ fn forced_avx2_and_direct_leaf_match_scalar_in_both_shuffle_lanes() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 fn required_avx512_native_sentinel_fails_instead_of_skipping() {
     let Some(value) = std::env::var_os("FRE_SIMD_REQUIRE_AVX512") else {
@@ -1912,6 +1979,7 @@ fn required_avx512_native_sentinel_fails_instead_of_skipping() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 fn avx512_proper_subset_lattice_falls_back_and_avx2_keeps_generic_preference() {
     if !host().usable().contains_all(X86_AVX512_MASK_FEATURES) {
@@ -1995,6 +2063,7 @@ fn avx512_proper_subset_lattice_falls_back_and_avx2_keeps_generic_preference() {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
 #[test]
 #[allow(
     unsafe_code,

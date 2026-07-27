@@ -16,16 +16,26 @@ then uses only compiler-set `cfg(target_feature)` facts. The
 by the qualified Neoverse V3 preference rules. It requires little-endian Linux
 AArch64 with compiler-enabled NEON, SVE, and SVE2. Cargo rejects misspelled or
 unsupported profile names instead of silently producing a generic build.
+Static handles retain neither a function pointer nor an ISA discriminant.
+Their operation methods compile to a direct call to the profile-selected
+scalar, NEON, SVE/SVE2, SSE/AVX, or AVX-512 leaf. Selection tables replace
+function pointers with zero-sized metadata and remain only to authenticate the
+receipt at construction. A policy or masked capability snapshot is accepted
+only when it selects that same compiler-fixed leaf; a policy that would
+retarget the operation returns `UnsupportedRequiredFeatures`. Use a runtime
+profile for portable/forced-ISA qualification in one binary. The tuned V3 run
+scanner still makes one set-dependent choice between its NEON path and its
+small-set NEON/SVE2 hybrid, but it performs no CPU-feature dispatch at the
+operation boundary. Out-of-line assembly leaves remain ordinary direct calls,
+not inlineable Rust.
 
 Static ISA and declared tuning remain separate evidence. Tuning never adds a
-feature, SME remains excluded, and generic static profiles map only features
-currently consumed by qualified kernel tables: NEON/SVE/SVE2 on AArch64 and
-all stable compiler-exposed members of the current feature vocabulary. Stateful
-SME remains excluded. Because Rust's runtime feature macros short-circuit for
-compiler-enabled features, they cannot verify such a binary independently.
-Use a separately baseline-compiled deployment gate to prevent launching a
-target-specific executable on incompatible hardware; it may execute target
-instructions before `main`.
+feature, and generic static profiles map all stable compiler-exposed members of
+the current feature vocabulary. Stateful SME remains excluded. Because Rust's
+runtime feature macros short-circuit for compiler-enabled features, they cannot
+verify such a binary independently. Use a separately baseline-compiled
+deployment gate to prevent launching a target-specific executable on
+incompatible hardware; it may execute target instructions before `main`.
 
 For performance comparisons, pass target flags globally (for example through
 `CARGO_ENCODED_RUSTFLAGS`) so dependency crates see the same features. Runtime
@@ -34,12 +44,26 @@ flags; only the FRE static-dispatch cfg may differ. Do not prewarm dispatch in
 the benchmark runner: cold-process measurements include initialization that
 the public operation actually performs.
 
+Compile-time dispatch does not erase an operating system's SIMD-state
+activation cost. In particular, Linux can trap a thread's first SVE
+instruction to allocate and initialize SVE state. A target-specific deployment
+may amortize that naturally elsewhere, but qualification must not move the
+cost out of a cold public-operation boundary with a benchmark-only warmup.
+The state is per-thread, and the kernel may re-enable trapping across system
+calls. Compare a NEON-selected control when first-use latency matters, but
+classify it as a different-ISA experiment: removing SVE from only FRE's
+selection is not enough if global target flags, the loader, or another library
+can execute SVE before the measured boundary. Record the selected receipts and
+inspect the complete binaries' instruction envelopes.
+
 Instruction safety and performance tuning are separate:
 
 - a variant lists every ISA feature required to enter it;
 - runtime detection supplies only features that the current OS makes usable;
-- a policy can remove features or require real features, but cannot invent
-  them;
+- in runtime profiles, a policy can remove features or require real features,
+  but cannot invent them;
+- in static profiles, a policy can validate the fixed leaf but cannot retarget
+  it;
 - a tuning predicate may change preference or thresholds, but cannot authorize
   instructions; and
 - every selection produces a receipt containing the exact variant, feature
@@ -91,8 +115,13 @@ silently claim the same identity.
 4. If measurements justify microarchitecture-specific thresholds, add a
    `when_tuning` predicate without weakening the feature requirements.
 5. Select once when compiling the operation and retain only the selected entry
-   point plus its receipt. Hot calls must not repeat feature detection.
-6. Add forced-portable and forced-supported-feature parity tests, arbitrary
+   plus its receipt. Runtime profiles retain a private qualified function
+   pointer. Static profiles must add a mutually exclusive `cfg(target_feature)`
+   direct-call definition and bind its stable ID to the automatic receipt;
+   they retain no execution-time entry. Hot calls must not repeat detection or
+   ISA dispatch.
+6. Add runtime-profile forced-portable and forced-supported-feature parity
+   tests, static-profile fixed-leaf and retarget-rejection tests, arbitrary
    alignment and boundary tests, native-host tests, and fail-closed release
    instruction-shape authentication.
 7. Add every unsafe leaf and complete source digest to

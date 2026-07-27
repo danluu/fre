@@ -1947,11 +1947,24 @@ fn ascii_block_policy(dispatch: SimdDispatchContext) -> Option<DispatchPolicy> {
     let sve2 = FeatureSet::EMPTY
         .with(Feature::ArmSve)
         .with(Feature::ArmSve2);
-    dispatch
-        .capabilities()
-        .usable()
-        .contains_all(sve2)
-        .then_some(DispatchPolicy::AllowOnly(sve2))
+    if !dispatch.capabilities().usable().contains_all(sve2) {
+        return None;
+    }
+    #[cfg(feature = "static-dispatch-arm-41-d84")]
+    {
+        Some(DispatchPolicy::Auto)
+    }
+    #[cfg(all(
+        feature = "static-dispatch",
+        not(feature = "static-dispatch-arm-41-d84")
+    ))]
+    {
+        None
+    }
+    #[cfg(not(feature = "static-dispatch"))]
+    {
+        Some(DispatchPolicy::AllowOnly(sve2))
+    }
 }
 
 #[inline(never)]
