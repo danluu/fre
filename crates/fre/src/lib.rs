@@ -55,6 +55,14 @@ mod replacement;
 mod required_literal;
 mod set;
 mod split;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+mod sve_class_suffix_benchmark;
 mod text;
 mod text_match;
 mod text_set;
