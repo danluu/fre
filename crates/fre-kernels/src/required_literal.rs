@@ -5,15 +5,31 @@
 //! non-overlapping suffix occurrences complete candidates and make all
 //! backward class-confirmation intervals disjoint. Search is therefore
 //! worst-case linear and uses no scratch allocation.
+//! A caller-captured dispatch context may retain one automatic directional
+//! scanner for an all-ASCII class on a host with OS-usable SVE. Its exact
+//! physical classifications, including failed-block recovery, are charged;
+//! every other construction retains the established scalar owner and loop.
 
 use core::{fmt, mem::size_of};
 
+use fre_simd_kernels::{
+    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
+    Feature, SelectionReceipt, SimdDispatchContext,
+};
 use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
 pub const PLAN_ID: &str = "required-literal.class-plus-unbordered-suffix.v1";
+
+/// Stable identity of the opt-in all-ASCII backward run implementation.
+pub const ASCII_BACKWARD_RUN_PLAN_ID: &str =
+    "required-literal.class-plus-unbordered-suffix.v1.ascii-backward-run16.v1";
+
+// The scanner builds both table representations in one 128-value pass,
+// makes one paired-direction selection, and records one immutable receipt.
+const SIMD_RUN_SCANNER_BUILD_WORK: u64 = 128 + 1 + 1;
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -80,6 +96,14 @@ impl ByteClass {
     #[must_use]
     pub const fn words(self) -> [u64; 4] {
         self.words
+    }
+
+    const fn is_ascii(self) -> bool {
+        self.words[2] == 0 && self.words[3] == 0
+    }
+
+    const fn ascii_set(self) -> AsciiByteSet {
+        AsciiByteSet::from_words([self.words[0], self.words[1]])
     }
 }
 
@@ -330,7 +354,28 @@ pub struct RequiredLiteralPlan {
     build: BuildAccounting,
 }
 
+/// Required-literal owner with one construction-selected backward run scanner.
+///
+/// The wrapper is separate so the legacy plan's storage and build receipts do
+/// not change on non-SVE hosts or for classes containing non-ASCII bytes.
+#[derive(Debug)]
+pub struct DispatchedRequiredLiteralPlan {
+    plan: RequiredLiteralPlan,
+    backward_scanner: Option<AsciiByteSetRunScanner>,
+}
+
 impl RequiredLiteralPlan {
+    /// Whether this host and class select the opt-in backward run scanner.
+    ///
+    /// This is the same predicate used by [`Self::build_with_dispatch`].
+    /// Callers can retain the legacy owner type whenever it returns false.
+    #[must_use]
+    pub fn run_scanner_eligible(dispatch: SimdDispatchContext, class: ByteClass) -> bool {
+        !class.is_empty()
+            && class.is_ascii()
+            && dispatch.capabilities().usable().contains(Feature::ArmSve)
+    }
+
     /// Prove eligibility and construct the owned native finder.
     ///
     /// # Errors
@@ -343,6 +388,55 @@ impl RequiredLiteralPlan {
         anchors: Anchors,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        let (plan, scanner) =
+            Self::build_inner(class, suffix, anchors, limits, size_of::<Self>(), None)?;
+        debug_assert!(scanner.is_none());
+        Ok(plan)
+    }
+
+    /// Prove eligibility while retaining an automatic scanner on OS-usable SVE.
+    ///
+    /// The returned wrapper preserves the scalar search path when the class or
+    /// host is ineligible. Its exact inline storage and the scanner's 130
+    /// construction work units are included before any allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed proof, arithmetic, resource, or allocation
+    /// refusals as [`Self::build`].
+    pub fn build_with_dispatch(
+        dispatch: SimdDispatchContext,
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+    ) -> Result<DispatchedRequiredLiteralPlan, BuildError> {
+        let (plan, backward_scanner) = Self::build_inner(
+            class,
+            suffix,
+            anchors,
+            limits,
+            size_of::<DispatchedRequiredLiteralPlan>(),
+            Some((dispatch, DispatchPolicy::Auto)),
+        )?;
+        Ok(DispatchedRequiredLiteralPlan {
+            plan,
+            backward_scanner,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps proof refusals and every resource boundary explicit"
+    )]
+    fn build_inner(
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+        retained_owner_bytes: usize,
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    ) -> Result<(Self, Option<AsciiByteSetRunScanner>), BuildError> {
         if class.is_empty() {
             return Err(BuildError::EmptyClass);
         }
@@ -358,6 +452,8 @@ impl RequiredLiteralPlan {
                 limit: limits.max_suffix_bytes,
             });
         }
+        let scanner_eligible =
+            dispatch.is_some_and(|(context, _)| Self::run_scanner_eligible(context, class));
 
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
@@ -366,6 +462,13 @@ impl RequiredLiteralPlan {
         let work_upper_bound = suffix_u64
             .checked_mul(12)
             .and_then(|work| work.checked_add(32))
+            .and_then(|work| {
+                work.checked_add(if scanner_eligible {
+                    SIMD_RUN_SCANNER_BUILD_WORK
+                } else {
+                    0
+                })
+            })
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "build work upper bound",
             })?;
@@ -388,12 +491,11 @@ impl RequiredLiteralPlan {
                 limit: limits.max_scratch_bytes,
             });
         }
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(suffix.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent plan bytes",
-                })?;
+        let persistent_bytes = retained_owner_bytes.checked_add(suffix.len()).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "persistent plan bytes",
+            },
+        )?;
         if persistent_bytes > limits.max_persistent_bytes {
             return Err(BuildError::PersistentLimit {
                 needed: persistent_bytes,
@@ -425,19 +527,33 @@ impl RequiredLiteralPlan {
                 additional: suffix.len(),
             })?;
         owned_suffix.extend_from_slice(suffix);
-        Ok(Self {
-            class,
-            finder: FinderBuilder::new().build_forward_owned(owned_suffix),
-            anchors,
-            build: BuildAccounting {
-                suffix_bytes: suffix.len(),
-                class_cardinality: class.cardinality(),
-                work_upper_bound,
-                scratch_bytes,
-                persistent_bytes,
-                peak_bytes,
+        let backward_scanner = if scanner_eligible {
+            let (dispatch, policy) =
+                dispatch.expect("scanner eligibility requires one dispatch context");
+            Some(
+                dispatch
+                    .ascii_byte_set_run_scanner(class.ascii_set(), policy)
+                    .expect("the retained policy was derived from this authentic host snapshot"),
+            )
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                class,
+                finder: FinderBuilder::new().build_forward_owned(owned_suffix),
+                anchors,
+                build: BuildAccounting {
+                    suffix_bytes: suffix.len(),
+                    class_cardinality: class.cardinality(),
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
             },
-        })
+            backward_scanner,
+        ))
     }
 
     /// Stable proof/implementation identity.
@@ -490,6 +606,21 @@ impl RequiredLiteralPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window_with_run_scanner(haystack, window, limits, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the scalar and scanner confirmations stay adjacent so their candidate and anchor control remains visibly identical"
+    )]
+    fn find_window_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        debug_assert!(backward_scanner.is_none() || self.class.is_ascii());
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(SearchError::InvalidWindow {
                 start: window.start(),
@@ -509,7 +640,7 @@ impl RequiredLiteralPlan {
             return Ok((None, zero_accounting(window_bytes)));
         }
 
-        let mut accounting = self.preflight(window, limits)?;
+        let mut accounting = self.preflight(window, limits, backward_scanner)?;
         let slice = &haystack[window.start()..window.end()];
         let mut candidates = self.finder.find_iter(slice);
         loop {
@@ -547,24 +678,45 @@ impl RequiredLiteralPlan {
                 continue;
             }
 
-            let mut start = candidate;
-            while start > window.start() {
-                let previous = start
-                    .checked_sub(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "backward confirmation position",
-                    })?;
+            let start = if let Some(scanner) = backward_scanner {
+                let backward =
+                    scanner.scan_backward(haystack.get(window.start()..candidate).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "backward confirmation slice",
+                        },
+                    )?);
                 accounting.backward_bytes_examined = accounting
                     .backward_bytes_examined
-                    .checked_add(1)
+                    .checked_add(backward.examined_bytes())
                     .ok_or(SearchError::ArithmeticOverflow {
                         computation: "actual backward examinations",
                     })?;
-                if !self.class.contains(haystack[previous]) {
-                    break;
+                candidate.checked_sub(backward.member_run_len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "backward confirmation start",
+                    },
+                )?
+            } else {
+                let mut start = candidate;
+                while start > window.start() {
+                    let previous = start
+                        .checked_sub(1)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "backward confirmation position",
+                        })?;
+                    accounting.backward_bytes_examined = accounting
+                        .backward_bytes_examined
+                        .checked_add(1)
+                        .ok_or(SearchError::ArithmeticOverflow {
+                            computation: "actual backward examinations",
+                        })?;
+                    if !self.class.contains(haystack[previous]) {
+                        break;
+                    }
+                    start = previous;
                 }
-                start = previous;
-            }
+                start
+            };
             let end = candidate.checked_add(self.suffix().len()).ok_or(
                 SearchError::ArithmeticOverflow {
                     computation: "selected match end",
@@ -584,6 +736,7 @@ impl RequiredLiteralPlan {
         &self,
         window: Window,
         limits: SearchLimits,
+        backward_scanner: Option<&AsciiByteSetRunScanner>,
     ) -> Result<SearchAccounting, SearchError> {
         let window_bytes =
             window
@@ -628,8 +781,23 @@ impl RequiredLiteralPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "candidate structural work",
                 })?;
+        let scanner_overhead = if backward_scanner.is_some() {
+            candidate_visits_upper_bound
+                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "backward scanner overhead upper bound",
+                })?
+        } else {
+            0
+        };
+        let backward_work =
+            window_bytes
+                .checked_add(scanner_overhead)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "backward work upper bound",
+                })?;
         let work = finder_work
-            .checked_add(window_bytes)
+            .checked_add(backward_work)
             .and_then(|value| value.checked_add(structural))
             .and_then(|value| value.checked_add(2))
             .ok_or(SearchError::ArithmeticOverflow {
@@ -654,13 +822,86 @@ impl RequiredLiteralPlan {
             candidate_visits_upper_bound,
             finder_calls_upper_bound,
             finder_work_upper_bound,
-            backward_work_upper_bound: window_bytes,
+            backward_work_upper_bound: backward_work,
             work_upper_bound,
             scratch_bytes: 0,
             candidate_visits: 0,
             finder_calls: 0,
             backward_bytes_examined: 0,
         })
+    }
+}
+
+impl DispatchedRequiredLiteralPlan {
+    /// Stable authenticated execution identity.
+    #[must_use]
+    pub const fn plan_id(&self) -> &'static str {
+        if self.backward_scanner.is_some() {
+            ASCII_BACKWARD_RUN_PLAN_ID
+        } else {
+            PLAN_ID
+        }
+    }
+
+    #[must_use]
+    pub const fn anchors(&self) -> Anchors {
+        self.plan.anchors()
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> ByteClass {
+        self.plan.class()
+    }
+
+    #[must_use]
+    pub fn suffix(&self) -> &[u8] {
+        self.plan.suffix()
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> BuildAccounting {
+        self.plan.build_accounting()
+    }
+
+    /// Exact immutable selection receipt for the optional backward scanner.
+    #[must_use]
+    pub const fn run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        match self.backward_scanner {
+            Some(scanner) => Some(scanner.selection()),
+            None => None,
+        }
+    }
+
+    /// Find the selected span in the full haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked resource failure before scanning begins.
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Find the selected span wholly within `window`; anchors remain absolute.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked range/resource failure. Search never falls back.
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.plan.find_window_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            self.backward_scanner.as_ref(),
+        )
     }
 }
 
@@ -724,8 +965,20 @@ fn longest_border(suffix: &[u8]) -> Result<usize, BuildError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Anchors, BuildError, BuildLimits, ByteClass, RequiredLiteralPlan, SearchLimits};
+    use super::{
+        ASCII_BACKWARD_RUN_PLAN_ID, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, Anchors, BuildError,
+        BuildLimits, ByteClass, DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralPlan,
+        SIMD_RUN_SCANNER_BUILD_WORK, SearchError, SearchLimits,
+    };
     use crate::Window;
+    use core::mem::size_of;
+    use fre_simd_kernels::{DispatchPolicy, Feature, SimdDispatchContext};
+
+    const ASCII_MEMBERS: &[u8] = b"0_aceg";
+
+    fn ascii_class() -> ByteClass {
+        ByteClass::from_bytes(ASCII_MEMBERS)
+    }
 
     #[test]
     fn spans_windows_and_accounting_are_exact() {
@@ -849,5 +1102,539 @@ mod tests {
                 .0,
             Some((1, 5))
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test keeps opt-in identity, owner accounting, boundary semantics, and exclusions together"
+    )]
+    fn public_dispatch_is_confined_to_sve_ascii_classes() {
+        let class = ascii_class();
+        let anchors = Anchors::default();
+        let legacy =
+            RequiredLiteralPlan::build(class, b"Z", anchors, BuildLimits::default()).unwrap();
+        let dispatch = SimdDispatchContext::capture();
+        let dispatched = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let sve_usable = dispatch.capabilities().usable().contains(Feature::ArmSve);
+        assert_eq!(dispatched.run_scanner_selection().is_some(), sve_usable);
+        assert_eq!(
+            dispatched.plan_id(),
+            if sve_usable {
+                ASCII_BACKWARD_RUN_PLAN_ID
+            } else {
+                PLAN_ID
+            }
+        );
+        assert_eq!(legacy.plan_id(), PLAN_ID);
+        assert_eq!(dispatched.class(), class);
+        assert_eq!(dispatched.suffix(), b"Z");
+        assert_eq!(dispatched.anchors(), anchors);
+        assert_eq!(
+            dispatched.build_accounting().work_upper_bound,
+            legacy.build_accounting().work_upper_bound
+                + u64::from(sve_usable) * SIMD_RUN_SCANNER_BUILD_WORK
+        );
+        assert_eq!(
+            legacy.build_accounting().persistent_bytes,
+            size_of::<RequiredLiteralPlan>() + 1
+        );
+        assert_eq!(
+            dispatched.build_accounting().persistent_bytes,
+            size_of::<DispatchedRequiredLiteralPlan>() + 1
+        );
+
+        for run_len in [0_usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
+            let mut haystack = b"Z!".to_vec();
+            haystack.extend((0..run_len).map(|index| ASCII_MEMBERS[index % ASCII_MEMBERS.len()]));
+            haystack.push(b'Z');
+            let legacy_result = legacy.find(&haystack, SearchLimits::unlimited()).unwrap();
+            let dispatched_result = dispatched
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(dispatched_result.0, legacy_result.0, "run_len={run_len}");
+            assert_eq!(
+                dispatched_result.1.candidate_visits,
+                legacy_result.1.candidate_visits
+            );
+            assert_eq!(
+                dispatched_result.1.finder_calls,
+                legacy_result.1.finder_calls
+            );
+            assert!(
+                dispatched_result.1.backward_bytes_examined
+                    <= dispatched_result.1.backward_work_upper_bound
+            );
+            if sve_usable {
+                assert!(
+                    dispatched_result.1.backward_bytes_examined
+                        <= legacy_result.1.backward_bytes_examined.saturating_add(
+                            dispatched_result
+                                .1
+                                .candidate_visits
+                                .saturating_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        )
+                );
+            } else {
+                assert_eq!(dispatched_result.1, legacy_result.1);
+            }
+        }
+
+        let non_ascii = ByteClass::from_bytes(&[0, 2, 4, 0x80, 0xff]);
+        assert!(!RequiredLiteralPlan::run_scanner_eligible(
+            dispatch, non_ascii
+        ));
+        let non_ascii_legacy =
+            RequiredLiteralPlan::build(non_ascii, b"Z", anchors, BuildLimits::default()).unwrap();
+        let non_ascii_dispatched = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            non_ascii,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(non_ascii_dispatched.run_scanner_selection().is_none());
+        assert_eq!(non_ascii_dispatched.plan_id(), PLAN_ID);
+        assert_eq!(
+            non_ascii_dispatched
+                .find(&[9, 0x80, 0xff, b'Z'], SearchLimits::unlimited())
+                .unwrap(),
+            non_ascii_legacy
+                .find(&[9, 0x80, 0xff, b'Z'], SearchLimits::unlimited())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn backward_scanner_path_preserves_anchors_and_charges_physical_work() {
+        let class = ascii_class();
+        let plan =
+            RequiredLiteralPlan::build(class, b"Z", Anchors::default(), BuildLimits::default())
+                .unwrap();
+        let scanner = SimdDispatchContext::capture()
+            .ascii_byte_set_run_scanner(class.ascii_set(), DispatchPolicy::Portable)
+            .unwrap();
+        let haystack = b"Z!0_aZ";
+        let scalar = plan.find(haystack, SearchLimits::unlimited()).unwrap();
+        let accelerated = plan
+            .find_window_with_run_scanner(
+                haystack,
+                Window::full(haystack),
+                SearchLimits::unlimited(),
+                Some(&scanner),
+            )
+            .unwrap();
+        assert_eq!(accelerated.0, scalar.0);
+        assert_eq!(accelerated.0, Some((2, 6)));
+        let leaf = scanner.scan_backward(&haystack[..5]);
+        assert_eq!(leaf.member_run_len(), 3);
+        assert_eq!(accelerated.1.backward_bytes_examined, leaf.examined_bytes());
+        assert_eq!(
+            accelerated.1.backward_work_upper_bound,
+            scalar
+                .1
+                .backward_work_upper_bound
+                .checked_add(
+                    accelerated
+                        .1
+                        .candidate_visits_upper_bound
+                        .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        .unwrap()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            accelerated.1.work_upper_bound,
+            scalar
+                .1
+                .work_upper_bound
+                .checked_add(
+                    u64::try_from(
+                        accelerated
+                            .1
+                            .candidate_visits_upper_bound
+                            .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                            .unwrap()
+                    )
+                    .unwrap()
+                )
+                .unwrap()
+        );
+
+        for anchors in [
+            Anchors {
+                start: true,
+                end: false,
+            },
+            Anchors {
+                start: false,
+                end: true,
+            },
+            Anchors {
+                start: true,
+                end: true,
+            },
+        ] {
+            let anchored =
+                RequiredLiteralPlan::build(class, b"Z", anchors, BuildLimits::default()).unwrap();
+            let scalar = anchored
+                .find_window(b"0_aZtail", Window::new(0, 4), SearchLimits::unlimited())
+                .unwrap();
+            let accelerated = anchored
+                .find_window_with_run_scanner(
+                    b"0_aZtail",
+                    Window::new(0, 4),
+                    SearchLimits::unlimited(),
+                    Some(&scanner),
+                )
+                .unwrap();
+            assert_eq!(accelerated.0, scalar.0, "anchors={anchors:?}");
+            let scalar_window = anchored
+                .find_window(b"0_aZ", Window::new(1, 4), SearchLimits::unlimited())
+                .unwrap();
+            let accelerated_window = anchored
+                .find_window_with_run_scanner(
+                    b"0_aZ",
+                    Window::new(1, 4),
+                    SearchLimits::unlimited(),
+                    Some(&scanner),
+                )
+                .unwrap();
+            assert_eq!(accelerated_window.0, scalar_window.0, "anchors={anchors:?}");
+            if anchors.start {
+                assert_eq!(accelerated_window.0, None);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the bounded base-four corpus has at most five bytes"
+    )]
+    fn portable_scanner_matches_scalar_across_bounded_windows_and_anchors() {
+        let dispatch = SimdDispatchContext::capture();
+        let classes = [
+            ByteClass::from_bytes(b"a"),
+            ByteClass::from_bytes(b"ab"),
+            ascii_class(),
+        ];
+        let anchors = [
+            Anchors {
+                start: false,
+                end: false,
+            },
+            Anchors {
+                start: true,
+                end: false,
+            },
+            Anchors {
+                start: false,
+                end: true,
+            },
+            Anchors {
+                start: true,
+                end: true,
+            },
+        ];
+        let alphabet = [b'a', b'!', b'Z', 0xff];
+
+        for class in classes {
+            let scanner = dispatch
+                .ascii_byte_set_run_scanner(class.ascii_set(), DispatchPolicy::Portable)
+                .unwrap();
+            for anchors in anchors {
+                let plan = RequiredLiteralPlan::build(class, b"Z", anchors, BuildLimits::default())
+                    .unwrap();
+                for len in 0_u32..=5 {
+                    for mut encoded in 0..alphabet.len().pow(len) {
+                        let mut haystack = vec![0_u8; usize::try_from(len).unwrap()];
+                        for byte in &mut haystack {
+                            *byte = alphabet[encoded % alphabet.len()];
+                            encoded /= alphabet.len();
+                        }
+                        for start in 0..=haystack.len() {
+                            for end in start..=haystack.len() {
+                                let window = Window::new(start, end);
+                                let scalar = plan
+                                    .find_window(&haystack, window, SearchLimits::unlimited())
+                                    .unwrap();
+                                let accelerated = plan
+                                    .find_window_with_run_scanner(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                        Some(&scanner),
+                                    )
+                                    .unwrap();
+                                assert_eq!(
+                                    accelerated.0, scalar.0,
+                                    "class={class:?} anchors={anchors:?} haystack={haystack:?} window={start}..{end}"
+                                );
+                                assert_eq!(
+                                    accelerated.1.candidate_visits,
+                                    scalar.1.candidate_visits
+                                );
+                                assert_eq!(accelerated.1.finder_calls, scalar.1.finder_calls);
+                                assert_eq!(
+                                    accelerated.1.backward_bytes_examined,
+                                    scalar.1.backward_bytes_examined
+                                );
+                                assert!(
+                                    accelerated.1.backward_bytes_examined
+                                        <= accelerated.1.backward_work_upper_bound
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatched_limits_close_over_owner_and_per_candidate_overhead() {
+        let dispatch = SimdDispatchContext::capture();
+        let class = ascii_class();
+        let permissive = BuildLimits {
+            max_suffix_bytes: usize::MAX,
+            max_build_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+        let baseline = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            class,
+            b"Z",
+            Anchors::default(),
+            permissive,
+        )
+        .unwrap();
+        let build = baseline.build_accounting();
+        assert_eq!(
+            build.persistent_bytes,
+            size_of::<DispatchedRequiredLiteralPlan>() + 1
+        );
+        assert_eq!(
+            build.peak_bytes,
+            build.persistent_bytes + build.scratch_bytes
+        );
+        let exact = BuildLimits {
+            max_suffix_bytes: build.suffix_bytes,
+            max_build_work: build.work_upper_bound,
+            max_scratch_bytes: build.scratch_bytes,
+            max_persistent_bytes: build.persistent_bytes,
+            max_peak_bytes: build.peak_bytes,
+        };
+        assert!(
+            RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"Z",
+                Anchors::default(),
+                exact
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"Z",
+                Anchors::default(),
+                BuildLimits {
+                    max_build_work: exact.max_build_work - 1,
+                    ..exact
+                }
+            ),
+            Err(BuildError::WorkLimit { .. })
+        ));
+        assert!(matches!(
+            RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"Z",
+                Anchors::default(),
+                BuildLimits {
+                    max_persistent_bytes: exact.max_persistent_bytes - 1,
+                    ..exact
+                }
+            ),
+            Err(BuildError::PersistentLimit { .. })
+        ));
+
+        let mut haystack: Vec<u8> = ASCII_MEMBERS.iter().copied().cycle().take(65).collect();
+        haystack.push(b'Z');
+        let (_, search) = baseline.find(&haystack, SearchLimits::unlimited()).unwrap();
+        assert!(search.backward_bytes_examined <= search.backward_work_upper_bound);
+        let exact_search = SearchLimits {
+            max_work_upper_bound: search.work_upper_bound,
+            max_candidate_visits: search.candidate_visits_upper_bound,
+            max_scratch_bytes: search.scratch_bytes,
+        };
+        assert!(baseline.find(&haystack, exact_search).is_ok());
+        assert!(matches!(
+            baseline.find(
+                &haystack,
+                SearchLimits {
+                    max_work_upper_bound: search.work_upper_bound - 1,
+                    ..exact_search
+                }
+            ),
+            Err(SearchError::WorkLimit { .. })
+        ));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native release qualification benchmark; requires OS-usable SVE"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the ignored benchmark keeps alternating end-to-end samples and its authenticated receipt together"
+    )]
+    fn benchmark_required_literal_backward_scalar_against_auto() {
+        use std::{hint::black_box, time::Instant};
+
+        fn measure_scalar(
+            plan: &RequiredLiteralPlan,
+            haystack: &[u8],
+            iterations: u32,
+        ) -> (f64, usize) {
+            let started = Instant::now();
+            let mut checksum = 0_usize;
+            for _ in 0..iterations {
+                let (matched, accounting) = black_box(plan)
+                    .find(black_box(haystack), SearchLimits::unlimited())
+                    .unwrap();
+                checksum ^= matched.map_or(0, |(_, end)| end.rotate_left(7))
+                    ^ accounting.backward_bytes_examined;
+            }
+            black_box(checksum);
+            (
+                started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations),
+                checksum,
+            )
+        }
+
+        fn measure_auto(
+            plan: &DispatchedRequiredLiteralPlan,
+            haystack: &[u8],
+            iterations: u32,
+        ) -> (f64, usize) {
+            let started = Instant::now();
+            let mut checksum = 0_usize;
+            for _ in 0..iterations {
+                let (matched, accounting) = black_box(plan)
+                    .find(black_box(haystack), SearchLimits::unlimited())
+                    .unwrap();
+                checksum ^= matched.map_or(0, |(_, end)| end.rotate_left(7))
+                    ^ accounting.backward_bytes_examined;
+            }
+            black_box(checksum);
+            (
+                started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations),
+                checksum,
+            )
+        }
+
+        fn median(samples: &[f64]) -> f64 {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        }
+
+        fn serialize(samples: &[f64]) -> String {
+            samples
+                .iter()
+                .map(|sample| format!("{sample:.9}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            dispatch.capabilities().usable().contains(Feature::ArmSve),
+            "benchmark requires OS-usable SVE"
+        );
+        let class = ascii_class();
+        let scalar =
+            RequiredLiteralPlan::build(class, b"Z", Anchors::default(), BuildLimits::default())
+                .unwrap();
+        let auto = RequiredLiteralPlan::build_with_dispatch(
+            dispatch,
+            class,
+            b"Z",
+            Anchors::default(),
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let candidate_variant = auto
+            .run_scanner_selection()
+            .expect("an SVE host retains an automatic backward scanner")
+            .variant_id;
+        let mut haystack: Vec<u8> = ASCII_MEMBERS
+            .iter()
+            .copied()
+            .cycle()
+            .take(256 << 10)
+            .collect();
+        haystack.push(b'Z');
+        assert_eq!(
+            scalar.find(&haystack, SearchLimits::unlimited()).unwrap().0,
+            auto.find(&haystack, SearchLimits::unlimited()).unwrap().0
+        );
+
+        let iterations = std::env::var("FRE_REQUIRED_LITERAL_RUN_BENCH_ITERS").map_or(128, |raw| {
+            raw.parse::<u32>()
+                .unwrap_or_else(|error| panic!("FRE_REQUIRED_LITERAL_RUN_BENCH_ITERS: {error}"))
+        });
+        let samples = std::env::var("FRE_REQUIRED_LITERAL_RUN_BENCH_SAMPLES").map_or(16, |raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|error| panic!("FRE_REQUIRED_LITERAL_RUN_BENCH_SAMPLES: {error}"))
+        });
+        assert!(iterations > 0);
+        assert!(samples >= 16 && samples.is_multiple_of(2));
+        let _ = measure_scalar(&scalar, &haystack, iterations / 8 + 1);
+        let _ = measure_auto(&auto, &haystack, iterations / 8 + 1);
+
+        let mut scalar_samples = Vec::with_capacity(samples);
+        let mut auto_samples = Vec::with_capacity(samples);
+        let mut orders = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            if sample & 1 == 0 {
+                scalar_samples.push(measure_scalar(&scalar, &haystack, iterations).0);
+                auto_samples.push(measure_auto(&auto, &haystack, iterations).0);
+                orders.push("scalar>auto");
+            } else {
+                auto_samples.push(measure_auto(&auto, &haystack, iterations).0);
+                scalar_samples.push(measure_scalar(&scalar, &haystack, iterations).0);
+                orders.push("auto>scalar");
+            }
+        }
+        let scalar_median = median(&scalar_samples);
+        let auto_median = median(&auto_samples);
+        let receipt = format!(
+            "REQUIRED_LITERAL_BACKWARD_RUN_BENCH iterations={iterations} samples={samples} \
+             bytes={} candidate_variant={candidate_variant} scalar_ns={scalar_median:.9} \
+             auto_ns={auto_median:.9} auto_over_scalar={:.9} orders={} \
+             scalar_samples={} auto_samples={}",
+            haystack.len(),
+            auto_median / scalar_median,
+            orders.join(","),
+            serialize(&scalar_samples),
+            serialize(&auto_samples),
+        );
+        assert_eq!(receipt.matches('\n').count(), 0);
+        eprintln!("{receipt}");
     }
 }

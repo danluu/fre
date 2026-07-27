@@ -441,16 +441,16 @@ pub use text_set::{
 
 use fre_automata::{Automaton, EarliestEnd, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{
-    AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, ForwardAnchoredBuildAccounting,
-    ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
-    ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
-    LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
-    LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan,
-    LiteralSetSearchLimits, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
-    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
-    RequiredLiteralBuildAccounting, RequiredLiteralBuildError, RequiredLiteralBuildLimits,
-    RequiredLiteralPlan, RequiredLiteralSearchAccounting, RequiredLiteralSearchError,
-    RequiredLiteralSearchLimits, Window as LiteralWindow,
+    AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan,
+    ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
+    ForwardAnchoredPlan, ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError,
+    ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan,
+    LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
+    LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
+    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
+    PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
+    RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
+    RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -1972,18 +1972,41 @@ impl PortableBuilder {
         if let Some(shape) = required.shape {
             let default_allowed = !(shape.anchors.start && shape.anchors.end);
             if self.selection == PlanSelection::ForceRequiredLiteral || default_allowed {
-                match RequiredLiteralPlan::build(
-                    shape.class,
-                    &shape.suffix,
-                    shape.anchors,
-                    self.limits.required_literal,
-                ) {
+                let dispatch = SimdDispatchContext::capture();
+                let required_plan =
+                    if RequiredLiteralPlan::run_scanner_eligible(dispatch, shape.class) {
+                        RequiredLiteralPlan::build_with_dispatch(
+                            dispatch,
+                            shape.class,
+                            &shape.suffix,
+                            shape.anchors,
+                            self.limits.required_literal,
+                        )
+                        .map(PortablePlan::DispatchedRequiredLiteral)
+                    } else {
+                        RequiredLiteralPlan::build(
+                            shape.class,
+                            &shape.suffix,
+                            shape.anchors,
+                            self.limits.required_literal,
+                        )
+                        .map(PortablePlan::RequiredLiteral)
+                    };
+                match required_plan {
                     Ok(plan) => {
-                        let build = plan.build_accounting();
+                        let build = match &plan {
+                            PortablePlan::RequiredLiteral(plan) => plan.build_accounting(),
+                            PortablePlan::DispatchedRequiredLiteral(plan) => {
+                                plan.build_accounting()
+                            }
+                            _ => unreachable!(
+                                "the required-literal constructor returned another family"
+                            ),
+                        };
                         return Ok(PortableRegex {
                             source,
                             capture_names,
-                            plan: PortablePlan::RequiredLiteral(plan),
+                            plan,
                             profile: profile.clone(),
                             limits: self.limits,
                             selection: self.selection,
@@ -2383,6 +2406,7 @@ enum PortablePlan {
     PackedLiteralSet(PackedLiteralSetPlan),
     LiteralSetDfa(LiteralSetPlan),
     RequiredLiteral(RequiredLiteralPlan),
+    DispatchedRequiredLiteral(DispatchedRequiredLiteralPlan),
     ForwardAnchored(ForwardAnchoredPlan),
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
@@ -2397,6 +2421,7 @@ impl PortablePlan {
             Self::PackedLiteralSet(_) => "packed-literal-set",
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
+            Self::DispatchedRequiredLiteral(required) => required.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -2648,6 +2673,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each authenticated native owner projects the same operation-specific accounting without erasing its concrete type"
+    )]
     pub fn is_match_window(
         &self,
         haystack: &[u8],
@@ -2689,6 +2718,18 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedRequiredLiteral(required) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = required.find_window(
                     haystack,
@@ -2798,6 +2839,14 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
+            PortablePlan::DispatchedRequiredLiteral(required) => required
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
             PortablePlan::ForwardAnchored(forward) => forward
                 .find_window(
                     haystack,
@@ -2868,6 +2917,10 @@ impl PortableRegex {
         self.shortest_match_window(haystack, SearchWindow::new(start, haystack.len()), limits)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each authenticated native owner projects the same operation-specific accounting without erasing its concrete type"
+    )]
     fn shortest_match_window(
         &self,
         haystack: &[u8],
@@ -2911,6 +2964,18 @@ impl PortableRegex {
                 Ok((end, SearchAccounting::LiteralSetDfa(accounting)))
             }
             PortablePlan::RequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedRequiredLiteral(required) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = required.find_window(
                     haystack,
@@ -3007,6 +3072,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
+                let (matched, accounting) =
+                    required.find(haystack, required_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedRequiredLiteral(required) => {
                 let (matched, accounting) =
                     required.find(haystack, required_literal_limits(limits))?;
                 Ok((
@@ -3203,6 +3276,10 @@ impl PortableRegex {
     /// # Errors
     ///
     /// Returns [`SearchError`] for an invalid window or a resource refusal.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each authenticated native owner projects the same operation-specific accounting without erasing its concrete type"
+    )]
     pub fn find_window(
         &self,
         haystack: &[u8],
@@ -3244,6 +3321,18 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::RequiredLiteral(required) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = required.find_window(
+                    haystack,
+                    literal_window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::DispatchedRequiredLiteral(required) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = required.find_window(
                     haystack,
@@ -3317,20 +3406,33 @@ impl PortableRegex {
         operation: CaptureFreeOperation,
         search_limits: SearchLimits,
     ) -> Option<RequiredLiteralCacheIdentity> {
-        let PortablePlan::RequiredLiteral(required) = &self.plan else {
-            return None;
-        };
-        Some(RequiredLiteralCacheIdentity {
-            schema_version: EXPLAIN_SCHEMA_VERSION,
-            plan_id: required.plan_id(),
-            profile: self.profile.clone(),
-            operation,
-            anchors: required.anchors(),
-            class_words: required.class().words(),
-            suffix: required.suffix().to_vec(),
-            build_limits: self.limits,
-            search_limits,
-        })
+        match &self.plan {
+            PortablePlan::RequiredLiteral(required) => Some(RequiredLiteralCacheIdentity {
+                schema_version: EXPLAIN_SCHEMA_VERSION,
+                plan_id: required.plan_id(),
+                profile: self.profile.clone(),
+                operation,
+                anchors: required.anchors(),
+                class_words: required.class().words(),
+                suffix: required.suffix().to_vec(),
+                build_limits: self.limits,
+                search_limits,
+            }),
+            PortablePlan::DispatchedRequiredLiteral(required) => {
+                Some(RequiredLiteralCacheIdentity {
+                    schema_version: EXPLAIN_SCHEMA_VERSION,
+                    plan_id: required.plan_id(),
+                    profile: self.profile.clone(),
+                    operation,
+                    anchors: required.anchors(),
+                    class_words: required.class().words(),
+                    suffix: required.suffix().to_vec(),
+                    build_limits: self.limits,
+                    search_limits,
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Produce the complete equality key for a forward-anchored operation.
@@ -4519,6 +4621,109 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the routing test keeps eligibility, identity, cache identity, and exact owner accounting together"
+    )]
+    fn required_literal_facade_dispatch_is_confined_to_sve_ascii_classes() {
+        use fre_kernels::{
+            REQUIRED_LITERAL_ASCII_BACKWARD_RUN_PLAN_ID, REQUIRED_LITERAL_PLAN_ID,
+            RequiredLiteralAnchors, RequiredLiteralByteClass, RequiredLiteralPlan,
+            SimdDispatchContext,
+        };
+
+        let dispatch = SimdDispatchContext::capture();
+        let anchors = RequiredLiteralAnchors::default();
+        let ascii_class = RequiredLiteralByteClass::from_bytes(b"0_aceg");
+        let ascii = PortableBuilder::new("[0_aceg]+Z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        let ascii_build = ascii
+            .build_report()
+            .required_literal
+            .expect("forced required-literal plan retains its construction receipt");
+        let eligible = RequiredLiteralPlan::run_scanner_eligible(dispatch, ascii_class);
+        assert_eq!(
+            matches!(&ascii.plan, PortablePlan::DispatchedRequiredLiteral(_)),
+            eligible
+        );
+        assert_eq!(
+            ascii.runtime_implementation_id(),
+            if eligible {
+                REQUIRED_LITERAL_ASCII_BACKWARD_RUN_PLAN_ID
+            } else {
+                REQUIRED_LITERAL_PLAN_ID
+            }
+        );
+        assert_eq!(
+            ascii
+                .required_literal_cache_identity(
+                    CaptureFreeOperation::Span,
+                    SearchLimits::default(),
+                )
+                .unwrap()
+                .plan_id,
+            ascii.runtime_implementation_id()
+        );
+        let expected = if eligible {
+            RequiredLiteralPlan::build_with_dispatch(
+                dispatch,
+                ascii_class,
+                b"Z",
+                anchors,
+                fre_kernels::RequiredLiteralBuildLimits::default(),
+            )
+            .unwrap()
+            .build_accounting()
+        } else {
+            RequiredLiteralPlan::build(
+                ascii_class,
+                b"Z",
+                anchors,
+                fre_kernels::RequiredLiteralBuildLimits::default(),
+            )
+            .unwrap()
+            .build_accounting()
+        };
+        assert_eq!(ascii_build, expected);
+        assert_eq!(
+            ascii.build_report().plan_storage_bytes,
+            ascii_build.persistent_bytes
+        );
+
+        let non_ascii_class = RequiredLiteralByteClass::from_bytes(&[0, 2, 4, 0x80, 0xff]);
+        assert!(!RequiredLiteralPlan::run_scanner_eligible(
+            dispatch,
+            non_ascii_class
+        ));
+        let non_ascii = PortableBuilder::new(r"(?-u:[\x00\x02\x04\x80\xFF]+Z)")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceRequiredLiteral)
+            .build()
+            .unwrap();
+        assert!(matches!(&non_ascii.plan, PortablePlan::RequiredLiteral(_)));
+        assert_eq!(
+            non_ascii.runtime_implementation_id(),
+            REQUIRED_LITERAL_PLAN_ID
+        );
+        let expected = RequiredLiteralPlan::build(
+            non_ascii_class,
+            b"Z",
+            anchors,
+            fre_kernels::RequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .build_accounting();
+        assert_eq!(non_ascii.build_report().required_literal, Some(expected));
+        assert_eq!(
+            non_ascii.build_report().plan_storage_bytes,
+            expected.persistent_bytes
+        );
+    }
+
+    #[test]
     fn cache_identity_stamps_profile_operation_anchors_and_every_limit() {
         let regex = PortableBuilder::new("[ab]+Z")
             .unicode(false)
@@ -4528,7 +4733,7 @@ mod tests {
         let span = regex
             .required_literal_cache_identity(CaptureFreeOperation::Span, limits)
             .unwrap();
-        assert_eq!(span.plan_id, fre_kernels::REQUIRED_LITERAL_PLAN_ID);
+        assert_eq!(span.plan_id, regex.runtime_implementation_id());
         assert_eq!(span.build_limits, BuildLimits::default());
         assert_eq!(span.search_limits, limits);
         assert_eq!(

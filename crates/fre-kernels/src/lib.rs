@@ -460,11 +460,13 @@ pub use required_internal_anchor::{
 };
 pub use required_literal::ByteClass as RequiredInternalAnchorByteClass;
 pub use required_literal::{
+    ASCII_BACKWARD_RUN_PLAN_ID as REQUIRED_LITERAL_ASCII_BACKWARD_RUN_PLAN_ID,
     Anchors as RequiredLiteralAnchors, BuildAccounting as RequiredLiteralBuildAccounting,
     BuildError as RequiredLiteralBuildError, BuildLimits as RequiredLiteralBuildLimits,
-    ByteClass as RequiredLiteralByteClass, PLAN_ID as REQUIRED_LITERAL_PLAN_ID,
-    RequiredLiteralPlan, SearchAccounting as RequiredLiteralSearchAccounting,
-    SearchError as RequiredLiteralSearchError, SearchLimits as RequiredLiteralSearchLimits,
+    ByteClass as RequiredLiteralByteClass, DispatchedRequiredLiteralPlan,
+    PLAN_ID as REQUIRED_LITERAL_PLAN_ID, RequiredLiteralPlan,
+    SearchAccounting as RequiredLiteralSearchAccounting, SearchError as RequiredLiteralSearchError,
+    SearchLimits as RequiredLiteralSearchLimits,
 };
 pub use sparse_ordered_literal_aggregate::{
     ALGORITHM_ID as SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
