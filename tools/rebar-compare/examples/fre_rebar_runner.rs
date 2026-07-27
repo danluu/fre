@@ -1415,6 +1415,7 @@ fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), Compar
 mod tests {
     use super::*;
     use rebar_compare::performance_contract::PerformanceLifecyclePreparation;
+    use std::{collections::BTreeSet, process::Command};
 
     fn field(output: &mut Vec<u8>, key: &str, value: &[u8]) {
         write!(output, "{key}:{}:", value.len()).unwrap();
@@ -2248,6 +2249,150 @@ mod tests {
             execute_grep_session(&mut fallback, b"ab\nmiss\na", limits).expect("fallback count"),
             2
         );
+    }
+
+    struct ExactGrepPointCase {
+        benchmark: &'static str,
+        first_point: &'static str,
+        steady_point: &'static str,
+        expected: u64,
+        pattern_sha256: &'static str,
+        haystack_sha256: &'static str,
+    }
+
+    const EXACT_GREP_POINT_CASES: &[ExactGrepPointCase] = &[
+        ExactGrepPointCase {
+            benchmark: "wild/ruff/unnecessary-coding-comment",
+            first_point: "5025d66d740709c9cc31a829",
+            steady_point: "0711993ed41d68476c302313",
+            expected: 16,
+            pattern_sha256: "84e0cc3593d33caadf1514b2a9812333cec9688400c213294aac9f13871dc131",
+            haystack_sha256: "1aaf33e0e5d90f0b350c5e04c3817c6c12b9e1ee0cecf2433c8ee6a7bae176d2",
+        },
+        ExactGrepPointCase {
+            benchmark: "opt/accelerate/whole-line",
+            first_point: "4daf5f136f93b62bf0335b7a",
+            steady_point: "39505cf71e565d453ecd1ed9",
+            expected: 239_963,
+            pattern_sha256: "5b22f7373a0d958dc8e60e039ebdfbb1244ca8c46453d8935ce31bcd4d9d7847",
+            haystack_sha256: "7d43cc8dfd053b083b809bd7ce7d4a074f2fd24a6b7ec38908b3966f3324fa36",
+        },
+        ExactGrepPointCase {
+            benchmark: "curated/09-aws-keys/quick",
+            first_point: "910af6338454ed8b0f039d04",
+            steady_point: "4479a56ac44660257a1de34d",
+            expected: 0,
+            pattern_sha256: "acff6bfb9eb90b7a486e98c7b0c20a48ca9e59b581207b4f4838f05fd8767d96",
+            haystack_sha256: "140a09e1134154c3222186d21ace797cf3ffaa1ed317480064e3faffd4fe85b6",
+        },
+        ExactGrepPointCase {
+            benchmark: "imported/lh3lh3-reb/uri",
+            first_point: "eaf2d4518dbbe36e62732cc5",
+            steady_point: "5a8094207291c4e128cff9ba",
+            expected: 17_549,
+            pattern_sha256: "b64702455770fd570e7233b5810d725e62d291d33d1746c1cbc6d10e7c302e95",
+            haystack_sha256: "e58320cfc01a0f0f0ae0b263a1c84406bae21449f8128c8fda83c22b85ee536d",
+        },
+        ExactGrepPointCase {
+            benchmark: "imported/lh3lh3-reb/email",
+            first_point: "855a8558e5a8294439d1625a",
+            steady_point: "e2abbbfb6e2789c2ce0afda8",
+            expected: 15_057,
+            pattern_sha256: "6cc0e2ec3a0f3b344987f88881ff21d0d5b2e9cff30b09d27a2bde5ce099b76d",
+            haystack_sha256: "e58320cfc01a0f0f0ae0b263a1c84406bae21449f8128c8fda83c22b85ee536d",
+        },
+        ExactGrepPointCase {
+            benchmark: "imported/lh3lh3-reb/uri-or-email",
+            first_point: "87ddbaeadf448b8f9137fde7",
+            steady_point: "cd47a59f57a84fc2b839c986",
+            expected: 32_539,
+            pattern_sha256: "05c2ad9d4d1d7a6eb3d2a15ffdaa482c43b8dcc5874025ab5549ae1e33e2f633",
+            haystack_sha256: "e58320cfc01a0f0f0ae0b263a1c84406bae21449f8128c8fda83c22b85ee536d",
+        },
+        ExactGrepPointCase {
+            benchmark: "imported/lh3lh3-reb/date",
+            first_point: "cc7337b681e74e0a46b8407f",
+            steady_point: "9796b5afbd23ba1f087a26a7",
+            expected: 668,
+            pattern_sha256: "3970711d148533bf7588cde3f7f0a3299cff950f2a86263d7db7057d42858a45",
+            haystack_sha256: "e58320cfc01a0f0f0ae0b263a1c84406bae21449f8128c8fda83c22b85ee536d",
+        },
+    ];
+
+    fn exact_rebar_klv(benchmark: &str) -> Vec<u8> {
+        let rebar = env::var_os("FRE_REBAR_BIN")
+            .expect("FRE_REBAR_BIN must name the pinned Rebar executable");
+        let definitions = env::var_os("FRE_REBAR_BENCH_DIR")
+            .expect("FRE_REBAR_BENCH_DIR must name the pinned benchmark directory");
+        let output = Command::new(rebar)
+            .args(["klv", "--max-iters", "1", "--max-warmup-iters", "0"])
+            .args(["--max-time", "1ns", "--max-warmup-time", "0ns"])
+            .arg("--dir")
+            .arg(definitions)
+            .arg(benchmark)
+            .output()
+            .expect("run pinned Rebar KLV generator");
+        assert!(
+            output.status.success(),
+            "Rebar KLV generation failed for {benchmark}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    #[ignore = "requires FRE_REBAR_BIN and FRE_REBAR_BENCH_DIR for the pinned expanded checkout"]
+    fn exact_14_grep_points_use_one_reusable_whole_input_session_without_a_clock() {
+        let mut point_ids = BTreeSet::new();
+        for case in EXACT_GREP_POINT_CASES {
+            assert!(point_ids.insert(case.first_point));
+            assert!(point_ids.insert(case.steady_point));
+            let benchmark =
+                Benchmark::parse(&exact_rebar_klv(case.benchmark)).expect("parse exact Rebar KLV");
+            assert_eq!(benchmark.name, case.benchmark);
+            assert_eq!(benchmark.model, "grep");
+            assert_eq!(benchmark.patterns.len(), 1);
+            assert_eq!(sha256(benchmark.pattern().as_bytes()), case.pattern_sha256);
+            assert_eq!(sha256(&benchmark.haystack), case.haystack_sha256);
+
+            let regex = current_fre_rebar_portable_builder(
+                benchmark.pattern(),
+                benchmark.unicode,
+                benchmark.case_insensitive,
+            )
+            .expect("portable builder")
+            .build()
+            .expect("portable regex");
+            assert_eq!(regex.build_report().plan, PlanKind::K0);
+            assert_eq!(regex.runtime_implementation_id(), "k0");
+            let limits = current_fre_rebar_search_limits();
+            let mut session = build_grep_session(&regex, limits).expect("whole-input grep session");
+            let CurrentFreGrepSession::Stream(stream) = &session else {
+                panic!("exact Grep point selected the per-line fallback");
+            };
+            assert!(stream.construction_receipt().closes());
+
+            let repeated = benchmark
+                .haystack
+                .lines()
+                .map(|line| {
+                    regex
+                        .is_match(line, limits)
+                        .expect("current per-line reference")
+                        .0
+                })
+                .filter(|matched| *matched)
+                .count();
+            assert_eq!(u64::try_from(repeated).expect("line count"), case.expected);
+
+            let first = execute_grep_session(&mut session, &benchmark.haystack, limits)
+                .expect("first public operation");
+            assert_eq!(first, case.expected, "first point {}", case.first_point);
+            let steady = execute_grep_session(&mut session, &benchmark.haystack, limits)
+                .expect("steady public operation");
+            assert_eq!(steady, case.expected, "steady point {}", case.steady_point);
+        }
+        assert_eq!(point_ids.len(), 14);
     }
 
     #[test]
