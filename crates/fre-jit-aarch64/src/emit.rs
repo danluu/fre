@@ -1,6 +1,6 @@
 use fre_kernel_ir::{
-    AbiVersion, AggregateOperation, AggregateOutput, AnchorFlags, BlockOp, ByteClass, DataBlob,
-    ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, Operation, OutputKind,
+    AbiVersion, AggregateOperation, AggregateOutput, AnchorFlags, BlockOp, ByteClass, Count,
+    DataBlob, ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, Operation, OutputKind,
     SemanticsVersion, ValidatedProgram,
 };
 use memchr::arch::all::packedpair::Pair;
@@ -355,12 +355,69 @@ pub fn emit_exact_aggregate<A: AggregateOperation>(
     program: &ExactAggregateProgram<A>,
     limits: EmitLimits,
 ) -> Result<NativeAggregateImage, EmitError> {
+    emit_exact_aggregate_backend(program, limits, AggregateBackend::Current)
+}
+
+/// Emit the experimental fixed-16-lane SVE2 backend for a one-byte Count.
+///
+/// This is an explicit experiment: [`emit_exact_aggregate`] and
+/// [`BackendVersion::AGGREGATE_CURRENT`] remain unchanged. The generated loop
+/// uses `MATCH`, an SVE2-only instruction, and the image requires OS-usable
+/// SVE and SVE2 at publication time.
+pub fn emit_exact_aggregate_sve2_fixed16_count_experimental(
+    program: &ExactAggregateProgram<Count>,
+    limits: EmitLimits,
+) -> Result<NativeAggregateImage, EmitError> {
+    emit_exact_aggregate_backend(
+        program,
+        limits,
+        AggregateBackend::Sve2Fixed16CountExperimental,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateBackend {
+    Current,
+    Sve2Fixed16CountExperimental,
+}
+
+impl AggregateBackend {
+    const fn version(self) -> BackendVersion {
+        match self {
+            Self::Current => BackendVersion::AGGREGATE_CURRENT,
+            Self::Sve2Fixed16CountExperimental => {
+                BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+            }
+        }
+    }
+
+    const fn features(self, vector_instructions: u32) -> CpuFeatures {
+        match self {
+            Self::Current if vector_instructions == 0 => CpuFeatures::NONE,
+            Self::Current => CpuFeatures::ASIMD,
+            Self::Sve2Fixed16CountExperimental => CpuFeatures::SVE.union(CpuFeatures::SVE2),
+        }
+    }
+}
+
+fn emit_exact_aggregate_backend<A: AggregateOperation>(
+    program: &ExactAggregateProgram<A>,
+    limits: EmitLimits,
+    backend: AggregateBackend,
+) -> Result<NativeAggregateImage, EmitError> {
     let literal = program.literal();
     if literal.len() > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
         return Err(EmitError::ConfirmationLengthLimit {
             kind: ConfirmationKind::ExactLiteral,
             limit: MAX_EXACT_AGGREGATE_LITERAL_BYTES,
             required: literal.len(),
+        });
+    }
+    if backend == AggregateBackend::Sve2Fixed16CountExperimental
+        && (literal.len() != 1 || A::OUTPUT != AggregateOutput::Count)
+    {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
         });
     }
     let capacities = Capacities {
@@ -385,10 +442,18 @@ pub fn emit_exact_aggregate<A: AggregateOperation>(
         assembler.new_label(LabelKind::ReturnNone)?
     };
     assembler.bind(entry)?;
-    emit_aggregate_exact(&mut assembler, literal, A::OUTPUT, done, overflow, &data)?;
+    emit_aggregate_exact(
+        &mut assembler,
+        literal,
+        A::OUTPUT,
+        backend,
+        done,
+        overflow,
+        &data,
+    )?;
     emit_aggregate_returns(&mut assembler, done, overflow)?;
     let finalized = assembler.finalize(data.bytes.len())?;
-    let image = build_aggregate_image(program, finalized, data, scratch)?;
+    let image = build_aggregate_image(program, finalized, data, scratch, backend)?;
     finalize_aggregate_image(image, limits)
 }
 
@@ -397,6 +462,7 @@ fn build_aggregate_image<A: AggregateOperation>(
     finalized: Finalized,
     data: Rodata,
     scratch: u64,
+    backend: AggregateBackend,
 ) -> Result<NativeImage, EmitError> {
     let code_len = finalized.code.len();
     let rodata_offset = align_up(code_len, DATA_ALIGNMENT, ArithmeticSite::ImageLayout)?;
@@ -422,13 +488,9 @@ fn build_aggregate_image<A: AggregateOperation>(
         vector_instructions: finalized.vector_instructions,
     };
     Ok(NativeImage {
-        backend_version: BackendVersion::AGGREGATE_CURRENT,
+        backend_version: backend.version(),
         target: TargetSpec {
-            features: if finalized.vector_instructions == 0 {
-                CpuFeatures::NONE
-            } else {
-                CpuFeatures::ASIMD
-            },
+            features: backend.features(finalized.vector_instructions),
             ..TargetSpec::AARCH64_AAPCS64
         },
         // This field belongs to the search-image wire layout and is ignored
@@ -457,6 +519,7 @@ fn emit_aggregate_exact(
     assembler: &mut Assembler,
     literal: &[u8],
     output: AggregateOutput,
+    backend: AggregateBackend,
     done: Label,
     overflow: Label,
     data: &Rodata,
@@ -483,8 +546,16 @@ fn emit_aggregate_exact(
         })?,
     )?;
     if literal.len() == 1 {
-        emit_aggregate_single_byte(assembler, done, overflow)
+        match backend {
+            AggregateBackend::Current => emit_aggregate_single_byte(assembler, done, overflow),
+            AggregateBackend::Sve2Fixed16CountExperimental => {
+                emit_aggregate_single_byte_sve2_fixed16_count(assembler, done, overflow)
+            }
+        }
     } else {
+        if backend != AggregateBackend::Current {
+            return Err(EmitError::InternalInvariant);
+        }
         emit_aggregate_multi_byte(assembler, literal, output, done, overflow)
     }
 }
@@ -516,6 +587,48 @@ fn emit_aggregate_single_byte(
     assembler.mov_imm64(X11, 256)?;
     assembler.sub_reg(X10, X11, X10)?;
     assembler.and_low_bits(X10, X10, 8)?;
+    emit_aggregate_add_register(assembler, X10, overflow)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(tail)?;
+    assembler.cmp_reg64(X5, X1)?;
+    assembler.branch_cond(Condition::CarrySet, done)?;
+    assembler.load_byte_reg(X10, X0, X5)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, tail_miss)?;
+    emit_aggregate_add_immediate(assembler, 1, overflow)?;
+    assembler.bind(tail_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.branch(tail)
+}
+
+fn emit_aggregate_single_byte_sve2_fixed16_count(
+    assembler: &mut Assembler,
+    done: Label,
+    overflow: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let tail = assembler.new_label(LabelKind::SlowPath)?;
+    let tail_miss = assembler.new_label(LabelKind::Internal)?;
+    assembler.load_byte(X11, X8, 0)?;
+    // P0 permanently selects the first sixteen byte lanes, independent of a
+    // larger physical VL. MATCH is intentionally used to make this backend
+    // genuinely SVE2-specific rather than a relabeled SVE sequence.
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    assembler.sve_duplicate_byte(1, X11)?;
+    assembler.mov_imm64(X5, 0)?;
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X5, X1)?;
+    assembler.branch_cond(Condition::CarrySet, done)?;
+    assembler.sub_reg(X10, X1, X5)?;
+    assembler.cmp_imm64(X10, 16)?;
+    assembler.branch_cond(Condition::CarryClear, tail)?;
+    assembler.add_reg(X15, X0, X5)?;
+    assembler.sve_load_bytes(0, 0, X15)?;
+    assembler.sve2_match_bytes(1, 0, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X10, 0, 1)?;
     emit_aggregate_add_register(assembler, X10, overflow)?;
     assembler.add_imm(X5, X5, 16)?;
     assembler.branch(vector)?;

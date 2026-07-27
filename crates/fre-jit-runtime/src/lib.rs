@@ -319,7 +319,10 @@ fn preflight_aggregate<A: RuntimeAggregateOperation>(
     {
         return Err(PublishError::TargetMismatch);
     }
-    let known_features = CpuFeatures::ASIMD.bits();
+    let known_features = CpuFeatures::ASIMD
+        .union(CpuFeatures::SVE)
+        .union(CpuFeatures::SVE2)
+        .bits();
     if target.features.bits() & !known_features != 0 {
         return Err(PublishError::UnknownCpuFeatures {
             bits: target.features.bits(),
@@ -327,6 +330,12 @@ fn preflight_aggregate<A: RuntimeAggregateOperation>(
     }
     if target.features.contains(CpuFeatures::ASIMD) && !platform::has_asimd() {
         return Err(PublishError::CpuFeatureUnavailable { feature: "asimd" });
+    }
+    if target.features.contains(CpuFeatures::SVE) && !platform::has_sve() {
+        return Err(PublishError::CpuFeatureUnavailable { feature: "sve" });
+    }
+    if target.features.contains(CpuFeatures::SVE2) && !platform::has_sve2() {
+        return Err(PublishError::CpuFeatureUnavailable { feature: "sve2" });
     }
     if image.output() != A::OUTPUT {
         return Err(PublishError::AggregateOutputContractMismatch {
@@ -358,7 +367,9 @@ fn preflight_search_backend_version(image: &NativeImage) -> Result<(), PublishEr
 fn preflight_aggregate_backend_version(image: &NativeAggregateImage) -> Result<(), PublishError> {
     if !matches!(
         image.backend_version(),
-        BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+        BackendVersion::AGGREGATE_V1
+            | BackendVersion::AGGREGATE_HISTORICAL_V2
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
     ) {
         return Err(PublishError::BackendVersionMismatch {
             expected: BackendVersion::AGGREGATE_CURRENT.0,

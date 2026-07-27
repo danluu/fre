@@ -41,6 +41,11 @@ impl BackendVersion {
     pub const AGGREGATE_V1: Self = Self(1);
     /// Historical pre-c4d tag for the same aggregate machine-code contract.
     pub const AGGREGATE_HISTORICAL_V2: Self = Self(2);
+    /// Experimental fixed-16-lane SVE2 backend for one-byte Count programs.
+    ///
+    /// This is deliberately not [`Self::AGGREGATE_CURRENT`]. Callers must opt
+    /// into its emitter and the runtime must independently admit SVE2.
+    pub const AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1: Self = Self(3);
     /// Current aggregate tag; its AOT wire remains aggregate v1.
     pub const AGGREGATE_CURRENT: Self = Self::AGGREGATE_V1;
     /// Compatibility alias for callers that only handle search images.

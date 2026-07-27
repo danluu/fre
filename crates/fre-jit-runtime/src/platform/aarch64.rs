@@ -189,10 +189,7 @@ impl Mapping for ExecutableMapping {
             && self.target.little_endian == expected.little_endian
             && self.target.pointer_width == expected.pointer_width
             && self.target.abi == expected.abi
-            && self.target.features.bits() & !CpuFeatures::ASIMD_SVE2.bits() == 0
-            && (!self.target.features.contains(CpuFeatures::ASIMD) || has_asimd())
-            && (!self.target.features.contains(CpuFeatures::SVE) || has_sve())
-            && (!self.target.features.contains(CpuFeatures::SVE2) || has_sve2())
+            && target_features_available(self.target.features)
     }
 
     fn invoke(&self, haystack: &[u8], window: SearchWindow) -> Result<RawCallResult, CallError> {
@@ -230,7 +227,9 @@ impl Mapping for ExecutableMapping {
         self.reservation.state == MappingState::Executable
             && matches!(
                 self.backend_version,
-                BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+                BackendVersion::AGGREGATE_V1
+                    | BackendVersion::AGGREGATE_HISTORICAL_V2
+                    | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
             )
             && self.aggregate
                 == Some(AggregateMappingContract {
@@ -241,8 +240,7 @@ impl Mapping for ExecutableMapping {
             && self.target.little_endian == expected.little_endian
             && self.target.pointer_width == expected.pointer_width
             && self.target.abi == expected.abi
-            && self.target.features.bits() & !CpuFeatures::ASIMD.bits() == 0
-            && (!self.target.features.contains(CpuFeatures::ASIMD) || has_asimd())
+            && target_features_available(self.target.features)
     }
 
     fn invoke_aggregate(&self, haystack: &[u8]) -> Result<RawAggregateCallResult, CallError> {
@@ -336,6 +334,14 @@ pub(crate) fn has_sve() -> bool {
 
 pub(crate) fn has_sve2() -> bool {
     host::has_sve2()
+}
+
+fn target_features_available(features: CpuFeatures) -> bool {
+    let known = CpuFeatures::ASIMD_SVE2;
+    features.bits() & !known.bits() == 0
+        && (!features.contains(CpuFeatures::ASIMD) || has_asimd())
+        && (!features.contains(CpuFeatures::SVE) || has_sve())
+        && (!features.contains(CpuFeatures::SVE2) || has_sve2())
 }
 
 #[derive(Clone, Copy)]

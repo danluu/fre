@@ -18,7 +18,8 @@ use crate::{
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
     SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
-    emit::emit_search_version_for_test, emit_exact_aggregate, emit_sve2_16, emit_sve16,
+    emit::emit_search_version_for_test, emit_exact_aggregate,
+    emit_exact_aggregate_sve2_fixed16_count_experimental, emit_sve2_16, emit_sve16,
     emit_with_backend, image::SearchShape,
 };
 
@@ -144,6 +145,169 @@ fn aggregate_images_are_typed_deterministic_and_domain_separated() {
         count_aot,
         span_image.to_aot(AotLimits::default()).expect("span AOT")
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the experimental backend receipt keeps emission, audit, decoding, identity, mutation, and oracle checks together"
+)]
+fn experimental_sve2_fixed16_count_is_explicit_audited_and_matches_oracle() {
+    let program =
+        build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("count program");
+    let current =
+        emit_exact_aggregate(&program, EmitLimits::default()).expect("current aggregate image");
+    let image =
+        emit_exact_aggregate_sve2_fixed16_count_experimental(&program, EmitLimits::default())
+            .expect("experimental SVE2 image");
+    let repeated =
+        emit_exact_aggregate_sve2_fixed16_count_experimental(&program, EmitLimits::default())
+            .expect("deterministic experimental image");
+
+    assert_eq!(image, repeated);
+    assert_eq!(current.backend_version(), BackendVersion::AGGREGATE_CURRENT);
+    assert_eq!(
+        image.backend_version(),
+        BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+    );
+    assert_eq!(current.target().features, CpuFeatures::ASIMD);
+    assert_eq!(
+        image.target().features,
+        CpuFeatures::SVE.union(CpuFeatures::SVE2)
+    );
+    assert_eq!(
+        audit_aggregate(&image)
+            .expect("whole-template audit")
+            .stores,
+        1
+    );
+
+    let current_instructions = decode(current.code()).expect("current ASIMD decoder");
+    assert_eq!(current_instructions.len(), 42);
+    assert!(
+        current_instructions.contains(&DecodedInstruction::CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: 1,
+        })
+    );
+    assert!(
+        current_instructions.contains(&DecodedInstruction::AddAcrossBytes16 {
+            destination: 0,
+            source: 0,
+        })
+    );
+    let instructions = decode(image.code()).expect("SVE2 decoder");
+    assert_eq!(instructions.len(), 39);
+    assert_eq!(image.stats().vector_instructions, 5);
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| !instruction.is_asimd())
+    );
+    assert!(instructions.contains(&DecodedInstruction::SvePtrueBytesVl16 { destination: 0 }));
+    assert!(instructions.contains(&DecodedInstruction::Sve2MatchBytes {
+        destination: 1,
+        predicate: 0,
+        left: 0,
+        right: 1,
+    }));
+    assert!(
+        instructions.contains(&DecodedInstruction::SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1,
+        })
+    );
+
+    assert_eq!(
+        decode_one(0x2518_e120, 0),
+        Ok(DecodedInstruction::SvePtrueBytesVl16 { destination: 0 })
+    );
+    assert_eq!(
+        decode_one(0x0520_3961, 4),
+        Ok(DecodedInstruction::SveDuplicateByte {
+            destination: 1,
+            source: 11,
+        })
+    );
+    assert_eq!(
+        decode_one(0xa400_a1e0, 8),
+        Ok(DecodedInstruction::SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: 15,
+        })
+    );
+    assert_eq!(
+        decode_one(0x4521_8001, 12),
+        Ok(DecodedInstruction::Sve2MatchBytes {
+            destination: 1,
+            predicate: 0,
+            left: 0,
+            right: 1,
+        })
+    );
+    assert_eq!(
+        decode_one(0x2520_802a, 16),
+        Ok(DecodedInstruction::SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1,
+        })
+    );
+
+    for length in [0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        for phase in 0..4 {
+            let haystack: Vec<u8> = (0..length)
+                .map(|index| if index % 4 == phase { b'x' } else { b'y' })
+                .collect();
+            let expected = *program
+                .execute(&haystack, AggregateExecutionLimits::unlimited())
+                .expect("oracle")
+                .output();
+            let actual = simulate_aggregate(&image, &haystack).expect("fixed-16 SVE2 simulation");
+            assert_eq!(aggregate_output(actual), Ok(expected));
+        }
+    }
+
+    let width_two =
+        build_exact_aggregate::<Count>(b"xx", ValidateLimits::default()).expect("width-two count");
+    assert_eq!(
+        emit_exact_aggregate_sve2_fixed16_count_experimental(&width_two, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape,
+        })
+    );
+
+    let mut missing_sve2 = image.inner().clone();
+    missing_sve2.target.features = CpuFeatures::SVE;
+    reseal_test_image(&mut missing_sve2);
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(missing_sve2)),
+        Err(AuditError::FeatureMismatch)
+    );
+
+    for (index, replacement) in [
+        (4, DecodedInstruction::SvePtrueBytesVl16 { destination: 1 }),
+        (
+            14,
+            DecodedInstruction::Sve2MatchBytes {
+                destination: 2,
+                predicate: 0,
+                left: 0,
+                right: 1,
+            },
+        ),
+    ] {
+        let mut mutated = image.inner().clone();
+        replace_test_decoded_at(&mut mutated, index, replacement);
+        reseal_test_image(&mut mutated);
+        assert!(
+            audit_aggregate(&NativeAggregateImage::new(mutated)).is_err(),
+            "SVE operand mutation at instruction {index} must fail"
+        );
+    }
 }
 
 #[test]

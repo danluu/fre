@@ -30,7 +30,8 @@ pub use audit::{AuditError, AuditReport, audit, audit_aggregate};
 pub use decode::{Condition, DecodeError, DecodedInstruction, decode, decode_one};
 pub use emit::{
     EmitLimits, MAX_REPEATED_CONFIRM_BYTES, SearchBackendPolicy, emit, emit_exact_aggregate,
-    emit_sve2_16, emit_sve16, emit_with_backend,
+    emit_exact_aggregate_sve2_fixed16_count_experimental, emit_sve2_16, emit_sve16,
+    emit_with_backend,
 };
 pub use error::{
     ArithmeticSite, BranchKind, ConfirmationKind, EmitError, ResourceKind, UnsupportedReason,

@@ -2204,8 +2204,8 @@ fn audit_impl(
         stores: 0,
         returns: 0,
     };
-    let mut required_features = CpuFeatures::NONE;
     let mut relocation_index = 0_usize;
+    let mut required_features = CpuFeatures::NONE;
     if instructions.len() != image.code.len() / 4 {
         return Err(AuditError::InvalidLayout);
     }
@@ -2427,7 +2427,8 @@ fn audit_aggregate_contract(
             DecodedInstruction::LoadByte { .. }
             | DecodedInstruction::LoadByteRegister { .. }
             | DecodedInstruction::Load64RegisterScaled { .. }
-            | DecodedInstruction::LoadVector128 { .. } => {
+            | DecodedInstruction::LoadVector128 { .. }
+            | DecodedInstruction::SveLoadBytes { .. } => {
                 if !valid_aggregate_load(instructions, index, literal_len) {
                     return Err(AuditError::InvalidAggregateLoad { offset });
                 }
@@ -2532,7 +2533,9 @@ fn authenticate_aggregate_envelope(
         .map_err(|_| AuditError::InvalidAggregateManifest)?;
     if !matches!(
         image.backend_version,
-        BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+        BackendVersion::AGGREGATE_V1
+            | BackendVersion::AGGREGATE_HISTORICAL_V2
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
     ) || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
@@ -2541,13 +2544,25 @@ fn authenticate_aggregate_envelope(
     }
 
     let (instructions, labels, relocations, vector_instructions) =
-        match (manifest.output, literal_len) {
-            (AggregateOutput::Count, 0) => (14_usize, 3_usize, 2_usize, 0_u32),
-            (AggregateOutput::SpanSum, 0) => (5, 2, 1, 0),
-            (_, 1) => (42, 6, 9, 5),
-            (_, 2) => (55, 9, 13, 9),
-            (_, 3..=15) => (68, 12, 17, 9),
-            (_, 16..=MAX_EXACT_AGGREGATE_LITERAL_BYTES) => (80, 13, 19, 14),
+        match (image.backend_version, manifest.output, literal_len) {
+            (
+                BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1,
+                AggregateOutput::Count,
+                1,
+            ) => (39_usize, 6_usize, 9_usize, 5_u32),
+            (
+                BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2,
+                output,
+                literal_len,
+            ) => match (output, literal_len) {
+                (AggregateOutput::Count, 0) => (14_usize, 3_usize, 2_usize, 0_u32),
+                (AggregateOutput::SpanSum, 0) => (5, 2, 1, 0),
+                (_, 1) => (42, 6, 9, 5),
+                (_, 2) => (55, 9, 13, 9),
+                (_, 3..=15) => (68, 12, 17, 9),
+                (_, 16..=MAX_EXACT_AGGREGATE_LITERAL_BYTES) => (80, 13, 19, 14),
+                _ => return Err(AuditError::InvalidAggregateManifest),
+            },
             _ => return Err(AuditError::InvalidAggregateManifest),
         };
     let code_bytes = instructions
@@ -2739,6 +2754,15 @@ fn validate_aggregate_template(
         MoveZero64, Return, Store64, SubtractImmediate64, SubtractRegister64, UnsignedMaxBytes16,
         UnsignedMinBytes16,
     };
+
+    if image.backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1 {
+        return validate_aggregate_sve2_fixed16_count_experimental_template(
+            image,
+            instructions,
+            literal_len,
+            output,
+        );
+    }
 
     validate_aggregate_template_labels(image, literal_len, output)?;
     let mut cursor = AggregateTemplateCursor::new(instructions);
@@ -3515,6 +3539,204 @@ fn validate_aggregate_template(
     cursor.finish()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the experimental backend's complete decoded template is intentionally explicit"
+)]
+fn validate_aggregate_sve2_fixed16_count_experimental_template(
+    image: &NativeImage,
+    instructions: &[DecodedInstruction],
+    literal_len: usize,
+    output: AggregateOutput,
+) -> Result<(), AuditError> {
+    use DecodedInstruction::{
+        AddImmediate64, AddRegister64, Address, Branch, BranchCondition, CompareImmediate64,
+        CompareRegister32, CompareRegister64, LoadByte, LoadByteRegister, MoveRegister64,
+        MoveZero64, Return, Store64, SubtractRegister64, Sve2MatchBytes, SveCountPredicateBytes,
+        SveDuplicateByte, SveLoadBytes, SvePtrueBytesVl16,
+    };
+    const LABELS: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (28, LabelKind::Loop),
+        (88, LabelKind::SlowPath),
+        (128, LabelKind::Internal),
+        (136, LabelKind::ReturnFound),
+        (148, LabelKind::ReturnNone),
+    ];
+
+    if literal_len != 1 || output != AggregateOutput::Count {
+        return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+    }
+    if image.labels.len() != LABELS.len()
+        || image
+            .labels
+            .iter()
+            .zip(LABELS)
+            .any(|(actual, expected)| (actual.offset, actual.kind) != *expected)
+    {
+        return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+    }
+
+    let mut cursor = AggregateTemplateCursor::new(instructions);
+    cursor.expect_all([
+        MoveZero64 {
+            destination: 13,
+            immediate: 0,
+            shift: 0,
+        },
+        Address {
+            destination: 8,
+            displacement: 156,
+        },
+        MoveZero64 {
+            destination: 12,
+            immediate: 1,
+            shift: 0,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        SvePtrueBytesVl16 { destination: 0 },
+        SveDuplicateByte {
+            destination: 1,
+            source: 11,
+        },
+        MoveZero64 {
+            destination: 5,
+            immediate: 0,
+            shift: 0,
+        },
+        CompareRegister64 { left: 5, right: 1 },
+        BranchCondition {
+            condition: crate::Condition::CarrySet,
+            displacement: 104,
+        },
+        SubtractRegister64 {
+            destination: 10,
+            left: 1,
+            right: 5,
+        },
+        CompareImmediate64 {
+            register: 10,
+            immediate: 16,
+        },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 44,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: 15,
+        },
+        Sve2MatchBytes {
+            destination: 1,
+            predicate: 0,
+            left: 0,
+            right: 1,
+        },
+        SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1,
+        },
+        MoveRegister64 {
+            destination: 14,
+            source: 13,
+        },
+        AddRegister64 {
+            destination: 13,
+            left: 13,
+            right: 10,
+        },
+        CompareRegister64 {
+            left: 13,
+            right: 14,
+        },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 72,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 16,
+        },
+        Branch { displacement: -56 },
+        CompareRegister64 { left: 5, right: 1 },
+        BranchCondition {
+            condition: crate::Condition::CarrySet,
+            displacement: 44,
+        },
+        LoadByteRegister {
+            destination: 10,
+            base: 0,
+            index: 5,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: crate::Condition::NotEqual,
+            displacement: 20,
+        },
+        MoveRegister64 {
+            destination: 14,
+            source: 13,
+        },
+        AddImmediate64 {
+            destination: 13,
+            source: 13,
+            immediate: 1,
+        },
+        CompareRegister64 {
+            left: 13,
+            right: 14,
+        },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 24,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+        Branch { displacement: -44 },
+        Store64 {
+            source: 13,
+            base: 2,
+            offset: 0,
+        },
+        MoveZero64 {
+            destination: 0,
+            immediate: 0,
+            shift: 0,
+        },
+        Return,
+        MoveZero64 {
+            destination: 0,
+            immediate: 1,
+            shift: 0,
+        },
+        Return,
+    ])?;
+    cursor.finish()
+}
+
 fn instruction_offset(index: usize) -> Result<u32, AuditError> {
     u32::try_from(index)
         .ok()
@@ -3617,7 +3839,8 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         DecodedInstruction::LoadByte {
             destination, base, ..
         } => forbidden(&[destination, base]),
-        DecodedInstruction::LoadVector128 { base, .. } => forbidden(&[base]),
+        DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::SveLoadBytes { base, .. } => forbidden(&[base]),
         DecodedInstruction::LoadByteRegister {
             destination,
             base,
@@ -3631,7 +3854,6 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         DecodedInstruction::Store64 { source, base, .. } => forbidden(&[source, base]),
         DecodedInstruction::DuplicateByte16 { source, .. }
         | DecodedInstruction::SveDuplicateByte { source, .. } => forbidden(&[source]),
-        DecodedInstruction::SveLoadBytes { base, .. } => forbidden(&[base]),
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination,
             source,
@@ -3660,12 +3882,16 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
     fn forbidden(registers: &[u8]) -> Option<u8> {
         registers.iter().copied().find(|&register| register > 5)
     }
-    if instruction.is_sve() {
-        return Some(0);
-    }
     match instruction {
         DecodedInstruction::LoadVector128 { destination, .. }
-        | DecodedInstruction::DuplicateByte16 { destination, .. } => forbidden(&[destination]),
+        | DecodedInstruction::DuplicateByte16 { destination, .. }
+        | DecodedInstruction::SveDuplicateByte { destination, .. }
+        | DecodedInstruction::SvePtrueBytesVl16 { destination } => forbidden(&[destination]),
+        DecodedInstruction::SveLoadBytes {
+            destination,
+            predicate,
+            ..
+        } => forbidden(&[destination, predicate]),
         DecodedInstruction::CompareEqualBytes16 {
             destination,
             left,
@@ -3681,6 +3907,12 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             left,
             right,
         } => forbidden(&[destination, left, right]),
+        DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => forbidden(&[destination, predicate, left, right]),
         DecodedInstruction::UnsignedMinBytes16 {
             destination,
             source,
@@ -3699,6 +3931,9 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
         } => forbidden(&[destination, source]),
         DecodedInstruction::MoveVectorByteTo32 { source, .. }
         | DecodedInstruction::MoveVectorDoubleTo64 { source, .. } => forbidden(&[source]),
+        DecodedInstruction::SveCountPredicateBytes {
+            predicate, source, ..
+        } => forbidden(&[predicate, source]),
         _ => None,
     }
 }
@@ -4010,6 +4245,10 @@ fn valid_aggregate_x10_write(
         } | DecodedInstruction::MoveVectorByteTo32 {
             destination: 10,
             source: 0 | 4
+        } | DecodedInstruction::SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1
         }
     ) || matches!(
         instruction,
@@ -4159,6 +4398,11 @@ fn valid_aggregate_load(
             base: 15 | 16,
             offset: 0,
             ..
+        }
+        | DecodedInstruction::SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: 15,
         } => true,
         DecodedInstruction::LoadByte {
             base: 8 | 15,
@@ -4180,7 +4424,8 @@ fn valid_aggregate_load(
         DecodedInstruction::LoadByte { .. }
         | DecodedInstruction::LoadByteRegister { .. }
         | DecodedInstruction::Load64RegisterScaled { .. }
-        | DecodedInstruction::LoadVector128 { .. } => false,
+        | DecodedInstruction::LoadVector128 { .. }
+        | DecodedInstruction::SveLoadBytes { .. } => false,
         _ => true,
     }
 }
@@ -4499,6 +4744,7 @@ fn valid_aggregate_forward_edge(
 struct InitializedState {
     gpr: u32,
     vector: u32,
+    predicate: u16,
 }
 
 fn validate_aggregate_definite_initialization(
@@ -4508,6 +4754,7 @@ fn validate_aggregate_definite_initialization(
     let initial = InitializedState {
         gpr: register_mask(&[0, 1, 2]),
         vector: 0,
+        predicate: 0,
     };
     states[0] = Some(initial);
     let mut pending = vec![0_usize];
@@ -4518,8 +4765,10 @@ fn validate_aggregate_definite_initialization(
         let instruction = instructions[index];
         let required_gpr = aggregate_gpr_reads(instruction);
         let required_vector = aggregate_vector_reads(instruction);
+        let required_predicate = aggregate_predicate_reads(instruction);
         if state.gpr & required_gpr != required_gpr
             || state.vector & required_vector != required_vector
+            || state.predicate & required_predicate != required_predicate
         {
             return Err(AuditError::InvalidAggregateControlFlow {
                 offset: instruction_offset(index)?,
@@ -4532,6 +4781,9 @@ fn validate_aggregate_definite_initialization(
         if let Some(destination) = aggregate_vector_write(instruction) {
             output.vector |= register_mask(&[destination]);
         }
+        if let Some(destination) = aggregate_predicate_write(instruction) {
+            output.predicate |= predicate_mask(&[destination]);
+        }
         let successors = aggregate_successors(instructions, index)?;
         for successor in successors.into_iter().flatten() {
             match states[successor] {
@@ -4543,6 +4795,7 @@ fn validate_aggregate_definite_initialization(
                     let intersection = InitializedState {
                         gpr: existing.gpr & output.gpr,
                         vector: existing.vector & output.vector,
+                        predicate: existing.predicate & output.predicate,
                     };
                     if intersection != existing {
                         states[successor] = Some(intersection);
@@ -4558,6 +4811,12 @@ fn validate_aggregate_definite_initialization(
 fn register_mask(registers: &[u8]) -> u32 {
     registers.iter().fold(0_u32, |mask, &register| {
         mask | 1_u32.checked_shl(u32::from(register)).unwrap_or(0)
+    })
+}
+
+fn predicate_mask(registers: &[u8]) -> u16 {
+    registers.iter().fold(0_u16, |mask, &register| {
+        mask | 1_u16.checked_shl(u32::from(register)).unwrap_or(0)
     })
 }
 
@@ -4588,7 +4847,8 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         DecodedInstruction::ReverseBits64 { source, .. }
         | DecodedInstruction::CountLeadingZeros64 { source, .. } => register_mask(&[source]),
         DecodedInstruction::LoadByte { base, .. }
-        | DecodedInstruction::LoadVector128 { base, .. } => register_mask(&[base]),
+        | DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),
         DecodedInstruction::LoadByteRegister { base, index, .. }
         | DecodedInstruction::Load64RegisterScaled { base, index, .. } => {
             register_mask(&[base, index])
@@ -4596,7 +4856,6 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         DecodedInstruction::Store64 { source, base, .. } => register_mask(&[source, base]),
         DecodedInstruction::DuplicateByte16 { source, .. }
         | DecodedInstruction::SveDuplicateByte { source, .. } => register_mask(&[source]),
-        DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),
         DecodedInstruction::LogicalShiftRightVariable64 { source, shift, .. } => {
             register_mask(&[source, shift])
         }
@@ -4628,9 +4887,8 @@ fn aggregate_vector_reads(instruction: DecodedInstruction) -> u32 {
     match instruction {
         DecodedInstruction::CompareEqualBytes16 { left, right, .. }
         | DecodedInstruction::AndBytes16 { left, right, .. }
-        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { left, right, .. } => {
-            register_mask(&[left, right])
-        }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { left, right, .. }
+        | DecodedInstruction::Sve2MatchBytes { left, right, .. } => register_mask(&[left, right]),
         DecodedInstruction::UnsignedMinBytes16 { source, .. }
         | DecodedInstruction::UnsignedMaxBytes16 { source, .. }
         | DecodedInstruction::AddAcrossBytes16 { source, .. }
@@ -4651,7 +4909,28 @@ const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
         | DecodedInstruction::UnsignedMaxBytes16 { destination, .. }
         | DecodedInstruction::UnsignedMaxPairwiseBytes16 { destination, .. }
         | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
-        | DecodedInstruction::AddAcrossBytes16 { destination, .. } => Some(destination),
+        | DecodedInstruction::AddAcrossBytes16 { destination, .. }
+        | DecodedInstruction::SveDuplicateByte { destination, .. }
+        | DecodedInstruction::SveLoadBytes { destination, .. } => Some(destination),
+        _ => None,
+    }
+}
+
+fn aggregate_predicate_reads(instruction: DecodedInstruction) -> u16 {
+    match instruction {
+        DecodedInstruction::SveLoadBytes { predicate, .. }
+        | DecodedInstruction::Sve2MatchBytes { predicate, .. } => predicate_mask(&[predicate]),
+        DecodedInstruction::SveCountPredicateBytes {
+            predicate, source, ..
+        } => predicate_mask(&[predicate, source]),
+        _ => 0,
+    }
+}
+
+const fn aggregate_predicate_write(instruction: DecodedInstruction) -> Option<u8> {
+    match instruction {
+        DecodedInstruction::SvePtrueBytesVl16 { destination }
+        | DecodedInstruction::Sve2MatchBytes { destination, .. } => Some(destination),
         _ => None,
     }
 }
