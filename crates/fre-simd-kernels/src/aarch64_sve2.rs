@@ -1,6 +1,6 @@
 use super::{
-    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables, aarch64,
-    scalar,
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables,
+    AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, AsciiWordSpaceTables, aarch64, scalar,
 };
 
 // This is a leaf AAPCS64 function. Its two pointer arguments arrive in x0/x1
@@ -102,6 +102,109 @@ fre_ascii_mask32_sve2_asm:
     ret
     .cfi_endproc
     .size fre_ascii_mask32_sve2_asm, .-fre_ascii_mask32_sve2_asm
+    .popsection
+"#
+    );
+
+    global_asm!(
+        r#"
+    // Fused three-class token-phrase classifiers. Both leaves activate
+    // exactly sixteen byte lanes. The word class uses one nibble table; the
+    // six ASCII whitespace bytes use SVE2 MATCH. All remaining lanes,
+    // including non-ASCII bytes, are implicitly `other`.
+    .pushsection .text.fre_ascii_word_space_mask16_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_word_space_mask16_sve2_asm
+    .global fre_ascii_word_space_mask16_sve2_asm
+    .type fre_ascii_word_space_mask16_sve2_asm, %function
+fre_ascii_word_space_mask16_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    ld1b z0.b, p0/z, [x0]
+    ld1rqb z1.b, p0/z, [x1]
+    ld1b z2.b, p0/z, [x2]
+
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    match p2.b, p0/z, z2.b, z1.b
+
+    str p1, [sp]
+    ldrh w8, [sp]
+    str p2, [sp]
+    ldrh w9, [sp]
+    orr w0, w8, w9, lsl #16
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_ascii_word_space_mask16_sve2_asm, .-fre_ascii_word_space_mask16_sve2_asm
+    .popsection
+
+    .pushsection .text.fre_ascii_word_space_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_word_space_mask32_sve2_asm
+    .global fre_ascii_word_space_mask32_sve2_asm
+    .type fre_ascii_word_space_mask32_sve2_asm, %function
+fre_ascii_word_space_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p0.b, vl16
+    ld1b z0.b, p0/z, [x0]
+    ld1rqb z1.b, p0/z, [x1]
+
+    ld1b z2.b, p0/z, [x2]
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    match p2.b, p0/z, z2.b, z1.b
+    str p1, [sp]
+    ldrh w10, [sp]
+    str p2, [sp]
+    ldrh w11, [sp]
+
+    add x8, x2, #16
+    ld1b z2.b, p0/z, [x8]
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    match p2.b, p0/z, z2.b, z1.b
+    str p1, [sp]
+    ldrh w12, [sp]
+    str p2, [sp]
+    ldrh w13, [sp]
+
+    orr w10, w10, w12, lsl #16
+    orr w11, w11, w13, lsl #16
+    orr x0, x10, x11, lsl #32
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_ascii_word_space_mask32_sve2_asm, .-fre_ascii_word_space_mask32_sve2_asm
     .popsection
 "#
     );
@@ -369,6 +472,16 @@ fre_ascii_run_backward_sve2_asm:
 )]
 unsafe extern "C" {
     fn fre_ascii_mask32_sve2_asm(columns: *const u8, bytes: *const u8) -> u64;
+    fn fre_ascii_word_space_mask16_sve2_asm(
+        word_columns: *const u8,
+        space_values: *const u8,
+        bytes: *const u8,
+    ) -> u32;
+    fn fre_ascii_word_space_mask32_sve2_asm(
+        word_columns: *const u8,
+        space_values: *const u8,
+        bytes: *const u8,
+    ) -> u64;
     fn fre_ascii_run_forward_sve_asm(
         columns: *const u8,
         bytes: *const u8,
@@ -389,6 +502,54 @@ unsafe extern "C" {
         bytes: *const u8,
         len: usize,
     ) -> AsciiRunResult;
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16 assembly after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn classify_word_space_16_sve2(
+    tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiWordSpaceMasks16 {
+    // SAFETY: both tables and the source are exact initialized 16-byte
+    // objects. The private retained entry proves Linux/AArch64 SVE plus SVE2.
+    let packed = unsafe {
+        fre_ascii_word_space_mask16_sve2_asm(
+            tables.word_columns.as_ptr(),
+            tables.space_values.as_ptr(),
+            bytes.as_ptr(),
+        )
+    };
+    let words =
+        u16::try_from(packed & u32::from(u16::MAX)).expect("the low half of a u32 fits in u16");
+    let spaces = u16::try_from(packed >> 16).expect("the high half of a u32 fits in u16");
+    AsciiWordSpaceMasks16::new(words, spaces)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed fixed-16x2 assembly after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn classify_word_space_32_sve2(
+    tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiWordSpaceMasks32 {
+    // SAFETY: the two fixed tables contain exactly 16 initialized bytes and
+    // the source array proves both exact active-16 load extents.
+    let packed = unsafe {
+        fre_ascii_word_space_mask32_sve2_asm(
+            tables.word_columns.as_ptr(),
+            tables.space_values.as_ptr(),
+            bytes.as_ptr(),
+        )
+    };
+    let words =
+        u32::try_from(packed & u64::from(u32::MAX)).expect("the low half of a u64 fits in u32");
+    let spaces = u32::try_from(packed >> 32).expect("the high half of a u64 fits in u32");
+    AsciiWordSpaceMasks32::new(words, spaces)
 }
 
 #[allow(

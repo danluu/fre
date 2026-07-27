@@ -1,6 +1,9 @@
-use super::{ASCII_NARROW_BYTES, AsciiByteSet, AsciiMasks16, AsciiRunResult, HIGH_NIBBLE_BITS};
 #[cfg(test)]
-use super::{ASCII_WIDE_BYTES, AsciiMasks32};
+use super::AsciiMasks32;
+use super::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiMasks16, AsciiRunResult,
+    AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, HIGH_NIBBLE_BITS,
+};
 
 pub(super) fn classify_16(
     columns: &[u8; ASCII_NARROW_BYTES],
@@ -22,6 +25,38 @@ pub(super) fn classify_16(
         }
     }
     AsciiMasks16::new(ascii, members)
+}
+
+pub(super) fn classify_word_space_16(bytes: &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16 {
+    let mut words = 0_u16;
+    let mut spaces = 0_u16;
+    for (lane, &byte) in bytes.iter().enumerate() {
+        let lane_bit = 1_u16
+            .checked_shl(u32::try_from(lane).expect("a 16-byte lane index fits in u32"))
+            .expect("a 16-byte lane index is below the u16 width");
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            words |= lane_bit;
+        } else if matches!(byte, b'\t'..=b'\r' | b' ') {
+            spaces |= lane_bit;
+        }
+    }
+    AsciiWordSpaceMasks16::new(words, spaces)
+}
+
+pub(super) fn classify_word_space_32(bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32 {
+    let mut words = 0_u32;
+    let mut spaces = 0_u32;
+    for (lane, &byte) in bytes.iter().enumerate() {
+        let lane_bit = 1_u32
+            .checked_shl(u32::try_from(lane).expect("a 32-byte lane index fits in u32"))
+            .expect("a 32-byte lane index is below the u32 width");
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            words |= lane_bit;
+        } else if matches!(byte, b'\t'..=b'\r' | b' ') {
+            spaces |= lane_bit;
+        }
+    }
+    AsciiWordSpaceMasks32::new(words, spaces)
 }
 
 pub(super) fn scan_run_forward(set: AsciiByteSet, bytes: &[u8]) -> AsciiRunResult {

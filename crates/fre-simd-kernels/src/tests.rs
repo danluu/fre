@@ -55,6 +55,14 @@ fn reference_32(set: AsciiByteSet, bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiMasks
     AsciiMasks32::new(ascii, members)
 }
 
+fn reference_word_space_16(bytes: &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16 {
+    scalar::classify_word_space_16(bytes)
+}
+
+fn reference_word_space_32(bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32 {
+    scalar::classify_word_space_32(bytes)
+}
+
 fn reference_run_forward(set: AsciiByteSet, bytes: &[u8]) -> usize {
     bytes
         .iter()
@@ -128,6 +136,97 @@ fn next_random(state: &mut u64) -> u64 {
     value ^= value << 17;
     *state = value;
     value
+}
+
+#[test]
+fn word_space_classifier_partitions_every_byte_exactly() {
+    for byte in u8::MIN..=u8::MAX {
+        assert_eq!(
+            ASCII_WORD_SET.contains(byte),
+            byte.is_ascii_alphanumeric() || byte == b'_'
+        );
+        assert_eq!(
+            ASCII_SPACE_VALUES.contains(&byte),
+            matches!(byte, b'\t'..=b'\r' | b' ')
+        );
+    }
+    let classifier =
+        AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Portable).expect("scalar classifier");
+    assert_eq!(
+        classifier.selection().variant_id,
+        "ascii-word-space.mask16x32.scalar.v1"
+    );
+    for phase in 0_u16..=255 {
+        let wide = core::array::from_fn(|lane| {
+            u8::try_from((usize::from(phase) + lane * 37) & 0xff).expect("masked byte")
+        });
+        let narrow = wide[..ASCII_NARROW_BYTES]
+            .try_into()
+            .expect("exact narrow prefix");
+        let narrow_masks = classifier.classify_16(narrow);
+        let wide_masks = classifier.classify_32(&wide);
+        assert_eq!(narrow_masks, reference_word_space_16(narrow));
+        assert_eq!(wide_masks, reference_word_space_32(&wide));
+        assert_eq!(
+            narrow_masks.word_mask() | narrow_masks.space_mask() | narrow_masks.other_mask(),
+            u16::MAX
+        );
+        assert_eq!(
+            wide_masks.word_mask() | wide_masks.space_mask() | wide_masks.other_mask(),
+            u32::MAX
+        );
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+fn word_space_sve2_fixed16_matches_scalar_when_usable() {
+    let required = FeatureSet::EMPTY
+        .with(Feature::ArmSve)
+        .with(Feature::ArmSve2);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let classifier =
+        AsciiWordSpaceClassifier::require_sve2_fixed16().expect("OS-usable SVE2 classifier");
+    assert_eq!(
+        classifier.selection().variant_id,
+        "ascii-word-space.mask16x32.sve2-vl16.v1"
+    );
+    assert!(classifier.selection().required.contains_all(required));
+
+    let mut state = 0x04d5_22aa_e671_c93b;
+    for _ in 0..1_024 {
+        let wide = core::array::from_fn(|_| next_random(&mut state).to_le_bytes()[0]);
+        let narrow = wide[..ASCII_NARROW_BYTES]
+            .try_into()
+            .expect("exact narrow prefix");
+        assert_eq!(
+            classifier.classify_16(narrow),
+            reference_word_space_16(narrow)
+        );
+        assert_eq!(
+            classifier.classify_32(&wide),
+            reference_word_space_32(&wide)
+        );
+    }
+    for alignment in 0..ASCII_NARROW_BYTES {
+        let mut storage = [0_u8; ASCII_WIDE_BYTES + ASCII_NARROW_BYTES];
+        for (index, byte) in storage.iter_mut().enumerate() {
+            *byte = u8::try_from((index * 53 + alignment * 29) & 0xff).expect("masked byte");
+        }
+        let wide: &[u8; ASCII_WIDE_BYTES] = storage[alignment..alignment + ASCII_WIDE_BYTES]
+            .try_into()
+            .expect("exact unaligned wide block");
+        let narrow: &[u8; ASCII_NARROW_BYTES] = wide[..ASCII_NARROW_BYTES]
+            .try_into()
+            .expect("exact unaligned narrow block");
+        assert_eq!(
+            classifier.classify_16(narrow),
+            reference_word_space_16(narrow)
+        );
+        assert_eq!(classifier.classify_32(wide), reference_word_space_32(wide));
+    }
 }
 
 #[test]

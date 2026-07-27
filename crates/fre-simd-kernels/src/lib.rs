@@ -39,6 +39,13 @@ pub const ASCII_NARROW_BYTES: usize = 16;
 /// Number of bytes consumed by the wide classifier operation.
 pub const ASCII_WIDE_BYTES: usize = 32;
 
+const ASCII_WORD_SET: AsciiByteSet =
+    AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
+const ASCII_SPACE_VALUES: [u8; ASCII_NARROW_BYTES] = [
+    b'\t', b'\n', 0x0b, 0x0c, b'\r', b' ', b'\t', b'\t', b'\t', b'\t', b'\t', b'\t', b'\t', b'\t',
+    b'\t', b'\t',
+];
+
 /// Maximum physical classification work beyond the logically necessary run.
 ///
 /// On failure, the logical minimum is `member_run_len + 1`; on an all-member
@@ -115,6 +122,14 @@ impl SimdDispatchContext {
         policy: DispatchPolicy,
     ) -> Result<AsciiByteSetRunScanner, UnsupportedRequiredFeatures> {
         AsciiByteSetRunScanner::with_capabilities(set, self.capabilities, policy)
+    }
+
+    /// Build the token-phrase three-class classifier from this snapshot.
+    pub fn ascii_word_space_classifier(
+        self,
+        policy: DispatchPolicy,
+    ) -> Result<AsciiWordSpaceClassifier, UnsupportedRequiredFeatures> {
+        AsciiWordSpaceClassifier::with_capabilities(self.capabilities, policy)
     }
 }
 
@@ -303,6 +318,75 @@ impl AsciiMasks16 {
 pub struct AsciiMasks32 {
     ascii: u32,
     members: u32,
+}
+
+/// Three-way word, whitespace, and other masks for exactly 16 bytes.
+///
+/// Word and whitespace masks are disjoint. Every lane absent from both masks
+/// belongs to the `other` class, including every non-ASCII byte.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AsciiWordSpaceMasks16 {
+    words: u16,
+    spaces: u16,
+}
+
+impl AsciiWordSpaceMasks16 {
+    fn new(words: u16, spaces: u16) -> Self {
+        debug_assert_eq!(words & spaces, 0);
+        Self { words, spaces }
+    }
+
+    /// Mask of ASCII word lanes (`[0-9A-Z_a-z]`).
+    #[must_use]
+    pub const fn word_mask(self) -> u16 {
+        self.words
+    }
+
+    /// Mask of ASCII whitespace lanes (`[\t-\r ]`).
+    #[must_use]
+    pub const fn space_mask(self) -> u16 {
+        self.spaces
+    }
+
+    /// Mask of lanes in neither ASCII class.
+    #[must_use]
+    pub const fn other_mask(self) -> u16 {
+        !(self.words | self.spaces)
+    }
+}
+
+/// Three-way word, whitespace, and other masks for exactly 32 bytes.
+///
+/// This is the wide companion to [`AsciiWordSpaceMasks16`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AsciiWordSpaceMasks32 {
+    words: u32,
+    spaces: u32,
+}
+
+impl AsciiWordSpaceMasks32 {
+    fn new(words: u32, spaces: u32) -> Self {
+        debug_assert_eq!(words & spaces, 0);
+        Self { words, spaces }
+    }
+
+    /// Mask of ASCII word lanes (`[0-9A-Z_a-z]`).
+    #[must_use]
+    pub const fn word_mask(self) -> u32 {
+        self.words
+    }
+
+    /// Mask of ASCII whitespace lanes (`[\t-\r ]`).
+    #[must_use]
+    pub const fn space_mask(self) -> u32 {
+        self.spaces
+    }
+
+    /// Mask of lanes in neither ASCII class.
+    #[must_use]
+    pub const fn other_mask(self) -> u32 {
+        !(self.words | self.spaces)
+    }
 }
 
 impl AsciiMasks32 {
@@ -718,6 +802,128 @@ impl AsciiByteSetClassifier {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little")),
+    allow(
+        dead_code,
+        reason = "fixed tables keep classifier layout target-independent while only the reviewed Linux/AArch64 leaf reads them directly"
+    )
+)]
+struct AsciiWordSpaceTables {
+    word_columns: [u8; ASCII_NARROW_BYTES],
+    space_values: [u8; ASCII_NARROW_BYTES],
+}
+
+impl AsciiWordSpaceTables {
+    fn new() -> Self {
+        Self {
+            word_columns: ASCII_WORD_SET.nibble_columns(),
+            space_values: ASCII_SPACE_VALUES,
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the private function-pointer type represents a retained target-feature proof"
+)]
+type ClassifyWordSpace16Entry =
+    unsafe fn(&AsciiWordSpaceTables, &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16;
+
+#[allow(
+    unsafe_code,
+    reason = "the private function-pointer type represents a retained target-feature proof"
+)]
+type ClassifyWordSpace32Entry =
+    unsafe fn(&AsciiWordSpaceTables, &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32;
+
+#[derive(Clone, Copy, Debug)]
+struct AsciiWordSpaceEntries {
+    narrow: ClassifyWordSpace16Entry,
+    wide: ClassifyWordSpace32Entry,
+}
+
+/// Retained fixed-block classifier for token-phrase byte classes.
+///
+/// Construction chooses one paired 16/32-byte implementation from immutable
+/// host facts. The production token-phrase scanner does not construct this
+/// handle automatically; callers must opt into the block path explicitly.
+#[derive(Clone, Copy)]
+pub struct AsciiWordSpaceClassifier {
+    tables: AsciiWordSpaceTables,
+    entries: AsciiWordSpaceEntries,
+    selection: SelectionReceipt,
+}
+
+impl fmt::Debug for AsciiWordSpaceClassifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsciiWordSpaceClassifier")
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsciiWordSpaceClassifier {
+    /// Build under a policy that can only remove or require authentic features.
+    pub fn with_policy(policy: DispatchPolicy) -> Result<Self, UnsupportedRequiredFeatures> {
+        SimdDispatchContext::capture().ascii_word_space_classifier(policy)
+    }
+
+    /// Build from an already captured, non-forgeable host snapshot.
+    pub fn with_capabilities(
+        capabilities: CpuCapabilities,
+        policy: DispatchPolicy,
+    ) -> Result<Self, UnsupportedRequiredFeatures> {
+        let selected = select_word_space(capabilities, policy)?;
+        Ok(Self {
+            tables: AsciiWordSpaceTables::new(),
+            entries: selected.entry(),
+            selection: selected.receipt(),
+        })
+    }
+
+    /// Require the reviewed Linux/AArch64 SVE2 fixed-16 implementation.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    pub fn require_sve2_fixed16() -> Result<Self, UnsupportedRequiredFeatures> {
+        let required = FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2);
+        Self::with_policy(DispatchPolicy::Require(required))
+    }
+
+    /// Stable receipt for the paired fixed-block implementation.
+    #[must_use]
+    pub const fn selection(&self) -> SelectionReceipt {
+        self.selection
+    }
+
+    /// Classify exactly 16 bytes into word, ASCII whitespace, and other.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "construction retained the private entry only after proving its feature requirements against authentic host facts"
+    )]
+    pub fn classify_16(&self, bytes: &[u8; ASCII_NARROW_BYTES]) -> AsciiWordSpaceMasks16 {
+        // SAFETY: callers cannot replace the entry or fixed tables, and the
+        // exact array proves every source load extent.
+        unsafe { (self.entries.narrow)(&self.tables, bytes) }
+    }
+
+    /// Classify exactly 32 bytes as two fixed active-16 groups.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "construction retained the private entry only after proving its feature requirements against authentic host facts"
+    )]
+    pub fn classify_32(&self, bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiWordSpaceMasks32 {
+        // SAFETY: the retained entry and exact source extent establish the
+        // same invariants as `classify_16`.
+        unsafe { (self.entries.wide)(&self.tables, bytes) }
+    }
+}
+
 #[allow(
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
@@ -894,6 +1100,63 @@ unsafe fn classify_16_scalar_entry(
 ) -> AsciiMasks16 {
     scalar::classify_16(columns, bytes)
 }
+
+#[allow(
+    unsafe_code,
+    reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
+)]
+unsafe fn classify_word_space_16_scalar_entry(
+    _tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_NARROW_BYTES],
+) -> AsciiWordSpaceMasks16 {
+    scalar::classify_word_space_16(bytes)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
+)]
+unsafe fn classify_word_space_32_scalar_entry(
+    _tables: &AsciiWordSpaceTables,
+    bytes: &[u8; ASCII_WIDE_BYTES],
+) -> AsciiWordSpaceMasks32 {
+    scalar::classify_word_space_32(bytes)
+}
+
+const SCALAR_WORD_SPACE: KernelVariant<AsciiWordSpaceEntries> = KernelVariant::new(
+    "ascii-word-space.mask16x32.scalar.v1",
+    ArchitectureRequirement::Any,
+    FeatureSet::EMPTY,
+    VectorKind::Scalar,
+    ASCII_NARROW_BYTES,
+    0,
+    AsciiWordSpaceEntries {
+        narrow: classify_word_space_16_scalar_entry,
+        wide: classify_word_space_32_scalar_entry,
+    },
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 2] = [
+    SCALAR_WORD_SPACE,
+    KernelVariant::new(
+        "ascii-word-space.mask16x32.sve2-vl16.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiWordSpaceEntries {
+            narrow: aarch64_sve2::classify_word_space_16_sve2,
+            wide: aarch64_sve2::classify_word_space_32_sve2,
+        },
+    ),
+];
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little")))]
+const WORD_SPACE_VARIANTS: [KernelVariant<AsciiWordSpaceEntries>; 1] = [SCALAR_WORD_SPACE];
 
 const SCALAR_16: KernelVariant<Classify16Entry> = KernelVariant::new(
     "ascii-byte-set.mask16.scalar.v1",
@@ -1083,6 +1346,19 @@ fn select_wide(
         select_kernel(capabilities, policy, ASCII_WIDE_BYTES, &WIDE_VARIANTS)?
             .expect("the private table always contains its split-narrow fallback"),
     )
+}
+
+fn select_word_space(
+    capabilities: CpuCapabilities,
+    policy: DispatchPolicy,
+) -> Result<SelectedKernel<AsciiWordSpaceEntries>, UnsupportedRequiredFeatures> {
+    Ok(select_kernel(
+        capabilities,
+        policy,
+        ASCII_NARROW_BYTES,
+        &WORD_SPACE_VARIANTS,
+    )?
+    .expect("the private table always contains its scalar fallback"))
 }
 
 fn select_run(
