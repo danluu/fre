@@ -1930,7 +1930,21 @@ impl<'h> Census<'h> {
                             "Unicode construction traversal",
                         )?
                     } else {
-                        0
+                        // The route-scoped analyzer repeats the five-operation
+                        // scalar metric pass and one width/range visit after
+                        // the census. Determinism additionally visits each
+                        // UTF-8 sequence. The compact per-node envelope below
+                        // cannot infer this input-sized work from retained
+                        // bytes, so publish it explicitly.
+                        add_usize(
+                            mul_usize(
+                                class.ranges().len(),
+                                6,
+                                "route-scoped Unicode construction traversal",
+                            )?,
+                            sequence_count,
+                            "route-scoped Unicode construction traversal",
+                        )?
                     },
                     own_allocation_upper: 0,
                 })

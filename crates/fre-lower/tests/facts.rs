@@ -2029,6 +2029,34 @@ fn unicode_optional_envelopes_skip_scalar_materialization_and_keep_exact_limits(
 }
 
 #[test]
+fn unicode_composite_route_envelopes_bound_actual_fact_work() {
+    for pattern in [r"\w{5}\s\w{6}\s\w{7}", r"\pL+herloc\pL+|\pL+olme\pL+"] {
+        let hir = parsed(pattern, true).hir;
+        for output in [FactOutput::Count, FactOutput::SpanSum] {
+            let base = FactOperation::capture_erased(output);
+            for optional_proofs in [
+                FactOptionalProofs::CoreOnly,
+                FactOptionalProofs::AssertionContext,
+            ] {
+                let operation = base.with_optional_proofs(optional_proofs);
+                let report = analyze_hir_facts(&hir, operation, FactLimits::default())
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{pattern:?} {output:?}/{optional_proofs:?} fact analysis failed: {error}"
+                        )
+                    });
+                assert_exact_and_one_below_hard_limits(
+                    &hir,
+                    operation,
+                    FactLimits::default(),
+                    &report,
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn shifted_assertion_copy_work_passes_exact_and_refuses_one_below() {
     let hir = Hir::repetition(Repetition {
         min: 1,
