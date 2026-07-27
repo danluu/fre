@@ -2536,6 +2536,7 @@ fn authenticate_aggregate_envelope(
         BackendVersion::AGGREGATE_V1
             | BackendVersion::AGGREGATE_HISTORICAL_V2
             | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
     ) || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
@@ -2548,6 +2549,11 @@ fn authenticate_aggregate_envelope(
             (
                 BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1,
                 AggregateOutput::Count,
+                1,
+            )
+            | (
+                BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1,
+                AggregateOutput::SpanSum,
                 1,
             ) => (39_usize, 6_usize, 9_usize, 5_u32),
             (
@@ -2755,7 +2761,11 @@ fn validate_aggregate_template(
         UnsignedMinBytes16,
     };
 
-    if image.backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1 {
+    if matches!(
+        image.backend_version,
+        BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
+    ) {
         return validate_aggregate_sve2_fixed16_count_experimental_template(
             image,
             instructions,
@@ -3564,7 +3574,12 @@ fn validate_aggregate_sve2_fixed16_count_experimental_template(
         (148, LabelKind::ReturnNone),
     ];
 
-    if literal_len != 1 || output != AggregateOutput::Count {
+    let expected_output = match image.backend_version {
+        BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1 => AggregateOutput::Count,
+        BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1 => AggregateOutput::SpanSum,
+        _ => return Err(AuditError::InvalidAggregateTemplate { offset: 0 }),
+    };
+    if literal_len != 1 || output != expected_output {
         return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
     }
     if image.labels.len() != LABELS.len()

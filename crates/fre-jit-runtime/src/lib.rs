@@ -370,6 +370,7 @@ fn preflight_aggregate_backend_version(image: &NativeAggregateImage) -> Result<(
         BackendVersion::AGGREGATE_V1
             | BackendVersion::AGGREGATE_HISTORICAL_V2
             | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
     ) {
         return Err(PublishError::BackendVersionMismatch {
             expected: BackendVersion::AGGREGATE_CURRENT.0,

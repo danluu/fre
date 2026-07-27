@@ -1,15 +1,18 @@
 use std::sync::{Mutex, MutexGuard};
 
+use fre_jit_aarch64::{
+    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, decode, emit,
+    emit_exact_aggregate,
+};
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-use fre_jit_aarch64::emit_exact_aggregate_sve2_fixed16_count_experimental;
 use fre_jit_aarch64::{
-    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, decode, emit,
-    emit_exact_aggregate,
+    emit_exact_aggregate_sve2_fixed16_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_span_sum_experimental,
 };
 use fre_kernel_ir::{
     AggregateExecutionLimits, AggregateOutput, AnchorFlags, ByteClass, Count, ExecutionLimits,
@@ -550,19 +553,62 @@ fn experimental_sve2_fixed16_count_hardware_matches_oracle() {
 #[test]
 #[cfg(all(
     target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+fn experimental_sve2_fixed16_span_sum_hardware_matches_oracle() {
+    if !platform::has_sve2() {
+        return;
+    }
+    let _lock = native_test_lock();
+    let program = build_exact_aggregate::<SpanSum>(b"x", ValidateLimits::default())
+        .expect("span-sum program");
+    let image =
+        emit_exact_aggregate_sve2_fixed16_span_sum_experimental(&program, EmitLimits::default())
+            .expect("SVE2 image");
+    let kernel = publish_aggregate::<SpanSum>(&image, PublicationLimits::default())
+        .expect("OS-usable SVE2 publication");
+
+    for alignment in 0..16 {
+        for length in [0, 1, 2, 15, 16, 17, 31, 32, 33, 255, 256, 257] {
+            let mut storage = vec![b'y'; alignment + length + 16];
+            let haystack = &mut storage[alignment..alignment + length];
+            for (index, byte) in haystack.iter_mut().enumerate() {
+                if index % 5 == alignment % 5 {
+                    *byte = b'x';
+                }
+            }
+            assert_aggregate_matches(&program, &kernel, haystack);
+        }
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
     target_os = "macos",
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-fn experimental_sve2_fixed16_count_requires_os_usable_sve() {
+fn experimental_sve2_fixed16_aggregates_require_os_usable_sve() {
     let _lock = native_test_lock();
-    let program =
+    let count =
         build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("count program");
-    let image =
-        emit_exact_aggregate_sve2_fixed16_count_experimental(&program, EmitLimits::default())
-            .expect("SVE2 image");
+    let spans = build_exact_aggregate::<SpanSum>(b"x", ValidateLimits::default())
+        .expect("span-sum program");
+    let count_image =
+        emit_exact_aggregate_sve2_fixed16_count_experimental(&count, EmitLimits::default())
+            .expect("SVE2 count image");
+    let span_image =
+        emit_exact_aggregate_sve2_fixed16_span_sum_experimental(&spans, EmitLimits::default())
+            .expect("SVE2 span-sum image");
     assert!(matches!(
-        publish_aggregate::<Count>(&image, PublicationLimits::default()),
+        publish_aggregate::<Count>(&count_image, PublicationLimits::default()),
+        Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+    ));
+    assert!(matches!(
+        publish_aggregate::<SpanSum>(&span_image, PublicationLimits::default()),
         Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
     ));
 }

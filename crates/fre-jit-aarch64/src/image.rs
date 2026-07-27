@@ -46,6 +46,12 @@ impl BackendVersion {
     /// This is deliberately not [`Self::AGGREGATE_CURRENT`]. Callers must opt
     /// into its emitter and the runtime must independently admit SVE2.
     pub const AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1: Self = Self(3);
+    /// Experimental fixed-16-lane SVE2 backend for one-byte `SpanSum` programs.
+    ///
+    /// A one-byte match contributes one to both Count and `SpanSum`, so this
+    /// backend shares the qualified predicate-counting loop while retaining a
+    /// distinct backend and aggregate-output identity.
+    pub const AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1: Self = Self(4);
     /// Current aggregate tag; its AOT wire remains aggregate v1.
     pub const AGGREGATE_CURRENT: Self = Self::AGGREGATE_V1;
     /// Compatibility alias for callers that only handle search images.

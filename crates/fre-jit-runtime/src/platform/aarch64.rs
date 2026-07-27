@@ -230,6 +230,7 @@ impl Mapping for ExecutableMapping {
                 BackendVersion::AGGREGATE_V1
                     | BackendVersion::AGGREGATE_HISTORICAL_V2
                     | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+                    | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
             )
             && self.aggregate
                 == Some(AggregateMappingContract {

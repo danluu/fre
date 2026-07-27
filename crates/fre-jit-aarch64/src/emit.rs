@@ -1,7 +1,7 @@
 use fre_kernel_ir::{
     AbiVersion, AggregateOperation, AggregateOutput, AnchorFlags, BlockOp, ByteClass, Count,
     DataBlob, ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, Operation, OutputKind,
-    SemanticsVersion, ValidatedProgram,
+    SemanticsVersion, SpanSum, ValidatedProgram,
 };
 use memchr::arch::all::packedpair::Pair;
 
@@ -375,10 +375,26 @@ pub fn emit_exact_aggregate_sve2_fixed16_count_experimental(
     )
 }
 
+/// Emit the experimental fixed-16-lane SVE2 backend for one-byte `SpanSum`.
+///
+/// Every admitted match has width one, so predicate population is exactly the
+/// matched-byte sum. The backend remains explicit and separately versioned.
+pub fn emit_exact_aggregate_sve2_fixed16_span_sum_experimental(
+    program: &ExactAggregateProgram<SpanSum>,
+    limits: EmitLimits,
+) -> Result<NativeAggregateImage, EmitError> {
+    emit_exact_aggregate_backend(
+        program,
+        limits,
+        AggregateBackend::Sve2Fixed16SpanSumExperimental,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AggregateBackend {
     Current,
     Sve2Fixed16CountExperimental,
+    Sve2Fixed16SpanSumExperimental,
 }
 
 impl AggregateBackend {
@@ -388,6 +404,9 @@ impl AggregateBackend {
             Self::Sve2Fixed16CountExperimental => {
                 BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
             }
+            Self::Sve2Fixed16SpanSumExperimental => {
+                BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
+            }
         }
     }
 
@@ -395,7 +414,9 @@ impl AggregateBackend {
         match self {
             Self::Current if vector_instructions == 0 => CpuFeatures::NONE,
             Self::Current => CpuFeatures::ASIMD,
-            Self::Sve2Fixed16CountExperimental => CpuFeatures::SVE.union(CpuFeatures::SVE2),
+            Self::Sve2Fixed16CountExperimental | Self::Sve2Fixed16SpanSumExperimental => {
+                CpuFeatures::SVE.union(CpuFeatures::SVE2)
+            }
         }
     }
 }
@@ -413,12 +434,17 @@ fn emit_exact_aggregate_backend<A: AggregateOperation>(
             required: literal.len(),
         });
     }
-    if backend == AggregateBackend::Sve2Fixed16CountExperimental
-        && (literal.len() != 1 || A::OUTPUT != AggregateOutput::Count)
-    {
-        return Err(EmitError::Unsupported {
-            reason: UnsupportedReason::KernelShape,
-        });
+    match backend {
+        AggregateBackend::Current => {}
+        AggregateBackend::Sve2Fixed16CountExperimental
+            if literal.len() == 1 && A::OUTPUT == AggregateOutput::Count => {}
+        AggregateBackend::Sve2Fixed16SpanSumExperimental
+            if literal.len() == 1 && A::OUTPUT == AggregateOutput::SpanSum => {}
+        _ => {
+            return Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            });
+        }
     }
     let capacities = Capacities {
         code: AGGREGATE_CODE_RESERVE,
@@ -548,7 +574,8 @@ fn emit_aggregate_exact(
     if literal.len() == 1 {
         match backend {
             AggregateBackend::Current => emit_aggregate_single_byte(assembler, done, overflow),
-            AggregateBackend::Sve2Fixed16CountExperimental => {
+            AggregateBackend::Sve2Fixed16CountExperimental
+            | AggregateBackend::Sve2Fixed16SpanSumExperimental => {
                 emit_aggregate_single_byte_sve2_fixed16_count(assembler, done, overflow)
             }
         }

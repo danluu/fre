@@ -19,7 +19,8 @@ use crate::{
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
     SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
     emit::emit_search_version_for_test, emit_exact_aggregate,
-    emit_exact_aggregate_sve2_fixed16_count_experimental, emit_sve2_16, emit_sve16,
+    emit_exact_aggregate_sve2_fixed16_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve16,
     emit_with_backend, image::SearchShape,
 };
 
@@ -308,6 +309,57 @@ fn experimental_sve2_fixed16_count_is_explicit_audited_and_matches_oracle() {
             "SVE operand mutation at instruction {index} must fail"
         );
     }
+}
+
+#[test]
+fn experimental_sve2_fixed16_span_sum_reuses_the_qualified_width_one_loop() {
+    let count =
+        build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("count program");
+    let spans = build_exact_aggregate::<SpanSum>(b"x", ValidateLimits::default())
+        .expect("span-sum program");
+    let count_image =
+        emit_exact_aggregate_sve2_fixed16_count_experimental(&count, EmitLimits::default())
+            .expect("count image");
+    let span_image =
+        emit_exact_aggregate_sve2_fixed16_span_sum_experimental(&spans, EmitLimits::default())
+            .expect("span-sum image");
+
+    assert_eq!(
+        span_image.backend_version(),
+        BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
+    );
+    assert_eq!(span_image.output(), AggregateOutput::SpanSum);
+    assert_eq!(span_image.code(), count_image.code());
+    assert_eq!(span_image.rodata(), count_image.rodata());
+    assert_ne!(
+        span_image.artifact_identity(),
+        count_image.artifact_identity()
+    );
+    audit_aggregate(&span_image).expect("span-sum template audit");
+
+    for length in [0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+        for phase in 0..4 {
+            let haystack: Vec<u8> = (0..length)
+                .map(|index| if index % 4 == phase { b'x' } else { b'y' })
+                .collect();
+            let expected = *spans
+                .execute(&haystack, AggregateExecutionLimits::unlimited())
+                .expect("oracle")
+                .output();
+            let actual =
+                simulate_aggregate(&span_image, &haystack).expect("fixed-16 SVE2 simulation");
+            assert_eq!(aggregate_output(actual), Ok(expected));
+        }
+    }
+
+    let width_two = build_exact_aggregate::<SpanSum>(b"xx", ValidateLimits::default())
+        .expect("width-two span sum");
+    assert_eq!(
+        emit_exact_aggregate_sve2_fixed16_span_sum_experimental(&width_two, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape,
+        })
+    );
 }
 
 #[test]
