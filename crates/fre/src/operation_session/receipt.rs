@@ -128,6 +128,8 @@ pub enum OperationSessionTerminal {
     InvalidInvocation,
     /// Checked arithmetic failed.
     ArithmeticOverflow,
+    /// A selected engine or its authenticated observer failed after begin.
+    ExecutionFailed,
     /// A fallible exact-layout allocation failed.
     AllocationFailed,
 }
@@ -955,6 +957,14 @@ pub(crate) enum OperationSessionFailureEvidence {
     InvalidOrder,
     ArithmeticOverflow,
     ReducerMismatch,
+    ExecutionFailed(OperationSessionExecutionFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationSessionExecutionFailure {
+    Engine,
+    Observer,
+    Protocol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -982,6 +992,9 @@ pub(crate) enum OperationSessionAttemptedOperation {
     },
     Finish {
         reducer: OperationSessionReducer,
+    },
+    ExecutionFailure {
+        failure: OperationSessionExecutionFailure,
     },
 }
 
@@ -1390,6 +1403,33 @@ impl OperationSessionAttemptReceipt {
                         &evidence,
                     )
             }
+            (OperationSessionTerminal::ExecutionFailed, Some(prospective), None) => {
+                let failure = match evidence.failure {
+                    OperationSessionFailureEvidence::ExecutionFailed(failure) => failure,
+                    _ => return false,
+                };
+                self.identity == expected_identity
+                    && self.identity.leaf == OperationSessionLeaf::Grep
+                    && self.identity.reducer == OperationSessionReducer::Count
+                    && super::invocation_closes(
+                        self.identity.leaf,
+                        self.identity.reducer,
+                        &self.invocation,
+                    )
+                    && super::route_supported(self.identity.leaf, self.identity.reducer)
+                    && self.reset.terminal == OperationSessionTerminal::Success
+                    && prospective.allocations == 0
+                    && execution_actual_admitted(self.limits, prospective, self.actual)
+                    && evidence.refused_actual.is_none()
+                    && evidence.attempted_operation
+                        == OperationSessionAttemptedOperation::ExecutionFailure { failure }
+                    && grep_execution_failure_evidence_closes(
+                        failure,
+                        &self.invocation,
+                        self.actual,
+                        &evidence,
+                    )
+            }
             _ => false,
         }
     }
@@ -1639,7 +1679,8 @@ fn attempted_operation_actual(
         }
         OperationSessionAttemptedOperation::None
         | OperationSessionAttemptedOperation::ObserveParticipation { .. }
-        | OperationSessionAttemptedOperation::Finish { .. } => return None,
+        | OperationSessionAttemptedOperation::Finish { .. }
+        | OperationSessionAttemptedOperation::ExecutionFailure { .. } => return None,
     }
     Some(next)
 }
@@ -1741,7 +1782,8 @@ fn attempted_operation_proves_arithmetic_overflow(
         }
         OperationSessionAttemptedOperation::None
         | OperationSessionAttemptedOperation::ObserveParticipation { .. }
-        | OperationSessionAttemptedOperation::Finish { .. } => false,
+        | OperationSessionAttemptedOperation::Finish { .. }
+        | OperationSessionAttemptedOperation::ExecutionFailure { .. } => false,
     }
 }
 
@@ -1763,7 +1805,8 @@ fn attempted_operation_proves_reducer_mismatch(
             evidence.pending_participation.is_none() && attempted != reducer
         }
         OperationSessionAttemptedOperation::None
-        | OperationSessionAttemptedOperation::Meter { .. } => false,
+        | OperationSessionAttemptedOperation::Meter { .. }
+        | OperationSessionAttemptedOperation::ExecutionFailure { .. } => false,
     }
 }
 
@@ -1924,6 +1967,51 @@ fn execution_failure_evidence_closes(
                 && actual.selected_span_bytes == 0
         }
     }
+}
+
+fn grep_execution_failure_evidence_closes(
+    failure: OperationSessionExecutionFailure,
+    invocation: &OperationSessionInvocation,
+    actual: OperationSessionExecutionActual,
+    evidence: &OperationSessionAttemptEvidence,
+) -> bool {
+    let line_count_closes = match failure {
+        OperationSessionExecutionFailure::Engine => {
+            evidence.line_events == actual.line_domains
+                && evidence.line_events == actual.output_events
+        }
+        OperationSessionExecutionFailure::Observer => evidence
+            .line_events
+            .checked_add(1)
+            .is_some_and(|events| events == actual.line_domains && events == actual.output_events),
+        OperationSessionExecutionFailure::Protocol => {
+            evidence.line_events <= actual.line_domains
+                && evidence.line_events <= actual.output_events
+        }
+    };
+    line_count_closes
+        && evidence.attempted_identity.is_none()
+        && evidence.pending_participation.is_none()
+        && evidence.first_span.is_none()
+        && evidence.last_span.is_none()
+        && evidence.span_events == 0
+        && evidence.first_participation.is_none()
+        && evidence.last_participation.is_none()
+        && evidence.participation_events == 0
+        && evidence.first_line_ordinal.is_some() == (evidence.line_events != 0)
+        && evidence.last_line_ordinal.is_some() == (evidence.line_events != 0)
+        && evidence
+            .first_line_ordinal
+            .zip(evidence.last_line_ordinal)
+            .is_none_or(|(first, last)| {
+                first <= last
+                    && (evidence.line_events <= 1 || first < last)
+                    && last < invocation.haystack_len
+            })
+        && evidence.order_valid
+        && actual.selected_span_bytes == 0
+        && actual.participation_entries == 0
+        && actual.allocations == 0
 }
 
 fn pending_participation_closes(

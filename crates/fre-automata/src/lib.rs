@@ -19,6 +19,7 @@
 mod contract;
 mod error;
 mod k0;
+pub mod p16_grep_stream;
 mod plan;
 mod priority;
 mod tagged_many;

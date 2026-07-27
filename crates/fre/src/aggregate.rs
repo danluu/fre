@@ -133,6 +133,7 @@ use crate::{
 mod forced_priority;
 mod forced_priority_many;
 mod literal_anchor;
+mod p16_grep_stream;
 
 pub use forced_priority::{
     PRIORITY_AGGREGATE_ACCOUNTING_ID, PRIORITY_AGGREGATE_SCHEMA_VERSION,
@@ -176,6 +177,13 @@ pub use literal_anchor::{
     LiteralAnchorAggregateRoute, LiteralAnchorAggregateRunError, LiteralAnchorAggregateRunLimits,
     LiteralAnchorAggregateSpanSumRegex, LiteralAnchorCandidateBuildReport,
     LiteralAnchorCandidateExecutionReceipt, LiteralAnchorFallbackReason,
+};
+pub use p16_grep_stream::{
+    ACCOUNTING_ID as PORTABLE_GREP_ACCOUNTING_ID,
+    ACCOUNTING_VERSION as PORTABLE_GREP_ACCOUNTING_VERSION,
+    ALGORITHM_VERSION as PORTABLE_GREP_ALGORITHM_VERSION, PortableGrepBuildError,
+    PortableGrepError, PortableGrepExecutionError, PortableGrepLiteralError, PortableGrepMatch,
+    PortableGrepProspective, PortableGrepResult, PortableGrepSession, PortableGrepWordError,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;

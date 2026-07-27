@@ -17,7 +17,8 @@ use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
-    BOUNDED_AFFIX_PLAN_ID, PlanKind, PortableSearchSession, SearchLimits, SearchSessionLimits,
+    BOUNDED_AFFIX_PLAN_ID, PlanKind, PortableGrepBuildError, PortableGrepSession, PortableRegex,
+    PortableSearchSession, SearchLimits, SearchSessionLimits,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
@@ -73,7 +74,7 @@ fn main() -> Result<(), DynError> {
                 let toolchain = bound_env("FRE_TOOLCHAIN", option_env!("FRE_TOOLCHAIN"))?;
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1 report={REPORT_SCHEMA} aggregate-explain=38 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1 report={REPORT_SCHEMA} aggregate-explain=38 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target}",
                     env!("CARGO_PKG_VERSION"),
                 );
                 return Ok(());
@@ -1108,7 +1109,7 @@ fn model_grep_performance_raw_with_measurement<F>(
 ) -> Result<PerformanceRawObservation, DynError>
 where
     F: FnOnce(
-        &mut PortableSearchSession<'_>,
+        &mut CurrentFreGrepSession<'_>,
         &[u8],
         SearchLimits,
     ) -> Result<(Duration, u64), CompareError>,
@@ -1131,12 +1132,7 @@ where
     require_grep_runtime_plan(&selected_runtime, regex.build_report().plan)?;
     identity.candidate_runtime = Some(selected_runtime.clone());
     let limits = current_fre_rebar_search_limits();
-    let mut session = regex
-        .search_session(SearchSessionLimits {
-            max_setup_work: limits.max_work,
-            max_scratch_bytes: limits.max_scratch_bytes,
-        })
-        .map_err(|error| CompareError::new(format!("FRE grep session build: {error}")))?;
+    let mut session = build_grep_session(&regex, limits)?;
     require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
@@ -1154,24 +1150,76 @@ where
     .map_err(Into::into)
 }
 
+enum CurrentFreGrepSession<'r> {
+    Stream(PortableGrepSession<'r>),
+    SearchFallback(PortableSearchSession<'r>),
+}
+
+impl CurrentFreGrepSession<'_> {
+    const fn runtime_implementation_id(&self) -> &'static str {
+        match self {
+            Self::Stream(session) => session.runtime_implementation_id(),
+            Self::SearchFallback(session) => session.runtime_implementation_id(),
+        }
+    }
+}
+
+fn build_grep_session<'r>(
+    regex: &'r PortableRegex,
+    limits: SearchLimits,
+) -> Result<CurrentFreGrepSession<'r>, CompareError> {
+    match regex.grep_stream_session() {
+        Ok(session) => Ok(CurrentFreGrepSession::Stream(session)),
+        Err(PortableGrepBuildError::UnsupportedRuntime { .. }) => regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: limits.max_work,
+                max_scratch_bytes: limits.max_scratch_bytes,
+            })
+            .map(CurrentFreGrepSession::SearchFallback)
+            .map_err(|error| {
+                CompareError::new(format!("FRE grep fallback session build: {error}"))
+            }),
+        Err(error) => Err(CompareError::new(format!(
+            "FRE whole-input grep session build: {error}"
+        ))),
+    }
+}
+
 fn execute_grep_session(
-    session: &mut PortableSearchSession<'_>,
+    session: &mut CurrentFreGrepSession<'_>,
     haystack: &[u8],
     limits: SearchLimits,
 ) -> Result<u64, CompareError> {
-    let mut count = 0_u64;
-    for line in haystack.lines() {
-        if session
-            .is_match(line, limits)
-            .map_err(|error| CompareError::new(format!("FRE grep lifecycle search: {error}")))?
-            .0
-        {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| CompareError::new("FRE grep lifecycle count overflow"))?;
+    match session {
+        CurrentFreGrepSession::Stream(session) => {
+            let result = session.count(haystack).map_err(|error| {
+                CompareError::new(format!("FRE whole-input grep lifecycle: {error}"))
+            })?;
+            if !result.receipt.closes() {
+                return Err(CompareError::new(
+                    "FRE whole-input grep lifecycle returned an open receipt",
+                ));
+            }
+            Ok(result.count())
+        }
+        CurrentFreGrepSession::SearchFallback(session) => {
+            let mut count = 0_u64;
+            for line in haystack.lines() {
+                if session
+                    .is_match(line, limits)
+                    .map_err(|error| {
+                        CompareError::new(format!("FRE grep fallback lifecycle search: {error}"))
+                    })?
+                    .0
+                {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        CompareError::new("FRE grep fallback lifecycle count overflow")
+                    })?;
+                }
+            }
+            Ok(count)
         }
     }
-    Ok(count)
 }
 
 fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
@@ -1342,28 +1390,18 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     require_grep_runtime_plan(regex.runtime_implementation_id(), regex.build_report().plan)?;
     let haystack = benchmark.haystack.as_slice();
     let limits = current_fre_rebar_search_limits();
-    let mut session = regex.search_session(SearchSessionLimits {
-        max_setup_work: limits.max_work,
-        max_scratch_bytes: limits.max_scratch_bytes,
-    })?;
+    let mut session = build_grep_session(&regex, limits)?;
     run(
         benchmark,
-        || {
-            let mut count = 0_u64;
-            for line in haystack.lines() {
-                if session.is_match(line, limits)?.0 {
-                    count = count.checked_add(1).ok_or("grep count overflow")?;
-                }
-            }
-            Ok(count)
-        },
+        || execute_grep_session(&mut session, haystack, limits).map_err(Into::into),
         Ok,
     )
 }
 
 fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), CompareError> {
     match (runtime, plan) {
-        ("k0", PlanKind::K0)
+        ("exact-literal", PlanKind::ExactLiteral)
+        | ("k0", PlanKind::K0)
         | ("ascii-word-run-linear-v1" | "unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => {
             Ok(())
         }
@@ -2182,7 +2220,39 @@ mod tests {
     }
 
     #[test]
+    fn grep_runner_uses_whole_input_routes_and_falls_back_only_before_source() {
+        let limits = current_fre_rebar_search_limits();
+
+        let literal = PortableRegex::new("ab").expect("exact literal");
+        let mut literal_session =
+            build_grep_session(&literal, limits).expect("whole-input literal session");
+        assert!(matches!(&literal_session, CurrentFreGrepSession::Stream(_)));
+        assert_eq!(
+            execute_grep_session(&mut literal_session, b"xxab\r\nmiss\nab", limits)
+                .expect("whole-input literal count"),
+            2
+        );
+
+        let finite = PortableRegex::new("a|ab").expect("finite language");
+        assert!(matches!(
+            finite.build_report().plan,
+            PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
+        ));
+        let mut fallback =
+            build_grep_session(&finite, limits).expect("pre-source fallback session");
+        assert!(matches!(
+            &fallback,
+            CurrentFreGrepSession::SearchFallback(_)
+        ));
+        assert_eq!(
+            execute_grep_session(&mut fallback, b"ab\nmiss\na", limits).expect("fallback count"),
+            2
+        );
+    }
+
+    #[test]
     fn authenticates_each_timed_grep_runtime_against_its_plan() {
+        assert!(require_grep_runtime_plan("exact-literal", PlanKind::ExactLiteral).is_ok());
         assert!(require_grep_runtime_plan("k0", PlanKind::K0).is_ok());
         assert!(
             require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::UnicodeWordRun,)
@@ -2192,6 +2262,7 @@ mod tests {
             require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::UnicodeWordRun,)
                 .is_ok()
         );
+        assert!(require_grep_runtime_plan("exact-literal", PlanKind::K0).is_err());
         assert!(require_grep_runtime_plan("k0", PlanKind::UnicodeWordRun).is_err());
         assert!(require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::K0).is_err());
         assert!(require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::K0).is_err());
@@ -2199,6 +2270,7 @@ mod tests {
 
     #[test]
     fn requires_runtime_identity_for_grep_without_freezing_it_to_k0() {
+        assert!(require_runtime_expectation("grep", Some("exact-literal")).is_ok());
         assert!(require_runtime_expectation("grep", Some("k0")).is_ok());
         assert!(require_runtime_expectation("grep", Some("ascii-word-run-linear-v1")).is_ok());
         assert!(require_runtime_expectation("grep", Some("unicode-word-run-linear-v1")).is_ok());
