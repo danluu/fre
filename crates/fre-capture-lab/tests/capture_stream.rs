@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use fre_capture_lab::{
     Ast, BuildLimits, CaptureStream, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
-    CaptureStreamProjection, CaptureStreamResource, Greed, Program,
+    CaptureStreamProjection, CaptureStreamResource, Greed, Program, Span,
 };
 
 fn compile(ast: &Ast) -> Arc<Program> {
@@ -395,6 +395,95 @@ fn prepared_workspace_reuses_exact_storage_without_dynamic_allocations() {
     assert_eq!(first, steady);
     assert_eq!(first.accounting.allocations, 0);
     assert_eq!(first.captures.count, 6);
+}
+
+#[test]
+fn exact_span_workspace_preserves_priority_and_refuses_one_below() {
+    let ast = Ast::alt([
+        Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'a')]),
+        Ast::Byte(b'a'),
+    ]);
+    let program = compile(&ast);
+    let span = Span { start: 0, end: 2 };
+    let prospective = CaptureStream::prospective(&program, 2).expect("prospective");
+    let construction_limits = CaptureStreamLimits {
+        max_source_bytes: prospective.source_bytes,
+        max_states: prospective.states,
+        max_build_work: prospective.build_work,
+        max_persistent_bytes: prospective.persistent_bytes,
+        max_combined_peak_bytes: prospective.combined_peak_bytes,
+        max_allocations: prospective.allocations,
+        ..CaptureStreamLimits::default()
+    };
+    let mut baseline = CaptureStream::new_exact(Arc::clone(&program), 2, construction_limits)
+        .expect("baseline exact workspace");
+    let (entries, accounting) = baseline
+        .execute_exact_span(b"aa", span)
+        .expect("the delayed priority branch reaches the certified end");
+    assert_eq!(2, entries);
+    assert_eq!(0, accounting.allocations);
+    assert_eq!(
+        CaptureStreamError::InvalidProgram,
+        baseline
+            .execute(b"aa")
+            .expect_err("exact-only workspace has no restarted mode")
+    );
+
+    let exact = CaptureStreamLimits {
+        max_source_bytes: prospective.source_bytes,
+        max_states: prospective.states,
+        max_build_work: prospective.build_work,
+        max_persistent_bytes: prospective.persistent_bytes,
+        max_combined_peak_bytes: prospective.combined_peak_bytes,
+        max_allocations: prospective.allocations,
+        max_line_domains: accounting.line_domains,
+        max_searches: accounting.searches,
+        max_matches: 1,
+        max_bytes_examined: accounting.bytes_examined,
+        max_starts_injected: accounting.starts_injected,
+        max_state_visits: accounting.state_visits,
+        max_tag_actions: accounting.tag_actions,
+        max_history_nodes: accounting.history_nodes,
+        max_history_walk: accounting.history_walk,
+        max_history_reads: accounting.history_reads,
+        max_materialization_reads: accounting.materialization_reads,
+        max_materialization_writes: accounting.materialization_writes,
+        max_materialization_preview_writes: accounting.materialization_preview_writes,
+        max_mask_states: accounting.mask_states,
+        max_mask_word_copies: accounting.mask_word_copies,
+        max_mask_word_reads: accounting.mask_word_reads,
+        max_reset_cells: accounting.reset_cells,
+        max_capture_events: accounting.capture_events,
+        max_capture_count: entries,
+        max_line_source_reads: accounting.line_source_reads,
+        max_work: accounting.work,
+    };
+    let mut exact_workspace =
+        CaptureStream::new_exact(Arc::clone(&program), 2, exact).expect("exact limits admit");
+    assert_eq!(
+        (entries, accounting),
+        exact_workspace
+            .execute_exact_span(b"aa", span)
+            .expect("exact limits execute")
+    );
+
+    let mut one_below = exact;
+    one_below.max_reset_cells = accounting
+        .reset_cells
+        .checked_sub(1)
+        .expect("exact replay resets workspace cells");
+    let mut refused =
+        CaptureStream::new_exact(program, 2, one_below).expect("construction remains admissible");
+    assert_eq!(
+        CaptureStreamError::Resource {
+            resource: CaptureStreamResource::ResetCells,
+            required: accounting.reset_cells,
+            limit: one_below.max_reset_cells,
+        },
+        refused
+            .execute_exact_span(b"aa", span)
+            .expect_err("one below reset bound refuses before source replay")
+    );
 }
 
 #[test]

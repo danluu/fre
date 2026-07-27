@@ -13,6 +13,12 @@
 )]
 
 use core::{fmt, mem::size_of};
+use std::{alloc::Layout, sync::Arc};
+
+use fre_capture_lab::{
+    CaptureStreamAccounting, CaptureStreamError, CaptureStreamLimits, CaptureStreamResource,
+    SearchLimits as CaptureSearchLimits, Span as CaptureSpan,
+};
 
 use fre_automata::{
     ActionCapabilities, CompileError, CompileLimits, DirectCount, DirectReduceLimits,
@@ -22,6 +28,7 @@ use fre_automata::{
     PriorityMatch, PriorityTarget, RawPlan, ReduceError, StateRole, TAGGED_MANY_ACCOUNTING_ID,
     TAGGED_MANY_BUILD_ALLOCATION_ATTEMPTS, TaggedManyBuildAccounting, TaggedManyBuildError,
     TaggedManyBuildLimits, TaggedManyExecutionClass, TaggedManyPlan, TaggedManyStats,
+    TaggedManyTraceSession, TaggedManyTraceSessionSetupProspective,
 };
 use fre_lower::{
     CheckedWidth, FactError, FactLimits, FactOperation, FactOutput, FactStats, LowerError,
@@ -31,6 +38,18 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
     ParseAttemptError, ParseAttemptReceipt, ParseAttemptTerminal, ParseRequest, ParseSummary,
     RustConstructor, RustMatchKind, RustProfile, SafetyEnvelope,
+};
+use regex_syntax::hir::Hir;
+
+use crate::capture_required_literal::{
+    self, CaptureRequiredLiteralBuildError, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralBuildReport, CaptureRequiredLiteralCacheIdentity,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchError,
+    CaptureRequiredLiteralSearchOperation, CaptureRequiredLiteralSearchReport,
+};
+use crate::captures::{
+    CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
+    CaptureExactProjectionSession, CaptureRegex, ExactCaptureParticipation,
 };
 
 /// Schema for the forced ordered Build-Many receipt.
@@ -42,6 +61,15 @@ pub const PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID: &str = "fre.priority-aggregate-
 // allocation. The tagged substrate separately seals every construction
 // allocation; lowering owns each per-pattern raw-plan allocation.
 const FACADE_ALLOCATION_ATTEMPTS: usize = 3;
+const WHOLE_LITERAL_IDENTITY_HEX: &[u8; 16] = b"0123456789abcdef";
+// The ordered-union proof holds one exact root table and one `Arc<CacheKey>`
+// after first moving the encoded identity source into that key. Every
+// nonempty ordinal additionally makes one exact temporary parser-source
+// copy. Parser internals and the nested literal builder are intentionally
+// sealed by their own receipts rather than double-counted here.
+const WHOLE_LITERAL_FIXED_DIRECT_BRIDGE_ALLOCATIONS: usize = 3;
+const WHOLE_LITERAL_MAX_DIRECT_BRIDGE_ALLOCATIONS: usize =
+    WHOLE_LITERAL_FIXED_DIRECT_BRIDGE_ALLOCATIONS + 128;
 /// Whole-operation value fixed before parsing any pattern.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PriorityAggregateManyOperation {
@@ -91,6 +119,10 @@ pub struct PriorityAggregateManyBuildLimits {
     /// the corresponding tagged construction dimensions; no legacy prepared
     /// sparse plan is constructed.
     pub preparation: PreparationLimits,
+    /// Capture-sidecar and one whole-operation literal-proof construction
+    /// envelope. This is consulted only by [`Self::build_capture_count`]; the
+    /// ordinary Count and `SpanSum` artifacts retain their established receipt.
+    pub capture_build: PriorityAggregateManyCaptureBuildLimits,
 }
 
 impl Default for PriorityAggregateManyBuildLimits {
@@ -114,8 +146,213 @@ impl Default for PriorityAggregateManyBuildLimits {
             composition_automata: CompileLimits::default(),
             tagged: TaggedManyBuildLimits::default(),
             preparation: PreparationLimits::default(),
+            capture_build: PriorityAggregateManyCaptureBuildLimits::default(),
         }
     }
+}
+
+/// Checked pre-source construction envelope for the forced multi-pattern
+/// capture-count artifact.
+///
+/// Sidecars inherit the enclosing builder's admission policy and syntax
+/// safety envelope. Their `required_literal` option is deliberately ignored:
+/// the sole permitted literal proof is the separately bounded, ordered-union
+/// pass in [`Self::whole_required_literal`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureBuildLimits {
+    /// Per-ordinal capture compiler limits, except syntax policy/safety and
+    /// per-sidecar literal filtering as documented above.
+    pub sidecar: CaptureBuildLimits,
+    /// Limits for the one ordered-union required-literal proof.
+    pub whole_required_literal: CaptureRequiredLiteralBuildLimits,
+    /// Aggregate retained sidecar-envelope bytes admitted before any capture
+    /// sidecar is allocated.
+    pub max_sidecar_persistent_bytes: usize,
+    /// Aggregate sidecar compiler-work envelope admitted before construction.
+    pub max_sidecar_build_work: usize,
+    /// Aggregate sidecar peak-envelope bytes admitted before construction.
+    pub max_sidecar_peak_bytes: usize,
+    /// Maximum capture-sidecar table allocations performed by this facade.
+    /// Individual nested compilers retain and check their own allocation
+    /// ledgers; this dimension covers the bridge-owned ordinal table.
+    pub max_sidecar_table_allocations: usize,
+    /// Aggregate parser work for the identity plus independently parsed
+    /// ordered-union literal proof.
+    pub max_whole_literal_parser_work: u64,
+    /// Retained union-identity plus nested literal-plan payload admitted
+    /// before any sidecar is constructed.
+    pub max_whole_literal_persistent_bytes: usize,
+    /// Conservative union-HIR bridge plus nested literal-plan construction
+    /// peak admitted before any sidecar is constructed.
+    pub max_whole_literal_peak_bytes: usize,
+    /// Exact wrapper-owned allocations outside the syntax parser and nested
+    /// literal builder: encoded identity source, identity `Arc<CacheKey>`,
+    /// exact root-HIR table, and one exact source copy for each nonempty
+    /// ordinal. The parser and nested literal builder authenticate their
+    /// separate allocations in their own published receipts.
+    pub max_whole_literal_bridge_allocations: usize,
+}
+
+impl Default for PriorityAggregateManyCaptureBuildLimits {
+    fn default() -> Self {
+        Self {
+            sidecar: CaptureBuildLimits::default(),
+            whole_required_literal: CaptureRequiredLiteralBuildLimits::default(),
+            // These are construction ceilings, not eager reservations. They
+            // leave room for the 16+ pattern qualified tail while preventing
+            // an unbounded aggregate envelope.
+            max_sidecar_persistent_bytes: 16 * 1_024 * 1_024 * 1_024,
+            max_sidecar_build_work: 16 * 1_024 * 1_024 * 1_024,
+            max_sidecar_peak_bytes: 16 * 1_024 * 1_024 * 1_024,
+            max_sidecar_table_allocations: 1,
+            max_whole_literal_parser_work: 128 * 1_024 * 1_024,
+            max_whole_literal_persistent_bytes: 64 * 1_024 * 1_024,
+            // The HIR bridge is admitted from the parser's hard node
+            // envelope and the outer pattern ceiling; this is a checked
+            // logical peak, not an eager allocation.
+            max_whole_literal_peak_bytes: 128 * 1_024 * 1_024 * 1_024,
+            max_whole_literal_bridge_allocations: WHOLE_LITERAL_MAX_DIRECT_BRIDGE_ALLOCATIONS,
+        }
+    }
+}
+
+/// One independently bounded construction resource owned by the forced
+/// multi-pattern capture artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorityAggregateManyCaptureBuildResource {
+    SidecarPersistentBytes,
+    SidecarBuildWork,
+    SidecarPeakBytes,
+    SidecarTableAllocations,
+    WholeLiteralParserWork,
+    WholeLiteralPersistentBytes,
+    WholeLiteralPeakBytes,
+    WholeLiteralBridgeAllocations,
+}
+
+/// Authenticated aggregate construction ledger for capture sidecars and the
+/// one optional ordered-union literal proof. Retained table/source bytes are
+/// exact; peak fields are deliberately named conservative envelopes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureConstructionAccounting {
+    /// One capture sidecar is retained for every ordered selector terminal.
+    pub patterns: usize,
+    /// Sum of the retained engine/selector/direct-plan payloads reported by
+    /// all sidecars.
+    pub sidecar_persistent_bytes: usize,
+    /// Sum of the HIR, capture-engine, selector, and direct-plan construction
+    /// work reported by all sidecars.
+    pub sidecar_build_work: usize,
+    /// Sum of independently reported sidecar construction peaks. This is an
+    /// envelope, not a claim that every sidecar peak is simultaneously live.
+    pub sidecar_peak_bytes: usize,
+    /// Bridge-owned exact-capacity sidecar-table allocations.
+    pub sidecar_table_allocations: usize,
+    /// Parse work spent making the ordered-union literal identity and HIR.
+    pub whole_literal_parser_work: u64,
+    /// Required-literal planner work; zero means no universal literal proof
+    /// was available for the ordered union.
+    pub whole_literal_planner_work: usize,
+    /// Retained identity plus the nested literal plan's authenticated
+    /// published source envelope. This is zero only before the sole
+    /// whole-operation proof has been constructed.
+    pub whole_literal_persistent_bytes: usize,
+    /// Conservative peak covering the identity, the bounded HIR bridge, and
+    /// the nested literal builder's own authenticated peak envelope.
+    pub whole_literal_peak_bytes: usize,
+    /// Exact wrapper-owned allocation attempts outside the syntax parser and
+    /// nested literal builder: encoded identity source, its `Arc<CacheKey>`,
+    /// exact root-HIR table, and one exact source copy for each nonempty
+    /// ordinal. Nested parser/literal-builder allocations remain sealed in
+    /// their respective receipts.
+    pub whole_literal_bridge_allocations: usize,
+}
+
+impl PriorityAggregateManyCaptureConstructionAccounting {
+    fn closes(self, limits: &PriorityAggregateManyCaptureBuildLimits) -> bool {
+        self.sidecar_persistent_bytes <= limits.max_sidecar_persistent_bytes
+            && self.sidecar_build_work <= limits.max_sidecar_build_work
+            && self.sidecar_peak_bytes <= limits.max_sidecar_peak_bytes
+            && self.sidecar_table_allocations <= limits.max_sidecar_table_allocations
+            && self.whole_literal_parser_work <= limits.max_whole_literal_parser_work
+            && self.whole_literal_persistent_bytes <= limits.max_whole_literal_persistent_bytes
+            && self.whole_literal_peak_bytes <= limits.max_whole_literal_peak_bytes
+            && self.whole_literal_bridge_allocations <= limits.max_whole_literal_bridge_allocations
+    }
+}
+
+/// Authenticated disposition of the sole whole-operation literal proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PriorityAggregateManyWholeRequiredLiteralBuildReceipt {
+    /// A bounded universal-literal proof was retained and can gate the shared
+    /// selector exactly once per operation.
+    Built {
+        report: CaptureRequiredLiteralBuildReport,
+        parser_work: u64,
+    },
+    /// The bounded analysis completed but the ordered union has no universal
+    /// literal suitable for a sound filter. The selector remains mandatory.
+    NoProof {
+        parser_work: u64,
+        planner_work: usize,
+    },
+}
+
+impl PriorityAggregateManyWholeRequiredLiteralBuildReceipt {
+    #[must_use]
+    pub const fn parser_work(&self) -> u64 {
+        match self {
+            Self::Built { parser_work, .. } | Self::NoProof { parser_work, .. } => *parser_work,
+        }
+    }
+
+    #[must_use]
+    pub const fn planner_work(&self) -> usize {
+        match self {
+            Self::Built { report, .. } => report.accounting.planner_work,
+            Self::NoProof { planner_work, .. } => *planner_work,
+        }
+    }
+
+    fn closes(
+        &self,
+        plan: Option<&CaptureRequiredLiteralPlan>,
+        identity: &Arc<CacheKey>,
+        selector: &PriorityAggregateManyBuildReport,
+    ) -> bool {
+        let identity_closes = whole_required_literal_identity_closes(identity, selector);
+        match (self, plan) {
+            (Self::Built { report, .. }, Some(plan)) => {
+                plan.build_report() == report
+                    && Arc::ptr_eq(&report.identity.syntax, identity)
+                    && capture_required_literal_build_report_closes(
+                        report,
+                        selector.limits.capture_build.whole_required_literal,
+                    )
+                    && identity_closes
+            }
+            (Self::NoProof { planner_work, .. }, None) => {
+                *planner_work
+                    <= selector
+                        .limits
+                        .capture_build
+                        .whole_required_literal
+                        .max_planner_work
+                    && identity_closes
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WholeRequiredLiteralBuild {
+    plan: Option<CaptureRequiredLiteralPlan>,
+    identity: Arc<CacheKey>,
+    receipt: PriorityAggregateManyWholeRequiredLiteralBuildReceipt,
+    persistent_bytes: usize,
+    peak_bytes: usize,
+    bridge_allocations: usize,
 }
 
 /// Bounds checked before binding each retained parse-attempt source owner.
@@ -653,6 +890,37 @@ pub enum PriorityAggregateManyBuildError {
     CaptureErasureNotProven {
         pattern: usize,
     },
+    /// The capture-preserving sidecar for one ordinal could not be compiled.
+    /// The shared tagged selector is never published without every source
+    /// sidecar needed to preserve its selected captures.
+    CaptureSidecar {
+        pattern: usize,
+        source: CaptureBuildError,
+    },
+    /// The aggregate sidecar/literal construction envelope was exhausted
+    /// before publishing a capture artifact.
+    CaptureConstructionLimit {
+        resource: PriorityAggregateManyCaptureBuildResource,
+        needed: usize,
+        limit: usize,
+    },
+    WholeRequiredLiteralParserWorkLimit {
+        needed: u64,
+        limit: u64,
+    },
+    /// The whole-operation literal identity or one of its ordered source HIRs
+    /// could not be parsed under the same policy/safety envelope as selector
+    /// construction.
+    WholeRequiredLiteralSyntax {
+        pattern: Option<usize>,
+        source: fre_syntax::ParseError,
+    },
+    /// The bounded whole-operation literal proof reached a terminal
+    /// construction failure. A successful capture artifact never silently
+    /// collapses this failure into an opaque missing filter.
+    WholeRequiredLiteral {
+        source: CaptureRequiredLiteralBuildError,
+    },
     Lower {
         pattern: usize,
         source: LowerError,
@@ -785,6 +1053,35 @@ impl fmt::Display for PriorityAggregateManyBuildError {
                 formatter,
                 "forced Build-Many pattern {pattern} lacks capture-erasure proof"
             ),
+            Self::CaptureSidecar { pattern, source } => write!(
+                formatter,
+                "forced Build-Many pattern {pattern} capture sidecar: {source}"
+            ),
+            Self::CaptureConstructionLimit {
+                resource,
+                needed,
+                limit,
+            } => write!(
+                formatter,
+                "forced Build-Many capture construction {resource:?} needs {needed}, limit is {limit}"
+            ),
+            Self::WholeRequiredLiteralParserWorkLimit { needed, limit } => write!(
+                formatter,
+                "forced Build-Many whole required-literal parser work needs {needed}, limit is {limit}"
+            ),
+            Self::WholeRequiredLiteralSyntax { pattern, source } => match pattern {
+                Some(pattern) => write!(
+                    formatter,
+                    "forced Build-Many whole required-literal pattern {pattern} syntax: {source}"
+                ),
+                None => write!(
+                    formatter,
+                    "forced Build-Many whole required-literal identity syntax: {source}"
+                ),
+            },
+            Self::WholeRequiredLiteral { source } => {
+                write!(formatter, "forced Build-Many whole required-literal: {source}")
+            }
             Self::Lower { pattern, source } => write!(
                 formatter,
                 "forced Build-Many pattern {pattern} lowering: {source}"
@@ -820,6 +1117,9 @@ impl std::error::Error for PriorityAggregateManyBuildError {
         match self {
             Self::Syntax { source, .. } => Some(source),
             Self::Facts { source, .. } => Some(source),
+            Self::CaptureSidecar { source, .. } => Some(source),
+            Self::WholeRequiredLiteralSyntax { source, .. } => Some(source),
+            Self::WholeRequiredLiteral { source } => Some(source),
             Self::Lower { source, .. } => Some(source),
             Self::Automaton(source) => Some(source),
             Self::Preparation(source) => Some(source),
@@ -903,6 +1203,105 @@ impl<'a> PriorityAggregateManyBuilder<'a> {
         Ok(PriorityAggregateManySpanSumRegex { plan, report })
     }
 
+    /// Build one shared priority selector plus one capture-preserving sidecar
+    /// for each source ordinal.
+    ///
+    /// The selector is still the sole whole-haystack matcher: sidecars only
+    /// project spans already selected by that one ordered automaton. Each
+    /// sidecar starts with the capture lab's no-required-literal default, so
+    /// it cannot accidentally rescan a selected span with a second literal
+    /// filter. A future whole-operation prefilter is therefore one explicit
+    /// outer pass rather than an implicit per-pattern or per-replay pass.
+    pub fn build_capture_count(
+        self,
+        execution: ForcedExecution,
+        target: PriorityTarget,
+    ) -> Result<PriorityAggregateManyCaptureCountRegex, PriorityAggregateManyBuildError> {
+        let selector = self.clone().build_count(execution, target)?;
+        let count = self.patterns.len();
+        let sidecar_limits =
+            capture_sidecar_limits(self.limits.capture_build.sidecar, &self.limits);
+        preflight_whole_required_literal_parser(
+            self.patterns,
+            self.limits.capture_build.max_whole_literal_parser_work,
+        )?;
+        let mut accounting = capture_construction_preflight(
+            self.patterns,
+            selector.build_report(),
+            &self.limits.capture_build,
+        )?;
+        let mut captures = reserve_exact::<CaptureRegex>(count, "capture sidecars")?;
+        for (ordinal, pattern) in self.patterns.iter().enumerate() {
+            let mut per_ordinal_sidecar_limits = sidecar_limits;
+            per_ordinal_sidecar_limits.syntax_safety = selector
+                .build_report()
+                .patterns()
+                .get(ordinal)
+                .ok_or(PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "capture sidecar ordinal exceeded its shared selector receipt",
+                })?
+                .syntax_key
+                .safety;
+            let sidecar = CaptureBuilder::new(pattern.as_str())
+                .profile(self.profile.clone())
+                .limits(per_ordinal_sidecar_limits)
+                .build()
+                .map_err(|source| PriorityAggregateManyBuildError::CaptureSidecar {
+                    pattern: ordinal,
+                    source,
+                })?;
+            if sidecar
+                .build_report()
+                .plan_identity
+                .syntax
+                .pattern
+                .capacity_bytes()
+                != pattern.len()
+            {
+                return Err(PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "capture sidecar syntax source did not retain the admitted exact capacity",
+                });
+            }
+            accumulate_capture_sidecar_accounting(&mut accounting, sidecar.build_report())?;
+            captures.push(sidecar);
+        }
+        if captures.len() != count || captures.capacity() != count {
+            return Err(PriorityAggregateManyBuildError::InternalInvariant {
+                detail: "capture sidecar collection lost its exact source ordinal shape",
+            });
+        }
+        // This optional proof is deliberately built over the alternation of
+        // all independently parsed source HIRs. It is never run per ordinal
+        // or per selected span: a negative whole-input decision is the only
+        // route on which it suppresses the shared selector.
+        let whole_required_literal = build_whole_operation_required_literal(
+            self.patterns,
+            &self.profile,
+            self.limits.admission,
+            self.limits.syntax_safety,
+            self.limits.capture_build.whole_required_literal,
+            self.limits.capture_build.max_whole_literal_parser_work,
+        )?;
+        accounting.whole_literal_parser_work = whole_required_literal.receipt.parser_work();
+        accounting.whole_literal_planner_work = whole_required_literal.receipt.planner_work();
+        accounting.whole_literal_persistent_bytes = whole_required_literal.persistent_bytes;
+        accounting.whole_literal_peak_bytes = whole_required_literal.peak_bytes;
+        accounting.whole_literal_bridge_allocations = whole_required_literal.bridge_allocations;
+        enforce_capture_construction_limits(accounting, &self.limits.capture_build)?;
+        let artifact = PriorityAggregateManyCaptureCountRegex {
+            selector,
+            captures: captures.into_boxed_slice(),
+            whole_required_literal: whole_required_literal.plan,
+            whole_required_literal_identity: whole_required_literal.identity,
+            whole_required_literal_receipt: whole_required_literal.receipt,
+            construction: accounting,
+        };
+        if !artifact.build_report().closes() {
+            return Err(PriorityAggregateManyBuildError::BuildReportNotClosed);
+        }
+        Ok(artifact)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the construction transaction keeps all preflight, independent parsing, and composition gates adjacent"
@@ -916,9 +1315,6 @@ impl<'a> PriorityAggregateManyBuilder<'a> {
         validate_route(execution, target)?;
         if !is_ordered_build_many_profile(&self.profile) {
             return Err(PriorityAggregateManyBuildError::UnsupportedBuildManyProfile);
-        }
-        if self.profile.options.unicode {
-            return Err(PriorityAggregateManyBuildError::UnsupportedUnicodeProfile);
         }
         if !bytes_empty_progress_is_byte(&self.profile) {
             return Err(PriorityAggregateManyBuildError::UnsupportedBytesEmptyProgress);
@@ -1727,6 +2123,890 @@ fn is_ordered_build_many_profile(profile: &RustProfile) -> bool {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct CaptureSidecarBuildEnvelope {
+    persistent_bytes: usize,
+    build_work: usize,
+    peak_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WholeRequiredLiteralConstructionEnvelope {
+    persistent_bytes: usize,
+    peak_bytes: usize,
+    bridge_allocations: usize,
+}
+
+fn arc_block_bytes<T>() -> Result<usize, PriorityAggregateManyBuildError> {
+    Layout::new::<[usize; 2]>()
+        .extend(Layout::new::<T>())
+        .map(|(layout, _)| layout.pad_to_align().size())
+        .map_err(
+            |_| PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "Arc block bytes",
+            },
+        )
+}
+
+fn cache_key_arc_storage_bytes(
+    pattern_capacity: usize,
+    computation: &'static str,
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    arc_block_bytes::<CacheKey>()?
+        .checked_add(pattern_capacity)
+        .ok_or(PriorityAggregateManyBuildError::CompositionArithmeticOverflow { computation })
+}
+
+fn capture_sidecar_limits(
+    mut sidecar: CaptureBuildLimits,
+    outer: &PriorityAggregateManyBuildLimits,
+) -> CaptureBuildLimits {
+    // One literal proof is deliberately owned by the multi-pattern artifact.
+    // Keeping this `None` prevents a sidecar from introducing a second
+    // per-pattern/per-span literal pass behind the forced interface.
+    sidecar.required_literal = None;
+    sidecar.admission = outer.admission;
+    sidecar.syntax_safety = outer.syntax_safety;
+    sidecar
+}
+
+fn capture_sidecar_build_envelope(
+    limits: &CaptureBuildLimits,
+    source_capacity: usize,
+) -> Result<CaptureSidecarBuildEnvelope, PriorityAggregateManyBuildError> {
+    let syntax_storage = cache_key_arc_storage_bytes(
+        source_capacity,
+        "capture sidecar syntax persistent envelope",
+    )?;
+    let persistent_bytes = syntax_storage
+        .checked_add(limits.engine.max_program_bytes)
+        .and_then(|value| value.checked_add(limits.selector.max_program_bytes))
+        .and_then(|value| value.checked_add(limits.prefix_class_participation.max_persistent_bytes))
+        .and_then(|value| {
+            value.checked_add(
+                limits
+                    .prefix_class_participation
+                    .max_retained_capacity_bytes,
+            )
+        })
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar persistent envelope",
+            },
+        )?;
+    let parser_work = usize::try_from(limits.syntax_safety.max_parse_work).map_err(|_| {
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "capture sidecar parser-work envelope",
+        }
+    })?;
+    let build_work = parser_work
+        .checked_add(limits.max_hir_work)
+        .and_then(|value| value.checked_add(limits.engine.max_compile_work))
+        .and_then(|value| value.checked_add(limits.selector.max_work))
+        .and_then(|value| value.checked_add(limits.max_prefix_class_participation_planner_work))
+        .and_then(|value| value.checked_add(limits.prefix_class_participation.max_build_work))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar work envelope",
+            },
+        )?;
+    // The nested builders are sequential, but the envelope is intentionally
+    // conservative: all independently retained payloads plus their checked
+    // construction peaks are admitted before a sidecar table is allocated.
+    let peak_bytes = persistent_bytes
+        .checked_add(limits.selector.max_program_bytes)
+        .and_then(|value| value.checked_add(limits.prefix_class_participation.max_peak_bytes))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar peak envelope",
+            },
+        )?;
+    Ok(CaptureSidecarBuildEnvelope {
+        persistent_bytes,
+        build_work,
+        peak_bytes,
+    })
+}
+
+fn enforce_capture_construction_limits(
+    accounting: PriorityAggregateManyCaptureConstructionAccounting,
+    limits: &PriorityAggregateManyCaptureBuildLimits,
+) -> Result<(), PriorityAggregateManyBuildError> {
+    for (resource, needed, limit) in [
+        (
+            PriorityAggregateManyCaptureBuildResource::SidecarPersistentBytes,
+            accounting.sidecar_persistent_bytes,
+            limits.max_sidecar_persistent_bytes,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::SidecarBuildWork,
+            accounting.sidecar_build_work,
+            limits.max_sidecar_build_work,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::SidecarPeakBytes,
+            accounting.sidecar_peak_bytes,
+            limits.max_sidecar_peak_bytes,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::SidecarTableAllocations,
+            accounting.sidecar_table_allocations,
+            limits.max_sidecar_table_allocations,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::WholeLiteralPersistentBytes,
+            accounting.whole_literal_persistent_bytes,
+            limits.max_whole_literal_persistent_bytes,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::WholeLiteralPeakBytes,
+            accounting.whole_literal_peak_bytes,
+            limits.max_whole_literal_peak_bytes,
+        ),
+        (
+            PriorityAggregateManyCaptureBuildResource::WholeLiteralBridgeAllocations,
+            accounting.whole_literal_bridge_allocations,
+            limits.max_whole_literal_bridge_allocations,
+        ),
+    ] {
+        if needed > limit {
+            return Err(PriorityAggregateManyBuildError::CaptureConstructionLimit {
+                resource,
+                needed,
+                limit,
+            });
+        }
+    }
+    if accounting.whole_literal_parser_work > limits.max_whole_literal_parser_work {
+        return Err(
+            PriorityAggregateManyBuildError::WholeRequiredLiteralParserWorkLimit {
+                needed: accounting.whole_literal_parser_work,
+                limit: limits.max_whole_literal_parser_work,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn capture_construction_preflight(
+    patterns: &[String],
+    selector: &PriorityAggregateManyBuildReport,
+    limits: &PriorityAggregateManyCaptureBuildLimits,
+) -> Result<PriorityAggregateManyCaptureConstructionAccounting, PriorityAggregateManyBuildError> {
+    let count = patterns.len();
+    if count != selector.patterns().len() {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "capture-sidecar preflight source count diverged from selector receipt",
+        });
+    }
+    let table_bytes = capacity_bytes::<CaptureRegex>(count, "capture sidecar table bytes")?;
+    let base_sidecar_limits = capture_sidecar_limits(limits.sidecar, &selector.limits);
+    let (aggregate_persistent, aggregate_work, aggregate_peak) =
+        patterns.iter().zip(selector.patterns()).try_fold(
+            (table_bytes, 0_usize, 0_usize),
+            |(persistent, work, peak), (pattern, selector_pattern)| {
+                let mut sidecar_limits = base_sidecar_limits;
+                sidecar_limits.syntax_safety = selector_pattern.syntax_key.safety;
+                let envelope = capture_sidecar_build_envelope(&sidecar_limits, pattern.len())?;
+                let persistent = persistent.checked_add(envelope.persistent_bytes).ok_or(
+                    PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                        computation: "aggregate capture-sidecar persistent envelope",
+                    },
+                )?;
+                let work = work.checked_add(envelope.build_work).ok_or(
+                    PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                        computation: "aggregate capture-sidecar work envelope",
+                    },
+                )?;
+                let peak = peak.checked_add(envelope.peak_bytes).ok_or(
+                    PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                        computation: "aggregate capture-sidecar peak envelope",
+                    },
+                )?;
+                Ok::<_, PriorityAggregateManyBuildError>((persistent, work, peak))
+            },
+        )?;
+    let whole = whole_required_literal_construction_envelope(
+        patterns,
+        selector.limits.syntax_safety,
+        limits.whole_required_literal,
+    )?;
+    let preflight = PriorityAggregateManyCaptureConstructionAccounting {
+        patterns: count,
+        sidecar_persistent_bytes: aggregate_persistent,
+        sidecar_build_work: aggregate_work,
+        sidecar_peak_bytes: aggregate_peak,
+        sidecar_table_allocations: usize::from(count != 0),
+        whole_literal_parser_work: 0,
+        whole_literal_planner_work: 0,
+        whole_literal_persistent_bytes: whole.persistent_bytes,
+        whole_literal_peak_bytes: whole.peak_bytes,
+        whole_literal_bridge_allocations: whole.bridge_allocations,
+    };
+    enforce_capture_construction_limits(preflight, limits)?;
+    Ok(PriorityAggregateManyCaptureConstructionAccounting {
+        patterns: count,
+        sidecar_persistent_bytes: table_bytes,
+        sidecar_build_work: 0,
+        sidecar_peak_bytes: 0,
+        sidecar_table_allocations: usize::from(count != 0),
+        whole_literal_parser_work: 0,
+        whole_literal_planner_work: 0,
+        whole_literal_persistent_bytes: 0,
+        whole_literal_peak_bytes: 0,
+        whole_literal_bridge_allocations: 0,
+    })
+}
+
+fn accumulate_capture_sidecar_accounting(
+    total: &mut PriorityAggregateManyCaptureConstructionAccounting,
+    report: &CaptureBuildReport,
+) -> Result<(), PriorityAggregateManyBuildError> {
+    if report.required_literal.is_some() || report.plan_identity.required_literal.is_some() {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "capture sidecar retained a forbidden per-ordinal literal proof",
+        });
+    }
+    let prefix = report.prefix_class_participation;
+    let syntax_storage = cache_key_arc_storage_bytes(
+        report.plan_identity.syntax.pattern.capacity_bytes(),
+        "capture sidecar syntax persistent accounting",
+    )?;
+    let persistent_bytes = syntax_storage
+        .checked_add(report.engine.program_bytes)
+        .and_then(|value| value.checked_add(report.selector.program_bytes))
+        .and_then(|value| value.checked_add(prefix.map_or(0, |receipt| receipt.persistent_bytes)))
+        .and_then(|value| {
+            value.checked_add(prefix.map_or(0, |receipt| receipt.retained_capacity_bytes))
+        })
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar persistent accounting",
+            },
+        )?;
+    let parser_work = usize::try_from(report.syntax.parse_work).map_err(|_| {
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "capture sidecar parser work accounting",
+        }
+    })?;
+    let build_work = parser_work
+        .checked_add(report.hir.work)
+        .and_then(|value| value.checked_add(report.engine.compile_work))
+        .and_then(|value| value.checked_add(report.selector.work))
+        .and_then(|value| value.checked_add(prefix.map_or(0, |receipt| receipt.work_upper_bound)))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar work accounting",
+            },
+        )?;
+    let peak_bytes = syntax_storage
+        .checked_add(report.engine.program_bytes)
+        .and_then(|value| value.checked_add(report.selector.construction_peak_bytes))
+        .and_then(|value| value.checked_add(prefix.map_or(0, |receipt| receipt.peak_bytes)))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "capture sidecar peak accounting",
+            },
+        )?;
+    total.sidecar_persistent_bytes = total
+        .sidecar_persistent_bytes
+        .checked_add(persistent_bytes)
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "aggregate capture-sidecar persistent accounting",
+            },
+        )?;
+    total.sidecar_build_work = total.sidecar_build_work.checked_add(build_work).ok_or(
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "aggregate capture-sidecar work accounting",
+        },
+    )?;
+    total.sidecar_peak_bytes = total.sidecar_peak_bytes.checked_add(peak_bytes).ok_or(
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "aggregate capture-sidecar peak accounting",
+        },
+    )?;
+    Ok(())
+}
+
+fn whole_operation_literal_identity_len(
+    patterns: &[String],
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    let byte_count = patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal identity byte sum",
+            },
+        )?;
+    byte_count
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(patterns.len()))
+        .and_then(|value| value.checked_add("frewholeliteralq".len()))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal identity capacity",
+            },
+        )
+}
+
+/// Maximum simultaneously live capacity of the exact temporary source copy
+/// made for an ordinal parse. The copies are parsed and dropped serially.
+fn whole_required_literal_source_copy_peak_bytes(lengths: impl Iterator<Item = usize>) -> usize {
+    lengths.filter(|length| *length != 0).max().unwrap_or(0)
+}
+
+/// Exact wrapper-owned allocation attempts outside the syntax parser and
+/// nested literal builder. The encoded identity source and its `Arc` always
+/// allocate; the exact HIR root table is allocated only for a nonempty union,
+/// and each nonempty ordinal gets one separately reserved transient source.
+fn whole_required_literal_direct_bridge_allocations(
+    patterns: usize,
+    lengths: impl Iterator<Item = usize>,
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    let fixed = if patterns == 0 {
+        2
+    } else {
+        WHOLE_LITERAL_FIXED_DIRECT_BRIDGE_ALLOCATIONS
+    };
+    lengths
+        .filter(|length| *length != 0)
+        .try_fold(fixed, |total, _| {
+            total.checked_add(1).ok_or(
+                PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                    computation: "whole required-literal bridge allocations",
+                },
+            )
+        })
+}
+
+/// Make one parser-owned ordinal source with the exact capacity used by the
+/// bridge receipt. Empty sources deliberately retain no allocation.
+fn copy_whole_required_literal_source(
+    pattern: &str,
+) -> Result<String, PriorityAggregateManyBuildError> {
+    let mut source = String::new();
+    if !pattern.is_empty() {
+        source.try_reserve_exact(pattern.len()).map_err(|_| {
+            PriorityAggregateManyBuildError::AllocationFailed {
+                structure: "whole required-literal ordinal source",
+                additional: pattern.len(),
+            }
+        })?;
+    }
+    source.push_str(pattern);
+    if source.capacity() != pattern.len() {
+        return Err(PriorityAggregateManyBuildError::AllocationFailed {
+            structure: "whole required-literal ordinal source capacity",
+            additional: source.capacity(),
+        });
+    }
+    Ok(source)
+}
+
+fn whole_required_literal_hir_bridge_peak_bytes(
+    patterns: usize,
+    syntax_safety: SafetyEnvelope,
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    // The parser's admitted HIR-node ceiling bounds material held through the
+    // logical ordered-union proof. Two root-sized logical envelopes per node
+    // conservatively cover parsed HIR material plus the wrapper's exact root
+    // table; this is a byte envelope, not a count of opaque parser
+    // allocations. `build_from_hirs` deliberately avoids upstream HIR
+    // normalization and its variable allocation paths.
+    let nodes_per_pattern = usize::try_from(syntax_safety.max_hir_nodes).map_err(|_| {
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal HIR node envelope",
+        }
+    })?;
+    let flattened = patterns.checked_mul(nodes_per_pattern).ok_or(
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal flattened HIR roots",
+        },
+    )?;
+    capacity_bytes::<Hir>(flattened, "whole required-literal HIR bridge")?
+        .checked_mul(2)
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal HIR bridge peak",
+            },
+        )
+}
+
+fn whole_required_literal_construction_envelope(
+    patterns: &[String],
+    syntax_safety: SafetyEnvelope,
+    limits: CaptureRequiredLiteralBuildLimits,
+) -> Result<WholeRequiredLiteralConstructionEnvelope, PriorityAggregateManyBuildError> {
+    let identity_capacity = whole_operation_literal_identity_len(patterns)?;
+    let identity_persistent = cache_key_arc_storage_bytes(
+        identity_capacity,
+        "whole required-literal identity persistent envelope",
+    )?;
+    let bridge_peak = whole_required_literal_hir_bridge_peak_bytes(patterns.len(), syntax_safety)?;
+    let source_copy_peak =
+        whole_required_literal_source_copy_peak_bytes(patterns.iter().map(String::len));
+    let persistent_bytes = identity_persistent
+        .checked_add(limits.max_source_bytes)
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal persistent envelope",
+            },
+        )?;
+    let peak_bytes = identity_persistent
+        .checked_add(bridge_peak)
+        .and_then(|value| value.checked_add(source_copy_peak))
+        .and_then(|value| value.checked_add(limits.max_peak_bytes))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal peak envelope",
+            },
+        )?;
+    Ok(WholeRequiredLiteralConstructionEnvelope {
+        persistent_bytes,
+        peak_bytes,
+        bridge_allocations: whole_required_literal_direct_bridge_allocations(
+            patterns.len(),
+            patterns.iter().map(String::len),
+        )?,
+    })
+}
+
+fn whole_required_literal_actual_persistent_bytes(
+    identity: &Arc<CacheKey>,
+    plan: Option<&CaptureRequiredLiteralPlan>,
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    let identity_bytes = cache_key_arc_storage_bytes(
+        identity.pattern.capacity_bytes(),
+        "whole required-literal identity persistent accounting",
+    )?;
+    identity_bytes
+        .checked_add(plan.map_or(0, |plan| plan.build_report().accounting.source_bytes))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal persistent accounting",
+            },
+        )
+}
+
+fn whole_required_literal_actual_peak_bytes(
+    identity: &Arc<CacheKey>,
+    plan: Option<&CaptureRequiredLiteralPlan>,
+    patterns: usize,
+    source_copy_peak: usize,
+    syntax_safety: SafetyEnvelope,
+) -> Result<usize, PriorityAggregateManyBuildError> {
+    let identity_bytes = cache_key_arc_storage_bytes(
+        identity.pattern.capacity_bytes(),
+        "whole required-literal identity peak accounting",
+    )?;
+    let bridge_peak = whole_required_literal_hir_bridge_peak_bytes(patterns, syntax_safety)?;
+    identity_bytes
+        .checked_add(bridge_peak)
+        .and_then(|value| value.checked_add(source_copy_peak))
+        .and_then(|value| {
+            value.checked_add(plan.map_or(0, |plan| {
+                plan.build_report().accounting.peak_bytes_upper_bound
+            }))
+        })
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal peak accounting",
+            },
+        )
+}
+
+/// Build a conservative required-any-literal proof over the ordered union of
+/// all source HIRs. The proof uses the enclosing forced builder's exact
+/// admission and safety policy. Every terminal parse/allocation/proof failure
+/// remains typed; only a completed proof with no universal literal publishes
+/// the explicit `NoProof` selector fallback receipt.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the parser reservation, ordered HIR union, proof disposition, and receipt publication form one audited construction transaction"
+)]
+fn build_whole_operation_required_literal(
+    patterns: &[String],
+    profile: &RustProfile,
+    admission: AdmissionPolicy,
+    syntax_safety: SafetyEnvelope,
+    limits: CaptureRequiredLiteralBuildLimits,
+    max_parser_work: u64,
+) -> Result<WholeRequiredLiteralBuild, PriorityAggregateManyBuildError> {
+    let identity_source = whole_operation_literal_identity_source(patterns)?;
+    let source_floor = patterns
+        .iter()
+        .try_fold(identity_source.len(), |total, pattern| {
+            total.checked_add(pattern.len())
+        })
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal parser source floor",
+            },
+        )?;
+    let source_floor = u64::try_from(source_floor).map_err(|_| {
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal parser source conversion",
+        }
+    })?;
+    if source_floor > max_parser_work {
+        return Err(
+            PriorityAggregateManyBuildError::WholeRequiredLiteralParserWorkLimit {
+                needed: source_floor,
+                limit: max_parser_work,
+            },
+        );
+    }
+    let compatibility = CompatibilityProfile::RustBytes(profile.clone());
+    let mut remaining_observed = max_parser_work.checked_sub(source_floor).ok_or(
+        PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "whole required-literal parser floor exceeded its admitted budget",
+        },
+    )?;
+    let mut remaining_slots = patterns.len().checked_add(1).ok_or(
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal parser slots",
+        },
+    )?;
+    let mut parse_source =
+        |source: String,
+         pattern: Option<usize>|
+         -> Result<fre_syntax::ParseRecord, PriorityAggregateManyBuildError> {
+            let slots = u64::try_from(remaining_slots).map_err(|_| {
+                PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                    computation: "whole required-literal remaining parser slots",
+                }
+            })?;
+            let observed_share = remaining_observed.checked_div(slots).ok_or(
+                PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "whole required-literal parser slots reached zero",
+                },
+            )?;
+            remaining_observed = remaining_observed.checked_sub(observed_share).ok_or(
+                PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "whole required-literal parser share exceeded its budget",
+                },
+            )?;
+            remaining_slots = remaining_slots.checked_sub(1).ok_or(
+                PriorityAggregateManyBuildError::InternalInvariant {
+                    detail: "whole required-literal parser slots underflowed",
+                },
+            )?;
+            let source_bytes = u64::try_from(source.len()).map_err(|_| {
+                PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                    computation: "whole required-literal source byte conversion",
+                }
+            })?;
+            let parser_cap = source_bytes.checked_add(observed_share).ok_or(
+                PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                    computation: "whole required-literal parser reservation",
+                },
+            )?;
+            let mut safety = syntax_safety;
+            safety.max_parse_work = safety.max_parse_work.min(parser_cap);
+            fre_syntax::parse(
+                ParseRequest::rust(source, compatibility.clone())
+                    .with_admission(admission)
+                    .with_safety_envelope(safety),
+            )
+            .map_err(|source| {
+                PriorityAggregateManyBuildError::WholeRequiredLiteralSyntax { pattern, source }
+            })
+        };
+    let fre_syntax::ParseRecord {
+        key: identity_key,
+        summary: identity_summary,
+        pattern: identity_pattern,
+        ..
+    } = parse_source(identity_source, None)?;
+    let mut parser_work = identity_summary.parse_work;
+    // The encoded identity is only a receipt key. Drop its parsed HIR before
+    // retaining any ordinal HIR so the bridge peak has one explicit owner.
+    drop(identity_pattern);
+    let mut hirs = reserve_exact(patterns.len(), "whole required-literal HIRs")?;
+    for (ordinal, pattern) in patterns.iter().enumerate() {
+        let fre_syntax::ParseRecord {
+            key,
+            summary,
+            pattern,
+            ..
+        } = parse_source(
+            copy_whole_required_literal_source(pattern.as_str())?,
+            Some(ordinal),
+        )?;
+        parser_work = parser_work.checked_add(summary.parse_work).ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal parser work",
+            },
+        )?;
+        // Each ordinal parser key owns only its temporary source copy. The
+        // HIR is retained in the exact root table; release the source before
+        // moving to the next ordinal so `source_copy_peak` is a true maximum.
+        drop(key);
+        let CanonicalPattern::Rust(rust) = pattern else {
+            return Err(PriorityAggregateManyBuildError::InternalInvariant {
+                detail: "whole required-literal Rust request produced non-Rust syntax",
+            });
+        };
+        hirs.push(rust.hir);
+    }
+    if remaining_slots != 0 || remaining_observed != 0 {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "whole required-literal parser reservation did not close",
+        });
+    }
+    if parser_work > max_parser_work {
+        return Err(
+            PriorityAggregateManyBuildError::WholeRequiredLiteralParserWorkLimit {
+                needed: parser_work,
+                limit: max_parser_work,
+            },
+        );
+    }
+    if hirs.len() != patterns.len() || hirs.capacity() != patterns.len() {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "whole required-literal HIR collection lost its source ordinal shape",
+        });
+    }
+    let identity = Arc::new(identity_key);
+    if identity.pattern.capacity_bytes() != whole_operation_literal_identity_len(patterns)? {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "whole required-literal identity lost its admitted exact capacity",
+        });
+    }
+    let outcome = capture_required_literal::build_from_hirs(&hirs, Arc::clone(&identity), limits)
+        .map_err(
+        |failure| PriorityAggregateManyBuildError::WholeRequiredLiteral {
+            source: failure.source,
+        },
+    )?;
+    let receipt = match outcome.plan.as_ref() {
+        Some(plan) => PriorityAggregateManyWholeRequiredLiteralBuildReceipt::Built {
+            report: plan.build_report().clone(),
+            parser_work,
+        },
+        None => PriorityAggregateManyWholeRequiredLiteralBuildReceipt::NoProof {
+            parser_work,
+            planner_work: outcome.planner_work,
+        },
+    };
+    let persistent_bytes =
+        whole_required_literal_actual_persistent_bytes(&identity, outcome.plan.as_ref())?;
+    let source_copy_peak =
+        whole_required_literal_source_copy_peak_bytes(patterns.iter().map(String::len));
+    let bridge_allocations = whole_required_literal_direct_bridge_allocations(
+        patterns.len(),
+        patterns.iter().map(String::len),
+    )?;
+    let peak_bytes = whole_required_literal_actual_peak_bytes(
+        &identity,
+        outcome.plan.as_ref(),
+        patterns.len(),
+        source_copy_peak,
+        syntax_safety,
+    )?;
+    let envelope = whole_required_literal_construction_envelope(patterns, syntax_safety, limits)?;
+    if persistent_bytes > envelope.persistent_bytes
+        || peak_bytes > envelope.peak_bytes
+        || bridge_allocations > envelope.bridge_allocations
+    {
+        return Err(PriorityAggregateManyBuildError::InternalInvariant {
+            detail: "whole required-literal construction exceeded its admitted envelope",
+        });
+    }
+    Ok(WholeRequiredLiteralBuild {
+        plan: outcome.plan,
+        identity,
+        receipt,
+        persistent_bytes,
+        peak_bytes,
+        bridge_allocations,
+    })
+}
+
+fn preflight_whole_required_literal_parser(
+    patterns: &[String],
+    max_parser_work: u64,
+) -> Result<(), PriorityAggregateManyBuildError> {
+    let pattern_bytes = patterns
+        .iter()
+        .try_fold(0_usize, |total, pattern| total.checked_add(pattern.len()))
+        .ok_or(
+            PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+                computation: "whole required-literal parser preflight pattern bytes",
+            },
+        )?;
+    let identity_bytes = whole_operation_literal_identity_len(patterns)?;
+    let floor = pattern_bytes.checked_add(identity_bytes).ok_or(
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal parser preflight source floor",
+        },
+    )?;
+    let floor = u64::try_from(floor).map_err(|_| {
+        PriorityAggregateManyBuildError::CompositionArithmeticOverflow {
+            computation: "whole required-literal parser preflight source conversion",
+        }
+    })?;
+    if floor > max_parser_work {
+        return Err(
+            PriorityAggregateManyBuildError::WholeRequiredLiteralParserWorkLimit {
+                needed: floor,
+                limit: max_parser_work,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Encode sources as a literal-only, collision-free parser key. The string is
+/// not used as the literal proof's semantic input; it only carries exact
+/// ordered multi-source identity because `CacheKey` is intentionally private
+/// to the syntax parser.
+fn whole_operation_literal_identity_source(
+    patterns: &[String],
+) -> Result<String, PriorityAggregateManyBuildError> {
+    let capacity = whole_operation_literal_identity_len(patterns)?;
+    let mut source = String::new();
+    source.try_reserve_exact(capacity).map_err(|_| {
+        PriorityAggregateManyBuildError::AllocationFailed {
+            structure: "whole required-literal identity",
+            additional: capacity,
+        }
+    })?;
+    source.push_str("frewholeliteralq");
+    for pattern in patterns {
+        source.push('z');
+        for byte in pattern.as_bytes() {
+            source.push(char::from(
+                WHOLE_LITERAL_IDENTITY_HEX[usize::from(byte >> 4)],
+            ));
+            source.push(char::from(
+                WHOLE_LITERAL_IDENTITY_HEX[usize::from(byte & 0x0F)],
+            ));
+        }
+    }
+    if source.capacity() != capacity {
+        return Err(PriorityAggregateManyBuildError::AllocationFailed {
+            structure: "whole required-literal identity capacity",
+            additional: source.capacity(),
+        });
+    }
+    Ok(source)
+}
+
+fn capture_required_literal_build_report_closes(
+    report: &CaptureRequiredLiteralBuildReport,
+    limits: CaptureRequiredLiteralBuildLimits,
+) -> bool {
+    let accounting = report.accounting;
+    let literal = accounting.literal_set;
+    report.identity.plan_id == capture_required_literal::CAPTURE_REQUIRED_LITERAL_PLAN_ID
+        && report.identity.needles.len() == accounting.needles
+        && report.identity.needles.byte_len() == accounting.needle_bytes
+        && accounting.planner_work <= limits.max_planner_work
+        && accounting.hir_depth <= limits.max_hir_depth
+        && accounting.needles >= 2
+        && accounting.needles <= limits.max_needles
+        && accounting.needle_bytes <= limits.max_needle_bytes
+        && accounting.minimum_needle_bytes > 0
+        && accounting.minimum_needle_bytes <= accounting.needle_bytes
+        && accounting.source_bytes <= limits.max_source_bytes
+        && accounting.scratch_bytes <= limits.max_scratch_bytes
+        && accounting.peak_bytes_upper_bound <= limits.max_peak_bytes
+        && literal.match_semantics == fre_kernels::LiteralSetMatchSemantics::StreamingAny
+        && literal.patterns == accounting.needles
+        && literal.pattern_bytes == accounting.needle_bytes
+        && literal.minimum_pattern_bytes == accounting.minimum_needle_bytes
+        && literal.patterns <= limits.literal_set.max_patterns
+        && literal.pattern_bytes <= limits.literal_set.max_pattern_bytes
+        && literal.build_work_upper_bound <= limits.literal_set.max_build_work
+        && literal.build_bytes_upper_bound <= limits.literal_set.max_build_bytes
+        && literal.persistent_bytes <= limits.literal_set.max_persistent_bytes
+}
+
+fn whole_required_literal_identity_closes(
+    identity: &Arc<CacheKey>,
+    selector: &PriorityAggregateManyBuildReport,
+) -> bool {
+    let patterns = selector.patterns();
+    let Some(pattern_bytes) = patterns.iter().try_fold(0_usize, |total, report| {
+        total.checked_add(report.syntax_key.pattern.as_bytes().len())
+    }) else {
+        return false;
+    };
+    let Some(identity_len) = pattern_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(patterns.len()))
+        .and_then(|value| value.checked_add("frewholeliteralq".len()))
+    else {
+        return false;
+    };
+    let Some(source_floor) = identity_len.checked_add(pattern_bytes) else {
+        return false;
+    };
+    let Ok(source_floor) = u64::try_from(source_floor) else {
+        return false;
+    };
+    let slots = match u64::try_from(patterns.len().saturating_add(1)) {
+        Ok(slots) if slots != 0 => slots,
+        _ => return false,
+    };
+    let parser_budget = selector.limits.capture_build.max_whole_literal_parser_work;
+    let Some(remaining) = parser_budget.checked_sub(source_floor) else {
+        return false;
+    };
+    let Ok(identity_bytes) = u64::try_from(identity_len) else {
+        return false;
+    };
+    let Some(share) = remaining.checked_div(slots) else {
+        return false;
+    };
+    let Some(parser_cap) = identity_bytes.checked_add(share) else {
+        return false;
+    };
+    let mut expected_safety = selector.limits.syntax_safety;
+    expected_safety.max_parse_work = expected_safety.max_parse_work.min(parser_cap);
+    let expected_profile = CompatibilityProfile::RustBytes(selector.profile.clone());
+    let Some(first) = patterns.first() else {
+        return false;
+    };
+    if identity.pattern.capacity_bytes() != identity_len
+        || identity.schema_version != first.syntax_key.schema_version
+        || identity.profile != expected_profile
+        || identity.admission != selector.limits.admission
+        || identity.safety != expected_safety
+    {
+        return false;
+    }
+    let mut remaining_source = identity.pattern.as_bytes();
+    let Some(after_prefix) = remaining_source.strip_prefix(b"frewholeliteralq") else {
+        return false;
+    };
+    remaining_source = after_prefix;
+    for report in patterns {
+        let Some((b'z', rest)) = remaining_source.split_first() else {
+            return false;
+        };
+        remaining_source = rest;
+        for &byte in report.syntax_key.pattern.as_bytes() {
+            let Some((&high, rest)) = remaining_source.split_first() else {
+                return false;
+            };
+            let Some((&low, rest)) = rest.split_first() else {
+                return false;
+            };
+            if high != WHOLE_LITERAL_IDENTITY_HEX[usize::from(byte >> 4)]
+                || low != WHOLE_LITERAL_IDENTITY_HEX[usize::from(byte & 0x0F)]
+            {
+                return false;
+            }
+            remaining_source = rest;
+        }
+    }
+    remaining_source.is_empty()
+}
+
+#[derive(Clone, Copy, Debug)]
 struct AggregateCapacityPreflight {
     source_states_limit: usize,
     source_edges_limit: usize,
@@ -2281,6 +3561,400 @@ impl Default for PriorityAggregateManyRunLimits {
     }
 }
 
+/// Whole-operation ceilings for exact capture projection work.
+///
+/// `resources` uses the same named resource fields as one prepared
+/// [`CaptureStreamLimits`]. For a per-match limit, construction and replay
+/// fields are both enforced. For an aggregate limit, replay fields,
+/// `max_matches`, and `max_capture_count` apply to the sum over selected
+/// spans. Whole-session construction storage is independently bounded by
+/// [`PriorityAggregateManyCaptureSessionLimits`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureProjectionLimits {
+    /// Named capture-stream construction and replay ceilings.
+    pub resources: CaptureStreamLimits,
+    /// Maximum live capture-frontier threads over the operation.
+    pub max_peak_threads: usize,
+    /// Maximum dynamic allocations after session preparation.
+    pub max_dynamic_allocations: usize,
+}
+
+impl PriorityAggregateManyCaptureProjectionLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            resources: CaptureStreamLimits {
+                max_source_bytes: usize::MAX,
+                max_states: usize::MAX,
+                max_build_work: usize::MAX,
+                max_persistent_bytes: usize::MAX,
+                max_combined_peak_bytes: usize::MAX,
+                max_allocations: usize::MAX,
+                max_line_domains: usize::MAX,
+                max_searches: usize::MAX,
+                max_matches: usize::MAX,
+                max_bytes_examined: usize::MAX,
+                max_starts_injected: usize::MAX,
+                max_state_visits: usize::MAX,
+                max_tag_actions: usize::MAX,
+                max_history_nodes: usize::MAX,
+                max_history_walk: usize::MAX,
+                max_history_reads: usize::MAX,
+                max_materialization_reads: usize::MAX,
+                max_materialization_writes: usize::MAX,
+                max_materialization_preview_writes: usize::MAX,
+                max_mask_states: usize::MAX,
+                max_mask_word_copies: usize::MAX,
+                max_mask_word_reads: usize::MAX,
+                max_reset_cells: usize::MAX,
+                max_capture_events: usize::MAX,
+                max_capture_count: usize::MAX,
+                max_line_source_reads: usize::MAX,
+                max_work: usize::MAX,
+            },
+            max_peak_threads: usize::MAX,
+            max_dynamic_allocations: 0,
+        }
+    }
+}
+
+impl Default for PriorityAggregateManyCaptureProjectionLimits {
+    fn default() -> Self {
+        Self {
+            resources: CaptureStreamLimits::default(),
+            max_peak_threads: usize::MAX,
+            max_dynamic_allocations: 0,
+        }
+    }
+}
+
+/// One independently limited pre-source capture-session resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PriorityAggregateManyCaptureSessionResource {
+    /// Retained selector-trace, projection-table, and reusable-stream bytes.
+    PersistentBytes,
+    /// Exact selector-session and projection initialization work.
+    BuildWork,
+    /// Setup allocations completed before source access.
+    Allocations,
+}
+
+/// Independently bounded setup envelope for a caller-owned capture session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "each field deliberately mirrors one named pre-source resource ceiling"
+)]
+pub struct PriorityAggregateManyCaptureSessionLimits {
+    /// Maximum retained selector-trace, projection-table, and reusable-stream
+    /// bytes.
+    pub max_persistent_bytes: usize,
+    /// Maximum exact selector-session and projection initialization work.
+    pub max_build_work: usize,
+    /// Maximum setup allocations, all completed before haystack access.
+    pub max_allocations: usize,
+}
+
+impl PriorityAggregateManyCaptureSessionLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_persistent_bytes: usize::MAX,
+            max_build_work: usize::MAX,
+            max_allocations: usize::MAX,
+        }
+    }
+}
+
+impl Default for PriorityAggregateManyCaptureSessionLimits {
+    fn default() -> Self {
+        Self {
+            max_persistent_bytes: 512 << 20,
+            max_build_work: 1 << 30,
+            max_allocations: 1 << 20,
+        }
+    }
+}
+
+/// Exact setup accounting for one prepared multi-pattern capture session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureSessionAccounting {
+    /// Fixed complete-source length bound into every reusable stream.
+    pub source_bytes: usize,
+    /// Number of source ordinals in the shared selector.
+    pub patterns: usize,
+    /// Sidecars that reduce every selected span by fixed cardinality.
+    pub cardinality_sidecars: usize,
+    /// Sidecars retaining an exact frontier and tag workspace.
+    pub replay_workspaces: usize,
+    /// Retained shared-selector trace workspace bytes.
+    pub selector_trace_persistent_bytes: usize,
+    /// Exact shared-selector trace initialization work performed before
+    /// source access. This deliberately excludes any future source scan.
+    pub selector_trace_build_work: usize,
+    /// Shared-selector trace workspace allocations completed at setup.
+    pub selector_trace_allocations: usize,
+    /// Total retained selector-trace, projection-table, and stream storage.
+    pub persistent_bytes: usize,
+    /// Exact selector-session and projection construction work.
+    pub build_work: usize,
+    /// Exact setup allocation count.
+    pub allocations: usize,
+}
+
+impl PriorityAggregateManyCaptureSessionAccounting {
+    #[must_use]
+    pub fn closes(self, limits: PriorityAggregateManyCaptureSessionLimits) -> bool {
+        self.cardinality_sidecars
+            .checked_add(self.replay_workspaces)
+            == Some(self.patterns)
+            && self.selector_trace_persistent_bytes <= self.persistent_bytes
+            && self.selector_trace_build_work <= self.build_work
+            && self.selector_trace_allocations <= self.allocations
+            && self.persistent_bytes <= limits.max_persistent_bytes
+            && self.build_work <= limits.max_build_work
+            && self.allocations <= limits.max_allocations
+    }
+}
+
+/// Limits for one capture-participation reduction driven by the shared
+/// priority selector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureRunLimits {
+    /// Limits for the sole whole-haystack shared tagged-automaton pass.
+    pub selector: PriorityAggregateManyRunLimits,
+    /// Per-selected-span bounds for the exact capture projection.
+    pub capture: CaptureSearchLimits,
+    /// Bound for all session preparation before haystack access.
+    pub session: PriorityAggregateManyCaptureSessionLimits,
+    /// Complete construction and replay ceiling for every selected span.
+    pub per_match_capture: PriorityAggregateManyCaptureProjectionLimits,
+    /// Aggregate capture-sidecar ceiling across the entire operation.
+    pub total_capture: PriorityAggregateManyCaptureProjectionLimits,
+    /// Bound for the one permitted whole-input required-literal pass.
+    pub required_literal: CaptureRequiredLiteralRunLimits,
+    /// Maximum participating groups, including group zero, in the final
+    /// count-only result.
+    pub max_capture_count: u64,
+}
+
+impl PriorityAggregateManyCaptureRunLimits {
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            selector: PriorityAggregateManyRunLimits::unlimited(),
+            capture: CaptureSearchLimits {
+                max_state_visits: usize::MAX,
+                max_slot_copies: usize::MAX,
+                max_history_nodes: usize::MAX,
+                max_history_walk: usize::MAX,
+                max_scratch_bytes: usize::MAX,
+            },
+            session: PriorityAggregateManyCaptureSessionLimits::unlimited(),
+            per_match_capture: PriorityAggregateManyCaptureProjectionLimits::unlimited(),
+            total_capture: PriorityAggregateManyCaptureProjectionLimits::unlimited(),
+            required_literal: CaptureRequiredLiteralRunLimits {
+                max_transitions: usize::MAX,
+            },
+            max_capture_count: u64::MAX,
+        }
+    }
+}
+
+impl Default for PriorityAggregateManyCaptureRunLimits {
+    fn default() -> Self {
+        Self {
+            selector: PriorityAggregateManyRunLimits::default(),
+            capture: CaptureSearchLimits::default(),
+            session: PriorityAggregateManyCaptureSessionLimits::default(),
+            per_match_capture: PriorityAggregateManyCaptureProjectionLimits::default(),
+            total_capture: PriorityAggregateManyCaptureProjectionLimits::default(),
+            required_literal: CaptureRequiredLiteralRunLimits::default(),
+            max_capture_count: u64::MAX,
+        }
+    }
+}
+
+/// Terminal source of a shared-selector capture-count failure.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PriorityAggregateManyCaptureRunFailure {
+    /// The sole shared selector did not complete.
+    Selector(PriorityAggregateManyRunError),
+    /// The selected ordinal was outside the immutable source-sidecar table.
+    PatternOrdinal { ordinal: u32, patterns: usize },
+    /// Exact-capacity caller-owned projection sessions could not be reserved.
+    SessionAllocation { patterns: usize },
+    /// Session setup exceeded one immutable pre-source resource ceiling.
+    SessionLimit {
+        resource: PriorityAggregateManyCaptureSessionResource,
+        required: usize,
+        limit: usize,
+    },
+    /// The one permitted whole-operation required-literal pass refused.
+    RequiredLiteral(CaptureRequiredLiteralSearchError),
+    /// A capture sidecar disagreed with a span selected from the same source
+    /// profile, or exceeded its independently admitted exact replay bounds.
+    Capture {
+        pattern: usize,
+        source: CaptureStreamError,
+    },
+    /// The checked participation sum exceeded the public output limit.
+    CaptureCountLimit { needed: u64, limit: u64 },
+    /// Aggregate exact-projection accounting exceeded a named stream resource.
+    CaptureProjectionLimit {
+        resource: CaptureStreamResource,
+        required: usize,
+        limit: usize,
+    },
+    /// Aggregate exact-projection frontier occupancy exceeded its independent cap.
+    CaptureProjectionPeakThreads { required: usize, limit: usize },
+    /// Prepared projection work unexpectedly allocated after session setup.
+    CaptureProjectionAllocations { required: usize, limit: usize },
+    /// Checked accumulation of capture participation overflowed.
+    ArithmeticOverflow,
+    /// An internally assembled result failed its immutable trace closure.
+    InternalInvariant { detail: &'static str },
+}
+
+impl fmt::Display for PriorityAggregateManyCaptureRunFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selector(source) => write!(formatter, "shared selector: {source}"),
+            Self::PatternOrdinal { ordinal, patterns } => write!(
+                formatter,
+                "shared selector emitted ordinal {ordinal} outside {patterns} capture sidecars"
+            ),
+            Self::SessionAllocation { patterns } => write!(
+                formatter,
+                "could not reserve {patterns} shared capture projection sessions"
+            ),
+            Self::SessionLimit {
+                resource,
+                required,
+                limit,
+            } => write!(
+                formatter,
+                "capture session {resource:?} {required} exceeds limit {limit}"
+            ),
+            Self::RequiredLiteral(source) => write!(formatter, "whole required literal: {source}"),
+            Self::Capture { pattern, source } => {
+                write!(formatter, "capture sidecar {pattern}: {source}")
+            }
+            Self::CaptureCountLimit { needed, limit } => write!(
+                formatter,
+                "capture participation count {needed} exceeds limit {limit}"
+            ),
+            Self::CaptureProjectionLimit {
+                resource,
+                required,
+                limit,
+            } => write!(
+                formatter,
+                "aggregate capture projection {resource:?} {required} exceeds limit {limit}"
+            ),
+            Self::CaptureProjectionPeakThreads { required, limit } => write!(
+                formatter,
+                "aggregate capture projection peak threads {required} exceeds limit {limit}"
+            ),
+            Self::CaptureProjectionAllocations { required, limit } => write!(
+                formatter,
+                "aggregate capture projection allocations {required} exceed limit {limit}"
+            ),
+            Self::ArithmeticOverflow => {
+                formatter.write_str("capture participation arithmetic overflow")
+            }
+            Self::InternalInvariant { detail } => {
+                write!(
+                    formatter,
+                    "shared capture reducer invariant failed: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PriorityAggregateManyCaptureRunFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Selector(source) => Some(source),
+            Self::Capture { source, .. } => Some(source),
+            Self::RequiredLiteral(source) => Some(source),
+            Self::PatternOrdinal { .. }
+            | Self::SessionAllocation { .. }
+            | Self::SessionLimit { .. }
+            | Self::CaptureCountLimit { .. }
+            | Self::CaptureProjectionLimit { .. }
+            | Self::CaptureProjectionPeakThreads { .. }
+            | Self::CaptureProjectionAllocations { .. }
+            | Self::ArithmeticOverflow
+            | Self::InternalInvariant { .. } => None,
+        }
+    }
+}
+
+fn enforce_capture_session_limits(
+    accounting: PriorityAggregateManyCaptureSessionAccounting,
+    limits: PriorityAggregateManyCaptureSessionLimits,
+) -> Result<(), PriorityAggregateManyCaptureRunFailure> {
+    for (resource, required, limit) in [
+        (
+            PriorityAggregateManyCaptureSessionResource::PersistentBytes,
+            accounting.persistent_bytes,
+            limits.max_persistent_bytes,
+        ),
+        (
+            PriorityAggregateManyCaptureSessionResource::BuildWork,
+            accounting.build_work,
+            limits.max_build_work,
+        ),
+        (
+            PriorityAggregateManyCaptureSessionResource::Allocations,
+            accounting.allocations,
+            limits.max_allocations,
+        ),
+    ] {
+        if required > limit {
+            return Err(PriorityAggregateManyCaptureRunFailure::SessionLimit {
+                resource,
+                required,
+                limit,
+            });
+        }
+    }
+    if accounting.closes(limits) {
+        Ok(())
+    } else {
+        Err(PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+            detail: "capture session setup accounting did not close",
+        })
+    }
+}
+
+/// A typed shared-selector capture-count failure with its full immutable
+/// source/limit identity.
+#[derive(Debug)]
+pub struct PriorityAggregateManyCaptureRunError {
+    pub limits: PriorityAggregateManyCaptureRunLimits,
+    pub source: PriorityAggregateManyCaptureRunFailure,
+}
+
+impl fmt::Display for PriorityAggregateManyCaptureRunError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "forced Build-Many capture count: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for PriorityAggregateManyCaptureRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// One terminal forced-run failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriorityAggregateManyRunError {
@@ -2351,6 +4025,10 @@ pub struct PriorityAggregateManyExecutionReceipt {
     prospective: ExecutionProspective,
     actual: ExecutionActual,
     value: u64,
+    /// True only for a caller-owned reusable trace workspace whose setup owns
+    /// the trace allocation while its steady execution reports zero new
+    /// allocations.
+    reused_trace_session: bool,
 }
 
 fn generic_tagged_execution_closes(
@@ -2378,6 +4056,7 @@ fn shared_frontier_tagged_execution_closes(
     stats: TaggedManyStats,
     prospective: ExecutionProspective,
     actual: &ExecutionActual,
+    reused_trace_session: bool,
     depth: usize,
     byte_start: u8,
     byte_end: u8,
@@ -2386,10 +4065,14 @@ fn shared_frontier_tagged_execution_closes(
     let matches = u64::try_from(actual.match_events).ok();
     let source_bytes = u64::try_from(actual.source_bytes).ok();
     let boundaries_work = boundaries.and_then(|value| u64::try_from(value).ok());
-    let traced = match prospective.allocation_attempts {
-        0 => Some(false),
-        1 => Some(true),
-        _ => None,
+    let traced = if reused_trace_session {
+        Some(true)
+    } else {
+        match prospective.allocation_attempts {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
     };
     let expected_scratch = traced.and_then(|trace| {
         if trace {
@@ -2497,6 +4180,13 @@ impl PriorityAggregateManyExecutionReceipt {
         self.value
     }
 
+    /// Whether this receipt ran against caller-owned trace workspace whose
+    /// allocation was admitted during session setup.
+    #[must_use]
+    pub const fn reuses_trace_session(&self) -> bool {
+        self.reused_trace_session
+    }
+
     #[must_use]
     pub fn closes(&self) -> bool {
         let source_boundaries = self.actual.source_bytes.checked_add(1);
@@ -2519,6 +4209,7 @@ impl PriorityAggregateManyExecutionReceipt {
                 self.tagged_stats,
                 self.prospective,
                 &self.actual,
+                self.reused_trace_session,
                 depth,
                 byte_start,
                 byte_end,
@@ -2583,6 +4274,7 @@ impl PriorityAggregateManyExecutionReceipt {
             && self.preparation.prospective.persistent_bytes == self.tagged_stats.persistent_bytes()
             && tagged_preparation_closes_against(self.preparation, PreparationLimits::unlimited())
             && self.actual.allocation_attempts == self.prospective.allocation_attempts
+            && (!self.reused_trace_session || self.prospective.allocation_attempts == 0)
             && output_closes
     }
 }
@@ -2717,6 +4409,1313 @@ impl PriorityAggregateManyCountRegex {
     }
 }
 
+/// Immutable multi-pattern capture-count artifact.
+///
+/// Its `selector` is the same one-owner-tagged automaton used by ordinary
+/// Count. Capture sidecars never search for another start, choose another
+/// pattern, or apply a literal filter: they only project a span/ordinal that
+/// the shared selector has already made irrevocable.
+#[derive(Debug)]
+pub struct PriorityAggregateManyCaptureCountRegex {
+    selector: PriorityAggregateManyCountRegex,
+    captures: Box<[CaptureRegex]>,
+    whole_required_literal: Option<CaptureRequiredLiteralPlan>,
+    whole_required_literal_identity: Arc<CacheKey>,
+    whole_required_literal_receipt: PriorityAggregateManyWholeRequiredLiteralBuildReceipt,
+    construction: PriorityAggregateManyCaptureConstructionAccounting,
+}
+
+/// Complete immutable build receipt for the forced multi-pattern
+/// capture-count artifact.
+///
+/// This is a borrowing view rather than a duplicated graph of reports: the
+/// selector and every capture sidecar retain their original authenticated
+/// receipts, and `closes` cross-checks their exact common ordinal/policy
+/// boundary.
+#[derive(Debug)]
+pub struct PriorityAggregateManyCaptureBuildReport<'a> {
+    selector: &'a PriorityAggregateManyBuildReport,
+    captures: &'a [CaptureRegex],
+    whole_required_literal: Option<&'a CaptureRequiredLiteralPlan>,
+    whole_required_literal_identity: &'a Arc<CacheKey>,
+    whole_required_literal_receipt: &'a PriorityAggregateManyWholeRequiredLiteralBuildReceipt,
+    construction: PriorityAggregateManyCaptureConstructionAccounting,
+}
+
+impl PriorityAggregateManyCaptureBuildReport<'_> {
+    /// The shared ordered-selector receipt.
+    #[must_use]
+    pub const fn selector(&self) -> &PriorityAggregateManyBuildReport {
+        self.selector
+    }
+
+    /// Per-ordinal capture sidecar receipts in source-pattern order.
+    #[must_use]
+    pub fn sidecars(&self) -> impl ExactSizeIterator<Item = &CaptureBuildReport> {
+        self.captures.iter().map(CaptureRegex::build_report)
+    }
+
+    /// The one permitted whole-operation literal-proof disposition.
+    #[must_use]
+    pub const fn whole_required_literal(
+        &self,
+    ) -> &PriorityAggregateManyWholeRequiredLiteralBuildReceipt {
+        self.whole_required_literal_receipt
+    }
+
+    /// Stable parser identity for the one ordered-union proof, retained even
+    /// when the completed analysis publishes the explicit `NoProof` fallback.
+    #[must_use]
+    pub fn whole_required_literal_identity(&self) -> &CacheKey {
+        self.whole_required_literal_identity
+    }
+
+    /// Aggregate sidecar/literal construction accounting.
+    #[must_use]
+    pub const fn construction(&self) -> PriorityAggregateManyCaptureConstructionAccounting {
+        self.construction
+    }
+
+    /// Re-authenticate the selector, all ordinal sidecars, the literal
+    /// disposition, and their common checked construction envelope.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        let selector_limits = self.selector.limits();
+        let limits = selector_limits.capture_build;
+        let base_sidecar_limits = capture_sidecar_limits(limits.sidecar, &selector_limits);
+        let table_bytes = self.captures.len().checked_mul(size_of::<CaptureRegex>());
+        let whole_persistent = whole_required_literal_actual_persistent_bytes(
+            self.whole_required_literal_identity,
+            self.whole_required_literal,
+        );
+        let source_copy_peak = whole_required_literal_source_copy_peak_bytes(
+            self.selector
+                .patterns()
+                .iter()
+                .map(|pattern| pattern.syntax_key.pattern.as_bytes().len()),
+        );
+        let whole_peak = whole_required_literal_actual_peak_bytes(
+            self.whole_required_literal_identity,
+            self.whole_required_literal,
+            self.selector.patterns().len(),
+            source_copy_peak,
+            selector_limits.syntax_safety,
+        );
+        let whole_bridge_allocations = whole_required_literal_direct_bridge_allocations(
+            self.selector.patterns().len(),
+            self.selector
+                .patterns()
+                .iter()
+                .map(|pattern| pattern.syntax_key.pattern.as_bytes().len()),
+        );
+        let mut expected = PriorityAggregateManyCaptureConstructionAccounting {
+            patterns: self.captures.len(),
+            sidecar_persistent_bytes: table_bytes.unwrap_or(usize::MAX),
+            sidecar_build_work: 0,
+            sidecar_peak_bytes: 0,
+            sidecar_table_allocations: usize::from(!self.captures.is_empty()),
+            whole_literal_parser_work: self.whole_required_literal_receipt.parser_work(),
+            whole_literal_planner_work: self.whole_required_literal_receipt.planner_work(),
+            whole_literal_persistent_bytes: whole_persistent.unwrap_or(usize::MAX),
+            whole_literal_peak_bytes: whole_peak.unwrap_or(usize::MAX),
+            whole_literal_bridge_allocations: whole_bridge_allocations.unwrap_or(usize::MAX),
+        };
+        let sidecars_close =
+            self.captures
+                .iter()
+                .zip(self.selector.patterns())
+                .all(|(capture, selector)| {
+                    let report = capture.build_report();
+                    let mut expected_sidecar_limits = base_sidecar_limits;
+                    expected_sidecar_limits.syntax_safety = selector.syntax_key.safety;
+                    let limits_close = capture.build_limits() == expected_sidecar_limits;
+                    let admission_close = report.admission == selector.admission;
+                    let syntax_close = report.syntax == selector.syntax;
+                    let key_close = report.plan_identity.syntax.as_ref() == &selector.syntax_key;
+                    let capacity_close = report.plan_identity.syntax.pattern.capacity_bytes()
+                        == selector.syntax_key.pattern.as_bytes().len();
+                    let literal_close = report.required_literal.is_none()
+                        && report.plan_identity.required_literal.is_none();
+                    limits_close
+                        && admission_close
+                        && syntax_close
+                        && key_close
+                        && capacity_close
+                        && literal_close
+                        && accumulate_capture_sidecar_accounting(&mut expected, report).is_ok()
+                });
+        let selector_closes = self.selector.operation() == PriorityAggregateManyOperation::Count
+            && self.selector.closes()
+            && self.captures.len() == self.selector.patterns().len();
+        let literal_closes = self.whole_required_literal_receipt.closes(
+            self.whole_required_literal,
+            self.whole_required_literal_identity,
+            self.selector,
+        );
+        let construction_closes =
+            expected == self.construction && self.construction.closes(&limits);
+        selector_closes && sidecars_close && literal_closes && construction_closes
+    }
+}
+
+impl PriorityAggregateManyCaptureCountRegex {
+    /// Complete immutable capture artifact receipt, including the shared
+    /// selector, every sidecar, and the one literal-proof disposition.
+    #[must_use]
+    pub fn build_report(&self) -> PriorityAggregateManyCaptureBuildReport<'_> {
+        PriorityAggregateManyCaptureBuildReport {
+            selector: self.selector.build_report(),
+            captures: &self.captures,
+            whole_required_literal: self.whole_required_literal.as_ref(),
+            whole_required_literal_identity: &self.whole_required_literal_identity,
+            whole_required_literal_receipt: &self.whole_required_literal_receipt,
+            construction: self.construction,
+        }
+    }
+
+    /// Shared-selector receipt retained for callers that need only the
+    /// capture-erased tagged automaton construction boundary.
+    #[must_use]
+    pub const fn selector_build_report(&self) -> &PriorityAggregateManyBuildReport {
+        self.selector.build_report()
+    }
+
+    /// Execute an owning selector trace for semantic diagnostics.
+    ///
+    /// This deliberately remains separate from [`Self::count_captures`]: the
+    /// latter consumes a caller-owned reusable trace workspace and performs
+    /// no steady-operation allocation, whereas this diagnostic API returns an
+    /// owned trace vector.
+    pub fn selector_trace(
+        &self,
+        haystack: &[u8],
+        limits: PriorityAggregateManyRunLimits,
+    ) -> Result<PriorityAggregateManyTraceReceipt, PriorityAggregateManyRunError> {
+        self.selector.count_trace(haystack, limits)
+    }
+
+    /// Number of independently compiled capture sidecars, one for every
+    /// source ordinal retained by the tagged selector.
+    #[must_use]
+    pub const fn patterns(&self) -> usize {
+        self.captures.len()
+    }
+
+    /// Capture-sidecar construction report for one source ordinal.
+    #[must_use]
+    pub fn capture_build_report(&self, ordinal: usize) -> Option<&CaptureBuildReport> {
+        self.captures.get(ordinal).map(CaptureRegex::build_report)
+    }
+
+    /// Optional union-HIR proof used once per whole capture operation. `None`
+    /// is a declared conservative fallback (for example, no universal
+    /// required literal or the fixed proof envelope refusing a wide union).
+    #[must_use]
+    pub fn whole_required_literal_build_report(
+        &self,
+    ) -> Option<&CaptureRequiredLiteralBuildReport> {
+        self.whole_required_literal
+            .as_ref()
+            .map(CaptureRequiredLiteralPlan::build_report)
+    }
+
+    /// Authenticated disposition of the one whole-operation literal proof.
+    #[must_use]
+    pub const fn whole_required_literal_build_receipt(
+        &self,
+    ) -> &PriorityAggregateManyWholeRequiredLiteralBuildReceipt {
+        &self.whole_required_literal_receipt
+    }
+
+    /// Aggregate pre-source sidecar/literal construction accounting.
+    #[must_use]
+    pub const fn construction_accounting(
+        &self,
+    ) -> PriorityAggregateManyCaptureConstructionAccounting {
+        self.construction
+    }
+
+    /// Prepare reusable exact-span capture workspaces for one fixed haystack
+    /// size. Construction occurs before source access; repeated calls on the
+    /// returned session reuse each ordinal's frontiers and tag workspace.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::large_types_passed_by_value,
+        reason = "the atomic preflight and construction boundary retains the complete immutable run-limit identity in its returned session"
+    )]
+    pub fn prepare_capture_session(
+        &self,
+        source_bytes: usize,
+        limits: PriorityAggregateManyCaptureRunLimits,
+    ) -> Result<PriorityAggregateManyCaptureSession<'_>, PriorityAggregateManyCaptureRunError> {
+        preflight_run_len(self.selector.build_report(), source_bytes, limits.selector).map_err(
+            |source| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::Selector(source),
+            },
+        )?;
+        let selector_setup = self
+            .selector
+            .plan
+            .trace_session_setup_prospective(source_bytes, limits.selector.execution)
+            .map_err(|source| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::Selector(run_error(
+                    self.selector.build_report(),
+                    limits.selector,
+                    PriorityAggregateManyRunFailure::Execution(source),
+                )),
+            })?;
+        let selector_setup_work =
+            usize::try_from(selector_setup.initialization_work).map_err(|_| {
+                PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                }
+            })?;
+        let table_bytes = self
+            .captures
+            .len()
+            .checked_mul(size_of::<CaptureExactProjectionSession>())
+            .ok_or(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+            })?;
+        let mut accounting = PriorityAggregateManyCaptureSessionAccounting {
+            source_bytes,
+            patterns: self.captures.len(),
+            cardinality_sidecars: 0,
+            replay_workspaces: 0,
+            selector_trace_persistent_bytes: selector_setup.persistent_bytes,
+            selector_trace_build_work: selector_setup_work,
+            selector_trace_allocations: selector_setup.allocation_attempts,
+            persistent_bytes: table_bytes
+                .checked_add(selector_setup.persistent_bytes)
+                .ok_or(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                })?,
+            build_work: self.captures.len().checked_add(selector_setup_work).ok_or(
+                PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                },
+            )?,
+            allocations: usize::from(!self.captures.is_empty())
+                .checked_add(selector_setup.allocation_attempts)
+                .ok_or(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                })?,
+        };
+        for (pattern, sidecar) in self.captures.iter().enumerate() {
+            match sidecar
+                .exact_projection_stream_prospective(
+                    source_bytes,
+                    limits.capture,
+                    limits.per_match_capture.resources,
+                )
+                .map_err(|source| PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::Capture { pattern, source },
+                })? {
+                Some(prospective) => {
+                    accounting.replay_workspaces = accounting
+                        .replay_workspaces
+                        .checked_add(1)
+                        .ok_or(PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        })?;
+                    accounting.persistent_bytes = accounting
+                        .persistent_bytes
+                        .checked_add(prospective.allocator_bytes)
+                        .ok_or(PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        })?;
+                    accounting.build_work = accounting
+                        .build_work
+                        .checked_add(prospective.build_work)
+                        .ok_or(PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        })?;
+                    accounting.allocations = accounting
+                        .allocations
+                        .checked_add(prospective.allocations)
+                        .ok_or(PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        })?;
+                }
+                None => {
+                    accounting.cardinality_sidecars = accounting
+                        .cardinality_sidecars
+                        .checked_add(1)
+                        .ok_or(PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        })?;
+                }
+            }
+        }
+        enforce_capture_session_limits(accounting, limits.session)
+            .map_err(|source| PriorityAggregateManyCaptureRunError { limits, source })?;
+        let selector_trace = self
+            .selector
+            .plan
+            .prepare_trace_session(source_bytes, limits.selector.execution)
+            .map_err(|source| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::Selector(run_error(
+                    self.selector.build_report(),
+                    limits.selector,
+                    PriorityAggregateManyRunFailure::Execution(source),
+                )),
+            })?;
+        if !selector_setup.closes() || selector_trace.setup_prospective_receipt() != selector_setup
+        {
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "capture selector session diverged from preflight envelope",
+                },
+            });
+        }
+        let mut projections = Vec::new();
+        projections
+            .try_reserve_exact(self.captures.len())
+            .map_err(|_| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::SessionAllocation {
+                    patterns: self.captures.len(),
+                },
+            })?;
+        for (pattern, sidecar) in self.captures.iter().enumerate() {
+            let projection = sidecar
+                .prepare_exact_projection_session(
+                    source_bytes,
+                    limits.capture,
+                    limits.per_match_capture.resources,
+                )
+                .map_err(|source| PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::Capture { pattern, source },
+                })?;
+            let expected = sidecar
+                .exact_projection_stream_prospective(
+                    source_bytes,
+                    limits.capture,
+                    limits.per_match_capture.resources,
+                )
+                .map_err(|source| PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::Capture { pattern, source },
+                })?;
+            if projection.stream_prospective() != expected {
+                return Err(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                        detail: "capture projection session diverged from preflight envelope",
+                    },
+                });
+            }
+            projections.push(projection);
+        }
+        if projections.len() != self.captures.len() || projections.capacity() != self.captures.len()
+        {
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "capture projection session table lost its source ordinal shape",
+                },
+            });
+        }
+        let required_literal_identity = self
+            .whole_required_literal
+            .as_ref()
+            .map(|plan| plan.candidate_cache_identity(limits.required_literal));
+        Ok(PriorityAggregateManyCaptureSession {
+            artifact: self,
+            selector_trace,
+            selector_setup,
+            projections: projections.into_boxed_slice(),
+            source_bytes,
+            limits,
+            accounting,
+            required_literal_identity,
+        })
+    }
+
+    /// Count participating groups, including group zero, for every selected
+    /// non-overlapping match.
+    ///
+    /// The method executes exactly one whole-haystack shared tagged automaton
+    /// pass. Its trace fixes the source ordinal and prioritized span before a
+    /// sidecar projects capture participation as a fixed cardinality, a
+    /// quotient mask, or exact persistent history.
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the returned reusable session retains the complete immutable run-limit identity"
+    )]
+    pub fn count_captures(
+        &self,
+        haystack: &[u8],
+        limits: PriorityAggregateManyCaptureRunLimits,
+    ) -> Result<PriorityAggregateManyCaptureCountResult, PriorityAggregateManyCaptureRunError> {
+        self.prepare_capture_session(haystack.len(), limits)?
+            .count_captures(haystack)
+    }
+}
+
+/// Caller-owned reusable capture projection session for one immutable shared
+/// selector and fixed haystack length. The selector remains the sole
+/// whole-input priority pass; this session only projects spans it selected.
+#[derive(Debug)]
+pub struct PriorityAggregateManyCaptureSession<'a> {
+    artifact: &'a PriorityAggregateManyCaptureCountRegex,
+    selector_trace: TaggedManyTraceSession<'a, DirectCount>,
+    selector_setup: TaggedManyTraceSessionSetupProspective,
+    projections: Box<[CaptureExactProjectionSession]>,
+    source_bytes: usize,
+    limits: PriorityAggregateManyCaptureRunLimits,
+    accounting: PriorityAggregateManyCaptureSessionAccounting,
+    required_literal_identity: Option<CaptureRequiredLiteralCacheIdentity>,
+}
+
+impl PriorityAggregateManyCaptureSession<'_> {
+    /// Immutable pre-source setup receipt for the reusable workspace table.
+    #[must_use]
+    pub const fn accounting(&self) -> PriorityAggregateManyCaptureSessionAccounting {
+        self.accounting
+    }
+
+    /// Run the shared selector and project every selected span through the
+    /// already-admitted ordinal workspace table.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one operation retains the whole-input literal gate, selector, per-ordinal projection, and closed aggregate receipt together"
+    )]
+    pub fn count_captures(
+        &mut self,
+        haystack: &[u8],
+    ) -> Result<PriorityAggregateManyCaptureCountResult, PriorityAggregateManyCaptureRunError> {
+        let limits = self.limits;
+        if haystack.len() != self.source_bytes {
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "capture session haystack length differs from its admitted workspace",
+                },
+            });
+        }
+        let required_literal = self
+            .artifact
+            .whole_required_literal
+            .as_ref()
+            .map(|plan| plan.is_candidate(haystack, limits.required_literal))
+            .transpose()
+            .map_err(|source| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::RequiredLiteral(source),
+            })?;
+        if required_literal
+            .as_ref()
+            .is_some_and(|report| !report.candidate)
+        {
+            let result = PriorityAggregateManyCaptureCountResult {
+                value: 0,
+                matches: 0,
+                cardinality_matches: 0,
+                mask_matches: 0,
+                persistent_history_matches: 0,
+                capture_accounting: CaptureStreamAccounting::default(),
+                capture_projection_limits: limits.total_capture,
+                required_literal_limits: limits.required_literal,
+                limits,
+                session_accounting: self.accounting,
+                selector_setup: self.selector_setup,
+                per_match_projection: PriorityAggregateManyCaptureProjectionReceipt::default(),
+                required_literal_identity: self.required_literal_identity.clone(),
+                required_literal,
+                selector_skipped_by_required_literal: true,
+                selector_receipt: None,
+                trace: None,
+            };
+            if result.closes() {
+                return Ok(result);
+            }
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "negative whole-operation literal gate did not close",
+                },
+            });
+        }
+        let trace = self
+            .selector_trace
+            .execute_trace(haystack)
+            .map_err(|source| PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::Selector(run_error(
+                    self.artifact.selector.build_report(),
+                    limits.selector,
+                    PriorityAggregateManyRunFailure::Execution(source),
+                )),
+            })?;
+        let selector_execution = finish_trace_session_run(
+            self.artifact.selector.build_report(),
+            limits.selector,
+            trace.report(),
+            |report| *report.output(),
+        )
+        .map_err(|source| PriorityAggregateManyCaptureRunError {
+            limits,
+            source: PriorityAggregateManyCaptureRunFailure::Selector(source),
+        })?;
+        let selector_receipt = PriorityAggregateManyCaptureSelectorReceipt {
+            execution: selector_execution,
+            setup: trace.setup_prospective_receipt(),
+            trace_capacity: trace.trace_capacity(),
+        };
+        if !trace.closes() || !selector_receipt.closes() {
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "capture selector session receipt did not close",
+                },
+            });
+        }
+        let mut value = 0_u64;
+        let mut cardinality_matches = 0_u64;
+        let mut mask_matches = 0_u64;
+        let mut persistent_history_matches = 0_u64;
+        let mut capture_accounting = CaptureStreamAccounting::default();
+        let mut projection_matches = 0_u64;
+        let mut per_match_projection = PriorityAggregateManyCaptureProjectionReceipt::default();
+
+        for selected in trace.matches() {
+            let ordinal = selected.ordinal().get();
+            let pattern =
+                usize::try_from(ordinal).map_err(|_| PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::PatternOrdinal {
+                        ordinal,
+                        patterns: self.projections.len(),
+                    },
+                })?;
+            let Some(projection_session) = self.projections.get_mut(pattern) else {
+                return Err(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::PatternOrdinal {
+                        ordinal,
+                        patterns: self.projections.len(),
+                    },
+                });
+            };
+            let (projection, accounting) = projection_session
+                .project(
+                    haystack,
+                    CaptureSpan {
+                        start: selected.start(),
+                        end: selected.end(),
+                    },
+                )
+                .map_err(|source| PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::Capture { pattern, source },
+                })?;
+            let entries = projection.entries();
+            enforce_capture_projection_limits(accounting, 1, entries, limits.per_match_capture)
+                .map_err(|source| PriorityAggregateManyCaptureRunError { limits, source })?;
+            per_match_projection
+                .record(accounting, entries)
+                .map_err(|source| PriorityAggregateManyCaptureRunError { limits, source })?;
+            accumulate_capture_projection_accounting(&mut capture_accounting, accounting)
+                .map_err(|source| PriorityAggregateManyCaptureRunError { limits, source })?;
+            projection_matches =
+                projection_matches
+                    .checked_add(1)
+                    .ok_or(PriorityAggregateManyCaptureRunError {
+                        limits,
+                        source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                    })?;
+            enforce_capture_projection_limits(
+                capture_accounting,
+                projection_matches,
+                value
+                    .checked_add(entries)
+                    .ok_or(PriorityAggregateManyCaptureRunError {
+                        limits,
+                        source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                    })?,
+                limits.total_capture,
+            )
+            .map_err(|source| PriorityAggregateManyCaptureRunError { limits, source })?;
+            value = value
+                .checked_add(entries)
+                .ok_or(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                })?;
+            if value > limits.max_capture_count {
+                return Err(PriorityAggregateManyCaptureRunError {
+                    limits,
+                    source: PriorityAggregateManyCaptureRunFailure::CaptureCountLimit {
+                        needed: value,
+                        limit: limits.max_capture_count,
+                    },
+                });
+            }
+            match projection {
+                ExactCaptureParticipation::Cardinality(_) => {
+                    cardinality_matches = cardinality_matches.checked_add(1).ok_or(
+                        PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        },
+                    )?;
+                }
+                ExactCaptureParticipation::MaskCount(_) => {
+                    mask_matches = mask_matches.checked_add(1).ok_or(
+                        PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        },
+                    )?;
+                }
+                ExactCaptureParticipation::PersistentHistory(_) => {
+                    persistent_history_matches = persistent_history_matches.checked_add(1).ok_or(
+                        PriorityAggregateManyCaptureRunError {
+                            limits,
+                            source: PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow,
+                        },
+                    )?;
+                }
+            }
+        }
+        let result = PriorityAggregateManyCaptureCountResult {
+            value,
+            matches: selector_receipt.execution().value(),
+            cardinality_matches,
+            mask_matches,
+            persistent_history_matches,
+            capture_accounting,
+            capture_projection_limits: limits.total_capture,
+            required_literal_limits: limits.required_literal,
+            limits,
+            session_accounting: self.accounting,
+            selector_setup: self.selector_setup,
+            per_match_projection,
+            required_literal_identity: self.required_literal_identity.clone(),
+            required_literal,
+            selector_skipped_by_required_literal: false,
+            selector_receipt: Some(selector_receipt),
+            trace: None,
+        };
+        if !result.closes() {
+            return Err(PriorityAggregateManyCaptureRunError {
+                limits,
+                source: PriorityAggregateManyCaptureRunFailure::InternalInvariant {
+                    detail: "capture participation result did not close its shared trace",
+                },
+            });
+        }
+        Ok(result)
+    }
+}
+
+fn accumulate_capture_projection_accounting(
+    total: &mut CaptureStreamAccounting,
+    delta: CaptureStreamAccounting,
+) -> Result<(), PriorityAggregateManyCaptureRunFailure> {
+    macro_rules! add {
+        ($field:ident) => {
+            total.$field = total
+                .$field
+                .checked_add(delta.$field)
+                .ok_or(PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow)?;
+        };
+    }
+    add!(line_domains);
+    add!(searches);
+    add!(state_visits);
+    add!(tag_actions);
+    add!(history_nodes);
+    add!(history_walk);
+    add!(history_reads);
+    add!(materialization_reads);
+    add!(materialization_writes);
+    add!(materialization_preview_writes);
+    add!(mask_states);
+    add!(mask_word_copies);
+    add!(mask_word_reads);
+    add!(reset_cells);
+    add!(capture_events);
+    add!(line_source_reads);
+    add!(bytes_examined);
+    add!(starts_injected);
+    add!(work);
+    add!(allocations);
+    total.peak_threads = total.peak_threads.max(delta.peak_threads);
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "every independently named projection resource is checked together at the one closed enforcement boundary"
+)]
+fn enforce_capture_projection_limits(
+    accounting: CaptureStreamAccounting,
+    matches: u64,
+    capture_count: u64,
+    limits: PriorityAggregateManyCaptureProjectionLimits,
+) -> Result<(), PriorityAggregateManyCaptureRunFailure> {
+    let matches = usize::try_from(matches)
+        .map_err(|_| PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow)?;
+    let capture_count = usize::try_from(capture_count)
+        .map_err(|_| PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow)?;
+    macro_rules! check {
+        ($resource:expr, $actual:expr, $limit:expr) => {
+            if $actual > $limit {
+                return Err(
+                    PriorityAggregateManyCaptureRunFailure::CaptureProjectionLimit {
+                        resource: $resource,
+                        required: $actual,
+                        limit: $limit,
+                    },
+                );
+            }
+        };
+    }
+    let resources = limits.resources;
+    check!(
+        CaptureStreamResource::LineDomains,
+        accounting.line_domains,
+        resources.max_line_domains
+    );
+    check!(
+        CaptureStreamResource::Searches,
+        accounting.searches,
+        resources.max_searches
+    );
+    check!(
+        CaptureStreamResource::Matches,
+        matches,
+        resources.max_matches
+    );
+    check!(
+        CaptureStreamResource::CaptureCount,
+        capture_count,
+        resources.max_capture_count
+    );
+    check!(
+        CaptureStreamResource::BytesExamined,
+        accounting.bytes_examined,
+        resources.max_bytes_examined
+    );
+    check!(
+        CaptureStreamResource::StartsInjected,
+        accounting.starts_injected,
+        resources.max_starts_injected
+    );
+    check!(
+        CaptureStreamResource::StateVisits,
+        accounting.state_visits,
+        resources.max_state_visits
+    );
+    check!(
+        CaptureStreamResource::TagActions,
+        accounting.tag_actions,
+        resources.max_tag_actions
+    );
+    check!(
+        CaptureStreamResource::HistoryNodes,
+        accounting.history_nodes,
+        resources.max_history_nodes
+    );
+    check!(
+        CaptureStreamResource::HistoryWalk,
+        accounting.history_walk,
+        resources.max_history_walk
+    );
+    check!(
+        CaptureStreamResource::HistoryReads,
+        accounting.history_reads,
+        resources.max_history_reads
+    );
+    check!(
+        CaptureStreamResource::MaterializationReads,
+        accounting.materialization_reads,
+        resources.max_materialization_reads
+    );
+    check!(
+        CaptureStreamResource::MaterializationWrites,
+        accounting.materialization_writes,
+        resources.max_materialization_writes
+    );
+    check!(
+        CaptureStreamResource::MaterializationPreviewWrites,
+        accounting.materialization_preview_writes,
+        resources.max_materialization_preview_writes
+    );
+    check!(
+        CaptureStreamResource::MaskStates,
+        accounting.mask_states,
+        resources.max_mask_states
+    );
+    check!(
+        CaptureStreamResource::MaskWordCopies,
+        accounting.mask_word_copies,
+        resources.max_mask_word_copies
+    );
+    check!(
+        CaptureStreamResource::MaskWordReads,
+        accounting.mask_word_reads,
+        resources.max_mask_word_reads
+    );
+    check!(
+        CaptureStreamResource::ResetCells,
+        accounting.reset_cells,
+        resources.max_reset_cells
+    );
+    check!(
+        CaptureStreamResource::CaptureEvents,
+        accounting.capture_events,
+        resources.max_capture_events
+    );
+    check!(
+        CaptureStreamResource::LineSourceReads,
+        accounting.line_source_reads,
+        resources.max_line_source_reads
+    );
+    check!(
+        CaptureStreamResource::Work,
+        accounting.work,
+        resources.max_work
+    );
+    if accounting.peak_threads > limits.max_peak_threads {
+        return Err(
+            PriorityAggregateManyCaptureRunFailure::CaptureProjectionPeakThreads {
+                required: accounting.peak_threads,
+                limit: limits.max_peak_threads,
+            },
+        );
+    }
+    if accounting.allocations > limits.max_dynamic_allocations {
+        return Err(
+            PriorityAggregateManyCaptureRunFailure::CaptureProjectionAllocations {
+                required: accounting.allocations,
+                limit: limits.max_dynamic_allocations,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Compact allocation-free steady selector receipt retained by a capture
+/// result. The ordinal/span trace itself remains in the caller-owned session
+/// workspace and is consumed before this value is returned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureSelectorReceipt {
+    execution: PriorityAggregateManyExecutionReceipt,
+    setup: TaggedManyTraceSessionSetupProspective,
+    trace_capacity: usize,
+}
+
+impl PriorityAggregateManyCaptureSelectorReceipt {
+    /// Shared selector execution receipt for this steady operation.
+    #[must_use]
+    pub const fn execution(&self) -> &PriorityAggregateManyExecutionReceipt {
+        &self.execution
+    }
+
+    /// One-time trace-workspace envelope admitted during session preparation.
+    #[must_use]
+    pub const fn setup_prospective(&self) -> ExecutionProspective {
+        self.setup.steady_traced_prospective
+    }
+
+    /// Exact preparation receipt for the caller-owned trace workspace.
+    #[must_use]
+    pub const fn setup(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.setup
+    }
+
+    /// Exact ordinal trace capacity retained by the caller-owned session.
+    #[must_use]
+    pub const fn trace_capacity(&self) -> usize {
+        self.trace_capacity
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.setup.closes()
+            && self.execution.closes()
+            && self.execution.reuses_trace_session()
+            && self.execution.prospective() == self.setup.steady_traced_prospective
+            && self.execution.actual().allocation_attempts == 0
+            && self.trace_capacity == self.setup.trace_capacity
+            && self.execution.actual().match_events <= self.trace_capacity
+    }
+}
+
+fn selector_setup_accounting_closes(
+    accounting: PriorityAggregateManyCaptureSessionAccounting,
+    setup: &TaggedManyTraceSessionSetupProspective,
+) -> bool {
+    setup.closes()
+        && accounting.selector_trace_persistent_bytes == setup.persistent_bytes
+        && usize::try_from(setup.initialization_work).ok()
+            == Some(accounting.selector_trace_build_work)
+        && accounting.selector_trace_allocations == setup.allocation_attempts
+        && accounting.source_bytes == setup.source_bytes
+        && accounting.source_bytes.checked_add(1)
+            == Some(setup.steady_traced_prospective.boundary_rows)
+}
+
+fn selector_session_accounting_closes(
+    accounting: PriorityAggregateManyCaptureSessionAccounting,
+    selector: &PriorityAggregateManyCaptureSelectorReceipt,
+) -> bool {
+    selector_setup_accounting_closes(accounting, &selector.setup())
+}
+
+fn required_literal_search_closes(
+    expected: Option<&CaptureRequiredLiteralCacheIdentity>,
+    report: Option<&CaptureRequiredLiteralSearchReport>,
+    source_bytes: usize,
+    limits: CaptureRequiredLiteralRunLimits,
+) -> bool {
+    match (expected, report) {
+        (None, None) => true,
+        (Some(expected), Some(report)) => {
+            expected.operation == CaptureRequiredLiteralSearchOperation::CandidateV1
+                && expected.run_limits == limits
+                && report.identity == *expected
+                && report.identity.operation == CaptureRequiredLiteralSearchOperation::CandidateV1
+                && report.identity.run_limits == limits
+                && report.accounting.searched_bytes == source_bytes
+                && source_bytes.checked_add(1) == Some(report.accounting.transitions_upper_bound)
+                && report.accounting.transitions_upper_bound <= limits.max_transitions
+                && report.accounting.scratch_bytes == 0
+        }
+        _ => false,
+    }
+}
+
+/// Exact sealed maxima for the individual ordinal projections contributing to
+/// one capture-count operation.
+///
+/// The aggregate capture accounting is not sufficient to prove a caller's
+/// per-match limit identity. This compact receipt retains a componentwise
+/// maximum and the largest participation contribution without storing an
+/// allocation-backed record for every selected span.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureProjectionReceipt {
+    /// Number of spans projected by the already-selected shared trace.
+    pub matches: u64,
+    /// Sum of participation entries; it must equal the public result value.
+    pub entries: u64,
+    /// Componentwise maximum capture-stream accounting for one projection.
+    pub maximum_accounting: CaptureStreamAccounting,
+    /// Largest participating-group contribution from one selected span.
+    pub maximum_entries: u64,
+}
+
+impl PriorityAggregateManyCaptureProjectionReceipt {
+    fn record(
+        &mut self,
+        accounting: CaptureStreamAccounting,
+        entries: u64,
+    ) -> Result<(), PriorityAggregateManyCaptureRunFailure> {
+        self.matches = self
+            .matches
+            .checked_add(1)
+            .ok_or(PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow)?;
+        self.entries = self
+            .entries
+            .checked_add(entries)
+            .ok_or(PriorityAggregateManyCaptureRunFailure::ArithmeticOverflow)?;
+        self.maximum_entries = self.maximum_entries.max(entries);
+        macro_rules! max {
+            ($field:ident) => {
+                self.maximum_accounting.$field =
+                    self.maximum_accounting.$field.max(accounting.$field);
+            };
+        }
+        max!(line_domains);
+        max!(searches);
+        max!(state_visits);
+        max!(tag_actions);
+        max!(history_nodes);
+        max!(history_walk);
+        max!(history_reads);
+        max!(materialization_reads);
+        max!(materialization_writes);
+        max!(materialization_preview_writes);
+        max!(mask_states);
+        max!(mask_word_copies);
+        max!(mask_word_reads);
+        max!(reset_cells);
+        max!(capture_events);
+        max!(line_source_reads);
+        max!(bytes_examined);
+        max!(starts_injected);
+        max!(work);
+        max!(allocations);
+        max!(peak_threads);
+        Ok(())
+    }
+
+    fn closes(
+        self,
+        aggregate: CaptureStreamAccounting,
+        limits: PriorityAggregateManyCaptureProjectionLimits,
+    ) -> bool {
+        let matches = u64::from(self.matches != 0);
+        let empty_closes = self.matches != 0
+            || (self.entries == 0
+                && self.maximum_entries == 0
+                && self.maximum_accounting == CaptureStreamAccounting::default());
+        let maximum_within_aggregate = {
+            let maximum = self.maximum_accounting;
+            maximum.line_domains <= aggregate.line_domains
+                && maximum.searches <= aggregate.searches
+                && maximum.state_visits <= aggregate.state_visits
+                && maximum.tag_actions <= aggregate.tag_actions
+                && maximum.history_nodes <= aggregate.history_nodes
+                && maximum.history_walk <= aggregate.history_walk
+                && maximum.history_reads <= aggregate.history_reads
+                && maximum.materialization_reads <= aggregate.materialization_reads
+                && maximum.materialization_writes <= aggregate.materialization_writes
+                && maximum.materialization_preview_writes
+                    <= aggregate.materialization_preview_writes
+                && maximum.mask_states <= aggregate.mask_states
+                && maximum.mask_word_copies <= aggregate.mask_word_copies
+                && maximum.mask_word_reads <= aggregate.mask_word_reads
+                && maximum.reset_cells <= aggregate.reset_cells
+                && maximum.capture_events <= aggregate.capture_events
+                && maximum.line_source_reads <= aggregate.line_source_reads
+                && maximum.bytes_examined <= aggregate.bytes_examined
+                && maximum.starts_injected <= aggregate.starts_injected
+                && maximum.work <= aggregate.work
+                && maximum.allocations <= aggregate.allocations
+                && maximum.peak_threads == aggregate.peak_threads
+        };
+        empty_closes
+            && self.maximum_entries <= self.entries
+            && maximum_within_aggregate
+            && enforce_capture_projection_limits(
+                self.maximum_accounting,
+                matches,
+                self.maximum_entries,
+                limits,
+            )
+            .is_ok()
+    }
+}
+
+/// Capture-count result and the single shared selection trace that drove it.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PriorityAggregateManyCaptureCountResult {
+    value: u64,
+    matches: u64,
+    cardinality_matches: u64,
+    mask_matches: u64,
+    persistent_history_matches: u64,
+    capture_accounting: CaptureStreamAccounting,
+    capture_projection_limits: PriorityAggregateManyCaptureProjectionLimits,
+    required_literal_limits: CaptureRequiredLiteralRunLimits,
+    limits: PriorityAggregateManyCaptureRunLimits,
+    session_accounting: PriorityAggregateManyCaptureSessionAccounting,
+    selector_setup: TaggedManyTraceSessionSetupProspective,
+    per_match_projection: PriorityAggregateManyCaptureProjectionReceipt,
+    required_literal_identity: Option<CaptureRequiredLiteralCacheIdentity>,
+    required_literal: Option<CaptureRequiredLiteralSearchReport>,
+    selector_skipped_by_required_literal: bool,
+    selector_receipt: Option<PriorityAggregateManyCaptureSelectorReceipt>,
+    /// Legacy one-shot diagnostic trace. Steady capture sessions deliberately
+    /// leave this empty because their ordinal buffer remains caller-owned.
+    trace: Option<PriorityAggregateManyTraceReceipt>,
+}
+
+impl PriorityAggregateManyCaptureCountResult {
+    /// Participating groups, including group zero, over all selected matches.
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Number of matches selected by the shared tagged automaton.
+    #[must_use]
+    pub const fn matches(&self) -> u64 {
+        self.matches
+    }
+
+    /// Matches reduced directly by a proved fixed cardinality.
+    #[must_use]
+    pub const fn cardinality_matches(&self) -> u64 {
+        self.cardinality_matches
+    }
+
+    /// Matches reduced by the fixed participation mask quotient.
+    #[must_use]
+    pub const fn mask_matches(&self) -> u64 {
+        self.mask_matches
+    }
+
+    /// Matches whose genuine ambiguity required persistent history.
+    #[must_use]
+    pub const fn persistent_history_matches(&self) -> u64 {
+        self.persistent_history_matches
+    }
+
+    /// Exact aggregate of all reusable sidecar replay counters. The selector
+    /// has a separate immutable execution receipt; this value contains only
+    /// capture projection work and must report zero dynamic allocations.
+    #[must_use]
+    pub const fn capture_accounting(&self) -> CaptureStreamAccounting {
+        self.capture_accounting
+    }
+
+    /// Complete immutable run-limit identity used by this result.
+    #[must_use]
+    pub const fn limits(&self) -> PriorityAggregateManyCaptureRunLimits {
+        self.limits
+    }
+
+    /// The pre-source reusable selector/capture workspace envelope that
+    /// admitted this operation.
+    #[must_use]
+    pub const fn session_accounting(&self) -> PriorityAggregateManyCaptureSessionAccounting {
+        self.session_accounting
+    }
+
+    /// One-time selector trace-workspace envelope retained by the session,
+    /// including the allocations deliberately absent from steady runs.
+    #[must_use]
+    pub const fn selector_setup_prospective(&self) -> ExecutionProspective {
+        self.selector_setup.steady_traced_prospective
+    }
+
+    /// Exact one-time selector-session accounting, distinct from the
+    /// allocation-free steady operation prospective.
+    #[must_use]
+    pub const fn selector_setup(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.selector_setup
+    }
+
+    /// Sealed per-projection maxima used to re-authenticate the independent
+    /// per-match capture limit identity.
+    #[must_use]
+    pub const fn per_match_projection(&self) -> PriorityAggregateManyCaptureProjectionReceipt {
+        self.per_match_projection
+    }
+
+    /// Whether the optional whole-operation required-literal proof ran and
+    /// found any candidate byte sequence.
+    #[must_use]
+    pub const fn required_literal_candidate(&self) -> Option<bool> {
+        match self.required_literal.as_ref() {
+            Some(report) => Some(report.candidate),
+            None => None,
+        }
+    }
+
+    /// A negative union literal proof is the only case that skips the shared
+    /// selector. All other runs retain a complete selector trace.
+    #[must_use]
+    pub const fn selector_skipped_by_required_literal(&self) -> bool {
+        self.selector_skipped_by_required_literal
+    }
+
+    /// The sole shared ordinal/span selection pass.
+    #[must_use]
+    pub const fn trace(&self) -> Option<&PriorityAggregateManyTraceReceipt> {
+        self.trace.as_ref()
+    }
+
+    /// Allocation-free steady selector receipt. Its trace was consumed while
+    /// projecting captures and remains in the reusable session workspace.
+    #[must_use]
+    pub const fn selector_receipt(&self) -> Option<&PriorityAggregateManyCaptureSelectorReceipt> {
+        self.selector_receipt.as_ref()
+    }
+
+    /// Check that the branch partition and output agree with the immutable
+    /// shared trace. Individual capture projections are checked before they
+    /// contribute to this result, so this closure remains O(1).
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        let branches = self
+            .cardinality_matches
+            .checked_add(self.mask_matches)
+            .and_then(|count| count.checked_add(self.persistent_history_matches));
+        let selector_closes = match (
+            &self.selector_receipt,
+            &self.required_literal,
+            self.selector_skipped_by_required_literal,
+        ) {
+            (Some(selector), Some(literal), false) => {
+                required_literal_search_closes(
+                    self.required_literal_identity.as_ref(),
+                    Some(literal),
+                    self.session_accounting.source_bytes,
+                    self.required_literal_limits,
+                ) && literal.candidate
+                    && selector.closes()
+                    && selector_session_accounting_closes(self.session_accounting, selector)
+                    && self.selector_setup == selector.setup()
+                    && self.matches == selector.execution().value()
+            }
+            (Some(selector), None, false) => {
+                required_literal_search_closes(
+                    self.required_literal_identity.as_ref(),
+                    None,
+                    self.session_accounting.source_bytes,
+                    self.required_literal_limits,
+                ) && selector.closes()
+                    && selector_session_accounting_closes(self.session_accounting, selector)
+                    && self.selector_setup == selector.setup()
+                    && self.matches == selector.execution().value()
+            }
+            (None, Some(literal), true) => {
+                required_literal_search_closes(
+                    self.required_literal_identity.as_ref(),
+                    Some(literal),
+                    self.session_accounting.source_bytes,
+                    self.required_literal_limits,
+                ) && !literal.candidate
+                    && self.matches == 0
+                    && self.value == 0
+            }
+            _ => false,
+        };
+        selector_closes
+            && self.trace.is_none()
+            && branches == Some(self.matches)
+            && self.value >= self.matches
+            && self.capture_projection_limits == self.limits.total_capture
+            && self.required_literal_limits == self.limits.required_literal
+            && self.session_accounting.closes(self.limits.session)
+            && selector_setup_accounting_closes(self.session_accounting, &self.selector_setup)
+            && self.per_match_projection.matches == self.matches
+            && self.per_match_projection.entries == self.value
+            && self
+                .per_match_projection
+                .closes(self.capture_accounting, self.limits.per_match_capture)
+            && enforce_capture_projection_limits(
+                self.capture_accounting,
+                self.matches,
+                self.value,
+                self.capture_projection_limits,
+            )
+            .is_ok()
+    }
+}
+
 /// Explicit forced `SpanSum` artifact.
 #[derive(Debug)]
 pub struct PriorityAggregateManySpanSumRegex {
@@ -2830,6 +5829,14 @@ fn preflight_run(
     haystack: &[u8],
     limits: PriorityAggregateManyRunLimits,
 ) -> Result<(), PriorityAggregateManyRunError> {
+    preflight_run_len(build, haystack.len(), limits)
+}
+
+fn preflight_run_len(
+    build: &PriorityAggregateManyBuildReport,
+    source_bytes: usize,
+    limits: PriorityAggregateManyRunLimits,
+) -> Result<(), PriorityAggregateManyRunError> {
     // Publication performed the full, prepaid receipt closure exactly once.
     // The owned artifact is immutable thereafter, so execution needs only the
     // sealed O(1) bit rather than a fresh O(patterns) metadata traversal.
@@ -2841,11 +5848,10 @@ fn preflight_run(
         ));
     }
     let needed = match build.operation {
-        PriorityAggregateManyOperation::Count => haystack
-            .len()
+        PriorityAggregateManyOperation::Count => source_bytes
             .checked_add(1)
             .and_then(|value| u64::try_from(value).ok()),
-        PriorityAggregateManyOperation::SpanSum => u64::try_from(haystack.len()).ok(),
+        PriorityAggregateManyOperation::SpanSum => u64::try_from(source_bytes).ok(),
     }
     .ok_or_else(|| {
         run_error(
@@ -2888,6 +5894,7 @@ where
         prospective: report.prospective(),
         actual: report.actual(),
         value: value(report),
+        reused_trace_session: false,
     };
     if !receipt.closes() {
         return Err(run_error(
@@ -2895,6 +5902,39 @@ where
             limits,
             PriorityAggregateManyRunFailure::Execution(ReduceError::InternalInvariant {
                 detail: "forced Build-Many execution receipt did not close",
+            }),
+        ));
+    }
+    Ok(receipt)
+}
+
+fn finish_trace_session_run<F>(
+    build: &PriorityAggregateManyBuildReport,
+    limits: PriorityAggregateManyRunLimits,
+    report: &DirectReduceReport<u64>,
+    value: F,
+) -> Result<PriorityAggregateManyExecutionReceipt, PriorityAggregateManyRunError>
+where
+    F: FnOnce(&DirectReduceReport<u64>) -> u64,
+{
+    let receipt = PriorityAggregateManyExecutionReceipt {
+        schema_version: PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION,
+        accounting_id: PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID,
+        operation: build.operation,
+        execution: build.execution,
+        preparation: build.preparation,
+        tagged_stats: build.automaton,
+        prospective: report.prospective(),
+        actual: report.actual(),
+        value: value(report),
+        reused_trace_session: true,
+    };
+    if !receipt.closes() {
+        return Err(run_error(
+            build,
+            limits,
+            PriorityAggregateManyRunFailure::Execution(ReduceError::InternalInvariant {
+                detail: "forced Build-Many reusable trace execution receipt did not close",
             }),
         ));
     }
@@ -3121,5 +6161,392 @@ mod receipt_tests {
             shape_fail_stats,
             invented_owner_phase
         ));
+    }
+
+    #[test]
+    fn positive_width_uniform_sidecars_need_no_exact_workspace() {
+        let values = vec!["(a)".repeat(65), "z".to_owned()];
+        let regex = PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        let mut limits = PriorityAggregateManyCaptureRunLimits::default();
+        let resources = &mut limits.per_match_capture.resources;
+        resources.max_source_bytes = 0;
+        resources.max_states = 0;
+        resources.max_build_work = 0;
+        resources.max_persistent_bytes = 0;
+        resources.max_combined_peak_bytes = 0;
+        resources.max_allocations = 0;
+        resources.max_matches = 1;
+        resources.max_capture_count = 66;
+        let haystack = vec![b'a'; 65];
+        let mut session = regex
+            .prepare_capture_session(haystack.len(), limits)
+            .unwrap();
+        assert_eq!(2, session.accounting().cardinality_sidecars);
+        assert_eq!(0, session.accounting().replay_workspaces);
+        assert!(session.accounting().closes(limits.session));
+        let result = session.count_captures(&haystack).unwrap();
+        assert_eq!(1, result.matches());
+        assert_eq!(66, result.value());
+        assert_eq!(1, result.cardinality_matches());
+        assert_eq!(0, result.capture_accounting().work);
+        assert!(result.closes());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test keeps exact-cap and one-below identities adjacent to their shared baseline"
+    )]
+    fn capture_session_and_projection_limits_admit_exact_and_refuse_one_below() {
+        let values = vec!["(?:a|(ab))c".to_owned()];
+        let regex = PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        let haystack = b"abcabc";
+        let baseline = regex
+            .count_captures(haystack, PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        assert_eq!(2, baseline.matches());
+        assert!(baseline.capture_accounting().reset_cells > 0);
+
+        let baseline_session = regex
+            .prepare_capture_session(
+                haystack.len(),
+                PriorityAggregateManyCaptureRunLimits::default(),
+            )
+            .unwrap()
+            .accounting();
+        assert_eq!(
+            u64::try_from(baseline_session.selector_trace_build_work).unwrap(),
+            baseline.selector_setup().initialization_work
+        );
+        assert!(
+            baseline.selector_setup().initialization_work
+                < baseline.selector_setup_prospective().work_upper_bound
+        );
+        let mut session_exact = PriorityAggregateManyCaptureRunLimits::default();
+        session_exact.session.max_persistent_bytes = baseline_session.persistent_bytes;
+        session_exact.session.max_build_work = baseline_session.build_work;
+        session_exact.session.max_allocations = baseline_session.allocations;
+        assert!(
+            regex
+                .prepare_capture_session(haystack.len(), session_exact)
+                .is_ok()
+        );
+        let mut session_one_below = session_exact;
+        session_one_below.session.max_persistent_bytes = baseline_session
+            .persistent_bytes
+            .checked_sub(1)
+            .expect("session retains storage");
+        let session_error = regex
+            .prepare_capture_session(haystack.len(), session_one_below)
+            .expect_err("one below session storage must refuse before allocation");
+        assert!(matches!(
+            session_error.source,
+            PriorityAggregateManyCaptureRunFailure::SessionLimit {
+                resource: PriorityAggregateManyCaptureSessionResource::PersistentBytes,
+                required,
+                limit,
+            } if required == baseline_session.persistent_bytes
+                && limit == session_one_below.session.max_persistent_bytes
+        ));
+
+        let mut work_one_below = session_exact;
+        work_one_below.session.max_build_work = baseline_session
+            .build_work
+            .checked_sub(1)
+            .expect("session initialization performs work");
+        let work_error = regex
+            .prepare_capture_session(haystack.len(), work_one_below)
+            .expect_err("one below session initialization work must refuse before allocation");
+        assert!(matches!(
+            work_error.source,
+            PriorityAggregateManyCaptureRunFailure::SessionLimit {
+                resource: PriorityAggregateManyCaptureSessionResource::BuildWork,
+                required,
+                limit,
+            } if required == baseline_session.build_work
+                && limit == work_one_below.session.max_build_work
+        ));
+
+        let mut allocations_one_below = session_exact;
+        allocations_one_below.session.max_allocations = baseline_session
+            .allocations
+            .checked_sub(1)
+            .expect("session owns allocations");
+        let allocations_error = regex
+            .prepare_capture_session(haystack.len(), allocations_one_below)
+            .expect_err("one below session allocation cap must refuse before allocation");
+        assert!(matches!(
+            allocations_error.source,
+            PriorityAggregateManyCaptureRunFailure::SessionLimit {
+                resource: PriorityAggregateManyCaptureSessionResource::Allocations,
+                required,
+                limit,
+            } if required == baseline_session.allocations
+                && limit == allocations_one_below.session.max_allocations
+        ));
+
+        let mut total_exact = PriorityAggregateManyCaptureRunLimits::default();
+        total_exact.total_capture.resources.max_reset_cells =
+            baseline.capture_accounting().reset_cells;
+        let exact = regex.count_captures(haystack, total_exact).unwrap();
+        assert_eq!(baseline.capture_accounting(), exact.capture_accounting());
+        assert!(exact.closes());
+        let mut total_one_below = total_exact;
+        total_one_below.total_capture.resources.max_reset_cells = baseline
+            .capture_accounting()
+            .reset_cells
+            .checked_sub(1)
+            .expect("two replay epochs reset cells");
+        let total_error = regex
+            .count_captures(haystack, total_one_below)
+            .expect_err("one below aggregate reset cap must refuse");
+        assert!(matches!(
+            total_error.source,
+            PriorityAggregateManyCaptureRunFailure::CaptureProjectionLimit {
+                resource: CaptureStreamResource::ResetCells,
+                required,
+                limit,
+            } if required == baseline.capture_accounting().reset_cells
+                && limit == total_one_below.total_capture.resources.max_reset_cells
+        ));
+
+        let single = regex
+            .count_captures(b"abc", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        let mut per_match_one_below = PriorityAggregateManyCaptureRunLimits::default();
+        per_match_one_below
+            .per_match_capture
+            .resources
+            .max_reset_cells = single
+            .capture_accounting()
+            .reset_cells
+            .checked_sub(1)
+            .expect("one replay resets cells");
+        let per_match_error = regex
+            .count_captures(b"abc", per_match_one_below)
+            .expect_err("one below exact replay reset cap must retain its resource identity");
+        assert!(matches!(
+            per_match_error.source,
+            PriorityAggregateManyCaptureRunFailure::Capture {
+                pattern: 0,
+                source: CaptureStreamError::Resource {
+                    resource: CaptureStreamResource::ResetCells,
+                    required,
+                    limit,
+                },
+            } if required == single.capture_accounting().reset_cells
+                && limit == per_match_one_below.per_match_capture.resources.max_reset_cells
+        ));
+    }
+
+    #[test]
+    fn capture_build_receipt_closes_across_sidecar_and_union_literal_owners() {
+        let values = vec!["([a-z])".to_owned(), "([0-9])".to_owned()];
+        let regex = PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        assert!(regex.build_report().closes());
+    }
+
+    #[test]
+    fn whole_literal_bridge_ledger_seals_exact_source_copies() {
+        let patterns = vec![String::new(), "AB".to_owned(), "WXYZ".to_owned()];
+        assert_eq!(
+            whole_operation_literal_identity_len(&patterns).unwrap(),
+            "frewholeliteralq".len() + patterns.len() + 2 * (2 + 4)
+        );
+        assert_eq!(
+            whole_required_literal_source_copy_peak_bytes(patterns.iter().map(String::len)),
+            4
+        );
+        assert_eq!(
+            whole_required_literal_direct_bridge_allocations(
+                patterns.len(),
+                patterns.iter().map(String::len),
+            )
+            .unwrap(),
+            5,
+            "identity, Arc, exact root table, and two nonempty source copies"
+        );
+        assert_eq!(
+            capacity_bytes::<Hir>(patterns.len(), "test exact root table").unwrap(),
+            patterns.len() * size_of::<Hir>()
+        );
+        let source = copy_whole_required_literal_source("WXYZ").unwrap();
+        assert_eq!(source.len(), 4);
+        assert_eq!(source.capacity(), 4);
+        assert_eq!(
+            copy_whole_required_literal_source("").unwrap().capacity(),
+            0
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cross-owner, exact-capacity, planner, and run-receipt mutations share one construction fixture"
+    )]
+    fn capture_receipts_reject_cross_owner_and_run_receipt_mutations() {
+        let values = vec!["([a-z])".to_owned(), "([0-9])".to_owned()];
+        let mut sidecars = PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        assert!(sidecars.build_report().closes());
+        sidecars.captures.swap(0, 1);
+        assert!(!sidecars.build_report().closes());
+
+        let mut bridge = PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        assert!(bridge.build_report().closes());
+        bridge.construction.whole_literal_bridge_allocations -= 1;
+        assert!(!bridge.build_report().closes());
+
+        let no_proof_values = vec!["(a)".to_owned()];
+        let mut no_proof = PriorityAggregateManyBuilder::new(&no_proof_values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        assert!(matches!(
+            no_proof.whole_required_literal_receipt,
+            PriorityAggregateManyWholeRequiredLiteralBuildReceipt::NoProof { .. }
+        ));
+        let mut oversized_source = whole_operation_literal_identity_source(&no_proof_values)
+            .expect("encoded NoProof identity source");
+        oversized_source
+            .try_reserve_exact(1)
+            .expect("oversized forged identity source");
+        let original_identity = &no_proof.whole_required_literal_identity;
+        let parsed = fre_syntax::parse(
+            ParseRequest::rust(oversized_source, original_identity.profile.clone())
+                .with_admission(original_identity.admission)
+                .with_safety_envelope(original_identity.safety),
+        )
+        .expect("same bytes remain a valid literal-only parser key");
+        assert_eq!(
+            parsed.key.pattern.as_bytes(),
+            original_identity.pattern.as_bytes()
+        );
+        assert!(
+            parsed.key.pattern.capacity_bytes() > original_identity.pattern.capacity_bytes(),
+            "the forged key retains the same bytes with excess source capacity"
+        );
+        no_proof.whole_required_literal_identity = Arc::new(parsed.key);
+        let source_copy_peak = whole_required_literal_source_copy_peak_bytes(
+            no_proof
+                .selector
+                .build_report()
+                .patterns()
+                .iter()
+                .map(|pattern| pattern.syntax_key.pattern.as_bytes().len()),
+        );
+        no_proof.construction.whole_literal_persistent_bytes =
+            whole_required_literal_actual_persistent_bytes(
+                &no_proof.whole_required_literal_identity,
+                no_proof.whole_required_literal.as_ref(),
+            )
+            .unwrap();
+        no_proof.construction.whole_literal_peak_bytes = whole_required_literal_actual_peak_bytes(
+            &no_proof.whole_required_literal_identity,
+            no_proof.whole_required_literal.as_ref(),
+            no_proof.selector.build_report().patterns().len(),
+            source_copy_peak,
+            no_proof.selector.build_report().limits().syntax_safety,
+        )
+        .unwrap();
+        assert!(
+            !no_proof.build_report().closes(),
+            "same bytes with excess identity capacity must not close"
+        );
+        no_proof.whole_required_literal_identity = Arc::new(
+            no_proof.selector.build_report().patterns()[0]
+                .syntax_key
+                .clone(),
+        );
+        assert!(!no_proof.build_report().closes());
+
+        let mut malformed_planner = PriorityAggregateManyBuilder::new(&no_proof_values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        let planner_limit = malformed_planner
+            .selector
+            .build_report()
+            .limits()
+            .capture_build
+            .whole_required_literal
+            .max_planner_work;
+        let malformed_planner_work = planner_limit.checked_add(1).unwrap();
+        let PriorityAggregateManyWholeRequiredLiteralBuildReceipt::NoProof { planner_work, .. } =
+            &mut malformed_planner.whole_required_literal_receipt
+        else {
+            panic!("single literal fixture must use the explicit NoProof receipt");
+        };
+        *planner_work = malformed_planner_work;
+        malformed_planner.construction.whole_literal_planner_work = malformed_planner_work;
+        assert!(
+            !malformed_planner.build_report().closes(),
+            "NoProof planner work must remain within its published proof limit"
+        );
+
+        let run_values = vec![
+            r"(?:a|(ab))c".to_owned(),
+            r"(?:(d)|(e))f".to_owned(),
+            r"(?P<g>g)".to_owned(),
+        ];
+        let regex = PriorityAggregateManyBuilder::new(&run_values)
+            .unicode(false)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap();
+        let baseline = regex
+            .count_captures(b"abcdfg", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        assert!(baseline.closes());
+        assert!(baseline.required_literal.is_some());
+        assert!(baseline.capture_accounting.work > 0);
+
+        let mut malformed = regex
+            .count_captures(b"abcdfg", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        malformed.per_match_projection.maximum_accounting.work =
+            malformed.capture_accounting.work.checked_add(1).unwrap();
+        assert!(!malformed.closes());
+
+        let mut malformed = regex
+            .count_captures(b"abcdfg", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        malformed
+            .required_literal
+            .as_mut()
+            .unwrap()
+            .identity
+            .operation = CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1;
+        assert!(!malformed.closes());
+
+        let mut malformed = regex
+            .count_captures(b"abcdfg", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        malformed
+            .required_literal
+            .as_mut()
+            .unwrap()
+            .accounting
+            .searched_bytes += 1;
+        assert!(!malformed.closes());
+
+        let mut malformed = regex
+            .count_captures(b"abcdfg", PriorityAggregateManyCaptureRunLimits::default())
+            .unwrap();
+        malformed.selector_setup.initialization_work += 1;
+        assert!(!malformed.closes());
     }
 }

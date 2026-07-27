@@ -151,13 +151,21 @@ pub use forced_priority_many::{
     PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION,
     PriorityAggregateManyBuildError, PriorityAggregateManyBuildLimits,
     PriorityAggregateManyBuildReport, PriorityAggregateManyBuilder,
+    PriorityAggregateManyCaptureBuildLimits, PriorityAggregateManyCaptureBuildReport,
+    PriorityAggregateManyCaptureBuildResource, PriorityAggregateManyCaptureConstructionAccounting,
+    PriorityAggregateManyCaptureCountRegex, PriorityAggregateManyCaptureCountResult,
+    PriorityAggregateManyCaptureProjectionLimits, PriorityAggregateManyCaptureProjectionReceipt,
+    PriorityAggregateManyCaptureRunError, PriorityAggregateManyCaptureRunFailure,
+    PriorityAggregateManyCaptureRunLimits, PriorityAggregateManyCaptureSelectorReceipt,
+    PriorityAggregateManyCaptureSession, PriorityAggregateManyCaptureSessionAccounting,
+    PriorityAggregateManyCaptureSessionLimits, PriorityAggregateManyCaptureSessionResource,
     PriorityAggregateManyCompositionAccounting, PriorityAggregateManyCountRegex,
     PriorityAggregateManyExecutionReceipt, PriorityAggregateManyOperation,
     PriorityAggregateManyPatternReport, PriorityAggregateManyRunError,
     PriorityAggregateManyRunFailure, PriorityAggregateManyRunLimits,
     PriorityAggregateManySourceOwnerAccounting, PriorityAggregateManySourceOwnerLimits,
     PriorityAggregateManySourceOwnerResource, PriorityAggregateManySpanSumRegex,
-    PriorityAggregateManyTraceReceipt,
+    PriorityAggregateManyTraceReceipt, PriorityAggregateManyWholeRequiredLiteralBuildReceipt,
 };
 
 pub use literal_anchor::{

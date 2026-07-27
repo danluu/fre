@@ -2246,6 +2246,7 @@ impl MapDesc {
     };
 }
 
+#[derive(Debug)]
 struct OutcomePool {
     maps: Vec<MapDesc>,
     groups: Vec<OutcomeGroup>,
@@ -2269,6 +2270,10 @@ impl OutcomePool {
         self.groups.clear();
         self.maps.push(MapDesc::EMPTY);
         Ok(())
+    }
+
+    fn has_exact_capacity(&self) -> bool {
+        self.maps.capacity() == self.map_capacity && self.groups.capacity() == self.group_capacity
     }
 
     fn map_groups(&self, map: u32) -> Result<&[OutcomeGroup], ReduceError> {
@@ -2447,6 +2452,14 @@ impl RunMeter {
 }
 
 fn reserve_run<T>(entries: usize, _structure: &'static str) -> Result<Vec<T>, ReduceError> {
+    // `Vec::try_reserve_exact(0)` is deliberately skipped. It cannot obtain
+    // storage, and trace-session setup receipts count only real dynamic
+    // allocation attempts. Keeping this branch here also makes the
+    // zero-capacity arithmetic agree with the workspace that is actually
+    // retained.
+    if entries == 0 {
+        return Ok(Vec::new());
+    }
     let mut values = Vec::new();
     values
         .try_reserve_exact(entries)
@@ -2469,6 +2482,416 @@ fn reserve_and_fill_run<T: Clone>(
     let mut values = reserve_run(entries, structure)?;
     values.resize(entries, value);
     Ok(values)
+}
+
+/// Exact one-time resources retained by a reusable tagged trace session.
+///
+/// This is intentionally separate from [`ExecutionProspective`]. The latter
+/// describes one source operation, whereas this receipt describes the
+/// caller-owned storage allocated before the first operation. In particular,
+/// [`Self::allocation_attempts`] counts only non-empty reservations and
+/// [`Self::initialization_work`] counts only the reservations and fills made
+/// during session construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaggedManyTraceSessionSetupProspective {
+    /// Fixed source length to which the retained workspace is bound.
+    pub source_bytes: usize,
+    /// Exact bytes retained by the session's rows, pools, and trace buffer.
+    pub persistent_bytes: usize,
+    /// Exact initialization work performed while preparing the session.
+    pub initialization_work: u64,
+    /// Exact non-empty dynamic allocation attempts made during preparation.
+    pub allocation_attempts: usize,
+    /// Exact ordinal-trace capacity retained during preparation.
+    pub trace_capacity: usize,
+    /// Allocation-free envelope for the same source operation without an
+    /// ordinal trace.
+    pub steady_untraced_prospective: ExecutionProspective,
+    /// Allocation-free envelope for a repeated ordinal-trace operation.
+    pub steady_traced_prospective: ExecutionProspective,
+}
+
+impl TaggedManyTraceSessionSetupProspective {
+    /// Validate the arithmetic relationship between the retained-session
+    /// receipt and its allocation-free operation envelopes.
+    #[must_use]
+    pub fn closes(self) -> bool {
+        trace_session_setup_formula(
+            self.source_bytes,
+            self.steady_untraced_prospective,
+            self.steady_traced_prospective,
+        )
+        .is_ok_and(
+            |(persistent_bytes, initialization_work, allocation_attempts)| {
+                self.persistent_bytes == persistent_bytes
+                    && self.initialization_work == initialization_work
+                    && self.allocation_attempts == allocation_attempts
+                    && self.trace_capacity
+                        == self.steady_traced_prospective.match_events_upper_bound
+            },
+        )
+    }
+}
+
+fn count_nonempty_reservations(entries: &[usize]) -> Result<usize, ReduceError> {
+    entries.iter().try_fold(0usize, |count, &entries| {
+        count
+            .checked_add(usize::from(entries != 0))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "tagged trace-session allocation attempts",
+            })
+    })
+}
+
+fn trace_session_setup_formula(
+    source_bytes: usize,
+    steady_untraced_prospective: ExecutionProspective,
+    steady_traced_prospective: ExecutionProspective,
+) -> Result<(usize, u64, usize), ReduceError> {
+    let boundary_rows = source_bytes
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session boundary rows",
+        })?;
+    let trace_capacity = steady_traced_prospective.match_events_upper_bound;
+    let trace_bytes = trace_capacity
+        .checked_mul(size_of::<PriorityMatch>())
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session trace bytes",
+        })?;
+    let trace_work = u64::try_from(trace_capacity)
+        .map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session trace work",
+        })?
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session trace work",
+        })?;
+    let mut expected_traced = steady_untraced_prospective;
+    expected_traced.scratch_bytes = expected_traced
+        .scratch_bytes
+        .checked_add(trace_bytes)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session traced scratch",
+        })?;
+    expected_traced.work_upper_bound = expected_traced
+        .work_upper_bound
+        .checked_add(trace_work)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "tagged trace-session traced work",
+        })?;
+    expected_traced.allocation_attempts = 0;
+    if steady_untraced_prospective.allocation_attempts != 0
+        || steady_traced_prospective.allocation_attempts != 0
+        || steady_untraced_prospective.boundary_rows != boundary_rows
+        || steady_traced_prospective.boundary_rows != boundary_rows
+        || steady_untraced_prospective.match_events_upper_bound != boundary_rows
+        || steady_traced_prospective.match_events_upper_bound != boundary_rows
+        || steady_traced_prospective != expected_traced
+    {
+        return Err(ReduceError::InternalInvariant {
+            detail: "tagged trace-session steady prospectives did not close",
+        });
+    }
+
+    match steady_traced_prospective.tagged_execution_class {
+        Some(TaggedManyExecutionClass::Generic) => {
+            let map_capacity = steady_traced_prospective.tagged_map_capacity;
+            let states = map_capacity
+                .checked_sub(1)
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "generic tagged trace-session omitted its empty outcome map",
+                })?;
+            let group_capacity = steady_traced_prospective.tagged_group_capacity;
+            let persistent_bytes =
+                tagged_run_scratch(states, boundary_rows, map_capacity, group_capacity)?
+                    .checked_add(trace_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "tagged trace-session persistent bytes",
+                    })?;
+            let allocation_attempts = count_nonempty_reservations(&[
+                states,
+                states,
+                boundary_rows,
+                map_capacity,
+                group_capacity,
+                map_capacity,
+                group_capacity,
+                trace_capacity,
+            ])?;
+            let initialized_entries = states
+                .checked_mul(2)
+                .and_then(|entries| entries.checked_add(boundary_rows))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "tagged trace-session initialized entries",
+                })?;
+            let initialization_work = u64::try_from(initialized_entries)
+                .map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "tagged trace-session initialization work",
+                })?
+                .checked_add(u64::try_from(allocation_attempts).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "tagged trace-session allocation work",
+                    }
+                })?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "tagged trace-session initialization work",
+                })?;
+            if steady_traced_prospective.scratch_bytes != persistent_bytes {
+                return Err(ReduceError::InternalInvariant {
+                    detail:
+                        "generic tagged trace-session scratch did not describe retained storage",
+                });
+            }
+            Ok((persistent_bytes, initialization_work, allocation_attempts))
+        }
+        Some(TaggedManyExecutionClass::SharedFrontierUniformRangeChain { .. }) => {
+            let allocation_attempts = count_nonempty_reservations(&[trace_capacity])?;
+            let initialization_work = u64::try_from(allocation_attempts).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "tagged shared-frontier trace-session initialization work",
+                }
+            })?;
+            if steady_untraced_prospective.scratch_bytes != 0
+                || steady_traced_prospective.scratch_bytes != trace_bytes
+            {
+                return Err(ReduceError::InternalInvariant {
+                    detail:
+                        "shared-frontier trace-session scratch did not describe retained storage",
+                });
+            }
+            Ok((trace_bytes, initialization_work, allocation_attempts))
+        }
+        None => Err(ReduceError::InternalInvariant {
+            detail: "tagged trace-session prospective omitted its execution class",
+        }),
+    }
+}
+
+fn trace_session_steady_prospectives<O: DirectReduceValue>(
+    plan: &TaggedManyPlan<O>,
+    source_bytes: usize,
+    limits: DirectReduceLimits,
+) -> Result<(ExecutionProspective, ExecutionProspective), ReduceError> {
+    // A retained session has no operation-time allocations. Relax the
+    // one-shot allocation field while deriving the work/scratch envelopes,
+    // then admit the exact construction allocation census separately.
+    let allocation_relaxed = DirectReduceLimits {
+        max_allocation_attempts: usize::MAX,
+        ..limits
+    };
+    let mut untraced = tagged_prospective(plan, source_bytes, allocation_relaxed, false)?;
+    let mut traced = tagged_prospective(plan, source_bytes, allocation_relaxed, true)?;
+    untraced.allocation_attempts = 0;
+    traced.allocation_attempts = 0;
+    Ok((untraced, traced))
+}
+
+fn trace_session_setup_prospective<O: DirectReduceValue>(
+    plan: &TaggedManyPlan<O>,
+    source_bytes: usize,
+    limits: DirectReduceLimits,
+) -> Result<TaggedManyTraceSessionSetupProspective, ReduceError> {
+    let (steady_untraced_prospective, steady_traced_prospective) =
+        trace_session_steady_prospectives(plan, source_bytes, limits)?;
+    let (persistent_bytes, initialization_work, allocation_attempts) = trace_session_setup_formula(
+        source_bytes,
+        steady_untraced_prospective,
+        steady_traced_prospective,
+    )?;
+    if persistent_bytes > limits.max_scratch_bytes {
+        return Err(ReduceError::ScratchLimit {
+            needed: persistent_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+    if initialization_work > limits.max_work {
+        return Err(ReduceError::WorkLimit {
+            consumed: 0,
+            requested: initialization_work,
+            limit: limits.max_work,
+        });
+    }
+    if allocation_attempts > limits.max_allocation_attempts {
+        return Err(ReduceError::AllocationAttemptsLimit {
+            needed: allocation_attempts,
+            limit: limits.max_allocation_attempts,
+        });
+    }
+    let setup = TaggedManyTraceSessionSetupProspective {
+        source_bytes,
+        persistent_bytes,
+        initialization_work,
+        allocation_attempts,
+        trace_capacity: steady_traced_prospective.match_events_upper_bound,
+        steady_untraced_prospective,
+        steady_traced_prospective,
+    };
+    if !setup.closes() {
+        return Err(ReduceError::InternalInvariant {
+            detail: "tagged trace-session setup prospective did not close",
+        });
+    }
+    Ok(setup)
+}
+
+/// Caller-owned reusable trace workspace for one fixed-length tagged run.
+///
+/// Construction admits and reserves every row, outcome pool, and trace entry
+/// before the first source byte is read. Repeated [`Self::execute_trace`]
+/// calls retain that storage and return a borrowing receipt, so the trace
+/// cannot outlive the workspace that owns it.
+#[derive(Debug)]
+pub struct TaggedManyTraceSession<'plan, O: DirectReduceValue> {
+    plan: &'plan TaggedManyPlan<O>,
+    source_bytes: usize,
+    limits: DirectReduceLimits,
+    /// Exact construction receipt for retained caller-owned storage.
+    setup: TaggedManyTraceSessionSetupProspective,
+    /// Legacy one-shot comparison envelopes retained for API compatibility.
+    /// Exact retained-session construction accounting lives in [`Self::setup`].
+    setup_untraced_prospective: ExecutionProspective,
+    setup_traced_prospective: ExecutionProspective,
+    /// The repeated-operation envelopes retain the same scratch/work bounds
+    /// but report no fresh dynamic allocations.
+    untraced_prospective: ExecutionProspective,
+    prospective: ExecutionProspective,
+    workspace: TaggedManyTraceWorkspace,
+}
+
+#[derive(Debug)]
+enum TaggedManyTraceWorkspace {
+    Generic(TaggedManyGenericTraceWorkspace),
+    SharedFrontier { trace: Vec<PriorityMatch> },
+}
+
+#[derive(Debug)]
+struct TaggedManyGenericTraceWorkspace {
+    current_rows: Vec<u32>,
+    next_rows: Vec<u32>,
+    roots: Vec<Option<TaggedOutcome>>,
+    current_pool: OutcomePool,
+    next_pool: OutcomePool,
+    trace: Vec<PriorityMatch>,
+}
+
+/// Borrowing result of one reusable tagged trace execution.
+///
+/// Unlike [`DirectReduceTraceReport`], this receipt cannot be detached from
+/// its session: the caller must drop it before executing that session again.
+/// This lets the session retain the trace allocation while preserving the
+/// same ordinal/span observation surface.
+#[derive(Debug)]
+pub struct TaggedManyTraceSessionReport<'session, T> {
+    report: DirectReduceReport<T>,
+    setup: TaggedManyTraceSessionSetupProspective,
+    untraced_prospective: ExecutionProspective,
+    setup_untraced_prospective: ExecutionProspective,
+    setup_traced_prospective: ExecutionProspective,
+    matches: &'session [PriorityMatch],
+    trace_capacity: usize,
+}
+
+impl<T> TaggedManyTraceSessionReport<'_, T> {
+    /// The direct-reducer receipt for this allocation-free steady execution.
+    #[must_use]
+    pub const fn report(&self) -> &DirectReduceReport<T> {
+        &self.report
+    }
+
+    /// Exact one-time retained-session construction receipt.
+    #[must_use]
+    pub const fn setup(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.setup
+    }
+
+    /// Alias for [`Self::setup`] that makes the preflight relationship
+    /// explicit at call sites.
+    #[must_use]
+    pub const fn setup_prospective_receipt(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.setup()
+    }
+
+    /// The source-free steady-operation envelope before trace storage.
+    #[must_use]
+    pub const fn untraced_prospective(&self) -> ExecutionProspective {
+        self.untraced_prospective
+    }
+
+    /// Legacy untraced one-shot comparison envelope.
+    ///
+    /// For exact retained-session construction accounting, use [`Self::setup`].
+    #[must_use]
+    pub const fn setup_untraced_prospective(&self) -> ExecutionProspective {
+        self.setup_untraced_prospective
+    }
+
+    /// Legacy traced one-shot comparison envelope.
+    ///
+    /// For exact retained-session construction accounting, use [`Self::setup`].
+    #[must_use]
+    pub const fn setup_prospective(&self) -> ExecutionProspective {
+        self.setup_traced_prospective
+    }
+
+    /// Exact trace capacity reserved during session preparation.
+    #[must_use]
+    pub const fn trace_capacity(&self) -> usize {
+        self.trace_capacity
+    }
+
+    /// Selected pattern ordinals and spans in source order.
+    #[must_use]
+    pub const fn matches(&self) -> &[PriorityMatch] {
+        self.matches
+    }
+
+    /// Check the setup-to-steady transition and the borrowing trace receipt.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        let trace_bytes = self.trace_capacity.checked_mul(size_of::<PriorityMatch>());
+        let trace_work = u64::try_from(self.trace_capacity)
+            .ok()
+            .and_then(|work| work.checked_add(1));
+        let setup_trace_closes = trace_bytes.zip(trace_work).is_some_and(|(bytes, work)| {
+            let mut expected = self.setup_untraced_prospective;
+            let Some(scratch_bytes) = expected.scratch_bytes.checked_add(bytes) else {
+                return false;
+            };
+            let Some(allocation_attempts) = expected.allocation_attempts.checked_add(1) else {
+                return false;
+            };
+            let Some(work_upper_bound) = expected.work_upper_bound.checked_add(work) else {
+                return false;
+            };
+            expected.scratch_bytes = scratch_bytes;
+            expected.allocation_attempts = allocation_attempts;
+            expected.work_upper_bound = work_upper_bound;
+            expected == self.setup_traced_prospective
+        });
+        let mut expected_untraced = self.setup_untraced_prospective;
+        expected_untraced.allocation_attempts = 0;
+        let mut expected_traced = self.setup_traced_prospective;
+        expected_traced.allocation_attempts = 0;
+        let traced = self.report.prospective();
+        let actual = self.report.actual();
+        setup_trace_closes
+            && self.setup.closes()
+            && self.setup.steady_untraced_prospective == self.untraced_prospective
+            && self.setup.steady_traced_prospective == traced
+            && self.setup.trace_capacity == self.trace_capacity
+            && self.trace_capacity == self.setup_untraced_prospective.match_events_upper_bound
+            && self.untraced_prospective == expected_untraced
+            && traced == expected_traced
+            && traced.tagged_execution_class == self.untraced_prospective.tagged_execution_class
+            && traced.boundary_rows == self.untraced_prospective.boundary_rows
+            && traced.match_events_upper_bound == self.untraced_prospective.match_events_upper_bound
+            && actual.scratch_bytes == traced.scratch_bytes
+            && actual.allocation_attempts == 0
+            && actual.work <= traced.work_upper_bound
+            && self.matches.len() == actual.match_events
+            && actual.match_events <= self.trace_capacity
+    }
 }
 
 impl<O: DirectReduceValue> TaggedManyPlan<O> {
@@ -2523,6 +2946,256 @@ impl<O: DirectReduceValue> TaggedManyPlan<O> {
             });
         }
         Ok(report)
+    }
+
+    /// Prepare one caller-owned ordinal trace session for a fixed source
+    /// length. All trace and tagged-frontier storage is reserved here, before
+    /// any source bytes are supplied. Repeated executions of the returned
+    /// session perform no fresh workspace or trace allocation.
+    pub fn prepare_trace_session(
+        &self,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<TaggedManyTraceSession<'_, O>, ReduceError> {
+        TaggedManyTraceSession::new(self, source_bytes, limits)
+    }
+
+    /// Preflight the exact one-time storage and initialization census for a
+    /// reusable ordinal trace session without allocating its workspace.
+    ///
+    /// Unlike [`Self::trace_session_prospective`], this receipt distinguishes
+    /// retained-session construction from a one-shot direct operation and
+    /// excludes zero-capacity `Vec` reservations from its allocation count.
+    pub fn trace_session_setup_prospective(
+        &self,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<TaggedManyTraceSessionSetupProspective, ReduceError> {
+        trace_session_setup_prospective(self, source_bytes, limits)
+    }
+
+    /// Return the untraced and traced one-time envelopes needed to prepare a
+    /// reusable trace session, without allocating its workspace.
+    ///
+    /// This compatibility API retains its historical one-shot
+    /// [`ExecutionProspective`] values. New code that needs exact retained
+    /// workspace accounting should use [`Self::trace_session_setup_prospective`].
+    pub fn trace_session_prospective(
+        &self,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<(ExecutionProspective, ExecutionProspective), ReduceError> {
+        Ok((
+            tagged_prospective(self, source_bytes, limits, false)?,
+            tagged_prospective(self, source_bytes, limits, true)?,
+        ))
+    }
+}
+
+impl<'plan, O: DirectReduceValue> TaggedManyTraceSession<'plan, O> {
+    fn new(
+        plan: &'plan TaggedManyPlan<O>,
+        source_bytes: usize,
+        limits: DirectReduceLimits,
+    ) -> Result<Self, ReduceError> {
+        let setup = plan.trace_session_setup_prospective(source_bytes, limits)?;
+        // Keep the old one-shot values available to existing callers, but do
+        // not let their fixed one-shot allocation census reject a session
+        // whose exact construction census has already been admitted above.
+        let allocation_relaxed = DirectReduceLimits {
+            max_allocation_attempts: usize::MAX,
+            ..limits
+        };
+        let (setup_untraced_prospective, setup_traced_prospective) =
+            plan.trace_session_prospective(source_bytes, allocation_relaxed)?;
+        let trace_capacity = setup.trace_capacity;
+        let workspace = match plan.stats.execution_class {
+            TaggedManyExecutionClass::Generic => {
+                let states = plan.states.len();
+                let map_capacity =
+                    states
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "tagged session map capacity",
+                        })?;
+                let group_capacity = plan.stats.owner_state_memberships;
+                TaggedManyTraceWorkspace::Generic(TaggedManyGenericTraceWorkspace {
+                    current_rows: reserve_and_fill_run(
+                        states,
+                        0u32,
+                        "tagged trace session current rows",
+                    )?,
+                    next_rows: reserve_and_fill_run(
+                        states,
+                        0u32,
+                        "tagged trace session next rows",
+                    )?,
+                    roots: reserve_and_fill_run(
+                        setup.steady_traced_prospective.boundary_rows,
+                        None::<TaggedOutcome>,
+                        "tagged trace session roots",
+                    )?,
+                    current_pool: OutcomePool::new(map_capacity, group_capacity)?,
+                    next_pool: OutcomePool::new(map_capacity, group_capacity)?,
+                    trace: reserve_run(trace_capacity, "tagged trace session entries")?,
+                })
+            }
+            TaggedManyExecutionClass::SharedFrontierUniformRangeChain { .. } => {
+                TaggedManyTraceWorkspace::SharedFrontier {
+                    trace: reserve_run(trace_capacity, "tagged shared-frontier session entries")?,
+                }
+            }
+        };
+        let session = Self {
+            plan,
+            source_bytes,
+            limits,
+            setup,
+            setup_untraced_prospective,
+            setup_traced_prospective,
+            untraced_prospective: setup.steady_untraced_prospective,
+            prospective: setup.steady_traced_prospective,
+            workspace,
+        };
+        if !session.closes() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "reusable tagged trace-session setup did not close",
+            });
+        }
+        Ok(session)
+    }
+
+    /// Source length to which this retained workspace is bound.
+    #[must_use]
+    pub const fn source_bytes(&self) -> usize {
+        self.source_bytes
+    }
+
+    /// Immutable run limits admitted when this session was prepared.
+    #[must_use]
+    pub const fn limits(&self) -> DirectReduceLimits {
+        self.limits
+    }
+
+    /// Exact preflight receipt for the retained caller-owned workspace.
+    #[must_use]
+    pub const fn setup(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.setup
+    }
+
+    /// Alias for [`Self::setup`] that makes the preflight relationship
+    /// explicit at call sites.
+    #[must_use]
+    pub const fn setup_prospective_receipt(&self) -> TaggedManyTraceSessionSetupProspective {
+        self.setup()
+    }
+
+    /// Legacy traced one-shot comparison envelope.
+    ///
+    /// For exact retained-session construction accounting, use [`Self::setup`].
+    #[must_use]
+    pub const fn setup_prospective(&self) -> ExecutionProspective {
+        self.setup_traced_prospective
+    }
+
+    /// Repeated-operation trace envelope. Its allocation count is always zero:
+    /// construction allocations are represented only by [`Self::setup_prospective`].
+    #[must_use]
+    pub const fn prospective(&self) -> ExecutionProspective {
+        self.prospective
+    }
+
+    /// Validate the retained workspace against its exact setup receipt.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        if !self.setup.closes()
+            || self.setup.source_bytes != self.source_bytes
+            || self.setup.steady_untraced_prospective != self.untraced_prospective
+            || self.setup.steady_traced_prospective != self.prospective
+            || self.setup.trace_capacity != self.prospective.match_events_upper_bound
+            || self.setup.persistent_bytes != self.prospective.scratch_bytes
+        {
+            return false;
+        }
+        match &self.workspace {
+            TaggedManyTraceWorkspace::Generic(workspace) => {
+                if self.plan.stats.execution_class != TaggedManyExecutionClass::Generic {
+                    return false;
+                }
+                let states = self.plan.states.len();
+                let Some(map_capacity) = states.checked_add(1) else {
+                    return false;
+                };
+                let group_capacity = self.plan.stats.owner_state_memberships;
+                workspace.current_rows.len() == states
+                    && workspace.current_rows.capacity() == states
+                    && workspace.next_rows.len() == states
+                    && workspace.next_rows.capacity() == states
+                    && workspace.roots.len() == self.prospective.boundary_rows
+                    && workspace.roots.capacity() == self.prospective.boundary_rows
+                    && workspace.current_pool.has_exact_capacity()
+                    && workspace.next_pool.has_exact_capacity()
+                    && workspace.current_pool.map_capacity == map_capacity
+                    && workspace.current_pool.group_capacity == group_capacity
+                    && workspace.next_pool.map_capacity == map_capacity
+                    && workspace.next_pool.group_capacity == group_capacity
+                    && workspace.trace.capacity() == self.setup.trace_capacity
+            }
+            TaggedManyTraceWorkspace::SharedFrontier { trace } => {
+                matches!(
+                    self.plan.stats.execution_class,
+                    TaggedManyExecutionClass::SharedFrontierUniformRangeChain { .. }
+                ) && trace.capacity() == self.setup.trace_capacity
+            }
+        }
+    }
+
+    /// Execute one ordinal trace without rebuilding its fixed-length workspace.
+    pub fn execute_trace(
+        &mut self,
+        haystack: &[u8],
+    ) -> Result<TaggedManyTraceSessionReport<'_, O::Output>, ReduceError> {
+        if haystack.len() != self.source_bytes {
+            return Err(ReduceError::InternalInvariant {
+                detail: "tagged trace session haystack length differs from its admitted workspace",
+            });
+        }
+        if !self.closes() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "reusable tagged trace-session setup receipt did not close",
+            });
+        }
+        let plan = self.plan;
+        let limits = self.limits;
+        let prospective = self.prospective;
+        let (output, actual, matches) = match &mut self.workspace {
+            TaggedManyTraceWorkspace::Generic(workspace) => {
+                let (output, actual) =
+                    execute_tagged_generic_reused(plan, haystack, limits, prospective, workspace)?;
+                (output, actual, workspace.trace.as_slice())
+            }
+            TaggedManyTraceWorkspace::SharedFrontier { trace } => {
+                let (output, actual) =
+                    execute_shared_frontier_reused(plan, haystack, limits, prospective, trace)?;
+                (output, actual, trace.as_slice())
+            }
+        };
+        let report = finish_tagged_report(haystack.len(), output, prospective, &actual)?;
+        let receipt = TaggedManyTraceSessionReport {
+            report,
+            setup: self.setup,
+            untraced_prospective: self.untraced_prospective,
+            setup_untraced_prospective: self.setup_untraced_prospective,
+            setup_traced_prospective: self.setup_traced_prospective,
+            matches,
+            trace_capacity: self.setup_untraced_prospective.match_events_upper_bound,
+        };
+        if !receipt.closes() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "reusable tagged trace session receipt did not close",
+            });
+        }
+        Ok(receipt)
     }
 }
 
@@ -3154,6 +3827,297 @@ fn execute_tagged<O: DirectReduceValue>(
     Ok((output, actual, trace))
 }
 
+/// Re-run the generic tagged kernel using storage admitted by a
+/// [`TaggedManyTraceSession`]. The fixed vectors are cleared/reset in place;
+/// no call in this function can grow them.
+#[allow(clippy::too_many_lines)]
+fn execute_tagged_generic_reused<O: DirectReduceValue>(
+    plan: &TaggedManyPlan<O>,
+    haystack: &[u8],
+    limits: DirectReduceLimits,
+    prospective: ExecutionProspective,
+    workspace: &mut TaggedManyGenericTraceWorkspace,
+) -> Result<(O::Output, ExecutionActual), ReduceError> {
+    if prospective.tagged_execution_class != Some(TaggedManyExecutionClass::Generic)
+        || prospective.tagged_dispatch_states_capacity != 0
+        || prospective.tagged_dispatch_cells_capacity != 0
+        || prospective.tagged_candidate_items_capacity != 0
+        || prospective.tagged_cache_cells_capacity != 0
+        || plan.stats.execution_class != TaggedManyExecutionClass::Generic
+    {
+        return Err(ReduceError::InternalInvariant {
+            detail: "reusable tagged trace session crossed the generic-kernel schema boundary",
+        });
+    }
+    let states = plan.states.len();
+    let map_capacity = states
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "reusable tagged session map capacity",
+        })?;
+    let group_capacity = plan.stats.owner_state_memberships;
+    let trace_capacity = prospective.match_events_upper_bound;
+    if workspace.current_rows.len() != states
+        || workspace.current_rows.capacity() != states
+        || workspace.next_rows.len() != states
+        || workspace.next_rows.capacity() != states
+        || workspace.roots.len() != prospective.boundary_rows
+        || workspace.roots.capacity() != prospective.boundary_rows
+        || !workspace.current_pool.has_exact_capacity()
+        || !workspace.next_pool.has_exact_capacity()
+        || workspace.current_pool.map_capacity != map_capacity
+        || workspace.current_pool.group_capacity != group_capacity
+        || workspace.next_pool.map_capacity != map_capacity
+        || workspace.next_pool.group_capacity != group_capacity
+        || workspace.trace.capacity() != trace_capacity
+    {
+        return Err(ReduceError::InternalInvariant {
+            detail: "reusable tagged trace session workspace no longer matches its admission",
+        });
+    }
+
+    let mut meter = RunMeter::new(limits.max_work);
+    let setup_slots = states
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(prospective.boundary_rows))
+        .and_then(|value| value.checked_add(map_capacity.checked_mul(2)?))
+        .and_then(|value| value.checked_add(group_capacity.checked_mul(2)?))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "reusable tagged session setup slots",
+        })?;
+    meter.charge_usize(setup_slots)?;
+    // These fills are the retained-storage equivalent of one-shot exact
+    // initialization. Their work is already covered by `setup_slots`.
+    workspace.roots.fill(None);
+    workspace.next_rows.fill(0);
+    workspace.next_pool.reset(&mut meter)?;
+    workspace.trace.clear();
+    // Preserve the existing trace-sidecar work charge. It now covers reset of
+    // the admitted trace buffer rather than a fresh allocation.
+    meter.charge(1)?;
+
+    let mut actual = ExecutionActual::zero(haystack.len());
+    actual.scratch_bytes = prospective.scratch_bytes;
+    actual.allocation_attempts = prospective.allocation_attempts;
+    let mut candidate = OutcomeCandidate::new();
+
+    for position in (0..=haystack.len()).rev() {
+        meter.charge(1)?;
+        actual.boundary_rows =
+            actual
+                .boundary_rows
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session boundary rows",
+                })?;
+        workspace.current_pool.reset(&mut meter)?;
+        meter.charge_usize(states)?;
+        workspace.current_rows.fill(0);
+        let byte = haystack.get(position).copied();
+        for &state_u32 in plan.evaluation_order.iter() {
+            meter.charge(1)?;
+            actual.tagged_state_evaluations = actual
+                .tagged_state_evaluations
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session state evaluations",
+                })?;
+            let state_index = plan_index(state_u32);
+            let state = plan.states[state_index];
+            candidate.clear();
+            let mut remaining = state.owners;
+            match state.role {
+                StateRole::Accept => {
+                    candidate.insert(remaining, position, &mut meter)?;
+                }
+                StateRole::Consume => {
+                    if let Some(byte) = byte {
+                        for edge_index in plan_index(state.edge_start)..plan_index(state.edge_end) {
+                            meter.charge(1)?;
+                            actual.tagged_edge_visits = actual
+                                .tagged_edge_visits
+                                .checked_add(1)
+                                .ok_or(ReduceError::ArithmeticOverflow {
+                                    computation: "reusable tagged session consuming edge visits",
+                                })?;
+                            let edge = plan.edges[edge_index];
+                            if byte < edge.byte_start || byte > edge.byte_end {
+                                continue;
+                            }
+                            let allowed = remaining & edge.owners;
+                            if allowed == 0 {
+                                continue;
+                            }
+                            let target_map = workspace.next_rows[plan_index(edge.target)];
+                            let mut matched = 0u128;
+                            for group in workspace.next_pool.map_groups(target_map)? {
+                                meter.charge(1)?;
+                                let owners = allowed & group.owners;
+                                if owners != 0 {
+                                    candidate.insert(owners, group.end, &mut meter)?;
+                                    matched |= owners;
+                                }
+                            }
+                            remaining &= !matched;
+                            if remaining == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                StateRole::Split => {
+                    for edge_index in plan_index(state.edge_start)..plan_index(state.edge_end) {
+                        meter.charge(1)?;
+                        actual.tagged_edge_visits = actual
+                            .tagged_edge_visits
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "reusable tagged session zero-width edge visits",
+                            })?;
+                        let edge = plan.edges[edge_index];
+                        let allowed = remaining & edge.owners;
+                        if allowed == 0 {
+                            continue;
+                        }
+                        let enabled = zero_width_edge_enabled_with_line_terminator(
+                            plan.line_terminator,
+                            edge.kind,
+                            haystack,
+                            position,
+                        )
+                        .map_err(|_| ReduceError::InternalInvariant {
+                            detail:
+                                "reusable tagged session zero-width assertion evaluation failed",
+                        })?;
+                        if !enabled {
+                            continue;
+                        }
+                        let target_map = workspace.current_rows[plan_index(edge.target)];
+                        let mut matched = 0u128;
+                        for group in workspace.current_pool.map_groups(target_map)? {
+                            meter.charge(1)?;
+                            let owners = allowed & group.owners;
+                            if owners != 0 {
+                                candidate.insert(owners, group.end, &mut meter)?;
+                                matched |= owners;
+                            }
+                        }
+                        remaining &= !matched;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if state.start_owners != 0 {
+                for group in candidate.as_slice() {
+                    meter.charge(1)?;
+                    let owners = group.owners & state.start_owners;
+                    if owners == 0 {
+                        continue;
+                    }
+                    let ordinal = owners.trailing_zeros();
+                    let replace = workspace.roots[position]
+                        .map_or(true, |selected| ordinal < selected.ordinal.get());
+                    if replace {
+                        workspace.roots[position] = Some(TaggedOutcome {
+                            ordinal: PatternOrdinal::new(ordinal),
+                            end: group.end,
+                        });
+                    }
+                }
+            }
+            workspace.current_rows[state_index] =
+                workspace
+                    .current_pool
+                    .publish(candidate.as_slice(), &mut meter, &mut actual)?;
+        }
+        if let Some(selected) = workspace.roots[position] {
+            let start = plan.starts[usize::try_from(selected.ordinal.get()).map_err(|_| {
+                ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session selected start ordinal",
+                }
+            })?];
+            let map = workspace.current_rows[plan_index(start)];
+            let mut authenticated = false;
+            for group in workspace.current_pool.map_groups(map)? {
+                meter.charge(1)?;
+                if group.owners & (1u128 << selected.ordinal.get()) != 0
+                    && group.end == selected.end
+                {
+                    authenticated = true;
+                    break;
+                }
+            }
+            if !authenticated {
+                return Err(ReduceError::InternalInvariant {
+                    detail:
+                        "reusable tagged session start-owner selection did not authenticate its row",
+                });
+            }
+        }
+        core::mem::swap(&mut workspace.current_rows, &mut workspace.next_rows);
+        core::mem::swap(&mut workspace.current_pool, &mut workspace.next_pool);
+    }
+
+    let mut output = O::zero();
+    let mut position = 0usize;
+    let mut suppress_empty_at = None::<usize>;
+    while position <= haystack.len() {
+        meter.charge(1)?;
+        let Some(outcome) = workspace.roots[position] else {
+            if position == haystack.len() {
+                break;
+            }
+            position = position
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session reducer progress",
+                })?;
+            continue;
+        };
+        if outcome.end == position && suppress_empty_at == Some(position) {
+            if position == haystack.len() {
+                break;
+            }
+            position = position
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session suppressed empty progress",
+                })?;
+            continue;
+        }
+        meter.charge(1)?;
+        record_tagged_match(&mut actual, outcome, position, limits.max_match_events)?;
+        output = O::append(output, position, outcome.end, outcome.ordinal)?;
+        if workspace.trace.len() == workspace.trace.capacity() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "reusable tagged session trace capacity was exceeded",
+            });
+        }
+        workspace.trace.push(PriorityMatch::from_parts(
+            outcome.ordinal,
+            position,
+            outcome.end,
+        ));
+        if outcome.end == position {
+            if position == haystack.len() {
+                break;
+            }
+            position = position
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable tagged session empty-match progress",
+                })?;
+        } else {
+            suppress_empty_at = Some(outcome.end);
+            position = outcome.end;
+        }
+    }
+    actual.work = meter.consumed;
+    Ok((output, actual))
+}
+
 #[allow(
     clippy::type_complexity,
     reason = "the executor returns the same receipt-bearing direct-reducer tuple as the generic tagged path"
@@ -3263,6 +4227,122 @@ fn execute_shared_frontier<O: DirectReduceValue>(
     }
     actual.work = meter.consumed;
     Ok((output, actual, trace))
+}
+
+/// Re-run the specialized shared-frontier kernel with its trace sidecar owned
+/// by a fixed-length [`TaggedManyTraceSession`].
+fn execute_shared_frontier_reused<O: DirectReduceValue>(
+    plan: &TaggedManyPlan<O>,
+    haystack: &[u8],
+    limits: DirectReduceLimits,
+    prospective: ExecutionProspective,
+    trace: &mut Vec<PriorityMatch>,
+) -> Result<(O::Output, ExecutionActual), ReduceError> {
+    let TaggedManyExecutionClass::SharedFrontierUniformRangeChain {
+        depth,
+        byte_start,
+        byte_end,
+    } = plan.stats.execution_class
+    else {
+        return Err(ReduceError::InternalInvariant {
+            detail: "reusable tagged trace session selected the wrong execution class",
+        });
+    };
+    let expected_boundary_rows =
+        haystack
+            .len()
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "reusable shared-frontier boundary rows",
+            })?;
+    if prospective.tagged_execution_class != Some(plan.stats.execution_class)
+        || prospective.boundary_rows != expected_boundary_rows
+        || prospective.tagged_state_evaluations_upper_bound != haystack.len()
+        || prospective.tagged_edge_visits_upper_bound != haystack.len()
+        || prospective.tagged_map_capacity != 0
+        || prospective.tagged_group_capacity != 0
+        || prospective.tagged_group_publications_upper_bound != 0
+        || prospective.tagged_dispatch_states_capacity != 0
+        || prospective.tagged_dispatch_cells_capacity != 0
+        || prospective.tagged_candidate_items_capacity != 0
+        || prospective.tagged_cache_cells_capacity != 0
+        || trace.capacity() != prospective.match_events_upper_bound
+    {
+        return Err(ReduceError::InternalInvariant {
+            detail:
+                "reusable tagged trace session prospective did not describe its shared frontier",
+        });
+    }
+
+    let mut meter = RunMeter::new(limits.max_work);
+    trace.clear();
+    // Preserve the one-shot trace-sidecar work charge while resetting the
+    // already admitted vector in place.
+    meter.charge(1)?;
+    let mut actual = ExecutionActual::zero(haystack.len());
+    actual.boundary_rows = prospective.boundary_rows;
+    actual.scratch_bytes = prospective.scratch_bytes;
+    actual.allocation_attempts = prospective.allocation_attempts;
+    let mut output = O::zero();
+    let mut consecutive = 0usize;
+
+    for (index, &byte) in haystack.iter().enumerate() {
+        meter.charge(1)?;
+        actual.tagged_state_evaluations = actual.tagged_state_evaluations.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "reusable shared-frontier state evaluations",
+            },
+        )?;
+        actual.tagged_edge_visits =
+            actual
+                .tagged_edge_visits
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reusable shared-frontier edge visits",
+                })?;
+        if byte < byte_start || byte > byte_end {
+            consecutive = 0;
+            continue;
+        }
+        consecutive = consecutive
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "reusable shared-frontier run length",
+            })?;
+        if consecutive != depth {
+            continue;
+        }
+        let end = index
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "reusable shared-frontier match end",
+            })?;
+        let start = end
+            .checked_sub(depth)
+            .ok_or(ReduceError::InternalInvariant {
+                detail: "reusable shared-frontier chain ended before it started",
+            })?;
+        let outcome = TaggedOutcome {
+            ordinal: PatternOrdinal::new(0),
+            end,
+        };
+        meter.charge(1)?;
+        record_tagged_match(&mut actual, outcome, start, limits.max_match_events)?;
+        output = O::append(output, start, end, outcome.ordinal)?;
+        meter.charge(1)?;
+        if trace.len() == trace.capacity() {
+            return Err(ReduceError::InternalInvariant {
+                detail: "reusable shared-frontier trace capacity was exceeded",
+            });
+        }
+        trace.push(PriorityMatch::from_parts(outcome.ordinal, start, end));
+        // A selected fixed-width match advances the leftmost-first reducer to
+        // its endpoint. Resetting here makes the next byte the only eligible
+        // new start, without retaining a row for every prior boundary.
+        consecutive = 0;
+    }
+    actual.work = meter.consumed;
+    Ok((output, actual))
 }
 
 fn record_tagged_match(
@@ -3522,6 +4602,16 @@ mod tests {
             .collect()
     }
 
+    fn session_trace_ids<T>(
+        trace: &TaggedManyTraceSessionReport<'_, T>,
+    ) -> Vec<(u32, usize, usize)> {
+        trace
+            .matches()
+            .iter()
+            .map(|entry| (entry.ordinal().get(), entry.start(), entry.end()))
+            .collect()
+    }
+
     #[test]
     fn owner_projection_preserves_source_order_and_internal_priority() {
         let short = TaggedManyPlan::<DirectCount>::from_raw(
@@ -3552,6 +4642,193 @@ mod tests {
             .unwrap();
         assert_eq!(vec![(0, 0, 2)], trace_ids(&trace));
         assert_eq!(&2, trace.report().output());
+    }
+
+    #[test]
+    fn reusable_trace_session_matches_one_shot_generic_runs_without_new_allocations() {
+        let plan = TaggedManyPlan::<DirectCount>::from_raw(
+            vec![literal(b"aa"), literal(b"a")],
+            b'\n',
+            compile_limits(),
+            TaggedManyBuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            TaggedManyExecutionClass::Generic,
+            plan.stats().execution_class()
+        );
+        let limits = DirectReduceLimits::unlimited();
+        let first_one_shot = plan.execute_trace(b"aabb", limits).unwrap();
+        let second_one_shot = plan.execute_trace(b"bbaa", limits).unwrap();
+        let mut session = plan.prepare_trace_session(4, limits).unwrap();
+        assert_eq!(0, session.prospective().allocation_attempts);
+        assert!(session.setup_prospective().allocation_attempts > 0);
+
+        {
+            let first = session.execute_trace(b"aabb").unwrap();
+            assert_eq!(trace_ids(&first_one_shot), session_trace_ids(&first));
+            assert_eq!(first_one_shot.report().output(), first.report().output());
+            assert_eq!(0, first.report().actual().allocation_attempts);
+            assert!(first.closes());
+        }
+        {
+            let second = session.execute_trace(b"bbaa").unwrap();
+            assert_eq!(trace_ids(&second_one_shot), session_trace_ids(&second));
+            assert_eq!(second_one_shot.report().output(), second.report().output());
+            assert_eq!(0, second.report().actual().allocation_attempts);
+            assert!(second.closes());
+        }
+    }
+
+    #[test]
+    fn reusable_trace_session_reuses_shared_frontier_trace_and_enforces_length() {
+        let plan = TaggedManyPlan::<DirectCount>::from_raw(
+            vec![uniform_nonliteral_chain(2); 2],
+            b'\n',
+            compile_limits(),
+            TaggedManyBuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.stats().execution_class(),
+            TaggedManyExecutionClass::SharedFrontierUniformRangeChain { depth: 2, .. }
+        ));
+        let limits = DirectReduceLimits::unlimited();
+        let expected = plan.execute_trace(b"ababab", limits).unwrap();
+        let mut session = plan.prepare_trace_session(6, limits).unwrap();
+        assert_eq!(1, session.setup_prospective().allocation_attempts);
+        assert_eq!(0, session.prospective().allocation_attempts);
+
+        {
+            let run = session.execute_trace(b"ababab").unwrap();
+            assert_eq!(trace_ids(&expected), session_trace_ids(&run));
+            assert_eq!(&3, run.report().output());
+            assert_eq!(0, run.report().actual().allocation_attempts);
+            assert!(run.closes());
+        }
+        {
+            let empty = session.execute_trace(b"!!!!!!").unwrap();
+            assert!(empty.matches().is_empty());
+            assert_eq!(&0, empty.report().output());
+            assert_eq!(0, empty.report().actual().allocation_attempts);
+            assert!(empty.closes());
+        }
+        assert!(matches!(
+            session.execute_trace(b"short"),
+            Err(ReduceError::InternalInvariant { detail })
+                if detail == "tagged trace session haystack length differs from its admitted workspace"
+        ));
+    }
+
+    #[test]
+    fn trace_session_setup_preflight_is_exact_for_generic_retained_storage() {
+        let plan = TaggedManyPlan::<DirectCount>::from_raw(
+            vec![literal(b"aa"), literal(b"a")],
+            b'\n',
+            compile_limits(),
+            TaggedManyBuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            TaggedManyExecutionClass::Generic,
+            plan.stats().execution_class()
+        );
+        let setup = plan
+            .trace_session_setup_prospective(4, DirectReduceLimits::unlimited())
+            .unwrap();
+        assert!(setup.closes());
+        assert_eq!(0, setup.steady_untraced_prospective.allocation_attempts);
+        assert_eq!(0, setup.steady_traced_prospective.allocation_attempts);
+        assert_eq!(
+            setup.persistent_bytes,
+            setup.steady_traced_prospective.scratch_bytes
+        );
+        let states = setup.steady_traced_prospective.tagged_map_capacity - 1;
+        let initialized_entries = states * 2 + setup.steady_traced_prospective.boundary_rows;
+        assert_eq!(8, setup.allocation_attempts);
+        assert_eq!(
+            u64::try_from(initialized_entries + setup.allocation_attempts).unwrap(),
+            setup.initialization_work
+        );
+
+        let mut session = plan
+            .prepare_trace_session(4, DirectReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(setup, session.setup());
+        assert_eq!(setup, session.setup_prospective_receipt());
+        assert!(session.closes());
+        {
+            let run = session.execute_trace(b"aabb").unwrap();
+            assert_eq!(setup, run.setup());
+            assert_eq!(setup, run.setup_prospective_receipt());
+            assert!(run.closes());
+        }
+
+        session.setup.allocation_attempts += 1;
+        assert!(!session.closes());
+        assert!(matches!(
+            session.execute_trace(b"aabb"),
+            Err(ReduceError::InternalInvariant { detail })
+                if detail == "reusable tagged trace-session setup receipt did not close"
+        ));
+    }
+
+    #[test]
+    fn trace_session_setup_excludes_zero_capacity_shared_frontier_reservations() {
+        let plan = TaggedManyPlan::<DirectCount>::from_raw(
+            vec![uniform_nonliteral_chain(2); 2],
+            b'\n',
+            compile_limits(),
+            TaggedManyBuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan.stats().execution_class(),
+            TaggedManyExecutionClass::SharedFrontierUniformRangeChain { .. }
+        ));
+        let setup = plan
+            .trace_session_setup_prospective(0, DirectReduceLimits::unlimited())
+            .unwrap();
+        assert!(setup.closes());
+        assert_eq!(1, setup.trace_capacity);
+        assert_eq!(size_of::<PriorityMatch>(), setup.persistent_bytes);
+        // The shared frontier owns only the non-empty trace vector. Its
+        // absent rows and outcome pools do not count as allocation attempts.
+        assert_eq!(1, setup.allocation_attempts);
+        assert_eq!(1, setup.initialization_work);
+
+        let exact = DirectReduceLimits {
+            max_work: setup.steady_traced_prospective.work_upper_bound,
+            max_scratch_bytes: setup.persistent_bytes,
+            max_boundary_rows: setup.steady_traced_prospective.boundary_rows,
+            max_match_events: setup.steady_traced_prospective.match_events_upper_bound,
+            max_dfa_states: 0,
+            max_dfa_cells: 0,
+            max_subset_items: 0,
+            max_tagged_dispatch_states: 0,
+            max_tagged_dispatch_cells: 0,
+            max_tagged_candidate_items: 0,
+            max_tagged_cache_cells: 0,
+            max_allocation_attempts: setup.allocation_attempts,
+        };
+        assert_eq!(
+            setup,
+            plan.trace_session_setup_prospective(0, exact).unwrap()
+        );
+        assert!(plan.prepare_trace_session(0, exact).is_ok());
+        assert!(matches!(
+            plan.trace_session_setup_prospective(
+                0,
+                DirectReduceLimits {
+                    max_allocation_attempts: 0,
+                    ..exact
+                },
+            ),
+            Err(ReduceError::AllocationAttemptsLimit {
+                needed: 1,
+                limit: 0
+            })
+        ));
     }
 
     #[test]

@@ -43,7 +43,8 @@ pub use priority::{
 };
 pub use tagged_many::{
     TaggedManyBuildAccounting, TaggedManyBuildError, TaggedManyBuildLimits,
-    TaggedManyExecutionClass, TaggedManyPlan, TaggedManyStats, TAGGED_MANY_ACCOUNTING_ID,
-    TAGGED_MANY_BUILD_ALLOCATION_ATTEMPTS,
+    TaggedManyExecutionClass, TaggedManyPlan, TaggedManyStats, TaggedManyTraceSession,
+    TaggedManyTraceSessionReport, TaggedManyTraceSessionSetupProspective,
+    TAGGED_MANY_ACCOUNTING_ID, TAGGED_MANY_BUILD_ALLOCATION_ATTEMPTS,
 };
 pub use unicode_look::{UnicodeLookError, UnicodeLookMatcher};

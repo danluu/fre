@@ -18,9 +18,9 @@ use fre_capture_lab::{
     AggregateLimits, Assertion as CaptureAssertion, Ast, BuildError as EngineBuildError,
     BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
     CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureProfile, CaptureRecord,
-    CaptureStream, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
-    CaptureStreamOperationProspective, CaptureStreamProjection, CaptureStreamProspective,
-    CaptureStreamReport, Greed, HistoryRegex, HistorySearchProspective,
+    CaptureStream, CaptureStreamAccounting, CaptureStreamDomains, CaptureStreamError,
+    CaptureStreamLimits, CaptureStreamOperationProspective, CaptureStreamProjection,
+    CaptureStreamProspective, CaptureStreamReport, Greed, HistoryRegex, HistorySearchProspective,
     PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
     PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
     ParticipationSearchProspective, Program, ResourceKind as EngineResource,
@@ -102,6 +102,38 @@ pub enum CapturePlanKind {
     /// persistent histories for schemas wider than one participation word.
     /// Source-free construction refusal retains selector/history replay.
     FusedCaptureStreamPersistentHistoryV1,
+}
+
+/// Aggregate-only projection selected for one already-verified whole-match
+/// span. This is crate-visible because the forced multi-pattern bridge owns
+/// ordinal selection while this facade owns capture semantics.
+///
+/// The variants deliberately retain only the information observable by a
+/// capture-count reducer. In particular, neither the mask nor the fixed
+/// cardinality route materializes capture offsets. Full persistent history is
+/// reserved for schemas whose participation cannot be represented by the
+/// fixed quotient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactCaptureParticipation {
+    /// A canonical-HIR proof fixes the complete participating-group count.
+    Cardinality(u64),
+    /// Count projected from a fixed-width reusable participation mask. The
+    /// reusable workspace deliberately retains no externally observable tag
+    /// offsets; only this count is needed by the aggregate reducer.
+    MaskCount(u64),
+    /// Exact persistent-history materialization counted participating groups.
+    PersistentHistory(u64),
+}
+
+impl ExactCaptureParticipation {
+    /// Number of participating groups, including the overall group.
+    pub(crate) const fn entries(self) -> u64 {
+        match self {
+            Self::Cardinality(entries)
+            | Self::MaskCount(entries)
+            | Self::PersistentHistory(entries) => entries,
+        }
+    }
 }
 
 /// Typed compatibility receipt for HIR forms outside the certified capture compiler.
@@ -2281,11 +2313,213 @@ impl CaptureStreamSession {
     }
 }
 
+/// One caller-owned reusable projection table for a capture sidecar selected
+/// by an outer shared multi-pattern automaton. It never searches for a start:
+/// each invocation receives the ordinal/span already fixed by that selector.
+#[derive(Debug)]
+pub(crate) struct CaptureExactProjectionSession {
+    route: CaptureExactProjectionRoute,
+}
+
+#[derive(Debug)]
+enum CaptureExactProjectionRoute {
+    /// A positive-width uniform proof needs no tag workspace at all: every
+    /// span emitted by the shared selector has the already-proved count.
+    Uniform {
+        entries: u64,
+    },
+    /// A nullable uniform proof still reduces non-empty spans directly, but
+    /// retains one exact workspace to authenticate the selector's empty-span
+    /// progress semantics.
+    UniformWithEmpty {
+        entries: u64,
+        empty_span_stream: CaptureStream,
+        empty_projection: CaptureStreamProjection,
+    },
+    Mask {
+        stream: CaptureStream,
+    },
+    PersistentHistory {
+        stream: CaptureStream,
+    },
+}
+
+impl CaptureExactProjectionSession {
+    /// Immutable exact workspace envelope retained by this route. A fixed
+    /// positive-width cardinality proof deliberately retains no stream.
+    pub(crate) const fn stream_prospective(&self) -> Option<CaptureStreamProspective> {
+        match &self.route {
+            CaptureExactProjectionRoute::Uniform { .. } => None,
+            CaptureExactProjectionRoute::UniformWithEmpty {
+                empty_span_stream, ..
+            }
+            | CaptureExactProjectionRoute::Mask {
+                stream: empty_span_stream,
+            }
+            | CaptureExactProjectionRoute::PersistentHistory {
+                stream: empty_span_stream,
+            } => Some(empty_span_stream.build_report()),
+        }
+    }
+
+    pub(crate) fn project(
+        &mut self,
+        haystack: &[u8],
+        span: EngineSpan,
+    ) -> Result<(ExactCaptureParticipation, CaptureStreamAccounting), CaptureStreamError> {
+        match &mut self.route {
+            CaptureExactProjectionRoute::Uniform { entries } => {
+                if span.start == span.end {
+                    return Err(CaptureStreamError::InvalidProgram);
+                }
+                Ok((
+                    ExactCaptureParticipation::Cardinality(*entries),
+                    CaptureStreamAccounting::default(),
+                ))
+            }
+            CaptureExactProjectionRoute::UniformWithEmpty { entries, .. }
+                if span.start != span.end =>
+            {
+                Ok((
+                    ExactCaptureParticipation::Cardinality(*entries),
+                    CaptureStreamAccounting::default(),
+                ))
+            }
+            CaptureExactProjectionRoute::UniformWithEmpty {
+                empty_span_stream,
+                empty_projection,
+                ..
+            } => {
+                let (entries, accounting) = empty_span_stream.execute_exact_span(haystack, span)?;
+                let entries =
+                    u64::try_from(entries).map_err(|_| CaptureStreamError::InvalidProgram)?;
+                let projection = match empty_projection {
+                    CaptureStreamProjection::ParticipationMask => {
+                        ExactCaptureParticipation::MaskCount(entries)
+                    }
+                    CaptureStreamProjection::PersistentHistory => {
+                        ExactCaptureParticipation::PersistentHistory(entries)
+                    }
+                };
+                Ok((projection, accounting))
+            }
+            CaptureExactProjectionRoute::Mask { stream } => {
+                let (entries, accounting) = stream.execute_exact_span(haystack, span)?;
+                let entries =
+                    u64::try_from(entries).map_err(|_| CaptureStreamError::InvalidProgram)?;
+                Ok((ExactCaptureParticipation::MaskCount(entries), accounting))
+            }
+            CaptureExactProjectionRoute::PersistentHistory { stream } => {
+                let (entries, accounting) = stream.execute_exact_span(haystack, span)?;
+                let entries =
+                    u64::try_from(entries).map_err(|_| CaptureStreamError::InvalidProgram)?;
+                Ok((
+                    ExactCaptureParticipation::PersistentHistory(entries),
+                    accounting,
+                ))
+            }
+        }
+    }
+}
+
+fn capture_exact_stream_limits(
+    states: usize,
+    user_captures: usize,
+    source_bytes: usize,
+    limits: EngineSearchLimits,
+    requested: CaptureStreamLimits,
+) -> CaptureStreamLimits {
+    let groups = user_captures.saturating_add(1);
+    let history_reads = limits
+        .max_history_nodes
+        .saturating_add(limits.max_history_walk.saturating_mul(2));
+    let baseline = CaptureStreamLimits {
+        max_source_bytes: source_bytes,
+        max_states: states,
+        max_build_work: usize::MAX,
+        max_persistent_bytes: limits.max_scratch_bytes,
+        max_combined_peak_bytes: limits.max_scratch_bytes,
+        max_allocations: 16,
+        max_line_domains: 1,
+        max_searches: 1,
+        max_matches: 1,
+        max_bytes_examined: source_bytes,
+        max_starts_injected: 1,
+        max_state_visits: limits.max_state_visits,
+        max_tag_actions: limits.max_slot_copies,
+        max_history_nodes: limits.max_history_nodes,
+        max_history_walk: limits.max_history_walk,
+        max_history_reads: history_reads,
+        max_materialization_reads: limits.max_history_walk,
+        max_materialization_writes: limits.max_history_walk,
+        max_materialization_preview_writes: 0,
+        max_mask_states: 0,
+        max_mask_word_copies: 0,
+        max_mask_word_reads: limits.max_state_visits,
+        max_reset_cells: usize::MAX,
+        max_capture_events: groups,
+        max_capture_count: groups,
+        max_line_source_reads: 0,
+        max_work: usize::MAX,
+    };
+    intersect_capture_stream_limits(baseline, requested)
+}
+
+fn intersect_capture_stream_limits(
+    baseline: CaptureStreamLimits,
+    requested: CaptureStreamLimits,
+) -> CaptureStreamLimits {
+    macro_rules! bounded {
+        ($field:ident) => {
+            baseline.$field.min(requested.$field)
+        };
+    }
+    CaptureStreamLimits {
+        max_source_bytes: bounded!(max_source_bytes),
+        max_states: bounded!(max_states),
+        max_build_work: bounded!(max_build_work),
+        max_persistent_bytes: bounded!(max_persistent_bytes),
+        max_combined_peak_bytes: bounded!(max_combined_peak_bytes),
+        max_allocations: bounded!(max_allocations),
+        max_line_domains: bounded!(max_line_domains),
+        max_searches: bounded!(max_searches),
+        max_matches: bounded!(max_matches),
+        max_bytes_examined: bounded!(max_bytes_examined),
+        max_starts_injected: bounded!(max_starts_injected),
+        max_state_visits: bounded!(max_state_visits),
+        max_tag_actions: bounded!(max_tag_actions),
+        max_history_nodes: bounded!(max_history_nodes),
+        max_history_walk: bounded!(max_history_walk),
+        max_history_reads: bounded!(max_history_reads),
+        max_materialization_reads: bounded!(max_materialization_reads),
+        max_materialization_writes: bounded!(max_materialization_writes),
+        max_materialization_preview_writes: bounded!(max_materialization_preview_writes),
+        max_mask_states: bounded!(max_mask_states),
+        max_mask_word_copies: bounded!(max_mask_word_copies),
+        max_mask_word_reads: bounded!(max_mask_word_reads),
+        max_reset_cells: bounded!(max_reset_cells),
+        max_capture_events: bounded!(max_capture_events),
+        max_capture_count: bounded!(max_capture_count),
+        max_line_source_reads: bounded!(max_line_source_reads),
+        max_work: bounded!(max_work),
+    }
+}
+
 impl CaptureRegex {
     /// Construction and plan identity.
     #[must_use]
     pub const fn build_report(&self) -> &CaptureBuildReport {
         &self.report
+    }
+
+    /// Exact construction limits retained by this immutable sidecar.
+    ///
+    /// Forced multi-pattern capture composition uses this accessor to
+    /// authenticate that every ordinal inherited its enclosing policy and
+    /// resource envelope rather than silently using a default constructor.
+    #[must_use]
+    pub const fn build_limits(&self) -> CaptureBuildLimits {
+        self.build_limits
     }
 
     /// Recompute the exact source-free direct-operation P for adapter/cache
@@ -2317,6 +2551,103 @@ impl CaptureRegex {
             self.engine.participation_exact_prospective(span).map(Some)
         } else {
             Ok(None)
+        }
+    }
+
+    /// Return the immutable stream envelope needed by one reusable exact
+    /// projector, if this sidecar actually needs tagged replay. Positive-width
+    /// uniform cardinality proofs return `None`: their selected spans can be
+    /// reduced without retaining a frontier or history workspace.
+    pub(crate) fn exact_projection_stream_prospective(
+        &self,
+        source_bytes: usize,
+        limits: EngineSearchLimits,
+        projection_limits: CaptureStreamLimits,
+    ) -> Result<Option<CaptureStreamProspective>, CaptureStreamError> {
+        if self.report.uniform_participating_captures.is_some()
+            && self.uniform_count_minimum_match_bytes.is_some()
+        {
+            return Ok(None);
+        }
+        let stream_limits = capture_exact_stream_limits(
+            self.report.engine.states,
+            self.report.engine.captures,
+            source_bytes,
+            limits,
+            projection_limits,
+        );
+        let prospective = CaptureStream::prospective(self.engine.program(), source_bytes)?;
+        prospective.admits_construction(stream_limits)?;
+        Ok(Some(prospective))
+    }
+
+    /// Prepare one reusable exact-span participation projector for a fixed
+    /// complete haystack length. The caller owns this session for an entire
+    /// shared multi-pattern operation, so every selected replay reuses the
+    /// same bounded frontiers and tag workspace.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the pinned capture-lab error retains the exact refused resource dimension"
+    )]
+    pub(crate) fn prepare_exact_projection_session(
+        &self,
+        source_bytes: usize,
+        limits: EngineSearchLimits,
+        projection_limits: CaptureStreamLimits,
+    ) -> Result<CaptureExactProjectionSession, CaptureStreamError> {
+        let stream_limits = capture_exact_stream_limits(
+            self.report.engine.states,
+            self.report.engine.captures,
+            source_bytes,
+            limits,
+            projection_limits,
+        );
+        if let Some(participating) = self.report.uniform_participating_captures {
+            let entries = participating
+                .checked_add(1)
+                .and_then(|entries| u64::try_from(entries).ok())
+                .ok_or(CaptureStreamError::InvalidProgram)?;
+            if self.uniform_count_minimum_match_bytes.is_some() {
+                return Ok(CaptureExactProjectionSession {
+                    route: CaptureExactProjectionRoute::Uniform { entries },
+                });
+            }
+            let stream = CaptureStream::new_exact(
+                Arc::clone(self.engine.program()),
+                source_bytes,
+                stream_limits,
+            )?;
+            let empty_projection = stream.build_report().projection;
+            return Ok(CaptureExactProjectionSession {
+                route: CaptureExactProjectionRoute::UniformWithEmpty {
+                    entries,
+                    empty_span_stream: stream,
+                    empty_projection,
+                },
+            });
+        }
+        let stream = CaptureStream::new_exact(
+            Arc::clone(self.engine.program()),
+            source_bytes,
+            stream_limits,
+        )?;
+        let projection = stream.build_report().projection;
+        match projection {
+            CaptureStreamProjection::ParticipationMask
+                if self.report.participation_quotient_proof().is_some() =>
+            {
+                Ok(CaptureExactProjectionSession {
+                    route: CaptureExactProjectionRoute::Mask { stream },
+                })
+            }
+            CaptureStreamProjection::PersistentHistory
+                if self.report.participation_quotient_proof().is_none() =>
+            {
+                Ok(CaptureExactProjectionSession {
+                    route: CaptureExactProjectionRoute::PersistentHistory { stream },
+                })
+            }
+            _ => Err(CaptureStreamError::InvalidProgram),
         }
     }
 

@@ -354,8 +354,25 @@ pub(crate) fn build_from_hir(
     syntax: Arc<CacheKey>,
     limits: CaptureRequiredLiteralBuildLimits,
 ) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
+    build_from_hirs(core::slice::from_ref(hir), syntax, limits)
+}
+
+/// Build one conservative any-literal plan for the logical ordered
+/// alternation of independently owned HIR roots.
+///
+/// This deliberately traverses the roots as an alternation instead of
+/// materializing [`Hir::alternation`]. The latter performs upstream HIR
+/// normalization with variable internal allocations that are neither needed
+/// for this conservative proof nor owned by the plan. Each root remains live
+/// only for the bounded proof construction; publication still copies every
+/// selected literal into the plan's exact-capacity arena.
+pub(crate) fn build_from_hirs(
+    hirs: &[Hir],
+    syntax: Arc<CacheKey>,
+    limits: CaptureRequiredLiteralBuildLimits,
+) -> Result<CaptureRequiredLiteralBuildOutcome, CaptureRequiredLiteralBuildFailure> {
     let mut meter = Meter::new(limits);
-    match build_from_hir_metered(hir, syntax, limits, &mut meter) {
+    match build_from_hirs_metered(hirs, syntax, limits, &mut meter) {
         Ok(plan) => Ok(CaptureRequiredLiteralBuildOutcome {
             plan,
             planner_work: meter.work,
@@ -371,13 +388,13 @@ pub(crate) fn build_from_hir(
     clippy::too_many_lines,
     reason = "the exact antichain, resource preflight, allocation, DFA construction, and publication form one auditable transaction"
 )]
-fn build_from_hir_metered(
-    hir: &Hir,
+fn build_from_hirs_metered(
+    hirs: &[Hir],
     syntax: Arc<CacheKey>,
     limits: CaptureRequiredLiteralBuildLimits,
     meter: &mut Meter,
 ) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureRequiredLiteralBuildError> {
-    let Some(raw_metrics) = measure(hir, 1, meter)? else {
+    let Some(raw_metrics) = measure_hir_alternation(hirs, meter)? else {
         return Ok(None);
     };
     if raw_metrics.needles > MAX_INLINE_NEEDLES {
@@ -397,7 +414,7 @@ fn build_from_hir_metered(
 
     let mut raw_needles = [RawNeedle::Literal(&[]); MAX_INLINE_NEEDLES];
     let mut raw_count = 0_usize;
-    collect_refs(hir, 1, meter, &mut raw_needles, &mut raw_count)?;
+    collect_hir_alternation(hirs, meter, &mut raw_needles, &mut raw_count)?;
     if raw_count != raw_metrics.needles {
         return Err(CaptureRequiredLiteralBuildError::InternalInvariant(
             "collected raw needle count differs from proof",
@@ -597,6 +614,24 @@ impl CaptureRequiredLiteralPlan {
         &self.report
     }
 
+    /// Derive the complete cache identity used by [`Self::is_candidate`] for
+    /// the supplied execution limits.
+    ///
+    /// This lets a composite caller authenticate a returned
+    /// [`CaptureRequiredLiteralSearchReport`] to this exact immutable plan,
+    /// its construction limits, the [`CaptureRequiredLiteralSearchOperation::CandidateV1`]
+    /// operation, and its own run limits without performing a search.
+    #[must_use]
+    pub fn candidate_cache_identity(
+        &self,
+        run_limits: CaptureRequiredLiteralRunLimits,
+    ) -> CaptureRequiredLiteralCacheIdentity {
+        self.cache_identity(
+            run_limits,
+            CaptureRequiredLiteralSearchOperation::CandidateV1,
+        )
+    }
+
     #[allow(
         clippy::result_large_err,
         reason = "typed refusal retains complete cache identity without an unmetered error-path allocation"
@@ -606,10 +641,7 @@ impl CaptureRequiredLiteralPlan {
         haystack: &[u8],
         run_limits: CaptureRequiredLiteralRunLimits,
     ) -> Result<CaptureRequiredLiteralSearchReport, CaptureRequiredLiteralSearchError> {
-        let identity = self.cache_identity(
-            run_limits,
-            CaptureRequiredLiteralSearchOperation::CandidateV1,
-        );
+        let identity = self.candidate_cache_identity(run_limits);
         let (matched, accounting) = self
             .matcher
             .find(
@@ -822,6 +854,39 @@ fn measure(
     }
 }
 
+/// Measure independently parsed roots as one logical alternation without
+/// constructing an upstream normalized HIR node. No synthetic root is
+/// charged: this helper owns no additional HIR and the individual parser
+/// receipts already account for every supplied root.
+fn measure_hir_alternation(
+    hirs: &[Hir],
+    meter: &mut Meter,
+) -> Result<Option<Metrics>, CaptureRequiredLiteralBuildError> {
+    if hirs.is_empty() {
+        return Ok(None);
+    }
+    let mut needles = 0_usize;
+    let mut bytes = 0_usize;
+    let mut minimum_bytes = usize::MAX;
+    for hir in hirs {
+        let Some(metrics) = measure(hir, 1, meter)? else {
+            return Ok(None);
+        };
+        needles = needles
+            .checked_add(metrics.needles)
+            .ok_or(CaptureRequiredLiteralBuildError::Overflow("needle count"))?;
+        bytes = bytes
+            .checked_add(metrics.bytes)
+            .ok_or(CaptureRequiredLiteralBuildError::Overflow("needle bytes"))?;
+        minimum_bytes = minimum_bytes.min(metrics.minimum_bytes);
+    }
+    Ok(Some(Metrics {
+        needles,
+        bytes,
+        minimum_bytes,
+    }))
+}
+
 fn measure_ascii_class(
     class: &Class,
     meter: &mut Meter,
@@ -1011,6 +1076,21 @@ fn collect_refs<'hir>(
             "proved node lost its required literal",
         )),
     }
+}
+
+/// Collect the conservative required-literal alternatives from independently
+/// parsed roots. This is the collection counterpart of
+/// [`measure_hir_alternation`].
+fn collect_hir_alternation<'hir>(
+    hirs: &'hir [Hir],
+    meter: &mut Meter,
+    output: &mut [RawNeedle<'hir>; MAX_INLINE_NEEDLES],
+    count: &mut usize,
+) -> Result<(), CaptureRequiredLiteralBuildError> {
+    for hir in hirs {
+        collect_refs(hir, 1, meter, output, count)?;
+    }
+    Ok(())
 }
 
 fn effective_antichain(
@@ -1240,6 +1320,19 @@ mod tests {
         build_from_hir(&rust.hir, key, limits)
     }
 
+    fn parsed_hir(pattern: &str) -> (CacheKey, Hir) {
+        let parsed = fre_syntax::parse(ParseRequest::rust(
+            pattern,
+            CompatibilityProfile::RustBytes(RustProfile::rebar_1_12_4()),
+        ))
+        .unwrap();
+        let fre_syntax::ParseRecord { key, pattern, .. } = parsed;
+        let CanonicalPattern::Rust(rust) = pattern else {
+            panic!("Rust parser returned a non-Rust pattern");
+        };
+        (key, rust.hir)
+    }
+
     fn build(
         pattern: &str,
         limits: CaptureRequiredLiteralBuildLimits,
@@ -1285,6 +1378,70 @@ mod tests {
                 .unwrap()
                 .plan
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn logical_hir_alternation_preserves_nested_union_candidate_soundness() {
+        let (identity, first) = parsed_hir("(?:AB|CD)");
+        let (_, second) = parsed_hir("(?:EF|GH)");
+        let hirs = [first, second];
+        let plan = build_from_hirs(
+            &hirs,
+            Arc::new(identity),
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap_or_else(|failure| panic!("logical union build failed: {}", failure.source))
+        .plan
+        .expect("each logical union branch has a bounded required literal");
+        assert_eq!(
+            owned_needles(&plan),
+            vec![
+                b"AB".to_vec(),
+                b"CD".to_vec(),
+                b"EF".to_vec(),
+                b"GH".to_vec(),
+            ]
+        );
+        for (haystack, candidate) in [
+            (b"AB".as_slice(), true),
+            (b"CD".as_slice(), true),
+            (b"EF".as_slice(), true),
+            (b"GH".as_slice(), true),
+            (b"ZZ".as_slice(), false),
+        ] {
+            assert_eq!(
+                plan.is_candidate(haystack, CaptureRequiredLiteralRunLimits::default())
+                    .unwrap()
+                    .candidate,
+                candidate,
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_cache_identity_authenticates_the_exact_candidate_operation() {
+        let plan = build("(?:AB|CD)+", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("mandatory literals");
+        let limits = CaptureRequiredLiteralRunLimits {
+            max_transitions: 97,
+        };
+        let identity = plan.candidate_cache_identity(limits);
+
+        assert_eq!(identity.plan, plan.build_report().identity);
+        assert_eq!(
+            identity.operation,
+            CaptureRequiredLiteralSearchOperation::CandidateV1
+        );
+        assert_eq!(identity.run_limits, limits);
+        assert_eq!(plan.is_candidate(b"AB", limits).unwrap().identity, identity);
+        assert_ne!(
+            identity,
+            plan.candidate_cache_identity(CaptureRequiredLiteralRunLimits {
+                max_transitions: limits.max_transitions - 1,
+            })
         );
     }
 

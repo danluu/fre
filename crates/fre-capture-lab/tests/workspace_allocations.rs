@@ -230,10 +230,50 @@ fn assert_capture_stream_census() {
     }
 }
 
+fn assert_exact_capture_replay_census() {
+    let program = Arc::new(
+        fre_capture_lab::Program::compile(
+            &Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'b')]),
+            BuildLimits::default(),
+        )
+        .expect("program"),
+    );
+    let prospective = CaptureStream::prospective(&program, 4).expect("prospective");
+    let limits = CaptureStreamLimits {
+        max_source_bytes: prospective.source_bytes,
+        max_states: prospective.states,
+        max_build_work: prospective.build_work,
+        max_persistent_bytes: prospective.persistent_bytes,
+        max_combined_peak_bytes: prospective.combined_peak_bytes,
+        max_allocations: prospective.allocations,
+        ..CaptureStreamLimits::default()
+    };
+    let (stream, stats) =
+        census(|| CaptureStream::new_exact(Arc::clone(&program), 4, limits).expect("exact stream"));
+    assert_eq!(stats.allocations, prospective.allocations);
+    assert_eq!(stats.bytes_allocated, prospective.allocator_bytes);
+    assert_eq!(stats.reallocations, 0);
+    assert_eq!(stats.deallocations, 0);
+    assert_eq!(stats.bytes_reallocated, 0);
+
+    let mut stream = stream;
+    for _ in 0..2 {
+        let ((entries, accounting), stats) = census(|| {
+            stream
+                .execute_exact_span(b"abxx", fre_capture_lab::Span { start: 0, end: 2 })
+                .expect("exact replay")
+        });
+        assert_eq!(2, entries);
+        assert_eq!(stats, Stats::default());
+        assert_eq!(accounting.allocations, 0);
+    }
+}
+
 #[test]
 fn exact_storage_and_reused_execution_match_the_allocator_census() {
     assert_construction_census();
     assert_reuse_census();
     assert_line_census();
     assert_capture_stream_census();
+    assert_exact_capture_replay_census();
 }

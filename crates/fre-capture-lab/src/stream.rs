@@ -620,6 +620,46 @@ impl CaptureStreamOperationProspective {
 }
 
 impl CaptureStreamProspective {
+    /// Check only the fixed prepared-workspace envelope before any source
+    /// byte is observed. Exact-span callers use this separately from the
+    /// selected-span replay counters, whose bounds depend on the certified
+    /// span supplied later by their selector.
+    pub fn admits_construction(
+        self,
+        limits: CaptureStreamLimits,
+    ) -> Result<(), CaptureStreamError> {
+        check(
+            CaptureStreamResource::SourceBytes,
+            self.source_bytes,
+            limits.max_source_bytes,
+        )?;
+        check(
+            CaptureStreamResource::States,
+            self.states,
+            limits.max_states,
+        )?;
+        check(
+            CaptureStreamResource::BuildWork,
+            self.build_work,
+            limits.max_build_work,
+        )?;
+        check(
+            CaptureStreamResource::PersistentBytes,
+            self.persistent_bytes,
+            limits.max_persistent_bytes,
+        )?;
+        check(
+            CaptureStreamResource::CombinedPeakBytes,
+            self.combined_peak_bytes,
+            limits.max_combined_peak_bytes,
+        )?;
+        check(
+            CaptureStreamResource::Allocations,
+            self.allocations,
+            limits.max_allocations,
+        )
+    }
+
     /// Whether every construction dimension closes mechanically.
     #[must_use]
     pub fn closes(self) -> bool {
@@ -994,6 +1034,12 @@ pub struct CaptureStream {
     seen: ExactVec<usize>,
     tags: TagWorkspace,
     generation: usize,
+    /// Exact-span sessions retain the same fixed frontier and tag workspace,
+    /// but are not admitted as the restarted whole-operation executor.
+    /// Keeping this bit explicit prevents a caller from accidentally using a
+    /// construction that only proved the exact replay envelope as a regular
+    /// restart stream.
+    exact_only: bool,
 }
 
 impl CaptureStream {
@@ -1313,6 +1359,78 @@ impl CaptureStream {
             seen,
             tags,
             generation: 0,
+            exact_only: false,
+        })
+    }
+
+    /// Allocate a reusable exact-span replay workspace.
+    ///
+    /// Unlike [`Self::new`], this constructor admits only the fixed workspace
+    /// construction envelope. Exact replay injects one certified start and
+    /// therefore must not be charged as a restarted positive-width operation.
+    /// The retained `operation` receipt is present solely to preserve the
+    /// stable object layout/API; [`Self::execute`] refuses this mode.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact fixed-envelope constructor mirrors the established stream allocation transaction"
+    )]
+    pub fn new_exact(
+        program: Arc<Program>,
+        source_bytes: usize,
+        limits: CaptureStreamLimits,
+    ) -> Result<Self, CaptureStreamError> {
+        let operation =
+            Self::operation_prospective(&program, source_bytes, CaptureStreamDomains::Whole)?;
+        let prospective = operation.construction;
+        operation.admits_construction(limits)?;
+        let tags = TagWorkspace::new(
+            prospective.groups,
+            prospective.tags.history_nodes,
+            0,
+            TagWorkspaceLimits {
+                max_groups: prospective.tags.groups,
+                max_history_nodes: prospective.tags.history_nodes,
+                max_mask_states: prospective.tags.mask_states,
+                max_mask_words: prospective.tags.mask_words,
+                max_build_work: prospective.tags.build_work,
+                max_initialized_bytes: prospective.tags.initialized_bytes,
+                max_copied_bytes: prospective.tags.copied_bytes,
+                max_scratch_bytes: prospective.tags.scratch_bytes,
+                max_persistent_bytes: prospective.tags.persistent_bytes,
+                max_peak_bytes: prospective.tags.peak_bytes,
+                max_allocator_bytes: prospective.tags.allocator_bytes,
+                max_allocations: prospective.tags.allocations,
+            },
+        )?;
+        let frontier = match prospective.projection {
+            CaptureStreamProjection::ParticipationMask => {
+                Frontier::Participation(ParticipationFrontier {
+                    current: exact_vec(prospective.states)?,
+                    next: exact_vec(prospective.states)?,
+                    stack: exact_vec(prospective.states)?,
+                })
+            }
+            CaptureStreamProjection::PersistentHistory => Frontier::History(HistoryFrontier {
+                current: exact_vec(prospective.states)?,
+                next: exact_vec(prospective.states)?,
+                stack: exact_vec(prospective.states)?,
+            }),
+        };
+        let mut seen = exact_vec(prospective.states)?;
+        for _ in 0..prospective.states {
+            exact_push(&mut seen, 0)?;
+        }
+        Ok(Self {
+            program,
+            domains: CaptureStreamDomains::Whole,
+            limits,
+            prospective,
+            operation,
+            frontier,
+            seen,
+            tags,
+            generation: 0,
+            exact_only: true,
         })
     }
 
@@ -1334,6 +1452,9 @@ impl CaptureStream {
         reason = "domain iteration and the terminal receipt are one allocation-free operation transaction"
     )]
     pub fn execute(&mut self, haystack: &[u8]) -> Result<CaptureStreamReport, CaptureStreamError> {
+        if self.exact_only {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
         if haystack.len() != self.prospective.source_bytes {
             return Err(CaptureStreamError::SourceLength {
                 expected: self.prospective.source_bytes,
@@ -1472,6 +1593,178 @@ impl CaptureStream {
         } else {
             Err(CaptureStreamError::InvalidProgram)
         }
+    }
+
+    /// Project one already-certified exact span with the prepared frontier.
+    ///
+    /// One start is injected at `span.start`; Match states reached before
+    /// `span.end` are ignored while every remaining priority thread stays
+    /// live. At `span.end` the first ordered Match supplies the participation
+    /// count. Assertions always observe the full original haystack, never a
+    /// sliced replay span. The returned accounting is exact for this one
+    /// reuse epoch and contains no dynamic allocations.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact replay keeps all admission, tag materialization, and counter closure in a single transaction"
+    )]
+    pub fn execute_exact_span(
+        &mut self,
+        haystack: &[u8],
+        span: Span,
+    ) -> Result<(usize, CaptureStreamAccounting), CaptureStreamError> {
+        if haystack.len() != self.prospective.source_bytes {
+            return Err(CaptureStreamError::SourceLength {
+                expected: self.prospective.source_bytes,
+                actual: haystack.len(),
+            });
+        }
+        if span.start > span.end || span.end > haystack.len() {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        // Every exact replay has exactly one domain, one search, one start,
+        // one certified match, and one group-schema observation. These are
+        // admitted before the first source byte is observed.
+        check(
+            CaptureStreamResource::LineDomains,
+            1,
+            self.limits.max_line_domains,
+        )?;
+        check(CaptureStreamResource::Searches, 1, self.limits.max_searches)?;
+        check(CaptureStreamResource::Matches, 1, self.limits.max_matches)?;
+        check(
+            CaptureStreamResource::StartsInjected,
+            1,
+            self.limits.max_starts_injected,
+        )?;
+        check(
+            CaptureStreamResource::CaptureEvents,
+            self.prospective.groups,
+            self.limits.max_capture_events,
+        )?;
+        let bytes = span
+            .end
+            .checked_sub(span.start)
+            .ok_or(CaptureStreamError::InvalidProgram)?;
+        check(
+            CaptureStreamResource::BytesExamined,
+            bytes,
+            self.limits.max_bytes_examined,
+        )?;
+
+        let mut accounting = CaptureStreamAccounting::default();
+        charge_accounted(
+            &mut accounting.line_domains,
+            &mut accounting.work,
+            1,
+            CaptureStreamResource::LineDomains,
+            self.limits.max_line_domains,
+            self.limits.max_work,
+        )?;
+        charge_accounted(
+            &mut accounting.searches,
+            &mut accounting.work,
+            1,
+            CaptureStreamResource::Searches,
+            self.limits.max_searches,
+            self.limits.max_work,
+        )?;
+        let winner = match &mut self.frontier {
+            Frontier::Participation(frontier) => {
+                StreamWinner::Participation(search_exact_participation(
+                    &self.program,
+                    frontier,
+                    &mut self.seen,
+                    &mut self.generation,
+                    &mut self.tags,
+                    haystack,
+                    span,
+                    self.limits,
+                    &mut accounting,
+                )?)
+            }
+            Frontier::History(frontier) => StreamWinner::History(search_exact_history(
+                &self.program,
+                frontier,
+                &mut self.seen,
+                &mut self.generation,
+                &mut self.tags,
+                haystack,
+                span,
+                self.limits,
+                &mut accounting,
+            )?),
+        };
+        let overall = match winner {
+            StreamWinner::Participation(winner) => winner.overall,
+            StreamWinner::History(winner) => winner.overall,
+        };
+        if overall != span {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        let participating =
+            match winner {
+                StreamWinner::Participation(winner) => {
+                    tighten_tag_work_limit(&mut self.tags, self.limits, &accounting)?;
+                    let mut mask = self.tags.participation_mask(winner.tags)?;
+                    if !mask.accepts_complete_match()? {
+                        return Err(CaptureStreamError::InvalidProgram);
+                    }
+                    mask.user_capture_count()?.checked_add(1).ok_or(
+                        CaptureStreamError::Overflow(CaptureStreamResource::CaptureCount),
+                    )?
+                }
+                StreamWinner::History(winner) => {
+                    tighten_tag_work_limit(&mut self.tags, self.limits, &accounting)?;
+                    let mut mask = self
+                        .tags
+                        .materialize_history_participation(winner.history)?;
+                    if !mask.accepts_complete_match()? {
+                        return Err(CaptureStreamError::InvalidProgram);
+                    }
+                    mask.user_capture_count()?.checked_add(1).ok_or(
+                        CaptureStreamError::Overflow(CaptureStreamResource::CaptureCount),
+                    )?
+                }
+            };
+        check(
+            CaptureStreamResource::CaptureCount,
+            participating,
+            self.limits.max_capture_count,
+        )?;
+        charge_accounted(
+            &mut accounting.capture_events,
+            &mut accounting.work,
+            self.prospective.groups,
+            CaptureStreamResource::CaptureEvents,
+            self.limits.max_capture_events,
+            self.limits.max_work,
+        )?;
+        accumulate_tag_accounting(&self.tags.accounting(), &mut accounting, self.limits)?;
+        let expected_work = operation_work_sum(
+            accounting.line_domains,
+            accounting.searches,
+            accounting.state_visits,
+            accounting.tag_actions,
+            accounting.history_nodes,
+            accounting.history_walk,
+            accounting.history_reads,
+            accounting.materialization_reads,
+            accounting.materialization_writes,
+            accounting.materialization_preview_writes,
+            accounting.mask_states,
+            accounting.mask_word_copies,
+            accounting.mask_word_reads,
+            accounting.reset_cells,
+            accounting.capture_events,
+            accounting.line_source_reads,
+            accounting.bytes_examined,
+            accounting.starts_injected,
+        )
+        .map_err(CaptureStreamError::Overflow)?;
+        if expected_work != accounting.work || accounting.allocations != 0 {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        Ok((participating, accounting))
     }
 
     #[allow(
@@ -1620,6 +1913,288 @@ struct ParticipationWinner {
 struct HistoryWinner {
     history: HistoryId,
     overall: Span,
+}
+
+/// Run one exact quotient replay. This intentionally differs from the
+/// restarted `search_participation`: it injects exactly one start and skips
+/// early Match states while retaining every byte-consuming thread in priority
+/// order until the certified end boundary.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the exact replay keeps its full assertion context and ordered frontier explicit"
+)]
+fn search_exact_participation(
+    program: &Program,
+    frontier: &mut ParticipationFrontier,
+    seen: &mut ExactVec<usize>,
+    generation: &mut usize,
+    tags: &mut TagWorkspace,
+    haystack: &[u8],
+    span: Span,
+    limits: CaptureStreamLimits,
+    accounting: &mut CaptureStreamAccounting,
+) -> Result<ParticipationWinner, CaptureStreamError> {
+    if span.start > span.end || span.end > haystack.len() {
+        return Err(CaptureStreamError::InvalidProgram);
+    }
+    let window = Window::all(haystack);
+    frontier.current.clear();
+    frontier.next.clear();
+    frontier.stack.clear();
+    let tag_limits = tag_run_limits(tags.build_report(), limits, accounting)?;
+    tags.begin_run(tag_limits)?;
+    let root = tags.participation_root()?;
+    next_generation(generation)?;
+    charge_accounted(
+        &mut accounting.starts_injected,
+        &mut accounting.work,
+        1,
+        CaptureStreamResource::StartsInjected,
+        limits.max_starts_injected,
+        limits.max_work,
+    )?;
+    add_participation_thread(
+        program,
+        &mut frontier.current,
+        &mut frontier.stack,
+        seen,
+        *generation,
+        ParticipationThread {
+            pc: program.start,
+            tags: root,
+            overall_start: None,
+            overall_end: None,
+        },
+        span.start,
+        haystack,
+        window,
+        false,
+        tags,
+        limits,
+        accounting,
+    )?;
+
+    let mut pos = span.start;
+    while pos < span.end {
+        frontier.next.clear();
+        next_generation(generation)?;
+        let next_pos = pos.checked_add(1).ok_or(CaptureStreamError::Overflow(
+            CaptureStreamResource::StateVisits,
+        ))?;
+        let byte = *haystack
+            .get(pos)
+            .ok_or(CaptureStreamError::InvalidProgram)?;
+        for thread in frontier.current.as_slice().iter().copied() {
+            if matches!(program.states.get(thread.pc), Some(State::Match)) {
+                // An early accepting thread cannot authenticate this exact
+                // end, but later byte threads retain their original priority.
+                continue;
+            }
+            let State::Byte {
+                ranges,
+                next: target,
+            } = program
+                .states
+                .get(thread.pc)
+                .ok_or(CaptureStreamError::InvalidProgram)?
+            else {
+                return Err(CaptureStreamError::InvalidProgram);
+            };
+            if ranges
+                .iter()
+                .any(|&(start, end)| start <= byte && byte <= end)
+            {
+                add_participation_thread(
+                    program,
+                    &mut frontier.next,
+                    &mut frontier.stack,
+                    seen,
+                    *generation,
+                    ParticipationThread {
+                        pc: *target,
+                        tags: thread.tags,
+                        overall_start: thread.overall_start,
+                        overall_end: thread.overall_end,
+                    },
+                    next_pos,
+                    haystack,
+                    window,
+                    false,
+                    tags,
+                    limits,
+                    accounting,
+                )?;
+            }
+        }
+        charge_accounted(
+            &mut accounting.bytes_examined,
+            &mut accounting.work,
+            1,
+            CaptureStreamResource::BytesExamined,
+            limits.max_bytes_examined,
+            limits.max_work,
+        )?;
+        core::mem::swap(&mut frontier.current, &mut frontier.next);
+        pos = next_pos;
+    }
+    accounting.peak_threads = accounting.peak_threads.max(frontier.current.len());
+    let winner = frontier
+        .current
+        .as_slice()
+        .iter()
+        .find(|thread| matches!(program.states.get(thread.pc), Some(State::Match)))
+        .ok_or(CaptureStreamError::InvalidProgram)?;
+    Ok(ParticipationWinner {
+        tags: winner.tags,
+        overall: Span {
+            start: winner
+                .overall_start
+                .ok_or(CaptureStreamError::InvalidProgram)?,
+            end: winner
+                .overall_end
+                .ok_or(CaptureStreamError::InvalidProgram)?,
+        },
+    })
+}
+
+/// Run one exact persistent-history replay using the same reusable workspace
+/// as the fused stream. See [`search_exact_participation`] for the exact-end
+/// priority rule shared by both tag projections.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the exact replay keeps its full assertion context and ordered frontier explicit"
+)]
+fn search_exact_history(
+    program: &Program,
+    frontier: &mut HistoryFrontier,
+    seen: &mut ExactVec<usize>,
+    generation: &mut usize,
+    tags: &mut TagWorkspace,
+    haystack: &[u8],
+    span: Span,
+    limits: CaptureStreamLimits,
+    accounting: &mut CaptureStreamAccounting,
+) -> Result<HistoryWinner, CaptureStreamError> {
+    if span.start > span.end || span.end > haystack.len() {
+        return Err(CaptureStreamError::InvalidProgram);
+    }
+    let window = Window::all(haystack);
+    frontier.current.clear();
+    frontier.next.clear();
+    frontier.stack.clear();
+    let tag_limits = tag_run_limits(tags.build_report(), limits, accounting)?;
+    tags.begin_run(tag_limits)?;
+    next_generation(generation)?;
+    charge_accounted(
+        &mut accounting.starts_injected,
+        &mut accounting.work,
+        1,
+        CaptureStreamResource::StartsInjected,
+        limits.max_starts_injected,
+        limits.max_work,
+    )?;
+    add_history_thread(
+        program,
+        &mut frontier.current,
+        &mut frontier.stack,
+        seen,
+        *generation,
+        HistoryThread {
+            pc: program.start,
+            history: None,
+            overall_start: None,
+            overall_end: None,
+        },
+        span.start,
+        haystack,
+        window,
+        false,
+        tags,
+        limits,
+        accounting,
+    )?;
+
+    let mut pos = span.start;
+    while pos < span.end {
+        frontier.next.clear();
+        next_generation(generation)?;
+        let next_pos = pos.checked_add(1).ok_or(CaptureStreamError::Overflow(
+            CaptureStreamResource::StateVisits,
+        ))?;
+        let byte = *haystack
+            .get(pos)
+            .ok_or(CaptureStreamError::InvalidProgram)?;
+        for thread in frontier.current.as_slice().iter().copied() {
+            if matches!(program.states.get(thread.pc), Some(State::Match)) {
+                continue;
+            }
+            let State::Byte {
+                ranges,
+                next: target,
+            } = program
+                .states
+                .get(thread.pc)
+                .ok_or(CaptureStreamError::InvalidProgram)?
+            else {
+                return Err(CaptureStreamError::InvalidProgram);
+            };
+            if ranges
+                .iter()
+                .any(|&(start, end)| start <= byte && byte <= end)
+            {
+                add_history_thread(
+                    program,
+                    &mut frontier.next,
+                    &mut frontier.stack,
+                    seen,
+                    *generation,
+                    HistoryThread {
+                        pc: *target,
+                        history: thread.history,
+                        overall_start: thread.overall_start,
+                        overall_end: thread.overall_end,
+                    },
+                    next_pos,
+                    haystack,
+                    window,
+                    false,
+                    tags,
+                    limits,
+                    accounting,
+                )?;
+            }
+        }
+        charge_accounted(
+            &mut accounting.bytes_examined,
+            &mut accounting.work,
+            1,
+            CaptureStreamResource::BytesExamined,
+            limits.max_bytes_examined,
+            limits.max_work,
+        )?;
+        core::mem::swap(&mut frontier.current, &mut frontier.next);
+        pos = next_pos;
+    }
+    accounting.peak_threads = accounting.peak_threads.max(frontier.current.len());
+    let winner = frontier
+        .current
+        .as_slice()
+        .iter()
+        .find(|thread| matches!(program.states.get(thread.pc), Some(State::Match)))
+        .ok_or(CaptureStreamError::InvalidProgram)?;
+    Ok(HistoryWinner {
+        history: winner.history.ok_or(CaptureStreamError::InvalidProgram)?,
+        overall: Span {
+            start: winner
+                .overall_start
+                .ok_or(CaptureStreamError::InvalidProgram)?,
+            end: winner
+                .overall_end
+                .ok_or(CaptureStreamError::InvalidProgram)?,
+        },
+    })
 }
 
 #[allow(

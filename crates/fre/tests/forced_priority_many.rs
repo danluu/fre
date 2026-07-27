@@ -1,9 +1,11 @@
 use core::mem::size_of;
 
 use fre::{
-    AggregateManyBuilder, AggregateManyPlanKind, PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID,
-    PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION, PriorityAggregateManyBuildError,
-    PriorityAggregateManyBuildLimits, PriorityAggregateManyBuilder,
+    AggregateManyBuilder, AggregateManyPlanKind, CaptureBuilder,
+    PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION,
+    PriorityAggregateManyBuildError, PriorityAggregateManyBuildLimits,
+    PriorityAggregateManyBuilder, PriorityAggregateManyCaptureBuildLimits,
+    PriorityAggregateManyCaptureBuildResource, PriorityAggregateManyCaptureRunLimits,
     PriorityAggregateManyRunFailure, PriorityAggregateManyRunLimits,
 };
 use fre_automata::{
@@ -534,13 +536,6 @@ fn forced_builder_refuses_pattern_admission_before_parsing() {
 
     assert!(matches!(
         PriorityAggregateManyBuilder::new(&values)
-            .unicode(true)
-            .build_count(ForcedExecution::Sparse, PriorityTarget::portable()),
-        Err(PriorityAggregateManyBuildError::UnsupportedUnicodeProfile)
-    ));
-
-    assert!(matches!(
-        PriorityAggregateManyBuilder::new(&values)
             .profile(RustProfile::default())
             .unicode(false)
             .build_count(ForcedExecution::Sparse, PriorityTarget::portable()),
@@ -557,6 +552,374 @@ fn forced_builder_refuses_pattern_admission_before_parsing() {
             .build_count(ForcedExecution::Sparse, missing_build_many),
         Err(PriorityAggregateManyBuildError::UnsupportedTarget)
     ));
+}
+
+#[test]
+fn forced_shared_automaton_preserves_unicode_crlf_and_invalid_byte_boundaries() {
+    let unicode = RustProfile::rebar_1_12_4();
+    assert!(unicode.options.unicode);
+
+    assert_count_and_span_trace_with_profile(
+        &[r"(?i:é)", "β", ""],
+        "Éβé".as_bytes(),
+        unicode.clone(),
+        &[(0, 0, 2), (1, 2, 4), (0, 4, 6)],
+    );
+    assert_count_and_span_trace_with_profile(
+        &[r"(?mR:^β$)", "β"],
+        "x\r\nβ\r\nβ".as_bytes(),
+        unicode.clone(),
+        &[(0, 3, 5), (0, 7, 9)],
+    );
+    assert_count_and_span_trace_with_profile(
+        &["é", ""],
+        &[0xFF, 0xC3, 0xA9],
+        unicode,
+        &[(1, 0, 0), (0, 1, 3)],
+    );
+}
+
+#[test]
+fn forced_shared_capture_count_projects_cardinality_masks_and_history() {
+    let values = patterns(&[r"(\Aa)", "(?:a|(ab))c", "(?:(d)|(e))f", "(?P<g>g)"]);
+    assert_eq!(
+        None,
+        CaptureBuilder::new("(?:a|(ab))c")
+            .unicode(false)
+            .build()
+            .unwrap()
+            .build_report()
+            .uniform_participating_captures
+    );
+    let regex = PriorityAggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    assert!(regex.build_report().closes());
+    assert_eq!(4, regex.build_report().sidecars().len());
+    assert!(matches!(
+        regex.whole_required_literal_build_receipt(),
+        fre::PriorityAggregateManyWholeRequiredLiteralBuildReceipt::Built { .. }
+    ));
+    assert_eq!(
+        Some(1),
+        regex
+            .capture_build_report(0)
+            .unwrap()
+            .uniform_participating_captures
+    );
+    assert_eq!(
+        None,
+        regex
+            .capture_build_report(1)
+            .unwrap()
+            .uniform_participating_captures
+    );
+    assert_eq!(
+        Some(1),
+        regex
+            .capture_build_report(2)
+            .unwrap()
+            .uniform_participating_captures
+    );
+    assert_eq!(
+        Some(1),
+        regex
+            .capture_build_report(3)
+            .unwrap()
+            .uniform_participating_captures
+    );
+    let result = regex
+        .count_captures(b"aabcdfg", PriorityAggregateManyCaptureRunLimits::default())
+        .unwrap();
+    assert_eq!(4, regex.patterns());
+    assert_eq!(4, result.matches());
+    assert_eq!(8, result.value());
+    assert_eq!(3, result.cardinality_matches());
+    assert_eq!(1, result.mask_matches());
+    assert_eq!(0, result.persistent_history_matches());
+    assert!(result.trace().is_none());
+    assert!(result.selector_receipt().is_some_and(|receipt| {
+        receipt.closes() && receipt.execution().actual().allocation_attempts == 0
+    }));
+    assert_eq!(
+        vec![(0, 0, 1), (1, 1, 4), (2, 4, 6), (3, 6, 7)],
+        traced_ids(
+            &regex
+                .selector_trace(b"aabcdfg", PriorityAggregateManyRunLimits::default())
+                .unwrap()
+        )
+    );
+    assert!(result.closes());
+
+    let ambiguous = format!("{}z", "(?:(a))?".repeat(64));
+    let history_values = patterns(&[ambiguous.as_str(), "x"]);
+    let history = PriorityAggregateManyBuilder::new(&history_values)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap()
+        .count_captures(b"z", PriorityAggregateManyCaptureRunLimits::default())
+        .unwrap();
+    assert_eq!(1, history.matches());
+    assert_eq!(1, history.value());
+    assert_eq!(0, history.cardinality_matches());
+    assert_eq!(0, history.mask_matches());
+    assert_eq!(1, history.persistent_history_matches());
+    assert!(history.closes());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact-cap, one-below, and mixed-source bridge ledger checks share one audited baseline"
+)]
+fn forced_capture_build_receipt_binds_sidecars_and_literal_preflight() {
+    let values = patterns(&["([a-z])", "([0-9])"]);
+    let baseline = PriorityAggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    assert!(baseline.build_report().closes());
+    assert_eq!(2, baseline.build_report().sidecars().len());
+    assert!(
+        baseline
+            .whole_required_literal_build_receipt()
+            .parser_work()
+            > 0
+    );
+    let bridge_allocations = baseline
+        .construction_accounting()
+        .whole_literal_bridge_allocations;
+    assert_eq!(5, bridge_allocations, "two nonempty ordinal copies");
+
+    let exact_union_bridge = PriorityAggregateManyBuildLimits {
+        capture_build: PriorityAggregateManyCaptureBuildLimits {
+            max_whole_literal_bridge_allocations: bridge_allocations,
+            ..PriorityAggregateManyCaptureBuildLimits::default()
+        },
+        ..PriorityAggregateManyBuildLimits::default()
+    };
+    assert!(
+        PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(exact_union_bridge)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+            .unwrap()
+            .build_report()
+            .closes()
+    );
+
+    let singleton = patterns(&["(a)"]);
+    let no_proof = PriorityAggregateManyBuilder::new(&singleton)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    assert!(matches!(
+        no_proof.whole_required_literal_build_receipt(),
+        fre::PriorityAggregateManyWholeRequiredLiteralBuildReceipt::NoProof { .. }
+    ));
+    assert!(no_proof.build_report().closes());
+
+    let no_table = PriorityAggregateManyBuildLimits {
+        capture_build: PriorityAggregateManyCaptureBuildLimits {
+            max_sidecar_table_allocations: 0,
+            ..PriorityAggregateManyCaptureBuildLimits::default()
+        },
+        ..PriorityAggregateManyBuildLimits::default()
+    };
+    assert!(matches!(
+        PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(no_table)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable()),
+        Err(PriorityAggregateManyBuildError::CaptureConstructionLimit {
+            resource: PriorityAggregateManyCaptureBuildResource::SidecarTableAllocations,
+            needed: 1,
+            limit: 0,
+        })
+    ));
+
+    let no_literal_parse = PriorityAggregateManyBuildLimits {
+        capture_build: PriorityAggregateManyCaptureBuildLimits {
+            max_whole_literal_parser_work: 0,
+            ..PriorityAggregateManyCaptureBuildLimits::default()
+        },
+        ..PriorityAggregateManyBuildLimits::default()
+    };
+    assert!(matches!(
+        PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(no_literal_parse)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable()),
+        Err(PriorityAggregateManyBuildError::WholeRequiredLiteralParserWorkLimit {
+            needed,
+            limit: 0,
+        }) if needed > 0
+    ));
+
+    let no_union_bridge = PriorityAggregateManyBuildLimits {
+        capture_build: PriorityAggregateManyCaptureBuildLimits {
+            max_whole_literal_bridge_allocations: bridge_allocations - 1,
+            ..PriorityAggregateManyCaptureBuildLimits::default()
+        },
+        ..PriorityAggregateManyBuildLimits::default()
+    };
+    assert!(matches!(
+        PriorityAggregateManyBuilder::new(&values)
+            .unicode(false)
+            .limits(no_union_bridge)
+            .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable()),
+        Err(PriorityAggregateManyBuildError::CaptureConstructionLimit {
+            resource: PriorityAggregateManyCaptureBuildResource::WholeLiteralBridgeAllocations,
+            needed,
+            limit,
+        })
+        if needed == bridge_allocations && limit == bridge_allocations - 1
+    ));
+
+    let mixed = patterns(&["", "([a-z])"]);
+    let mixed = PriorityAggregateManyBuilder::new(&mixed)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    assert_eq!(
+        4,
+        mixed
+            .construction_accounting()
+            .whole_literal_bridge_allocations,
+        "only the nonempty ordinal source reserves a temporary copy"
+    );
+    assert!(mixed.build_report().closes());
+}
+
+#[test]
+fn forced_shared_capture_session_reuses_exact_workspaces_and_literal_gate() {
+    let values = patterns(&[r"(?:a|(ab))c", r"(?:(d)|(e))f", r"(?P<g>g)"]);
+    let regex = PriorityAggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    assert!(regex.whole_required_literal_build_report().is_some());
+
+    let mut session = regex
+        .prepare_capture_session(
+            b"abcdfg".len(),
+            PriorityAggregateManyCaptureRunLimits::default(),
+        )
+        .unwrap();
+    let first = session.count_captures(b"abcdfg").unwrap();
+    let second = session.count_captures(b"abcdfg").unwrap();
+    assert_eq!(first.value(), second.value());
+    assert_eq!(first.capture_accounting(), second.capture_accounting());
+    assert_eq!(0, first.capture_accounting().allocations);
+    assert_eq!(0, second.capture_accounting().allocations);
+    assert_eq!(Some(true), first.required_literal_candidate());
+    assert!(!first.selector_skipped_by_required_literal());
+    assert!(first.trace().is_none());
+    assert!(
+        first
+            .selector_receipt()
+            .is_some_and(fre::PriorityAggregateManyCaptureSelectorReceipt::closes)
+    );
+    assert!(
+        second
+            .selector_receipt()
+            .is_some_and(fre::PriorityAggregateManyCaptureSelectorReceipt::closes)
+    );
+
+    let absent = regex
+        .count_captures(b"zzzz", PriorityAggregateManyCaptureRunLimits::default())
+        .unwrap();
+    assert_eq!(0, absent.value());
+    assert_eq!(0, absent.matches());
+    assert_eq!(Some(false), absent.required_literal_candidate());
+    assert!(absent.selector_skipped_by_required_literal());
+    assert!(absent.trace().is_none());
+    assert!(absent.closes());
+}
+
+#[test]
+fn forced_shared_capture_generated_sixteen_pattern_prefix_density_holdout() {
+    let mut values = Vec::new();
+    let mut haystack = Vec::new();
+    for ordinal in 0..16 {
+        let prefix = format!("shared-prefix-{ordinal:02}");
+        values.push(format!("{prefix}(?:a|(b))"));
+        haystack.extend_from_slice(prefix.as_bytes());
+        haystack.push(b'a');
+        haystack.extend_from_slice(prefix.as_bytes());
+        haystack.push(b'b');
+    }
+    let regex = PriorityAggregateManyBuilder::new(&values)
+        .unicode(false)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap();
+    let mut session = regex
+        .prepare_capture_session(
+            haystack.len(),
+            PriorityAggregateManyCaptureRunLimits::default(),
+        )
+        .unwrap();
+    let result = session.count_captures(&haystack).unwrap();
+    assert_eq!(32, result.matches());
+    assert_eq!(48, result.value());
+    assert_eq!(0, result.cardinality_matches());
+    assert_eq!(32, result.mask_matches());
+    assert_eq!(0, result.persistent_history_matches());
+    assert_eq!(0, result.capture_accounting().allocations);
+    assert!(result.trace().is_none());
+    assert!(
+        result
+            .selector_receipt()
+            .is_some_and(fre::PriorityAggregateManyCaptureSelectorReceipt::closes)
+    );
+    assert!(result.closes());
+}
+
+#[test]
+fn forced_shared_capture_preserves_unicode_crlf_and_invalid_byte_spans() {
+    let unicode = RustProfile::rebar_1_12_4();
+    let unicode_values = patterns(&[r"(?i:(é))", r"(β)"]);
+    let unicode_result = PriorityAggregateManyBuilder::new(&unicode_values)
+        .profile(unicode.clone())
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap()
+        .count_captures(
+            "Éβé".as_bytes(),
+            PriorityAggregateManyCaptureRunLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(3, unicode_result.matches());
+    assert_eq!(6, unicode_result.value());
+    assert!(unicode_result.closes());
+
+    let crlf_values = patterns(&[r"(?mR:^(β)$)", r"(β)"]);
+    let crlf_result = PriorityAggregateManyBuilder::new(&crlf_values)
+        .profile(unicode.clone())
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap()
+        .count_captures(
+            "x\r\nβ\r\nβ".as_bytes(),
+            PriorityAggregateManyCaptureRunLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(2, crlf_result.matches());
+    assert_eq!(4, crlf_result.value());
+    assert!(crlf_result.closes());
+
+    let invalid_values = patterns(&["(é)", ""]);
+    let invalid_result = PriorityAggregateManyBuilder::new(&invalid_values)
+        .profile(unicode)
+        .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
+        .unwrap()
+        .count_captures(
+            &[0xFF, 0xC3, 0xA9],
+            PriorityAggregateManyCaptureRunLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(2, invalid_result.matches());
+    assert_eq!(3, invalid_result.value());
+    assert!(invalid_result.closes());
 }
 
 #[test]
