@@ -27,8 +27,9 @@ pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v4";
 pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v4";
 pub const MAX_OPTIONAL_STAGES: usize = 4;
 const MAX_ANCHOR_BYTES: usize = 64;
-// One complete ASCII-domain table pass, one paired-direction selection, and
-// one retained receipt. This is independent of the dispatcher's variant count.
+// One complete ASCII-domain table pass, one paired-direction profile binding,
+// and one exposed receipt. Static profiles reconstruct the receipt without
+// per-scanner storage. This is independent of the variant count.
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

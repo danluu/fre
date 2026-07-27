@@ -34,7 +34,8 @@ pub const ASCII_BITSET_RUN_PLAN_ID: &str =
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
 
 // The run scanner builds both table representations in one 128-value pass,
-// makes one paired-direction selection, and records one immutable receipt.
+// binds one paired-direction profile, and exposes one immutable receipt.
+// Static profiles reconstruct that receipt without per-scanner storage.
 const SIMD_RUN_SCANNER_BUILD_WORK: u64 = 128 + 1 + 1;
 
 /// A normalized 256-bit byte class.
@@ -3252,7 +3253,12 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[cfg(all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little"
+    ))]
     #[test]
     #[allow(
         clippy::too_many_lines,

@@ -12,7 +12,8 @@
 //! requirements and thresholds. The process-wide snapshot is immutable. Test
 //! and benchmark policies can remove features or require a feature to be
 //! present, but can never add a feature that the snapshot did not report as
-//! usable.
+//! usable. Compiler-specialized kernel handles may use those policies only as
+//! construction-time assertions and report their normalized profile receipt.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -1070,6 +1071,8 @@ fn x86_tuning() -> TuningClass {
 /// Runtime-dispatch consumers may retain the resulting implementation.
 /// Compiler-specialized consumers use the same policy to authenticate their
 /// fixed implementation and reject a policy that would select another leaf.
+/// They may discard the authenticating policy and expose a normalized
+/// compiler-profile [`DispatchPolicy::Auto`] receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum DispatchPolicy {
@@ -1210,6 +1213,9 @@ pub struct SelectionReceipt {
     /// Exact child variant used when `variant_id` names a composite
     /// implementation. `None` means the selected variant executes directly.
     pub delegate_variant_id: Option<&'static str>,
+    /// Policy represented by this receipt. Compiler-specialized handles may
+    /// normalize this to [`DispatchPolicy::Auto`] because custom policies are
+    /// authenticated at construction and are not retained per handle.
     pub policy: DispatchPolicy,
     pub architecture: Architecture,
     pub host_tuning: TuningClass,

@@ -21,6 +21,32 @@ fn expected_sve2_variant(tuning: TuningClass) -> &'static str {
 #[test]
 fn compiler_fixed_direct_leaves_match_automatic_receipts() {
     let classifier = AsciiByteSetClassifier::new(AsciiByteSet::ALL);
+    let expected_narrow = select_narrow(*host(), DispatchPolicy::Auto)
+        .expect("automatic narrow selection")
+        .receipt();
+    let expected_wide =
+        select_wide(*host(), DispatchPolicy::Auto).expect("automatic wide selection");
+    let expected_wide_receipt = match expected_wide.entry() {
+        WideEntry::SplitNarrow => SelectionReceipt {
+            delegate_variant_id: Some(expected_narrow.variant_id),
+            required: expected_narrow.required,
+            vector: expected_narrow.vector,
+            ..expected_wide.receipt()
+        },
+        #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+        WideEntry::Sve2(()) => expected_wide.receipt(),
+        #[cfg(target_arch = "x86_64")]
+        WideEntry::Avx2(()) => expected_wide.receipt(),
+        #[cfg(target_arch = "x86_64")]
+        WideEntry::Avx512(()) => expected_wide.receipt(),
+    };
+    assert_eq!(
+        classifier.selection(),
+        AsciiSelection {
+            narrow: expected_narrow,
+            wide: expected_wide_receipt,
+        }
+    );
     assert_eq!(
         classifier.selection().narrow().variant_id,
         static_narrow_variant_id()
@@ -33,6 +59,12 @@ fn compiler_fixed_direct_leaves_match_automatic_receipts() {
     let word_space =
         AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Auto).expect("static auto leaf");
     assert_eq!(
+        word_space.selection(),
+        select_word_space(*host(), DispatchPolicy::Auto)
+            .expect("automatic word-space selection")
+            .receipt()
+    );
+    assert_eq!(
         word_space.selection().variant_id,
         static_word_space_variant_id()
     );
@@ -41,10 +73,47 @@ fn compiler_fixed_direct_leaves_match_automatic_receipts() {
         let (_, match_eligible) = set.run_tables();
         let scanner = AsciiByteSetRunScanner::new(set);
         assert_eq!(
+            scanner.selection(),
+            select_run(*host(), DispatchPolicy::Auto, match_eligible)
+                .expect("automatic run selection")
+                .receipt()
+        );
+        assert_eq!(
             scanner.selection().variant_id,
             static_run_variant_id(match_eligible)
         );
     }
+}
+
+#[cfg(all(feature = "static-dispatch", target_pointer_width = "64"))]
+#[test]
+fn compiler_fixed_handles_do_not_retain_receipts_or_entries() {
+    assert_eq!(core::mem::size_of::<AsciiByteSetClassifier>(), 32);
+    assert_eq!(core::mem::size_of::<AsciiByteSetRunScanner>(), 56);
+    assert_eq!(core::mem::size_of::<AsciiWordSpaceClassifier>(), 32);
+}
+
+#[cfg(feature = "static-dispatch")]
+#[test]
+fn same_leaf_custom_policy_is_an_assertion_and_reports_profile_auto() {
+    let automatic = AsciiByteSetClassifier::new(AsciiByteSet::ALL);
+    let automatic_selection = automatic.selection();
+    let required = automatic_selection
+        .narrow()
+        .required
+        .union(automatic_selection.wide().required);
+    let authenticated =
+        AsciiByteSetClassifier::with_policy(AsciiByteSet::ALL, DispatchPolicy::Require(required))
+            .expect("requiring the fixed leaf's features authenticates it");
+    assert_eq!(authenticated.selection(), automatic_selection);
+    assert_eq!(
+        authenticated.selection().narrow().policy,
+        DispatchPolicy::Auto
+    );
+    assert_eq!(
+        authenticated.selection().wide().policy,
+        DispatchPolicy::Auto
+    );
 }
 
 #[cfg(feature = "static-dispatch")]
@@ -63,6 +132,44 @@ fn static_profile_rejects_policies_that_would_retarget_a_direct_leaf() {
             .expect_err("portable policy cannot retarget a compiler-fixed vector scanner");
         assert!(!error.required.is_empty());
         assert!(error.usable.is_empty());
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+#[test]
+fn compiler_fixed_run_scanner_exhausts_boundaries_and_alignments() {
+    for set in [singleton(b'a'), AsciiByteSet::ALL] {
+        let scanner = AsciiByteSetRunScanner::new(set);
+        for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+            for offset in 0..ASCII_NARROW_BYTES {
+                let mut storage = vec![0xcc; offset + len];
+                let bytes = &mut storage[offset..];
+                for prefix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if prefix_len < len {
+                        bytes[prefix_len] = b'!';
+                    }
+                    assert_run_result(
+                        &scanner,
+                        bytes,
+                        scanner.scan_forward(bytes),
+                        scanner.scan_backward(bytes),
+                    );
+                }
+                for suffix_len in 0..=len {
+                    bytes.fill(b'a');
+                    if suffix_len < len {
+                        bytes[len - suffix_len - 1] = b'!';
+                    }
+                    assert_run_result(
+                        &scanner,
+                        bytes,
+                        scanner.scan_forward(bytes),
+                        scanner.scan_backward(bytes),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1364,14 +1471,24 @@ fn neoverse_v3_hybrid_run_scanner_preserves_boundaries_and_work_envelope() {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 #[derive(Debug)]
 struct RunBenchmarkCase {
     bytes: Box<[u8]>,
     backward: bool,
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "the bounded benchmark fixtures use small compile-time lengths and lane indices"
@@ -1419,7 +1536,12 @@ fn run_benchmark_cases() -> Vec<RunBenchmarkCase> {
     cases
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "the benchmark loop uses proved nonempty case arrays and bounded timing/checksum arithmetic"
@@ -1450,7 +1572,12 @@ fn measure_run_scanner(
     started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 fn serialize_run_samples(samples: &[f64]) -> String {
     samples
         .iter()
@@ -1459,7 +1586,12 @@ fn serialize_run_samples(samples: &[f64]) -> String {
         .join(",")
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 #[test]
 #[ignore = "native release qualification benchmark; requires NEON, SVE and SVE2 with the scanner's fixed 16 active lanes"]
 #[allow(
@@ -1597,7 +1729,12 @@ fn benchmark_direct_run_scanners_scalar_neon_sve_and_sve2() {
     eprintln!("{receipt}");
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 fn measure_classifier(
     classifier: &AsciiByteSetClassifier,
     inputs: &[[u8; ASCII_WIDE_BYTES]],
@@ -1625,7 +1762,12 @@ fn measure_classifier(
     started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little"
+))]
 #[test]
 #[ignore = "native qualification benchmark; run pinned on an SVE2 host in release mode"]
 fn benchmark_sve2_against_split_neon() {
@@ -2131,7 +2273,7 @@ fn forced_avx512_direct_random_lane_and_all_alignment_cases_match_scalar() {
     );
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
 fn measure_x86_classifier(
     classifier: &AsciiByteSetClassifier,
     inputs: &[[u8; ASCII_WIDE_BYTES]],
@@ -2160,7 +2302,7 @@ fn measure_x86_classifier(
     started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
 fn benchmark_parameter(name: &str, default: u32, minimum: u32) -> u32 {
     let value = std::env::var(name).map_or(default, |raw| {
         raw.parse::<u32>()
@@ -2425,7 +2567,7 @@ fn machine_receipt_publication_requires_a_fresh_absolute_path() {
     std::fs::remove_dir_all(&directory).expect("remove receipt test directory");
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
 #[test]
 #[ignore = "required native x86 qualification benchmark; run pinned in release mode"]
 fn benchmark_avx2_against_avx512() {

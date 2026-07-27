@@ -27,8 +27,9 @@ pub const PLAN_ID: &str = "required-literal.class-plus-unbordered-suffix.v1";
 pub const ASCII_BACKWARD_RUN_PLAN_ID: &str =
     "required-literal.class-plus-unbordered-suffix.v1.ascii-backward-run16.v1";
 
-// The scanner builds both table representations in one 128-value pass,
-// makes one paired-direction selection, and records one immutable receipt.
+// The scanner builds both table representations in one 128-value pass, binds
+// one paired-direction profile, and exposes one immutable receipt. Static
+// profiles reconstruct that receipt without per-scanner storage.
 const SIMD_RUN_SCANNER_BUILD_WORK: u64 = 128 + 1 + 1;
 
 /// A normalized 256-bit byte class.
@@ -972,7 +973,9 @@ mod tests {
     };
     use crate::Window;
     use core::mem::size_of;
-    use fre_simd_kernels::{DispatchPolicy, Feature, SimdDispatchContext};
+    #[cfg(not(feature = "static-dispatch"))]
+    use fre_simd_kernels::DispatchPolicy;
+    use fre_simd_kernels::{Feature, SimdDispatchContext};
 
     const ASCII_MEMBERS: &[u8] = b"0_aceg";
 

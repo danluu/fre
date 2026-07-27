@@ -2600,10 +2600,21 @@ mod tests {
         Dictionary::build_precounted(dimensions(words), words.iter().copied(), limits)
     }
 
-    fn with_portable_run_scanner(dictionary: &Dictionary) -> DispatchedDictionary<'_> {
+    const fn compatible_test_policy() -> DispatchPolicy {
+        #[cfg(feature = "static-dispatch")]
+        {
+            DispatchPolicy::Auto
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            DispatchPolicy::Portable
+        }
+    }
+
+    fn with_test_run_scanner(dictionary: &Dictionary) -> DispatchedDictionary<'_> {
         let scanner = SimdDispatchContext::capture()
-            .ascii_byte_set_run_scanner(ASCII_WORD_SET, DispatchPolicy::Portable)
-            .expect("portable policy always retains the scalar scanner");
+            .ascii_byte_set_run_scanner(ASCII_WORD_SET, compatible_test_policy())
+            .expect("compatible policy retains the test scanner");
         DispatchedDictionary {
             dictionary,
             word_run_scanner: Some(scanner),
@@ -2632,15 +2643,24 @@ mod tests {
             word(&long_word),
         ];
         let dictionary = build(&words, BuildLimits::unlimited()).unwrap();
-        let dispatched = with_portable_run_scanner(&dictionary);
+        let dispatched = with_test_run_scanner(&dictionary);
         assert_eq!(dispatched.build_accounting(), dictionary.build_accounting());
         assert_eq!(dispatched.identity(), dictionary.identity());
+        #[cfg(not(feature = "static-dispatch"))]
         assert_eq!(
             dispatched
                 .run_scanner_selection()
                 .expect("test binds a scanner")
                 .variant_id,
             "ascii-byte-set.run.scalar.v1"
+        );
+        #[cfg(feature = "static-dispatch")]
+        assert_eq!(
+            dispatched
+                .run_scanner_selection()
+                .expect("test binds a scanner")
+                .policy,
+            DispatchPolicy::Auto
         );
 
         let alphabet = [b'a', b's', b'b', b'_', b' ', 0xff];

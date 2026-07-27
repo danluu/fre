@@ -42,8 +42,9 @@ pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
 
 const INTERVAL_BYTES: usize = 12;
 const MIN_FIXED_WIDTH: u32 = 2;
-// One complete ASCII-domain table pass, one paired-direction selection, and
-// one immutable selection receipt.
+// One complete ASCII-domain table pass, one paired-direction profile binding,
+// and one exposed selection receipt. Static profiles reconstruct that receipt
+// without retaining it in every scanner.
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 // A failed run scan classifies its boundary once before the scalar control
 // loop consumes that same byte, in addition to the scanner's recovery lanes.

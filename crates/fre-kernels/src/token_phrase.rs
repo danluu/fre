@@ -1454,12 +1454,23 @@ mod tests {
         reason = "the retained-path receipt keeps exhaustive semantics, boundary behavior, source accounting, and exact limits together"
     )]
     fn block_classifier_preserves_tokens_outputs_and_exact_accounting() {
+        #[cfg(not(feature = "static-dispatch"))]
         let classifier =
             AsciiWordSpaceClassifier::with_policy(fre_simd_kernels::DispatchPolicy::Portable)
                 .expect("portable retained classifier");
+        #[cfg(feature = "static-dispatch")]
+        let classifier =
+            AsciiWordSpaceClassifier::with_policy(fre_simd_kernels::DispatchPolicy::Auto)
+                .expect("compiler-fixed retained classifier");
+        #[cfg(not(feature = "static-dispatch"))]
         assert_eq!(
             classifier.selection().variant_id,
             "ascii-word-space.mask16x32.scalar.v1"
+        );
+        #[cfg(feature = "static-dispatch")]
+        assert_eq!(
+            classifier.selection().policy,
+            fre_simd_kernels::DispatchPolicy::Auto
         );
 
         for asserted in [false, true] {

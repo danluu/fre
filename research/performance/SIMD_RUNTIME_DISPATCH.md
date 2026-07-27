@@ -19,10 +19,20 @@ unsupported profile names instead of silently producing a generic build.
 Static handles retain neither a function pointer nor an ISA discriminant.
 Their operation methods compile to a direct call to the profile-selected
 scalar, NEON, SVE/SVE2, SSE/AVX, or AVX-512 leaf. Selection tables replace
-function pointers with zero-sized metadata and remain only to authenticate the
-receipt at construction. A policy or masked capability snapshot is accepted
-only when it selects that same compiler-fixed leaf; a policy that would
-retarget the operation returns `UnsupportedRequiredFeatures`. Use a runtime
+function pointers with zero-sized metadata and are entered only when a
+non-automatic policy or masked snapshot must authenticate the fixed leaf. The
+common host-plus-`Auto` path does not walk a selection table. A policy or
+masked capability snapshot is accepted only when it selects that same
+compiler-fixed leaf; a policy that would retarget the operation returns
+`UnsupportedRequiredFeatures`.
+
+Static handles also retain no `SelectionReceipt`. Their `selection()` methods
+const-reconstruct the compiler profile's normalized `Auto` receipt. A
+same-leaf custom policy is therefore a construction-time assertion, not
+per-handle provenance; use a runtime profile when exact forced-policy
+provenance must remain attached to the handle. On 64-bit targets this keeps
+the byte-set classifier, run scanner, and word/space classifier at 32, 56, and
+32 bytes respectively instead of carrying 160-byte receipts. Use a runtime
 profile for portable/forced-ISA qualification in one binary. The tuned V3 run
 scanner still makes one set-dependent choice between its NEON path and its
 small-set NEON/SVE2 hybrid, but it performs no CPU-feature dispatch at the
@@ -63,11 +73,13 @@ Instruction safety and performance tuning are separate:
 - in runtime profiles, a policy can remove features or require real features,
   but cannot invent them;
 - in static profiles, a policy can validate the fixed leaf but cannot retarget
-  it;
+  it, and the resulting handle reports the compiler profile's normalized
+  `Auto` receipt rather than retaining custom-policy provenance;
 - a tuning predicate may change preference or thresholds, but cannot authorize
   instructions; and
-- every selection produces a receipt containing the exact variant, feature
-  evidence, policy, tuning identity, vector shape, and operation width.
+- runtime selections retain a receipt containing the exact variant, feature
+  evidence, caller policy, tuning identity, vector shape, and operation width;
+  static handles const-reconstruct the equivalent compiler-profile receipt.
 
 Apple CPU-family values, Arm implementer/part values, and x86
 vendor/family/model values are therefore tuning identities, not proxy feature
@@ -114,12 +126,11 @@ silently claim the same identity.
    operation width, and preference.
 4. If measurements justify microarchitecture-specific thresholds, add a
    `when_tuning` predicate without weakening the feature requirements.
-5. Select once when compiling the operation and retain only the selected entry
-   plus its receipt. Runtime profiles retain a private qualified function
-   pointer. Static profiles must add a mutually exclusive `cfg(target_feature)`
-   direct-call definition and bind its stable ID to the automatic receipt;
-   they retain no execution-time entry. Hot calls must not repeat detection or
-   ISA dispatch.
+5. Select once when compiling the operation. Runtime profiles retain only the
+   selected qualified function pointer and receipt. Static profiles must add a
+   mutually exclusive `cfg(target_feature)` direct-call definition, a const
+   compiler-profile receipt, and no entry, discriminant, or receipt field in
+   the handle. Hot calls must not repeat detection or ISA dispatch.
 6. Add runtime-profile forced-portable and forced-supported-feature parity
    tests, static-profile fixed-leaf and retarget-rejection tests, arbitrary
    alignment and boundary tests, native-host tests, and fail-closed release

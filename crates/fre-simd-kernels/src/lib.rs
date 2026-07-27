@@ -22,6 +22,8 @@
 
 use core::fmt;
 
+#[cfg(feature = "static-dispatch")]
+use fre_target_features::DISPATCH_POLICY_VERSION;
 use fre_target_features::{
     Architecture, ArchitectureRequirement, KernelVariant, SelectedKernel, VectorKind, host,
     select_kernel,
@@ -135,6 +137,10 @@ impl SimdDispatchContext {
         set: AsciiByteSet,
         policy: DispatchPolicy,
     ) -> Result<AsciiByteSetClassifier, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(AsciiByteSetClassifier::from_static_profile(set));
+        }
         AsciiByteSetClassifier::with_capabilities(set, self.capabilities, policy)
     }
 
@@ -144,6 +150,10 @@ impl SimdDispatchContext {
         set: AsciiByteSet,
         policy: DispatchPolicy,
     ) -> Result<AsciiByteSetRunScanner, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(AsciiByteSetRunScanner::from_static_profile(set));
+        }
         AsciiByteSetRunScanner::with_capabilities(set, self.capabilities, policy)
     }
 
@@ -152,6 +162,10 @@ impl SimdDispatchContext {
         self,
         policy: DispatchPolicy,
     ) -> Result<AsciiWordSpaceClassifier, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(AsciiWordSpaceClassifier::from_static_profile());
+        }
         AsciiWordSpaceClassifier::with_capabilities(self.capabilities, policy)
     }
 }
@@ -587,6 +601,7 @@ pub struct AsciiByteSetRunScanner {
     entries: AsciiRunEntries,
     #[cfg(feature = "static-dispatch")]
     match_eligible: bool,
+    #[cfg(not(feature = "static-dispatch"))]
     selection: SelectionReceipt,
 }
 
@@ -595,7 +610,7 @@ impl fmt::Debug for AsciiByteSetRunScanner {
         formatter
             .debug_struct("AsciiByteSetRunScanner")
             .field("set", &self.tables.set)
-            .field("selection", &self.selection)
+            .field("selection", &self.selection())
             .finish_non_exhaustive()
     }
 }
@@ -611,7 +626,9 @@ impl AsciiByteSetRunScanner {
     /// Build a run scanner under an authentic host-feature policy.
     ///
     /// In a static profile, the policy must select the compiler-fixed leaf;
-    /// policies that would retarget the scanner return an error.
+    /// policies that would retarget the scanner return an error. Successful
+    /// custom policies authenticate construction but are normalized to the
+    /// compiler profile's `Auto` receipt.
     pub fn with_policy(
         set: AsciiByteSet,
         policy: DispatchPolicy,
@@ -628,6 +645,10 @@ impl AsciiByteSetRunScanner {
         capabilities: CpuCapabilities,
         policy: DispatchPolicy,
     ) -> Result<Self, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto && capabilities == *host() {
+            return Ok(Self::from_static_profile(set));
+        }
         // One complete 128-byte-domain pass builds both representations so
         // resource-accounted callers can charge exactly 128 membership probes.
         let (tables, match_eligible) = set.run_tables();
@@ -635,7 +656,7 @@ impl AsciiByteSetRunScanner {
         #[cfg(feature = "static-dispatch")]
         require_static_selection(
             selected.receipt(),
-            select_run(*host(), DispatchPolicy::Auto, match_eligible)?.receipt(),
+            automatic_run_selection(match_eligible),
             static_run_variant_id(match_eligible),
         )?;
         Ok(Self {
@@ -644,8 +665,18 @@ impl AsciiByteSetRunScanner {
             entries: selected.entry(),
             #[cfg(feature = "static-dispatch")]
             match_eligible,
+            #[cfg(not(feature = "static-dispatch"))]
             selection: selected.receipt(),
         })
+    }
+
+    #[cfg(feature = "static-dispatch")]
+    fn from_static_profile(set: AsciiByteSet) -> Self {
+        let (tables, match_eligible) = set.run_tables();
+        Self {
+            tables,
+            match_eligible,
+        }
     }
 
     /// The byte set compiled into this scanner.
@@ -656,8 +687,20 @@ impl AsciiByteSetRunScanner {
 
     /// Stable receipt for the paired forward/backward implementation.
     #[must_use]
+    #[cfg(not(feature = "static-dispatch"))]
     pub const fn selection(&self) -> SelectionReceipt {
         self.selection
+    }
+
+    /// Stable receipt for the compiler-fixed forward/backward implementation.
+    ///
+    /// Static-profile policies authenticate construction but are not retained
+    /// in every scanner. The receipt therefore describes the compiler profile
+    /// and its automatic fixed-leaf choice.
+    #[must_use]
+    #[cfg(feature = "static-dispatch")]
+    pub const fn selection(&self) -> SelectionReceipt {
+        automatic_run_selection(self.match_eligible)
     }
 
     /// Scan the maximal member prefix.
@@ -818,6 +861,7 @@ pub struct AsciiByteSetClassifier {
     narrow_entry: Classify16Entry,
     #[cfg(not(feature = "static-dispatch"))]
     wide_entry: WideEntry,
+    #[cfg(not(feature = "static-dispatch"))]
     selection: AsciiSelection,
 }
 
@@ -826,7 +870,7 @@ impl fmt::Debug for AsciiByteSetClassifier {
         formatter
             .debug_struct("AsciiByteSetClassifier")
             .field("set", &self.set)
-            .field("selection", &self.selection)
+            .field("selection", &self.selection())
             .finish_non_exhaustive()
     }
 }
@@ -844,6 +888,8 @@ impl AsciiByteSetClassifier {
     ///
     /// In a static profile, the policy must select the compiler-fixed leaves;
     /// policies that would retarget either operation return an error.
+    /// Successful custom policies authenticate construction but are normalized
+    /// to the compiler profile's `Auto` receipts.
     pub fn with_policy(
         set: AsciiByteSet,
         policy: DispatchPolicy,
@@ -863,12 +909,18 @@ impl AsciiByteSetClassifier {
         capabilities: CpuCapabilities,
         policy: DispatchPolicy,
     ) -> Result<Self, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto && capabilities == *host() {
+            return Ok(Self::from_static_profile(set));
+        }
         // Both fixed-width decisions use precisely the same immutable facts and
         // policy supplied by the caller.
         let narrow = select_narrow(capabilities, policy)?;
         let wide = select_wide(capabilities, policy)?;
         let narrow_receipt = narrow.receipt();
+        #[cfg(not(feature = "static-dispatch"))]
         let wide_entry = wide.entry();
+        #[cfg(not(feature = "static-dispatch"))]
         let wide_receipt = match wide_entry {
             WideEntry::SplitNarrow => SelectionReceipt {
                 // The 32-byte implementation delegates every instruction to
@@ -890,8 +942,9 @@ impl AsciiByteSetClassifier {
         };
         #[cfg(feature = "static-dispatch")]
         {
-            let expected_narrow = select_narrow(*host(), DispatchPolicy::Auto)?.receipt();
-            let expected_wide = select_wide(*host(), DispatchPolicy::Auto)?.receipt();
+            let expected = automatic_ascii_selection();
+            let expected_narrow = expected.narrow();
+            let expected_wide = expected.wide();
             require_static_selection(narrow_receipt, expected_narrow, static_narrow_variant_id())?;
             require_static_selection(wide.receipt(), expected_wide, static_wide_variant_id())?;
         }
@@ -902,11 +955,20 @@ impl AsciiByteSetClassifier {
             narrow_entry: narrow.entry(),
             #[cfg(not(feature = "static-dispatch"))]
             wide_entry,
+            #[cfg(not(feature = "static-dispatch"))]
             selection: AsciiSelection {
                 narrow: narrow_receipt,
                 wide: wide_receipt,
             },
         })
+    }
+
+    #[cfg(feature = "static-dispatch")]
+    fn from_static_profile(set: AsciiByteSet) -> Self {
+        Self {
+            set,
+            columns: set.nibble_columns(),
+        }
     }
 
     /// The byte set compiled into this handle.
@@ -917,8 +979,20 @@ impl AsciiByteSetClassifier {
 
     /// Stable receipts for the handle's two construction-time decisions.
     #[must_use]
+    #[cfg(not(feature = "static-dispatch"))]
     pub const fn selection(&self) -> AsciiSelection {
         self.selection
+    }
+
+    /// Stable receipts for the compiler-fixed narrow and wide implementations.
+    ///
+    /// Static-profile policies authenticate construction but are not retained
+    /// in every classifier. These receipts therefore describe the compiler
+    /// profile and its automatic fixed-leaf choices.
+    #[must_use]
+    #[cfg(feature = "static-dispatch")]
+    pub const fn selection(&self) -> AsciiSelection {
+        automatic_ascii_selection()
     }
 
     /// Classify exactly 16 bytes.
@@ -1093,6 +1167,7 @@ pub struct AsciiWordSpaceClassifier {
     tables: AsciiWordSpaceTables,
     #[cfg(not(feature = "static-dispatch"))]
     entries: AsciiWordSpaceEntries,
+    #[cfg(not(feature = "static-dispatch"))]
     selection: SelectionReceipt,
 }
 
@@ -1100,7 +1175,7 @@ impl fmt::Debug for AsciiWordSpaceClassifier {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AsciiWordSpaceClassifier")
-            .field("selection", &self.selection)
+            .field("selection", &self.selection())
             .finish_non_exhaustive()
     }
 }
@@ -1109,7 +1184,9 @@ impl AsciiWordSpaceClassifier {
     /// Build under a policy that can only remove or require authentic features.
     ///
     /// In a static profile, the policy must select the compiler-fixed leaf;
-    /// policies that would retarget the classifier return an error.
+    /// policies that would retarget the classifier return an error. Successful
+    /// custom policies authenticate construction but are normalized to the
+    /// compiler profile's `Auto` receipt.
     pub fn with_policy(policy: DispatchPolicy) -> Result<Self, UnsupportedRequiredFeatures> {
         SimdDispatchContext::capture().ascii_word_space_classifier(policy)
     }
@@ -1119,19 +1196,31 @@ impl AsciiWordSpaceClassifier {
         capabilities: CpuCapabilities,
         policy: DispatchPolicy,
     ) -> Result<Self, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto && capabilities == *host() {
+            return Ok(Self::from_static_profile());
+        }
         let selected = select_word_space(capabilities, policy)?;
         #[cfg(feature = "static-dispatch")]
         require_static_selection(
             selected.receipt(),
-            select_word_space(*host(), DispatchPolicy::Auto)?.receipt(),
+            automatic_word_space_selection(),
             static_word_space_variant_id(),
         )?;
         Ok(Self {
             tables: AsciiWordSpaceTables::new(),
             #[cfg(not(feature = "static-dispatch"))]
             entries: selected.entry(),
+            #[cfg(not(feature = "static-dispatch"))]
             selection: selected.receipt(),
         })
+    }
+
+    #[cfg(feature = "static-dispatch")]
+    fn from_static_profile() -> Self {
+        Self {
+            tables: AsciiWordSpaceTables::new(),
+        }
     }
 
     /// Require the reviewed Linux/AArch64 SVE2 fixed-16 implementation.
@@ -1140,13 +1229,40 @@ impl AsciiWordSpaceClassifier {
         let required = FeatureSet::EMPTY
             .with(Feature::ArmSve)
             .with(Feature::ArmSve2);
-        Self::with_policy(DispatchPolicy::Require(required))
+        #[cfg(feature = "static-dispatch")]
+        {
+            let fixed = automatic_word_space_selection();
+            if fixed.required.contains_all(required) {
+                Ok(Self::from_static_profile())
+            } else {
+                Err(UnsupportedRequiredFeatures {
+                    required,
+                    usable: fixed.policy_usable,
+                })
+            }
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            Self::with_policy(DispatchPolicy::Require(required))
+        }
     }
 
     /// Stable receipt for the paired fixed-block implementation.
     #[must_use]
+    #[cfg(not(feature = "static-dispatch"))]
     pub const fn selection(&self) -> SelectionReceipt {
         self.selection
+    }
+
+    /// Stable receipt for the compiler-fixed fixed-block implementation.
+    ///
+    /// Static-profile policies authenticate construction but are not retained
+    /// in every classifier. The receipt therefore describes the compiler
+    /// profile and its automatic fixed-leaf choice.
+    #[must_use]
+    #[cfg(feature = "static-dispatch")]
+    pub const fn selection(&self) -> SelectionReceipt {
+        automatic_word_space_selection()
     }
 
     /// Classify exactly 16 bytes into word, ASCII whitespace, and other.
@@ -1393,6 +1509,384 @@ const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
 ))]
 const fn static_run_variant_id(_match_eligible: bool) -> &'static str {
     SCALAR_RUN_VARIANT_ID
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn compiler_selection_receipt(
+    variant_id: &'static str,
+    delegate_variant_id: Option<&'static str>,
+    required: FeatureSet,
+    vector: VectorKind,
+    selection_input_bytes: usize,
+    minimum_input_bytes: usize,
+) -> SelectionReceipt {
+    let capabilities = *host();
+    SelectionReceipt {
+        policy_version: DISPATCH_POLICY_VERSION,
+        variant_id,
+        delegate_variant_id,
+        policy: DispatchPolicy::Auto,
+        architecture: capabilities.architecture(),
+        host_tuning: capabilities.tuning(),
+        host_evidence: capabilities.evidence(),
+        host_reported: capabilities.reported(),
+        policy_usable: capabilities.usable(),
+        required,
+        vector,
+        selection_input_bytes,
+        minimum_input_bytes,
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn automatic_narrow_selection() -> SelectionReceipt {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    let (required, vector) = (
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+    );
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+    let (required, vector) = (
+        FeatureSet::of(Feature::X86Ssse3),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+    );
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "ssse3"),
+        target_feature = "sse2"
+    ))]
+    let (required, vector) = (
+        FeatureSet::of(Feature::X86Sse2),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+    );
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(target_arch = "x86_64", target_feature = "ssse3"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "ssse3"),
+            target_feature = "sse2"
+        )
+    )))]
+    let (required, vector) = (FeatureSet::EMPTY, VectorKind::Scalar);
+    compiler_selection_receipt(
+        static_narrow_variant_id(),
+        None,
+        required,
+        vector,
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(feature = "static-dispatch")]
+#[allow(
+    unused_variables,
+    clippy::needless_return,
+    clippy::too_many_lines,
+    reason = "mutually exclusive target profiles use only their needed inputs and keep each exact receipt adjacent to its cfg"
+)]
+const fn automatic_wide_selection(narrow: SelectionReceipt) -> SelectionReceipt {
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2",
+        feature = "static-dispatch-arm-41-d84"
+    ))]
+    {
+        return compiler_selection_receipt(
+            SVE2_ARM_41_D84_MASK32_VARIANT_ID,
+            None,
+            FeatureSet::EMPTY
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            VectorKind::Scalable,
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        );
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "neon",
+        not(feature = "static-dispatch-arm-41-d84")
+    ))]
+    {
+        return compiler_selection_receipt(
+            SPLIT_NEON_MASK32_VARIANT_ID,
+            Some(narrow.variant_id),
+            narrow.required,
+            narrow.vector,
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        );
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2",
+        not(feature = "static-dispatch-arm-41-d84"),
+        not(target_feature = "neon")
+    ))]
+    {
+        return compiler_selection_receipt(
+            SVE2_MASK32_VARIANT_ID,
+            None,
+            FeatureSet::EMPTY
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            VectorKind::Scalable,
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        );
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        return compiler_selection_receipt(
+            AVX2_MASK32_VARIANT_ID,
+            None,
+            FeatureSet::of(Feature::X86Avx2),
+            VectorKind::Fixed {
+                bytes: ASCII_WIDE_VECTOR_BYTES,
+            },
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        );
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(target_feature = "avx2"),
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl"
+    ))]
+    {
+        return compiler_selection_receipt(
+            AVX512_MASK32_VARIANT_ID,
+            None,
+            X86_AVX512_MASK_FEATURES,
+            VectorKind::Fixed {
+                bytes: ASCII_WIDE_VECTOR_BYTES,
+            },
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        );
+    }
+    #[cfg(not(any(
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "neon",
+            not(feature = "static-dispatch-arm-41-d84")
+        ),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2",
+            any(feature = "static-dispatch-arm-41-d84", not(target_feature = "neon"))
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
+        )
+    )))]
+    {
+        compiler_selection_receipt(
+            SPLIT_MASK32_VARIANT_ID,
+            Some(narrow.variant_id),
+            narrow.required,
+            narrow.vector,
+            ASCII_WIDE_BYTES,
+            ASCII_WIDE_BYTES,
+        )
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn automatic_ascii_selection() -> AsciiSelection {
+    let narrow = automatic_narrow_selection();
+    AsciiSelection {
+        narrow,
+        wide: automatic_wide_selection(narrow),
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn automatic_word_space_selection() -> SelectionReceipt {
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    let (required, vector) = (
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+    );
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    )))]
+    let (required, vector) = (FeatureSet::EMPTY, VectorKind::Scalar);
+    compiler_selection_receipt(
+        static_word_space_variant_id(),
+        None,
+        required,
+        vector,
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(all(feature = "static-dispatch-arm-41-d84", feature = "static-dispatch"))]
+const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
+    if match_eligible {
+        compiler_selection_receipt(
+            NEON_SVE2_ARM_41_D84_RUN_VARIANT_ID,
+            None,
+            FeatureSet::EMPTY
+                .with(Feature::ArmNeon)
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            VectorKind::Scalable,
+            ASCII_NARROW_BYTES,
+            ASCII_NARROW_BYTES,
+        )
+    } else {
+        compiler_selection_receipt(
+            NEON_RUN_VARIANT_ID,
+            None,
+            FeatureSet::of(Feature::ArmNeon),
+            VectorKind::Fixed {
+                bytes: ASCII_NARROW_VECTOR_BYTES,
+            },
+            ASCII_NARROW_BYTES,
+            ASCII_NARROW_BYTES,
+        )
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_feature = "neon"
+))]
+const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+    compiler_selection_receipt(
+        NEON_RUN_VARIANT_ID,
+        None,
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+const fn automatic_run_selection(match_eligible: bool) -> SelectionReceipt {
+    if match_eligible {
+        compiler_selection_receipt(
+            SVE2_MATCH16_RUN_VARIANT_ID,
+            None,
+            FeatureSet::EMPTY
+                .with(Feature::ArmSve)
+                .with(Feature::ArmSve2),
+            VectorKind::Scalable,
+            ASCII_NARROW_BYTES,
+            ASCII_NARROW_BYTES,
+        )
+    } else {
+        compiler_selection_receipt(
+            SVE_RUN_VARIANT_ID,
+            None,
+            FeatureSet::of(Feature::ArmSve),
+            VectorKind::Scalable,
+            ASCII_NARROW_BYTES,
+            ASCII_NARROW_BYTES,
+        )
+    }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(feature = "static-dispatch-arm-41-d84"),
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    not(target_feature = "neon"),
+    target_feature = "sve",
+    not(target_feature = "sve2")
+))]
+const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+    compiler_selection_receipt(
+        SVE_RUN_VARIANT_ID,
+        None,
+        FeatureSet::of(Feature::ArmSve),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    not(any(
+        feature = "static-dispatch-arm-41-d84",
+        all(target_arch = "aarch64", target_feature = "neon"),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            not(target_feature = "neon"),
+            target_feature = "sve"
+        )
+    ))
+))]
+const fn automatic_run_selection(_match_eligible: bool) -> SelectionReceipt {
+    compiler_selection_receipt(
+        SCALAR_RUN_VARIANT_ID,
+        None,
+        FeatureSet::EMPTY,
+        VectorKind::Scalar,
+        ASCII_NARROW_BYTES,
+        0,
+    )
 }
 
 #[cfg(feature = "static-dispatch")]

@@ -63,9 +63,10 @@ const LITERAL_COMPARISON_WORK: usize = 2;
 const RUN_WORK: usize = 12;
 const MATCH_WORK: usize = 8;
 // Building either reusable byte-set lookup charges its 128 nibble-column
-// membership probes. The fixed classifier additionally chooses and records
-// narrow and wide leaves; the run scanner makes one paired-direction choice
-// and records it. These stay independent of the dispatcher's variant count.
+// membership probes. The fixed classifier additionally binds and exposes
+// narrow and wide leaves; the run scanner does the same for one paired
+// direction profile. Static receipts are reconstructed without handle storage.
+// These abstract charges stay independent of the dispatcher's variant count.
 const SIMD_FIXED_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const SIMD_SCALAR_PROOF_BYTES: usize = ASCII_WIDE_BYTES;

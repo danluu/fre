@@ -47,7 +47,8 @@ pub(super) const HOT_BYTE_DESCRIPTOR_ACCOUNTING_BOUNDARY: &str =
 
 const PLAN_HASH_DOMAIN: &[u8] = b"fre.hot-byte-program.plan.v1";
 // Building the reusable lookup performs 128 nibble-column membership probes,
-// two narrow/wide selections, and installs two selection receipts.
+// binds two narrow/wide leaves, and exposes two selection receipts. Static
+// profiles reconstruct those receipts without per-classifier storage.
 const CLASSIFIER_BUILD_WORK: u64 = 128 + 2 + 2;
 const CLASSIFIER_BINDING_WORK: u64 = 4;
 const DESCRIPTOR_ALLOCATION_WORK: u64 = 1;
@@ -1540,6 +1541,7 @@ fn checked_pow(mut base: usize, mut exponent: usize) -> Result<usize, HotByteBui
 mod tests {
     use super::*;
     use crate::operation_session::{OperationSessionAttemptReceipt, OperationSessionValue};
+    #[cfg(not(feature = "static-dispatch"))]
     use fre_kernels::{Feature, FeatureSet};
 
     const SIMD_PATTERN: &str = r"[ab]{16}xy";
@@ -1636,6 +1638,17 @@ mod tests {
         assert_eq!(span.value, Some(OperationSessionValue::SpanSum(expected.1)));
     }
 
+    const fn compatible_test_policy() -> DispatchPolicy {
+        #[cfg(feature = "static-dispatch")]
+        {
+            DispatchPolicy::Auto
+        }
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            DispatchPolicy::Portable
+        }
+    }
+
     #[test]
     fn facade_preserves_priority_cartesian_expansion_lf_and_malformed_bytes() {
         let _guard = super::super::hot_kernel_test_guard();
@@ -1644,7 +1657,7 @@ mod tests {
         assert_semantics(
             &first_short,
             profile(false),
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
             first_short_source.as_bytes(),
             0..first_short_source.len(),
         );
@@ -1654,7 +1667,7 @@ mod tests {
         assert_semantics(
             cartesian,
             profile(false),
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
             source,
             0..source.len(),
         );
@@ -1663,14 +1676,14 @@ mod tests {
         assert_semantics(
             r".{16}",
             profile(false),
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
             dot_source,
             0..dot_source.len(),
         );
         assert_semantics(
             r".{16}",
             profile(true),
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
             dot_source,
             0..dot_source.len(),
         );
@@ -1678,7 +1691,7 @@ mod tests {
         let malformed = [0xff_u8; 16];
         let scalar_non_ascii = builder(
             r"[\x80-\xFF]{16}",
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .build()
         .expect("non-ASCII scalar artifact");
@@ -1697,6 +1710,7 @@ mod tests {
         assert_eq!(span.value, Some(OperationSessionValue::SpanSum(expected.1)));
     }
 
+    #[cfg(not(feature = "static-dispatch"))]
     #[test]
     fn scalar_portable_and_auto_match_at_simd_boundaries_and_unaligned_ranges() {
         let _guard = super::super::hot_kernel_test_guard();
@@ -1777,7 +1791,7 @@ mod tests {
         let _guard = super::super::hot_kernel_test_guard();
         let artifact = builder(
             SIMD_PATTERN,
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .build()
         .expect("baseline construction");
@@ -1826,7 +1840,7 @@ mod tests {
             lower(&mut one_below);
             let error = builder(
                 SIMD_PATTERN,
-                HotByteDispatch::Runtime(DispatchPolicy::Portable),
+                HotByteDispatch::Runtime(compatible_test_policy()),
             )
             .limits(one_below)
             .build()
@@ -1852,7 +1866,7 @@ mod tests {
             .expect("scalar baseline");
         let runtime = builder(
             SIMD_PATTERN,
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .build()
         .expect("runtime classifier");
@@ -1876,7 +1890,7 @@ mod tests {
         one_below.max_work -= 1;
         match builder(
             SIMD_PATTERN,
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .limits(one_below)
         .build()
@@ -1894,13 +1908,13 @@ mod tests {
     fn low_configurable_limit_refusal_contains_the_complete_prospective() {
         let _guard = super::super::hot_kernel_test_guard();
         let pattern = r"(?:[ab]{16}|[cd]{16})";
-        let baseline = builder(pattern, HotByteDispatch::Runtime(DispatchPolicy::Portable))
+        let baseline = builder(pattern, HotByteDispatch::Runtime(compatible_test_policy()))
             .build()
             .expect("two-program baseline");
         let complete = baseline.build_receipt().prospective();
         let mut limits = HotByteBuildLimits::exact(complete);
         limits.max_programs = 1;
-        match builder(pattern, HotByteDispatch::Runtime(DispatchPolicy::Portable))
+        match builder(pattern, HotByteDispatch::Runtime(compatible_test_policy()))
             .limits(limits)
             .build()
             .expect_err("program limit refuses")
@@ -1918,7 +1932,7 @@ mod tests {
         let _guard = super::super::hot_kernel_test_guard();
         let baseline = builder(
             SIMD_PATTERN,
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .build()
         .expect("baseline construction");
@@ -1927,7 +1941,7 @@ mod tests {
         for ordinal in 1..=attempts {
             let error = builder(
                 SIMD_PATTERN,
-                HotByteDispatch::Runtime(DispatchPolicy::Portable),
+                HotByteDispatch::Runtime(compatible_test_policy()),
             )
             .build_with_allocation_fault(Some(ordinal))
             .expect_err("injected exact allocation failure");
@@ -1944,7 +1958,7 @@ mod tests {
         let _guard = super::super::hot_kernel_test_guard();
         let artifact = builder(
             r"[ab]{16}",
-            HotByteDispatch::Runtime(DispatchPolicy::Portable),
+            HotByteDispatch::Runtime(compatible_test_policy()),
         )
         .build()
         .expect("SIMD artifact");
