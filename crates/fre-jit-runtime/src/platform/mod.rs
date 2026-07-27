@@ -18,15 +18,15 @@ pub(crate) enum FailureInjection {
 
 #[cfg(all(
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 ))]
 #[allow(
     unsafe_code,
-    reason = "the audited macOS mmap, cache-maintenance, and native-call boundary is isolated here"
+    reason = "the audited AArch64 mmap and native-call boundary is isolated here"
 )]
-mod macos_aarch64;
+mod aarch64;
 
 #[cfg(all(
     target_arch = "aarch64",
@@ -34,11 +34,51 @@ mod macos_aarch64;
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-use macos_aarch64 as implementation;
+#[allow(
+    unsafe_code,
+    reason = "the macOS instruction-cache and VM-introspection hooks are isolated here"
+)]
+mod macos_aarch64;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the Linux auxv and AArch64 cache-maintenance hooks are isolated here"
+)]
+mod linux_aarch64;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "macos",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+use macos_aarch64 as host;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+use linux_aarch64 as host;
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "linux", target_os = "macos"),
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+use aarch64 as implementation;
 
 #[cfg(not(all(
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 )))]
@@ -46,7 +86,7 @@ mod unsupported;
 
 #[cfg(not(all(
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 )))]
@@ -57,7 +97,7 @@ pub(crate) use implementation::ExecutableMapping;
 #[cfg(all(
     test,
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 ))]

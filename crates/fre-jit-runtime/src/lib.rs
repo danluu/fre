@@ -1,11 +1,11 @@
 //! Audited executable-memory publication for FRE native images.
 //!
-//! The only admitted publisher is currently strict-W^X `AArch64` macOS. An
+//! The admitted publishers use strict-W^X on `AArch64` macOS and Linux. An
 //! image is independently audited, copied between inaccessible guard pages,
-//! byte-verified, changed from writable to executable (never both), and has
-//! its instruction cache synchronized before a callable object is exposed.
-//! Other hosts and hardened-runtime configurations that deny this sequence
-//! return typed errors.
+//! byte-verified, changed from writable to executable (never both), and has its
+//! instruction cache synchronized before a callable object is exposed. Other
+//! hosts and hardened-runtime configurations that deny this sequence return
+//! typed errors.
 //!
 //! Generated code is leaf-only and cannot unwind. Unix signals and Mach
 //! exceptions raised by generated code are deliberately outside this API's

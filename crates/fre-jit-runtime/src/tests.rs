@@ -47,7 +47,7 @@ fn strict_wx_smoke_matches_kernel_ir() {
 #[test]
 #[cfg(all(
     target_arch = "aarch64",
-    target_os = "macos",
+    any(target_os = "linux", target_os = "macos"),
     target_pointer_width = "64",
     target_endian = "little"
 ))]
@@ -1226,14 +1226,17 @@ fn inaccessible_haystack_boundaries_are_respected() {
 }
 
 #[test]
-fn mapping_guards_and_rx_permissions_are_observed_by_mach() {
+fn mapping_guards_and_rx_permissions_are_observed_by_host() {
     let _lock = native_test_lock();
     let program =
         build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
             .expect("program");
     let image = emit(&program, EmitLimits::default()).expect("image");
     let kernel = publish::<Span>(&image, PublicationLimits::default()).expect("publish");
-    let protections = kernel.mapping.protections().expect("mach_vm_region");
+    let protections = kernel
+        .mapping
+        .protections()
+        .expect("mapping protection query");
     assert_eq!(protections.left_guard, libc::PROT_NONE);
     assert_eq!(protections.payload, libc::PROT_READ | libc::PROT_EXEC);
     assert_eq!(protections.payload & libc::PROT_WRITE, 0);
@@ -1255,7 +1258,7 @@ fn mapping_guards_and_rx_permissions_are_observed_by_mach() {
     let protections = aggregate_kernel
         .mapping
         .protections()
-        .expect("aggregate mach_vm_region");
+        .expect("aggregate mapping protection query");
     assert_eq!(protections.left_guard, libc::PROT_NONE);
     assert_eq!(protections.payload, libc::PROT_READ | libc::PROT_EXEC);
     assert_eq!(protections.payload & libc::PROT_WRITE, 0);

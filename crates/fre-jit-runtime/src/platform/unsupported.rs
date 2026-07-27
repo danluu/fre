@@ -45,7 +45,7 @@ impl Mapping for ExecutableMapping {
 pub(crate) fn ensure_host_supported() -> Result<(), PublishError> {
     let reason = if !cfg!(target_arch = "aarch64") {
         HostSupportReason::Architecture
-    } else if !cfg!(target_os = "macos") {
+    } else if !cfg!(any(target_os = "linux", target_os = "macos")) {
         HostSupportReason::OperatingSystem
     } else if !cfg!(target_pointer_width = "64") {
         HostSupportReason::PointerWidth
