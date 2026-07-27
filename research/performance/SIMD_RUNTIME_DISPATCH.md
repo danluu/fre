@@ -16,7 +16,8 @@ then uses only compiler-set `cfg(target_feature)` facts. The
 by the qualified Neoverse V3 preference rules. It requires little-endian Linux
 AArch64 with compiler-enabled NEON, SVE, and SVE2. Cargo rejects misspelled or
 unsupported profile names instead of silently producing a generic build.
-Static handles retain neither a function pointer nor an ISA discriminant.
+Static handles retain neither a function pointer nor a CPU-feature dispatch
+discriminant.
 Their operation methods compile to a direct call to the profile-selected
 scalar, NEON, SVE/SVE2, SSE/AVX, or AVX-512 leaf. Selection tables replace
 function pointers with zero-sized metadata and are entered only when a

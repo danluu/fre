@@ -3149,8 +3149,22 @@ mod tests {
         assert_eq!(PLAN_ID, established.count_identity().plan_id);
         assert_eq!(DISPATCHED_PLAN_ID, dispatched.count_identity().plan_id);
         for selection in dispatched.run_scanner_selections() {
-            assert!(selection.required.contains(Feature::ArmSve));
-            assert!(selection.variant_id.contains("sve"));
+            #[cfg(not(feature = "static-dispatch"))]
+            {
+                assert!(selection.required.contains(Feature::ArmSve));
+                assert!(selection.variant_id.contains("sve"));
+            }
+            #[cfg(feature = "static-dispatch")]
+            {
+                assert_eq!(selection.policy, DispatchPolicy::Auto);
+                assert!(
+                    selection.required.contains(Feature::ArmNeon)
+                        || selection.required.contains(Feature::ArmSve)
+                );
+                assert!(
+                    selection.variant_id.contains("neon") || selection.variant_id.contains("sve")
+                );
+            }
             assert_eq!(ASCII_NARROW_BYTES, selection.minimum_input_bytes);
         }
 
