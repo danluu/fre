@@ -1899,7 +1899,85 @@ mod tests {
         REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceError, ReduceLimits, Repetition,
         UnicodeScalarAggregatePlan, binary_search_comparison_bound,
     };
-    use crate::Window;
+    use crate::{
+        ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext, Window,
+    };
+
+    #[test]
+    #[ignore = "native qualification benchmark; requires Linux/AArch64 with OS-usable SVE2"]
+    fn benchmark_unicode_scalar_ascii_classifier_ceiling() {
+        use std::{hint::black_box, time::Instant};
+
+        const ITERATIONS: usize = 128;
+        const HAYSTACK_BYTES: usize = 1 << 20;
+
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            dispatch.capabilities().usable().contains(Feature::ArmSve2),
+            "benchmark requires OS-usable SVE2"
+        );
+        let plan = UnicodeScalarAggregatePlan::build(
+            [('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')],
+            BuildLimits::unlimited(),
+        )
+        .expect("ASCII Unicode-scalar plan");
+        let set = AsciiByteSet::from_words(plan.ascii);
+        let classifier = dispatch
+            .ascii_byte_set_classifier(set, DispatchPolicy::Auto)
+            .expect("automatic classifier retains a fallback");
+        let corpus = b"abc_XYZ0123 !-\t";
+        let haystack: Vec<u8> = corpus
+            .iter()
+            .copied()
+            .cycle()
+            .take(HAYSTACK_BYTES)
+            .collect();
+        let expected = plan
+            .count(&haystack, ReduceLimits::unlimited())
+            .expect("scalar Unicode-scalar count")
+            .count;
+
+        let started = Instant::now();
+        let mut scalar_checksum = 0_u64;
+        for _ in 0..ITERATIONS {
+            scalar_checksum = scalar_checksum.wrapping_add(black_box(
+                plan.count(black_box(&haystack), black_box(ReduceLimits::unlimited()))
+                    .expect("scalar Unicode-scalar benchmark")
+                    .count,
+            ));
+        }
+        let scalar_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64;
+
+        let started = Instant::now();
+        let mut classifier_checksum = 0_u64;
+        for _ in 0..ITERATIONS {
+            let mut count = 0_u64;
+            let mut chunks = black_box(haystack.as_slice()).chunks_exact(ASCII_WIDE_BYTES);
+            for chunk in &mut chunks {
+                let block: &[u8; ASCII_WIDE_BYTES] =
+                    chunk.try_into().expect("exact classifier chunk");
+                count = count.wrapping_add(u64::from(classifier.count_32(block)));
+            }
+            for &byte in chunks.remainder() {
+                count = count.wrapping_add(u64::from(set.contains(byte)));
+            }
+            classifier_checksum = classifier_checksum.wrapping_add(black_box(count));
+        }
+        let classifier_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64;
+        assert_eq!(scalar_checksum, classifier_checksum);
+        assert_eq!(
+            scalar_checksum,
+            expected.wrapping_mul(u64::try_from(ITERATIONS).expect("small iteration count"))
+        );
+        println!(
+            "UNICODE_SCALAR_ASCII_CLASSIFIER_BENCH iterations={ITERATIONS} \
+             haystack_bytes={HAYSTACK_BYTES} scalar_ns={scalar_ns:.6} \
+             classifier_ns={classifier_ns:.6} classifier_over_scalar={:.9} \
+             wide_selection={:?}",
+            classifier_ns / scalar_ns,
+            classifier.selection().wide()
+        );
+    }
 
     #[test]
     fn build_attempt_reports_exact_success_and_partial_range_failure() {
