@@ -18,7 +18,7 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
     BOUNDED_AFFIX_PLAN_ID, PlanKind, PortableGrepBuildError, PortableGrepSession, PortableRegex,
-    PortableSearchSession, SearchLimits, SearchSessionLimits,
+    PortableSearchSession, SearchLimits, SearchSessionLimits, SimdDispatchContext,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
@@ -53,6 +53,8 @@ const MAX_KLV_BYTES: u64 = 64 * 1_048_576;
     reason = "the fail-closed CLI keeps parsing, identity checks and dispatch in one auditable boundary"
 )]
 fn main() -> Result<(), DynError> {
+    let _process_simd_dispatch = SimdDispatchContext::capture();
+
     let mut expectations = Expectations::default();
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
