@@ -655,8 +655,8 @@ impl HotByteProgramRun<'_, '_, '_> {
     ) -> Result<super::OperationSessionAttemptReceipt, OperationSessionAttemptError> {
         match self.state {
             HotByteProgramRunState::ForwardCommon { request, reducer } => {
-                let result = begin_prepared_byte_programs(self.forced, request, reducer);
-                let Err(error) = result else {
+                let forwarded = begin_prepared_byte_programs(self.forced, request, reducer);
+                let Err(error) = forwarded else {
                     unreachable!("exclusive common preflight state cannot change before run")
                 };
                 Err(error)
@@ -671,8 +671,8 @@ impl HotByteProgramRun<'_, '_, '_> {
                 // the private trusted plan ID, so common preflight emits the
                 // existing closed pre-reset route-mismatch receipt.
                 request.identity.compiled_plan_id = descriptor_plan_id;
-                let result = begin_prepared_byte_programs(self.forced, request, reducer);
-                let Err(error) = result else {
+                let forwarded = begin_prepared_byte_programs(self.forced, request, reducer);
+                let Err(error) = forwarded else {
                     unreachable!("descriptor plan mismatch must fail common preflight")
                 };
                 Err(error)
