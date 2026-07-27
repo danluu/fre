@@ -647,11 +647,17 @@ fn authenticate_search_candidate_policy(
         |(primary, secondary, verification, quaternary)| {
             (
                 if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
-                    && manifest.shape == SearchShape::ExactLiteral
+                    && matches!(
+                        manifest.shape,
+                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                    )
                 {
                     SEARCH_CANDIDATE_POLICY_SVE2_16_V1
                 } else if manifest.backend_version == BackendVersion::SEARCH_SVE16_V1
-                    && manifest.shape == SearchShape::ExactLiteral
+                    && matches!(
+                        manifest.shape,
+                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                    )
                 {
                     SEARCH_CANDIDATE_POLICY_SVE16_V1
                 } else if manifest.backend_version == BackendVersion::SEARCH_V7

@@ -1918,20 +1918,36 @@ fn emit_singleton_class_suffix_first(
     {
         return Err(AuditError::InvalidSearchManifest);
     }
+    let sve = matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+    );
     template.mov_imm64(12, suffix_length);
     template.sub_reg(10, 3, 2);
     template.cmp_reg64(10, 12);
     template.branch_cond(Condition::LowerOrSame, none);
     template.sub_reg(6, 3, 12);
     template.add_imm(5, 2, 1);
-    template.load_byte(11, 7, 0);
-    template.dup_byte16(4, 11);
-    if suffix.len() > 1 {
-        template.load_byte(11, 7, last_offset);
-        template.dup_byte16(5, 11);
+    if sve {
+        template.sve_ptrue_bytes_vl16(0);
+        template.load_byte(11, 7, 0);
+        template.sve_duplicate_byte(1, 11);
+        if suffix.len() > 1 {
+            template.load_byte(11, 7, last_offset);
+            template.sve_duplicate_byte(3, 11);
+        }
+        template.mov_imm64(11, u64::from(class_byte));
+        template.sve_duplicate_byte(5, 11);
+    } else {
+        template.load_byte(11, 7, 0);
+        template.dup_byte16(4, 11);
+        if suffix.len() > 1 {
+            template.load_byte(11, 7, last_offset);
+            template.dup_byte16(5, 11);
+        }
+        template.mov_imm64(11, u64::from(class_byte));
+        template.dup_byte16(6, 11);
     }
-    template.mov_imm64(11, u64::from(class_byte));
-    template.dup_byte16(6, 11);
 
     let vector = template.new_label(LabelKind::Loop);
     let advance_vector = template.new_label(LabelKind::Internal);
@@ -1951,16 +1967,27 @@ fn emit_singleton_class_suffix_first(
     template.cmp_imm64(10, 15);
     template.branch_cond(Condition::CarryClear, tail_scalar);
     template.add_reg(15, 9, 5);
-    template.load_vector128(2, 15, 0);
-    template.compare_equal_bytes16(2, 2, 4);
-    if let Some(second_filter) = second_filter {
-        template.unsigned_max_bytes16(7, 2);
-        template.move_vector_byte_to32(10, 7);
-        template.compare_branch_zero(10, true, second_filter);
+    if sve {
+        template.sve_load_bytes(0, 0, 15);
+        if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            template.sve2_match_bytes(1, 0, 0, 1);
+        } else {
+            template.sve_compare_equal_bytes(1, 0, 0, 1);
+        }
+        template.sve_test_predicate_bytes(0, 1);
+        template.branch_cond(Condition::NotEqual, second_filter.unwrap_or(block_scalar));
     } else {
-        template.unsigned_max_bytes16(2, 2);
-        template.move_vector_byte_to32(10, 2);
-        template.compare_branch_zero(10, true, block_scalar);
+        template.load_vector128(2, 15, 0);
+        template.compare_equal_bytes16(2, 2, 4);
+        if let Some(second_filter) = second_filter {
+            template.unsigned_max_bytes16(7, 2);
+            template.move_vector_byte_to32(10, 7);
+            template.compare_branch_zero(10, true, second_filter);
+        } else {
+            template.unsigned_max_bytes16(2, 2);
+            template.move_vector_byte_to32(10, 2);
+            template.compare_branch_zero(10, true, block_scalar);
+        }
     }
     template.bind(advance_vector)?;
     template.add_imm(5, 5, 16);
@@ -1969,12 +1996,24 @@ fn emit_singleton_class_suffix_first(
     if let Some(second_filter) = second_filter {
         template.bind(second_filter)?;
         template.add_imm(10, 15, last_offset);
-        template.load_vector128(3, 10, 0);
-        template.compare_equal_bytes16(3, 3, 5);
-        template.and_bytes16(2, 2, 3);
-        template.unsigned_max_bytes16(2, 2);
-        template.move_vector_byte_to32(10, 2);
-        template.compare_branch_zero(10, true, block_scalar);
+        if sve {
+            template.sve_load_bytes(2, 0, 10);
+            if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+                template.sve2_match_bytes(2, 0, 2, 3);
+            } else {
+                template.sve_compare_equal_bytes(2, 0, 2, 3);
+            }
+            template.sve_and_predicate_bytes(1, 0, 1, 2);
+            template.sve_test_predicate_bytes(0, 1);
+            template.branch_cond(Condition::NotEqual, block_scalar);
+        } else {
+            template.load_vector128(3, 10, 0);
+            template.compare_equal_bytes16(3, 3, 5);
+            template.and_bytes16(2, 2, 3);
+            template.unsigned_max_bytes16(2, 2);
+            template.move_vector_byte_to32(10, 2);
+            template.compare_branch_zero(10, true, block_scalar);
+        }
         template.branch(advance_vector);
     }
 
@@ -1998,7 +2037,11 @@ fn emit_singleton_class_suffix_first(
         template.cmp_reg32(10, 11);
         template.branch_cond(Condition::NotEqual, candidate_reject);
     }
-    emit_literal_equality(template, 15, 7, suffix.len(), candidate_reject)?;
+    if sve {
+        emit_literal_equality_with_vectors(template, 15, 7, suffix.len(), candidate_reject, 0, 2)?;
+    } else {
+        emit_literal_equality(template, 15, 7, suffix.len(), candidate_reject)?;
+    }
     template.add_reg(14, 5, 12);
     if manifest.anchors.end {
         template.cmp_reg64(14, 1);
@@ -2017,11 +2060,22 @@ fn emit_singleton_class_suffix_first(
     template.branch_cond(Condition::CarryClear, backward_scalar);
     template.add_reg(15, 9, 13);
     template.sub_imm(15, 15, 16);
-    template.load_vector128(2, 15, 0);
-    template.compare_equal_bytes16(2, 2, 6);
-    template.unsigned_min_bytes16(2, 2);
-    template.move_vector_byte_to32(10, 2);
-    template.cmp_imm32(10, 255);
+    if sve {
+        template.sve_load_bytes(4, 0, 15);
+        if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            template.sve2_match_bytes(1, 0, 4, 5);
+        } else {
+            template.sve_compare_equal_bytes(1, 0, 4, 5);
+        }
+        template.sve_count_predicate_bytes(10, 0, 1);
+        template.cmp_imm64(10, 16);
+    } else {
+        template.load_vector128(2, 15, 0);
+        template.compare_equal_bytes16(2, 2, 6);
+        template.unsigned_min_bytes16(2, 2);
+        template.move_vector_byte_to32(10, 2);
+        template.cmp_imm32(10, 255);
+    }
     template.branch_cond(Condition::NotEqual, backward_scalar);
     template.sub_imm(13, 13, 16);
     template.branch(backward_vector);

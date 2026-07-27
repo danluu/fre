@@ -184,6 +184,190 @@ fn fixed_16_sve_native_execution_matches_v7() {
     }
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+fn fixed_16_sve_class_suffix_native_execution_matches_v7() {
+    use fre_jit_aarch64::{SearchBackendPolicy, emit_with_backend};
+
+    const ALPHABET: &[u8] = b"bcdefghijklmnopqrstuvwxyz012345";
+
+    if !platform::has_sve() || !platform::has_sve2() {
+        eprintln!("skipped: Linux auxv does not advertise SVE2");
+        return;
+    }
+    let _lock = native_test_lock();
+    for suffix_len in [1_usize, 16, 32] {
+        let suffix: Vec<u8> = (0..suffix_len)
+            .map(|index| ALPHABET[index % ALPHABET.len()])
+            .collect();
+        for anchors in [
+            AnchorFlags::default(),
+            AnchorFlags {
+                start: false,
+                end: true,
+            },
+        ] {
+            let program = build_class_suffix::<Span>(
+                ByteClass::from_bytes(b"a"),
+                &suffix,
+                anchors,
+                ValidateLimits::default(),
+            )
+            .expect("native class-suffix program");
+            let images = [
+                SearchBackendPolicy::AsimdV7,
+                SearchBackendPolicy::Sve16,
+                SearchBackendPolicy::Sve2Fixed16,
+            ]
+            .map(|policy| {
+                emit_with_backend(&program, policy, EmitLimits::default())
+                    .expect("native class-suffix image")
+            });
+            let kernels = images.each_ref().map(|image| {
+                publish::<Span>(image, PublicationLimits::default())
+                    .expect("native class-suffix publication")
+            });
+
+            for alignment in [0_usize, 1, 15] {
+                for run_len in [1_usize, 17, 33] {
+                    let mut haystack = vec![b'x'; alignment];
+                    haystack.extend(std::iter::repeat_n(b'a', run_len));
+                    haystack.extend_from_slice(&suffix);
+                    if !anchors.end {
+                        haystack.extend_from_slice(b"tail");
+                    }
+                    let window = SearchWindow::new(alignment, haystack.len());
+                    let expected = program
+                        .execute(&haystack, window, ExecutionLimits::unlimited())
+                        .expect("class-suffix oracle")
+                        .into_output();
+                    for kernel in &kernels {
+                        assert_eq!(kernel.search(&haystack, window), Ok(expected));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+#[ignore = "qualification receipt: requires a native Linux host with SVE2"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ignored benchmark emits a complete parseable receipt for all class-suffix backends"
+)]
+fn fixed_16_sve_class_suffix_qualification_receipt() {
+    use std::{hint::black_box, time::Instant};
+
+    use fre_jit_aarch64::{NativeImage, SearchBackendPolicy, emit_with_backend};
+
+    const ALPHABET: &[u8] = b"bcdefghijklmnopqrstuvwxyz012345";
+    const HAYSTACK_BYTES: usize = 1 << 20;
+    const ITERATIONS: usize = 64;
+    const CLASS_RUN_BYTES: usize = 64;
+
+    fn measure(
+        kernel: &crate::PublishedKernel<Span>,
+        haystack: &[u8],
+        iterations: usize,
+    ) -> (u128, usize) {
+        let window = SearchWindow::new(0, haystack.len());
+        let started = Instant::now();
+        let mut checksum = 0_usize;
+        for _ in 0..iterations {
+            let found = kernel
+                .search(black_box(haystack), black_box(window))
+                .expect("native class-suffix benchmark call")
+                .expect("benchmark haystack contains a match");
+            checksum = checksum
+                .wrapping_add(black_box(found.start()))
+                .wrapping_add(black_box(found.end()));
+        }
+        (started.elapsed().as_nanos(), checksum)
+    }
+
+    fn instruction_mix(image: &NativeImage) -> (usize, usize, usize) {
+        let instructions = decode(image.code()).expect("benchmark image decodes");
+        (
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_asimd())
+                .count(),
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_sve())
+                .count(),
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_sve2())
+                .count(),
+        )
+    }
+
+    let _lock = native_test_lock();
+    println!(
+        "fre_sve16_class_suffix_receipt,backend,suffix_bytes,code_bytes,rodata_bytes,feature_bits,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
+    );
+    for suffix_len in [1_usize, 3, 16, 32] {
+        let suffix: Vec<u8> = (0..suffix_len)
+            .map(|index| ALPHABET[index % ALPHABET.len()])
+            .collect();
+        let program = build_class_suffix::<Span>(
+            ByteClass::from_bytes(b"a"),
+            &suffix,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("benchmark class-suffix program");
+        let images = [
+            ("asimd_v7", SearchBackendPolicy::AsimdV7),
+            ("sve16", SearchBackendPolicy::Sve16),
+            ("sve2_16", SearchBackendPolicy::Sve2Fixed16),
+        ];
+        let mut haystack = vec![b'x'; HAYSTACK_BYTES];
+        let expected_start = HAYSTACK_BYTES
+            .checked_sub(suffix_len)
+            .and_then(|value| value.checked_sub(CLASS_RUN_BYTES))
+            .expect("bounded benchmark dimensions");
+        haystack[expected_start..expected_start + CLASS_RUN_BYTES].fill(b'a');
+        haystack[expected_start + CLASS_RUN_BYTES..].copy_from_slice(&suffix);
+
+        for (backend, policy) in images {
+            let image = emit_with_backend(&program, policy, EmitLimits::default())
+                .expect("benchmark image");
+            let kernel = publish::<Span>(&image, PublicationLimits::default())
+                .expect("host must advertise every benchmark backend");
+            let found = kernel
+                .search(&haystack, SearchWindow::new(0, haystack.len()))
+                .expect("benchmark correctness call")
+                .expect("benchmark match");
+            assert_eq!(found.start(), expected_start);
+            assert_eq!(found.end(), HAYSTACK_BYTES);
+
+            let (asimd, sve, sve2) = instruction_mix(&image);
+            let (elapsed_ns, checksum) = measure(&kernel, &haystack, ITERATIONS);
+            println!(
+                "fre_sve16_class_suffix_receipt,{backend},{suffix_len},{},{},{},{asimd},{sve},{sve2},{ITERATIONS},{HAYSTACK_BYTES},{elapsed_ns},{checksum},{}",
+                image.code().len(),
+                image.rodata().len(),
+                image.target().features.bits(),
+                kernel.identity()
+            );
+        }
+    }
+}
+
 #[test]
 fn strict_wx_smoke_matches_kernel_ir() {
     let _lock = native_test_lock();

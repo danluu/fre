@@ -3027,6 +3027,179 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "the fixed-lane class-suffix matrix keeps policy selection, feature identity, and oracle comparisons together"
+)]
+fn sve16_singleton_class_suffix_matches_v7_and_the_oracle() {
+    const SUFFIX_ALPHABET: &[u8] = b"bcdefghijklmnopqrstuvwxyz012345";
+
+    let class = ByteClass::from_bytes(b"a");
+    let mut comparisons = 0_u64;
+    for suffix_len in [1_usize, 2, 15, 16, 17, 32] {
+        let suffix: Vec<u8> = (0..suffix_len)
+            .map(|index| SUFFIX_ALPHABET[index % SUFFIX_ALPHABET.len()])
+            .collect();
+        for anchors in [
+            AnchorFlags::default(),
+            AnchorFlags {
+                start: false,
+                end: true,
+            },
+        ] {
+            let program =
+                build_class_suffix::<Span>(class, &suffix, anchors, ValidateLimits::default())
+                    .expect("singleton class-suffix program");
+            let images = [
+                emit_with_backend(
+                    &program,
+                    SearchBackendPolicy::AsimdV7,
+                    EmitLimits::default(),
+                )
+                .expect("V7 class-suffix image"),
+                emit_with_backend(&program, SearchBackendPolicy::Sve16, EmitLimits::default())
+                    .expect("SVE16 class-suffix image"),
+                emit_with_backend(
+                    &program,
+                    SearchBackendPolicy::Sve2Fixed16,
+                    EmitLimits::default(),
+                )
+                .expect("SVE2 class-suffix image"),
+            ];
+            for (index, image) in images.iter().enumerate() {
+                audit(image).expect("class-suffix image audits");
+                let manifest = image.search_manifest().expect("sealed manifest");
+                assert_eq!(manifest.shape, SearchShape::ClassSuffix);
+                assert_eq!(manifest.candidate_policy_version, [1, 5, 6][index]);
+                assert_eq!(
+                    image.target().features.contains(CpuFeatures::SVE),
+                    index != 0
+                );
+                assert_eq!(
+                    image.target().features.contains(CpuFeatures::SVE2),
+                    index == 2
+                );
+                assert_eq!(
+                    image.target().features.contains(CpuFeatures::ASIMD),
+                    index == 0 || suffix_len >= 16
+                );
+            }
+            assert!(
+                decode(images[1].code())
+                    .expect("SVE class-suffix decode")
+                    .iter()
+                    .any(|instruction| matches!(
+                        instruction,
+                        DecodedInstruction::SveCountPredicateBytes { .. }
+                    ))
+            );
+            assert!(
+                decode(images[2].code())
+                    .expect("SVE2 class-suffix decode")
+                    .iter()
+                    .any(|instruction| matches!(
+                        instruction,
+                        DecodedInstruction::Sve2MatchBytes { .. }
+                    ))
+            );
+
+            let mut immediate = vec![b'a'];
+            immediate.extend_from_slice(&suffix);
+            let mut long_run = vec![b'a'; 47];
+            long_run.extend_from_slice(&suffix);
+            let mut offset_run = vec![b'x'; 19];
+            offset_run.extend(std::iter::repeat_n(b'a', 33));
+            offset_run.extend_from_slice(&suffix);
+            offset_run.extend_from_slice(b"tail");
+            let mut false_candidates = vec![b'x'; 96];
+            for offset in (3..false_candidates.len()).step_by(11) {
+                false_candidates[offset] = suffix[0];
+            }
+            let haystacks = [
+                Vec::new(),
+                suffix.clone(),
+                immediate,
+                long_run,
+                offset_run,
+                false_candidates,
+            ];
+            for haystack in &haystacks {
+                let windows = [
+                    SearchWindow::new(0, haystack.len()),
+                    SearchWindow::new(haystack.len().min(1), haystack.len()),
+                    SearchWindow::new(0, haystack.len().saturating_sub(1)),
+                ];
+                for window in windows {
+                    let expected = program
+                        .execute(haystack, window, ExecutionLimits::unlimited())
+                        .expect("class-suffix oracle")
+                        .output()
+                        .map(|span| (span.start(), span.end()));
+                    for image in &images {
+                        let actual = simulate(image, haystack, window.start(), window.end())
+                            .expect("fixed-lane class-suffix ISA model");
+                        assert_eq!(
+                            span_output(actual),
+                            expected,
+                            "backend={:?} suffix_len={suffix_len} anchors={anchors:?} haystack_len={} window={}..{}",
+                            image.backend_version(),
+                            haystack.len(),
+                            window.start(),
+                            window.end()
+                        );
+                        comparisons = comparisons.checked_add(1).expect("bounded matrix");
+                    }
+                }
+            }
+
+            let mut downgraded_policy = images[1].clone();
+            downgraded_policy
+                .search
+                .as_mut()
+                .expect("SVE class manifest")
+                .candidate_policy_version = 1;
+            reseal_test_image(&mut downgraded_policy);
+            assert_eq!(
+                audit(&downgraded_policy),
+                Err(AuditError::InvalidSearchManifest)
+            );
+        }
+    }
+    assert_eq!(comparisons, 648);
+}
+
+#[test]
+fn sve16_class_suffix_refuses_unqualified_shapes() {
+    let multi = build_class_suffix::<Span>(
+        ByteClass::from_bytes(b"ac"),
+        b"suffix",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("multi-byte class program");
+    let anchored = build_class_suffix::<Span>(
+        ByteClass::from_bytes(b"a"),
+        b"suffix",
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        ValidateLimits::default(),
+    )
+    .expect("start-anchored class program");
+    for program in [&multi, &anchored] {
+        for policy in [SearchBackendPolicy::Sve16, SearchBackendPolicy::Sve2Fixed16] {
+            assert_eq!(
+                emit_with_backend(program, policy, EmitLimits::default()),
+                Err(EmitError::Unsupported {
+                    reason: crate::UnsupportedReason::KernelShape
+                })
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "admission, feature, relabeling, and every SVE1 operand mutation form one fail-closed contract"
 )]
 fn sve16_admission_features_relabels_and_operands_fail_closed() {

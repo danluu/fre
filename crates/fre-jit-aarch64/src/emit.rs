@@ -150,8 +150,9 @@ pub fn emit_with_backend<O: Operation>(
 ///
 /// The physical architectural vector length may be larger; emitted code uses
 /// `PTRUE ..., VL16` and never changes thread vector-length state. This
-/// backend admits only non-empty, unanchored exact literals. [`emit`] remains
-/// the deterministic Search V7 default for every shape.
+/// backend admits non-empty unanchored exact literals and the proved
+/// non-start-anchored singleton-class suffix family. Other shapes fail
+/// explicitly. [`emit`] remains the deterministic Search V7 default.
 pub fn emit_sve16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
@@ -162,7 +163,8 @@ pub fn emit_sve16<O: Operation>(
 /// Emit the opt-in SVE2 backend with exactly sixteen active byte lanes.
 ///
 /// Candidate comparison uses the SVE2-only `MATCH` instruction, so the image
-/// carries an explicit SVE2 feature requirement.
+/// carries an explicit SVE2 feature requirement. Shape admission is identical
+/// to [`emit_sve16`].
 pub fn emit_sve2_16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
@@ -221,7 +223,7 @@ fn emit_search_version<O: Operation>(
     if matches!(
         backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
-    ) && !plan.is_unanchored_nonempty_exact()
+    ) && !plan.is_fixed16_policy_shape()
     {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::KernelShape,
@@ -690,15 +692,7 @@ fn emit_plan(
             assembler.adr(X7, data.symbol_offset(1)?)?;
             if let Some(class_byte) = (!anchors.start).then(|| singleton_byte(class)).flatten() {
                 emit_singleton_class_suffix_first(
-                    assembler,
-                    class_byte,
-                    suffix,
-                    anchors,
-                    candidate_offsets
-                        .map(|offsets| (offsets.primary, offsets.secondary))
-                        .ok_or(EmitError::InternalInvariant)?,
-                    found,
-                    none,
+                    assembler, class_byte, suffix, manifest, found, none,
                 )
             } else {
                 emit_class_suffix(assembler, class, suffix, anchors, found, none)
@@ -819,21 +813,36 @@ mod v7_policy_scan_admission {
 use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
-    const fn is_unanchored_nonempty_exact(self) -> bool {
-        matches!(
-            self,
+    fn is_fixed16_policy_shape(self) -> bool {
+        match self {
             Self::Exact {
                 literal: [_, ..],
-                anchors: AnchorFlags {
-                    start: false,
-                    end: false
-                }
-            }
-        )
+                anchors:
+                    AnchorFlags {
+                        start: false,
+                        end: false,
+                    },
+            } => true,
+            Self::ClassSuffix {
+                class,
+                suffix: [_, ..],
+                anchors: AnchorFlags { start: false, .. },
+            } => singleton_byte(class).is_some(),
+            _ => false,
+        }
     }
 
     const fn uses_asimd_confirmation(self) -> bool {
-        matches!(self, Self::Exact { literal, .. } if literal.len() >= 16)
+        matches!(
+            self,
+            Self::Exact {
+                literal,
+                ..
+            } | Self::ClassSuffix {
+                suffix: literal,
+                ..
+            } if literal.len() >= 16
+        )
     }
 
     fn recognize<O: Operation>(program: &'a ValidatedProgram<O>) -> Result<Self, EmitError> {
@@ -1053,11 +1062,11 @@ impl<'a> Plan<'a> {
             |offsets| {
                 (
                     if backend_version == BackendVersion::SEARCH_SVE2_16_V1
-                        && shape == SearchShape::ExactLiteral
+                        && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
                     {
                         SEARCH_CANDIDATE_POLICY_SVE2_16_V1
                     } else if backend_version == BackendVersion::SEARCH_SVE16_V1
-                        && shape == SearchShape::ExactLiteral
+                        && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
                     {
                         SEARCH_CANDIDATE_POLICY_SVE16_V1
                     } else if backend_version == BackendVersion::SEARCH_V7
@@ -2499,11 +2508,12 @@ fn emit_singleton_class_suffix_first(
     assembler: &mut Assembler,
     class_byte: u8,
     suffix: &[u8],
-    anchors: AnchorFlags,
-    candidate_offsets: (u16, Option<u16>),
+    manifest: SearchManifest,
     found: Label,
     none: Label,
 ) -> Result<(), EmitError> {
+    let anchors = manifest.anchors;
+    let backend_version = manifest.backend_version;
     debug_assert!(!anchors.start);
     debug_assert!(!suffix.is_empty());
     debug_assert!(suffix.len() <= MAX_REPEATED_CONFIRM_BYTES);
@@ -2512,7 +2522,9 @@ fn emit_singleton_class_suffix_first(
     let suffix_length = u64::try_from(suffix.len()).map_err(|_| EmitError::ArithmeticOverflow {
         site: ArithmeticSite::DataOffset,
     })?;
-    let (primary_offset, secondary_offset) = candidate_offsets;
+    let primary_offset = manifest.primary_offset;
+    let secondary_offset = (manifest.secondary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+        .then_some(manifest.secondary_offset);
     if primary_offset != 0
         || secondary_offset
             != (suffix.len() > 1).then(|| {
@@ -2528,6 +2540,10 @@ fn emit_singleton_class_suffix_first(
         return Err(EmitError::InternalInvariant);
     }
     let last_offset = secondary_offset.unwrap_or(0);
+    let sve = matches!(
+        backend_version,
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+    );
     assembler.mov_imm64(X12, suffix_length)?;
     // A match needs at least one class byte followed by the complete suffix.
     assembler.sub_reg(X10, X3, X2)?;
@@ -2536,16 +2552,31 @@ fn emit_singleton_class_suffix_first(
     assembler.sub_reg(X6, X3, X12)?;
     assembler.add_imm(X5, X2, 1)?;
 
-    // v4/v5 retain the suffix pair across full confirmation in v0/v1. v6
-    // retains the singleton class byte for the backward vector scan.
-    assembler.load_byte(X11, X7, 0)?;
-    assembler.dup_byte16(4, X11)?;
-    if suffix.len() > 1 {
-        assembler.load_byte(X11, X7, last_offset)?;
-        assembler.dup_byte16(5, X11)?;
+    // The fixed-lane policies retain their constants in odd-numbered Z
+    // registers while full confirmation uses even-numbered V registers.
+    // P0 is exactly VL16, independent of the thread's physical SVE length.
+    if sve {
+        assembler.sve_ptrue_bytes_vl16(0)?;
+        assembler.load_byte(X11, X7, 0)?;
+        assembler.sve_duplicate_byte(1, X11)?;
+        if suffix.len() > 1 {
+            assembler.load_byte(X11, X7, last_offset)?;
+            assembler.sve_duplicate_byte(3, X11)?;
+        }
+        assembler.mov_imm64(X11, u64::from(class_byte))?;
+        assembler.sve_duplicate_byte(5, X11)?;
+    } else {
+        // v4/v5 retain the suffix pair across full confirmation in v0/v1.
+        // v6 retains the class byte for the backward vector scan.
+        assembler.load_byte(X11, X7, 0)?;
+        assembler.dup_byte16(4, X11)?;
+        if suffix.len() > 1 {
+            assembler.load_byte(X11, X7, last_offset)?;
+            assembler.dup_byte16(5, X11)?;
+        }
+        assembler.mov_imm64(X11, u64::from(class_byte))?;
+        assembler.dup_byte16(6, X11)?;
     }
-    assembler.mov_imm64(X11, u64::from(class_byte))?;
-    assembler.dup_byte16(6, X11)?;
 
     let vector = assembler.new_label(LabelKind::Loop)?;
     let advance_vector = assembler.new_label(LabelKind::Internal)?;
@@ -2569,18 +2600,30 @@ fn emit_singleton_class_suffix_first(
     assembler.cmp_imm64(X10, 15)?;
     assembler.branch_cond(Condition::CarryClear, tail_scalar)?;
     assembler.add_reg(X15, X9, X5)?;
-    assembler.load_vector128(2, X15, 0)?;
-    assembler.compare_equal_bytes16(2, 2, 4)?;
-    if let Some(second_filter) = second_filter {
-        // Reduce into v7 so the first-byte lane mask in v2 remains available
-        // for exact lane-wise intersection on the uncommon path.
-        assembler.unsigned_max_bytes16(7, 2)?;
-        assembler.move_vector_byte_to32(X10, 7)?;
-        assembler.compare_branch_zero(X10, true, second_filter)?;
+    if sve {
+        assembler.sve_load_bytes(0, 0, X15)?;
+        if backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            assembler.sve2_match_bytes(1, 0, 0, 1)?;
+        } else {
+            assembler.sve_compare_equal_bytes(1, 0, 0, 1)?;
+        }
+        assembler.sve_test_predicate_bytes(0, 1)?;
+        assembler.branch_cond(Condition::NotEqual, second_filter.unwrap_or(block_scalar))?;
     } else {
-        assembler.unsigned_max_bytes16(2, 2)?;
-        assembler.move_vector_byte_to32(X10, 2)?;
-        assembler.compare_branch_zero(X10, true, block_scalar)?;
+        assembler.load_vector128(2, X15, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 4)?;
+        if let Some(second_filter) = second_filter {
+            // Reduce into v7 so the first-byte lane mask in v2 remains
+            // available for exact lane-wise intersection on the uncommon
+            // path.
+            assembler.unsigned_max_bytes16(7, 2)?;
+            assembler.move_vector_byte_to32(X10, 7)?;
+            assembler.compare_branch_zero(X10, true, second_filter)?;
+        } else {
+            assembler.unsigned_max_bytes16(2, 2)?;
+            assembler.move_vector_byte_to32(X10, 2)?;
+            assembler.compare_branch_zero(X10, true, block_scalar)?;
+        }
     }
     assembler.bind(advance_vector)?;
     assembler.add_imm(X5, X5, 16)?;
@@ -2589,12 +2632,24 @@ fn emit_singleton_class_suffix_first(
     if let Some(second_filter) = second_filter {
         assembler.bind(second_filter)?;
         assembler.add_imm(X10, X15, last_offset)?;
-        assembler.load_vector128(3, X10, 0)?;
-        assembler.compare_equal_bytes16(3, 3, 5)?;
-        assembler.and_bytes16(2, 2, 3)?;
-        assembler.unsigned_max_bytes16(2, 2)?;
-        assembler.move_vector_byte_to32(X10, 2)?;
-        assembler.compare_branch_zero(X10, true, block_scalar)?;
+        if sve {
+            assembler.sve_load_bytes(2, 0, X10)?;
+            if backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+                assembler.sve2_match_bytes(2, 0, 2, 3)?;
+            } else {
+                assembler.sve_compare_equal_bytes(2, 0, 2, 3)?;
+            }
+            assembler.sve_and_predicate_bytes(1, 0, 1, 2)?;
+            assembler.sve_test_predicate_bytes(0, 1)?;
+            assembler.branch_cond(Condition::NotEqual, block_scalar)?;
+        } else {
+            assembler.load_vector128(3, X10, 0)?;
+            assembler.compare_equal_bytes16(3, 3, 5)?;
+            assembler.and_bytes16(2, 2, 3)?;
+            assembler.unsigned_max_bytes16(2, 2)?;
+            assembler.move_vector_byte_to32(X10, 2)?;
+            assembler.compare_branch_zero(X10, true, block_scalar)?;
+        }
         assembler.branch(advance_vector)?;
     }
 
@@ -2621,7 +2676,19 @@ fn emit_singleton_class_suffix_first(
         assembler.cmp_reg32(X10, X11)?;
         assembler.branch_cond(Condition::NotEqual, candidate_reject)?;
     }
-    emit_literal_equality(assembler, X15, X7, suffix.len(), candidate_reject)?;
+    if sve {
+        emit_literal_equality_with_vectors(
+            assembler,
+            X15,
+            X7,
+            suffix.len(),
+            candidate_reject,
+            0,
+            2,
+        )?;
+    } else {
+        emit_literal_equality(assembler, X15, X7, suffix.len(), candidate_reject)?;
+    }
     assembler.add_reg(X14, X5, X12)?;
     if anchors.end {
         assembler.cmp_reg64(X14, X1)?;
@@ -2643,11 +2710,22 @@ fn emit_singleton_class_suffix_first(
     assembler.branch_cond(Condition::CarryClear, backward_scalar)?;
     assembler.add_reg(X15, X9, X13)?;
     assembler.sub_imm(X15, X15, 16)?;
-    assembler.load_vector128(2, X15, 0)?;
-    assembler.compare_equal_bytes16(2, 2, 6)?;
-    assembler.unsigned_min_bytes16(2, 2)?;
-    assembler.move_vector_byte_to32(X10, 2)?;
-    assembler.cmp_imm32(X10, 255)?;
+    if sve {
+        assembler.sve_load_bytes(4, 0, X15)?;
+        if backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            assembler.sve2_match_bytes(1, 0, 4, 5)?;
+        } else {
+            assembler.sve_compare_equal_bytes(1, 0, 4, 5)?;
+        }
+        assembler.sve_count_predicate_bytes(X10, 0, 1)?;
+        assembler.cmp_imm64(X10, 16)?;
+    } else {
+        assembler.load_vector128(2, X15, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 6)?;
+        assembler.unsigned_min_bytes16(2, 2)?;
+        assembler.move_vector_byte_to32(X10, 2)?;
+        assembler.cmp_imm32(X10, 255)?;
+    }
     assembler.branch_cond(Condition::NotEqual, backward_scalar)?;
     assembler.sub_imm(X13, X13, 16)?;
     assembler.branch(backward_vector)?;
