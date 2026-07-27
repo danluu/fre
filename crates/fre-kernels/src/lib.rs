@@ -14,7 +14,8 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 pub use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiSelection,
-    DispatchPolicy, Feature, FeatureSet, SimdDispatchContext, UnsupportedRequiredFeatures,
+    DispatchPolicy, Feature, FeatureSet, SelectionReceipt, SimdDispatchContext,
+    UnsupportedRequiredFeatures,
 };
 
 mod anchored_line_capture;
@@ -257,12 +258,14 @@ pub use folded_literal_trie::{
     ScanUpperBounds as FoldedLiteralTrieScanUpperBounds,
 };
 pub use forward_anchored::{
-    ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
-    BuildAccounting as ForwardAnchoredBuildAccounting, BuildError as ForwardAnchoredBuildError,
-    BuildLimits as ForwardAnchoredBuildLimits, ByteClass as ForwardAnchoredByteClass,
-    ClassImplementation as ForwardClassImplementation, ForwardAnchoredPlan,
-    PLAN_ID as FORWARD_ANCHORED_PLAN_ID, SearchAccounting as ForwardAnchoredSearchAccounting,
-    SearchError as ForwardAnchoredSearchError, SearchLimits as ForwardAnchoredSearchLimits,
+    ABSOLUTE_END_FIXED_PLAN_ID,
+    ASCII_BITSET_RUN_PLAN_ID as FORWARD_ANCHORED_ASCII_BITSET_RUN_PLAN_ID, AbsoluteEndFixedPlan,
+    Anchors as ForwardAnchoredAnchors, BuildAccounting as ForwardAnchoredBuildAccounting,
+    BuildError as ForwardAnchoredBuildError, BuildLimits as ForwardAnchoredBuildLimits,
+    ByteClass as ForwardAnchoredByteClass, ClassImplementation as ForwardClassImplementation,
+    DispatchedForwardAnchoredPlan, ForwardAnchoredPlan, PLAN_ID as FORWARD_ANCHORED_PLAN_ID,
+    SearchAccounting as ForwardAnchoredSearchAccounting, SearchError as ForwardAnchoredSearchError,
+    SearchLimits as ForwardAnchoredSearchLimits,
 };
 
 pub use grapheme_scalar_dfa::{

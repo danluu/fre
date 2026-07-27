@@ -5,10 +5,20 @@
 //! suffix byte is outside `CLASS`, the first non-class byte is the only
 //! possible repetition boundary. Suffix borders are therefore irrelevant.
 //! Search is worst-case linear and allocates no memory.
+//!
+//! [`ForwardAnchoredPlan::build_with_dispatch`] preserves the established
+//! range and two-through-five-member scanners. On a host with OS-usable SVE it
+//! may compile only an arbitrary ASCII [`ClassImplementation::Bitset`] into a
+//! directional run scanner. The legacy [`ForwardAnchoredPlan::build`] owner and
+//! every non-SVE execution path remain unchanged.
 
 use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
+use fre_simd_kernels::{
+    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
+    Feature, SelectionReceipt, SimdDispatchContext,
+};
 use memchr::{memchr, memrchr};
 
 use crate::Window;
@@ -16,8 +26,16 @@ use crate::Window;
 /// Stable identity of this exact proof and execution strategy.
 pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22";
 
+/// Stable identity of the opt-in ASCII `Bitset` directional-run reuse.
+pub const ASCII_BITSET_RUN_PLAN_ID: &str =
+    "anchored-class-suffix.forward-v22.ascii-bitset-directional-run16.v1";
+
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
+
+// The run scanner builds both table representations in one 128-value pass,
+// makes one paired-direction selection, and records one immutable receipt.
+const SIMD_RUN_SCANNER_BUILD_WORK: u64 = 128 + 1 + 1;
 
 /// A normalized 256-bit byte class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -120,6 +138,14 @@ impl ByteClass {
             }
         }
         (member_count == N).then_some(members)
+    }
+
+    const fn is_ascii(self) -> bool {
+        self.words[2] == 0 && self.words[3] == 0
+    }
+
+    const fn ascii_set(self) -> AsciiByteSet {
+        AsciiByteSet::from_words([self.words[0], self.words[1]])
     }
 }
 
@@ -245,9 +271,11 @@ impl Default for BuildLimits {
 /// Limits checked before scanning any haystack byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
-    /// Maximum logical byte examinations across the prefilter, prefix scan,
-    /// and suffix confirmation. This is not a bound on primitive equality
-    /// comparisons, native instructions, or CPU work.
+    /// Maximum accounted byte examinations across the prefilter, prefix scan,
+    /// and suffix confirmation. A SIMD prefix includes every physically
+    /// classified active lane and any fixed-block scalar recovery. This is not
+    /// a bound on primitive equality comparisons, native instructions, or CPU
+    /// work.
     pub max_work_upper_bound: u64,
     /// Maximum logical byte examinations expressed as a `usize`.
     pub max_examined_bytes_upper_bound: usize,
@@ -284,6 +312,8 @@ pub struct BuildAccounting {
     pub suffix_capacity_bytes: usize,
     pub class_cardinality: usize,
     pub implementation: ClassImplementation,
+    /// Construction work, including exactly 130 units when the dispatched
+    /// owner retains an ASCII Bitset run scanner.
     pub work_upper_bound: u64,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
@@ -296,6 +326,8 @@ pub struct SearchAccounting {
     pub window_bytes: usize,
     pub implementation: ClassImplementation,
     pub prefilter_bytes_upper_bound: usize,
+    /// Prefix classifications, including the selected scanner's bounded
+    /// terminating-load or fixed-block recovery margin when present.
     pub prefix_bytes_upper_bound: usize,
     pub suffix_bytes_upper_bound: usize,
     /// Logical byte examinations, including a repeated examination when a
@@ -308,6 +340,7 @@ pub struct SearchAccounting {
     /// Native prefilter calls actually issued by this search. Fixed scalar
     /// comparisons in the asymmetric front probe are not native calls.
     pub prefilter_calls: usize,
+    /// Exact physical classifications issued by the prefix path.
     pub prefix_bytes_examined: usize,
     pub suffix_confirmation_attempted: bool,
 }
@@ -474,6 +507,17 @@ pub struct ForwardAnchoredPlan {
     anchors: Anchors,
     implementation: ClassImplementation,
     build: BuildAccounting,
+}
+
+/// Opt-in dispatch owner for the forward-anchored proof.
+///
+/// Only an arbitrary ASCII [`ClassImplementation::Bitset`] on a host with
+/// OS-usable SVE retains a directional scanner. All other implementations
+/// delegate to the exact legacy [`ForwardAnchoredPlan`] search paths.
+#[derive(Debug)]
+pub struct DispatchedForwardAnchoredPlan {
+    plan: ForwardAnchoredPlan,
+    bitset_scanner: Option<AsciiByteSetRunScanner>,
 }
 
 /// Immutable, deliberately non-`Clone` plan for the absolute-end fixed split.
@@ -842,16 +886,98 @@ impl ForwardAnchoredPlan {
     ///
     /// Returns a typed proof refusal or checked resource failure. It never
     /// substitutes a different search plan.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "construction keeps proof refusals and every resource boundary explicit"
-    )]
     pub fn build(
         class: ByteClass,
         suffix: &[u8],
         anchors: Anchors,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        let (plan, scanner) =
+            Self::build_inner(class, suffix, anchors, limits, size_of::<Self>(), None)?;
+        debug_assert!(scanner.is_none());
+        Ok(plan)
+    }
+
+    /// Prove eligibility while retaining an opt-in scanner on OS-usable SVE.
+    ///
+    /// The returned wrapper preserves every specialized and non-SVE search
+    /// path. Only an arbitrary ASCII [`ClassImplementation::Bitset`] may bind a
+    /// scanner, and its immutable receipt is available through
+    /// [`DispatchedForwardAnchoredPlan::run_scanner_selection`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed proof, arithmetic, resource, or allocation
+    /// refusals as [`Self::build`]. The wrapper's exact inline storage and the
+    /// scanner's 130 construction work units are included before allocation.
+    pub fn build_with_dispatch(
+        dispatch: SimdDispatchContext,
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+    ) -> Result<DispatchedForwardAnchoredPlan, BuildError> {
+        Self::build_with_dispatch_policy_inner(
+            dispatch,
+            DispatchPolicy::Auto,
+            class,
+            suffix,
+            anchors,
+            limits,
+        )
+    }
+
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little"
+    ))]
+    fn build_with_dispatch_policy(
+        dispatch: SimdDispatchContext,
+        policy: DispatchPolicy,
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+    ) -> Result<DispatchedForwardAnchoredPlan, BuildError> {
+        Self::build_with_dispatch_policy_inner(dispatch, policy, class, suffix, anchors, limits)
+    }
+
+    fn build_with_dispatch_policy_inner(
+        dispatch: SimdDispatchContext,
+        policy: DispatchPolicy,
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+    ) -> Result<DispatchedForwardAnchoredPlan, BuildError> {
+        let (plan, bitset_scanner) = Self::build_inner(
+            class,
+            suffix,
+            anchors,
+            limits,
+            size_of::<DispatchedForwardAnchoredPlan>(),
+            Some((dispatch, policy)),
+        )?;
+        Ok(DispatchedForwardAnchoredPlan {
+            plan,
+            bitset_scanner,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps proof refusals and every resource boundary explicit"
+    )]
+    fn build_inner(
+        class: ByteClass,
+        suffix: &[u8],
+        anchors: Anchors,
+        limits: BuildLimits,
+        retained_owner_bytes: usize,
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    ) -> Result<(Self, Option<AsciiByteSetRunScanner>), BuildError> {
         if !anchors.start {
             return Err(BuildError::MissingAbsoluteStart);
         }
@@ -867,6 +993,11 @@ impl ForwardAnchoredPlan {
 
         let class_cardinality = class.cardinality();
         let implementation = select_class_implementation(class)?;
+        let scanner_eligible = implementation == ClassImplementation::Bitset
+            && class.is_ascii()
+            && dispatch.is_some_and(|(context, _)| {
+                context.capabilities().usable().contains(Feature::ArmSve)
+            });
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "suffix length as u64",
@@ -874,16 +1005,22 @@ impl ForwardAnchoredPlan {
         let work_upper_bound = suffix_u64
             .checked_mul(2)
             .and_then(|work| work.checked_add(64))
+            .and_then(|work| {
+                work.checked_add(if scanner_eligible {
+                    SIMD_RUN_SCANNER_BUILD_WORK
+                } else {
+                    0
+                })
+            })
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "build work upper bound",
             })?;
         let scratch_bytes = 0_usize;
-        let persistent_bytes =
-            size_of::<Self>()
-                .checked_add(suffix.len())
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "persistent plan bytes",
-                })?;
+        let persistent_bytes = retained_owner_bytes.checked_add(suffix.len()).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "persistent plan bytes",
+            },
+        )?;
         let peak_bytes =
             persistent_bytes
                 .checked_add(scratch_bytes)
@@ -925,22 +1062,36 @@ impl ForwardAnchoredPlan {
         let owned_suffix = copy_suffix_exact(suffix)?;
         debug_assert_eq!(owned_suffix.len(), owned_suffix.capacity());
         let suffix_capacity_bytes = owned_suffix.capacity();
-        Ok(Self {
-            class,
-            suffix: owned_suffix,
-            anchors,
-            implementation,
-            build: BuildAccounting {
-                suffix_bytes: suffix.len(),
-                suffix_capacity_bytes,
-                class_cardinality,
+        let bitset_scanner = if scanner_eligible {
+            let (dispatch, policy) =
+                dispatch.expect("scanner eligibility requires one dispatch context");
+            Some(
+                dispatch
+                    .ascii_byte_set_run_scanner(class.ascii_set(), policy)
+                    .expect("the caller supplied an authentic compatible dispatch policy"),
+            )
+        } else {
+            None
+        };
+        Ok((
+            Self {
+                class,
+                suffix: owned_suffix,
+                anchors,
                 implementation,
-                work_upper_bound,
-                scratch_bytes,
-                persistent_bytes,
-                peak_bytes,
+                build: BuildAccounting {
+                    suffix_bytes: suffix.len(),
+                    suffix_capacity_bytes,
+                    class_cardinality,
+                    implementation,
+                    work_upper_bound,
+                    scratch_bytes,
+                    persistent_bytes,
+                    peak_bytes,
+                },
             },
-        })
+            bitset_scanner,
+        ))
     }
 
     /// Stable proof/implementation identity.
@@ -1000,6 +1151,20 @@ impl ForwardAnchoredPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window_with_run_scanner(haystack, window, limits, None)
+    }
+
+    fn find_window_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        debug_assert!(
+            bitset_scanner.is_none() || self.implementation == ClassImplementation::Bitset
+        );
+        debug_assert!(bitset_scanner.is_none() || self.class.is_ascii());
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(SearchError::InvalidWindow {
                 start: window.start(),
@@ -1016,10 +1181,11 @@ impl ForwardAnchoredPlan {
             return Ok((None, zero_accounting(window_bytes, self.implementation)));
         }
 
-        let mut accounting = self.preflight(window, limits)?;
+        let mut accounting = self.preflight_with_run_scanner(window, limits, bitset_scanner)?;
         let searched = &haystack[..window.end()];
         let boundary = if searched.len() < RANGE_BLOCK {
-            let (boundary, examined) = self.scan_prefix(searched)?;
+            let (boundary, examined) =
+                self.scan_prefix_with_run_scanner(searched, bitset_scanner)?;
             accounting.prefix_bytes_examined = examined;
             if boundary == 0 || boundary == searched.len() {
                 return Ok((None, accounting));
@@ -1078,7 +1244,8 @@ impl ForwardAnchoredPlan {
             // outside the class by construction. Validate only the prefix
             // before it so a valid candidate never enters failed-block
             // recovery merely to rediscover that known boundary.
-            let (boundary, examined) = self.scan_candidate_prefix(&searched[..candidate])?;
+            let (boundary, examined) = self
+                .scan_candidate_prefix_with_run_scanner(&searched[..candidate], bitset_scanner)?;
             accounting.prefix_bytes_examined = accounting
                 .prefix_bytes_examined
                 .checked_add(examined)
@@ -1114,11 +1281,27 @@ impl ForwardAnchoredPlan {
     }
 
     fn scan_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
+        self.scan_prefix_with_run_scanner(bytes, None)
+    }
+
+    fn scan_prefix_with_run_scanner(
+        &self,
+        bytes: &[u8],
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<(usize, usize), SearchError> {
+        if let Some(scanner) = bitset_scanner {
+            let result = scanner.scan_forward(bytes);
+            return Ok((result.member_run_len(), result.examined_bytes()));
+        }
         scan_start_class_prefix(bytes, self.class, self.implementation)
     }
 
     #[inline]
-    fn scan_candidate_prefix(&self, bytes: &[u8]) -> Result<(usize, usize), SearchError> {
+    fn scan_candidate_prefix_with_run_scanner(
+        &self,
+        bytes: &[u8],
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<(usize, usize), SearchError> {
         match self.implementation {
             ClassImplementation::InclusiveRange { start, end } if start == end => {
                 if bytes.len() > SINGLE_CANDIDATE_MAX {
@@ -1155,7 +1338,7 @@ impl ForwardAnchoredPlan {
                 fourth,
                 fifth,
             } => scan_quint_candidate_prefix(bytes, first, second, third, fourth, fifth),
-            _ => self.scan_prefix(bytes),
+            _ => self.scan_prefix_with_run_scanner(bytes, bitset_scanner),
         }
     }
 
@@ -1178,10 +1361,11 @@ impl ForwardAnchoredPlan {
         self.scan_prefix(bytes)
     }
 
-    fn preflight(
+    fn preflight_with_run_scanner(
         &self,
         window: Window,
         limits: SearchLimits,
+        bitset_scanner: Option<&AsciiByteSetRunScanner>,
     ) -> Result<SearchAccounting, SearchError> {
         let window_bytes =
             window
@@ -1203,7 +1387,9 @@ impl ForwardAnchoredPlan {
             self.implementation,
             ClassImplementation::InclusiveRange { start, end } if start != end
         ) && window_bytes >= START_RANGE_SWAR_MIN;
-        let rescan_margin = if range_swar_bound {
+        let rescan_margin = if bitset_scanner.is_some() && window_bytes != 0 {
+            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        } else if range_swar_bound {
             WORD_BYTES
         } else if block_scanner && window_bytes >= RANGE_BLOCK {
             RANGE_BLOCK
@@ -1265,6 +1451,86 @@ impl ForwardAnchoredPlan {
             prefix_bytes_examined: 0,
             suffix_confirmation_attempted: false,
         })
+    }
+}
+
+impl DispatchedForwardAnchoredPlan {
+    /// Stable proof and execution identity.
+    #[must_use]
+    pub const fn plan_id(&self) -> &'static str {
+        if self.bitset_scanner.is_some() {
+            ASCII_BITSET_RUN_PLAN_ID
+        } else {
+            PLAN_ID
+        }
+    }
+
+    #[must_use]
+    pub const fn anchors(&self) -> Anchors {
+        self.plan.anchors()
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> ByteClass {
+        self.plan.class()
+    }
+
+    #[must_use]
+    pub fn suffix(&self) -> &[u8] {
+        self.plan.suffix()
+    }
+
+    #[must_use]
+    pub const fn implementation(&self) -> ClassImplementation {
+        self.plan.implementation()
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> BuildAccounting {
+        self.plan.build_accounting()
+    }
+
+    /// Exact immutable selection receipt for the optional ASCII Bitset scan.
+    #[must_use]
+    pub const fn run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        match self.bitset_scanner {
+            Some(scanner) => Some(scanner.selection()),
+            None => None,
+        }
+    }
+
+    /// Find the selected span in the full haystack.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked resource failure before scanning begins.
+    #[inline]
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.find_window(haystack, Window::full(haystack), limits)
+    }
+
+    /// Find the selected span wholly within `window`; anchors remain absolute.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked range/resource failure. Search never falls back.
+    #[inline]
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
+        self.plan.find_window_with_run_scanner(
+            haystack,
+            window,
+            limits,
+            self.bitset_scanner.as_ref(),
+        )
     }
 }
 
@@ -2558,8 +2824,10 @@ fn scan_fixed_range_prefix(
 #[cfg(test)]
 mod tests {
     use super::{
-        ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits,
-        ByteClass, ClassImplementation, ForwardAnchoredPlan, RANGE_BLOCK, SearchError,
+        ABSOLUTE_END_FIXED_PLAN_ID, ASCII_BITSET_RUN_PLAN_ID,
+        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AbsoluteEndFixedPlan, Anchors, BuildError,
+        BuildLimits, ByteClass, ClassImplementation, DispatchedForwardAnchoredPlan,
+        ForwardAnchoredPlan, PLAN_ID, RANGE_BLOCK, SIMD_RUN_SCANNER_BUILD_WORK, SearchError,
         SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
         copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
         packed_outside_mask, repeat_byte, scan_swar_range_prefix,
@@ -2567,6 +2835,15 @@ mod tests {
     use crate::Window;
     use core::mem::size_of;
     use fre_exact_alloc::CopyError;
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    use fre_simd_kernels::{DispatchPolicy, FeatureSet};
+    use fre_simd_kernels::{Feature, SimdDispatchContext};
+
+    const ASCII_BITSET_MEMBERS: [u8; 6] = [b'0', b'_', b'a', b'c', b'e', b'g'];
+
+    fn ascii_bitset() -> ByteClass {
+        ByteClass::from_bytes(&ASCII_BITSET_MEMBERS)
+    }
 
     fn plan(class: ByteClass, suffix: &[u8], end: bool) -> ForwardAnchoredPlan {
         ForwardAnchoredPlan::build(
@@ -2589,6 +2866,733 @@ mod tests {
             BuildLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test keeps opt-in identity, owner accounting, boundary semantics, and absolute-window behavior together"
+    )]
+    fn public_dispatch_is_opt_in_and_keeps_legacy_bitset_receipts_off_sve() {
+        let class = ascii_bitset();
+        let anchors = Anchors {
+            start: true,
+            end: false,
+        };
+        let legacy =
+            ForwardAnchoredPlan::build(class, b"Z", anchors, BuildLimits::default()).unwrap();
+        let dispatch = SimdDispatchContext::capture();
+        let dispatched = ForwardAnchoredPlan::build_with_dispatch(
+            dispatch,
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy.plan_id(), PLAN_ID);
+        assert_eq!(legacy.implementation(), ClassImplementation::Bitset);
+        assert_eq!(dispatched.implementation(), ClassImplementation::Bitset);
+        assert_eq!(dispatched.class(), class);
+        assert_eq!(dispatched.suffix(), b"Z");
+        assert_eq!(dispatched.anchors(), anchors);
+
+        let selection = dispatched.run_scanner_selection();
+        let sve_usable = dispatch.capabilities().usable().contains(Feature::ArmSve);
+        assert_eq!(selection.is_some(), sve_usable);
+        assert_eq!(
+            dispatched.plan_id(),
+            if sve_usable {
+                ASCII_BITSET_RUN_PLAN_ID
+            } else {
+                PLAN_ID
+            }
+        );
+        assert_eq!(
+            dispatched.build_accounting().work_upper_bound,
+            legacy.build_accounting().work_upper_bound
+                + u64::from(sve_usable) * SIMD_RUN_SCANNER_BUILD_WORK
+        );
+        assert_eq!(
+            legacy.build_accounting().persistent_bytes,
+            size_of::<ForwardAnchoredPlan>() + 1
+        );
+        assert_eq!(
+            dispatched.build_accounting().persistent_bytes,
+            size_of::<DispatchedForwardAnchoredPlan>() + 1
+        );
+
+        for run_len in 0..=96 {
+            let mut haystack: Vec<u8> = (0..run_len)
+                .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+                .collect();
+            haystack.push(b'Z');
+            let legacy_result = legacy.find(&haystack, SearchLimits::unlimited()).unwrap();
+            let dispatched_result = dispatched
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(dispatched_result.0, legacy_result.0, "run_len={run_len}");
+            if selection.is_none() {
+                assert_eq!(
+                    dispatched_result.1, legacy_result.1,
+                    "a non-SVE dispatch must retain the complete scalar receipt"
+                );
+            } else {
+                assert!(
+                    dispatched_result.1.prefix_bytes_examined
+                        <= dispatched_result.1.prefix_bytes_upper_bound
+                );
+                assert!(
+                    dispatched_result.1.prefix_bytes_examined
+                        <= legacy_result
+                            .1
+                            .prefix_bytes_examined
+                            .saturating_add(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                );
+            }
+        }
+
+        let mut windowed: Vec<u8> = (0..48)
+            .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+            .collect();
+        windowed.extend_from_slice(b"Ztail");
+        let selected_end = 49;
+        assert_eq!(
+            dispatched
+                .find_window(
+                    &windowed,
+                    Window::new(0, selected_end),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((0, selected_end))
+        );
+        assert_eq!(
+            dispatched
+                .find_window(
+                    &windowed,
+                    Window::new(1, selected_end),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            None
+        );
+        assert!(matches!(
+            dispatched.find_window(&windowed, Window::new(49, 48), SearchLimits::unlimited(),),
+            Err(SearchError::InvalidWindow { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test keeps exact build and search limit boundaries adjacent to their successful receipts"
+    )]
+    fn dispatched_build_and_search_limits_account_the_exact_owner_and_scanner_bound() {
+        let dispatch = SimdDispatchContext::capture();
+        let class = ascii_bitset();
+        let anchors = Anchors {
+            start: true,
+            end: false,
+        };
+        let permissive = BuildLimits {
+            max_suffix_bytes: usize::MAX,
+            max_build_work: u64::MAX,
+            max_scratch_bytes: usize::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+        };
+        let baseline =
+            ForwardAnchoredPlan::build_with_dispatch(dispatch, class, b"Z", anchors, permissive)
+                .unwrap();
+        let build = baseline.build_accounting();
+        assert_eq!(
+            build.persistent_bytes,
+            size_of::<DispatchedForwardAnchoredPlan>() + b"Z".len()
+        );
+        assert_eq!(build.peak_bytes, build.persistent_bytes);
+        assert_eq!(build.scratch_bytes, 0);
+        assert_eq!(
+            build.work_upper_bound,
+            2 + 64
+                + if baseline.run_scanner_selection().is_some() {
+                    SIMD_RUN_SCANNER_BUILD_WORK
+                } else {
+                    0
+                }
+        );
+        let exact = BuildLimits {
+            max_suffix_bytes: build.suffix_bytes,
+            max_build_work: build.work_upper_bound,
+            max_scratch_bytes: build.scratch_bytes,
+            max_persistent_bytes: build.persistent_bytes,
+            max_peak_bytes: build.peak_bytes,
+        };
+        exact_suffix_copy_probe::reset();
+        assert!(
+            ForwardAnchoredPlan::build_with_dispatch(dispatch, class, b"Z", anchors, exact).is_ok()
+        );
+        assert_eq!(exact_suffix_copy_probe::calls(), 1);
+
+        for limits in [
+            BuildLimits {
+                max_build_work: exact.max_build_work - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_persistent_bytes: exact.max_persistent_bytes - 1,
+                ..exact
+            },
+            BuildLimits {
+                max_peak_bytes: exact.max_peak_bytes - 1,
+                ..exact
+            },
+        ] {
+            exact_suffix_copy_probe::reset();
+            assert!(
+                ForwardAnchoredPlan::build_with_dispatch(dispatch, class, b"Z", anchors, limits)
+                    .is_err()
+            );
+            assert_eq!(
+                exact_suffix_copy_probe::calls(),
+                0,
+                "every resource refusal must precede the suffix allocation"
+            );
+        }
+
+        let mut haystack: Vec<u8> = (0..64)
+            .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+            .collect();
+        haystack.push(b'Z');
+        let (matched, search) = baseline.find(&haystack, SearchLimits::unlimited()).unwrap();
+        assert_eq!(matched, Some((0, haystack.len())));
+        assert_eq!(
+            search.prefix_bytes_upper_bound,
+            haystack.len()
+                + usize::from(baseline.run_scanner_selection().is_some())
+                    * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        );
+        assert!(search.prefix_bytes_examined <= search.prefix_bytes_upper_bound);
+        let exact_search = SearchLimits {
+            max_work_upper_bound: search.work_upper_bound,
+            max_examined_bytes_upper_bound: search.examined_bytes_upper_bound,
+            max_scratch_bytes: search.scratch_bytes,
+        };
+        assert!(baseline.find(&haystack, exact_search).is_ok());
+        assert!(matches!(
+            baseline.find(
+                &haystack,
+                SearchLimits {
+                    max_examined_bytes_upper_bound: search.examined_bytes_upper_bound - 1,
+                    ..exact_search
+                }
+            ),
+            Err(SearchError::ExaminedBytesLimit { .. })
+        ));
+        assert!(matches!(
+            baseline.find(
+                &haystack,
+                SearchLimits {
+                    max_work_upper_bound: search.work_upper_bound - 1,
+                    ..exact_search
+                }
+            ),
+            Err(SearchError::WorkLimit { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test enumerates each retained specialized implementation and the non-ASCII Bitset exclusion"
+    )]
+    fn dispatch_never_replaces_specialized_or_non_ascii_prefix_paths() {
+        let dispatch = SimdDispatchContext::capture();
+        let cases = [
+            (
+                ByteClass::inclusive(b'a', b'z'),
+                ClassImplementation::InclusiveRange {
+                    start: b'a',
+                    end: b'z',
+                },
+                b'a',
+            ),
+            (
+                ByteClass::from_bytes(b"ac"),
+                ClassImplementation::Pair {
+                    first: b'a',
+                    second: b'c',
+                },
+                b'a',
+            ),
+            (
+                ByteClass::from_bytes(b"ace"),
+                ClassImplementation::Triple {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                },
+                b'c',
+            ),
+            (
+                ByteClass::from_bytes(b"aceg"),
+                ClassImplementation::Quad {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                },
+                b'e',
+            ),
+            (
+                ByteClass::from_bytes(b"acegi"),
+                ClassImplementation::Quint {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                    fifth: b'i',
+                },
+                b'g',
+            ),
+        ];
+        for (class, implementation, member) in cases {
+            let legacy = ForwardAnchoredPlan::build(
+                class,
+                b"Z",
+                Anchors {
+                    start: true,
+                    end: false,
+                },
+                BuildLimits::default(),
+            )
+            .unwrap();
+            let dispatched = ForwardAnchoredPlan::build_with_dispatch(
+                dispatch,
+                class,
+                b"Z",
+                Anchors {
+                    start: true,
+                    end: false,
+                },
+                BuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(dispatched.implementation(), implementation);
+            assert_eq!(dispatched.plan_id(), PLAN_ID);
+            assert!(dispatched.run_scanner_selection().is_none());
+            let mut haystack = vec![member; 80];
+            haystack.push(b'Z');
+            assert_eq!(
+                dispatched
+                    .find(&haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                legacy.find(&haystack, SearchLimits::unlimited()).unwrap()
+            );
+        }
+
+        let non_ascii = ByteClass::from_bytes(&[0x00, 0x02, 0x04, 0x06, 0x80, 0xff]);
+        let legacy = ForwardAnchoredPlan::build(
+            non_ascii,
+            b"Z",
+            Anchors {
+                start: true,
+                end: false,
+            },
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = ForwardAnchoredPlan::build_with_dispatch(
+            dispatch,
+            non_ascii,
+            b"Z",
+            Anchors {
+                start: true,
+                end: false,
+            },
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(dispatched.implementation(), ClassImplementation::Bitset);
+        assert_eq!(dispatched.plan_id(), PLAN_ID);
+        assert!(dispatched.run_scanner_selection().is_none());
+        let mut haystack = [0x00, 0x02, 0x04, 0x06, 0x80, 0xff].repeat(12);
+        haystack.push(b'Z');
+        assert_eq!(
+            dispatched
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap(),
+            legacy.find(&haystack, SearchLimits::unlimited()).unwrap()
+        );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the native-only test covers four forced receipts, every 16-lane boundary, every cache-line alignment, and dense-set fallback together"
+    )]
+    fn forced_run_variants_match_legacy_at_boundaries_and_cache_line_alignments() {
+        let dispatch = SimdDispatchContext::capture();
+        let usable = dispatch.capabilities().usable();
+        if !usable.contains(Feature::ArmSve) {
+            return;
+        }
+        let mut policies = vec![(DispatchPolicy::Portable, "ascii-byte-set.run.scalar.v1")];
+        if usable.contains(Feature::ArmNeon) {
+            policies.push((
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmNeon)),
+                "ascii-byte-set.run.neon.v1",
+            ));
+        }
+        policies.push((
+            DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve)),
+            "ascii-byte-set.run.sve.v1",
+        ));
+        if usable.contains(Feature::ArmSve2) {
+            policies.push((
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2)),
+                "ascii-byte-set.run.sve2-match16.v1",
+            ));
+        }
+
+        let class = ascii_bitset();
+        let anchors = Anchors {
+            start: true,
+            end: false,
+        };
+        let legacy =
+            ForwardAnchoredPlan::build(class, b"Z", anchors, BuildLimits::default()).unwrap();
+        for (policy, expected_variant) in policies {
+            let dispatched = ForwardAnchoredPlan::build_with_dispatch_policy(
+                dispatch,
+                policy,
+                class,
+                b"Z",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(dispatched.plan_id(), ASCII_BITSET_RUN_PLAN_ID);
+            assert_eq!(
+                dispatched
+                    .run_scanner_selection()
+                    .expect("an SVE host binds the opt-in Bitset scanner")
+                    .variant_id,
+                expected_variant
+            );
+
+            for offset in 0..64 {
+                for run_len in 0..=65 {
+                    let mut input: Vec<u8> = (0..run_len)
+                        .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+                        .collect();
+                    input.push(b'Z');
+                    let mut storage = vec![0xcc; offset + input.len()];
+                    storage[offset..].copy_from_slice(&input);
+                    let haystack = &storage[offset..];
+                    let legacy_result = legacy.find(haystack, SearchLimits::unlimited()).unwrap();
+                    let dispatched_result = dispatched
+                        .find(haystack, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(
+                        dispatched_result.0, legacy_result.0,
+                        "variant={expected_variant} offset={offset} run_len={run_len}"
+                    );
+                    assert!(
+                        dispatched_result.1.prefix_bytes_examined
+                            <= dispatched_result.1.prefix_bytes_upper_bound
+                    );
+                }
+            }
+
+            for offset in 0..64 {
+                for lane in 0..16 {
+                    let run_len = 65;
+                    let mut input: Vec<u8> = (0..run_len)
+                        .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+                        .collect();
+                    input[32 + lane] = b'Q';
+                    input.push(b'Z');
+                    let mut storage = vec![0xcc; offset + input.len()];
+                    storage[offset..].copy_from_slice(&input);
+                    let haystack = &storage[offset..];
+                    let legacy_result = legacy.find(haystack, SearchLimits::unlimited()).unwrap();
+                    let dispatched_result = dispatched
+                        .find(haystack, SearchLimits::unlimited())
+                        .unwrap();
+                    assert_eq!(legacy_result.0, None);
+                    assert_eq!(dispatched_result.0, legacy_result.0);
+                    assert!(
+                        dispatched_result.1.prefix_bytes_examined
+                            <= dispatched_result.1.prefix_bytes_upper_bound,
+                        "variant={expected_variant} offset={offset} lane={lane}"
+                    );
+                }
+            }
+        }
+
+        if usable.contains(Feature::ArmSve2) {
+            let dense_members: Vec<u8> = (0_u8..=0x7e).step_by(2).collect();
+            let dense = ByteClass::from_bytes(&dense_members);
+            let dense_legacy =
+                ForwardAnchoredPlan::build(dense, b"}", anchors, BuildLimits::default()).unwrap();
+            assert_eq!(dense_legacy.implementation(), ClassImplementation::Bitset);
+            let dense_dispatched = ForwardAnchoredPlan::build_with_dispatch_policy(
+                dispatch,
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2)),
+                dense,
+                b"}",
+                anchors,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                dense_dispatched
+                    .run_scanner_selection()
+                    .expect("the dense ASCII Bitset still binds a base-SVE scanner")
+                    .variant_id,
+                "ascii-byte-set.run.sve.v1"
+            );
+            let mut haystack = dense_members.repeat(3);
+            haystack.push(b'}');
+            assert_eq!(
+                dense_dispatched
+                    .find(&haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                dense_legacy
+                    .find(&haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the bounded benchmark fixtures use small compile-time run lengths and lane indices"
+    )]
+    fn forward_bitset_benchmark_cases() -> Vec<Box<[u8]>> {
+        let mut cases = Vec::new();
+        for run_len in [
+            1_usize, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 257, 1024, 65_536,
+        ] {
+            let mut input: Vec<u8> = (0..run_len)
+                .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+                .collect();
+            input.push(b'Z');
+            cases.push(input.into_boxed_slice());
+        }
+        for lane in 0..16 {
+            let run_len = 16 * 8 + 7;
+            let mut input: Vec<u8> = (0..run_len)
+                .map(|index| ASCII_BITSET_MEMBERS[index % ASCII_BITSET_MEMBERS.len()])
+                .collect();
+            input[32 + lane] = b'Q';
+            input.push(b'Z');
+            cases.push(input.into_boxed_slice());
+        }
+        cases
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the ignored benchmark uses bounded case indices and checksum arithmetic"
+    )]
+    fn measure_forward_bitset_plan(
+        plan: &DispatchedForwardAnchoredPlan,
+        cases: &[Box<[u8]>],
+        iterations: u32,
+    ) -> f64 {
+        assert!(iterations > 0);
+        assert!(!cases.is_empty());
+        let started = std::time::Instant::now();
+        let mut checksum = 0_usize;
+        for iteration in 0..iterations {
+            let index = usize::try_from(std::hint::black_box(iteration)).unwrap() % cases.len();
+            let (matched, accounting) = std::hint::black_box(plan)
+                .find(
+                    std::hint::black_box(&cases[index]),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            checksum ^= matched.map_or(0, |(_, end)| end.rotate_left(7))
+                ^ accounting.prefix_bytes_examined.rotate_left(17)
+                ^ index;
+        }
+        std::hint::black_box(checksum);
+        started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    fn forward_bitset_benchmark_median(samples: &[f64]) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    fn serialize_forward_bitset_samples(samples: &[f64]) -> String {
+        samples
+            .iter()
+            .map(|sample| format!("{sample:.9}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native release qualification benchmark; requires OS-usable NEON, SVE and SVE2"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "the ignored end-to-end benchmark keeps four-way validation, balanced rotation, raw samples, and its machine receipt together"
+    )]
+    fn benchmark_forward_anchored_bitset_scalar_neon_sve_and_sve2() {
+        let dispatch = SimdDispatchContext::capture();
+        let usable = dispatch.capabilities().usable();
+        let neon = FeatureSet::of(Feature::ArmNeon);
+        let sve = FeatureSet::of(Feature::ArmSve);
+        let sve2 = sve.with(Feature::ArmSve2);
+        assert!(
+            usable.contains_all(neon) && usable.contains_all(sve2),
+            "benchmark requires OS-usable NEON, SVE and SVE2; usable={usable:?}"
+        );
+        let class = ascii_bitset();
+        let anchors = Anchors {
+            start: true,
+            end: false,
+        };
+        let scalar = ForwardAnchoredPlan::build_with_dispatch_policy(
+            dispatch,
+            DispatchPolicy::Portable,
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let neon_plan = ForwardAnchoredPlan::build_with_dispatch_policy(
+            dispatch,
+            DispatchPolicy::AllowOnly(neon),
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let sve_plan = ForwardAnchoredPlan::build_with_dispatch_policy(
+            dispatch,
+            DispatchPolicy::AllowOnly(sve),
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let sve2_plan = ForwardAnchoredPlan::build_with_dispatch_policy(
+            dispatch,
+            DispatchPolicy::AllowOnly(sve2),
+            class,
+            b"Z",
+            anchors,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let plans = [
+            ("scalar", &scalar, "ascii-byte-set.run.scalar.v1"),
+            ("neon", &neon_plan, "ascii-byte-set.run.neon.v1"),
+            ("sve", &sve_plan, "ascii-byte-set.run.sve.v1"),
+            ("sve2", &sve2_plan, "ascii-byte-set.run.sve2-match16.v1"),
+        ];
+        for (_, plan, expected_variant) in plans {
+            assert_eq!(plan.plan_id(), ASCII_BITSET_RUN_PLAN_ID);
+            assert_eq!(
+                plan.run_scanner_selection()
+                    .expect("the forced benchmark binds every scanner")
+                    .variant_id,
+                expected_variant
+            );
+        }
+
+        let legacy =
+            ForwardAnchoredPlan::build(class, b"Z", anchors, BuildLimits::default()).unwrap();
+        let cases = forward_bitset_benchmark_cases();
+        for case in &cases {
+            let expected = legacy.find(case, SearchLimits::unlimited()).unwrap().0;
+            for (_, plan, _) in plans {
+                let (observed, accounting) = plan.find(case, SearchLimits::unlimited()).unwrap();
+                assert_eq!(observed, expected);
+                assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+            }
+        }
+
+        let iterations = std::env::var("FRE_FORWARD_BITSET_BENCH_ITERS").map_or(50_000, |raw| {
+            raw.parse::<u32>()
+                .unwrap_or_else(|error| panic!("FRE_FORWARD_BITSET_BENCH_ITERS: {error}"))
+        });
+        let samples = std::env::var("FRE_FORWARD_BITSET_BENCH_SAMPLES").map_or(16, |raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|error| panic!("FRE_FORWARD_BITSET_BENCH_SAMPLES: {error}"))
+        });
+        assert!(iterations > 0);
+        assert!(samples >= 16 && samples.is_multiple_of(4));
+        for (_, plan, _) in plans {
+            let _ = measure_forward_bitset_plan(plan, &cases, iterations / 10 + 1);
+        }
+
+        let mut raw = [
+            Vec::with_capacity(samples),
+            Vec::with_capacity(samples),
+            Vec::with_capacity(samples),
+            Vec::with_capacity(samples),
+        ];
+        let mut orders = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let mut order = Vec::with_capacity(plans.len());
+            for slot in 0..plans.len() {
+                let index = (slot + sample) % plans.len();
+                let (name, plan, _) = plans[index];
+                order.push(name);
+                raw[index].push(measure_forward_bitset_plan(plan, &cases, iterations));
+            }
+            orders.push(order.join(">"));
+        }
+        assert!(
+            raw.iter()
+                .flatten()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+        let medians = raw
+            .each_ref()
+            .map(|samples| forward_bitset_benchmark_median(samples));
+        let receipt = format!(
+            "FORWARD_ANCHORED_BITSET_BENCH iterations={iterations} samples={samples} cases={} \
+             scalar_ns={:.9} neon_ns={:.9} sve_ns={:.9} sve2_ns={:.9} \
+             neon_over_scalar={:.9} sve_over_neon={:.9} sve2_over_neon={:.9} \
+             orders={} scalar_samples={} neon_samples={} sve_samples={} sve2_samples={}",
+            cases.len(),
+            medians[0],
+            medians[1],
+            medians[2],
+            medians[3],
+            medians[1] / medians[0],
+            medians[2] / medians[1],
+            medians[3] / medians[1],
+            orders.join(","),
+            serialize_forward_bitset_samples(&raw[0]),
+            serialize_forward_bitset_samples(&raw[1]),
+            serialize_forward_bitset_samples(&raw[2]),
+            serialize_forward_bitset_samples(&raw[3]),
+        );
+        assert_eq!(receipt.matches('\n').count(), 0);
+        eprintln!("{receipt}");
     }
 
     #[test]
