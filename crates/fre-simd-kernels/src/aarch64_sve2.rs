@@ -119,18 +119,12 @@ fre_ascii_mask32_sve2_asm:
     .type fre_ascii_run_forward_sve_asm, %function
 fre_ascii_run_forward_sve_asm:
     .cfi_startproc
+    ptrue p0.b, vl16
+    ld1b z0.b, p0/z, [x0]
     mov x8, #0
-    mov x10, #16
-    whilelo p3.b, xzr, x10
-    ld1b z0.b, p3/z, [x0]
-    mov x9, #16
+    cmp x2, #16
+    b.lo 3f
 1:
-    cmp x8, x2
-    b.hs 3f
-    sub x10, x2, x8
-    cmp x10, x9
-    csel x10, x10, x9, lo
-    whilelo p0.b, xzr, x10
     ld1b z2.b, p0/z, [x1, x8]
 
     mov z3.d, z2.d
@@ -145,7 +139,32 @@ fre_ascii_run_forward_sve_asm:
     not p2.b, p0/z, p1.b
     ptest p0, p2.b
     b.none 2f
+    b 4f
 
+2:
+    add x8, x8, #16
+    sub x10, x2, x8
+    cmp x10, #16
+    b.hs 1b
+3:
+    cmp x8, x2
+    b.hs 5f
+    whilelo p0.b, x8, x2
+    ld1b z2.b, p0/z, [x1, x8]
+
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
     // BRKB retains active lanes strictly before the first nonmember.
     brkb p3.b, p0/z, p2.b
     cntp x10, p0, p3.b
@@ -153,10 +172,7 @@ fre_ascii_run_forward_sve_asm:
     cntp x11, p0, p0.b
     add x1, x8, x11
     ret
-2:
-    incp x8, p0.b
-    b 1b
-3:
+5:
     mov x0, x2
     mov x1, x2
     ret
@@ -174,18 +190,14 @@ fre_ascii_run_forward_sve_asm:
     .type fre_ascii_run_backward_sve_asm, %function
 fre_ascii_run_backward_sve_asm:
     .cfi_startproc
-    mov x10, #16
-    whilelo p3.b, xzr, x10
-    ld1b z0.b, p3/z, [x0]
+    ptrue p0.b, vl16
+    ld1b z0.b, p0/z, [x0]
     index z6.b, #0, #1
-    mov x9, #16
     mov x8, x2
+    cmp x8, #16
+    b.lo 3f
 1:
-    cbz x8, 3f
-    cmp x8, x9
-    csel x10, x8, x9, lo
-    sub x11, x8, x10
-    whilelo p0.b, xzr, x10
+    sub x11, x8, #16
     ld1b z2.b, p0/z, [x1, x11]
 
     mov z3.d, z2.d
@@ -200,7 +212,31 @@ fre_ascii_run_backward_sve_asm:
     not p2.b, p0/z, p1.b
     ptest p0, p2.b
     b.none 2f
+    b 4f
 
+2:
+    mov x8, x11
+    cmp x8, #16
+    b.hs 1b
+3:
+    cbz x8, 5f
+    mov x11, #0
+    whilelo p0.b, xzr, x8
+    ld1b z2.b, p0/z, [x1]
+
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
     lastb w12, p2, z6.b
     uxtb x12, w12
     add x12, x11, x12
@@ -208,10 +244,7 @@ fre_ascii_run_backward_sve_asm:
     sub x0, x2, x12
     sub x1, x2, x11
     ret
-2:
-    mov x8, x11
-    b 1b
-3:
+5:
     mov x0, x2
     mov x1, x2
     ret
@@ -230,33 +263,41 @@ fre_ascii_run_backward_sve_asm:
     .type fre_ascii_run_forward_sve2_asm, %function
 fre_ascii_run_forward_sve2_asm:
     .cfi_startproc
-    ptrue p3.b
-    ld1rqb z0.b, p3/z, [x0]
+    ptrue p0.b, vl16
+    ld1rqb z0.b, p0/z, [x0]
     mov x8, #0
-    mov x9, #16
+    cmp x2, #16
+    b.lo 3f
 1:
-    cmp x8, x2
-    b.hs 3f
-    sub x10, x2, x8
-    cmp x10, x9
-    csel x10, x10, x9, lo
-    whilelo p0.b, xzr, x10
     ld1b z2.b, p0/z, [x1, x8]
     match p1.b, p0/z, z2.b, z0.b
     not p2.b, p0/z, p1.b
     ptest p0, p2.b
     b.none 2f
+    b 4f
 
+2:
+    add x8, x8, #16
+    sub x10, x2, x8
+    cmp x10, #16
+    b.hs 1b
+3:
+    cmp x8, x2
+    b.hs 5f
+    whilelo p0.b, x8, x2
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
     brkb p3.b, p0/z, p2.b
     cntp x10, p0, p3.b
     add x0, x8, x10
     cntp x11, p0, p0.b
     add x1, x8, x11
     ret
-2:
-    incp x8, p0.b
-    b 1b
-3:
+5:
     mov x0, x2
     mov x1, x2
     ret
@@ -272,23 +313,35 @@ fre_ascii_run_forward_sve2_asm:
     .type fre_ascii_run_backward_sve2_asm, %function
 fre_ascii_run_backward_sve2_asm:
     .cfi_startproc
-    ptrue p3.b
-    ld1rqb z0.b, p3/z, [x0]
+    ptrue p0.b, vl16
+    ld1rqb z0.b, p0/z, [x0]
     index z6.b, #0, #1
-    mov x9, #16
     mov x8, x2
+    cmp x8, #16
+    b.lo 3f
 1:
-    cbz x8, 3f
-    cmp x8, x9
-    csel x10, x8, x9, lo
-    sub x11, x8, x10
-    whilelo p0.b, xzr, x10
+    sub x11, x8, #16
     ld1b z2.b, p0/z, [x1, x11]
     match p1.b, p0/z, z2.b, z0.b
     not p2.b, p0/z, p1.b
     ptest p0, p2.b
     b.none 2f
+    b 4f
 
+2:
+    mov x8, x11
+    cmp x8, #16
+    b.hs 1b
+3:
+    cbz x8, 5f
+    mov x11, #0
+    whilelo p0.b, xzr, x8
+    ld1b z2.b, p0/z, [x1]
+    match p1.b, p0/z, z2.b, z0.b
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 5f
+4:
     lastb w12, p2, z6.b
     uxtb x12, w12
     add x12, x11, x12
@@ -296,10 +349,7 @@ fre_ascii_run_backward_sve2_asm:
     sub x0, x2, x12
     sub x1, x2, x11
     ret
-2:
-    mov x8, x11
-    b 1b
-3:
+5:
     mov x0, x2
     mov x1, x2
     ret
