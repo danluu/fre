@@ -32,6 +32,7 @@ pub use emit::{
     EmitLimits, MAX_REPEATED_CONFIRM_BYTES, SearchBackendPolicy, emit, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve16,
     emit_with_backend,
 };

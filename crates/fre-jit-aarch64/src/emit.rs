@@ -394,6 +394,29 @@ pub fn emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
     )
 }
 
+/// Emit the experimental fixed-16-lane SVE2 backend for unequal-pair `SpanSum`.
+///
+/// Unequal adjacent bytes cannot overlap, so the backend reuses the exact
+/// fixed-16 pair-count loop and checks a final multiplication by the literal
+/// width. Equal-byte pairs are deliberately outside this direct-count shape.
+/// This remains explicit and does not change [`emit_exact_aggregate`] or
+/// [`BackendVersion::AGGREGATE_CURRENT`].
+pub fn emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(
+    program: &ExactAggregateProgram<SpanSum>,
+    limits: EmitLimits,
+) -> Result<NativeAggregateImage, EmitError> {
+    if matches!(program.literal(), [left, right] if left == right) {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
+    emit_exact_aggregate_backend(
+        program,
+        limits,
+        AggregateBackend::Sve2Fixed16PairSpanSumExperimental,
+    )
+}
+
 /// Emit the experimental fixed-16-lane SVE2 backend for one-byte `SpanSum`.
 ///
 /// Every admitted match has width one, so predicate population is exactly the
@@ -414,6 +437,7 @@ enum AggregateBackend {
     Current,
     Sve2Fixed16CountExperimental,
     Sve2Fixed16PairCountExperimental,
+    Sve2Fixed16PairSpanSumExperimental,
     Sve2Fixed16SpanSumExperimental,
 }
 
@@ -427,6 +451,9 @@ impl AggregateBackend {
             Self::Sve2Fixed16PairCountExperimental => {
                 BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
             }
+            Self::Sve2Fixed16PairSpanSumExperimental => {
+                BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
+            }
             Self::Sve2Fixed16SpanSumExperimental => {
                 BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
             }
@@ -439,6 +466,7 @@ impl AggregateBackend {
             Self::Current => CpuFeatures::ASIMD,
             Self::Sve2Fixed16CountExperimental
             | Self::Sve2Fixed16PairCountExperimental
+            | Self::Sve2Fixed16PairSpanSumExperimental
             | Self::Sve2Fixed16SpanSumExperimental => CpuFeatures::SVE.union(CpuFeatures::SVE2),
         }
     }
@@ -463,6 +491,10 @@ fn emit_exact_aggregate_backend<A: AggregateOperation>(
             if literal.len() == 1 && A::OUTPUT == AggregateOutput::Count => {}
         AggregateBackend::Sve2Fixed16PairCountExperimental
             if literal.len() == 2 && A::OUTPUT == AggregateOutput::Count => {}
+        AggregateBackend::Sve2Fixed16PairSpanSumExperimental
+            if literal.len() == 2
+                && literal[0] != literal[1]
+                && A::OUTPUT == AggregateOutput::SpanSum => {}
         AggregateBackend::Sve2Fixed16SpanSumExperimental
             if literal.len() == 1 && A::OUTPUT == AggregateOutput::SpanSum => {}
         _ => {
@@ -502,7 +534,7 @@ fn emit_exact_aggregate_backend<A: AggregateOperation>(
         overflow,
         &data,
     )?;
-    emit_aggregate_returns(&mut assembler, done, overflow)?;
+    emit_aggregate_returns(&mut assembler, done, overflow, backend)?;
     let finalized = assembler.finalize(data.bytes.len())?;
     let image = build_aggregate_image(program, finalized, data, scratch, backend)?;
     finalize_aggregate_image(image, limits)
@@ -603,10 +635,23 @@ fn emit_aggregate_exact(
             | AggregateBackend::Sve2Fixed16SpanSumExperimental => {
                 emit_aggregate_single_byte_sve2_fixed16_count(assembler, done, overflow)
             }
-            AggregateBackend::Sve2Fixed16PairCountExperimental => Err(EmitError::InternalInvariant),
+            AggregateBackend::Sve2Fixed16PairCountExperimental
+            | AggregateBackend::Sve2Fixed16PairSpanSumExperimental => {
+                Err(EmitError::InternalInvariant)
+            }
         }
-    } else if literal.len() == 2 && backend == AggregateBackend::Sve2Fixed16PairCountExperimental {
-        emit_aggregate_two_byte_sve2_fixed16_count(assembler, literal, done, overflow)
+    } else if literal.len() == 2
+        && matches!(
+            backend,
+            AggregateBackend::Sve2Fixed16PairCountExperimental
+                | AggregateBackend::Sve2Fixed16PairSpanSumExperimental
+        )
+    {
+        if backend == AggregateBackend::Sve2Fixed16PairSpanSumExperimental {
+            emit_aggregate_non_self_overlapping_pair_sve2_fixed16_count(assembler, done, overflow)
+        } else {
+            emit_aggregate_two_byte_sve2_fixed16_count(assembler, literal, done, overflow)
+        }
     } else {
         if backend != AggregateBackend::Current {
             return Err(EmitError::InternalInvariant);
@@ -953,8 +998,12 @@ fn emit_aggregate_returns(
     assembler: &mut Assembler,
     done: Label,
     overflow: Label,
+    backend: AggregateBackend,
 ) -> Result<(), EmitError> {
     assembler.bind(done)?;
+    if backend == AggregateBackend::Sve2Fixed16PairSpanSumExperimental {
+        emit_aggregate_add_register(assembler, X13, overflow)?;
+    }
     assembler.store64(X13, X2, 0)?;
     assembler.mov_imm64(X0, 0)?;
     assembler.ret()?;

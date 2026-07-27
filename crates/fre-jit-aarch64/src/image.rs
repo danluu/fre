@@ -58,6 +58,11 @@ impl BackendVersion {
     /// intersected pair predicate can be counted directly. Equal-byte pairs
     /// retain exact non-overlap semantics through scalar recovery.
     pub const AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1: Self = Self(5);
+    /// Experimental fixed-16-lane SVE2 backend for unequal two-byte `SpanSum`.
+    ///
+    /// The backend reuses the exact non-overlapping pair count and checks a
+    /// final doubling before publishing the width-two matched-byte sum.
+    pub const AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1: Self = Self(6);
     /// Current aggregate tag; its AOT wire remains aggregate v1.
     pub const AGGREGATE_CURRENT: Self = Self::AGGREGATE_V1;
     /// Compatibility alias for callers that only handle search images.

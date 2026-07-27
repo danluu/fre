@@ -2414,7 +2414,13 @@ fn audit_aggregate_contract(
         if let Some(register) = first_forbidden_aggregate_vector_register(instruction) {
             return Err(AuditError::ForbiddenAggregateVectorRegister { offset, register });
         }
-        validate_aggregate_critical_write(instructions, index, literal_len, output)?;
+        validate_aggregate_critical_write(
+            instructions,
+            index,
+            literal_len,
+            output,
+            image.backend_version,
+        )?;
         match instruction {
             DecodedInstruction::Address { destination: 8, .. } => {
                 address_count = address_count
@@ -2506,7 +2512,7 @@ fn audit_aggregate_contract(
     if let Some((_fault_status, fault_return)) = fault {
         protected.push(fault_return);
     }
-    validate_aggregate_branches(instructions, &protected, literal_len)?;
+    validate_aggregate_branches(instructions, &protected, literal_len, image.backend_version)?;
     validate_aggregate_definite_initialization(instructions)?;
     validate_aggregate_reachability(instructions)?;
     validate_aggregate_template(image, instructions, literal_len, output)?;
@@ -2542,6 +2548,7 @@ fn authenticate_aggregate_envelope(
             | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
             | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
             | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
     ) || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
@@ -2572,6 +2579,11 @@ fn authenticate_aggregate_envelope(
                     (55, 6, 12, 9)
                 }
             }
+            (
+                BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1,
+                AggregateOutput::SpanSum,
+                2,
+            ) if image.rodata[0] != image.rodata[1] => (59, 6, 13, 9),
             (
                 BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2,
                 output,
@@ -2789,8 +2801,12 @@ fn validate_aggregate_template(
             output,
         );
     }
-    if image.backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1 {
-        return validate_aggregate_sve2_fixed16_pair_count_experimental_template(
+    if matches!(
+        image.backend_version,
+        BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
+    ) {
+        return validate_aggregate_sve2_fixed16_pair_experimental_template(
             image,
             instructions,
             literal_len,
@@ -3780,7 +3796,7 @@ fn validate_aggregate_sve2_fixed16_count_experimental_template(
     clippy::too_many_lines,
     reason = "the pair backend's complete decoded templates intentionally expose every opcode and operand"
 )]
-fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
+fn validate_aggregate_sve2_fixed16_pair_experimental_template(
     image: &NativeImage,
     instructions: &[DecodedInstruction],
     literal_len: usize,
@@ -3793,13 +3809,21 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
         SveCountPredicateBytes, SveDuplicateByte, SveLoadBytes, SvePtrueBytesVl16,
         SveTestPredicateBytes,
     };
-    const DIRECT_LABELS: &[(u32, LabelKind)] = &[
+    const COUNT_DIRECT_LABELS: &[(u32, LabelKind)] = &[
         (0, LabelKind::Entry),
         (48, LabelKind::Loop),
         (124, LabelKind::SlowPath),
         (192, LabelKind::Internal),
         (200, LabelKind::ReturnFound),
         (212, LabelKind::ReturnNone),
+    ];
+    const SPAN_SUM_DIRECT_LABELS: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (48, LabelKind::Loop),
+        (124, LabelKind::SlowPath),
+        (192, LabelKind::Internal),
+        (200, LabelKind::ReturnFound),
+        (228, LabelKind::ReturnNone),
     ];
     const RECOVERY_LABELS: &[(u32, LabelKind)] = &[
         (0, LabelKind::Entry),
@@ -3813,18 +3837,27 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
         (212, LabelKind::ReturnNone),
     ];
 
-    if image.backend_version != BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
-        || literal_len != 2
-        || output != AggregateOutput::Count
-        || image.rodata.len() != 2
-    {
+    let pair_span_sum = match (image.backend_version, output) {
+        (
+            BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1,
+            AggregateOutput::Count,
+        ) => false,
+        (
+            BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1,
+            AggregateOutput::SpanSum,
+        ) if image.rodata.first() != image.rodata.get(1) => true,
+        _ => return Err(AuditError::InvalidAggregateTemplate { offset: 0 }),
+    };
+    if literal_len != 2 || image.rodata.len() != 2 {
         return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
     }
     let equal_pair = image.rodata[0] == image.rodata[1];
-    let expected_labels = if equal_pair {
+    let expected_labels = if pair_span_sum {
+        SPAN_SUM_DIRECT_LABELS
+    } else if equal_pair {
         RECOVERY_LABELS
     } else {
-        DIRECT_LABELS
+        COUNT_DIRECT_LABELS
     };
     if image.labels.len() != expected_labels.len()
         || image
@@ -3845,7 +3878,7 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
         },
         Address {
             destination: 8,
-            displacement: 220,
+            displacement: if pair_span_sum { 236 } else { 220 },
         },
         MoveZero64 {
             destination: 12,
@@ -4040,7 +4073,7 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
             },
             BranchCondition {
                 condition: crate::Condition::CarryClear,
-                displacement: 100,
+                displacement: if pair_span_sum { 116 } else { 100 },
             },
             AddImmediate64 {
                 destination: 5,
@@ -4113,7 +4146,7 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
         },
         BranchCondition {
             condition: crate::Condition::CarryClear,
-            displacement: 32,
+            displacement: if pair_span_sum { 48 } else { 32 },
         },
         AddImmediate64 {
             destination: 5,
@@ -4127,6 +4160,29 @@ fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
             immediate: 1,
         },
         Branch { displacement: -72 },
+    ])?;
+    if pair_span_sum {
+        cursor.expect_all([
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 13,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 16,
+            },
+        ])?;
+    }
+    cursor.expect_all([
         Store64 {
             source: 13,
             base: 2,
@@ -4481,6 +4537,7 @@ fn validate_aggregate_critical_write(
     index: usize,
     literal_len: usize,
     output: AggregateOutput,
+    backend_version: BackendVersion,
 ) -> Result<(), AuditError> {
     let instruction = instructions[index];
     let Some(destination) = instruction.written_gpr() else {
@@ -4552,7 +4609,13 @@ fn validate_aggregate_critical_write(
                 shift: 0
             } if usize::from(immediate) == literal_len
         ),
-        13 => valid_aggregate_accumulator_write(instructions, index, literal_len, output),
+        13 => valid_aggregate_accumulator_write(
+            instructions,
+            index,
+            literal_len,
+            output,
+            backend_version,
+        ),
         14 => matches!(
             instruction,
             DecodedInstruction::MoveRegister64 {
@@ -4725,6 +4788,7 @@ fn valid_aggregate_accumulator_write(
     index: usize,
     literal_len: usize,
     output: AggregateOutput,
+    backend_version: BackendVersion,
 ) -> bool {
     let instruction = instructions[index];
     if index == 0
@@ -4752,20 +4816,35 @@ fn valid_aggregate_accumulator_write(
     {
         return true;
     }
+    let pair_span_sum =
+        backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1;
     let expected_delta = match output {
         AggregateOutput::Count => 1,
         AggregateOutput::SpanSum => literal_len,
     };
-    let is_accumulation = ((literal_len == 1
-        || (literal_len == 2 && output == AggregateOutput::Count))
+    let is_pair_span_sum_count = pair_span_sum
         && matches!(
             instruction,
             DecodedInstruction::AddRegister64 {
                 destination: 13,
                 left: 13,
-                right: 10
+                right: 10 | 13
+            } | DecodedInstruction::AddImmediate64 {
+                destination: 13,
+                source: 13,
+                immediate: 1
             }
-        ))
+        );
+    let is_accumulation = is_pair_span_sum_count
+        || ((literal_len == 1 || (literal_len == 2 && output == AggregateOutput::Count))
+            && matches!(
+                instruction,
+                DecodedInstruction::AddRegister64 {
+                    destination: 13,
+                    left: 13,
+                    right: 10
+                }
+            ))
         || matches!(
             instruction,
             DecodedInstruction::AddImmediate64 {
@@ -4995,6 +5074,7 @@ fn validate_aggregate_branches(
     instructions: &[DecodedInstruction],
     protected_targets: &[usize],
     literal_len: usize,
+    backend_version: BackendVersion,
 ) -> Result<(), AuditError> {
     let vector_cursor_guard = unique_vector_cursor_guard(instructions);
     for (index, &instruction) in instructions.iter().enumerate() {
@@ -5014,9 +5094,13 @@ fn validate_aggregate_branches(
             core::cmp::Ordering::Less => {
                 valid_aggregate_back_edge(instructions, index, target, vector_cursor_guard)
             }
-            core::cmp::Ordering::Greater => {
-                valid_aggregate_forward_edge(instructions, index, target, literal_len)
-            }
+            core::cmp::Ordering::Greater => valid_aggregate_forward_edge(
+                instructions,
+                index,
+                target,
+                literal_len,
+                backend_version,
+            ),
             core::cmp::Ordering::Equal => false,
         };
         if !valid_edge {
@@ -5037,6 +5121,7 @@ fn valid_aggregate_forward_edge(
     index: usize,
     target: usize,
     literal_len: usize,
+    backend_version: BackendVersion,
 ) -> bool {
     let prior = index
         .checked_sub(1)
@@ -5057,14 +5142,7 @@ fn valid_aggregate_forward_edge(
                         immediate: 1
                     }
                 )
-            ) && matches!(
-                target_instruction,
-                Some(DecodedInstruction::Store64 {
-                    source: 13,
-                    base: 2,
-                    offset: 0
-                })
-            );
+            ) && valid_aggregate_finish_target(target_instruction, backend_version);
             let enter_scalar_envelope = matches!(
                 prior,
                 Some(DecodedInstruction::AddImmediate64 {
@@ -5105,14 +5183,7 @@ fn valid_aggregate_forward_edge(
             | (
                 Some(DecodedInstruction::CompareRegister64 { left: 5, right: 1 }),
                 crate::Condition::CarrySet,
-            ) => matches!(
-                target_instruction,
-                Some(DecodedInstruction::Store64 {
-                    source: 13,
-                    base: 2,
-                    offset: 0
-                })
-            ),
+            ) => valid_aggregate_finish_target(target_instruction, backend_version),
             (
                 Some(DecodedInstruction::CompareImmediate64 {
                     register: 10,
@@ -5231,6 +5302,27 @@ fn valid_aggregate_forward_edge(
         ),
         _ => false,
     }
+}
+
+fn valid_aggregate_finish_target(
+    instruction: Option<&DecodedInstruction>,
+    backend_version: BackendVersion,
+) -> bool {
+    matches!(
+        instruction,
+        Some(DecodedInstruction::Store64 {
+            source: 13,
+            base: 2,
+            offset: 0
+        })
+    ) || (backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
+        && matches!(
+            instruction,
+            Some(DecodedInstruction::MoveRegister64 {
+                destination: 14,
+                source: 13
+            })
+        ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

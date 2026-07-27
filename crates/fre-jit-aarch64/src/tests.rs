@@ -21,6 +21,7 @@ use crate::{
     emit::emit_search_version_for_test, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve16,
     emit_with_backend, image::SearchShape,
 };
@@ -554,6 +555,224 @@ fn experimental_sve2_fixed16_pair_count_is_exact_explicit_and_audited() {
         audit_aggregate(&NativeAggregateImage::new(wrong_output)),
         Err(AuditError::InvalidAggregateManifest)
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the pair SpanSum receipt keeps exact reuse, accounting, audit, differential, and admission checks together"
+)]
+fn experimental_sve2_fixed16_pair_span_sum_reuses_checked_count_result() {
+    let count =
+        build_exact_aggregate::<Count>(b"ab", ValidateLimits::default()).expect("count program");
+    let spans =
+        build_exact_aggregate::<SpanSum>(b"ab", ValidateLimits::default()).expect("span program");
+    let current = emit_exact_aggregate(&spans, EmitLimits::default()).expect("current image");
+    let count_image =
+        emit_exact_aggregate_sve2_fixed16_pair_count_experimental(&count, EmitLimits::default())
+            .expect("pair count image");
+    let span_image =
+        emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(&spans, EmitLimits::default())
+            .expect("pair span-sum image");
+    let repeated =
+        emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(&spans, EmitLimits::default())
+            .expect("deterministic pair span-sum image");
+
+    assert_eq!(span_image, repeated);
+    assert_eq!(current.backend_version(), BackendVersion::AGGREGATE_CURRENT);
+    assert_eq!(
+        span_image.backend_version(),
+        BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
+    );
+    assert_eq!(span_image.output(), AggregateOutput::SpanSum);
+    assert_eq!(span_image.literal_bytes(), 2);
+    assert_eq!(
+        span_image.target().features,
+        CpuFeatures::SVE.union(CpuFeatures::SVE2)
+    );
+    assert_ne!(
+        span_image.artifact_identity(),
+        count_image.artifact_identity()
+    );
+    assert_ne!(span_image.artifact_identity(), current.artifact_identity());
+    assert_eq!(
+        audit_aggregate(&span_image).expect("sealed audit").stores,
+        1
+    );
+
+    let count_stats = count_image.stats();
+    assert_eq!(count_stats.code_bytes, 220);
+    assert_eq!(count_stats.relocations, 12);
+    assert_eq!(count_stats.labels, 6);
+    assert_eq!(count_stats.vector_instructions, 9);
+    assert_eq!(count_stats.emission_work, 739);
+    let stats = span_image.stats();
+    assert_eq!(stats.code_bytes, 236);
+    assert_eq!(stats.data_bytes, 2);
+    assert_eq!(stats.relocations, 13);
+    assert_eq!(stats.labels, 6);
+    assert_eq!(stats.vector_instructions, 9);
+    assert_eq!(stats.emission_work, 780);
+    assert_eq!(span_image.layout().rodata_from_code_start, 240);
+    assert_eq!(span_image.layout().total_mapped_bytes, 242);
+    let aot = span_image
+        .to_aot(AotLimits::default())
+        .expect("pair SpanSum AOT");
+    assert_eq!(aot.as_bytes().len(), 694);
+    assert_eq!(aot.identity(), span_image.artifact_identity());
+
+    let instructions = decode(span_image.code()).expect("pair SpanSum decode");
+    assert_eq!(instructions.len(), 59);
+    assert_eq!(
+        &instructions[50..54],
+        &[
+            DecodedInstruction::MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            DecodedInstruction::AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 13,
+            },
+            DecodedInstruction::CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            DecodedInstruction::BranchCondition {
+                condition: Condition::CarryClear,
+                displacement: 16,
+            },
+        ]
+    );
+    assert!(
+        instructions.contains(&DecodedInstruction::SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1,
+        })
+    );
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| !instruction.is_asimd())
+    );
+
+    for (index, replacement) in [
+        (
+            51,
+            DecodedInstruction::AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 10,
+            },
+        ),
+        (
+            53,
+            DecodedInstruction::BranchCondition {
+                condition: Condition::CarrySet,
+                displacement: 16,
+            },
+        ),
+    ] {
+        let mut mutated = span_image.inner().clone();
+        replace_test_decoded_at(&mut mutated, index, replacement);
+        reseal_test_image(&mut mutated);
+        assert!(
+            audit_aggregate(&NativeAggregateImage::new(mutated)).is_err(),
+            "checked-double mutation at instruction {index} must fail"
+        );
+    }
+
+    for literal in [b"ab".as_slice(), b"\0\xff".as_slice(), b"\xff\0".as_slice()] {
+        let count_program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+            .expect("differential count program");
+        let span_program = build_exact_aggregate::<SpanSum>(literal, ValidateLimits::default())
+            .expect("differential span program");
+        let image = emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(
+            &span_program,
+            EmitLimits::default(),
+        )
+        .expect("differential pair SpanSum image");
+        for length in [0, 1, 2, 3, 15, 16, 17, 18, 31, 32, 33, 34, 63, 64, 65] {
+            for phase in 0..7 {
+                let haystack: Vec<u8> = (0..length)
+                    .map(|index| {
+                        if (index + phase) % 5 < 3 {
+                            literal[(index + phase) % 2]
+                        } else {
+                            u8::try_from((index * 37 + phase * 19) & 0xff).expect("masked byte")
+                        }
+                    })
+                    .collect();
+                let expected_count = *count_program
+                    .execute(&haystack, AggregateExecutionLimits::unlimited())
+                    .expect("count oracle")
+                    .output();
+                let expected = *span_program
+                    .execute(&haystack, AggregateExecutionLimits::unlimited())
+                    .expect("SpanSum oracle")
+                    .output();
+                assert_eq!(expected, expected_count * 2);
+                let actual =
+                    simulate_aggregate(&image, &haystack).expect("pair SpanSum simulation");
+                assert_eq!(
+                    aggregate_output(actual),
+                    Ok(expected),
+                    "literal={literal:?} length={length} phase={phase}"
+                );
+            }
+        }
+    }
+
+    for invalid_literal in [
+        b"".as_slice(),
+        b"x".as_slice(),
+        b"aa".as_slice(),
+        b"xyz".as_slice(),
+    ] {
+        let invalid = build_exact_aggregate::<SpanSum>(invalid_literal, ValidateLimits::default())
+            .expect("invalid-shape SpanSum program");
+        assert_eq!(
+            emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(
+                &invalid,
+                EmitLimits::default()
+            ),
+            Err(EmitError::Unsupported {
+                reason: crate::UnsupportedReason::KernelShape,
+            })
+        );
+    }
+
+    for (resource, exact) in [
+        (ResourceKind::CodeBytes, u64::from(stats.code_bytes)),
+        (ResourceKind::DataBytes, u64::from(stats.data_bytes)),
+        (ResourceKind::Relocations, u64::from(stats.relocations)),
+        (ResourceKind::Labels, u64::from(stats.labels)),
+        (ResourceKind::EmissionWork, stats.emission_work),
+        (ResourceKind::ScratchBytes, stats.scratch_bytes),
+    ] {
+        emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(
+            &spans,
+            with_limit(EmitLimits::default(), resource, exact),
+        )
+        .expect("exact pair SpanSum resource boundary succeeds");
+        let error = emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental(
+            &spans,
+            with_limit(EmitLimits::default(), resource, exact - 1),
+        )
+        .expect_err("one below pair SpanSum resource boundary fails");
+        assert!(
+            matches!(
+                error,
+                EmitError::ResourceLimit {
+                    resource: actual,
+                    ..
+                } if actual == resource
+            ),
+            "wrong error for {resource:?}: {error:?}"
+        );
+    }
 }
 
 #[test]
