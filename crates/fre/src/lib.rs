@@ -255,6 +255,10 @@ pub use fre_kernels::{
     AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredLineCaptureRunUpperBounds,
 };
 pub use fre_kernels::{
+    AsciiSelection as SimdAsciiSelection, DispatchPolicy as SimdDispatchPolicy,
+    Feature as SimdFeature, FeatureSet as SimdFeatureSet,
+};
+pub use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,
     BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID, BOUNDED_AFFIX_PLAN_ID,
     BOUNDED_CLASS_SEQUENCE_COUNT_OPERATION_ID, BOUNDED_CLASS_SEQUENCE_PLAN_ID,
@@ -374,6 +378,13 @@ pub use fre_kernels::{
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds, UrlAggregateReduceError,
     UrlAggregateReduceUpperBounds, url_aggregate_reduce_upper_bounds,
+};
+pub use operation_session::hot::{
+    HOT_BYTE_PROGRAM_ACCOUNTING_ID, HOT_BYTE_PROGRAM_ACCOUNTING_VERSION,
+    HOT_BYTE_PROGRAM_ALGORITHM_VERSION, HotByteBuildAccounting, HotByteBuildError,
+    HotByteBuildLimits, HotByteBuildReceipt, HotByteBuildResource, HotByteDispatch,
+    HotByteIneligibility, HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunError,
+    HotByteRunLimits, HotKernelPreparationError,
 };
 pub use operation_session::{
     OperationSession, OperationSessionAdmission, OperationSessionAttemptReceipt,

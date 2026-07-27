@@ -28,6 +28,8 @@ pub enum P128ForcedCompiler {
     BuildMany,
     /// Tagged capture participation, history, and line execution.
     CaptureStream,
+    /// Fixed-width byte programs with retained ASCII-class SIMD classifiers.
+    HotBytePrograms,
 }
 
 impl P128ForcedCompiler {
@@ -39,6 +41,7 @@ impl P128ForcedCompiler {
             Self::WholeAutomata => "fre.forced.whole-automata.v1",
             Self::BuildMany => "fre.forced.build-many.v1",
             Self::CaptureStream => "fre.forced.capture-stream.v1",
+            Self::HotBytePrograms => "fre.forced.hot-byte-programs.v1",
         }
     }
 }
@@ -132,7 +135,7 @@ impl P128ForcedCompilerContract {
     }
 }
 
-const CONTRACTS: [P128ForcedCompilerContract; 7] = [
+const CONTRACTS: [P128ForcedCompilerContract; 9] = [
     P128ForcedCompilerContract::new(P128ForcedCompiler::LiteralAnchor, P128ForcedModel::Count),
     P128ForcedCompilerContract::new(P128ForcedCompiler::LiteralAnchor, P128ForcedModel::SpanSum),
     P128ForcedCompilerContract::new(P128ForcedCompiler::WholeAutomata, P128ForcedModel::Count),
@@ -145,6 +148,11 @@ const CONTRACTS: [P128ForcedCompilerContract; 7] = [
     P128ForcedCompilerContract::new(
         P128ForcedCompiler::CaptureStream,
         P128ForcedModel::GrepCaptures,
+    ),
+    P128ForcedCompilerContract::new(P128ForcedCompiler::HotBytePrograms, P128ForcedModel::Count),
+    P128ForcedCompilerContract::new(
+        P128ForcedCompiler::HotBytePrograms,
+        P128ForcedModel::SpanSum,
     ),
 ];
 
@@ -256,6 +264,10 @@ mod tests {
                     Some(P128ForcedModel::GrepCaptures),
                 ],
             ),
+            (
+                P128ForcedCompiler::HotBytePrograms,
+                [Some(P128ForcedModel::Count), Some(P128ForcedModel::SpanSum)],
+            ),
         ];
         for (compiler, models) in expected {
             for model in models.into_iter().flatten() {
@@ -267,7 +279,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(manifest.contracts().len(), 7);
+        assert_eq!(manifest.contracts().len(), 9);
     }
 
     #[test]

@@ -12,7 +12,10 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
-pub use fre_simd_kernels::SimdDispatchContext;
+pub use fre_simd_kernels::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiSelection,
+    DispatchPolicy, Feature, FeatureSet, SimdDispatchContext, UnsupportedRequiredFeatures,
+};
 
 mod anchored_line_capture;
 mod blocking_delimiter;

@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Component, Path, PathBuf},
@@ -54,25 +55,28 @@ use fre::{
     FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
     FixedPredicateWord64ReduceError, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
     GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
-    GraphemeScalarDfaReduceLimits, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
-    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
-    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
-    LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
-    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
-    LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
-    LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    GraphemeScalarDfaReduceLimits, HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
+    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
+    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LineCaptureBuildError, LineCaptureBuildLimits,
+    LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
+    LineCaptureRunLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
+    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
+    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
     LiteralClassRunLiteralReduceLimits, LiteralReplacementErrorSource, LiteralReplacementLimits,
     NoqaBuildError, NoqaBuildLimits, NoqaGrepCaptureBuilder, NoqaGrepCaptureRegex, NoqaRunError,
     NoqaRunLimits, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, PrefixClassUniformParticipationBuildLimits, RustProfile,
-    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OperationSession, OperationSessionLeaf,
+    OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
+    OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder,
+    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
+    PrefixClassUniformParticipationBuildLimits, RustProfile, SHEBANG_CAPTURE_PATTERN,
+    SHEBANG_INSPECTION_WORK, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
     SPACE_AROUND_OPERATOR_INSPECTION_WORK, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits,
@@ -1527,6 +1531,155 @@ pub fn current_fre_rebar_aggregate_compile_lifecycle(
         unicode,
         case_insensitive,
         haystack_len,
+    })
+}
+
+/// Stable plan label for the explicit planner-disabled hot-byte compiler.
+pub const CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN: &str = "hot-byte-programs-simd-v1";
+
+/// One explicitly requested fixed-byte-program artifact and its retained
+/// allocation-free operation session.
+#[derive(Debug)]
+pub struct CurrentFreHotByteOperationLifecycle {
+    model: p128_forced_registry::P128ForcedModel,
+    haystack_len: usize,
+    artifact: HotByteProgramArtifact,
+    session: RefCell<OperationSession>,
+    limits: HotByteRunLimits,
+}
+
+impl CurrentFreHotByteOperationLifecycle {
+    /// Exact Rebar model retained by this forced artifact.
+    #[must_use]
+    pub const fn model(&self) -> &'static str {
+        self.model.as_str()
+    }
+
+    /// Stable planner-disabled plan label.
+    #[must_use]
+    pub const fn plan(&self) -> &'static str {
+        CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN
+    }
+
+    /// Execute one complete public `Count` or `SpanSum` operation on the retained
+    /// artifact and session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an input-length mismatch, exact resource refusal,
+    /// receipt authentication failure, or reducer/value mismatch.
+    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "hot-byte operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let reducer = match self.model {
+            p128_forced_registry::P128ForcedModel::Count => OperationSessionReducer::Count,
+            p128_forced_registry::P128ForcedModel::SpanSum => OperationSessionReducer::SpanSum,
+            p128_forced_registry::P128ForcedModel::CountCaptures
+            | p128_forced_registry::P128ForcedModel::GrepCaptures => {
+                return Err(CompareError::new(
+                    "hot-byte lifecycle retained an unsupported reducer",
+                ));
+            }
+        };
+        let receipt = self
+            .artifact
+            .execute_with_limits(
+                &mut self.session.borrow_mut(),
+                haystack,
+                0..haystack.len(),
+                reducer,
+                self.limits,
+            )
+            .map_err(|error| CompareError::new(format!("FRE hot-byte lifecycle: {error}")))?;
+        if !receipt.closes() {
+            return Err(CompareError::new(
+                "FRE hot-byte lifecycle returned an unauthenticated receipt",
+            ));
+        }
+        match (self.model, receipt.value) {
+            (
+                p128_forced_registry::P128ForcedModel::Count,
+                Some(OperationSessionValue::Count(value)),
+            )
+            | (
+                p128_forced_registry::P128ForcedModel::SpanSum,
+                Some(OperationSessionValue::SpanSum(value)),
+            ) => Ok(value),
+            _ => Err(CompareError::new(
+                "FRE hot-byte lifecycle returned the wrong typed value",
+            )),
+        }
+    }
+}
+
+/// Build the one executable planner-disabled compiler selected by exact
+/// compiler ID. No benchmark identity, expected result, or source bytes enter
+/// this construction boundary.
+///
+/// # Errors
+///
+/// Returns an error for an unknown/mismatched compiler ID, a multi-pattern
+/// request, structural ineligibility, missing retained SIMD classifier, exact
+/// descriptor/session refusal, or checked limit derivation failure.
+pub fn current_fre_rebar_hot_byte_operation_lifecycle(
+    compiler_id: &str,
+    model: &str,
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreHotByteOperationLifecycle, CompareError> {
+    let model = p128_forced_registry::P128ForcedModel::parse(model)?;
+    let contract =
+        p128_forced_registry::P128ForcedCompilerManifest::load().resolve(compiler_id, model)?;
+    if contract.compiler() != p128_forced_registry::P128ForcedCompiler::HotBytePrograms {
+        return Err(CompareError::new(
+            "requested forced compiler has no hot-byte executable lifecycle",
+        ));
+    }
+    let [pattern] = patterns else {
+        return Err(CompareError::new(
+            "hot-byte forced lifecycle requires exactly one pattern",
+        ));
+    };
+    let mut profile = rebar_profile();
+    profile.options.unicode = unicode;
+    profile.options.case_insensitive = case_insensitive;
+    let artifact = HotByteProgramBuilder::new(pattern.clone())
+        .profile(profile)
+        .build()
+        .map_err(|error| CompareError::new(format!("FRE hot-byte lifecycle build: {error}")))?;
+    if artifact.build_receipt().actual().simd_classifiers == 0 {
+        return Err(CompareError::new(
+            "hot-byte forced lifecycle requires a retained SIMD classifier",
+        ));
+    }
+    let session = artifact
+        .new_session()
+        .map_err(|error| CompareError::new(format!("FRE hot-byte session build: {error:?}")))?;
+    let prospective = artifact
+        .prospective(0..haystack_len)
+        .map_err(|error| CompareError::new(format!("FRE hot-byte preflight: {error:?}")))?;
+    let reset = session
+        .reset_prospective(OperationSessionLeaf::Hot, 1)
+        .map_err(|error| CompareError::new(format!("FRE hot-byte reset preflight: {error:?}")))?;
+    let reset = OperationSessionResetLimits::exact(&reset)
+        .ok_or_else(|| CompareError::new("FRE hot-byte reset limit conversion overflow"))?;
+    let limits = HotByteRunLimits {
+        reset,
+        run: OperationSessionRunLimits::exact(prospective),
+    };
+    Ok(CurrentFreHotByteOperationLifecycle {
+        model,
+        haystack_len,
+        artifact,
+        session: RefCell::new(session),
+        limits,
     })
 }
 

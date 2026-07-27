@@ -21,12 +21,13 @@ use fre::{
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
-    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle, InputReceipt,
-    REPORT_SCHEMA, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
-    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_aggregate_run_limits, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_count_run_limits, current_fre_rebar_portable_builder,
+    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle,
+    CurrentFreHotByteOperationLifecycle, InputReceipt, REPORT_SCHEMA,
+    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
+    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
+    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_aggregate_run_limits,
+    current_fre_rebar_capture_lifecycle, current_fre_rebar_count_run_limits,
+    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
     current_fre_rebar_search_limits, current_fre_rebar_span_sum_run_limits,
     current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
@@ -126,12 +127,16 @@ fn main() -> Result<(), DynError> {
                 expectations.comparator =
                     Some(next_argument(&mut arguments, "--expect-comparator")?);
             }
+            "--forced-compiler" => {
+                expectations.forced_compiler =
+                    Some(next_argument(&mut arguments, "--forced-compiler")?);
+            }
             "--performance-raw" => {
                 expectations.performance_raw = true;
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
+                    "usage: fre_rebar_runner --expect-benchmark NAME --expect-model MODEL --expect-plan PLAN [--forced-compiler ID] [--expect-runtime ID] --expect-count N [capture: --expect-job-id ID --expect-contract-id ID --expect-canonical-sha OID --expect-canonical-tree OID --expect-semantic-receipts SHA256 --expect-boundary first-public-operation|steady-public-operation --expect-process-token SHA256] [aggregate all-model: --performance-raw plus the identity fields and --expect-comparator ID] | --version"
                         .into(),
                 );
             }
@@ -164,6 +169,11 @@ fn main() -> Result<(), DynError> {
         .ok_or("formal FRE timing requires --expect-count")?;
     require_optional("model", Some(expected_model), &benchmark.model)?;
     require_optional("benchmark", Some(expected_benchmark), &benchmark.name)?;
+    if expectations.forced_compiler.is_some()
+        && !matches!(benchmark.model.as_str(), "count" | "count-spans")
+    {
+        return Err("forced hot-byte compiler supports only count and count-spans".into());
+    }
     if expectations.performance_raw {
         require_performance_raw_metadata(&benchmark.model, &expectations)?;
         let observation = model_performance_raw(&benchmark, &expectations)?;
@@ -226,6 +236,7 @@ struct Expectations {
     boundary: Option<String>,
     process_token: Option<String>,
     comparator: Option<String>,
+    forced_compiler: Option<String>,
     performance_raw: bool,
 }
 
@@ -762,6 +773,9 @@ fn model_count(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if expectations.forced_compiler.is_some() {
+        return model_hot_byte_operation(benchmark, expectations);
+    }
     if benchmark.patterns.len() > 1 {
         return model_count_many(benchmark, expectations);
     }
@@ -810,6 +824,9 @@ fn model_count_spans(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<Vec<Sample>, DynError> {
+    if expectations.forced_compiler.is_some() {
+        return model_hot_byte_operation(benchmark, expectations);
+    }
     if benchmark.patterns.len() > 1 {
         return model_count_spans_many(benchmark, expectations);
     }
@@ -829,6 +846,30 @@ fn model_count_spans(
                 .span_sum_value(&benchmark.haystack, limits)
                 .map_err(Into::into)
         },
+        Ok,
+    )
+}
+
+fn model_hot_byte_operation(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+) -> Result<Vec<Sample>, DynError> {
+    let compiler_id = expectations
+        .forced_compiler
+        .as_deref()
+        .ok_or("hot-byte operation requires an explicit compiler ID")?;
+    let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
+        compiler_id,
+        &benchmark.model,
+        &benchmark.patterns,
+        benchmark.unicode,
+        benchmark.case_insensitive,
+        benchmark.haystack.len(),
+    )?;
+    require_optional("plan", expectations.plan.as_deref(), lifecycle.plan())?;
+    run(
+        benchmark,
+        || lifecycle.execute(&benchmark.haystack).map_err(Into::into),
         Ok,
     )
 }
@@ -858,6 +899,23 @@ fn model_performance_raw(
     benchmark: &Benchmark,
     expectations: &Expectations,
 ) -> Result<PerformanceRawObservation, DynError> {
+    if expectations.forced_compiler.is_some() {
+        return match benchmark.model.as_str() {
+            "count" | "count-spans" => model_hot_byte_operation_performance_raw_with_measurement(
+                benchmark,
+                expectations,
+                |lifecycle, haystack| {
+                    let start = Instant::now();
+                    let actual = lifecycle.execute(haystack)?;
+                    Ok((start.elapsed(), actual))
+                },
+            ),
+            model => Err(format!(
+                "forced hot-byte compiler rejects performance-raw model {model:?}"
+            )
+            .into()),
+        };
+    }
     match benchmark.model.as_str() {
         "compile" => {
             model_compile_performance_raw_with_measurement(benchmark, expectations, |lifecycle| {
@@ -895,6 +953,45 @@ fn model_performance_raw(
         ),
         model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
     }
+}
+
+fn model_hot_byte_operation_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(&CurrentFreHotByteOperationLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let compiler_id = expectations
+        .forced_compiler
+        .as_deref()
+        .ok_or("hot-byte performance lifecycle requires an explicit compiler ID")?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let lifecycle = current_fre_rebar_hot_byte_operation_lifecycle(
+            compiler_id,
+            &benchmark.model,
+            &benchmark.patterns,
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            benchmark.haystack.len(),
+        )?;
+        require_performance_plan(&expected_plan, lifecycle.plan())?;
+        if steady {
+            let primed = lifecycle.execute(&benchmark.haystack)?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "hot-byte lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
 }
 
 fn model_compile_performance_raw_with_measurement<F>(
@@ -1458,6 +1555,21 @@ mod tests {
         }
     }
 
+    fn hot_byte_benchmark(model: &str) -> Benchmark {
+        Benchmark {
+            name: format!("test/model/hot-byte/{model}"),
+            model: model.to_string(),
+            patterns: vec![r"[ab]{16}".to_string()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: vec![b'a'; 32],
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        }
+    }
+
     #[test]
     fn parses_arbitrary_haystack_and_delimiters_in_values() {
         let benchmark = Benchmark::parse(&valid_klv()).unwrap();
@@ -1741,6 +1853,117 @@ mod tests {
             .is_err()
         );
         assert!(!ran.get(), "wrong operation plan reached measurement");
+    }
+
+    #[test]
+    fn explicit_hot_byte_compiler_reaches_semantic_and_performance_raw_paths() {
+        let compiler_id = rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms
+            .id()
+            .to_string();
+        for (model, expected) in [("count", 2_u64), ("count-spans", 32_u64)] {
+            let benchmark = hot_byte_benchmark(model);
+            let semantic = Expectations {
+                plan: Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN.to_string()),
+                count: Some(expected),
+                forced_compiler: Some(compiler_id.clone()),
+                ..Expectations::default()
+            };
+            let samples = if model == "count" {
+                model_count(&benchmark, &semantic)
+            } else {
+                model_count_spans(&benchmark, &semantic)
+            }
+            .expect("forced semantic runner path");
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].count, expected);
+
+            let mut raw = performance_expectations(
+                "steady-public-operation",
+                rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN,
+                expected,
+            );
+            raw.forced_compiler = Some(compiler_id.clone());
+            let measured = std::cell::Cell::new(0_u8);
+            let observation = model_hot_byte_operation_performance_raw_with_measurement(
+                &benchmark,
+                &raw,
+                |lifecycle, haystack| {
+                    measured.set(measured.get() + 1);
+                    Ok((Duration::from_nanos(47), lifecycle.execute(haystack)?))
+                },
+            )
+            .expect("forced performance-raw runner path");
+            assert_eq!(measured.get(), 1);
+            assert_eq!(observation.priming_operations, 1);
+            assert_eq!(observation.elapsed_ns, 47);
+            assert_eq!(observation.actual, expected);
+            assert_eq!(
+                observation.candidate_plan.as_deref(),
+                Some(rebar_compare::CURRENT_FRE_HOT_BYTE_PROGRAM_PLAN)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_hot_byte_compiler_refuses_wrong_id_scope_and_missing_classifier_pre_source() {
+        let compiler_id =
+            rebar_compare::p128_forced_registry::P128ForcedCompiler::HotBytePrograms.id();
+        let pattern = vec![r"[ab]{16}".to_string()];
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                "fre.forced.unknown.v1",
+                "count",
+                &pattern,
+                false,
+                false,
+                32,
+            )
+            .is_err()
+        );
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                compiler_id,
+                "count",
+                &[r"[ab]+".to_string()],
+                false,
+                false,
+                32,
+            )
+            .is_err()
+        );
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                compiler_id,
+                "count",
+                &["abcdefghijklmnop".to_string()],
+                false,
+                false,
+                32,
+            )
+            .is_err()
+        );
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                compiler_id,
+                "count",
+                &pattern,
+                true,
+                false,
+                32,
+            )
+            .is_err()
+        );
+        assert!(
+            current_fre_rebar_hot_byte_operation_lifecycle(
+                compiler_id,
+                "count",
+                &[r"[ab]{16}".to_string(), r"[cd]{16}".to_string()],
+                false,
+                false,
+                32,
+            )
+            .is_err()
+        );
     }
 
     #[test]
