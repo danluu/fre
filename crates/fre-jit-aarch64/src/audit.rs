@@ -478,6 +478,13 @@ fn authenticate_search_manifest<'image>(
             {
                 return Err(AuditError::InvalidSearchManifest);
             }
+            if matches!(
+                manifest.backend_version,
+                BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+            ) && (manifest.anchors != AnchorFlags::default() || literal_len == 0)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
             let [symbol] = image.symbols.as_ref() else {
                 return Err(AuditError::InvalidSearchManifest);
             };
@@ -493,39 +500,7 @@ fn authenticate_search_manifest<'image>(
             rebuild_exact_search_identity(manifest.output, &image.rodata, manifest.anchors, limits)?
         }
         SearchShape::ClassSuffix => {
-            if !manifest.anchors.start && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
-                return Err(AuditError::InvalidSearchManifest);
-            }
-            let [class_symbol, suffix_symbol] = image.symbols.as_ref() else {
-                return Err(AuditError::InvalidSearchManifest);
-            };
-            let expected_rodata_len = 32_usize
-                .checked_add(literal_len)
-                .ok_or(AuditError::ArithmeticOverflow)?;
-            if class_symbol.ir_data_id != 0
-                || class_symbol.offset != 0
-                || class_symbol.length != 32
-                || class_symbol.alignment != 16
-                || class_symbol.kind != DataSymbolKind::ByteClass
-                || suffix_symbol.ir_data_id != 1
-                || suffix_symbol.offset != 32
-                || usize::try_from(suffix_symbol.length).ok() != Some(literal_len)
-                || suffix_symbol.alignment != 16
-                || suffix_symbol.kind != DataSymbolKind::Bytes
-                || image.rodata.len() != expected_rodata_len
-            {
-                return Err(AuditError::InvalidSearchManifest);
-            }
-            let class_bytes = image
-                .rodata
-                .get(..32)
-                .ok_or(AuditError::InvalidSearchManifest)?;
-            let suffix = image
-                .rodata
-                .get(32..)
-                .ok_or(AuditError::InvalidSearchManifest)?;
-            let class = decode_manifest_byte_class(class_bytes)?;
-            rebuild_class_search_identity(manifest.output, class, suffix, manifest.anchors, limits)?
+            authenticate_class_suffix_manifest(image, manifest, literal_len, limits)?
         }
     };
     if expected_identity != manifest.source_identity {
@@ -534,11 +509,87 @@ fn authenticate_search_manifest<'image>(
     authenticate_search_candidate_policy(image, manifest, literal_len)?;
     match manifest.shape {
         SearchShape::ExactLiteral => Ok(&image.rodata),
-        SearchShape::ClassSuffix => image
-            .rodata
-            .get(32..)
-            .ok_or(AuditError::InvalidSearchManifest),
+        SearchShape::ClassSuffix => authenticated_class_suffix_literal(image, literal_len),
     }
+}
+
+fn authenticate_class_suffix_manifest(
+    image: &NativeImage,
+    manifest: SearchManifest,
+    literal_len: usize,
+    limits: ValidateLimits,
+) -> Result<CacheIdentity, AuditError> {
+    if !manifest.anchors.start && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let suffix_end = 32_usize
+        .checked_add(literal_len)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    let class_bytes = image
+        .rodata
+        .get(..32)
+        .ok_or(AuditError::InvalidSearchManifest)?;
+    let suffix = authenticated_class_suffix_literal(image, literal_len)?;
+    let class = decode_manifest_byte_class(class_bytes)?;
+    let singleton = independent_singleton_class_byte(class_bytes).is_some();
+    let canonical_table = independent_sve2_fixed16_ascii_class_table(class_bytes);
+    let uses_sve2_table = manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+        && !singleton
+        && canonical_table.is_some();
+    let fixed16_admitted =
+        !manifest.anchors.start && literal_len != 0 && (singleton || uses_sve2_table);
+    if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+    ) && !fixed16_admitted
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+
+    let (class_symbol, suffix_symbol, table_symbol) = match image.symbols.as_ref() {
+        [class_symbol, suffix_symbol] if !uses_sve2_table => (class_symbol, suffix_symbol, None),
+        [class_symbol, suffix_symbol, table_symbol] if uses_sve2_table => {
+            (class_symbol, suffix_symbol, Some(table_symbol))
+        }
+        _ => return Err(AuditError::InvalidSearchManifest),
+    };
+    if class_symbol.ir_data_id != 0
+        || class_symbol.offset != 0
+        || class_symbol.length != 32
+        || class_symbol.alignment != 16
+        || class_symbol.kind != DataSymbolKind::ByteClass
+        || suffix_symbol.ir_data_id != 1
+        || suffix_symbol.offset != 32
+        || usize::try_from(suffix_symbol.length).ok() != Some(literal_len)
+        || suffix_symbol.alignment != 16
+        || suffix_symbol.kind != DataSymbolKind::Bytes
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    if let (Some(expected_table), Some(table_symbol)) = (canonical_table, table_symbol) {
+        let table_offset = independent_sve2_class_table_offset(literal_len)?;
+        let expected_rodata_len = table_offset
+            .checked_add(SVE2_CLASS_TABLE_BYTES)
+            .ok_or(AuditError::ArithmeticOverflow)?;
+        if table_symbol.ir_data_id != SVE2_CLASS_TABLE_DATA_ID
+            || usize::try_from(table_symbol.offset).ok() != Some(table_offset)
+            || usize::try_from(table_symbol.length).ok() != Some(SVE2_CLASS_TABLE_BYTES)
+            || table_symbol.alignment != 16
+            || table_symbol.kind != DataSymbolKind::Bytes
+            || image.rodata.len() != expected_rodata_len
+            || image
+                .rodata
+                .get(suffix_end..table_offset)
+                .is_none_or(|padding| padding.iter().any(|&byte| byte != 0))
+            || image.rodata.get(table_offset..expected_rodata_len)
+                != Some(expected_table.as_slice())
+        {
+            return Err(AuditError::InvalidSearchManifest);
+        }
+    } else if table_symbol.is_some() || image.rodata.len() != suffix_end {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    rebuild_class_search_identity(manifest.output, class, suffix, manifest.anchors, limits)
 }
 
 const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
@@ -549,6 +600,8 @@ const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
+const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
+const SVE2_CLASS_TABLE_BYTES: usize = 16;
 
 #[allow(
     clippy::too_many_lines,
@@ -561,10 +614,7 @@ fn authenticate_search_candidate_policy(
 ) -> Result<(), AuditError> {
     let literal = match manifest.shape {
         SearchShape::ExactLiteral => image.rodata.as_ref(),
-        SearchShape::ClassSuffix => image
-            .rodata
-            .get(32..)
-            .ok_or(AuditError::InvalidSearchManifest)?,
+        SearchShape::ClassSuffix => authenticated_class_suffix_literal(image, literal_len)?,
     };
     if literal.len() != literal_len {
         return Err(AuditError::InvalidSearchManifest);
@@ -616,7 +666,10 @@ fn authenticate_search_candidate_policy(
                 .rodata
                 .get(..32)
                 .ok_or(AuditError::InvalidSearchManifest)?;
-            independent_singleton_class_byte(class).map(|_| {
+            (independent_singleton_class_byte(class).is_some()
+                || (manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                    && independent_sve2_fixed16_ascii_class_table(class).is_some()))
+            .then(|| {
                 (
                     0,
                     (literal.len() > 1).then(|| {
@@ -723,6 +776,65 @@ fn independent_singleton_class_byte(class: &[u8]) -> Option<u8> {
         .find(|(_, byte)| *byte != 0)?;
     let bit = usize::try_from(byte.trailing_zeros()).ok()?;
     u8::try_from(index.checked_mul(8)?.checked_add(bit)?).ok()
+}
+
+pub(crate) fn independent_sve2_fixed16_ascii_class_table(
+    class: &[u8],
+) -> Option<[u8; SVE2_CLASS_TABLE_BYTES]> {
+    if class.len() != 32 || class[16..].iter().any(|&byte| byte != 0) {
+        return None;
+    }
+    let member_count = class[..16].iter().try_fold(0_usize, |total, byte| {
+        total.checked_add(usize::try_from(byte.count_ones()).ok()?)
+    })?;
+    if !(2..=SVE2_CLASS_TABLE_BYTES).contains(&member_count) {
+        return None;
+    }
+    let mut members = [0_u8; SVE2_CLASS_TABLE_BYTES];
+    let mut member_index = 0_usize;
+    for value in 0_u8..=127 {
+        let byte = class.get(usize::from(value / 8))?;
+        if byte & (1_u8 << u32::from(value % 8)) != 0 {
+            members[member_index] = value;
+            member_index = member_index.checked_add(1)?;
+        }
+    }
+    if member_index != member_count {
+        return None;
+    }
+    // Independently reproduce the emitter's ascending, cyclic table. Every
+    // lane is a real member, including when NUL is not in the source class.
+    let mut table = [0_u8; SVE2_CLASS_TABLE_BYTES];
+    for (byte, member) in table
+        .iter_mut()
+        .zip(members[..member_count].iter().copied().cycle())
+    {
+        *byte = member;
+    }
+    Some(table)
+}
+
+pub(crate) fn independent_sve2_class_table_offset(literal_len: usize) -> Result<usize, AuditError> {
+    let unaligned = 32_usize
+        .checked_add(literal_len)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    unaligned
+        .checked_add(SVE2_CLASS_TABLE_BYTES - 1)
+        .map(|value| value & !(SVE2_CLASS_TABLE_BYTES - 1))
+        .ok_or(AuditError::ArithmeticOverflow)
+}
+
+fn authenticated_class_suffix_literal(
+    image: &NativeImage,
+    literal_len: usize,
+) -> Result<&[u8], AuditError> {
+    let end = 32_usize
+        .checked_add(literal_len)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    image
+        .rodata
+        .get(32..end)
+        .ok_or(AuditError::InvalidSearchManifest)
 }
 
 fn independent_exact_candidate_pair(literal: &[u8]) -> (u16, Option<u16>) {

@@ -38,6 +38,8 @@ const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
+const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
+const SVE2_CLASS_TABLE_BYTES: usize = 16;
 
 /// Largest confirmation payload admitted when a search can confirm at more
 /// than one candidate position.
@@ -60,7 +62,8 @@ pub enum SearchBackendPolicy {
     AsimdV7,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
-    /// SVE2 `MATCH` screening with exactly sixteen active byte lanes.
+    /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
+    /// including canonical ASCII classes with at most sixteen members.
     Sve2Fixed16,
 }
 
@@ -163,8 +166,9 @@ pub fn emit_sve16<O: Operation>(
 /// Emit the opt-in SVE2 backend with exactly sixteen active byte lanes.
 ///
 /// Candidate comparison uses the SVE2-only `MATCH` instruction, so the image
-/// carries an explicit SVE2 feature requirement. Shape admission is identical
-/// to [`emit_sve16`].
+/// carries an explicit SVE2 feature requirement. In addition to the shapes
+/// admitted by [`emit_sve16`], this admits non-start-anchored class suffixes
+/// whose canonical ASCII class contains two through sixteen members.
 pub fn emit_sve2_16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
@@ -223,7 +227,7 @@ fn emit_search_version<O: Operation>(
     if matches!(
         backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
-    ) && !plan.is_fixed16_policy_shape()
+    ) && !plan.is_fixed16_policy_shape(backend_version)
     {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::KernelShape,
@@ -249,8 +253,15 @@ fn emit_search_version<O: Operation>(
         scratch,
         limits.max_scratch_bytes,
     )?;
+    let sve2_class_table = match plan {
+        Plan::ClassSuffix { class, .. } if backend_version == BackendVersion::SEARCH_SVE2_16_V1 => {
+            sve2_fixed16_ascii_class_table(class)
+        }
+        _ => None,
+    };
     let data = build_rodata(
         program.raw().data.as_slice(),
+        sve2_class_table,
         limits.max_data_bytes,
         &mut meter,
     )?;
@@ -690,9 +701,20 @@ fn emit_plan(
         } => {
             assembler.adr(X8, data.symbol_offset(0)?)?;
             assembler.adr(X7, data.symbol_offset(1)?)?;
-            if let Some(class_byte) = (!anchors.start).then(|| singleton_byte(class)).flatten() {
-                emit_singleton_class_suffix_first(
-                    assembler, class_byte, suffix, manifest, found, none,
+            let suffix_first_class = (!anchors.start)
+                .then(|| suffix_first_class(class, backend_version))
+                .flatten();
+            if let Some(suffix_first_class) = suffix_first_class {
+                if suffix_first_class == SuffixFirstClass::Sve2Table {
+                    assembler.adr(X16, data.symbol_offset(SVE2_CLASS_TABLE_DATA_ID)?)?;
+                }
+                emit_suffix_first_class(
+                    assembler,
+                    suffix_first_class,
+                    suffix,
+                    manifest,
+                    found,
+                    none,
                 )
             } else {
                 emit_class_suffix(assembler, class, suffix, anchors, found, none)
@@ -813,7 +835,7 @@ mod v7_policy_scan_admission {
 use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
-    fn is_fixed16_policy_shape(self) -> bool {
+    fn is_fixed16_policy_shape(self, backend_version: BackendVersion) -> bool {
         match self {
             Self::Exact {
                 literal: [_, ..],
@@ -827,7 +849,11 @@ impl<'a> Plan<'a> {
                 class,
                 suffix: [_, ..],
                 anchors: AnchorFlags { start: false, .. },
-            } => singleton_byte(class).is_some(),
+            } => {
+                singleton_byte(class).is_some()
+                    || (backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                        && sve2_fixed16_ascii_class_table(class).is_some())
+            }
             _ => false,
         }
     }
@@ -1025,7 +1051,9 @@ impl<'a> Plan<'a> {
                 }
                 let candidate_policy = (!anchors.start
                     && !suffix.is_empty()
-                    && singleton_byte(class).is_some())
+                    && (singleton_byte(class).is_some()
+                        || (backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                            && sve2_fixed16_ascii_class_table(class).is_some())))
                 .then(|| CandidateOffsets {
                     primary: 0,
                     secondary: (suffix.len() > 1).then(|| {
@@ -2498,15 +2526,34 @@ fn emit_class_suffix(
     }
 }
 
-/// Emit a suffix-first search for the mechanically admitted singleton-class
-/// family proved in `research/jit/bakeoff/class-suffix-theorem.md`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuffixFirstClass {
+    Singleton(u8),
+    Sve2Table,
+}
+
+fn suffix_first_class(
+    class: ByteClass,
+    backend_version: BackendVersion,
+) -> Option<SuffixFirstClass> {
+    singleton_byte(class)
+        .map(SuffixFirstClass::Singleton)
+        .or_else(|| {
+            (backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                && sve2_fixed16_ascii_class_table(class).is_some())
+            .then_some(SuffixFirstClass::Sve2Table)
+        })
+}
+
+/// Emit a suffix-first search for the mechanically admitted class family
+/// proved in `research/jit/bakeoff/class-suffix-theorem.md`.
 #[allow(
     clippy::too_many_lines,
     reason = "keeping the complete monotonic candidate and backward-confirmation CFG together makes its range proof auditable"
 )]
-fn emit_singleton_class_suffix_first(
+fn emit_suffix_first_class(
     assembler: &mut Assembler,
-    class_byte: u8,
+    class: SuffixFirstClass,
     suffix: &[u8],
     manifest: SearchManifest,
     found: Label,
@@ -2517,7 +2564,9 @@ fn emit_singleton_class_suffix_first(
     debug_assert!(!anchors.start);
     debug_assert!(!suffix.is_empty());
     debug_assert!(suffix.len() <= MAX_REPEATED_CONFIRM_BYTES);
-    debug_assert_ne!(suffix[0], class_byte);
+    if let SuffixFirstClass::Singleton(class_byte) = class {
+        debug_assert_ne!(suffix[0], class_byte);
+    }
 
     let suffix_length = u64::try_from(suffix.len()).map_err(|_| EmitError::ArithmeticOverflow {
         site: ArithmeticSite::DataOffset,
@@ -2544,6 +2593,10 @@ fn emit_singleton_class_suffix_first(
         backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
     );
+    if class == SuffixFirstClass::Sve2Table && backend_version != BackendVersion::SEARCH_SVE2_16_V1
+    {
+        return Err(EmitError::InternalInvariant);
+    }
     assembler.mov_imm64(X12, suffix_length)?;
     // A match needs at least one class byte followed by the complete suffix.
     assembler.sub_reg(X10, X3, X2)?;
@@ -2563,9 +2616,17 @@ fn emit_singleton_class_suffix_first(
             assembler.load_byte(X11, X7, last_offset)?;
             assembler.sve_duplicate_byte(3, X11)?;
         }
-        assembler.mov_imm64(X11, u64::from(class_byte))?;
-        assembler.sve_duplicate_byte(5, X11)?;
+        match class {
+            SuffixFirstClass::Singleton(class_byte) => {
+                assembler.mov_imm64(X11, u64::from(class_byte))?;
+                assembler.sve_duplicate_byte(5, X11)?;
+            }
+            SuffixFirstClass::Sve2Table => assembler.sve_load_bytes(5, 0, X16)?,
+        }
     } else {
+        let SuffixFirstClass::Singleton(class_byte) = class else {
+            return Err(EmitError::InternalInvariant);
+        };
         // v4/v5 retain the suffix pair across full confirmation in v0/v1.
         // v6 retains the class byte for the backward vector scan.
         assembler.load_byte(X11, X7, 0)?;
@@ -2696,12 +2757,20 @@ fn emit_singleton_class_suffix_first(
     }
     // X5 starts at window_start + 1, so this predecessor is in-range.
     assembler.sub_imm(X10, X5, 1)?;
-    assembler.load_byte_reg(X15, X9, X10)?;
-    assembler.mov_imm64(X11, u64::from(class_byte))?;
-    assembler.cmp_reg32(X15, X11)?;
-    assembler.branch_cond(Condition::NotEqual, candidate_reject)?;
+    match class {
+        SuffixFirstClass::Singleton(class_byte) => {
+            assembler.load_byte_reg(X15, X9, X10)?;
+            assembler.mov_imm64(X11, u64::from(class_byte))?;
+            assembler.cmp_reg32(X15, X11)?;
+            assembler.branch_cond(Condition::NotEqual, candidate_reject)?;
+        }
+        SuffixFirstClass::Sve2Table => {
+            assembler.load_byte_reg(X10, X9, X10)?;
+            emit_class_membership(assembler, candidate_reject)?;
+        }
+    }
 
-    // Scan the maximal singleton-class run backward. Every vector load covers
+    // Scan the maximal admitted-class run backward. Every vector load covers
     // [X13-16, X13), admitted only when at least 16 window bytes remain.
     assembler.mov_reg(X13, X5)?;
     assembler.bind(backward_vector)?;
@@ -2733,11 +2802,21 @@ fn emit_singleton_class_suffix_first(
     assembler.bind(backward_scalar)?;
     assembler.cmp_reg64(X13, X2)?;
     assembler.branch_cond(Condition::Equal, backward_done)?;
-    assembler.sub_imm(X10, X13, 1)?;
-    assembler.load_byte_reg(X15, X9, X10)?;
-    assembler.cmp_reg32(X15, X11)?;
-    assembler.branch_cond(Condition::NotEqual, backward_done)?;
-    assembler.mov_reg(X13, X10)?;
+    match class {
+        SuffixFirstClass::Singleton(_) => {
+            assembler.sub_imm(X10, X13, 1)?;
+            assembler.load_byte_reg(X15, X9, X10)?;
+            assembler.cmp_reg32(X15, X11)?;
+            assembler.branch_cond(Condition::NotEqual, backward_done)?;
+            assembler.mov_reg(X13, X10)?;
+        }
+        SuffixFirstClass::Sve2Table => {
+            assembler.sub_imm(X6, X13, 1)?;
+            assembler.load_byte_reg(X10, X9, X6)?;
+            emit_class_membership(assembler, backward_done)?;
+            assembler.mov_reg(X13, X6)?;
+        }
+    }
     assembler.branch(backward_scalar)?;
     assembler.bind(backward_done)?;
     assembler.branch(found)?;
@@ -2765,6 +2844,41 @@ pub(crate) fn singleton_byte(class: ByteClass) -> Option<u8> {
         return u8::try_from(base.checked_add(bit)?).ok();
     }
     None
+}
+
+fn sve2_fixed16_ascii_class_table(class: ByteClass) -> Option<[u8; SVE2_CLASS_TABLE_BYTES]> {
+    let lanes = class.lanes();
+    if lanes[2] != 0 || lanes[3] != 0 {
+        return None;
+    }
+    let member_count = lanes[..2].iter().try_fold(0_usize, |total, lane| {
+        total.checked_add(usize::try_from(lane.count_ones()).ok()?)
+    })?;
+    if !(2..=SVE2_CLASS_TABLE_BYTES).contains(&member_count) {
+        return None;
+    }
+    let mut members = [0_u8; SVE2_CLASS_TABLE_BYTES];
+    let mut member_index = 0_usize;
+    for (word_index, mut word) in lanes[..2].iter().copied().enumerate() {
+        while word != 0 {
+            let bit = usize::try_from(word.trailing_zeros()).ok()?;
+            members[member_index] =
+                u8::try_from(word_index.checked_mul(64)?.checked_add(bit)?).ok()?;
+            member_index = member_index.checked_add(1)?;
+            word &= word.checked_sub(1)?;
+        }
+    }
+    debug_assert_eq!(member_index, member_count);
+    // MATCH compares against every byte in its 128-bit segment. Repeat the
+    // ascending canonical members so no padding byte becomes a false member.
+    let mut table = [0_u8; SVE2_CLASS_TABLE_BYTES];
+    for (byte, member) in table
+        .iter_mut()
+        .zip(members[..member_count].iter().copied().cycle())
+    {
+        *byte = member;
+    }
+    Some(table)
 }
 
 fn emit_class_membership(assembler: &mut Assembler, not_member: Label) -> Result<(), EmitError> {
@@ -2949,6 +3063,7 @@ fn build_literal_rodata(
 
 fn build_rodata(
     blobs: &[DataBlob],
+    sve2_class_table: Option<[u8; SVE2_CLASS_TABLE_BYTES]>,
     max_bytes: u64,
     meter: &mut WorkMeter,
 ) -> Result<Rodata, EmitError> {
@@ -2962,6 +3077,15 @@ fn build_rodata(
                     site: ArithmeticSite::DataOffset,
                 })?;
     }
+    if sve2_class_table.is_some() {
+        required = align_up(required, DATA_ALIGNMENT, ArithmeticSite::DataOffset)?;
+        required =
+            required
+                .checked_add(SVE2_CLASS_TABLE_BYTES)
+                .ok_or(EmitError::ArithmeticOverflow {
+                    site: ArithmeticSite::DataOffset,
+                })?;
+    }
     enforce(ResourceKind::DataBytes, required, max_bytes)?;
     let mut bytes = Vec::new();
     bytes
@@ -2970,8 +3094,14 @@ fn build_rodata(
             resource: ResourceKind::DataBytes,
         })?;
     let mut symbols = Vec::new();
+    let symbol_count = blobs
+        .len()
+        .checked_add(usize::from(sve2_class_table.is_some()))
+        .ok_or(EmitError::ArithmeticOverflow {
+            site: ArithmeticSite::DataOffset,
+        })?;
     symbols
-        .try_reserve_exact(blobs.len())
+        .try_reserve_exact(symbol_count)
         .map_err(|_| EmitError::AllocationFailed {
             resource: ResourceKind::DataBytes,
         })?;
@@ -3001,6 +3131,22 @@ fn build_rodata(
             length: to_u32(length, ArithmeticSite::DataOffset)?,
             alignment: u8::try_from(DATA_ALIGNMENT).expect("small constant"),
             kind,
+        });
+    }
+    if let Some(table) = sve2_class_table {
+        while bytes.len() % DATA_ALIGNMENT != 0 {
+            meter.charge(1)?;
+            bytes.push(0);
+        }
+        let offset = to_u32(bytes.len(), ArithmeticSite::DataOffset)?;
+        meter.charge(u64::try_from(SVE2_CLASS_TABLE_BYTES).expect("small constant"))?;
+        bytes.extend_from_slice(&table);
+        symbols.push(DataSymbol {
+            ir_data_id: SVE2_CLASS_TABLE_DATA_ID,
+            offset,
+            length: u32::try_from(SVE2_CLASS_TABLE_BYTES).expect("small constant"),
+            alignment: u8::try_from(DATA_ALIGNMENT).expect("small constant"),
+            kind: DataSymbolKind::Bytes,
         });
     }
     debug_assert_eq!(bytes.len(), required);

@@ -201,53 +201,72 @@ fn fixed_16_sve_class_suffix_native_execution_matches_v7() {
         return;
     }
     let _lock = native_test_lock();
-    for suffix_len in [1_usize, 16, 32] {
-        let suffix: Vec<u8> = (0..suffix_len)
-            .map(|index| ALPHABET[index % ALPHABET.len()])
+    for member_count in [1_usize, 2, 5, 16] {
+        let members: Vec<u8> = (0..member_count)
+            .map(|index| b'A' + u8::try_from(index).expect("small native class"))
             .collect();
-        for anchors in [
-            AnchorFlags::default(),
-            AnchorFlags {
-                start: false,
-                end: true,
-            },
-        ] {
-            let program = build_class_suffix::<Span>(
-                ByteClass::from_bytes(b"a"),
-                &suffix,
-                anchors,
-                ValidateLimits::default(),
-            )
-            .expect("native class-suffix program");
-            let images = [
-                SearchBackendPolicy::AsimdV7,
-                SearchBackendPolicy::Sve16,
-                SearchBackendPolicy::Sve2Fixed16,
-            ]
-            .map(|policy| {
-                emit_with_backend(&program, policy, EmitLimits::default())
-                    .expect("native class-suffix image")
-            });
-            let kernels = images.each_ref().map(|image| {
-                publish::<Span>(image, PublicationLimits::default())
-                    .expect("native class-suffix publication")
-            });
+        for suffix_len in [1_usize, 16, 32] {
+            let suffix: Vec<u8> = (0..suffix_len)
+                .map(|index| ALPHABET[index % ALPHABET.len()])
+                .collect();
+            for anchors in [
+                AnchorFlags::default(),
+                AnchorFlags {
+                    start: false,
+                    end: true,
+                },
+            ] {
+                let program = build_class_suffix::<Span>(
+                    ByteClass::from_bytes(&members),
+                    &suffix,
+                    anchors,
+                    ValidateLimits::default(),
+                )
+                .expect("native class-suffix program");
+                let policies: &[SearchBackendPolicy] = if member_count == 1 {
+                    &[
+                        SearchBackendPolicy::AsimdV7,
+                        SearchBackendPolicy::Sve16,
+                        SearchBackendPolicy::Sve2Fixed16,
+                    ]
+                } else {
+                    &[
+                        SearchBackendPolicy::AsimdV7,
+                        SearchBackendPolicy::Sve2Fixed16,
+                    ]
+                };
+                let images: Vec<_> = policies
+                    .iter()
+                    .copied()
+                    .map(|policy| {
+                        emit_with_backend(&program, policy, EmitLimits::default())
+                            .expect("native class-suffix image")
+                    })
+                    .collect();
+                let kernels: Vec<_> = images
+                    .iter()
+                    .map(|image| {
+                        publish::<Span>(image, PublicationLimits::default())
+                            .expect("native class-suffix publication")
+                    })
+                    .collect();
 
-            for alignment in [0_usize, 1, 15] {
-                for run_len in [1_usize, 17, 33] {
-                    let mut haystack = vec![b'x'; alignment];
-                    haystack.extend(std::iter::repeat_n(b'a', run_len));
-                    haystack.extend_from_slice(&suffix);
-                    if !anchors.end {
-                        haystack.extend_from_slice(b"tail");
-                    }
-                    let window = SearchWindow::new(alignment, haystack.len());
-                    let expected = program
-                        .execute(&haystack, window, ExecutionLimits::unlimited())
-                        .expect("class-suffix oracle")
-                        .into_output();
-                    for kernel in &kernels {
-                        assert_eq!(kernel.search(&haystack, window), Ok(expected));
+                for alignment in [0_usize, 1, 15] {
+                    for run_len in [1_usize, 17, 33] {
+                        let mut haystack = vec![b'x'; alignment];
+                        haystack.extend((0..run_len).map(|index| members[index % member_count]));
+                        haystack.extend_from_slice(&suffix);
+                        if !anchors.end {
+                            haystack.extend_from_slice(b"tail");
+                        }
+                        let window = SearchWindow::new(alignment, haystack.len());
+                        let expected = program
+                            .execute(&haystack, window, ExecutionLimits::unlimited())
+                            .expect("class-suffix oracle")
+                            .into_output();
+                        for kernel in &kernels {
+                            assert_eq!(kernel.search(&haystack, window), Ok(expected));
+                        }
                     }
                 }
             }
@@ -317,53 +336,70 @@ fn fixed_16_sve_class_suffix_qualification_receipt() {
 
     let _lock = native_test_lock();
     println!(
-        "fre_sve16_class_suffix_receipt,backend,suffix_bytes,code_bytes,rodata_bytes,feature_bits,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
+        "fre_sve16_class_suffix_receipt,backend,class_members,suffix_bytes,code_bytes,rodata_bytes,feature_bits,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
     );
-    for suffix_len in [1_usize, 3, 16, 32] {
-        let suffix: Vec<u8> = (0..suffix_len)
-            .map(|index| ALPHABET[index % ALPHABET.len()])
+    for member_count in [1_usize, 2, 4, 8, 16] {
+        let members: Vec<u8> = (0..member_count)
+            .map(|index| b'A' + u8::try_from(index).expect("small benchmark class"))
             .collect();
-        let program = build_class_suffix::<Span>(
-            ByteClass::from_bytes(b"a"),
-            &suffix,
-            AnchorFlags::default(),
-            ValidateLimits::default(),
-        )
-        .expect("benchmark class-suffix program");
-        let images = [
-            ("asimd_v7", SearchBackendPolicy::AsimdV7),
-            ("sve16", SearchBackendPolicy::Sve16),
-            ("sve2_16", SearchBackendPolicy::Sve2Fixed16),
-        ];
-        let mut haystack = vec![b'x'; HAYSTACK_BYTES];
-        let expected_start = HAYSTACK_BYTES
-            .checked_sub(suffix_len)
-            .and_then(|value| value.checked_sub(CLASS_RUN_BYTES))
-            .expect("bounded benchmark dimensions");
-        haystack[expected_start..expected_start + CLASS_RUN_BYTES].fill(b'a');
-        haystack[expected_start + CLASS_RUN_BYTES..].copy_from_slice(&suffix);
+        for suffix_len in [1_usize, 3, 16, 32] {
+            let suffix: Vec<u8> = (0..suffix_len)
+                .map(|index| ALPHABET[index % ALPHABET.len()])
+                .collect();
+            let program = build_class_suffix::<Span>(
+                ByteClass::from_bytes(&members),
+                &suffix,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("benchmark class-suffix program");
+            let images: &[(&str, SearchBackendPolicy)] = if member_count == 1 {
+                &[
+                    ("asimd_v7", SearchBackendPolicy::AsimdV7),
+                    ("sve16", SearchBackendPolicy::Sve16),
+                    ("sve2_16", SearchBackendPolicy::Sve2Fixed16),
+                ]
+            } else {
+                &[
+                    ("asimd_v7", SearchBackendPolicy::AsimdV7),
+                    ("sve2_16", SearchBackendPolicy::Sve2Fixed16),
+                ]
+            };
+            let mut haystack = vec![b'x'; HAYSTACK_BYTES];
+            let expected_start = HAYSTACK_BYTES
+                .checked_sub(suffix_len)
+                .and_then(|value| value.checked_sub(CLASS_RUN_BYTES))
+                .expect("bounded benchmark dimensions");
+            for (index, byte) in haystack[expected_start..expected_start + CLASS_RUN_BYTES]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = members[index % member_count];
+            }
+            haystack[expected_start + CLASS_RUN_BYTES..].copy_from_slice(&suffix);
 
-        for (backend, policy) in images {
-            let image = emit_with_backend(&program, policy, EmitLimits::default())
-                .expect("benchmark image");
-            let kernel = publish::<Span>(&image, PublicationLimits::default())
-                .expect("host must advertise every benchmark backend");
-            let found = kernel
-                .search(&haystack, SearchWindow::new(0, haystack.len()))
-                .expect("benchmark correctness call")
-                .expect("benchmark match");
-            assert_eq!(found.start(), expected_start);
-            assert_eq!(found.end(), HAYSTACK_BYTES);
+            for &(backend, policy) in images {
+                let image = emit_with_backend(&program, policy, EmitLimits::default())
+                    .expect("benchmark image");
+                let kernel = publish::<Span>(&image, PublicationLimits::default())
+                    .expect("host must advertise every benchmark backend");
+                let found = kernel
+                    .search(&haystack, SearchWindow::new(0, haystack.len()))
+                    .expect("benchmark correctness call")
+                    .expect("benchmark match");
+                assert_eq!(found.start(), expected_start);
+                assert_eq!(found.end(), HAYSTACK_BYTES);
 
-            let (asimd, sve, sve2) = instruction_mix(&image);
-            let (elapsed_ns, checksum) = measure(&kernel, &haystack, ITERATIONS);
-            println!(
-                "fre_sve16_class_suffix_receipt,{backend},{suffix_len},{},{},{},{asimd},{sve},{sve2},{ITERATIONS},{HAYSTACK_BYTES},{elapsed_ns},{checksum},{}",
-                image.code().len(),
-                image.rodata().len(),
-                image.target().features.bits(),
-                kernel.identity()
-            );
+                let (asimd, sve, sve2) = instruction_mix(&image);
+                let (elapsed_ns, checksum) = measure(&kernel, &haystack, ITERATIONS);
+                println!(
+                    "fre_sve16_class_suffix_receipt,{backend},{member_count},{suffix_len},{},{},{},{asimd},{sve},{sve2},{ITERATIONS},{HAYSTACK_BYTES},{elapsed_ns},{checksum},{}",
+                    image.code().len(),
+                    image.rodata().len(),
+                    image.target().features.bits(),
+                    kernel.identity()
+                );
+            }
         }
     }
 }

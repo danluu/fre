@@ -3167,8 +3167,8 @@ fn sve16_singleton_class_suffix_matches_v7_and_the_oracle() {
 }
 
 #[test]
-fn sve16_class_suffix_refuses_unqualified_shapes() {
-    let multi = build_class_suffix::<Span>(
+fn fixed16_class_suffix_refuses_unqualified_shapes() {
+    let admitted_sve2_multi = build_class_suffix::<Span>(
         ByteClass::from_bytes(b"ac"),
         b"suffix",
         AnchorFlags::default(),
@@ -3185,7 +3185,40 @@ fn sve16_class_suffix_refuses_unqualified_shapes() {
         ValidateLimits::default(),
     )
     .expect("start-anchored class program");
-    for program in [&multi, &anchored] {
+    let too_wide_members: Vec<u8> = (0..17).map(|index| b'A' + index).collect();
+    let too_wide = build_class_suffix::<Span>(
+        ByteClass::from_bytes(&too_wide_members),
+        b"suffix",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("too-wide ASCII class program");
+    let non_ascii = build_class_suffix::<Span>(
+        ByteClass::from_bytes(&[b'A', 0x80]),
+        b"suffix",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("non-ASCII class program");
+
+    assert_eq!(
+        emit_with_backend(
+            &admitted_sve2_multi,
+            SearchBackendPolicy::Sve16,
+            EmitLimits::default()
+        ),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape
+        })
+    );
+    emit_with_backend(
+        &admitted_sve2_multi,
+        SearchBackendPolicy::Sve2Fixed16,
+        EmitLimits::default(),
+    )
+    .expect("SVE2 admits a canonical two-member ASCII class");
+
+    for program in [&anchored, &too_wide, &non_ascii] {
         for policy in [SearchBackendPolicy::Sve16, SearchBackendPolicy::Sve2Fixed16] {
             assert_eq!(
                 emit_with_backend(program, policy, EmitLimits::default()),
@@ -3195,6 +3228,262 @@ fn sve16_class_suffix_refuses_unqualified_shapes() {
             );
         }
     }
+
+    for (program, backend) in [
+        (&admitted_sve2_multi, BackendVersion::SEARCH_SVE16_V1),
+        (&too_wide, BackendVersion::SEARCH_SVE2_16_V1),
+        (&non_ascii, BackendVersion::SEARCH_SVE2_16_V1),
+    ] {
+        let mut relabeled =
+            emit_with_backend(program, SearchBackendPolicy::AsimdV7, EmitLimits::default())
+                .expect("V7 refusal seed");
+        relabeled.backend_version = backend;
+        relabeled
+            .search
+            .as_mut()
+            .expect("sealed refusal seed")
+            .backend_version = backend;
+        reseal_test_image(&mut relabeled);
+        assert_eq!(audit(&relabeled), Err(AuditError::InvalidSearchManifest));
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the SVE2 table matrix keeps canonical rodata, decoded operands, and oracle equivalence in one reviewable qualification"
+)]
+fn sve2_fixed16_ascii_class_tables_match_v7_and_the_oracle() {
+    const SUFFIX_ALPHABET: &[u8] = b"bcdefghijklmnopqrstuvwxyz012345";
+
+    let mut comparisons = 0_u64;
+    for member_count in [2_usize, 3, 8, 16] {
+        let canonical_members: Vec<u8> = if member_count == 2 {
+            vec![0, 0x7f]
+        } else {
+            (0..member_count)
+                .map(|index| b'A' + u8::try_from(index).expect("small class"))
+                .collect()
+        };
+        let mut constructor_members: Vec<u8> = canonical_members.iter().copied().rev().collect();
+        constructor_members.push(canonical_members[0]);
+        let class = ByteClass::from_bytes(&constructor_members);
+        let expected_table: [u8; 16] =
+            core::array::from_fn(|index| canonical_members[index % member_count]);
+
+        for suffix_len in [1_usize, 2, 16, 32] {
+            let suffix: Vec<u8> = (0..suffix_len)
+                .map(|index| SUFFIX_ALPHABET[index % SUFFIX_ALPHABET.len()])
+                .collect();
+            for anchors in [
+                AnchorFlags::default(),
+                AnchorFlags {
+                    start: false,
+                    end: true,
+                },
+            ] {
+                let program =
+                    build_class_suffix::<Span>(class, &suffix, anchors, ValidateLimits::default())
+                        .expect("ASCII class-suffix program");
+                let v7 = emit_with_backend(
+                    &program,
+                    SearchBackendPolicy::AsimdV7,
+                    EmitLimits::default(),
+                )
+                .expect("V7 ASCII class image");
+                let sve2 = emit_with_backend(
+                    &program,
+                    SearchBackendPolicy::Sve2Fixed16,
+                    EmitLimits::default(),
+                )
+                .expect("SVE2 ASCII class image");
+                audit(&v7).expect("V7 class image audits");
+                audit(&sve2).expect("SVE2 class image audits");
+
+                assert_eq!(v7.symbols.len(), 2);
+                assert_eq!(v7.rodata.len(), 32 + suffix_len);
+                let table_offset = (32 + suffix_len + 15) & !15;
+                assert_eq!(sve2.symbols.len(), 3);
+                assert_eq!(
+                    sve2.symbols[2],
+                    DataSymbol {
+                        ir_data_id: 2,
+                        offset: u32::try_from(table_offset).expect("small table offset"),
+                        length: 16,
+                        alignment: 16,
+                        kind: DataSymbolKind::Bytes,
+                    }
+                );
+                assert_eq!(
+                    sve2.rodata.get(table_offset..table_offset + 16),
+                    Some(expected_table.as_slice())
+                );
+                assert!(
+                    sve2.rodata[32 + suffix_len..table_offset]
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+                let manifest = sve2.search_manifest().expect("SVE2 class manifest");
+                assert_eq!(manifest.shape, SearchShape::ClassSuffix);
+                assert_eq!(manifest.candidate_policy_version, 6);
+                assert_eq!(
+                    sve2.target().features.contains(CpuFeatures::ASIMD),
+                    suffix_len >= 16
+                );
+                assert!(sve2.target().features.contains(CpuFeatures::SVE));
+                assert!(sve2.target().features.contains(CpuFeatures::SVE2));
+                let decoded = decode(sve2.code()).expect("SVE2 table image decodes");
+                assert!(decoded.iter().any(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstruction::SveLoadBytes {
+                            destination: 5,
+                            predicate: 0,
+                            base: 16
+                        }
+                    )
+                }));
+                assert!(decoded.iter().any(|instruction| {
+                    matches!(
+                        instruction,
+                        DecodedInstruction::Sve2MatchBytes {
+                            destination: 1,
+                            predicate: 0,
+                            left: 4,
+                            right: 5
+                        }
+                    )
+                }));
+
+                let mut immediate = vec![canonical_members[0]];
+                immediate.extend_from_slice(&suffix);
+                let mut long_run: Vec<u8> = (0..47)
+                    .map(|index| canonical_members[index % member_count])
+                    .collect();
+                long_run.extend_from_slice(&suffix);
+                let mut offset_run = vec![b'!'; 19];
+                offset_run
+                    .extend((0..33).map(|index| canonical_members[(index + 1) % member_count]));
+                offset_run.extend_from_slice(&suffix);
+                offset_run.extend_from_slice(b"tail");
+                let mut false_candidates = vec![b'!'; 96];
+                for offset in (3..false_candidates.len()).step_by(11) {
+                    false_candidates[offset] = suffix[0];
+                }
+                let haystacks = [
+                    Vec::new(),
+                    suffix.clone(),
+                    immediate,
+                    long_run,
+                    offset_run,
+                    false_candidates,
+                ];
+                for haystack in &haystacks {
+                    for window in [
+                        SearchWindow::new(0, haystack.len()),
+                        SearchWindow::new(haystack.len().min(1), haystack.len()),
+                        SearchWindow::new(0, haystack.len().saturating_sub(1)),
+                    ] {
+                        let expected = program
+                            .execute(haystack, window, ExecutionLimits::unlimited())
+                            .expect("ASCII class oracle")
+                            .output()
+                            .map(|span| (span.start(), span.end()));
+                        for image in [&v7, &sve2] {
+                            let actual = simulate(image, haystack, window.start(), window.end())
+                                .expect("ASCII class ISA model");
+                            assert_eq!(
+                                span_output(actual),
+                                expected,
+                                "backend={:?} members={member_count} suffix_len={suffix_len} anchors={anchors:?} haystack_len={} window={}..{}",
+                                image.backend_version(),
+                                haystack.len(),
+                                window.start(),
+                                window.end()
+                            );
+                            comparisons = comparisons.checked_add(1).expect("bounded matrix");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_152);
+
+    let mutation_program = build_class_suffix::<Span>(
+        ByteClass::from_bytes(b"CA"),
+        b"suffix",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("table mutation program");
+    let canonical =
+        emit_sve2_16(&mutation_program, EmitLimits::default()).expect("canonical table image");
+    let table_offset = usize::try_from(canonical.symbols[2].offset).expect("table offset");
+    let exact_data_bytes = u64::try_from(canonical.rodata.len()).expect("bounded table image");
+    emit_sve2_16(
+        &mutation_program,
+        EmitLimits {
+            max_data_bytes: exact_data_bytes,
+            ..EmitLimits::default()
+        },
+    )
+    .expect("exact derived-table data boundary");
+    assert!(matches!(
+        emit_sve2_16(
+            &mutation_program,
+            EmitLimits {
+                max_data_bytes: exact_data_bytes - 1,
+                ..EmitLimits::default()
+            }
+        ),
+        Err(EmitError::ResourceLimit {
+            resource: ResourceKind::DataBytes,
+            ..
+        })
+    ));
+
+    let mut table_mutation = canonical.clone();
+    table_mutation.rodata[table_offset] ^= 1;
+    reseal_test_image(&mut table_mutation);
+    assert_eq!(
+        audit(&table_mutation),
+        Err(AuditError::InvalidSearchManifest)
+    );
+
+    let mut padding_mutation = canonical.clone();
+    padding_mutation.rodata[38] = 1;
+    reseal_test_image(&mut padding_mutation);
+    assert_eq!(
+        audit(&padding_mutation),
+        Err(AuditError::InvalidSearchManifest)
+    );
+
+    let decoded = decode(canonical.code()).expect("canonical table decode");
+    let table_load = decoded
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SveLoadBytes {
+                    destination: 5,
+                    predicate: 0,
+                    base: 16
+                }
+            )
+        })
+        .expect("table load");
+    let mut load_operand_mutation = canonical;
+    replace_test_decoded_at(
+        &mut load_operand_mutation,
+        table_load,
+        DecodedInstruction::SveLoadBytes {
+            destination: 5,
+            predicate: 0,
+            base: 15,
+        },
+    );
+    assert_resealed_search_rejected(load_operand_mutation, "SVE2 class-table load base mutation");
 }
 
 #[test]

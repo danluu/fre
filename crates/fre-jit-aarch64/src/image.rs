@@ -225,7 +225,8 @@ pub(crate) struct SearchManifest {
     pub(crate) output: OutputKind,
     pub(crate) anchors: AnchorFlags,
     pub(crate) source_identity: CacheIdentity,
-    /// Exact-literal bytes, or suffix bytes for `ClassSuffix`.
+    /// Exact-literal bytes, or suffix bytes for `ClassSuffix`. A backend may
+    /// append independently derived, authenticated auxiliary rodata.
     pub(crate) literal_bytes: u32,
     /// Version of the deterministic candidate-selection policy, or zero when
     /// the authenticated shape has no vector candidate selector.

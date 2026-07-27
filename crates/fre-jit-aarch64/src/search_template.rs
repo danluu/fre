@@ -3,6 +3,7 @@ use fre_kernel_ir::{AnchorFlags, OutputKind};
 use crate::{
     AuditError, BackendVersion, Condition, DecodedInstruction, LabelKind, NativeImage,
     RelocationTarget,
+    audit::{independent_sve2_class_table_offset, independent_sve2_fixed16_ascii_class_table},
     image::{SearchManifest, SearchShape},
 };
 
@@ -582,14 +583,26 @@ pub(crate) fn validate_search_whole_template(
                 .rodata()
                 .get(..32)
                 .ok_or(AuditError::InvalidSearchManifest)?;
-            if !manifest.anchors.start
-                && independent_singleton_class_byte(class).is_some()
-                && !literal.is_empty()
+            let suffix_first_class = if manifest.anchors.start || literal.is_empty() {
+                None
+            } else if let Some(class_byte) = independent_singleton_class_byte(class) {
+                Some(SuffixFirstClass::Singleton(class_byte))
+            } else if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                && independent_sve2_fixed16_ascii_class_table(class).is_some()
             {
-                emit_singleton_class_suffix_first(
+                let table_offset = independent_sve2_class_table_offset(literal.len())?;
+                template.address(
+                    16,
+                    u32::try_from(table_offset).map_err(|_| AuditError::ArithmeticOverflow)?,
+                );
+                Some(SuffixFirstClass::Sve2Table)
+            } else {
+                None
+            };
+            if let Some(suffix_first_class) = suffix_first_class {
+                emit_suffix_first_class(
                     &mut template,
-                    independent_singleton_class_byte(class)
-                        .ok_or(AuditError::InvalidSearchManifest)?,
+                    suffix_first_class,
                     literal,
                     manifest,
                     found,
@@ -1893,13 +1906,19 @@ fn emit_class_membership(template: &mut Template, not_member: Label) {
     template.compare_branch_zero(15, false, not_member);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuffixFirstClass {
+    Singleton(u8),
+    Sve2Table,
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "the complete singleton suffix-first control-flow template is reviewed as one unit"
+    reason = "the complete suffix-first class control-flow template is reviewed as one unit"
 )]
-fn emit_singleton_class_suffix_first(
+fn emit_suffix_first_class(
     template: &mut Template,
-    class_byte: u8,
+    class: SuffixFirstClass,
     suffix: &[u8],
     manifest: SearchManifest,
     found: Label,
@@ -1922,6 +1941,11 @@ fn emit_singleton_class_suffix_first(
         manifest.backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
     );
+    if class == SuffixFirstClass::Sve2Table
+        && manifest.backend_version != BackendVersion::SEARCH_SVE2_16_V1
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
     template.mov_imm64(12, suffix_length);
     template.sub_reg(10, 3, 2);
     template.cmp_reg64(10, 12);
@@ -1936,9 +1960,17 @@ fn emit_singleton_class_suffix_first(
             template.load_byte(11, 7, last_offset);
             template.sve_duplicate_byte(3, 11);
         }
-        template.mov_imm64(11, u64::from(class_byte));
-        template.sve_duplicate_byte(5, 11);
+        match class {
+            SuffixFirstClass::Singleton(class_byte) => {
+                template.mov_imm64(11, u64::from(class_byte));
+                template.sve_duplicate_byte(5, 11);
+            }
+            SuffixFirstClass::Sve2Table => template.sve_load_bytes(5, 0, 16),
+        }
     } else {
+        let SuffixFirstClass::Singleton(class_byte) = class else {
+            return Err(AuditError::InvalidSearchManifest);
+        };
         template.load_byte(11, 7, 0);
         template.dup_byte16(4, 11);
         if suffix.len() > 1 {
@@ -2048,10 +2080,18 @@ fn emit_singleton_class_suffix_first(
         template.branch_cond(Condition::NotEqual, candidate_reject);
     }
     template.sub_imm(10, 5, 1);
-    template.load_byte_reg(15, 9, 10);
-    template.mov_imm64(11, u64::from(class_byte));
-    template.cmp_reg32(15, 11);
-    template.branch_cond(Condition::NotEqual, candidate_reject);
+    match class {
+        SuffixFirstClass::Singleton(class_byte) => {
+            template.load_byte_reg(15, 9, 10);
+            template.mov_imm64(11, u64::from(class_byte));
+            template.cmp_reg32(15, 11);
+            template.branch_cond(Condition::NotEqual, candidate_reject);
+        }
+        SuffixFirstClass::Sve2Table => {
+            template.load_byte_reg(10, 9, 10);
+            emit_class_membership(template, candidate_reject);
+        }
+    }
     template.mov_reg(13, 5);
 
     template.bind(backward_vector)?;
@@ -2083,11 +2123,21 @@ fn emit_singleton_class_suffix_first(
     template.bind(backward_scalar)?;
     template.cmp_reg64(13, 2);
     template.branch_cond(Condition::Equal, backward_done);
-    template.sub_imm(10, 13, 1);
-    template.load_byte_reg(15, 9, 10);
-    template.cmp_reg32(15, 11);
-    template.branch_cond(Condition::NotEqual, backward_done);
-    template.mov_reg(13, 10);
+    match class {
+        SuffixFirstClass::Singleton(_) => {
+            template.sub_imm(10, 13, 1);
+            template.load_byte_reg(15, 9, 10);
+            template.cmp_reg32(15, 11);
+            template.branch_cond(Condition::NotEqual, backward_done);
+            template.mov_reg(13, 10);
+        }
+        SuffixFirstClass::Sve2Table => {
+            template.sub_imm(6, 13, 1);
+            template.load_byte_reg(10, 9, 6);
+            emit_class_membership(template, backward_done);
+            template.mov_reg(13, 6);
+        }
+    }
     template.branch(backward_scalar);
     template.bind(backward_done)?;
     template.branch(found);
