@@ -8,6 +8,32 @@ variant-selection contract. `fre-simd-kernels` owns safe, compiled kernel
 handles whose private `#[target_feature]` leaves cannot be called without a
 successful selection.
 
+Target-specific deployments may replace runtime detection with a compiler
+specialized snapshot. Build every crate with the same target flags and enable
+the top-level `static-dispatch` Cargo feature; `fre-target-features::host()`
+then uses only compiler-set `cfg(target_feature)` facts. The
+`static-dispatch-arm-41-d84` feature declares the Arm implementer and part used
+by the qualified Neoverse V3 preference rules. It requires little-endian Linux
+AArch64 with compiler-enabled NEON, SVE, and SVE2. Cargo rejects misspelled or
+unsupported profile names instead of silently producing a generic build.
+
+Static ISA and declared tuning remain separate evidence. Tuning never adds a
+feature, SME remains excluded, and generic static profiles map only features
+currently consumed by qualified kernel tables: NEON/SVE/SVE2 on AArch64 and
+all stable compiler-exposed members of the current feature vocabulary. Stateful
+SME remains excluded. Because Rust's runtime feature macros short-circuit for
+compiler-enabled features, they cannot verify such a binary independently.
+Use a separately baseline-compiled deployment gate to prevent launching a
+target-specific executable on incompatible hardware; it may execute target
+instructions before `main`.
+
+For performance comparisons, pass target flags globally (for example through
+`CARGO_ENCODED_RUSTFLAGS`) so dependency crates see the same features. Runtime
+and static candidates must use identical `-C target-cpu`/`-C target-feature`
+flags; only the FRE static-dispatch cfg may differ. Do not prewarm dispatch in
+the benchmark runner: cold-process measurements include initialization that
+the public operation actually performs.
+
 Instruction safety and performance tuning are separate:
 
 - a variant lists every ISA feature required to enter it;

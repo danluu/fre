@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+static-dispatch = []
+static-dispatch-arm-41-d84 = ["static-dispatch"]
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 libc = "=0.2.186"
 

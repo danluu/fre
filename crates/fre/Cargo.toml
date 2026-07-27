@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+static-dispatch = ["fre-kernels/static-dispatch"]
+static-dispatch-arm-41-d84 = [
+    "static-dispatch",
+    "fre-kernels/static-dispatch-arm-41-d84",
+]
+
 [dependencies]
 fre-aggregate = { path = "../fre-aggregate" }
 fre-automata = { path = "../fre-automata" }

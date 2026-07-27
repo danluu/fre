@@ -277,7 +277,8 @@ pub use fre_kernels::{
 };
 pub use fre_kernels::{
     AsciiSelection as SimdAsciiSelection, DispatchPolicy as SimdDispatchPolicy,
-    Feature as SimdFeature, FeatureSet as SimdFeatureSet, SimdDispatchContext,
+    DispatchProfile as SimdDispatchProfile, Feature as SimdFeature, FeatureSet as SimdFeatureSet,
+    SimdDispatchContext, dispatch_profile as simd_dispatch_profile,
 };
 pub use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,

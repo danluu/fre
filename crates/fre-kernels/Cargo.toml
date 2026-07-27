@@ -7,6 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+static-dispatch = ["fre-simd-kernels/static-dispatch"]
+static-dispatch-arm-41-d84 = [
+    "static-dispatch",
+    "fre-simd-kernels/static-dispatch-arm-41-d84",
+]
+
 [dependencies]
 aho-corasick = "=1.1.4"
 fre-exact-alloc = { path = "../fre-exact-alloc" }

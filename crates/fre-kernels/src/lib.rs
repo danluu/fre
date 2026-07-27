@@ -15,8 +15,8 @@ use memchr::memmem::{Finder, FinderBuilder};
 pub use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
     AsciiByteSetRunScanner, AsciiSelection, AsciiWordSpaceClassifier, AsciiWordSpaceMasks16,
-    AsciiWordSpaceMasks32, DispatchPolicy, Feature, FeatureSet, SelectionReceipt,
-    SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures,
+    AsciiWordSpaceMasks32, DispatchPolicy, DispatchProfile, Feature, FeatureSet, SelectionReceipt,
+    SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures, dispatch_profile,
 };
 
 mod anchored_line_capture;

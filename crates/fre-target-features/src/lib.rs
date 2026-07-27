@@ -1,23 +1,86 @@
-//! Runtime CPU capability facts and reusable kernel-variant selection.
+//! CPU capability facts and reusable kernel-variant selection.
 //!
-//! FRE builds portable binaries and selects an already-qualified kernel
-//! implementation once, outside its hot loop. Hardware/OS facts are kept
-//! separate from performance policy: seeing AVX-512, SVE2 or SME2 does not
-//! imply that every operation should use it. Each operation publishes an
-//! ordered table of variants with exact feature requirements and thresholds.
+//! FRE builds portable binaries by default and selects an already-qualified
+//! kernel implementation once, outside its hot loop. Target-specific
+//! deployments can instead enable `static-dispatch`; in that profile,
+//! the compiler's `cfg(target_feature)` facts become the immutable snapshot and
+//! no runtime feature detector is entered by [`host`].
 //!
-//! The process-wide snapshot is immutable. Test and benchmark policies can
-//! remove host features or require a feature to be present, but can never add
-//! a feature that the host did not report as usable.
+//! Hardware/OS facts are kept separate from performance policy: seeing
+//! AVX-512, SVE2 or SME2 does not imply that every operation should use it.
+//! Each operation publishes an ordered table of variants with exact feature
+//! requirements and thresholds. The process-wide snapshot is immutable. Test
+//! and benchmark policies can remove features or require a feature to be
+//! present, but can never add a feature that the snapshot did not report as
+//! usable.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use core::fmt;
+#[cfg(not(feature = "static-dispatch"))]
 use std::sync::OnceLock;
 
 /// Version of the feature vocabulary and variant-selection contract.
-pub const DISPATCH_POLICY_VERSION: u16 = 1;
+pub const DISPATCH_POLICY_VERSION: u16 = 2;
+
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    feature = "static-dispatch-arm-41-d84"
+))]
+compile_error!("static-dispatch-arm-41-d84 requires static-dispatch");
+
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))
+))]
+compile_error!("static-dispatch-arm-41-d84 requires little-endian Linux AArch64");
+
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    not(all(
+        target_feature = "neon",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))
+))]
+compile_error!("static-dispatch-arm-41-d84 requires compiler-enabled neon, sve, and sve2");
+
+/// Source of the process-wide SIMD capability snapshot.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum DispatchProfile {
+    /// Portable binary using OS-aware runtime feature detection.
+    RuntimeDetected,
+    /// Target-specific binary using compiler-enabled target features.
+    CompileTimeTarget,
+    /// Target-specific Arm `0x41`/`0xd84` binary with declared tuning.
+    CompileTimeArm41D84,
+}
+
+impl DispatchProfile {
+    /// Stable profile name for build and benchmark identity.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RuntimeDetected => "runtime-detected",
+            Self::CompileTimeTarget => "compile-time-target",
+            Self::CompileTimeArm41D84 => "compile-time-arm-41-d84",
+        }
+    }
+}
+
+/// Return the dispatch profile compiled into this crate.
+#[must_use]
+pub const fn dispatch_profile() -> DispatchProfile {
+    if cfg!(feature = "static-dispatch-arm-41-d84") {
+        DispatchProfile::CompileTimeArm41D84
+    } else if cfg!(feature = "static-dispatch") {
+        DispatchProfile::CompileTimeTarget
+    } else {
+        DispatchProfile::RuntimeDetected
+    }
+}
 
 /// CPU architecture relevant to native kernel selection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -381,6 +444,8 @@ impl Evidence {
     pub const APPLE_SYSCTL: Self = Self(2);
     pub const X86_CPUID: Self = Self(4);
     pub const LINUX_CPUINFO: Self = Self(8);
+    pub const COMPILE_TIME: Self = Self(16);
+    pub const DECLARED_TUNING: Self = Self(32);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
@@ -464,14 +529,237 @@ impl CpuCapabilities {
     }
 }
 
+#[cfg(not(feature = "static-dispatch"))]
 static HOST_CAPABILITIES: OnceLock<CpuCapabilities> = OnceLock::new();
 
-/// Return the once-detected process-wide CPU capability snapshot.
+#[cfg(feature = "static-dispatch")]
+static HOST_CAPABILITIES: CpuCapabilities = compile_time_capabilities();
+
+/// Return the immutable process-wide CPU capability snapshot.
+///
+/// Portable builds initialize this once using OS-aware runtime detection.
+/// Builds made with `static-dispatch` return a constant snapshot
+/// derived from compiler-enabled target features.
 #[must_use]
+#[cfg(not(feature = "static-dispatch"))]
 pub fn host() -> &'static CpuCapabilities {
     HOST_CAPABILITIES.get_or_init(detect_host)
 }
 
+/// Return the compiler-specialized CPU capability snapshot.
+#[must_use]
+#[cfg(feature = "static-dispatch")]
+pub const fn host() -> &'static CpuCapabilities {
+    &HOST_CAPABILITIES
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn compile_time_capabilities() -> CpuCapabilities {
+    let features = compile_time_features();
+    let evidence = if cfg!(feature = "static-dispatch-arm-41-d84") {
+        Evidence::COMPILE_TIME.union(Evidence::DECLARED_TUNING)
+    } else {
+        Evidence::COMPILE_TIME
+    };
+    CpuCapabilities {
+        architecture: Architecture::host(),
+        reported: features,
+        usable: features,
+        tuning: compile_time_tuning(),
+        evidence,
+    }
+}
+
+#[cfg(feature = "static-dispatch")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping each compiler cfg adjacent to its public feature prevents mapping drift"
+)]
+const fn compile_time_features() -> FeatureSet {
+    let mut features = FeatureSet::EMPTY;
+    if cfg!(all(target_arch = "aarch64", target_feature = "neon")) {
+        features = features.with(Feature::ArmNeon);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
+        features = features.with(Feature::ArmAes);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sha2")) {
+        features = features.with(Feature::ArmSha2);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sha3")) {
+        features = features.with(Feature::ArmSha3);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "crc")) {
+        features = features.with(Feature::ArmCrc);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "fp16")) {
+        features = features.with(Feature::ArmFp16);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "fhm")) {
+        features = features.with(Feature::ArmFhm);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "rdm")) {
+        features = features.with(Feature::ArmRdm);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "dotprod")) {
+        features = features.with(Feature::ArmDotprod);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "fcma")) {
+        features = features.with(Feature::ArmFcma);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "bf16")) {
+        features = features.with(Feature::ArmBf16);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "i8mm")) {
+        features = features.with(Feature::ArmI8mm);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sve")) {
+        features = features.with(Feature::ArmSve);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sve2")) {
+        features = features.with(Feature::ArmSve2);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sve2-aes")) {
+        features = features.with(Feature::ArmSve2Aes);
+    }
+    if cfg!(all(
+        target_arch = "aarch64",
+        target_feature = "sve2-bitperm"
+    )) {
+        features = features.with(Feature::ArmSve2Bitperm);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sve2-sha3")) {
+        features = features.with(Feature::ArmSve2Sha3);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sve2-sm4")) {
+        features = features.with(Feature::ArmSve2Sm4);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "sm4")) {
+        features = features.with(Feature::ArmSm4);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "f32mm")) {
+        features = features.with(Feature::ArmF32mm);
+    }
+    if cfg!(all(target_arch = "aarch64", target_feature = "f64mm")) {
+        features = features.with(Feature::ArmF64mm);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse2")) {
+        features = features.with(Feature::X86Sse2);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse3")) {
+        features = features.with(Feature::X86Sse3);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "ssse3")) {
+        features = features.with(Feature::X86Ssse3);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse4.1")) {
+        features = features.with(Feature::X86Sse41);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "sse4.2")) {
+        features = features.with(Feature::X86Sse42);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "popcnt")) {
+        features = features.with(Feature::X86Popcnt);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "pclmulqdq")) {
+        features = features.with(Feature::X86Pclmulqdq);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "aes")) {
+        features = features.with(Feature::X86Aes);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx")) {
+        features = features.with(Feature::X86Avx);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+        features = features.with(Feature::X86Avx2);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "fma")) {
+        features = features.with(Feature::X86Fma);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "bmi1")) {
+        features = features.with(Feature::X86Bmi1);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "bmi2")) {
+        features = features.with(Feature::X86Bmi2);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "lzcnt")) {
+        features = features.with(Feature::X86Lzcnt);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512f")) {
+        features = features.with(Feature::X86Avx512F);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512bw")) {
+        features = features.with(Feature::X86Avx512Bw);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512vl")) {
+        features = features.with(Feature::X86Avx512Vl);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512dq")) {
+        features = features.with(Feature::X86Avx512Dq);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512cd")) {
+        features = features.with(Feature::X86Avx512Cd);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512vbmi")) {
+        features = features.with(Feature::X86Avx512Vbmi);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512vbmi2")) {
+        features = features.with(Feature::X86Avx512Vbmi2);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512vnni")) {
+        features = features.with(Feature::X86Avx512Vnni);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx512bitalg")) {
+        features = features.with(Feature::X86Avx512Bitalg);
+    }
+    if cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx512vpopcntdq"
+    )) {
+        features = features.with(Feature::X86Avx512Vpopcntdq);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "gfni")) {
+        features = features.with(Feature::X86Gfni);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "vaes")) {
+        features = features.with(Feature::X86Vaes);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "vpclmulqdq")) {
+        features = features.with(Feature::X86Vpclmulqdq);
+    }
+    if cfg!(all(target_arch = "x86_64", target_feature = "avxvnni")) {
+        features = features.with(Feature::X86AvxVnni);
+    }
+    features
+}
+
+#[cfg(feature = "static-dispatch")]
+const fn compile_time_tuning() -> TuningClass {
+    if cfg!(feature = "static-dispatch-arm-41-d84") {
+        TuningClass::ArmServer {
+            cpu: Some(ArmCpuIdentity {
+                implementer: 0x41,
+                part: 0x0d84,
+                variant: None,
+                revision: None,
+            }),
+        }
+    } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        TuningClass::AppleSilicon { cpu_family: None }
+    } else if cfg!(target_arch = "aarch64") {
+        TuningClass::ArmServer { cpu: None }
+    } else if cfg!(target_arch = "x86_64") {
+        TuningClass::X86 {
+            vendor: X86Vendor::Unknown,
+            family: 0,
+            model: 0,
+        }
+    } else {
+        TuningClass::Generic
+    }
+}
+
+#[cfg(not(feature = "static-dispatch"))]
 fn detect_host() -> CpuCapabilities {
     match Architecture::host() {
         Architecture::Aarch64 => detect_aarch64(),
@@ -486,7 +774,7 @@ fn detect_host() -> CpuCapabilities {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "aarch64"))]
 fn detect_aarch64() -> CpuCapabilities {
     let reported = detect_aarch64_std();
     let mut evidence = Evidence::STD_ARCH;
@@ -537,12 +825,12 @@ fn detect_aarch64() -> CpuCapabilities {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(feature = "static-dispatch"), not(target_arch = "aarch64")))]
 fn detect_aarch64() -> CpuCapabilities {
     unreachable!("architecture dispatch only calls the matching detector")
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "aarch64"))]
 #[allow(
     clippy::too_many_lines,
     reason = "keeping each stable std feature spelling adjacent to its FRE feature prevents mapping drift"
@@ -621,7 +909,7 @@ fn detect_aarch64_std() -> FeatureSet {
     features
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
 #[allow(
     clippy::too_many_lines,
     reason = "keeping each std feature spelling adjacent to its FRE feature prevents mapping drift"
@@ -722,12 +1010,12 @@ fn detect_x86_64() -> CpuCapabilities {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(feature = "static-dispatch"), not(target_arch = "x86_64")))]
 fn detect_x86_64() -> CpuCapabilities {
     unreachable!("architecture dispatch only calls the matching detector")
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
 #[allow(
     unsafe_code,
     reason = "CPUID leaf 0/1 are architecture-defined, side-effect-free tuning queries; instruction safety still comes from std feature detection"
@@ -998,7 +1286,14 @@ pub fn select_kernel<F: Copy>(
     }))
 }
 
-#[cfg(any(all(target_arch = "aarch64", target_os = "linux"), test))]
+#[cfg(any(
+    all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "linux"
+    ),
+    test
+))]
 mod linux_aarch64 {
     use std::io::{ErrorKind, Read};
 
@@ -1197,7 +1492,11 @@ mod linux_aarch64 {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "static-dispatch"),
+    target_os = "macos",
+    target_arch = "aarch64"
+))]
 mod macos {
     use core::{ffi::CStr, mem::size_of};
 
@@ -1349,6 +1648,124 @@ mod tests {
             assert!(!feature.name().is_empty());
         }
         assert_eq!(seen.iter().count(), Feature::ALL.len());
+    }
+
+    #[test]
+    fn dispatch_profile_matches_snapshot_evidence() {
+        match dispatch_profile() {
+            DispatchProfile::RuntimeDetected => {
+                assert!(!host().evidence().contains(Evidence::COMPILE_TIME));
+                assert!(!host().evidence().contains(Evidence::DECLARED_TUNING));
+            }
+            DispatchProfile::CompileTimeTarget => {
+                assert!(host().evidence().contains(Evidence::COMPILE_TIME));
+                assert!(!host().evidence().contains(Evidence::DECLARED_TUNING));
+            }
+            DispatchProfile::CompileTimeArm41D84 => {
+                assert!(host().evidence().contains(Evidence::COMPILE_TIME));
+                assert!(host().evidence().contains(Evidence::DECLARED_TUNING));
+            }
+        }
+    }
+
+    #[cfg(feature = "static-dispatch")]
+    #[test]
+    fn static_snapshot_contains_exactly_the_mapped_target_features() {
+        let expected = compile_time_features();
+        assert_eq!(host().reported(), expected);
+        assert_eq!(host().usable(), expected);
+        macro_rules! assert_target_feature {
+            ($feature:expr, $enabled:expr) => {
+                assert_eq!(
+                    host().usable().contains($feature),
+                    $enabled,
+                    "{}",
+                    $feature.name()
+                );
+            };
+        }
+        assert_target_feature!(
+            Feature::ArmNeon,
+            cfg!(all(target_arch = "aarch64", target_feature = "neon"))
+        );
+        assert_target_feature!(
+            Feature::ArmAes,
+            cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+        );
+        assert_target_feature!(
+            Feature::ArmSve,
+            cfg!(all(target_arch = "aarch64", target_feature = "sve"))
+        );
+        assert_target_feature!(
+            Feature::ArmSve2,
+            cfg!(all(target_arch = "aarch64", target_feature = "sve2"))
+        );
+        assert_target_feature!(
+            Feature::ArmSve2Aes,
+            cfg!(all(target_arch = "aarch64", target_feature = "sve2-aes"))
+        );
+        assert_target_feature!(
+            Feature::ArmF64mm,
+            cfg!(all(target_arch = "aarch64", target_feature = "f64mm"))
+        );
+        assert_target_feature!(
+            Feature::X86Sse2,
+            cfg!(all(target_arch = "x86_64", target_feature = "sse2"))
+        );
+        assert_target_feature!(
+            Feature::X86Ssse3,
+            cfg!(all(target_arch = "x86_64", target_feature = "ssse3"))
+        );
+        assert_target_feature!(
+            Feature::X86Avx2,
+            cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        );
+        assert_target_feature!(
+            Feature::X86Fma,
+            cfg!(all(target_arch = "x86_64", target_feature = "fma"))
+        );
+        assert_target_feature!(
+            Feature::X86Bmi2,
+            cfg!(all(target_arch = "x86_64", target_feature = "bmi2"))
+        );
+        assert_target_feature!(
+            Feature::X86Avx512F,
+            cfg!(all(target_arch = "x86_64", target_feature = "avx512f"))
+        );
+        assert_target_feature!(
+            Feature::X86Avx512Bw,
+            cfg!(all(target_arch = "x86_64", target_feature = "avx512bw"))
+        );
+        assert_target_feature!(
+            Feature::X86Avx512Vl,
+            cfg!(all(target_arch = "x86_64", target_feature = "avx512vl"))
+        );
+        assert!(!host().usable().contains(Feature::ArmSme));
+        assert!(!host().usable().contains(Feature::ArmSme2));
+    }
+
+    #[cfg(feature = "static-dispatch-arm-41-d84")]
+    #[test]
+    fn static_arm_41_d84_profile_has_separate_isa_and_tuning_evidence() {
+        let required = FeatureSet::EMPTY
+            .with(Feature::ArmNeon)
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2);
+        assert!(host().usable().contains_all(required));
+        assert!(matches!(
+            host().tuning(),
+            TuningClass::ArmServer {
+                cpu: Some(ArmCpuIdentity {
+                    implementer: 0x41,
+                    part: 0x0d84,
+                    ..
+                })
+            }
+        ));
+        assert!(host().evidence().contains(Evidence::COMPILE_TIME));
+        assert!(host().evidence().contains(Evidence::DECLARED_TUNING));
+        assert!(!host().evidence().contains(Evidence::STD_ARCH));
+        assert!(!host().evidence().contains(Evidence::LINUX_CPUINFO));
     }
 
     #[test]
@@ -1753,7 +2170,11 @@ CPU revision\t: 1\n";
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[cfg(all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "macos"
+    ))]
     #[test]
     fn apple_stateful_sme_is_visible_but_not_selectable() {
         let reported_sme = host().reported().contains(Feature::ArmSme);

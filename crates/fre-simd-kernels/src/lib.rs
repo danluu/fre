@@ -18,8 +18,8 @@ use fre_target_features::{
     select_kernel,
 };
 pub use fre_target_features::{
-    CpuCapabilities, DispatchPolicy, Feature, FeatureSet, SelectionReceipt, TuningClass,
-    UnsupportedRequiredFeatures,
+    CpuCapabilities, DispatchPolicy, DispatchProfile, Feature, FeatureSet, SelectionReceipt,
+    TuningClass, UnsupportedRequiredFeatures, dispatch_profile,
 };
 
 #[cfg(target_arch = "aarch64")]
