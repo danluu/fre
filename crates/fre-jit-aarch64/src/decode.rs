@@ -33,7 +33,7 @@ impl Condition {
     }
 }
 
-/// Independently decoded instruction admitted by the v1 backend policy.
+/// Independently decoded instruction admitted by the current backend policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodedInstruction {
     MoveRegister64 {
@@ -85,6 +85,11 @@ pub enum DecodedInstruction {
         destination: u8,
         source: u8,
         immediate: u16,
+    },
+    AndRegister64 {
+        destination: u8,
+        left: u8,
+        right: u8,
     },
     AndLowBits64 {
         destination: u8,
@@ -140,6 +145,10 @@ pub enum DecodedInstruction {
         left: u8,
         right: u8,
     },
+    ShiftRightNarrowHalfwordsToBytes8 {
+        destination: u8,
+        source: u8,
+    },
     UnsignedMinBytes16 {
         destination: u8,
         source: u8,
@@ -147,6 +156,11 @@ pub enum DecodedInstruction {
     UnsignedMaxBytes16 {
         destination: u8,
         source: u8,
+    },
+    UnsignedMaxPairwiseBytes16 {
+        destination: u8,
+        left: u8,
+        right: u8,
     },
     AddAcrossBytes16 {
         destination: u8,
@@ -156,10 +170,22 @@ pub enum DecodedInstruction {
         destination: u8,
         source: u8,
     },
+    MoveVectorDoubleTo64 {
+        destination: u8,
+        source: u8,
+    },
     LogicalShiftRightVariable64 {
         destination: u8,
         source: u8,
         shift: u8,
+    },
+    ReverseBits64 {
+        destination: u8,
+        source: u8,
+    },
+    CountLeadingZeros64 {
+        destination: u8,
+        source: u8,
     },
     Address {
         destination: u8,
@@ -190,10 +216,13 @@ impl DecodedInstruction {
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
                 | Self::AndBytes16 { .. }
+                | Self::ShiftRightNarrowHalfwordsToBytes8 { .. }
                 | Self::UnsignedMinBytes16 { .. }
                 | Self::UnsignedMaxBytes16 { .. }
+                | Self::UnsignedMaxPairwiseBytes16 { .. }
                 | Self::AddAcrossBytes16 { .. }
                 | Self::MoveVectorByteTo32 { .. }
+                | Self::MoveVectorDoubleTo64 { .. }
         )
     }
 
@@ -224,6 +253,7 @@ impl DecodedInstruction {
             | Self::AddImmediate64 { destination, .. }
             | Self::SubtractRegister64 { destination, .. }
             | Self::SubtractImmediate64 { destination, .. }
+            | Self::AndRegister64 { destination, .. }
             | Self::AndLowBits64 { destination, .. }
             | Self::LogicalShiftRightImmediate64 { destination, .. }
             | Self::LogicalShiftLeftImmediate64 { destination, .. }
@@ -231,7 +261,10 @@ impl DecodedInstruction {
             | Self::LoadByteRegister { destination, .. }
             | Self::Load64RegisterScaled { destination, .. }
             | Self::MoveVectorByteTo32 { destination, .. }
+            | Self::MoveVectorDoubleTo64 { destination, .. }
             | Self::LogicalShiftRightVariable64 { destination, .. }
+            | Self::ReverseBits64 { destination, .. }
+            | Self::CountLeadingZeros64 { destination, .. }
             | Self::Address { destination, .. } => Some(destination),
             Self::CompareRegister64 { .. }
             | Self::CompareRegister32 { .. }
@@ -242,8 +275,10 @@ impl DecodedInstruction {
             | Self::DuplicateByte16 { .. }
             | Self::CompareEqualBytes16 { .. }
             | Self::AndBytes16 { .. }
+            | Self::ShiftRightNarrowHalfwordsToBytes8 { .. }
             | Self::UnsignedMinBytes16 { .. }
             | Self::UnsignedMaxBytes16 { .. }
+            | Self::UnsignedMaxPairwiseBytes16 { .. }
             | Self::AddAcrossBytes16 { .. }
             | Self::Branch { .. }
             | Self::BranchCondition { .. }
@@ -356,6 +391,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             source: rn,
             immediate: imm12(word),
         }
+    } else if word & 0xffe0_fc00 == 0x8a00_0000 {
+        DecodedInstruction::AndRegister64 {
+            destination: rd,
+            left: rn,
+            right: rm,
+        }
     } else if word & 0xffc0_0000 == 0x9240_0000 && (word >> 16).trailing_zeros() >= 6 {
         DecodedInstruction::AndLowBits64 {
             destination: rd,
@@ -414,6 +455,11 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             left: rn,
             right: rm,
         }
+    } else if word & 0xffff_fc00 == 0x0f0c_8400 {
+        DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+            destination: rd,
+            source: rn,
+        }
     } else if word & 0xffff_fc00 == 0x6e31_a800 {
         DecodedInstruction::UnsignedMinBytes16 {
             destination: rd,
@@ -423,6 +469,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
         DecodedInstruction::UnsignedMaxBytes16 {
             destination: rd,
             source: rn,
+        }
+    } else if word & 0xffe0_fc00 == 0x6e20_a400 {
+        DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+            destination: rd,
+            left: rn,
+            right: rm,
         }
     } else if word & 0xffff_fc00 == 0x4e31_b800 {
         DecodedInstruction::AddAcrossBytes16 {
@@ -434,11 +486,26 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             destination: rd,
             source: rn,
         }
+    } else if word & 0xffff_fc00 == 0x9e66_0000 {
+        DecodedInstruction::MoveVectorDoubleTo64 {
+            destination: rd,
+            source: rn,
+        }
     } else if word & 0xffe0_fc00 == 0x9ac0_2400 {
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination: rd,
             source: rn,
             shift: rm,
+        }
+    } else if word & 0xffff_fc00 == 0xdac0_0000 {
+        DecodedInstruction::ReverseBits64 {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffff_fc00 == 0xdac0_1000 {
+        DecodedInstruction::CountLeadingZeros64 {
+            destination: rd,
+            source: rn,
         }
     } else if word & 0x9f00_0000 == 0x1000_0000 {
         DecodedInstruction::Address {
@@ -546,6 +613,11 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | field(source, 5)?
                 | field(destination, 0)?
         }
+        DecodedInstruction::AndRegister64 {
+            destination,
+            left,
+            right,
+        } => 0x8a00_0000 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
         DecodedInstruction::AndLowBits64 {
             destination,
             source,
@@ -635,6 +707,10 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             left,
             right,
         } => 0x4e20_1c00 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
+        DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+            destination,
+            source,
+        } => 0x0f0c_8400 | field(source, 5)? | field(destination, 0)?,
         DecodedInstruction::UnsignedMinBytes16 {
             destination,
             source,
@@ -643,6 +719,11 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             destination,
             source,
         } => 0x6e30_a800 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+            destination,
+            left,
+            right,
+        } => 0x6e20_a400 | field(right, 16)? | field(left, 5)? | field(destination, 0)?,
         DecodedInstruction::AddAcrossBytes16 {
             destination,
             source,
@@ -651,11 +732,23 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             destination,
             source,
         } => 0x0e01_3c00 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::MoveVectorDoubleTo64 {
+            destination,
+            source,
+        } => 0x9e66_0000 | field(source, 5)? | field(destination, 0)?,
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination,
             source,
             shift,
         } => 0x9ac0_2400 | field(shift, 16)? | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::ReverseBits64 {
+            destination,
+            source,
+        } => 0xdac0_0000 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::CountLeadingZeros64 {
+            destination,
+            source,
+        } => 0xdac0_1000 | field(source, 5)? | field(destination, 0)?,
         DecodedInstruction::Address {
             destination,
             displacement,

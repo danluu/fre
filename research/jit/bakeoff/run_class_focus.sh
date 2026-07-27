@@ -1,33 +1,35 @@
 #!/bin/sh
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-workspace=$(CDPATH= cd -- "$script_dir/../../.." && pwd)
-output=${1:-"$script_dir/results/focus-suffix-first"}
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+workspace=$(CDPATH= cd -P -- "$script_dir/../../.." && pwd -P)
+output_argument=${1:?usage: run_class_focus.sh ABSOLUTE_OUTPUT_DIRECTORY [RETAINED_RESULTS]}
 retained=${2:-"$script_dir/results/after-lazy-two-position"}
+. "$script_dir/runner_support.sh"
 
-if [ -e "$output" ]; then
-    echo "refusing to overwrite existing output: $output" >&2
-    exit 2
-fi
 if [ ! -f "$retained/ranges.csv" ]; then
     echo "missing retained ranges: $retained/ranges.csv" >&2
     exit 2
 fi
 
-mkdir -p "$output"
-cargo build --manifest-path "$script_dir/Cargo.toml" --release --locked
-binary="$script_dir/target/release/fre-jit-bakeoff"
+fre_bakeoff_prepare_timing_inputs \
+    "$workspace" "$output_argument" "$script_dir/capture_provenance.sh"
+output=$FRE_BAKEOFF_OUTPUT
+source_state=$FRE_BAKEOFF_SOURCE_STATE
+binary=$FRE_BAKEOFF_BINARY_PATH
 
 {
     date -u '+utc_started=%Y-%m-%dT%H:%M:%SZ'
-    printf 'workspace_revision='; git -C "$workspace" rev-parse HEAD 2>/dev/null || printf unknown
-    printf '\n'
-    printf 'rustc='; rustc --version
-    printf 'cargo='; cargo --version
+    printf 'workspace_revision='; sed -n '1p' "$output/provenance/source/head.txt"
+    printf 'source_state_id=%s\n' "$source_state"
+    printf 'source_dirty='; sed -n '1p' "$output/provenance/source/dirty.txt"
+    printf 'rustc=%s\n' "$FRE_BAKEOFF_BUILD_RUSTC"
+    printf 'cargo=%s\n' "$FRE_BAKEOFF_BUILD_CARGO"
     printf 'uname='; uname -a
     printf 'cpu='; sysctl -n machdep.cpu.brand_string 2>/dev/null || printf unavailable
-    printf 'binary='; shasum -a 256 "$binary"
+    printf 'binary=%s  %s\n' "$FRE_BAKEOFF_BINARY_SHA256" "$binary"
+    printf 'build_receipt=%s  %s\n' \
+        "$FRE_BAKEOFF_BUILD_RECEIPT_SHA256" "$FRE_BAKEOFF_BUILD_RECEIPT_PATH"
     printf 'retained_ranges='; shasum -a 256 "$retained/ranges.csv"
 } > "$output/environment.txt"
 
@@ -75,9 +77,11 @@ awk -F, '
     }
 ' "$retained/ranges.csv" "$output/ranges.csv" > "$output/vs-retained.csv"
 
+fre_bakeoff_verify_timing_inputs "$workspace" "$script_dir/capture_provenance.sh"
 {
     printf 'raw_rows='; awk 'END { print NR - 1 }' "$output/raw.csv"
     printf 'cells='; wc -l < "$output/cells.txt" | tr -d ' '
     printf 'processes_per_cell=5\n'
+    printf 'source_state_id=%s\n' "$source_state"
     printf 'utc_finished='; date -u '+%Y-%m-%dT%H:%M:%SZ'
 } > "$output/completion.txt"

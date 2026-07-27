@@ -1,6 +1,9 @@
 use std::sync::{Mutex, MutexGuard};
 
-use fre_jit_aarch64::{EmitLimits, NativeAggregateResult, emit, emit_exact_aggregate};
+use fre_jit_aarch64::{
+    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, decode, emit,
+    emit_exact_aggregate,
+};
 use fre_kernel_ir::{
     AggregateExecutionLimits, AggregateOutput, AnchorFlags, ByteClass, Count, ExecutionLimits,
     Exists, SearchWindow, SelectedEnd, Span, SpanSum, ValidateLimits, build_class_suffix,
@@ -39,6 +42,43 @@ fn strict_wx_smoke_matches_kernel_ir() {
         .into_output();
     let actual = kernel.search(haystack, window).expect("native call");
     assert_eq!(actual, expected);
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "macos",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+fn search_call_preserves_aapcs64_vector_callee_saved_lanes() {
+    let _lock = native_test_lock();
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("fixed-width exact program");
+    let image = emit(&program, EmitLimits::default()).expect("fixed-width exact image");
+    let kernel = publish::<Span>(&image, PublicationLimits::default()).expect("published kernel");
+    let canaries = [
+        0x0808_0808_0808_0808,
+        0x0909_0909_0909_0909,
+        0x1010_1010_1010_1010,
+        0x1111_1111_1111_1111,
+        0x1212_1212_1212_1212,
+        0x1313_1313_1313_1313,
+        0x1414_1414_1414_1414,
+        0x1515_1515_1515_1515,
+    ];
+    let (raw, observed) = platform::invoke_with_vector_callee_saved_canary(
+        &kernel.mapping,
+        literal,
+        SearchWindow::new(0, literal.len()),
+        canaries,
+    );
+    assert_eq!(raw.status, 1);
+    assert_eq!(raw.slot.start, 0);
+    assert_eq!(raw.slot.end, literal.len());
+    assert_eq!(observed, canaries);
 }
 
 #[test]
@@ -475,6 +515,7 @@ fn vector_candidate_tails_and_haystack_alignments_match_oracle() {
         b"a".as_slice(),
         b"needle",
         b"Sherlock Holmes",
+        b"0123456789abcdef",
         b"0123456789abcdefg",
     ] {
         let program =
@@ -496,7 +537,569 @@ fn vector_candidate_tails_and_haystack_alignments_match_oracle() {
             }
         }
     }
-    assert_eq!(comparisons, 4_096);
+    assert_eq!(comparisons, 5_120);
+}
+
+#[test]
+fn rare_pair_vector_candidates_respect_guard_pages_and_leftmost_windows() {
+    const WINDOW_START: usize = 3;
+    const CANDIDATE_STARTS: usize = 16;
+    const FIRST_LANE: usize = 0;
+    const LAST_LANE: usize = CANDIDATE_STARTS - 1;
+
+    let _lock = native_test_lock();
+    // The emitter's pinned packed-pair selector chooses these offsets. Keeping
+    // both address orders here exercises the add and subtract forms used to
+    // reach the secondary vector column.
+    for (literal, primary_offset, secondary_offset) in [
+        (b"7a".as_slice(), 0_usize, 1_usize),
+        (b"a7".as_slice(), 1_usize, 0_usize),
+    ] {
+        assert_ne!(primary_offset, secondary_offset);
+        let program =
+            build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+                .expect("rare-pair exact program");
+        let image = emit(&program, EmitLimits::default()).expect("rare-pair exact image");
+        assert!(image.stats().vector_instructions >= 4);
+        let kernel =
+            publish::<Span>(&image, PublicationLimits::default()).expect("rare-pair publication");
+        let window_len = CANDIDATE_STARTS
+            .checked_add(literal.len())
+            .and_then(|length| length.checked_sub(1))
+            .expect("bounded window length");
+
+        for (scenario, match_lanes, primary_only_lanes, expected_lane) in [
+            (
+                "absent-primary-lanes-0-and-15",
+                [].as_slice(),
+                [FIRST_LANE, LAST_LANE].as_slice(),
+                None,
+            ),
+            (
+                "lane-0",
+                [FIRST_LANE].as_slice(),
+                [].as_slice(),
+                Some(FIRST_LANE),
+            ),
+            (
+                "lane-15",
+                [LAST_LANE].as_slice(),
+                [].as_slice(),
+                Some(LAST_LANE),
+            ),
+            (
+                "lane-0-and-15",
+                [FIRST_LANE, LAST_LANE].as_slice(),
+                [].as_slice(),
+                Some(FIRST_LANE),
+            ),
+        ] {
+            let haystack_len = WINDOW_START
+                .checked_add(window_len)
+                .expect("bounded haystack length");
+            let mut bytes = vec![b'x'; haystack_len];
+            // A valid match before the nonzero window must never be selected.
+            bytes[..literal.len()].copy_from_slice(literal);
+            // Primary-only hits force the secondary vector load but must not
+            // turn into exact matches.
+            for &lane in primary_only_lanes {
+                let start = WINDOW_START.checked_add(lane).expect("bounded lane");
+                let selected = start
+                    .checked_add(primary_offset)
+                    .expect("bounded selected offset");
+                bytes[selected] = literal[primary_offset];
+            }
+            for &lane in match_lanes {
+                let start = WINDOW_START.checked_add(lane).expect("bounded lane");
+                let end = start.checked_add(literal.len()).expect("bounded literal");
+                bytes[start..end].copy_from_slice(literal);
+            }
+            let window = SearchWindow::new(WINDOW_START, bytes.len());
+            let candidate_starts = window
+                .end()
+                .checked_sub(window.start())
+                .and_then(|length| length.checked_sub(literal.len()))
+                .and_then(|last_start| last_start.checked_add(1))
+                .expect("literal fits in the window");
+            assert_eq!(candidate_starts, CANDIDATE_STARTS);
+
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&bytes, right_boundary, |haystack| {
+                    let actual = kernel
+                        .search(haystack, window)
+                        .expect("guarded native execution")
+                        .map(|span| (span.start(), span.end()));
+                    let expected = expected_lane.map(|lane| {
+                        let start = WINDOW_START.checked_add(lane).expect("bounded lane");
+                        let end = start.checked_add(literal.len()).expect("bounded literal");
+                        (start, end)
+                    });
+                    assert_eq!(
+                        actual, expected,
+                        "literal={literal:?} offsets={primary_offset},{secondary_offset} \
+                         scenario={scenario} right_boundary={right_boundary}"
+                    );
+                    assert_native_matches(&program, &kernel, haystack, window);
+                })
+                .expect("guarded rare-pair haystack");
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the native v7 lane matrix keeps both offset directions, every lane, all groups, and false-before-true recovery together"
+)]
+fn v7_sparse_recovery_covers_every_lane_group_and_pair_direction() {
+    const WINDOW_START: usize = 5;
+    const LANES: usize = 16;
+    const GROUPS: usize = 3;
+    const CANDIDATE_STARTS: usize = LANES * GROUPS;
+
+    let _lock = native_test_lock();
+    // The packed-pair policy selects 0->1 for the first literal and 1->0 for
+    // the second. The next two ranked columns are staged only if the prior
+    // mask still has multiple survivors.
+    // The trailing space remains outside the four selected columns, so a
+    // staged-mask hit can still fail whole-literal confirmation.
+    for (literal, primary_offset, secondary_offset) in [
+        (b"7a e ".as_slice(), 0_usize, 1_usize),
+        (b"a7 e ".as_slice(), 1_usize, 0_usize),
+    ] {
+        let program =
+            build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+                .expect("ranked exact program");
+        let image = emit(&program, EmitLimits::default()).expect("ranked exact image");
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V7);
+        let instructions = decode(image.code()).expect("v7 native image decode");
+        let filter_offsets: Vec<usize> = instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset,
+                } => Some(usize::from(*offset)),
+                _ => None,
+            })
+            .take(4)
+            .collect();
+        assert_eq!(filter_offsets.len(), 4);
+        assert_eq!(filter_offsets[..2], [primary_offset, secondary_offset]);
+        let verification_offset = filter_offsets[2];
+        let quaternary_offset = filter_offsets[3];
+        assert!(instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                    destination: 2,
+                    source: 0
+                }
+            )
+        }));
+        assert!(instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::ReverseBits64 {
+                    destination: 10,
+                    source: 0
+                }
+            )
+        }));
+        assert!(instructions.iter().any(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CountLeadingZeros64 {
+                    destination: 10,
+                    source: 10
+                }
+            )
+        }));
+        let kernel =
+            publish::<Span>(&image, PublicationLimits::default()).expect("ranked publication");
+        let window_len = CANDIDATE_STARTS
+            .checked_add(literal.len())
+            .and_then(|length| length.checked_sub(1))
+            .expect("bounded window length");
+        let haystack_len = WINDOW_START
+            .checked_add(window_len)
+            .expect("bounded haystack length");
+
+        for group in 0..GROUPS {
+            for lane in 0..LANES {
+                let candidate = group
+                    .checked_mul(LANES)
+                    .and_then(|start| start.checked_add(lane))
+                    .expect("bounded candidate lane");
+                let start = WINDOW_START
+                    .checked_add(candidate)
+                    .expect("bounded match start");
+                let end = start.checked_add(literal.len()).expect("bounded literal");
+                let mut bytes = vec![b'x'; haystack_len];
+                bytes[start..end].copy_from_slice(literal);
+                let window = SearchWindow::new(WINDOW_START, bytes.len());
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |haystack| {
+                        let actual = kernel
+                            .search(haystack, window)
+                            .expect("native lane execution")
+                            .map(|span| (span.start(), span.end()));
+                        assert_eq!(
+                            actual,
+                            Some((start, end)),
+                            "literal={literal:?} group={group} lane={lane} \
+                             right_boundary={right_boundary}"
+                        );
+                        assert_native_matches(&program, &kernel, haystack, window);
+                    })
+                    .expect("guarded ranked lane haystack");
+                }
+            }
+        }
+
+        for lane in 0..LANES {
+            let mut bytes = vec![b'x'; haystack_len];
+            let false_start = WINDOW_START.checked_add(lane).expect("bounded false start");
+            for offset in [
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+            ] {
+                bytes[false_start + offset] = literal[offset];
+            }
+            let true_start = WINDOW_START
+                .checked_add(2 * LANES)
+                .and_then(|start| start.checked_add(lane))
+                .expect("bounded later true start");
+            let true_end = true_start
+                .checked_add(literal.len())
+                .expect("bounded later literal");
+            bytes[true_start..true_end].copy_from_slice(literal);
+            let window = SearchWindow::new(WINDOW_START, bytes.len());
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&bytes, right_boundary, |haystack| {
+                    let actual = kernel
+                        .search(haystack, window)
+                        .expect("native false-then-true execution")
+                        .map(|span| (span.start(), span.end()));
+                    assert_eq!(
+                        actual,
+                        Some((true_start, true_end)),
+                        "literal={literal:?} lane={lane} right_boundary={right_boundary}"
+                    );
+                    assert_native_matches(&program, &kernel, haystack, window);
+                })
+                .expect("guarded false-then-true haystack");
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the native multi-survivor matrix keeps every same-mask, next-block, tail, direction, width, and guard case explicit"
+)]
+fn v7_multi_survivor_masks_preserve_leftmost_across_blocks_and_tail() {
+    const WINDOW_START: usize = 5;
+
+    let _lock = native_test_lock();
+    for width in [16_usize, 17, 32] {
+        // Lower frequency rank wins. Four leading `a` columns therefore beat
+        // the `e` at offset four and are selected in increasing order. An
+        // all-`a` block consequently has sixteen simultaneous filter hits,
+        // while every complete confirmation fails at offset four.
+        let mut add_literal = vec![b'a'; width];
+        add_literal[4] = b'e';
+        let add_program = build_exact_literal::<Span>(
+            &add_literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("add-direction exact program");
+        let add_image = emit(&add_program, EmitLimits::default()).expect("add-direction image");
+        let add_offsets = initial_v7_filter_offsets(&add_image);
+        assert_eq!(add_offsets, [0, 1, 2, 3]);
+        let add_kernel =
+            publish::<Span>(&add_image, PublicationLimits::default()).expect("add kernel");
+
+        for true_lane in 1..16 {
+            let mut bytes = candidate_haystack(width, 32, b'a');
+            install_literal(&mut bytes, WINDOW_START + true_lane, &add_literal);
+            assert_guarded_v7_case(
+                &add_program,
+                &add_kernel,
+                &bytes,
+                Some(WINDOW_START + true_lane),
+                "lane-0-false-then-same-mask-true",
+            );
+        }
+
+        let mut several_false = candidate_haystack(width, 32, b'a');
+        install_literal(&mut several_false, WINDOW_START + 9, &add_literal);
+        assert_guarded_v7_case(
+            &add_program,
+            &add_kernel,
+            &several_false,
+            Some(WINDOW_START + 9),
+            "several-earlier-false-bits",
+        );
+
+        let mut all_sixteen_then_next = candidate_haystack(width, 32, b'a');
+        install_literal(&mut all_sixteen_then_next, WINDOW_START + 16, &add_literal);
+        assert_guarded_v7_case(
+            &add_program,
+            &add_kernel,
+            &all_sixteen_then_next,
+            Some(WINDOW_START + 16),
+            "all-sixteen-false-then-next-block-lane-zero",
+        );
+
+        let mut lane_fifteen_then_next = candidate_haystack(width, 32, b'x');
+        install_filter_hit(
+            &mut lane_fifteen_then_next,
+            WINDOW_START + 15,
+            &add_literal,
+            add_offsets,
+        );
+        install_literal(&mut lane_fifteen_then_next, WINDOW_START + 16, &add_literal);
+        assert_guarded_v7_case(
+            &add_program,
+            &add_kernel,
+            &lane_fifteen_then_next,
+            Some(WINDOW_START + 16),
+            "lane-fifteen-false-then-next-block-lane-zero",
+        );
+
+        let all_false_tail = candidate_haystack(width, 21, b'a');
+        assert_guarded_v7_case(
+            &add_program,
+            &add_kernel,
+            &all_false_tail,
+            None,
+            "all-sixteen-false-then-tail-none",
+        );
+
+        // These four control bytes have strict ranks 28, 29, 30, and 31.
+        // Their offsets force every staged column pointer to subtract from the
+        // primary offset, while lane spacings 5/10/15 avoid write conflicts.
+        let mut subtract_literal = vec![b'e'; width];
+        subtract_literal[8] = 0x1f;
+        subtract_literal[4] = 0x1e;
+        subtract_literal[2] = 0x1d;
+        subtract_literal[1] = 0x1c;
+        let subtract_program = build_exact_literal::<Span>(
+            &subtract_literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("subtract-direction exact program");
+        let subtract_image =
+            emit(&subtract_program, EmitLimits::default()).expect("subtract-direction image");
+        let subtract_offsets = initial_v7_filter_offsets(&subtract_image);
+        assert_eq!(subtract_offsets, [8, 4, 2, 1]);
+        let subtract_kernel = publish::<Span>(&subtract_image, PublicationLimits::default())
+            .expect("subtract kernel");
+        let mut subtract_bytes = candidate_haystack(width, 32, b'x');
+        for lane in [0_usize, 5, 10, 15] {
+            install_filter_hit(
+                &mut subtract_bytes,
+                WINDOW_START + lane,
+                &subtract_literal,
+                subtract_offsets,
+            );
+        }
+        install_literal(&mut subtract_bytes, WINDOW_START + 31, &subtract_literal);
+        assert_guarded_v7_case(
+            &subtract_program,
+            &subtract_kernel,
+            &subtract_bytes,
+            Some(WINDOW_START + 31),
+            "ranked-subtract-multi-survivor-mask",
+        );
+    }
+}
+
+fn initial_v7_filter_offsets(image: &fre_jit_aarch64::NativeImage) -> [usize; 4] {
+    let offsets: Vec<usize> = decode(image.code())
+        .expect("v7 filter image decode")
+        .iter()
+        .filter_map(|instruction| match instruction {
+            DecodedInstruction::LoadByte {
+                destination: 11,
+                base: 8,
+                offset,
+            } => Some(usize::from(*offset)),
+            _ => None,
+        })
+        .take(4)
+        .collect();
+    offsets.try_into().expect("v7 has four ranked filter loads")
+}
+
+fn candidate_haystack(width: usize, candidate_starts: usize, fill: u8) -> Vec<u8> {
+    let length = WINDOW_START_FOR_V7_TESTS
+        .checked_add(candidate_starts)
+        .and_then(|value| value.checked_add(width))
+        .and_then(|value| value.checked_sub(1))
+        .expect("bounded v7 multi-survivor haystack");
+    vec![fill; length]
+}
+
+const WINDOW_START_FOR_V7_TESTS: usize = 5;
+
+fn install_filter_hit(haystack: &mut [u8], start: usize, literal: &[u8], offsets: [usize; 4]) {
+    for offset in offsets {
+        let position = start.checked_add(offset).expect("bounded filter position");
+        haystack[position] = literal[offset];
+    }
+}
+
+fn install_literal(haystack: &mut [u8], start: usize, literal: &[u8]) {
+    let end = start
+        .checked_add(literal.len())
+        .expect("bounded literal position");
+    haystack[start..end].copy_from_slice(literal);
+}
+
+fn assert_guarded_v7_case(
+    program: &fre_kernel_ir::ValidatedProgram<Span>,
+    kernel: &crate::PublishedKernel<Span>,
+    bytes: &[u8],
+    expected_start: Option<usize>,
+    scenario: &str,
+) {
+    let window = SearchWindow::new(WINDOW_START_FOR_V7_TESTS, bytes.len());
+    for right_boundary in [false, true] {
+        platform::with_guarded_haystack(bytes, right_boundary, |haystack| {
+            let actual = kernel
+                .search(haystack, window)
+                .expect("guarded v7 multi-survivor execution");
+            let actual = actual.map(fre_kernel_ir::MatchSpan::start);
+            assert_eq!(
+                actual, expected_start,
+                "scenario={scenario} right_boundary={right_boundary}"
+            );
+            assert_native_matches(program, kernel, haystack, window);
+        })
+        .expect("guarded v7 multi-survivor haystack");
+    }
+}
+
+#[test]
+fn v7_overlapping_candidates_preserve_leftmost_and_window_nonoverlap() {
+    const WINDOW_START: usize = 5;
+    const CANDIDATE_STARTS: usize = 32;
+    const LITERAL: &[u8] = b"aba";
+
+    let _lock = native_test_lock();
+    let program =
+        build_exact_literal::<Span>(LITERAL, AnchorFlags::default(), ValidateLimits::default())
+            .expect("overlapping exact program");
+    let image = emit(&program, EmitLimits::default()).expect("overlapping v7 image");
+    assert_eq!(image.backend_version(), BackendVersion::SEARCH_V7);
+    let kernel =
+        publish::<Span>(&image, PublicationLimits::default()).expect("overlapping publication");
+    let haystack_len = WINDOW_START
+        .checked_add(CANDIDATE_STARTS)
+        .and_then(|length| length.checked_add(LITERAL.len() - 1))
+        .expect("bounded overlapping haystack");
+    let mut bytes = vec![b'x'; haystack_len];
+    bytes[WINDOW_START..WINDOW_START + 5].copy_from_slice(b"ababa");
+
+    for right_boundary in [false, true] {
+        platform::with_guarded_haystack(&bytes, right_boundary, |haystack| {
+            let whole = SearchWindow::new(WINDOW_START, haystack.len());
+            let first = kernel
+                .search(haystack, whole)
+                .expect("first overlapping native search")
+                .map(|span| (span.start(), span.end()));
+            assert_eq!(first, Some((WINDOW_START, WINDOW_START + LITERAL.len())));
+            assert_native_matches(&program, &kernel, haystack, whole);
+
+            let after_first_start = WINDOW_START + 1;
+            let after_first = SearchWindow::new(after_first_start, haystack.len());
+            let second = kernel
+                .search(haystack, after_first)
+                .expect("second overlapping native search")
+                .map(|span| (span.start(), span.end()));
+            assert_eq!(
+                second,
+                Some((WINDOW_START + 2, WINDOW_START + 2 + LITERAL.len()))
+            );
+            assert_native_matches(&program, &kernel, haystack, after_first);
+        })
+        .expect("guarded overlapping v7 haystack");
+    }
+}
+
+#[test]
+fn fixed_16_false_pair_confirmation_resumes_before_a_guarded_distant_match() {
+    const WINDOW_START: usize = 5;
+    const CANDIDATE_STARTS: usize = 48;
+    const DISTANT_LANE: usize = 32;
+    const LITERAL: &[u8; 16] = b"0123456789abcdef";
+
+    let _lock = native_test_lock();
+    let program =
+        build_exact_literal::<Span>(LITERAL, AnchorFlags::default(), ValidateLimits::default())
+            .expect("fixed-16 exact program");
+    let image = emit(&program, EmitLimits::default()).expect("fixed-16 exact image");
+    let kernel =
+        publish::<Span>(&image, PublicationLimits::default()).expect("fixed-16 publication");
+    let window_len = CANDIDATE_STARTS
+        .checked_add(LITERAL.len())
+        .and_then(|length| length.checked_sub(1))
+        .expect("bounded window length");
+
+    for present in [false, true] {
+        let haystack_len = WINDOW_START
+            .checked_add(window_len)
+            .expect("bounded guarded haystack length");
+        let mut bytes = vec![b'x'; haystack_len];
+        // The canonical pair for this literal is at offsets 7 and 6. This
+        // candidate passes both vector columns but fails fixed-width
+        // confirmation at offset 8. In particular, confirmation must reset
+        // X15 from the primary-column pointer before its 16-byte load.
+        let false_start = WINDOW_START;
+        let false_end = false_start
+            .checked_add(LITERAL.len())
+            .expect("bounded false candidate");
+        bytes[false_start..false_end].copy_from_slice(LITERAL);
+        bytes[false_start + 8] = b'X';
+        if present {
+            let match_start = WINDOW_START
+                .checked_add(DISTANT_LANE)
+                .expect("bounded distant match");
+            let match_end = match_start
+                .checked_add(LITERAL.len())
+                .expect("bounded distant literal");
+            bytes[match_start..match_end].copy_from_slice(LITERAL);
+        }
+        let window = SearchWindow::new(WINDOW_START, bytes.len());
+
+        for right_boundary in [false, true] {
+            platform::with_guarded_haystack(&bytes, right_boundary, |haystack| {
+                let actual = kernel
+                    .search(haystack, window)
+                    .expect("guarded native execution")
+                    .map(|span| (span.start(), span.end()));
+                let expected = present.then_some((
+                    WINDOW_START + DISTANT_LANE,
+                    WINDOW_START + DISTANT_LANE + LITERAL.len(),
+                ));
+                assert_eq!(
+                    actual, expected,
+                    "present={present} right_boundary={right_boundary}"
+                );
+                assert_native_matches(&program, &kernel, haystack, window);
+            })
+            .expect("guarded fixed-16 false-pair haystack");
+        }
+    }
 }
 
 #[test]
@@ -555,6 +1158,38 @@ fn inaccessible_haystack_boundaries_are_respected() {
             .expect("guarded exact haystack");
         }
     }
+
+    // The canonical primary byte for this literal is at offset 7. A first-byte
+    // hit at the final candidate therefore proves that scalar confirmation
+    // resets its primary-column pointer before the 16-byte load at a right
+    // guard boundary.
+    let boundary_literal = b"0123456789abcdef";
+    let boundary_program = build_exact_literal::<Span>(
+        boundary_literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("fixed-width boundary program");
+    let boundary_image =
+        emit(&boundary_program, EmitLimits::default()).expect("fixed-width boundary image");
+    let boundary_kernel =
+        publish::<Span>(&boundary_image, PublicationLimits::default()).expect("boundary kernel");
+    let mut final_candidate = vec![b'x'; 15];
+    final_candidate.extend_from_slice(boundary_literal);
+    platform::with_guarded_haystack(&final_candidate, true, |haystack| {
+        let actual = boundary_kernel
+            .search(haystack, SearchWindow::new(0, haystack.len()))
+            .expect("final-candidate native execution")
+            .map(|span| (span.start(), span.end()));
+        assert_eq!(actual, Some((15, 31)));
+        assert_native_matches(
+            &boundary_program,
+            &boundary_kernel,
+            haystack,
+            SearchWindow::new(0, haystack.len()),
+        );
+    })
+    .expect("right-guard fixed-width final candidate");
 
     let empty = build_exact_literal::<Span>(b"", AnchorFlags::default(), ValidateLimits::default())
         .expect("empty exact program");

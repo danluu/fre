@@ -107,6 +107,11 @@ Native JIT code also requires a verified relocation/branch target model,
 W^X publication lifecycle, instruction-cache synchronization, target-feature
 checks, bounded code-cache behavior, and parity tests against the Kernel IR and
 K0. A native loop over regex bytecode is not accepted as JIT specialization.
+The current AArch64 exact-search contract is `SEARCH_V7`: two ranked vector
+columns form the initial mask, and ranked third/fourth columns are loaded only
+while that mask has multiple survivors. Sparse recovery selects lanes in
+ascending order, preserves reusable filter constants across rejected full
+confirmations, and retains byte-identical V1--V6 AOT identities.
 
 ## Qualification status language
 

@@ -1,6 +1,15 @@
 use std::{error::Error, fmt, fs, hint::black_box, path::Path, process, time::Instant};
 
-use fre_jit_aarch64::{DecodedInstruction, EmitLimits, NativeImage, decode, emit};
+use fre::{
+    QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
+    QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+    QualifiedExactSearch, QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification,
+    QualifiedExactSearchRoute, QualifiedExactSearchWorkload, SearchLimits as FacadeSearchLimits,
+};
+use fre_jit_aarch64::{
+    ArtifactIdentityReceipt, BackendVersion, DecodedInstruction, EmitLimits, ImageStats,
+    NativeImage, decode, emit,
+};
 use fre_jit_cache::{CacheLimits, KernelCache};
 use fre_jit_runtime::{
     PublicationAccounting, PublicationLimits, RuntimeIdentity, RuntimeOperation, publish,
@@ -14,10 +23,12 @@ use fre_kernels::{
     RequiredLiteralBuildLimits, RequiredLiteralByteClass, RequiredLiteralPlan,
     RequiredLiteralSearchLimits,
 };
+use memchr::arch::all::packedpair::Pair;
 use regex::bytes::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
 
-const SCHEMA: &str = "fre-jit-bakeoff-v1";
+const SCHEMA: &str = "fre-jit-bakeoff-v2";
+const CSV_HEADER: &str = "schema,revision,pid,repetition,cell,shape,operation,size,scenario,haystack_bytes,alignment_mod16,engine,stage,timing_scope,iterations,total_ns,ns_per_iter,checksum,semantic_value,code_bytes,data_bytes,payload_used_bytes,total_mapped_bytes,total_pages,instructions,vector_instructions,loads,stores,branches,identity_bytes_hashed,identity_scratch_bytes,identity_heap_allocations,cache_bookkeeping_bytes,cache_hits,fixture,output_kind,backend,route,artifact_identity,evidence_identity,qualification_state,qualification_bundle_sha256,evidence_binding,artifact_binding,declared_min_window_bytes,declared_min_qualifying_calls,measured_calls,measured_qualifying_calls";
 const EXACT_LITERAL: &[u8] = b"0123456789abcdef";
 const LITERAL_1: &[u8] = b"a";
 const LITERAL_6: &[u8] = b"needle";
@@ -27,12 +38,16 @@ const SHERLOCK_LITERAL: &[u8] = b"Sherlock Holmes";
 const SHERLOCK_BYTES: usize = 899_232;
 const SHERLOCK_MATCHES: usize = 513;
 const SHERLOCK_SHA256: &str = "0d40805f6d02c8fe02bd75945b98911891f707e8ecb939e018446858065d76ea";
+const NATURAL_TEXT: &[u8] = b"Elementary observations reward patient measurement. \
+False candidates should be cheap, and distant evidence must remain visible. ";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = std::env::args().collect();
     match arguments.get(1).map(String::as_str) {
         Some("header") if arguments.len() == 2 => print_header(),
         Some("list") if arguments.len() == 2 => list_cells(),
+        Some("list-adversarial") if arguments.len() == 2 => list_adversarial_cells(),
+        Some("adversarial-info") if arguments.len() == 2 => print_adversarial_info(),
         Some("run") if arguments.len() == 7 => {
             let cell = Cell {
                 shape: Shape::parse(&arguments[2])?,
@@ -55,7 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             eprintln!(
-                "usage: {} header | list | run SHAPE OP SIZE SCENARIO REP | sherlock PATH REP | inspect SHAPE OP",
+                "usage: {} header | list | list-adversarial | adversarial-info | run SHAPE OP SIZE SCENARIO REP | sherlock PATH REP | inspect SHAPE OP",
                 arguments.first().map_or("fre-jit-bakeoff", String::as_str)
             );
             process::exit(2);
@@ -168,8 +183,36 @@ impl Size {
     const fn hot_iterations(self) -> u64 {
         match self {
             Self::Short => 20_000,
-            Self::K64 => 500,
-            Self::M1 => 32,
+            Self::K64 => 1_024,
+            Self::M1 => 64,
+        }
+    }
+
+    const fn qualified_workload(self) -> QualifiedExactSearchWorkload {
+        match self {
+            Self::Short => QualifiedExactSearchWorkload::new(Self::Short.bytes(), 1),
+            Self::K64 => QualifiedExactSearchWorkload::new(
+                QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+                QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
+            ),
+            Self::M1 => QualifiedExactSearchWorkload::new(
+                QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
+                QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES,
+            ),
+        }
+    }
+
+    const fn under_threshold_workload(self) -> QualifiedExactSearchWorkload {
+        match self {
+            Self::Short => QualifiedExactSearchWorkload::new(Self::Short.bytes(), 1),
+            Self::K64 => QualifiedExactSearchWorkload::new(
+                QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+                QUALIFIED_EXACT_SEARCH_MIN_SEARCHES - 1,
+            ),
+            Self::M1 => QualifiedExactSearchWorkload::new(
+                QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
+                QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES - 1,
+            ),
         }
     }
 }
@@ -181,6 +224,12 @@ enum Scenario {
     Dense,
     Tail,
     Unaligned,
+    PrimaryDenseSecondaryAbsent,
+    PairDenseLiteralAbsent,
+    TripleDenseLiteralAbsent,
+    FalsePairDistantMatch,
+    Binary,
+    NaturalText,
 }
 
 impl Scenario {
@@ -191,6 +240,12 @@ impl Scenario {
             "dense" => Ok(Self::Dense),
             "tail" => Ok(Self::Tail),
             "unaligned" => Ok(Self::Unaligned),
+            "primary-dense-secondary-absent" => Ok(Self::PrimaryDenseSecondaryAbsent),
+            "pair-dense-literal-absent" => Ok(Self::PairDenseLiteralAbsent),
+            "triple-dense-literal-absent" => Ok(Self::TripleDenseLiteralAbsent),
+            "false-pair-distant-match" => Ok(Self::FalsePairDistantMatch),
+            "binary" => Ok(Self::Binary),
+            "natural-text" => Ok(Self::NaturalText),
             _ => Err(ParseError::new("scenario", text)),
         }
     }
@@ -202,6 +257,26 @@ impl Scenario {
             Self::Dense => "dense",
             Self::Tail => "tail",
             Self::Unaligned => "unaligned",
+            Self::PrimaryDenseSecondaryAbsent => "primary-dense-secondary-absent",
+            Self::PairDenseLiteralAbsent => "pair-dense-literal-absent",
+            Self::TripleDenseLiteralAbsent => "triple-dense-literal-absent",
+            Self::FalsePairDistantMatch => "false-pair-distant-match",
+            Self::Binary => "binary",
+            Self::NaturalText => "natural-text",
+        }
+    }
+
+    const fn fixture(self) -> &'static str {
+        match self {
+            Self::Present | Self::Absent | Self::Dense | Self::Tail | Self::Unaligned => {
+                "synthetic-v1"
+            }
+            Self::PrimaryDenseSecondaryAbsent
+            | Self::PairDenseLiteralAbsent
+            | Self::FalsePairDistantMatch
+            | Self::Binary
+            | Self::NaturalText => "synthetic-adversarial-v1",
+            Self::TripleDenseLiteralAbsent => "synthetic-adversarial-v2",
         }
     }
 }
@@ -275,6 +350,49 @@ fn list_cells() {
             }
         }
     }
+}
+
+fn list_adversarial_cells() {
+    for operation in [
+        OperationName::Exists,
+        OperationName::SelectedEnd,
+        OperationName::Span,
+    ] {
+        for size in [Size::Short, Size::K64, Size::M1] {
+            for scenario in [
+                Scenario::PrimaryDenseSecondaryAbsent,
+                Scenario::PairDenseLiteralAbsent,
+                Scenario::TripleDenseLiteralAbsent,
+                Scenario::FalsePairDistantMatch,
+                Scenario::Binary,
+                Scenario::NaturalText,
+            ] {
+                println!(
+                    "{} {} {} {}",
+                    Shape::Exact.name(),
+                    operation.name(),
+                    size.name(),
+                    scenario.name()
+                );
+            }
+        }
+    }
+}
+
+fn print_adversarial_info() {
+    let (primary, secondary) = selected_pair(EXACT_LITERAL);
+    println!("schema=fre-jit-bakeoff-adversarial-v1");
+    println!("shape=exact");
+    println!("literal_hex={}", hex_encode(EXACT_LITERAL));
+    println!("pair_selector=memchr-2.8.3-default-frequency-rank");
+    println!("primary_offset={primary}");
+    println!("primary_byte=0x{:02x}", EXACT_LITERAL[primary]);
+    println!("secondary_offset={secondary}");
+    println!("secondary_byte=0x{:02x}", EXACT_LITERAL[secondary]);
+    let verification = selected_verification(EXACT_LITERAL, primary, secondary)
+        .expect("adversarial literal has a distinct verification byte");
+    println!("verification_offset={verification}");
+    println!("verification_byte=0x{:02x}", EXACT_LITERAL[verification]);
 }
 
 fn run_cell(cell: Cell, repetition: u32) -> Result<(), Box<dyn Error>> {
@@ -363,6 +481,36 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     let image = emit(&program, EmitLimits::default())?;
     let regex = build_regex(cell.shape)?;
     let native_plan = NativePlan::build(cell.shape)?;
+    let qualified_workload = cell.size.qualified_workload();
+    let under_threshold_workload = cell.size.under_threshold_workload();
+    let qualified = if cell.shape == Shape::Exact {
+        Some(QualifiedExactSearch::new(
+            EXACT_LITERAL,
+            qualified_workload,
+        )?)
+    } else {
+        None
+    };
+    let under_threshold = if cell.shape == Shape::Exact {
+        Some(QualifiedExactSearch::new(
+            EXACT_LITERAL,
+            under_threshold_workload,
+        )?)
+    } else {
+        None
+    };
+    let qualified_span_image = if cell.shape == Shape::Exact {
+        let span_program = build_exact_literal::<Span>(
+            EXACT_LITERAL,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )?;
+        let span_image = emit(&span_program, EmitLimits::default())?;
+        let span_mix = InstructionMix::for_image(&span_image)?;
+        Some((span_image, span_mix))
+    } else {
+        None
+    };
 
     let oracle = O::encode(
         &program
@@ -373,6 +521,52 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     let kernels_value = O::encode_span(native_plan.find(haystack)?);
     ensure_equal("regex", oracle, regex_value, cell)?;
     ensure_equal("fre-kernels", oracle, kernels_value, cell)?;
+    let qualified_route = if let Some(qualified) = &qualified {
+        let (matched, execution) = qualified.find(haystack, FacadeSearchLimits::unlimited())?;
+        let qualified_value = O::encode_span(matched.map(|span| (span.start(), span.end())));
+        ensure_equal("qualified exact facade", oracle, qualified_value, cell)?;
+        let expected_route = if haystack.len()
+            >= qualified.build_report().workload.minimum_window_bytes()
+            && qualified.build_report().native.is_published()
+        {
+            QualifiedExactSearchRoute::NativeJit
+        } else {
+            QualifiedExactSearchRoute::PortableLiteral
+        };
+        if execution.route != expected_route {
+            return Err(format!(
+                "qualified facade route mismatch for {cell:?}: expected {expected_route:?}, got {:?}",
+                execution.route
+            )
+            .into());
+        }
+        Some(execution.route)
+    } else {
+        None
+    };
+    let under_threshold_route = if let Some(under_threshold) = &under_threshold {
+        let (matched, execution) =
+            under_threshold.find(haystack, FacadeSearchLimits::unlimited())?;
+        let qualified_value = O::encode_span(matched.map(|span| (span.start(), span.end())));
+        ensure_equal(
+            "under-threshold qualified exact facade",
+            oracle,
+            qualified_value,
+            cell,
+        )?;
+        if execution.route != QualifiedExactSearchRoute::PortableLiteral
+            || under_threshold.build_report().native.is_published()
+        {
+            return Err(format!(
+                "under-threshold facade must remain portable for {cell:?}, got {:?}",
+                execution.route
+            )
+            .into());
+        }
+        Some(execution.route)
+    } else {
+        None
+    };
 
     let published = publish::<O>(&image, PublicationLimits::default())?;
     let jit_value = O::encode(&published.search(haystack, window)?);
@@ -390,12 +584,36 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
         black_box(O::encode(&published.search(black_box(haystack), window)?));
         black_box(O::regex_search(&regex, black_box(haystack)));
         black_box(O::encode_span(native_plan.find(black_box(haystack))?));
+        if let Some(qualified) = &qualified {
+            black_box(
+                qualified
+                    .find(black_box(haystack), FacadeSearchLimits::unlimited())?
+                    .0,
+            );
+        }
+        if let Some(under_threshold) = &under_threshold {
+            black_box(
+                under_threshold
+                    .find(black_box(haystack), FacadeSearchLimits::unlimited())?
+                    .0,
+            );
+        }
         let lease = cache.get_or_publish(&image)?;
         black_box(O::encode(&lease.search(black_box(haystack), window)?));
     }
 
     let hot_iterations = cell.size.hot_iterations();
-    let mut samples = Vec::with_capacity(10);
+    let mut samples = Vec::with_capacity(15);
+    samples.push(Sample::new(
+        "jit",
+        "plan",
+        "cold_literal_to_validated_kernel_ir_no_regex_parse",
+        measure(20, || {
+            let planned =
+                build_program::<O>(cell.shape).expect("fixed benchmark shape remains valid");
+            cache_identity_word(planned.cache_identity())
+        }),
+    ));
     samples.push(Sample::new(
         "jit",
         "emit",
@@ -502,6 +720,147 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
             )
         }),
     ));
+    if let (
+        Some(qualified),
+        Some(under_threshold),
+        Some(route),
+        Some(under_route),
+        Some((span_image, span_mix)),
+    ) = (
+        &qualified,
+        &under_threshold,
+        qualified_route,
+        under_threshold_route,
+        &qualified_span_image,
+    ) {
+        let search_timed = measure(hot_iterations, || {
+            let (matched, execution) = qualified
+                .find(black_box(haystack), FacadeSearchLimits::unlimited())
+                .expect("qualified facade search remains valid");
+            assert_eq!(
+                execution.route, route,
+                "qualified route changed inside one search-only sample"
+            );
+            O::encode_span(matched.map(|span| (span.start(), span.end())))
+        });
+        samples.push(
+            Sample::new(
+                "fre-qualified-exact",
+                "search",
+                "search_only_declared_workload_build_excluded",
+                search_timed,
+            )
+            .with_evidence(qualified_row_evidence(
+                qualified,
+                route,
+                span_image,
+                *span_mix,
+                haystack.len(),
+                search_timed.iterations,
+            )?),
+        );
+
+        let full_workload_calls = u64::try_from(qualified_workload.minimum_qualifying_searches())
+            .expect("bounded declared workload fits u64");
+        let full_workload_timed = measure_full_workload(
+            full_workload_calls,
+            || {
+                QualifiedExactSearch::new(EXACT_LITERAL, qualified_workload)
+                    .expect("qualified facade build")
+            },
+            |cold| {
+                let (matched, execution) = cold
+                    .find(black_box(haystack), FacadeSearchLimits::unlimited())
+                    .expect("qualified facade workload search remains valid");
+                assert_eq!(
+                    execution.route, route,
+                    "qualified route changed inside full-workload sample"
+                );
+                O::encode_span(matched.map(|span| (span.start(), span.end())))
+            },
+        );
+        samples.push(
+            Sample::new(
+                "fre-qualified-exact",
+                "build_full_workload",
+                "build_plus_declared_workload_amortized_per_search",
+                full_workload_timed,
+            )
+            .with_evidence(qualified_row_evidence(
+                qualified,
+                route,
+                span_image,
+                *span_mix,
+                haystack.len(),
+                full_workload_timed.iterations,
+            )?),
+        );
+
+        let under_threshold_calls =
+            u64::try_from(under_threshold_workload.minimum_qualifying_searches())
+                .expect("bounded under-threshold workload fits u64")
+                .max(1);
+        let under_search_timed = measure(under_threshold_calls, || {
+            let (matched, execution) = under_threshold
+                .find(black_box(haystack), FacadeSearchLimits::unlimited())
+                .expect("under-threshold facade search remains valid");
+            assert_eq!(
+                execution.route, under_route,
+                "under-threshold route changed inside one search-only sample"
+            );
+            O::encode_span(matched.map(|span| (span.start(), span.end())))
+        });
+        samples.push(
+            Sample::new(
+                "fre-qualified-exact-under-threshold",
+                "search",
+                "search_only_forced_portable_under_threshold",
+                under_search_timed,
+            )
+            .with_evidence(qualified_row_evidence(
+                under_threshold,
+                under_route,
+                span_image,
+                *span_mix,
+                haystack.len(),
+                under_search_timed.iterations,
+            )?),
+        );
+
+        let under_full_timed = measure_full_workload(
+            under_threshold_calls,
+            || {
+                QualifiedExactSearch::new(EXACT_LITERAL, under_threshold_workload)
+                    .expect("under-threshold facade build")
+            },
+            |cold| {
+                let (matched, execution) = cold
+                    .find(black_box(haystack), FacadeSearchLimits::unlimited())
+                    .expect("under-threshold facade workload search remains valid");
+                assert_eq!(
+                    execution.route, under_route,
+                    "under-threshold route changed inside full-workload sample"
+                );
+                O::encode_span(matched.map(|span| (span.start(), span.end())))
+            },
+        );
+        samples.push(
+            Sample::new(
+                "fre-qualified-exact-under-threshold",
+                "build_full_workload",
+                "portable_build_plus_declared_workload_amortized_per_search",
+                under_full_timed,
+            )
+            .with_evidence(qualified_row_evidence(
+                under_threshold,
+                under_route,
+                span_image,
+                *span_mix,
+                haystack.len(),
+                under_full_timed.iterations,
+            )?),
+        );
+    }
     samples.push(Sample::new(
         "fre-kernels",
         "search",
@@ -528,7 +887,7 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
         identity: image.artifact_identity_receipt(),
         cache_bookkeeping_bytes: snapshot.current.bookkeeping_bytes,
         cache_hits: snapshot.totals.hits,
-        fixture: "synthetic-v1",
+        fixture: cell.scenario.fixture(),
     };
     for sample in samples {
         print_sample(&metadata, &sample);
@@ -619,6 +978,10 @@ impl OwnedHaystack {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all benchmark scenario construction remains centralized for comparable fixtures"
+)]
 fn make_haystack(cell: Cell) -> OwnedHaystack {
     let length = cell.size.bytes();
     let storage_length = length.checked_add(32).expect("bounded benchmark size");
@@ -655,12 +1018,153 @@ fn make_haystack(cell: Cell) -> OwnedHaystack {
                 .expect("match fits benchmark haystack");
             slice[position..].copy_from_slice(&matched);
         }
+        Scenario::PrimaryDenseSecondaryAbsent => {
+            let literal = adversarial_literal(cell.shape);
+            let (primary, secondary) = selected_pair(literal);
+            assert_ne!(
+                literal[primary], literal[secondary],
+                "primary-dense workload requires distinct selected bytes"
+            );
+            slice.fill(literal[primary]);
+        }
+        Scenario::PairDenseLiteralAbsent => {
+            let literal = adversarial_literal(cell.shape);
+            let (primary, secondary) = selected_pair(literal);
+            let primary_byte = literal[primary];
+            let secondary_byte = literal[secondary];
+            assert_ne!(
+                primary_byte, secondary_byte,
+                "pair-dense workload requires distinct selected bytes"
+            );
+            for candidate in 0..=length
+                .checked_sub(literal.len())
+                .expect("literal fits benchmark haystack")
+            {
+                let primary_index = candidate
+                    .checked_add(primary)
+                    .expect("selected pair fits benchmark haystack");
+                let secondary_index = candidate
+                    .checked_add(secondary)
+                    .expect("selected pair fits benchmark haystack");
+                let primary_slot = slice[primary_index];
+                let secondary_slot = slice[secondary_index];
+                if (primary_slot != b'x' && primary_slot != primary_byte)
+                    || (secondary_slot != b'x' && secondary_slot != secondary_byte)
+                {
+                    continue;
+                }
+                slice[primary_index] = primary_byte;
+                slice[secondary_index] = secondary_byte;
+            }
+        }
+        Scenario::TripleDenseLiteralAbsent => {
+            let literal = adversarial_literal(cell.shape);
+            let (primary, secondary) = selected_pair(literal);
+            let verification = selected_verification(literal, primary, secondary)
+                .expect("adversarial literal has a distinct verification byte");
+            for candidate in 0..=length
+                .checked_sub(literal.len())
+                .expect("literal fits benchmark haystack")
+            {
+                let selected = [
+                    (primary, literal[primary]),
+                    (secondary, literal[secondary]),
+                    (verification, literal[verification]),
+                ];
+                if selected.iter().any(|&(offset, byte)| {
+                    let index = candidate
+                        .checked_add(offset)
+                        .expect("selected triple fits benchmark haystack");
+                    let slot = slice[index];
+                    slot != b'x' && slot != byte
+                }) {
+                    continue;
+                }
+                for (offset, byte) in selected {
+                    let index = candidate
+                        .checked_add(offset)
+                        .expect("selected triple fits benchmark haystack");
+                    slice[index] = byte;
+                }
+            }
+        }
+        Scenario::FalsePairDistantMatch => {
+            let literal = adversarial_literal(cell.shape);
+            let (primary, secondary) = selected_pair(literal);
+            slice[primary] = literal[primary];
+            slice[secondary] = literal[secondary];
+            let position = length
+                .checked_sub(literal.len())
+                .expect("literal fits benchmark haystack");
+            slice[position..].copy_from_slice(literal);
+        }
+        Scenario::Binary => {
+            let literal = adversarial_literal(cell.shape);
+            for (index, byte) in slice.iter_mut().enumerate() {
+                *byte = u8::try_from(index & 0xff).expect("masked index fits in a byte");
+            }
+            let position = distant_position(length, literal.len());
+            let matched_end = position
+                .checked_add(literal.len())
+                .expect("literal fits benchmark haystack");
+            slice[position..matched_end].copy_from_slice(literal);
+        }
+        Scenario::NaturalText => {
+            let literal = adversarial_literal(cell.shape);
+            for (index, byte) in slice.iter_mut().enumerate() {
+                let source = index
+                    .checked_rem(NATURAL_TEXT.len())
+                    .expect("natural-text fixture is nonempty");
+                *byte = NATURAL_TEXT[source];
+            }
+            let position = distant_position(length, literal.len());
+            let matched_end = position
+                .checked_add(literal.len())
+                .expect("literal fits benchmark haystack");
+            slice[position..matched_end].copy_from_slice(literal);
+        }
     }
     OwnedHaystack {
         storage,
         start,
         length,
     }
+}
+
+fn adversarial_literal(shape: Shape) -> &'static [u8] {
+    assert_eq!(
+        shape,
+        Shape::Exact,
+        "adversarial pair workloads are admitted only for the exact literal"
+    );
+    EXACT_LITERAL
+}
+
+fn selected_pair(literal: &[u8]) -> (usize, usize) {
+    let pair = Pair::new(literal).expect("adversarial literal has at least two bytes");
+    (usize::from(pair.index1()), usize::from(pair.index2()))
+}
+
+fn selected_verification(
+    literal: &[u8],
+    primary_offset: usize,
+    secondary_offset: usize,
+) -> Option<usize> {
+    let primary_byte = *literal.get(primary_offset)?;
+    let secondary_byte = *literal.get(secondary_offset)?;
+    literal
+        .iter()
+        .position(|&byte| byte != primary_byte && byte != secondary_byte)
+}
+
+fn distant_position(haystack_len: usize, literal_len: usize) -> usize {
+    haystack_len
+        .checked_sub(literal_len)
+        .expect("literal fits benchmark haystack")
+        .checked_mul(3)
+        .expect("bounded benchmark size")
+        .checked_div(4)
+        .expect("nonzero divisor")
 }
 
 fn match_bytes(shape: Shape) -> Vec<u8> {
@@ -722,7 +1226,37 @@ where
     }
 }
 
+fn measure_full_workload<S, I, F>(iterations: u64, initialize: I, mut measured: F) -> Timed
+where
+    I: FnOnce() -> S,
+    F: FnMut(&S) -> u64,
+{
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
+    let start = Instant::now();
+    let state = initialize();
+    for iteration in 0..iterations {
+        let value = black_box(measured(&state));
+        checksum = checksum.rotate_left(9)
+            ^ value.wrapping_add(iteration.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    }
+    let total_ns = start.elapsed().as_nanos();
+    black_box(checksum);
+    Timed {
+        iterations,
+        total_ns,
+        checksum,
+    }
+}
+
 fn identity_word(identity: RuntimeIdentity) -> u64 {
+    u64::from_le_bytes(
+        identity.as_bytes()[..8]
+            .try_into()
+            .expect("identity prefix has fixed length"),
+    )
+}
+
+fn cache_identity_word(identity: fre_kernel_ir::CacheIdentity) -> u64 {
     u64::from_le_bytes(
         identity.as_bytes()[..8]
             .try_into()
@@ -776,12 +1310,155 @@ impl InstructionMix {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NativeArtifactEvidence {
+    image: ImageStats,
+    publication: PublicationAccounting,
+    mix: InstructionMix,
+    identity: ArtifactIdentityReceipt,
+}
+
+#[derive(Clone, Debug)]
+struct RowEvidence {
+    artifact: Option<NativeArtifactEvidence>,
+    output_kind: &'static str,
+    backend: String,
+    route: &'static str,
+    evidence_identity: String,
+    qualification_state: &'static str,
+    qualification_bundle_sha256: String,
+    evidence_binding: String,
+    artifact_binding: &'static str,
+    declared_min_window_bytes: usize,
+    declared_min_qualifying_calls: usize,
+    measured_calls: u64,
+    measured_qualifying_calls: u64,
+}
+
+fn qualification_row_fields(
+    qualification: QualifiedExactSearchQualification,
+) -> Result<(&'static str, String), Box<dyn Error>> {
+    match qualification {
+        QualifiedExactSearchQualification::Candidate => Ok(("candidate", "none".to_owned())),
+        QualifiedExactSearchQualification::Qualified { .. } => qualification
+            .authorized_bundle_sha256()
+            .map(|bundle| ("qualified", hex_encode(&bundle)))
+            .ok_or_else(|| "qualified facade state carries an invalid bundle identity".into()),
+    }
+}
+
+fn qualified_search_backend_label(backend: BackendVersion) -> Result<String, Box<dyn Error>> {
+    if backend != BackendVersion::SEARCH_V7 {
+        return Err(format!(
+            "qualified facade reported search backend {}, expected {}",
+            backend.0,
+            BackendVersion::SEARCH_V7.0
+        )
+        .into());
+    }
+    Ok(format!("aarch64-search-v{}", backend.0))
+}
+
+fn qualified_row_evidence(
+    qualified: &QualifiedExactSearch,
+    route: QualifiedExactSearchRoute,
+    span_image: &NativeImage,
+    span_mix: InstructionMix,
+    haystack_bytes: usize,
+    measured_calls: u64,
+) -> Result<RowEvidence, Box<dyn Error>> {
+    let report = qualified.build_report();
+    let workload = report.workload;
+    let (qualification_state, qualification_bundle_sha256) =
+        qualification_row_fields(report.qualification)?;
+    let (artifact, backend, route_name, artifact_binding, artifact_identity) = match route {
+        QualifiedExactSearchRoute::NativeJit => {
+            let QualifiedExactSearchNativeStatus::Published {
+                image,
+                mapping,
+                identity,
+            } = &qualified.build_report().native
+            else {
+                return Err("facade reported a native route without a published image".into());
+            };
+            if *image != span_image.stats() {
+                return Err(
+                    "facade native-span image stats differ from deterministic evidence image"
+                        .into(),
+                );
+            }
+            let image_identity = span_image.artifact_identity_receipt();
+            if identity.artifact_sha256 != *span_image.artifact_identity().as_bytes()
+                || identity.backend != span_image.backend_version()
+                || identity.target != span_image.target()
+            {
+                return Err(
+                    "facade-reported native identity differs from the executed image contract"
+                        .into(),
+                );
+            }
+            if identity.qualification != report.qualification {
+                return Err(
+                    "facade native identity differs from the build-report qualification state"
+                        .into(),
+                );
+            }
+            let backend = qualified_search_backend_label(identity.backend)?;
+            (
+                Some(NativeArtifactEvidence {
+                    image: *image,
+                    publication: *mapping,
+                    mix: span_mix,
+                    identity: image_identity,
+                }),
+                backend,
+                "native-jit",
+                "facade-reported-identity+deterministic-native-span-image",
+                hex_encode(&identity.artifact_sha256),
+            )
+        }
+        QualifiedExactSearchRoute::PortableLiteral => (
+            None,
+            "portable-literal".to_owned(),
+            "portable-literal",
+            "portable-semantic-owner",
+            "none".to_owned(),
+        ),
+    };
+    let evidence_binding = format!(
+        "fre-qualified-exact-evidence-v2|output=span|backend={backend}|route={route_name}|artifact={artifact_identity}|qualification_state={qualification_state}|qualification_bundle={qualification_bundle_sha256}|minimum_window_bytes={}|minimum_qualifying_calls={}",
+        workload.minimum_window_bytes(),
+        workload.minimum_qualifying_searches(),
+    );
+    let measured_qualifying_calls = if haystack_bytes >= workload.minimum_window_bytes() {
+        measured_calls
+    } else {
+        0
+    };
+    Ok(RowEvidence {
+        artifact,
+        output_kind: "span",
+        backend,
+        route: route_name,
+        evidence_identity: hex_digest(evidence_binding.as_bytes()),
+        qualification_state,
+        qualification_bundle_sha256,
+        evidence_binding,
+        artifact_binding,
+        declared_min_window_bytes: workload.minimum_window_bytes(),
+        declared_min_qualifying_calls: workload.minimum_qualifying_searches(),
+        measured_calls,
+        measured_qualifying_calls,
+    })
+}
+
 #[derive(Debug)]
 struct Sample {
     engine: &'static str,
     stage: &'static str,
     scope: &'static str,
     timed: Timed,
+    evidence: Option<RowEvidence>,
 }
 
 impl Sample {
@@ -796,7 +1473,13 @@ impl Sample {
             stage,
             scope,
             timed,
+            evidence: None,
         }
+    }
+
+    fn with_evidence(mut self, evidence: RowEvidence) -> Self {
+        self.evidence = Some(evidence);
+        self
     }
 }
 
@@ -817,15 +1500,129 @@ struct Metadata {
 }
 
 fn print_header() {
-    println!(
-        "schema,revision,pid,repetition,cell,shape,operation,size,scenario,haystack_bytes,alignment_mod16,engine,stage,timing_scope,iterations,total_ns,ns_per_iter,checksum,semantic_value,code_bytes,data_bytes,payload_used_bytes,total_mapped_bytes,total_pages,instructions,vector_instructions,loads,stores,branches,identity_bytes_hashed,identity_scratch_bytes,identity_heap_allocations,cache_bookkeeping_bytes,cache_hits,fixture"
-    );
+    println!("{CSV_HEADER}");
 }
 
-fn print_sample(metadata: &Metadata, sample: &Sample) {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one CSV serializer keeps the evidence columns and positional schema adjacent"
+)]
+fn format_sample(metadata: &Metadata, sample: &Sample) -> String {
     let revision = std::env::var("FRE_BAKEOFF_REVISION").unwrap_or_else(|_| "unknown".to_owned());
-    println!(
-        "{SCHEMA},{revision},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:#x},{:#x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+    let direct_artifact_identity = metadata.identity.identity.to_string();
+    let (
+        code_bytes,
+        data_bytes,
+        payload_used_bytes,
+        total_mapped_bytes,
+        total_pages,
+        instructions,
+        vector_instructions,
+        loads,
+        stores,
+        branches,
+        identity_bytes_hashed,
+        identity_scratch_bytes,
+        identity_heap_allocations,
+    ) = match sample.evidence.as_ref() {
+        Some(RowEvidence {
+            artifact: Some(artifact),
+            ..
+        }) => (
+            artifact.image.code_bytes,
+            artifact.image.data_bytes,
+            artifact.publication.payload_used_bytes,
+            artifact.publication.total_mapped_bytes,
+            artifact.publication.total_pages,
+            artifact.mix.instructions,
+            artifact.mix.vector,
+            artifact.mix.loads,
+            artifact.mix.stores,
+            artifact.mix.branches,
+            artifact.identity.canonical_bytes_hashed,
+            artifact.identity.scratch_bytes,
+            artifact.identity.heap_allocations,
+        ),
+        Some(RowEvidence { artifact: None, .. }) => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        None => (
+            metadata.image.code_bytes,
+            metadata.image.data_bytes,
+            metadata.publication.payload_used_bytes,
+            metadata.publication.total_mapped_bytes,
+            metadata.publication.total_pages,
+            metadata.mix.instructions,
+            metadata.mix.vector,
+            metadata.mix.loads,
+            metadata.mix.stores,
+            metadata.mix.branches,
+            metadata.identity.canonical_bytes_hashed,
+            metadata.identity.scratch_bytes,
+            metadata.identity.heap_allocations,
+        ),
+    };
+    let evidence_artifact_identity = sample
+        .evidence
+        .as_ref()
+        .and_then(|evidence| evidence.artifact.as_ref())
+        .map(|artifact| artifact.identity.identity.to_string());
+    let (
+        output_kind,
+        backend,
+        route,
+        artifact_identity,
+        evidence_identity,
+        qualification_state,
+        qualification_bundle_sha256,
+        evidence_binding,
+        artifact_binding,
+        declared_min_window_bytes,
+        declared_min_qualifying_calls,
+        measured_calls,
+        measured_qualifying_calls,
+    ) = if let Some(evidence) = sample.evidence.as_ref() {
+        (
+            evidence.output_kind,
+            evidence.backend.as_str(),
+            evidence.route,
+            evidence_artifact_identity.as_deref().unwrap_or("none"),
+            evidence.evidence_identity.as_str(),
+            evidence.qualification_state,
+            evidence.qualification_bundle_sha256.as_str(),
+            evidence.evidence_binding.as_str(),
+            evidence.artifact_binding,
+            evidence.declared_min_window_bytes,
+            evidence.declared_min_qualifying_calls,
+            evidence.measured_calls,
+            evidence.measured_qualifying_calls,
+        )
+    } else {
+        let (route, artifact_identity, artifact_binding) = if sample.engine == "jit" {
+            (
+                "direct-image",
+                direct_artifact_identity.as_str(),
+                "executed-direct-image",
+            )
+        } else {
+            ("reference", "none", "none")
+        };
+        (
+            metadata.cell.operation.name(),
+            sample.engine,
+            route,
+            artifact_identity,
+            artifact_identity,
+            "not-applicable",
+            "none",
+            "legacy-unqualified-row",
+            artifact_binding,
+            0,
+            0,
+            sample.timed.iterations,
+            0,
+        )
+    };
+    format!(
+        "{SCHEMA},{revision},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:#x},{:#x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         process::id(),
         metadata.repetition,
         metadata.cell.id(),
@@ -847,23 +1644,40 @@ fn print_sample(metadata: &Metadata, sample: &Sample) {
             .expect("measurement iterations are nonzero"),
         sample.timed.checksum,
         metadata.semantic_value,
-        metadata.image.code_bytes,
-        metadata.image.data_bytes,
-        metadata.publication.payload_used_bytes,
-        metadata.publication.total_mapped_bytes,
-        metadata.publication.total_pages,
-        metadata.mix.instructions,
-        metadata.mix.vector,
-        metadata.mix.loads,
-        metadata.mix.stores,
-        metadata.mix.branches,
-        metadata.identity.canonical_bytes_hashed,
-        metadata.identity.scratch_bytes,
-        metadata.identity.heap_allocations,
+        code_bytes,
+        data_bytes,
+        payload_used_bytes,
+        total_mapped_bytes,
+        total_pages,
+        instructions,
+        vector_instructions,
+        loads,
+        stores,
+        branches,
+        identity_bytes_hashed,
+        identity_scratch_bytes,
+        identity_heap_allocations,
         metadata.cache_bookkeeping_bytes,
         metadata.cache_hits,
         metadata.fixture,
-    );
+        output_kind,
+        backend,
+        route,
+        artifact_identity,
+        evidence_identity,
+        qualification_state,
+        qualification_bundle_sha256,
+        evidence_binding,
+        artifact_binding,
+        declared_min_window_bytes,
+        declared_min_qualifying_calls,
+        measured_calls,
+        measured_qualifying_calls,
+    )
+}
+
+fn print_sample(metadata: &Metadata, sample: &Sample) {
+    println!("{}", format_sample(metadata, sample));
 }
 
 fn inspect_image(shape: Shape, operation: OperationName) -> Result<(), Box<dyn Error>> {
@@ -1031,8 +1845,36 @@ fn count_regex(regex: &Regex, haystack: &[u8]) -> CountResult {
     result
 }
 
+trait SpanSearch {
+    fn span_search(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<fre_kernel_ir::MatchSpan>, fre_jit_runtime::CallError>;
+}
+
+impl SpanSearch for fre_jit_runtime::PublishedKernel<Span> {
+    fn span_search(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<fre_kernel_ir::MatchSpan>, fre_jit_runtime::CallError> {
+        self.search(haystack, window)
+    }
+}
+
+impl SpanSearch for fre_jit_cache::KernelLease<Span> {
+    fn span_search(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<Option<fre_kernel_ir::MatchSpan>, fre_jit_runtime::CallError> {
+        self.search(haystack, window)
+    }
+}
+
 fn count_jit(
-    kernel: &fre_jit_runtime::PublishedKernel<Span>,
+    kernel: &impl SpanSearch,
     haystack: &[u8],
 ) -> Result<CountResult, fre_jit_runtime::CallError> {
     let mut result = CountResult {
@@ -1041,7 +1883,8 @@ fn count_jit(
     };
     let mut start = 0;
     while start <= haystack.len() {
-        let Some(matched) = kernel.search(haystack, SearchWindow::new(start, haystack.len()))?
+        let Some(matched) =
+            kernel.span_search(haystack, SearchWindow::new(start, haystack.len()))?
         else {
             break;
         };
@@ -1095,42 +1938,260 @@ fn hex_digest(bytes: &[u8]) -> String {
     encoded
 }
 
-fn print_fixture_sample(metadata: &Metadata, sample: &Sample) {
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        use fmt::Write as _;
+        write!(encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
+}
+
+fn format_fixture_sample(metadata: &Metadata, sample: &Sample) -> String {
     let fixture_cell = "exact-count-rebar-sherlock";
     let revision = std::env::var("FRE_BAKEOFF_REVISION").unwrap_or_else(|_| "unknown".to_owned());
-    println!(
-        "{SCHEMA},{revision},{},{},{fixture_cell},exact,count,rebar,sherlock,{},{},{},{},{},{},{},{},{:#x},{:#x},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        process::id(),
-        metadata.repetition,
-        metadata.haystack_bytes,
-        metadata.alignment_mod16,
-        sample.engine,
-        sample.stage,
-        sample.scope,
-        sample.timed.iterations,
-        sample.timed.total_ns,
+    let direct_artifact_identity = metadata.identity.identity.to_string();
+    let (backend, route, artifact_identity, artifact_binding) = if sample.engine == "jit" {
+        (
+            "aarch64-jit",
+            "direct-span-loop",
+            direct_artifact_identity.as_str(),
+            "executed-direct-image",
+        )
+    } else {
+        (sample.engine, "reference", "none", "none")
+    };
+    [
+        SCHEMA.to_owned(),
+        revision,
+        process::id().to_string(),
+        metadata.repetition.to_string(),
+        fixture_cell.to_owned(),
+        "exact".to_owned(),
+        "count".to_owned(),
+        "rebar".to_owned(),
+        "sherlock".to_owned(),
+        metadata.haystack_bytes.to_string(),
+        metadata.alignment_mod16.to_string(),
+        sample.engine.to_owned(),
+        sample.stage.to_owned(),
+        sample.scope.to_owned(),
+        sample.timed.iterations.to_string(),
+        sample.timed.total_ns.to_string(),
         sample
             .timed
             .total_ns
             .checked_div(u128::from(sample.timed.iterations))
-            .expect("measurement iterations are nonzero"),
-        sample.timed.checksum,
-        metadata.semantic_value,
-        metadata.image.code_bytes,
-        metadata.image.data_bytes,
-        metadata.publication.payload_used_bytes,
-        metadata.publication.total_mapped_bytes,
-        metadata.publication.total_pages,
-        metadata.mix.instructions,
-        metadata.mix.vector,
-        metadata.mix.loads,
-        metadata.mix.stores,
-        metadata.mix.branches,
-        metadata.identity.canonical_bytes_hashed,
-        metadata.identity.scratch_bytes,
-        metadata.identity.heap_allocations,
-        metadata.cache_bookkeeping_bytes,
-        metadata.cache_hits,
-        metadata.fixture,
-    );
+            .expect("measurement iterations are nonzero")
+            .to_string(),
+        format!("{:#x}", sample.timed.checksum),
+        format!("{:#x}", metadata.semantic_value),
+        metadata.image.code_bytes.to_string(),
+        metadata.image.data_bytes.to_string(),
+        metadata.publication.payload_used_bytes.to_string(),
+        metadata.publication.total_mapped_bytes.to_string(),
+        metadata.publication.total_pages.to_string(),
+        metadata.mix.instructions.to_string(),
+        metadata.mix.vector.to_string(),
+        metadata.mix.loads.to_string(),
+        metadata.mix.stores.to_string(),
+        metadata.mix.branches.to_string(),
+        metadata.identity.canonical_bytes_hashed.to_string(),
+        metadata.identity.scratch_bytes.to_string(),
+        metadata.identity.heap_allocations.to_string(),
+        metadata.cache_bookkeeping_bytes.to_string(),
+        metadata.cache_hits.to_string(),
+        metadata.fixture.to_owned(),
+        "span-loop-count".to_owned(),
+        backend.to_owned(),
+        route.to_owned(),
+        artifact_identity.to_owned(),
+        artifact_identity.to_owned(),
+        "not-applicable".to_owned(),
+        "none".to_owned(),
+        "legacy-sherlock-row".to_owned(),
+        artifact_binding.to_owned(),
+        "0".to_owned(),
+        "0".to_owned(),
+        sample.timed.iterations.to_string(),
+        "0".to_owned(),
+    ]
+    .join(",")
+}
+
+fn print_fixture_sample(metadata: &Metadata, sample: &Sample) {
+    println!("{}", format_fixture_sample(metadata, sample));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exact_cell(scenario: Scenario) -> Cell {
+        Cell {
+            shape: Shape::Exact,
+            operation: OperationName::Span,
+            size: Size::Short,
+            scenario,
+        }
+    }
+
+    fn match_offsets(haystack: &[u8]) -> Vec<usize> {
+        haystack
+            .windows(EXACT_LITERAL.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == EXACT_LITERAL).then_some(offset))
+            .collect()
+    }
+
+    #[test]
+    fn exact_literal_pair_selection_is_pinned() {
+        assert_eq!(selected_pair(EXACT_LITERAL), (7, 6));
+        assert_eq!(selected_verification(EXACT_LITERAL, 7, 6), Some(0));
+    }
+
+    #[test]
+    fn primary_dense_secondary_absent_has_no_pair_or_match() {
+        let owned = make_haystack(exact_cell(Scenario::PrimaryDenseSecondaryAbsent));
+        let haystack = owned.as_slice();
+        let (primary, secondary) = selected_pair(EXACT_LITERAL);
+        assert!(haystack.iter().all(|&byte| byte == EXACT_LITERAL[primary]));
+        assert!(!haystack.contains(&EXACT_LITERAL[secondary]));
+        assert!(match_offsets(haystack).is_empty());
+    }
+
+    #[test]
+    fn selected_pair_is_dense_without_full_literal() {
+        let owned = make_haystack(exact_cell(Scenario::PairDenseLiteralAbsent));
+        let haystack = owned.as_slice();
+        let (primary, secondary) = selected_pair(EXACT_LITERAL);
+        let last_start = haystack
+            .len()
+            .checked_sub(EXACT_LITERAL.len())
+            .expect("literal fits test haystack");
+        let pair_candidates = (0..=last_start)
+            .filter(|&candidate| {
+                let primary_index = candidate
+                    .checked_add(primary)
+                    .expect("selected pair fits test haystack");
+                let secondary_index = candidate
+                    .checked_add(secondary)
+                    .expect("selected pair fits test haystack");
+                haystack[primary_index] == EXACT_LITERAL[primary]
+                    && haystack[secondary_index] == EXACT_LITERAL[secondary]
+            })
+            .count();
+        assert!(pair_candidates >= 5);
+        assert!(match_offsets(haystack).is_empty());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "candidate and selected offsets are bounded by the immediately preceding last-start proof"
+    )]
+    fn selected_triple_is_dense_without_full_literal() {
+        let owned = make_haystack(exact_cell(Scenario::TripleDenseLiteralAbsent));
+        let haystack = owned.as_slice();
+        let (primary, secondary) = selected_pair(EXACT_LITERAL);
+        let verification = selected_verification(EXACT_LITERAL, primary, secondary)
+            .expect("pinned verification offset");
+        let last_start = haystack
+            .len()
+            .checked_sub(EXACT_LITERAL.len())
+            .expect("literal fits test haystack");
+        let triple_candidates = (0..=last_start)
+            .filter(|&candidate| {
+                haystack[candidate + primary] == EXACT_LITERAL[primary]
+                    && haystack[candidate + secondary] == EXACT_LITERAL[secondary]
+                    && haystack[candidate + verification] == EXACT_LITERAL[verification]
+            })
+            .count();
+        assert!(triple_candidates >= 5);
+        assert!(match_offsets(haystack).is_empty());
+    }
+
+    #[test]
+    fn false_pair_precedes_only_full_match() {
+        let owned = make_haystack(exact_cell(Scenario::FalsePairDistantMatch));
+        let haystack = owned.as_slice();
+        let (primary, secondary) = selected_pair(EXACT_LITERAL);
+        assert_eq!(haystack[primary], EXACT_LITERAL[primary]);
+        assert_eq!(haystack[secondary], EXACT_LITERAL[secondary]);
+        assert_ne!(&haystack[..EXACT_LITERAL.len()], EXACT_LITERAL);
+        assert_eq!(
+            match_offsets(haystack),
+            vec![
+                haystack
+                    .len()
+                    .checked_sub(EXACT_LITERAL.len())
+                    .expect("literal fits test haystack")
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_and_natural_corpora_have_one_distant_match() {
+        for scenario in [Scenario::Binary, Scenario::NaturalText] {
+            let owned = make_haystack(exact_cell(scenario));
+            let haystack = owned.as_slice();
+            assert_eq!(
+                match_offsets(haystack),
+                vec![distant_position(haystack.len(), EXACT_LITERAL.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn normal_and_sherlock_rows_exactly_match_the_v2_csv_schema() {
+        let cell = exact_cell(Scenario::Absent);
+        let program = build_program::<Span>(cell.shape).expect("test program");
+        let image = emit(&program, EmitLimits::default()).expect("test image");
+        let published =
+            publish::<Span>(&image, PublicationLimits::default()).expect("test publication");
+        let metadata = Metadata {
+            cell,
+            repetition: 7,
+            haystack_bytes: 64,
+            alignment_mod16: 0,
+            semantic_value: 0,
+            image: image.stats(),
+            publication: published.accounting(),
+            mix: InstructionMix::for_image(&image).expect("test instruction mix"),
+            identity: image.artifact_identity_receipt(),
+            cache_bookkeeping_bytes: 0,
+            cache_hits: 0,
+            fixture: "schema-test",
+        };
+        let sample = Sample::new(
+            "jit",
+            "direct_lease_call",
+            "schema_test",
+            Timed {
+                iterations: 1,
+                total_ns: 1,
+                checksum: 1,
+            },
+        );
+        let header: Vec<_> = CSV_HEADER.split(',').collect();
+        let normal = format_sample(&metadata, &sample);
+        let sherlock = format_fixture_sample(&metadata, &sample);
+        let normal_columns: Vec<_> = normal.split(',').collect();
+        let sherlock_columns: Vec<_> = sherlock.split(',').collect();
+        assert_eq!(header.len(), 48);
+        assert_eq!(normal_columns.len(), header.len());
+        assert_eq!(sherlock_columns.len(), header.len());
+        let state = header
+            .iter()
+            .position(|column| *column == "qualification_state")
+            .expect("qualification-state column");
+        let bundle = header
+            .iter()
+            .position(|column| *column == "qualification_bundle_sha256")
+            .expect("qualification-bundle column");
+        assert_eq!(normal_columns[state], "not-applicable");
+        assert_eq!(normal_columns[bundle], "none");
+        assert_eq!(sherlock_columns[state], "not-applicable");
+        assert_eq!(sherlock_columns[bundle], "none");
+    }
 }

@@ -1,0 +1,363 @@
+{
+  "schema": "fre-jit-status-v1",
+  "updated_utc": "2026-07-27T00:54:15Z",
+  "branch": "work/jit-v7-promotion-20260726-r1",
+  "base_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+  "qualified_source_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+  "milestones": [
+    {
+      "revision": "57314b4a06950b1236174d9e9054afe9428db448",
+      "subject": "jit: qualify fast exact-literal search route"
+    },
+    {
+      "revision": "85e8423f48ee329d84264488e3e7a918acf5cd16",
+      "subject": "jit: enforce measured cold-cost amortization"
+    },
+    {
+      "revision": "0881191f9c7b0394f14c1d83a5766031ce3e21b1",
+      "subject": "bench: measure JIT planning separately"
+    }
+  ],
+  "status": "search_v7_qualified_explicit_opt_in",
+  "route": {
+    "api": "fre::QualifiedExactSearch",
+    "literal_bytes": 16,
+    "tiers": [
+      {
+        "minimum_window_bytes": 65536,
+        "minimum_qualifying_searches": 1024
+      },
+      {
+        "minimum_window_bytes": 1048576,
+        "minimum_qualifying_searches": 64
+      }
+    ],
+    "fallback": "portable literal plan for every other width, workload, call window, or unavailable native host",
+    "selection_inputs": [
+      "exact semantic operation",
+      "literal width",
+      "declared minimum qualifying searches",
+      "searched window bytes",
+      "native publication availability"
+    ],
+    "forbidden_selection_inputs": [
+      "benchmark name",
+      "fixture identity",
+      "haystack contents",
+      "timing result"
+    ]
+  },
+  "qualification": {
+    "valid": true,
+    "state": "qualified",
+    "backend": "aarch64-search-v7",
+    "scope": "explicit fre::QualifiedExactSearch only; 16-byte literal and declared large-window reuse tiers only; no default facade, class, aggregate, Sherlock, x86-64, or AOT claim",
+    "subject_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+    "subject_tree": "131e38a4bfe5946bba6e994ee376ad239e1cca97",
+    "required_promotion_parent": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+    "bundle_sha256": "de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453",
+    "promotion_gate_sha256": "7c645a31641d41678e2847d6b49b5f73fcc077537c6b97eca5026c97737332ef",
+    "independent_review_sha256": "1c50399d2b4c3b3e7a49abac54c1ec7ae2dafd88086555c4278f6c475a5a2751",
+    "findings_sha256": "bdd3d43db72d8ab4918976899764ff0982c927a5cf56910b7688ebbe13adf04b",
+    "candidate_binary_sha256": "f78edc78aefc1d0431af32ca28783c757cdd516b72f7b8249f6ae4649b090b78",
+    "candidate_build_receipt_sha256": "c0f237c65656bd2f0f4cb1b469045185b96f55b6e00969b7c331bbc8407add64",
+    "bundle_observed_path": "/private/tmp/fre-jit-v7-q8-88e9c22c-bundle-r2",
+    "bundle_observed_path_durability": "ephemeral local copy; not a runtime or deployment-path dependency",
+    "durable_artifact_location": null,
+    "promotion_contract": "research/jit/bakeoff/qualified_exact_search_promotion.tsv",
+    "host": "Apple M5 Max, macOS arm64",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)",
+    "cells": 90,
+    "processes_per_stage": 5,
+    "raw_rows": 5870,
+    "qualified_large_exact_cells": 30,
+    "main_facade_gate_rows": 60,
+    "main_max_facade_over_kernels": 0.939701493,
+    "main_required_ratio": "strictly_less_than_1",
+    "adversarial_gate_cells": 18,
+    "adversarial_max_candidate_over_baseline": 0.152542373,
+    "adversarial_max_ratio": 1.15,
+    "targeted_gate_cells": 1,
+    "targeted_max_candidate_over_baseline": 0.971576447,
+    "targeted_max_ratio": 1.15,
+    "retained_first_run": {
+      "result": "performance_gate_fail",
+      "failing_cell": "exact-exists-1m-present/build_full_workload",
+      "ratio": 1.049564874161
+    }
+  },
+  "historical_invalidated_cold_cost_ns": {
+    "qualification_use": "none; retained from the invalidated pre-Q8 screen",
+    "validated_kernel_ir_mean_range": [
+      379,
+      519
+    ],
+    "emit_and_audit_mean_range": [
+      10603,
+      13483
+    ],
+    "publish_and_first_call_mean_range": [
+      36645,
+      62700
+    ],
+    "build_emit_publish_first_call_mean_range": [
+      46942,
+      94382
+    ],
+    "qualified_64k_build_first_call_mean_range": [
+      47327,
+      55244
+    ],
+    "qualified_1m_build_first_call_mean_range": [
+      55227,
+      80231
+    ],
+    "underqualified_short_build_first_call_mean_range": [
+      84,
+      171
+    ]
+  },
+  "correctness": {
+    "subject_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+    "bundle_validation": "complete frozen replay, exact inventory, binary receipts, promotion receipt, independent review, and external manifest hash passed",
+    "promotion_validation": "direct Q8 parent, closed source delta, exact qualification atom, and Q8-materialized bundle verifier are required",
+    "qualified_router_tests": "7 passed at the promotion state",
+    "bakeoff_unit_tests": "7 passed at the promotion state",
+    "guard_pages": "passed",
+    "strict_wx": "passed",
+    "aapcs64_vector_callee_saved_canary": "passed",
+    "exact_hardware_differential_comparisons": 354096,
+    "class_hardware_differential_comparisons": 308988
+  },
+  "v5_diagnostic_gate": {
+    "qualification_use": "none unless the source-bound 54-cell matrix passes the dense target",
+    "implementation_revision": "0d7cee293022452adcd1e8afe7279d3f069d69db",
+    "fixture_revision": "880597c8e76b51f31d88ccba8befd4e95516459b",
+    "new_fixture": "triple-dense-literal-absent densely matches primary, secondary, and verification columns while omitting the full literal",
+    "required_dense_reference_ratio_max": 1.15,
+    "applies_to": [
+      "pair-dense-literal-absent",
+      "triple-dense-literal-absent"
+    ],
+    "fallback_if_failed": "allocate a new backend version for true per-lane recovery using a NEON SHRN sparse movemask and lowest-set-lane/clear-bit loop"
+  },
+  "historical_evidence": {
+    "source_revision": "0881191f9c7b0394f14c1d83a5766031ce3e21b1",
+    "qualification_use": "none; retained only as historical invalidated evidence",
+    "disposition": "not attributable to or authorization for the current safety repair",
+    "baseline_directory": "/tmp/fre-jit-current-BFQqD6/results",
+    "final_directory": "/private/tmp/fre-jit-r1-qualified-0881191f.bup3jo",
+    "build_receipt": "/private/tmp/fre-jit-r1-qualified-0881191f.bup3jo/build-receipt.txt",
+    "manifest": "/private/tmp/fre-jit-r1-qualified-0881191f.bup3jo/manifest.sha256",
+    "manifest_sha256": "89af5a04190a39c40a4819ce916fc28630330550e1cafc15e9919122af0ae9f7",
+    "raw_csv_sha256": "a5c7aa70810cd887d168f1ce4a4d19298e9088875c08f85d15d2964841cca809",
+    "ranges_csv_sha256": "f7597ec2de8d9c470d5b4168b75ef65e7c592fe212a961142355a791fd0135df",
+    "losses_csv_sha256": "86f36212f8499bea42e31c4682a91fb2e5fe7000b6d8b5845ab14f5517dbb95b",
+    "binary_sha256": "175fe5b0aa754ea3b507383ed3170ebe8e02887153d08a486938a1f4cde6a08b",
+    "build_receipt_sha256": "15ecedab4c4abad8ddbd31625b91773b9d587d33cc74bc3a97dc3c1013f51c8c"
+  },
+  "diagnostic_timing": {
+    "qualification_use": "none; all attempts are preserved as diagnostic only",
+    "attempt_1": {
+      "directory": "/private/tmp/fre-jit-adversarial-ab-f0461488",
+      "control_revision": "d9b15e36039dd2806dcc2ed2ac2e9d392581d9b9",
+      "candidate_revision": "f046148841939bbc44ddadeef87a7905d794f8b0",
+      "cells": 45,
+      "processes_per_cell_per_variant": 5,
+      "candidate_losses_vs_kernels_or_regex": 62,
+      "notable_regressions": "long binary and pair-dense cases are roughly 1.7x to 2.3x slower"
+    },
+    "attempt_2": {
+      "directory": "/private/tmp/fre-jit-adversarial-ab-f0461488-r2",
+      "control_revision": "d9b15e36039dd2806dcc2ed2ac2e9d392581d9b9",
+      "candidate_revision": "f046148841939bbc44ddadeef87a7905d794f8b0",
+      "cells": 45,
+      "processes_per_cell_per_variant": 5,
+      "candidate_losses_vs_kernels_or_regex": 63,
+      "logical_cpus": 18,
+      "observed_active_cpu_percent_range": [
+        115.9,
+        265.7
+      ],
+      "observed_load1_range": [
+        6.39,
+        9.82
+      ],
+      "disposition": "retained with headroom and thermal observations; noisier cell dispersion remains diagnostic"
+    },
+    "main_matrix": {
+      "directory": "/private/tmp/fre-jit-main-f0461488",
+      "source_revision": "f046148841939bbc44ddadeef87a7905d794f8b0",
+      "cells": 90,
+      "processes_per_cell": 5,
+      "losses_vs_kernels_or_regex": 60,
+      "logical_cpus": 18,
+      "disposition": "retained diagnostic evidence only"
+    },
+    "attempt_3": {
+      "directory": "/private/tmp/fre-jit-v4-mask-ab-122ddb06",
+      "control_revision": "47ab3ca903faea44ba8430ca5cff0734794b3055",
+      "candidate_revision": "122ddb06d0284b9a6b0de6aaa08b55f3315c266d",
+      "control_binary_sha256": "ca37805008be64d2cd86d275ccfa21337a6d861d84acf89fe11e4e5c9cd319aa",
+      "candidate_binary_sha256": "462a1d5e39066dbc47d0f38fa6d7281a2789853de7aafd69f08d57af53589eec",
+      "control_receipt_sha256": "e6b542ba82168ac621496292e5e775aef3e189bc201416c99dab72919828f63b",
+      "candidate_receipt_sha256": "f2040ce90e1ff46879bfe3f8caf4ac0fa779948fdbf3dd2b67ab530c6fecad0a",
+      "cells": 45,
+      "processes_per_cell_per_variant": 5,
+      "candidate_losses_vs_kernels_or_regex": 43,
+      "control_losses_vs_kernels_or_regex": 64,
+      "direct_candidate_vs_control": {
+        "faster": 27,
+        "slower": 16,
+        "ties": 2
+      },
+      "direct_group_mean_candidate_over_control": {
+        "binary": 0.533,
+        "false_pair": 0.824,
+        "natural": 0.881,
+        "pair_dense": 1.367,
+        "primary_dense": 1.009
+      },
+      "logical_cpus": 18,
+      "physical_cpus": 18,
+      "observed_active_cpu_percent_range": [
+        21.07,
+        78.13
+      ],
+      "observed_load1_range": [
+        4.84,
+        6.1
+      ],
+      "thermal_pressure": "pmset reported no thermal or performance warning before, during, or after; powermetrics was unavailable without elevated privileges",
+      "sample_dispersion": {
+        "metric": "per-cell direct-JIT sample range divided by mean",
+        "control_median": 0.1495,
+        "control_p95": 0.4319,
+        "control_max": 0.4707,
+        "candidate_median": 0.1489,
+        "candidate_p95": 0.3571,
+        "candidate_max": 0.5172
+      },
+      "retry": "none; all nine pair-dense cells regressed and the group mean regression was systematic rather than an isolated noisy cell",
+      "raw_control_sha256": "6845dfe9ddc4f8680d079fc806ea41265109cd4aaace731a255b48a434c50209",
+      "raw_candidate_sha256": "c219a52f39476ee6099cbe15bb2aaff00f6819eda392f57639c75fbb571a7dc8",
+      "direct_ab_sha256": "812585acfc820164dec210490b8131c1a5325193025f1f7f12969f2182a48eda",
+      "headroom_monitor_sha256": "2f3094cf541e87d091b995616c7987fec3ff2b02458c9a7fa3a254058fe75774",
+      "disposition": "retained diagnostic only; v4 materially improves binary and total losses but is not promotable because pair-dense and primary-dense reference losses remain"
+    },
+    "attempt_4": {
+      "directory": "/private/tmp/fre-jit-v5-tertiary-ab-8a53965a",
+      "control_revision": "37fc5f9aa72b2ab549b2411c3ac6b9b9d6cbf798",
+      "candidate_revision": "8a53965ace7936a3346812f55cbf8eb318613039",
+      "control_binary_sha256": "f957894256934ab114a4cd7b20f2e97c2610204b19da7f4f4b0b84ad160eebbb",
+      "candidate_binary_sha256": "e918c7c25f0202b1a5c3dd5a2f94c6a728a5d29d8429206ce428f25babd5c48a",
+      "control_receipt_sha256": "20597f2b29ad22e7be45cc2889254b58efc4b017b3aacf941853c18036f467fb",
+      "candidate_receipt_sha256": "f42a542d49e3ff2bc53aff50b872feca2240bfa7ccad4d759fb5b441a56b6c27",
+      "cells": 54,
+      "processes_per_cell_per_variant": 5,
+      "candidate_losses_vs_kernels_or_regex": 44,
+      "control_losses_vs_kernels_or_regex": 64,
+      "direct_candidate_vs_control": {
+        "faster": 28,
+        "slower": 16,
+        "ties": 10
+      },
+      "direct_group_mean_candidate_over_control": {
+        "binary": 1.0012,
+        "false_pair": 0.9902,
+        "natural": 0.9942,
+        "pair_dense": 0.0738,
+        "primary_dense": 1.0425,
+        "triple_dense": 0.9821
+      },
+      "candidate_group_mean_over_faster_reference": {
+        "binary": 1.04,
+        "false_pair": 0.8578,
+        "natural": 1.0068,
+        "pair_dense": 0.1873,
+        "primary_dense": 1.8221,
+        "triple_dense": 3.7432
+      },
+      "dense_gate": "failed; pair-dense passed every cell, while triple-dense failed every cell and exceeded the required 1.15 ratio",
+      "logical_cpus": 18,
+      "physical_cpus": 18,
+      "observed_active_cpu_percent_range": [
+        21.8,
+        43.41
+      ],
+      "observed_load1_range": [
+        7.37,
+        8.31
+      ],
+      "thermal_pressure": "pmset reported no thermal or performance warning before, during, or after; powermetrics was unavailable without elevated privileges",
+      "sample_dispersion": {
+        "metric": "per-cell direct-JIT sample range divided by mean",
+        "control_median": 0.1039,
+        "control_p95": 0.397,
+        "control_max": 0.4604,
+        "candidate_median": 0.0852,
+        "candidate_p95": 0.3167,
+        "candidate_max": 0.5751
+      },
+      "retry": "none; all nine triple-dense cells failed the target at a 3.7432 group mean with ample headroom and no observed thermal pressure",
+      "raw_control_sha256": "61e6d7fa6df2ce45e9364239304d90c85b19be4a2f4ae069c7cffeb7ff83e94b",
+      "raw_candidate_sha256": "0fa16538f96dbaa038a0f9f7b9fd0771b000911f0ae53ff6cda3a7591a1a34a6",
+      "direct_ab_sha256": "1643ea9f2200de2c0839b00e07c7c50d3e07a4f3d65e706a3ee8652d85e70408",
+      "headroom_monitor_sha256": "bddd005176245cd8b9e098574e875cb550c6b1ce744bd23709a8501fb0ac2ff2",
+      "disposition": "retained diagnostic only; v5 fixes pair-dense but fails the mandatory triple-dense reference target and is not promotable"
+    }
+  },
+  "commands": [
+    "cargo fmt --all -- --check",
+    "cargo test -p fre --test qualified_exact_search --locked",
+    "cargo clippy -p fre --all-targets --locked -- -D warnings",
+    "RUSTDOCFLAGS=-D warnings cargo doc -p fre --no-deps --locked",
+    "cargo test --manifest-path research/jit/bakeoff/Cargo.toml --locked",
+    "research/jit/bakeoff/test_qualified_exact_search_promotion.sh PROMOTION_REVISION",
+    "research/jit/bakeoff/verify_qualified_exact_search_promotion.sh PROMOTION_REVISION /private/tmp/fre-jit-v7-q8-88e9c22c-bundle-r2 REPOSITORY"
+  ],
+  "blockers": [
+    "no blocker remains for the exact direct-child promotion of the explicit 16-byte QualifiedExactSearch route",
+    "the canonical 34 MiB bundle is currently only an ephemeral local copy; durable content-addressed publication remains an audit-retention follow-up, not a runtime dependency",
+    "class-plus-suffix, the 15-byte Sherlock aggregate, other exact-literal widths, default planner selection, x86-64 publication, and AOT remain outside this qualification"
+  ],
+  "next_action": "Integrate only the exact direct-child promotion commit, run its Q8-materialized external-bundle verifier before release, and publish the canonical bundle under a durable content-addressed artifact location before the observed private/tmp copy expires. Do not widen the route or make it a default.",
+  "owned_paths": [
+    "crates/fre-jit-aarch64",
+    "crates/fre-jit-cache",
+    "crates/fre-jit-runtime",
+    "crates/fre-kernels/src/lib.rs",
+    "crates/fre/src/qualified_exact_search.rs",
+    "crates/fre/tests/qualified_exact_search.rs",
+    "research/jit/bakeoff",
+    "research/jit/STATUS.json"
+  ],
+  "workers": [
+    {
+      "name": "jit_diff_review",
+      "state": "completed",
+      "last_report": "fresh read-only review of immutable 47ab3ca9 returned no findings; safety repair is clean"
+    },
+    {
+      "name": "jit_matrix_runner",
+      "state": "completed",
+      "last_report": "added prebuilt timing support and initial provenance capture"
+    },
+    {
+      "name": "jit_search_audit_review",
+      "state": "completed",
+      "last_report": "specified the fail-closed whole-operation template and adversarial coverage; implemented and tested"
+    },
+    {
+      "name": "root",
+      "state": "in_progress",
+      "heartbeat_utc": "2026-07-26T21:25:17Z"
+    }
+  ],
+  "resource_coordinator": {
+    "heartbeat_utc": "2026-07-26T21:25:17Z",
+    "build_slots_active": 0,
+    "timing_active": 0,
+    "unsafe_holders": 0
+  }
+}

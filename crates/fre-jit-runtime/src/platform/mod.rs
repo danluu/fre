@@ -61,7 +61,9 @@ pub(crate) use implementation::ExecutableMapping;
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-pub(crate) use implementation::{live_code_mappings, with_guarded_haystack};
+pub(crate) use implementation::{
+    invoke_with_vector_callee_saved_canary, live_code_mappings, with_guarded_haystack,
+};
 
 pub(crate) fn ensure_host_supported() -> Result<(), PublishError> {
     implementation::ensure_host_supported()

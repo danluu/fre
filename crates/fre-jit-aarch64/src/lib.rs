@@ -5,6 +5,12 @@
 //! platform-specific publisher must audit the image again, copy it into a
 //! writable mapping, apply the required W^X transition, flush the instruction
 //! cache and only then publish an AAPCS64 function pointer.
+//!
+//! The current unanchored exact-literal backend ranks four deterministic byte
+//! columns. It loads the third and fourth columns only while the preceding
+//! mask still has multiple candidates, then recovers surviving lanes in exact
+//! ascending order. Historical search backend encodings remain versioned and
+//! byte-stable.
 
 #![forbid(unsafe_code)]
 
@@ -14,6 +20,7 @@ mod decode;
 mod emit;
 mod error;
 mod image;
+mod search_template;
 
 pub use abi::{
     Aapcs64V1, AggregateAapcs64V1, AggregateResultLayout, NativeAggregateResult, NativeResult,

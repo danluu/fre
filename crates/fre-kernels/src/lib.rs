@@ -736,11 +736,44 @@ impl LiteralPlan {
         window: Window,
         limits: LiteralSearchLimits,
     ) -> Result<(Option<(usize, usize)>, LiteralAccounting), LiteralError> {
-        if window.start > window.end || window.end > haystack.len() {
+        let accounting = self.preflight_window(haystack.len(), window, limits)?;
+        let relative = self.finder.find(&haystack[window.start..window.end]);
+        let matched =
+            relative
+                .map(|relative| {
+                    let start = window.start.checked_add(relative).ok_or(
+                        LiteralError::ArithmeticOverflow {
+                            computation: "literal match start",
+                        },
+                    )?;
+                    let end = start.checked_add(self.needle_bytes).ok_or(
+                        LiteralError::ArithmeticOverflow {
+                            computation: "literal match end",
+                        },
+                    )?;
+                    Ok((start, end))
+                })
+                .transpose()?;
+        Ok((matched, accounting))
+    }
+
+    /// Validate a literal search and return its exact resource certificate
+    /// without reading the haystack.
+    ///
+    /// This lets a higher-level semantic router preserve the portable plan's
+    /// refusal contract before selecting an independently authenticated
+    /// executor for the same exact-literal operation.
+    pub fn preflight_window(
+        &self,
+        haystack_len: usize,
+        window: Window,
+        limits: LiteralSearchLimits,
+    ) -> Result<LiteralAccounting, LiteralError> {
+        if window.start > window.end || window.end > haystack_len {
             return Err(LiteralError::InvalidWindow {
                 start: window.start,
                 end: window.end,
-                haystack_len: haystack.len(),
+                haystack_len,
             });
         }
         let searched_bytes =
@@ -761,30 +794,12 @@ impl LiteralPlan {
                 limit: limits.max_linear_terms,
             });
         }
-        let accounting = LiteralAccounting {
+        Ok(LiteralAccounting {
             needle_bytes: self.needle_bytes,
             searched_bytes,
             linear_terms,
             scratch_bytes: 0,
-        };
-        let relative = self.finder.find(&haystack[window.start..window.end]);
-        let matched =
-            relative
-                .map(|relative| {
-                    let start = window.start.checked_add(relative).ok_or(
-                        LiteralError::ArithmeticOverflow {
-                            computation: "literal match start",
-                        },
-                    )?;
-                    let end = start.checked_add(self.needle_bytes).ok_or(
-                        LiteralError::ArithmeticOverflow {
-                            computation: "literal match end",
-                        },
-                    )?;
-                    Ok((start, end))
-                })
-                .transpose()?;
-        Ok((matched, accounting))
+        })
     }
 }
 

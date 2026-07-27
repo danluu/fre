@@ -1,14 +1,15 @@
 use core::fmt;
 
-use fre_kernel_ir::{
-    AggregateOutput, Count, MAX_EXACT_AGGREGATE_LITERAL_BYTES, SpanSum, ValidateLimits,
-    build_exact_aggregate,
-};
-
 use crate::{
-    BackendVersion, CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction, LabelKind,
-    NativeAggregateImage, NativeImage, RelocationKind, RelocationTarget,
-    decode::{canonical_word, decode_one},
+    BackendVersion, Condition, CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction,
+    LabelKind, NativeAggregateImage, NativeImage, RelocationKind, RelocationTarget,
+    decode::{canonical_word, decode},
+    image::{SearchManifest, SearchShape},
+};
+use fre_kernel_ir::{
+    AggregateOutput, AnchorFlags, ByteClass, CacheIdentity, Count, Exists,
+    MAX_EXACT_AGGREGATE_LITERAL_BYTES, OutputKind, SelectedEnd, Span, SpanSum, ValidateLimits,
+    build_class_suffix, build_exact_aggregate, build_exact_literal,
 };
 
 /// Independent post-emission authenticity failure.
@@ -65,6 +66,18 @@ pub enum AuditError {
         offset: u32,
         register: u8,
     },
+    InvalidSearchCandidateContract {
+        offset: u32,
+    },
+    InvalidSearchManifest,
+    SearchBackendVersionMismatch {
+        expected: u16,
+        actual: u16,
+    },
+    ForbiddenSearchVectorRegister {
+        offset: u32,
+        register: u8,
+    },
     InvalidAggregateManifest,
     ForbiddenAggregateRegister {
         offset: u32,
@@ -110,12 +123,41 @@ impl std::error::Error for AuditError {}
 /// Instruction-shape and manifest evidence produced by a successful audit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuditReport {
+    /// Complete instruction decode passes performed by this cold audit.
+    pub decode_passes: u32,
+    /// Semantic source identities rebuilt from authenticated rodata.
+    pub source_identity_rebuilds: u32,
     pub instructions: u32,
     pub direct_branches: u32,
     pub data_addresses: u32,
     pub vector_instructions: u32,
     pub stores: u32,
     pub returns: u32,
+}
+
+#[derive(Default)]
+struct AuditWork {
+    decode_passes: u32,
+    source_identity_rebuilds: u32,
+}
+
+impl AuditWork {
+    fn decode(&mut self, code: &[u8]) -> Result<Vec<DecodedInstruction>, AuditError> {
+        let instructions = decode(code)?;
+        self.decode_passes = self
+            .decode_passes
+            .checked_add(1)
+            .ok_or(AuditError::ArithmeticOverflow)?;
+        Ok(instructions)
+    }
+
+    fn record_source_identity_rebuild(&mut self) -> Result<(), AuditError> {
+        self.source_identity_rebuilds = self
+            .source_identity_rebuilds
+            .checked_add(1)
+            .ok_or(AuditError::ArithmeticOverflow)?;
+        Ok(())
+    }
 }
 
 /// Re-decode and authenticate a finalized image.
@@ -132,16 +174,44 @@ pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
     if image.aggregate_manifest().is_some() {
         return Err(AuditError::InvalidImageContract);
     }
-    let report = audit_impl(image, StoreContract::Search)?;
+    // Version and sealed-container checks intentionally precede instruction
+    // decoding or semantic-shape interpretation. In particular, changing a
+    // v2 image's container version to v1 cannot select an older, weaker audit.
+    let mut work = AuditWork::default();
+    let envelope = authenticate_search_envelope(image, &mut work)?;
+    let instructions = work.decode(image.code())?;
+    let manifest = envelope.manifest;
+    let literal = envelope.literal;
+    let report = audit_impl(image, StoreContract::Search, &instructions, &work)?;
+    crate::search_template::validate_search_whole_template(
+        image,
+        manifest,
+        literal,
+        &instructions,
+    )?;
+    if manifest.backend_version == BackendVersion::SEARCH_V3
+        && manifest.shape == SearchShape::ExactLiteral
+        && manifest.anchors == AnchorFlags::default()
+        && !literal.is_empty()
+    {
+        validate_search_candidate_contract(image, manifest, literal, &instructions)?;
+    }
     validate_artifact_identity(image)?;
     Ok(report)
 }
 
 /// Independently re-decode a whole-haystack aggregate image.
 pub fn audit_aggregate(image: &NativeAggregateImage) -> Result<AuditReport, AuditError> {
-    audit_aggregate_shape(image.inner())?;
-    let report = audit_impl(image.inner(), StoreContract::Aggregate)?;
-    audit_aggregate_contract(image.inner())?;
+    let mut work = AuditWork::default();
+    let envelope = authenticate_aggregate_envelope(image.inner(), &mut work)?;
+    let instructions = work.decode(image.code())?;
+    let report = audit_impl(
+        image.inner(),
+        StoreContract::Aggregate,
+        &instructions,
+        &work,
+    )?;
+    audit_aggregate_contract(image.inner(), &instructions, envelope)?;
     validate_artifact_identity(image.inner())?;
     Ok(report)
 }
@@ -154,6 +224,1819 @@ fn validate_artifact_identity(image: &NativeImage) -> Result<(), AuditError> {
         return Err(AuditError::ArtifactIdentityMismatch);
     }
     Ok(())
+}
+
+fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion, AuditError> {
+    match image.backend_version {
+        BackendVersion::SEARCH_V1
+        | BackendVersion::SEARCH_V2
+        | BackendVersion::SEARCH_V3
+        | BackendVersion::SEARCH_V4
+        | BackendVersion::SEARCH_V5
+        | BackendVersion::SEARCH_V6
+        | BackendVersion::SEARCH_V7 => Ok(image.backend_version),
+        actual => Err(AuditError::SearchBackendVersionMismatch {
+            expected: BackendVersion::SEARCH_CURRENT.0,
+            actual: actual.0,
+        }),
+    }
+}
+
+struct AuthenticatedSearchEnvelope<'image> {
+    manifest: SearchManifest,
+    literal: &'image [u8],
+}
+
+fn authenticate_search_envelope<'image>(
+    image: &'image NativeImage,
+    work: &mut AuditWork,
+) -> Result<AuthenticatedSearchEnvelope<'image>, AuditError> {
+    let backend = validate_search_backend_version(image)?;
+    if image.aggregate_manifest().is_some() {
+        return Err(AuditError::InvalidImageContract);
+    }
+    if matches!(
+        backend,
+        BackendVersion::SEARCH_V3
+            | BackendVersion::SEARCH_V4
+            | BackendVersion::SEARCH_V5
+            | BackendVersion::SEARCH_V6
+            | BackendVersion::SEARCH_V7
+    ) {
+        let manifest = validate_sealed_search_manifest(image)?;
+        let literal = authenticate_search_manifest(image, manifest, work)?;
+        return Ok(AuthenticatedSearchEnvelope { manifest, literal });
+    }
+    if image.search_manifest().is_some() {
+        return Err(AuditError::InvalidImageContract);
+    }
+    let manifest = authenticate_legacy_search_semantics(image, backend, work)?;
+    let literal = authenticate_search_manifest(image, manifest, work)?;
+    Ok(AuthenticatedSearchEnvelope { manifest, literal })
+}
+
+fn validate_sealed_search_manifest(image: &NativeImage) -> Result<SearchManifest, AuditError> {
+    let manifest = image
+        .search_manifest()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+    if manifest.backend_version != image.backend_version
+        || manifest.output != image.output
+        || manifest.source_identity != image.source_identity
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    Ok(manifest)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the legacy envelope enumerates every anchor and seals the derived compatibility context in one reviewable function"
+)]
+fn authenticate_legacy_search_semantics(
+    image: &NativeImage,
+    backend: BackendVersion,
+    work: &mut AuditWork,
+) -> Result<SearchManifest, AuditError> {
+    let (shape, literal, class) = match image.symbols.as_ref() {
+        [symbol]
+            if symbol.ir_data_id == 0
+                && symbol.offset == 0
+                && usize::try_from(symbol.length).ok() == Some(image.rodata.len())
+                && symbol.alignment == 16
+                && symbol.kind == DataSymbolKind::Bytes =>
+        {
+            (SearchShape::ExactLiteral, image.rodata.as_ref(), None)
+        }
+        [class_symbol, suffix_symbol]
+            if class_symbol.ir_data_id == 0
+                && class_symbol.offset == 0
+                && class_symbol.length == 32
+                && class_symbol.alignment == 16
+                && class_symbol.kind == DataSymbolKind::ByteClass
+                && suffix_symbol.ir_data_id == 1
+                && suffix_symbol.offset == 32
+                && suffix_symbol.alignment == 16
+                && suffix_symbol.kind == DataSymbolKind::Bytes
+                && usize::try_from(suffix_symbol.length)
+                    .ok()
+                    .and_then(|length| length.checked_add(32))
+                    == Some(image.rodata.len()) =>
+        {
+            let class_bytes = image
+                .rodata
+                .get(..32)
+                .ok_or(AuditError::InvalidSearchManifest)?;
+            (
+                SearchShape::ClassSuffix,
+                image
+                    .rodata
+                    .get(32..)
+                    .ok_or(AuditError::InvalidSearchManifest)?,
+                Some(decode_manifest_byte_class(class_bytes)?),
+            )
+        }
+        _ => return Err(AuditError::InvalidSearchManifest),
+    };
+    let limits = search_identity_limits(image.rodata.len())?;
+    let mut matched = None;
+    for anchors in [
+        AnchorFlags {
+            start: false,
+            end: false,
+        },
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        AnchorFlags {
+            start: false,
+            end: true,
+        },
+        AnchorFlags {
+            start: true,
+            end: true,
+        },
+    ] {
+        work.record_source_identity_rebuild()?;
+        let identity = match (shape, class) {
+            (SearchShape::ExactLiteral, _) => {
+                rebuild_exact_search_identity(image.output, literal, anchors, limits)
+            }
+            (SearchShape::ClassSuffix, Some(class)) => {
+                rebuild_class_search_identity(image.output, class, literal, anchors, limits)
+            }
+            _ => Err(AuditError::InvalidSearchManifest),
+        };
+        if identity.ok() == Some(image.source_identity) && matched.replace(anchors).is_some() {
+            return Err(AuditError::InvalidSearchManifest);
+        }
+    }
+    let anchors = matched.ok_or(AuditError::InvalidSearchManifest)?;
+    let repeated_confirmation_too_wide = match shape {
+        SearchShape::ExactLiteral => {
+            !anchors.start && !anchors.end && literal.len() > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+        }
+        SearchShape::ClassSuffix => {
+            !anchors.start && literal.len() > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+        }
+    };
+    if repeated_confirmation_too_wide {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let selected = match shape {
+        SearchShape::ExactLiteral if !anchors.start && !anchors.end && !literal.is_empty() => {
+            Some(if backend == BackendVersion::SEARCH_V1 {
+                (0, checked_legacy_secondary_offset(literal.len())?, None)
+            } else {
+                let (primary, secondary) = independent_exact_candidate_pair(literal);
+                (primary, secondary, None)
+            })
+        }
+        SearchShape::ClassSuffix if !anchors.start && !literal.is_empty() => {
+            let class_bytes = image
+                .rodata
+                .get(..32)
+                .ok_or(AuditError::InvalidSearchManifest)?;
+            if independent_singleton_class_byte(class_bytes).is_some() {
+                Some((0, checked_legacy_secondary_offset(literal.len())?, None))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let (
+        candidate_policy_version,
+        candidate_block_width,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+    ) = selected.map_or(
+        (
+            SEARCH_CANDIDATE_POLICY_NONE,
+            0,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+        ),
+        |(primary, secondary, verification)| {
+            (
+                SEARCH_CANDIDATE_POLICY_V1,
+                SEARCH_CANDIDATE_BLOCK_WIDTH,
+                primary,
+                secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+            )
+        },
+    );
+    Ok(SearchManifest {
+        backend_version: backend,
+        shape,
+        output: image.output,
+        anchors,
+        source_identity: image.source_identity,
+        literal_bytes: u32::try_from(literal.len()).map_err(|_| AuditError::ArithmeticOverflow)?,
+        candidate_policy_version,
+        candidate_block_width,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        quaternary_offset: SEARCH_CANDIDATE_OFFSET_NONE,
+    })
+}
+
+fn checked_legacy_secondary_offset(literal_len: usize) -> Result<Option<u16>, AuditError> {
+    if literal_len <= 1 {
+        return Ok(None);
+    }
+    let offset = literal_len
+        .checked_sub(1)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    Ok(Some(
+        u16::try_from(offset).map_err(|_| AuditError::InvalidSearchManifest)?,
+    ))
+}
+
+fn authenticate_search_manifest<'image>(
+    image: &'image NativeImage,
+    manifest: SearchManifest,
+    work: &mut AuditWork,
+) -> Result<&'image [u8], AuditError> {
+    let literal_len =
+        usize::try_from(manifest.literal_bytes).map_err(|_| AuditError::InvalidSearchManifest)?;
+    let limits = search_identity_limits(image.rodata.len())?;
+    work.record_source_identity_rebuild()?;
+    let expected_identity = match manifest.shape {
+        SearchShape::ExactLiteral => {
+            if !manifest.anchors.start
+                && !manifest.anchors.end
+                && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            let [symbol] = image.symbols.as_ref() else {
+                return Err(AuditError::InvalidSearchManifest);
+            };
+            if symbol.ir_data_id != 0
+                || symbol.offset != 0
+                || usize::try_from(symbol.length).ok() != Some(literal_len)
+                || symbol.alignment != 16
+                || symbol.kind != DataSymbolKind::Bytes
+                || image.rodata.len() != literal_len
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            rebuild_exact_search_identity(manifest.output, &image.rodata, manifest.anchors, limits)?
+        }
+        SearchShape::ClassSuffix => {
+            if !manifest.anchors.start && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            let [class_symbol, suffix_symbol] = image.symbols.as_ref() else {
+                return Err(AuditError::InvalidSearchManifest);
+            };
+            let expected_rodata_len = 32_usize
+                .checked_add(literal_len)
+                .ok_or(AuditError::ArithmeticOverflow)?;
+            if class_symbol.ir_data_id != 0
+                || class_symbol.offset != 0
+                || class_symbol.length != 32
+                || class_symbol.alignment != 16
+                || class_symbol.kind != DataSymbolKind::ByteClass
+                || suffix_symbol.ir_data_id != 1
+                || suffix_symbol.offset != 32
+                || usize::try_from(suffix_symbol.length).ok() != Some(literal_len)
+                || suffix_symbol.alignment != 16
+                || suffix_symbol.kind != DataSymbolKind::Bytes
+                || image.rodata.len() != expected_rodata_len
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            let class_bytes = image
+                .rodata
+                .get(..32)
+                .ok_or(AuditError::InvalidSearchManifest)?;
+            let suffix = image
+                .rodata
+                .get(32..)
+                .ok_or(AuditError::InvalidSearchManifest)?;
+            let class = decode_manifest_byte_class(class_bytes)?;
+            rebuild_class_search_identity(manifest.output, class, suffix, manifest.anchors, limits)?
+        }
+    };
+    if expected_identity != manifest.source_identity {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    authenticate_search_candidate_policy(image, manifest, literal_len)?;
+    match manifest.shape {
+        SearchShape::ExactLiteral => Ok(&image.rodata),
+        SearchShape::ClassSuffix => image
+            .rodata
+            .get(32..)
+            .ok_or(AuditError::InvalidSearchManifest),
+    }
+}
+
+const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
+const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
+const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
+const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
+const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independent versioned policy reconstruction and every offset bound remain in one fail-closed review unit"
+)]
+fn authenticate_search_candidate_policy(
+    image: &NativeImage,
+    manifest: SearchManifest,
+    literal_len: usize,
+) -> Result<(), AuditError> {
+    let literal = match manifest.shape {
+        SearchShape::ExactLiteral => image.rodata.as_ref(),
+        SearchShape::ClassSuffix => image
+            .rodata
+            .get(32..)
+            .ok_or(AuditError::InvalidSearchManifest)?,
+    };
+    if literal.len() != literal_len {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let selected = match manifest.shape {
+        SearchShape::ExactLiteral
+            if !manifest.anchors.start && !manifest.anchors.end && !literal.is_empty() =>
+        {
+            Some(if manifest.backend_version == BackendVersion::SEARCH_V1 {
+                (
+                    0,
+                    (literal.len() > 1).then(|| {
+                        u16::try_from(
+                            literal
+                                .len()
+                                .checked_sub(1)
+                                .expect("non-empty legacy literal"),
+                        )
+                        .expect("legacy repeated-confirmation bound fits u16")
+                    }),
+                    None,
+                    None,
+                )
+            } else {
+                let (primary, secondary) = independent_exact_candidate_pair(literal);
+                let (verification, quaternary) = if manifest.backend_version
+                    == BackendVersion::SEARCH_V7
+                {
+                    independent_ranked_verification_offsets(literal, primary, secondary)
+                } else {
+                    (
+                        matches!(
+                            manifest.backend_version,
+                            BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+                        )
+                        .then(|| independent_exact_verification_offset(literal, primary, secondary))
+                        .flatten(),
+                        None,
+                    )
+                };
+                (primary, secondary, verification, quaternary)
+            })
+        }
+        SearchShape::ClassSuffix if !manifest.anchors.start && !literal.is_empty() => {
+            let class = image
+                .rodata
+                .get(..32)
+                .ok_or(AuditError::InvalidSearchManifest)?;
+            independent_singleton_class_byte(class).map(|_| {
+                (
+                    0,
+                    (literal.len() > 1).then(|| {
+                        u16::try_from(
+                            literal
+                                .len()
+                                .checked_sub(1)
+                                .expect("non-empty legacy suffix"),
+                        )
+                        .expect("authenticated repeated-confirmation bound fits u16")
+                    }),
+                    None,
+                    None,
+                )
+            })
+        }
+        _ => None,
+    };
+    let expected = selected.map_or(
+        (
+            SEARCH_CANDIDATE_POLICY_NONE,
+            0,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
+        ),
+        |(primary, secondary, verification, quaternary)| {
+            (
+                if manifest.backend_version == BackendVersion::SEARCH_V7
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V3
+                } else if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+                ) && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V2
+                } else {
+                    SEARCH_CANDIDATE_POLICY_V1
+                },
+                SEARCH_CANDIDATE_BLOCK_WIDTH,
+                primary,
+                secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+            )
+        },
+    );
+    let actual = (
+        manifest.candidate_policy_version,
+        manifest.candidate_block_width,
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+    );
+    if actual != expected {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    if selected.is_some()
+        && (usize::from(manifest.primary_offset) >= literal.len()
+            || (manifest.secondary_offset != SEARCH_CANDIDATE_OFFSET_NONE
+                && (usize::from(manifest.secondary_offset) >= literal.len()
+                    || manifest.secondary_offset == manifest.primary_offset))
+            || (manifest.verification_offset != SEARCH_CANDIDATE_OFFSET_NONE
+                && (usize::from(manifest.verification_offset) >= literal.len()
+                    || manifest.verification_offset == manifest.primary_offset
+                    || manifest.verification_offset == manifest.secondary_offset))
+            || (manifest.quaternary_offset != SEARCH_CANDIDATE_OFFSET_NONE
+                && (usize::from(manifest.quaternary_offset) >= literal.len()
+                    || manifest.quaternary_offset == manifest.primary_offset
+                    || manifest.quaternary_offset == manifest.secondary_offset
+                    || manifest.quaternary_offset == manifest.verification_offset)))
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    Ok(())
+}
+
+fn independent_singleton_class_byte(class: &[u8]) -> Option<u8> {
+    if class.len() != 32 || class.iter().map(|byte| byte.count_ones()).sum::<u32>() != 1 {
+        return None;
+    }
+    let (index, byte) = class
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, byte)| *byte != 0)?;
+    let bit = usize::try_from(byte.trailing_zeros()).ok()?;
+    u8::try_from(index.checked_mul(8)?.checked_add(bit)?).ok()
+}
+
+fn independent_exact_candidate_pair(literal: &[u8]) -> (u16, Option<u16>) {
+    if literal.len() == 1 {
+        return (0, None);
+    }
+    let mut primary = 0_usize;
+    let mut secondary = 1_usize;
+    if INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(literal[secondary])]
+        < INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(literal[primary])]
+    {
+        core::mem::swap(&mut primary, &mut secondary);
+    }
+    for index in 2..literal.len().min(255) {
+        let byte = literal[index];
+        if INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)]
+            < INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(literal[primary])]
+        {
+            secondary = primary;
+            primary = index;
+        } else if byte != literal[primary]
+            && INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)]
+                < INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(literal[secondary])]
+        {
+            secondary = index;
+        }
+    }
+    (
+        u16::try_from(primary).expect("authenticated exact literal bound fits u16"),
+        Some(u16::try_from(secondary).expect("authenticated exact literal bound fits u16")),
+    )
+}
+
+fn independent_exact_verification_offset(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> Option<u16> {
+    let primary_byte = *literal.get(usize::from(primary_offset))?;
+    let secondary_byte = secondary_offset
+        .and_then(|offset| literal.get(usize::from(offset)))
+        .copied();
+    literal
+        .iter()
+        .position(|&byte| byte != primary_byte && Some(byte) != secondary_byte)
+        .and_then(|offset| u16::try_from(offset).ok())
+}
+
+fn independent_ranked_verification_offsets(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>) {
+    let ranked = literal
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (offset != primary_offset && Some(offset) != secondary_offset)
+                .then_some((INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        });
+    let mut first = None;
+    let mut second = None;
+    for candidate in ranked {
+        if first.is_none_or(|current| candidate < current) {
+            second = first;
+            first = Some(candidate);
+        } else if second.is_none_or(|current| candidate < current) {
+            second = Some(candidate);
+        }
+    }
+    (
+        first.map(|(_, offset)| offset),
+        second.map(|(_, offset)| offset),
+    )
+}
+
+// Frozen copy of memchr 2.8.3's default packed-pair frequency policy. The
+// emitter uses `Pair::new`; the independent audit deliberately does not.
+const INDEPENDENT_BYTE_FREQUENCY_RANK: [u8; 256] = [
+    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43, 42, 41, 40, 39, 38, 37, 36,
+    35, 34, 33, 56, 32, 31, 30, 29, 28, 255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122,
+    232, 202, 215, 224, 208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174,
+    126, 120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167, 186, 112,
+    175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223, 151, 249, 216, 238, 236,
+    253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244, 231, 139, 245, 243, 251, 235, 201, 196,
+    240, 214, 152, 182, 205, 181, 127, 27, 212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105,
+    80, 98, 96, 97, 81, 207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111, 82,
+    108, 118, 141, 113, 129, 119, 125, 165, 117, 92, 106, 83, 72, 99, 93, 65, 79, 166, 237, 163,
+    199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255,
+];
+
+fn search_identity_limits(data_bytes: usize) -> Result<ValidateLimits, AuditError> {
+    let data_bytes = u64::try_from(data_bytes).map_err(|_| AuditError::ArithmeticOverflow)?;
+    let linear_bytes = data_bytes
+        .checked_add(4_096)
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    let validation_work = data_bytes
+        .checked_mul(8)
+        .and_then(|value| value.checked_add(8_192))
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    let defaults = ValidateLimits::default();
+    Ok(ValidateLimits {
+        max_data_bytes: defaults.max_data_bytes.max(linear_bytes),
+        max_serialized_bytes: defaults.max_serialized_bytes.max(linear_bytes),
+        max_estimated_code_bytes: defaults.max_estimated_code_bytes.max(linear_bytes),
+        max_validation_work: defaults.max_validation_work.max(validation_work),
+        max_work_factor: defaults.max_work_factor.max(linear_bytes),
+        ..defaults
+    })
+}
+
+fn decode_manifest_byte_class(bytes: &[u8]) -> Result<ByteClass, AuditError> {
+    let bytes: &[u8; 32] = bytes
+        .try_into()
+        .map_err(|_| AuditError::InvalidSearchManifest)?;
+    let mut members = [0_u8; 256];
+    let mut count = 0_usize;
+    for byte in 0_u16..=u16::from(u8::MAX) {
+        let value = u8::try_from(byte).map_err(|_| AuditError::ArithmeticOverflow)?;
+        let lane = usize::from(value / 8);
+        let bit = u32::from(value % 8);
+        if bytes[lane] & (1_u8 << bit) != 0 {
+            members[count] = value;
+            count = count.checked_add(1).ok_or(AuditError::ArithmeticOverflow)?;
+        }
+    }
+    Ok(ByteClass::from_bytes(&members[..count]))
+}
+
+fn rebuild_exact_search_identity(
+    output: OutputKind,
+    literal: &[u8],
+    anchors: AnchorFlags,
+    limits: ValidateLimits,
+) -> Result<CacheIdentity, AuditError> {
+    match output {
+        OutputKind::Exists => build_exact_literal::<Exists>(literal, anchors, limits)
+            .map(|program| program.cache_identity()),
+        OutputKind::SelectedEnd => build_exact_literal::<SelectedEnd>(literal, anchors, limits)
+            .map(|program| program.cache_identity()),
+        OutputKind::Span => build_exact_literal::<Span>(literal, anchors, limits)
+            .map(|program| program.cache_identity()),
+    }
+    .map_err(|_| AuditError::InvalidSearchManifest)
+}
+
+fn rebuild_class_search_identity(
+    output: OutputKind,
+    class: ByteClass,
+    suffix: &[u8],
+    anchors: AnchorFlags,
+    limits: ValidateLimits,
+) -> Result<CacheIdentity, AuditError> {
+    match output {
+        OutputKind::Exists => build_class_suffix::<Exists>(class, suffix, anchors, limits)
+            .map(|program| program.cache_identity()),
+        OutputKind::SelectedEnd => {
+            build_class_suffix::<SelectedEnd>(class, suffix, anchors, limits)
+                .map(|program| program.cache_identity())
+        }
+        OutputKind::Span => build_class_suffix::<Span>(class, suffix, anchors, limits)
+            .map(|program| program.cache_identity()),
+    }
+    .map_err(|_| AuditError::InvalidSearchManifest)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the authenticated instruction template advances a cursor only after a successful bounds-checked decode lookup"
+)]
+fn validate_search_candidate_contract(
+    image: &NativeImage,
+    manifest: SearchManifest,
+    literal: &[u8],
+    instructions: &[DecodedInstruction],
+) -> Result<(), AuditError> {
+    let authenticated_candidate_shape = manifest.backend_version == BackendVersion::SEARCH_V3
+        && manifest.shape == SearchShape::ExactLiteral
+        && manifest.anchors == AnchorFlags::default()
+        && !literal.is_empty()
+        && literal.len() <= MAX_EXACT_AGGREGATE_LITERAL_BYTES;
+    if !authenticated_candidate_shape {
+        return Err(invalid_search_instruction(0));
+    }
+
+    let primary_index = instructions
+        .windows(2)
+        .position(|pair| {
+            matches!(
+                pair,
+                [
+                    DecodedInstruction::LoadByte {
+                        destination: 11,
+                        base: 8,
+                        ..
+                    },
+                    DecodedInstruction::DuplicateByte16 {
+                        destination: 1,
+                        source: 11
+                    }
+                ]
+            )
+        })
+        .ok_or_else(|| invalid_search_instruction(0))?;
+    let primary_offset = manifest.primary_offset;
+    let secondary_offset = (manifest.secondary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+        .then_some(manifest.secondary_offset);
+    let none_index = image
+        .labels
+        .iter()
+        .find(|label| label.kind == LabelKind::ReturnNone)
+        .and_then(|label| usize::try_from(label.offset / 4).ok())
+        .ok_or_else(|| invalid_search_instruction(primary_index))?;
+    if primary_index != 12 {
+        return Err(invalid_search_instruction(primary_index));
+    }
+    expect_search_instruction(
+        instructions,
+        0,
+        DecodedInstruction::MoveRegister64 {
+            destination: 9,
+            source: 0,
+        },
+    )?;
+    expect_search_instruction(
+        instructions,
+        1,
+        DecodedInstruction::CompareRegister64 { left: 2, right: 3 },
+    )?;
+    let invalid_window = expect_search_condition(instructions, 2, Condition::Higher)?;
+    expect_search_instruction(
+        instructions,
+        3,
+        DecodedInstruction::CompareRegister64 { left: 3, right: 1 },
+    )?;
+    let invalid_end = expect_search_condition(instructions, 4, Condition::Higher)?;
+    expect_search_address(instructions, 5, 8)?;
+    expect_search_instruction(
+        instructions,
+        6,
+        DecodedInstruction::MoveZero64 {
+            destination: 12,
+            immediate: u16::try_from(literal.len()).map_err(|_| AuditError::ArithmeticOverflow)?,
+            shift: 0,
+        },
+    )?;
+    expect_search_instruction(
+        instructions,
+        7,
+        DecodedInstruction::SubtractRegister64 {
+            destination: 10,
+            left: 3,
+            right: 2,
+        },
+    )?;
+    expect_search_instruction(
+        instructions,
+        8,
+        DecodedInstruction::CompareRegister64 {
+            left: 10,
+            right: 12,
+        },
+    )?;
+    let too_short = expect_search_condition(instructions, 9, Condition::CarryClear)?;
+    expect_search_instruction(
+        instructions,
+        10,
+        DecodedInstruction::SubtractRegister64 {
+            destination: 6,
+            left: 3,
+            right: 12,
+        },
+    )?;
+    expect_search_instruction(
+        instructions,
+        11,
+        DecodedInstruction::MoveRegister64 {
+            destination: 5,
+            source: 2,
+        },
+    )?;
+    if [invalid_window, invalid_end, too_short]
+        .into_iter()
+        .any(|target| target != none_index)
+    {
+        return Err(invalid_search_instruction(0));
+    }
+    let mut cursor = primary_index;
+
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 8,
+            offset: primary_offset,
+        },
+    )?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::DuplicateByte16 {
+            destination: 1,
+            source: 11,
+        },
+    )?;
+    cursor += 1;
+    if let Some(secondary_offset) = secondary_offset {
+        expect_search_instruction(
+            instructions,
+            cursor,
+            DecodedInstruction::LoadByte {
+                destination: 11,
+                base: 8,
+                offset: secondary_offset,
+            },
+        )?;
+        cursor += 1;
+        expect_search_instruction(
+            instructions,
+            cursor,
+            DecodedInstruction::DuplicateByte16 {
+                destination: 3,
+                source: 11,
+            },
+        )?;
+        cursor += 1;
+    }
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 9,
+            right: 5,
+        },
+    )?;
+    cursor += 1;
+    if primary_offset != 0 {
+        expect_search_instruction(
+            instructions,
+            cursor,
+            DecodedInstruction::AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: primary_offset,
+            },
+        )?;
+        cursor += 1;
+    }
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareRegister64 { left: 5, right: 6 },
+    )?;
+    cursor += 1;
+    let none_from_entry = expect_search_condition(instructions, cursor, Condition::Higher)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::SubtractRegister64 {
+            destination: 10,
+            left: 6,
+            right: 5,
+        },
+    )?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareImmediate64 {
+            register: 10,
+            immediate: 15,
+        },
+    )?;
+    cursor += 1;
+    let scalar_from_entry = expect_search_condition(instructions, cursor, Condition::CarryClear)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::SubtractImmediate64 {
+            destination: 7,
+            source: 6,
+            immediate: 15,
+        },
+    )?;
+    cursor += 1;
+
+    let vector_index = cursor;
+    let primary_reduction = if secondary_offset.is_some() { 2 } else { 0 };
+    for expected in [
+        DecodedInstruction::LoadVector128 {
+            destination: 0,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: 1,
+        },
+        DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+            destination: primary_reduction,
+            left: 0,
+            right: 0,
+        },
+        DecodedInstruction::MoveVectorDoubleTo64 {
+            destination: 10,
+            source: primary_reduction,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let secondary_from_primary = expect_search_compare_branch(instructions, cursor, true)?;
+    cursor += 1;
+
+    let advance_index = cursor;
+    for expected in [
+        DecodedInstruction::AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 16,
+        },
+        DecodedInstruction::AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 16,
+        },
+        DecodedInstruction::CompareRegister64 { left: 5, right: 7 },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let vector_from_advance =
+        expect_search_condition(instructions, cursor, Condition::LowerOrSame)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareRegister64 { left: 5, right: 6 },
+    )?;
+    cursor += 1;
+    let none_from_advance = expect_search_condition(instructions, cursor, Condition::Higher)?;
+    cursor += 1;
+    let scalar_from_advance = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+
+    let secondary_index = secondary_offset.map(|_| cursor);
+    let (scalar_from_secondary, advance_from_secondary) =
+        if let Some(secondary_offset) = secondary_offset {
+            let secondary_delta = primary_offset.abs_diff(secondary_offset);
+            let secondary_address = if secondary_offset > primary_offset {
+                DecodedInstruction::AddImmediate64 {
+                    destination: 10,
+                    source: 15,
+                    immediate: secondary_delta,
+                }
+            } else {
+                DecodedInstruction::SubtractImmediate64 {
+                    destination: 10,
+                    source: 15,
+                    immediate: secondary_delta,
+                }
+            };
+            for expected in [
+                secondary_address,
+                DecodedInstruction::LoadVector128 {
+                    destination: 2,
+                    base: 10,
+                    offset: 0,
+                },
+                DecodedInstruction::CompareEqualBytes16 {
+                    destination: 2,
+                    left: 2,
+                    right: 3,
+                },
+                DecodedInstruction::AndBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: 2,
+                },
+                DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: 0,
+                },
+                DecodedInstruction::MoveVectorDoubleTo64 {
+                    destination: 10,
+                    source: 0,
+                },
+            ] {
+                expect_search_instruction(instructions, cursor, expected)?;
+                cursor += 1;
+            }
+            let scalar = expect_search_compare_branch(instructions, cursor, true)?;
+            cursor += 1;
+            let advance = expect_search_branch(instructions, cursor)?;
+            cursor += 1;
+            (Some(scalar), Some(advance))
+        } else {
+            (None, None)
+        };
+    let block_setup_index = cursor;
+    for expected in [
+        DecodedInstruction::MoveZero64 {
+            destination: 13,
+            immediate: 1,
+            shift: 0,
+        },
+        DecodedInstruction::AddImmediate64 {
+            destination: 7,
+            source: 5,
+            immediate: 15,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let scalar_from_block_setup = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let tail_setup_index = cursor;
+    for expected in [
+        DecodedInstruction::MoveZero64 {
+            destination: 13,
+            immediate: 0,
+            shift: 0,
+        },
+        DecodedInstruction::MoveRegister64 {
+            destination: 7,
+            source: 6,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let scalar_index = cursor;
+
+    for (branch, target) in [
+        (none_from_entry, none_index),
+        (scalar_from_entry, tail_setup_index),
+        (
+            secondary_from_primary,
+            secondary_index.unwrap_or(block_setup_index),
+        ),
+        (vector_from_advance, vector_index),
+        (none_from_advance, none_index),
+        (scalar_from_advance, tail_setup_index),
+        (scalar_from_block_setup, scalar_index),
+    ] {
+        if branch != target {
+            return Err(invalid_search_instruction(primary_index));
+        }
+    }
+    if scalar_from_secondary.is_some_and(|branch| branch != block_setup_index)
+        || advance_from_secondary.is_some_and(|branch| branch != advance_index)
+    {
+        return Err(invalid_search_instruction(primary_index));
+    }
+    let (found_index, scalar_advance_index, recovery_index, equality_labels) =
+        if literal.len() == 16 {
+            let (found, advance, recovery) =
+                validate_fixed_16_search_confirmation(instructions, scalar_index)?;
+            (found, advance, recovery, Vec::new())
+        } else {
+            validate_generic_search_confirmation(instructions, scalar_index, literal.len())?
+        };
+    let (scalar_exhausted_index, block_resume_index, recovery_end) =
+        validate_search_block_recovery(
+            instructions,
+            recovery_index,
+            primary_offset,
+            secondary_offset,
+            vector_index,
+            tail_setup_index,
+            none_index,
+        )?;
+    if recovery_end != found_index {
+        return Err(invalid_search_instruction(recovery_end));
+    }
+    validate_search_return_template(image, instructions, found_index, none_index)?;
+    validate_search_label_manifest(
+        image,
+        found_index,
+        none_index,
+        vector_index,
+        scalar_index,
+        advance_index,
+        secondary_index,
+        block_setup_index,
+        tail_setup_index,
+        scalar_advance_index,
+        scalar_exhausted_index,
+        block_resume_index,
+        &equality_labels,
+    )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the authenticated fixed-width template advances a cursor only after a successful bounds-checked decode lookup"
+)]
+fn validate_fixed_16_search_confirmation(
+    instructions: &[DecodedInstruction],
+    scalar_index: usize,
+) -> Result<(usize, usize, usize), AuditError> {
+    let fixed = [
+        DecodedInstruction::LoadByteRegister {
+            destination: 10,
+            base: 9,
+            index: 5,
+        },
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        DecodedInstruction::CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+    ];
+    let mut cursor = scalar_index;
+    for expected in fixed {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let advance_from_first = expect_search_condition(instructions, cursor, Condition::NotEqual)?;
+    cursor += 1;
+    for expected in [
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 9,
+            right: 5,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 0,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 1,
+            base: 8,
+            offset: 0,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: 1,
+        },
+        DecodedInstruction::UnsignedMinBytes16 {
+            destination: 0,
+            source: 0,
+        },
+        DecodedInstruction::MoveVectorByteTo32 {
+            destination: 10,
+            source: 0,
+        },
+        DecodedInstruction::CompareImmediate32 {
+            register: 10,
+            immediate: 255,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let advance_from_vector = expect_search_condition(instructions, cursor, Condition::NotEqual)?;
+    cursor += 1;
+    for expected in [
+        DecodedInstruction::MoveRegister64 {
+            destination: 13,
+            source: 5,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: 14,
+            left: 5,
+            right: 12,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let found_from_confirmation = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let advance_index = cursor;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareRegister64 { left: 5, right: 7 },
+    )?;
+    cursor += 1;
+    let recovery_from_advance = expect_search_condition(instructions, cursor, Condition::CarrySet)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+    )?;
+    cursor += 1;
+    let scalar_from_advance = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let recovery_index = cursor;
+    let found_index = found_from_confirmation;
+    for (branch, target) in [
+        (advance_from_first, advance_index),
+        (advance_from_vector, advance_index),
+        (found_from_confirmation, found_index),
+        (recovery_from_advance, recovery_index),
+        (scalar_from_advance, scalar_index),
+    ] {
+        if branch != target {
+            return Err(invalid_search_instruction(scalar_index));
+        }
+    }
+    Ok((found_index, advance_index, recovery_index))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    reason = "the independent scalar confirmation template keeps every load and backedge explicit"
+)]
+fn validate_generic_search_confirmation(
+    instructions: &[DecodedInstruction],
+    scalar_index: usize,
+    literal_len: usize,
+) -> Result<(usize, usize, usize, Vec<(usize, LabelKind)>), AuditError> {
+    let mut cursor = scalar_index;
+    for expected in [
+        DecodedInstruction::LoadByteRegister {
+            destination: 10,
+            base: 9,
+            index: 5,
+        },
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        DecodedInstruction::CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let advance_from_first = expect_search_condition(instructions, cursor, Condition::NotEqual)?;
+    cursor += 1;
+    for expected in [
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 9,
+            right: 5,
+        },
+        DecodedInstruction::MoveRegister64 {
+            destination: 15,
+            source: 15,
+        },
+        DecodedInstruction::MoveRegister64 {
+            destination: 16,
+            source: 8,
+        },
+        DecodedInstruction::MoveZero64 {
+            destination: 17,
+            immediate: u16::try_from(literal_len).map_err(|_| AuditError::ArithmeticOverflow)?,
+            shift: 0,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+
+    let mut vector_loop_index = None;
+    let mut scalar_from_vector = None;
+    let mut advance_from_vector = None;
+    let mut scalar_direct = None;
+    if literal_len >= 16 {
+        vector_loop_index = Some(cursor);
+        expect_search_instruction(
+            instructions,
+            cursor,
+            DecodedInstruction::CompareImmediate64 {
+                register: 17,
+                immediate: 16,
+            },
+        )?;
+        cursor += 1;
+        scalar_from_vector = Some(expect_search_condition(
+            instructions,
+            cursor,
+            Condition::CarryClear,
+        )?);
+        cursor += 1;
+        for expected in [
+            DecodedInstruction::LoadVector128 {
+                destination: 0,
+                base: 15,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVector128 {
+                destination: 1,
+                base: 16,
+                offset: 0,
+            },
+            DecodedInstruction::CompareEqualBytes16 {
+                destination: 0,
+                left: 0,
+                right: 1,
+            },
+            DecodedInstruction::UnsignedMinBytes16 {
+                destination: 0,
+                source: 0,
+            },
+            DecodedInstruction::MoveVectorByteTo32 {
+                destination: 10,
+                source: 0,
+            },
+            DecodedInstruction::CompareImmediate32 {
+                register: 10,
+                immediate: 255,
+            },
+        ] {
+            expect_search_instruction(instructions, cursor, expected)?;
+            cursor += 1;
+        }
+        advance_from_vector = Some(expect_search_condition(
+            instructions,
+            cursor,
+            Condition::NotEqual,
+        )?);
+        cursor += 1;
+        for expected in [
+            DecodedInstruction::AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: 16,
+            },
+            DecodedInstruction::AddImmediate64 {
+                destination: 16,
+                source: 16,
+                immediate: 16,
+            },
+            DecodedInstruction::SubtractImmediate64 {
+                destination: 17,
+                source: 17,
+                immediate: 16,
+            },
+        ] {
+            expect_search_instruction(instructions, cursor, expected)?;
+            cursor += 1;
+        }
+        let vector_backedge = expect_search_branch(instructions, cursor)?;
+        if vector_backedge != vector_loop_index.unwrap_or_default() {
+            return Err(invalid_search_instruction(cursor));
+        }
+        cursor += 1;
+    } else {
+        scalar_direct = Some(expect_search_branch(instructions, cursor)?);
+        cursor += 1;
+    }
+
+    let equality_scalar_index = cursor;
+    let equal_from_empty = expect_search_compare_branch_register(instructions, cursor, 17, false)?;
+    cursor += 1;
+    let equality_scalar_loop_index = cursor;
+    for expected in [
+        DecodedInstruction::LoadByte {
+            destination: 10,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 16,
+            offset: 0,
+        },
+        DecodedInstruction::CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let advance_from_scalar = expect_search_condition(instructions, cursor, Condition::NotEqual)?;
+    cursor += 1;
+    for expected in [
+        DecodedInstruction::AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 1,
+        },
+        DecodedInstruction::AddImmediate64 {
+            destination: 16,
+            source: 16,
+            immediate: 1,
+        },
+        DecodedInstruction::SubtractImmediate64 {
+            destination: 17,
+            source: 17,
+            immediate: 1,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let scalar_backedge = expect_search_compare_branch_register(instructions, cursor, 17, true)?;
+    cursor += 1;
+    let equality_equal_index = cursor;
+    for expected in [
+        DecodedInstruction::MoveRegister64 {
+            destination: 13,
+            source: 5,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: 14,
+            left: 5,
+            right: 12,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let found_index = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let advance_index = cursor;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareRegister64 { left: 5, right: 7 },
+    )?;
+    cursor += 1;
+    let recovery_from_advance = expect_search_condition(instructions, cursor, Condition::CarrySet)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+    )?;
+    cursor += 1;
+    let scan_backedge = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let recovery_index = cursor;
+
+    if advance_from_first != advance_index
+        || advance_from_vector.is_some_and(|target| target != advance_index)
+        || advance_from_scalar != advance_index
+        || scalar_from_vector.is_some_and(|target| target != equality_scalar_index)
+        || scalar_direct.is_some_and(|target| target != equality_scalar_index)
+        || equal_from_empty != equality_equal_index
+        || scalar_backedge != equality_scalar_loop_index
+        || recovery_from_advance != recovery_index
+        || scan_backedge != scalar_index
+    {
+        return Err(invalid_search_instruction(scalar_index));
+    }
+
+    let mut labels = vec![
+        (equality_scalar_index, LabelKind::Internal),
+        (equality_scalar_loop_index, LabelKind::Loop),
+        (equality_equal_index, LabelKind::Internal),
+    ];
+    if let Some(vector_loop_index) = vector_loop_index {
+        labels.push((vector_loop_index, LabelKind::Loop));
+    }
+    Ok((found_index, advance_index, recovery_index, labels))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the authenticated block-recovery template advances only after exact instruction matches"
+)]
+fn validate_search_block_recovery(
+    instructions: &[DecodedInstruction],
+    scalar_exhausted_index: usize,
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    vector_index: usize,
+    tail_setup_index: usize,
+    none_index: usize,
+) -> Result<(usize, usize, usize), AuditError> {
+    let mut cursor = scalar_exhausted_index;
+    let block_from_exhausted =
+        expect_search_compare_branch_register(instructions, cursor, 13, true)?;
+    cursor += 1;
+    let none_from_exhausted = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    let block_resume_index = cursor;
+    for expected in [
+        DecodedInstruction::LoadByte {
+            destination: 11,
+            base: 8,
+            offset: primary_offset,
+        },
+        DecodedInstruction::DuplicateByte16 {
+            destination: 1,
+            source: 11,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    if let Some(secondary_offset) = secondary_offset {
+        for expected in [
+            DecodedInstruction::LoadByte {
+                destination: 11,
+                base: 8,
+                offset: secondary_offset,
+            },
+            DecodedInstruction::DuplicateByte16 {
+                destination: 3,
+                source: 11,
+            },
+        ] {
+            expect_search_instruction(instructions, cursor, expected)?;
+            cursor += 1;
+        }
+    }
+    for expected in [
+        DecodedInstruction::AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+        DecodedInstruction::AddRegister64 {
+            destination: 15,
+            left: 9,
+            right: 5,
+        },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    if primary_offset != 0 {
+        expect_search_instruction(
+            instructions,
+            cursor,
+            DecodedInstruction::AddImmediate64 {
+                destination: 15,
+                source: 15,
+                immediate: primary_offset,
+            },
+        )?;
+        cursor += 1;
+    }
+    for expected in [
+        DecodedInstruction::SubtractImmediate64 {
+            destination: 7,
+            source: 6,
+            immediate: 15,
+        },
+        DecodedInstruction::CompareRegister64 { left: 5, right: 7 },
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    let vector_from_resume = expect_search_condition(instructions, cursor, Condition::LowerOrSame)?;
+    cursor += 1;
+    expect_search_instruction(
+        instructions,
+        cursor,
+        DecodedInstruction::CompareRegister64 { left: 5, right: 6 },
+    )?;
+    cursor += 1;
+    let none_from_resume = expect_search_condition(instructions, cursor, Condition::Higher)?;
+    cursor += 1;
+    let tail_from_resume = expect_search_branch(instructions, cursor)?;
+    cursor += 1;
+    for (branch, target) in [
+        (block_from_exhausted, block_resume_index),
+        (none_from_exhausted, none_index),
+        (vector_from_resume, vector_index),
+        (none_from_resume, none_index),
+        (tail_from_resume, tail_setup_index),
+    ] {
+        if branch != target {
+            return Err(invalid_search_instruction(scalar_exhausted_index));
+        }
+    }
+    Ok((scalar_exhausted_index, block_resume_index, cursor))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the authenticated return template advances a cursor only after a successful bounds-checked decode lookup"
+)]
+fn validate_search_return_template(
+    image: &NativeImage,
+    instructions: &[DecodedInstruction],
+    found_index: usize,
+    none_index: usize,
+) -> Result<(), AuditError> {
+    let mut cursor = found_index;
+    match image.output {
+        fre_kernel_ir::OutputKind::Exists => {}
+        fre_kernel_ir::OutputKind::SelectedEnd => {
+            expect_search_instruction(
+                instructions,
+                cursor,
+                DecodedInstruction::Store64 {
+                    source: 14,
+                    base: 4,
+                    offset: 8,
+                },
+            )?;
+            cursor += 1;
+        }
+        fre_kernel_ir::OutputKind::Span => {
+            for expected in [
+                DecodedInstruction::Store64 {
+                    source: 13,
+                    base: 4,
+                    offset: 0,
+                },
+                DecodedInstruction::Store64 {
+                    source: 14,
+                    base: 4,
+                    offset: 8,
+                },
+            ] {
+                expect_search_instruction(instructions, cursor, expected)?;
+                cursor += 1;
+            }
+        }
+    }
+    for expected in [
+        DecodedInstruction::MoveZero64 {
+            destination: 0,
+            immediate: 1,
+            shift: 0,
+        },
+        DecodedInstruction::Return,
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    if cursor != none_index {
+        return Err(invalid_search_instruction(cursor));
+    }
+    for expected in [
+        DecodedInstruction::MoveZero64 {
+            destination: 0,
+            immediate: 0,
+            shift: 0,
+        },
+        DecodedInstruction::Return,
+    ] {
+        expect_search_instruction(instructions, cursor, expected)?;
+        cursor += 1;
+    }
+    if cursor != instructions.len() {
+        return Err(invalid_search_instruction(cursor));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "all exact-search label roles remain explicit in the authenticated manifest"
+)]
+fn validate_search_label_manifest(
+    image: &NativeImage,
+    found_index: usize,
+    none_index: usize,
+    vector_index: usize,
+    scalar_index: usize,
+    candidate_advance_index: usize,
+    secondary_index: Option<usize>,
+    block_setup_index: usize,
+    tail_setup_index: usize,
+    scalar_advance_index: usize,
+    scalar_exhausted_index: usize,
+    block_resume_index: usize,
+    equality_labels: &[(usize, LabelKind)],
+) -> Result<(), AuditError> {
+    let mut expected = vec![
+        (0, LabelKind::Entry),
+        (found_index, LabelKind::ReturnFound),
+        (none_index, LabelKind::ReturnNone),
+        (vector_index, LabelKind::Loop),
+        (scalar_index, LabelKind::SlowPath),
+        (candidate_advance_index, LabelKind::Internal),
+        (block_setup_index, LabelKind::SlowPath),
+        (tail_setup_index, LabelKind::SlowPath),
+        (scalar_exhausted_index, LabelKind::Internal),
+        (block_resume_index, LabelKind::Internal),
+    ];
+    if let Some(secondary_index) = secondary_index {
+        expected.push((secondary_index, LabelKind::SlowPath));
+    }
+    expected.push((scalar_index, LabelKind::Loop));
+    expected.push((scalar_advance_index, LabelKind::Internal));
+    expected.extend_from_slice(equality_labels);
+    expected.sort_unstable();
+    if image.labels.len() != expected.len() {
+        return Err(invalid_search_instruction(0));
+    }
+    for (actual, &(index, kind)) in image.labels.iter().zip(expected.iter()) {
+        if actual.kind != kind || usize::try_from(actual.offset / 4).ok() != Some(index) {
+            return Err(invalid_search_instruction(index));
+        }
+    }
+    Ok(())
+}
+
+fn expect_search_instruction(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    expected: DecodedInstruction,
+) -> Result<(), AuditError> {
+    if instructions.get(index) != Some(&expected) {
+        return Err(invalid_search_instruction(index));
+    }
+    Ok(())
+}
+
+fn expect_search_condition(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    expected: Condition,
+) -> Result<usize, AuditError> {
+    let Some(DecodedInstruction::BranchCondition {
+        condition,
+        displacement,
+    }) = instructions.get(index)
+    else {
+        return Err(invalid_search_instruction(index));
+    };
+    if *condition != expected {
+        return Err(invalid_search_instruction(index));
+    }
+    search_branch_target(index, *displacement, instructions.len())
+}
+
+fn expect_search_address(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    destination: u8,
+) -> Result<(), AuditError> {
+    if !matches!(
+        instructions.get(index),
+        Some(DecodedInstruction::Address {
+            destination: actual,
+            ..
+        }) if *actual == destination
+    ) {
+        return Err(invalid_search_instruction(index));
+    }
+    Ok(())
+}
+
+fn expect_search_compare_branch(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    expected_nonzero: bool,
+) -> Result<usize, AuditError> {
+    expect_search_compare_branch_register(instructions, index, 10, expected_nonzero)
+}
+
+fn expect_search_compare_branch_register(
+    instructions: &[DecodedInstruction],
+    index: usize,
+    expected_register: u8,
+    expected_nonzero: bool,
+) -> Result<usize, AuditError> {
+    let Some(DecodedInstruction::CompareBranchZero64 {
+        register,
+        nonzero,
+        displacement,
+    }) = instructions.get(index)
+    else {
+        return Err(invalid_search_instruction(index));
+    };
+    if *register != expected_register || *nonzero != expected_nonzero {
+        return Err(invalid_search_instruction(index));
+    }
+    search_branch_target(index, *displacement, instructions.len())
+}
+
+fn expect_search_branch(
+    instructions: &[DecodedInstruction],
+    index: usize,
+) -> Result<usize, AuditError> {
+    let Some(DecodedInstruction::Branch { displacement }) = instructions.get(index) else {
+        return Err(invalid_search_instruction(index));
+    };
+    search_branch_target(index, *displacement, instructions.len())
+}
+
+fn search_branch_target(
+    index: usize,
+    displacement: i32,
+    instruction_count: usize,
+) -> Result<usize, AuditError> {
+    let byte_offset = instruction_offset(index)?;
+    let target = i64::from(byte_offset)
+        .checked_add(i64::from(displacement))
+        .ok_or(AuditError::ArithmeticOverflow)?;
+    if target < 0 || target % 4 != 0 {
+        return Err(invalid_search_instruction(index));
+    }
+    let target = usize::try_from(target / 4).map_err(|_| AuditError::ArithmeticOverflow)?;
+    if target >= instruction_count {
+        return Err(invalid_search_instruction(index));
+    }
+    Ok(target)
+}
+
+fn invalid_search_instruction(index: usize) -> AuditError {
+    AuditError::InvalidSearchCandidateContract {
+        offset: u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_mul(4))
+            .unwrap_or(u32::MAX),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -169,12 +2052,16 @@ enum StoreContract {
 fn audit_impl(
     image: &NativeImage,
     store_contract: StoreContract,
+    instructions: &[DecodedInstruction],
+    audit_work: &AuditWork,
 ) -> Result<AuditReport, AuditError> {
     validate_layout(image)?;
     validate_labels(image)?;
     validate_symbols(image)?;
     validate_relocation_order(image)?;
     let mut report = AuditReport {
+        decode_passes: audit_work.decode_passes,
+        source_identity_rebuilds: audit_work.source_identity_rebuilds,
         instructions: 0,
         direct_branches: 0,
         data_addresses: 0,
@@ -183,18 +2070,26 @@ fn audit_impl(
         returns: 0,
     };
     let mut relocation_index = 0_usize;
-    for (index, bytes) in image.code.chunks_exact(4).enumerate() {
+    if instructions.len() != image.code.len() / 4 {
+        return Err(AuditError::InvalidLayout);
+    }
+    for (index, (bytes, &instruction)) in image.code.chunks_exact(4).zip(instructions).enumerate() {
         let offset = u32::try_from(index)
             .ok()
             .and_then(|value| value.checked_mul(4))
             .ok_or(AuditError::ArithmeticOverflow)?;
         let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let instruction = decode_one(word, offset)?;
         if canonical_word(instruction) != Some(word) {
             return Err(AuditError::NonCanonicalInstruction { offset });
         }
         if let Some(register) = first_forbidden_explicit_gpr(instruction) {
             return Err(AuditError::ForbiddenAggregateRegister { offset, register });
+        }
+        if matches!(store_contract, StoreContract::Search)
+            && let Some(register) =
+                first_forbidden_search_vector_register(instruction, image.backend_version)
+        {
+            return Err(AuditError::ForbiddenSearchVectorRegister { offset, register });
         }
         report.instructions = report
             .instructions
@@ -358,40 +2253,14 @@ fn audit_impl(
     clippy::too_many_lines,
     reason = "the aggregate-only decoded contract is intentionally kept as one auditable gate"
 )]
-fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
-    let literal_len = audit_aggregate_shape(image)?;
-    let manifest = image
-        .aggregate_manifest()
-        .ok_or(AuditError::InvalidAggregateManifest)?;
-    let symbol = image.symbols[0];
-    if symbol.ir_data_id != 0
-        || symbol.offset != 0
-        || usize::try_from(symbol.length).ok() != Some(literal_len)
-        || symbol.alignment != 16
-        || symbol.kind != DataSymbolKind::Bytes
-    {
-        return Err(AuditError::InvalidAggregateManifest);
-    }
-    let (expected_identity, expected_search_identity) = match manifest.output {
-        AggregateOutput::Count => {
-            let program = build_exact_aggregate::<Count>(&image.rodata, ValidateLimits::default())
-                .map_err(|_| AuditError::InvalidAggregateManifest)?;
-            (program.cache_identity(), program.search_cache_identity())
-        }
-        AggregateOutput::SpanSum => {
-            let program =
-                build_exact_aggregate::<SpanSum>(&image.rodata, ValidateLimits::default())
-                    .map_err(|_| AuditError::InvalidAggregateManifest)?;
-            (program.cache_identity(), program.search_cache_identity())
-        }
-    };
-    if manifest.source_identity != expected_identity
-        || image.source_identity != expected_search_identity
-    {
-        return Err(AuditError::InvalidAggregateManifest);
-    }
+fn audit_aggregate_contract(
+    image: &NativeImage,
+    instructions: &[DecodedInstruction],
+    envelope: AuthenticatedAggregateEnvelope,
+) -> Result<(), AuditError> {
+    let literal_len = envelope.literal_len;
+    let output = envelope.output;
 
-    let instructions = crate::decode(image.code())?;
     let mut stores = Vec::new();
     let mut status_zero = None;
     let mut status_one = None;
@@ -401,7 +2270,7 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
         if let Some(register) = first_forbidden_aggregate_vector_register(instruction) {
             return Err(AuditError::ForbiddenAggregateVectorRegister { offset, register });
         }
-        validate_aggregate_critical_write(&instructions, index, literal_len, manifest.output)?;
+        validate_aggregate_critical_write(instructions, index, literal_len, output)?;
         match instruction {
             DecodedInstruction::Address { destination: 8, .. } => {
                 address_count = address_count
@@ -415,7 +2284,7 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
             | DecodedInstruction::LoadByteRegister { .. }
             | DecodedInstruction::Load64RegisterScaled { .. }
             | DecodedInstruction::LoadVector128 { .. } => {
-                if !valid_aggregate_load(&instructions, index, literal_len) {
+                if !valid_aggregate_load(instructions, index, literal_len) {
                     return Err(AuditError::InvalidAggregateLoad { offset });
                 }
             }
@@ -468,7 +2337,7 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
     let (success_status, success_return) =
         status_zero.ok_or(AuditError::InvalidAggregateStoreContract)?;
     let fault = status_one;
-    let fault_required = literal_len != 0 || manifest.output == AggregateOutput::Count;
+    let fault_required = literal_len != 0 || output == AggregateOutput::Count;
     if fault.is_some() != fault_required {
         return Err(AuditError::InvalidAggregateStoreContract);
     }
@@ -492,21 +2361,35 @@ fn audit_aggregate_contract(image: &NativeImage) -> Result<(), AuditError> {
     if let Some((_fault_status, fault_return)) = fault {
         protected.push(fault_return);
     }
-    validate_aggregate_branches(&instructions, &protected, literal_len)?;
-    validate_aggregate_definite_initialization(&instructions)?;
-    validate_aggregate_reachability(&instructions)?;
-    validate_aggregate_template(image, &instructions, literal_len, manifest.output)?;
+    validate_aggregate_branches(instructions, &protected, literal_len)?;
+    validate_aggregate_definite_initialization(instructions)?;
+    validate_aggregate_reachability(instructions)?;
+    validate_aggregate_template(image, instructions, literal_len, output)?;
     Ok(())
 }
 
-fn audit_aggregate_shape(image: &NativeImage) -> Result<usize, AuditError> {
+#[derive(Clone, Copy)]
+struct AuthenticatedAggregateEnvelope {
+    literal_len: usize,
+    output: AggregateOutput,
+}
+
+fn authenticate_aggregate_envelope(
+    image: &NativeImage,
+    work: &mut AuditWork,
+) -> Result<AuthenticatedAggregateEnvelope, AuditError> {
+    if image.search_manifest().is_some() {
+        return Err(AuditError::InvalidImageContract);
+    }
     let manifest = image
         .aggregate_manifest()
         .ok_or(AuditError::InvalidAggregateManifest)?;
     let literal_len = usize::try_from(manifest.literal_bytes)
         .map_err(|_| AuditError::InvalidAggregateManifest)?;
-    if image.backend_version != BackendVersion::CURRENT
-        || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
+    if !matches!(
+        image.backend_version,
+        BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+    ) || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
     {
@@ -534,7 +2417,39 @@ fn audit_aggregate_shape(image: &NativeImage) -> Result<usize, AuditError> {
     {
         return Err(AuditError::InvalidAggregateManifest);
     }
-    Ok(literal_len)
+    let symbol = image.symbols[0];
+    if symbol.ir_data_id != 0
+        || symbol.offset != 0
+        || usize::try_from(symbol.length).ok() != Some(literal_len)
+        || symbol.alignment != 16
+        || symbol.kind != DataSymbolKind::Bytes
+    {
+        return Err(AuditError::InvalidAggregateManifest);
+    }
+
+    work.record_source_identity_rebuild()?;
+    let (expected_identity, expected_search_identity) = match manifest.output {
+        AggregateOutput::Count => {
+            let program = build_exact_aggregate::<Count>(&image.rodata, ValidateLimits::default())
+                .map_err(|_| AuditError::InvalidAggregateManifest)?;
+            (program.cache_identity(), program.search_cache_identity())
+        }
+        AggregateOutput::SpanSum => {
+            let program =
+                build_exact_aggregate::<SpanSum>(&image.rodata, ValidateLimits::default())
+                    .map_err(|_| AuditError::InvalidAggregateManifest)?;
+            (program.cache_identity(), program.search_cache_identity())
+        }
+    };
+    if manifest.source_identity != expected_identity
+        || image.source_identity != expected_search_identity
+    {
+        return Err(AuditError::InvalidAggregateManifest);
+    }
+    Ok(AuthenticatedAggregateEnvelope {
+        literal_len,
+        output: manifest.output,
+    })
 }
 
 struct AggregateTemplateCursor<'a> {
@@ -1475,6 +3390,7 @@ fn instruction_after(
 
 #[allow(
     clippy::match_same_arms,
+    clippy::too_many_lines,
     reason = "operand arities remain grouped by decoded ISA form for security review"
 )]
 pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> Option<u8> {
@@ -1497,6 +3413,7 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
             ..
         }
         | DecodedInstruction::MoveVectorByteTo32 { destination, .. }
+        | DecodedInstruction::MoveVectorDoubleTo64 { destination, .. }
         | DecodedInstruction::Address { destination, .. }
         | DecodedInstruction::CompareBranchZero64 {
             register: destination,
@@ -1510,6 +3427,11 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
             right,
         }
         | DecodedInstruction::SubtractRegister64 {
+            destination,
+            left,
+            right,
+        }
+        | DecodedInstruction::AndRegister64 {
             destination,
             left,
             right,
@@ -1538,6 +3460,14 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
             destination,
             source,
             ..
+        }
+        | DecodedInstruction::ReverseBits64 {
+            destination,
+            source,
+        }
+        | DecodedInstruction::CountLeadingZeros64 {
+            destination,
+            source,
         } => forbidden(&[destination, source]),
         DecodedInstruction::LoadByte {
             destination, base, ..
@@ -1562,8 +3492,10 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         } => forbidden(&[destination, source, shift]),
         DecodedInstruction::CompareEqualBytes16 { .. }
         | DecodedInstruction::AndBytes16 { .. }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { .. }
         | DecodedInstruction::UnsignedMinBytes16 { .. }
         | DecodedInstruction::UnsignedMaxBytes16 { .. }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { .. }
         | DecodedInstruction::AddAcrossBytes16 { .. }
         | DecodedInstruction::Branch { .. }
         | DecodedInstruction::BranchCondition { .. }
@@ -1587,6 +3519,11 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             destination,
             left,
             right,
+        }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+            destination,
+            left,
+            right,
         } => forbidden(&[destination, left, right]),
         DecodedInstruction::UnsignedMinBytes16 {
             destination,
@@ -1596,11 +3533,70 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             destination,
             source,
         }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+            destination,
+            source,
+        }
         | DecodedInstruction::AddAcrossBytes16 {
             destination,
             source,
         } => forbidden(&[destination, source]),
-        DecodedInstruction::MoveVectorByteTo32 { source, .. } => forbidden(&[source]),
+        DecodedInstruction::MoveVectorByteTo32 { source, .. }
+        | DecodedInstruction::MoveVectorDoubleTo64 { source, .. } => forbidden(&[source]),
+        _ => None,
+    }
+}
+
+fn first_forbidden_search_vector_register(
+    instruction: DecodedInstruction,
+    backend_version: BackendVersion,
+) -> Option<u8> {
+    fn forbidden(registers: &[u8], backend_version: BackendVersion) -> Option<u8> {
+        registers.iter().copied().find(|&register| {
+            register > 7
+                && !(backend_version == BackendVersion::SEARCH_V7 && matches!(register, 16 | 17))
+        })
+    }
+    match instruction {
+        DecodedInstruction::LoadVector128 { destination, .. }
+        | DecodedInstruction::DuplicateByte16 { destination, .. } => {
+            forbidden(&[destination], backend_version)
+        }
+        DecodedInstruction::CompareEqualBytes16 {
+            destination,
+            left,
+            right,
+        }
+        | DecodedInstruction::AndBytes16 {
+            destination,
+            left,
+            right,
+        }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 {
+            destination,
+            left,
+            right,
+        } => forbidden(&[destination, left, right], backend_version),
+        DecodedInstruction::UnsignedMinBytes16 {
+            destination,
+            source,
+        }
+        | DecodedInstruction::UnsignedMaxBytes16 {
+            destination,
+            source,
+        }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+            destination,
+            source,
+        }
+        | DecodedInstruction::AddAcrossBytes16 {
+            destination,
+            source,
+        } => forbidden(&[destination, source], backend_version),
+        DecodedInstruction::MoveVectorByteTo32 { source, .. }
+        | DecodedInstruction::MoveVectorDoubleTo64 { source, .. } => {
+            forbidden(&[source], backend_version)
+        }
         _ => None,
     }
 }
@@ -2369,9 +4365,8 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::CompareImmediate32 { register, .. }
         | DecodedInstruction::CompareBranchZero64 { register, .. } => register_mask(&[register]),
         DecodedInstruction::AddRegister64 { left, right, .. }
-        | DecodedInstruction::SubtractRegister64 { left, right, .. } => {
-            register_mask(&[left, right])
-        }
+        | DecodedInstruction::SubtractRegister64 { left, right, .. }
+        | DecodedInstruction::AndRegister64 { left, right, .. } => register_mask(&[left, right]),
         DecodedInstruction::AddImmediate64 { source, .. }
         | DecodedInstruction::SubtractImmediate64 { source, .. }
         | DecodedInstruction::AndLowBits64 { source, .. }
@@ -2379,6 +4374,8 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::LogicalShiftLeftImmediate64 { source, .. } => {
             register_mask(&[source])
         }
+        DecodedInstruction::ReverseBits64 { source, .. }
+        | DecodedInstruction::CountLeadingZeros64 { source, .. } => register_mask(&[source]),
         DecodedInstruction::LoadByte { base, .. }
         | DecodedInstruction::LoadVector128 { base, .. } => register_mask(&[base]),
         DecodedInstruction::LoadByteRegister { base, index, .. }
@@ -2392,10 +4389,13 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         }
         DecodedInstruction::MoveZero64 { .. }
         | DecodedInstruction::MoveVectorByteTo32 { .. }
+        | DecodedInstruction::MoveVectorDoubleTo64 { .. }
         | DecodedInstruction::CompareEqualBytes16 { .. }
         | DecodedInstruction::AndBytes16 { .. }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { .. }
         | DecodedInstruction::UnsignedMinBytes16 { .. }
         | DecodedInstruction::UnsignedMaxBytes16 { .. }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { .. }
         | DecodedInstruction::AddAcrossBytes16 { .. }
         | DecodedInstruction::Address { .. }
         | DecodedInstruction::Branch { .. }
@@ -2407,11 +4407,16 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
 fn aggregate_vector_reads(instruction: DecodedInstruction) -> u32 {
     match instruction {
         DecodedInstruction::CompareEqualBytes16 { left, right, .. }
-        | DecodedInstruction::AndBytes16 { left, right, .. } => register_mask(&[left, right]),
+        | DecodedInstruction::AndBytes16 { left, right, .. }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { left, right, .. } => {
+            register_mask(&[left, right])
+        }
         DecodedInstruction::UnsignedMinBytes16 { source, .. }
         | DecodedInstruction::UnsignedMaxBytes16 { source, .. }
         | DecodedInstruction::AddAcrossBytes16 { source, .. }
-        | DecodedInstruction::MoveVectorByteTo32 { source, .. } => register_mask(&[source]),
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { source, .. }
+        | DecodedInstruction::MoveVectorByteTo32 { source, .. }
+        | DecodedInstruction::MoveVectorDoubleTo64 { source, .. } => register_mask(&[source]),
         _ => 0,
     }
 }
@@ -2424,6 +4429,8 @@ const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
         | DecodedInstruction::AndBytes16 { destination, .. }
         | DecodedInstruction::UnsignedMinBytes16 { destination, .. }
         | DecodedInstruction::UnsignedMaxBytes16 { destination, .. }
+        | DecodedInstruction::UnsignedMaxPairwiseBytes16 { destination, .. }
+        | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
         | DecodedInstruction::AddAcrossBytes16 { destination, .. } => Some(destination),
         _ => None,
     }

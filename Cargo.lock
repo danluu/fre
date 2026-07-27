@@ -101,6 +101,9 @@ dependencies = [
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",
+ "fre-jit-aarch64",
+ "fre-jit-runtime",
+ "fre-kernel-ir",
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
@@ -190,6 +193,7 @@ name = "fre-jit-aarch64"
 version = "0.1.0"
 dependencies = [
  "fre-kernel-ir",
+ "memchr",
  "sha2",
 ]
 

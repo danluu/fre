@@ -1,6 +1,8 @@
 use core::fmt;
 
-use fre_kernel_ir::{AggregateOutput, AggregateProgramIdentity, CacheIdentity, OutputKind};
+use fre_kernel_ir::{
+    AggregateOutput, AggregateProgramIdentity, AnchorFlags, CacheIdentity, OutputKind,
+};
 use sha2::{Digest, Sha256};
 
 use crate::{ArithmeticSite, EmitError, ResourceKind};
@@ -10,7 +12,32 @@ use crate::{ArithmeticSite, EmitError, ResourceKind};
 pub struct BackendVersion(pub u16);
 
 impl BackendVersion {
-    pub const CURRENT: Self = Self(1);
+    /// Original search templates using `UMAXV`/`UMOV` candidate reduction.
+    pub const SEARCH_V1: Self = Self(1);
+    /// Search templates using `UMAXP`/`FMOV` and scalar-remainder recovery.
+    pub const SEARCH_V2: Self = Self(2);
+    /// Search templates with sealed manifests and block-local recovery.
+    pub const SEARCH_V3: Self = Self(3);
+    /// Search templates with sealed manifests and mask-guided block recovery.
+    pub const SEARCH_V4: Self = Self(4);
+    /// Mask-guided recovery with a sealed third-byte false-pair filter.
+    pub const SEARCH_V5: Self = Self(5);
+    /// Exact per-lane recovery from a sealed three-byte candidate mask.
+    pub const SEARCH_V6: Self = Self(6);
+    /// Exact per-lane recovery with ranked, staged four-column filtering.
+    pub const SEARCH_V7: Self = Self(7);
+    /// Compatibility name for the original search backend.
+    pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
+    /// Current search backend and AOT wire contract.
+    pub const SEARCH_CURRENT: Self = Self::SEARCH_V7;
+    /// Explicit tag assigned to the unchanged aggregate contract by c4d.
+    pub const AGGREGATE_V1: Self = Self(1);
+    /// Historical pre-c4d tag for the same aggregate machine-code contract.
+    pub const AGGREGATE_HISTORICAL_V2: Self = Self(2);
+    /// Current aggregate tag; its AOT wire remains aggregate v1.
+    pub const AGGREGATE_CURRENT: Self = Self::AGGREGATE_V1;
+    /// Compatibility alias for callers that only handle search images.
+    pub const CURRENT: Self = Self::SEARCH_CURRENT;
 }
 
 /// `AArch64` target properties included in every cache/AOT identity.
@@ -154,7 +181,44 @@ pub struct NativeImage {
     pub(crate) relocations: Box<[Relocation]>,
     pub(crate) stats: ImageStats,
     pub(crate) artifact_identity: ArtifactIdentity,
+    pub(crate) search: Option<SearchManifest>,
     pub(crate) aggregate: Option<AggregateManifest>,
+}
+
+/// Sealed semantic and backend envelope for one search image.
+///
+/// This is deliberately distinct from instruction-shape inference. The
+/// independent auditor authenticates these facts against immutable rodata and
+/// the Kernel IR identity before selecting a backend-versioned template.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SearchManifest {
+    pub(crate) backend_version: BackendVersion,
+    pub(crate) shape: SearchShape,
+    pub(crate) output: OutputKind,
+    pub(crate) anchors: AnchorFlags,
+    pub(crate) source_identity: CacheIdentity,
+    /// Exact-literal bytes, or suffix bytes for `ClassSuffix`.
+    pub(crate) literal_bytes: u32,
+    /// Version of the deterministic candidate-selection policy, or zero when
+    /// the authenticated shape has no vector candidate selector.
+    pub(crate) candidate_policy_version: u16,
+    /// Candidate block width selected by that policy.
+    pub(crate) candidate_block_width: u16,
+    /// Selected primary literal/suffix byte offset.
+    pub(crate) primary_offset: u16,
+    /// Selected secondary offset, or `u16::MAX` when absent.
+    pub(crate) secondary_offset: u16,
+    /// Selected third-byte verification offset, or `u16::MAX` when absent.
+    pub(crate) verification_offset: u16,
+    /// Selected fourth-byte verification offset, or `u16::MAX` when absent.
+    pub(crate) quaternary_offset: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum SearchShape {
+    ExactLiteral = 1,
+    ClassSuffix = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +312,10 @@ impl NativeImage {
         self.aggregate
     }
 
+    pub(crate) const fn search_manifest(&self) -> Option<SearchManifest> {
+        self.search
+    }
+
     pub(crate) fn compute_artifact_identity(&self) -> Result<ArtifactIdentity, EmitError> {
         let mut hasher = Sha256::new();
         encode_aot(self, &mut |bytes| hasher.update(bytes))?;
@@ -274,8 +342,15 @@ impl NativeImage {
 }
 
 impl NativeAggregateImage {
+    pub(crate) fn try_new(inner: NativeImage) -> Result<Self, EmitError> {
+        if inner.search.is_some() || inner.aggregate.is_none() {
+            return Err(EmitError::InternalInvariant);
+        }
+        Ok(Self(inner))
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(inner: NativeImage) -> Self {
-        debug_assert!(inner.aggregate.is_some());
         Self(inner)
     }
 
@@ -438,9 +513,29 @@ impl fmt::Display for ArtifactIdentity {
 }
 
 pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
-    let aggregate_bytes = if image.aggregate.is_some() { 4 } else { 0 };
+    // Search v3 and later add an independently authenticated, source-bound
+    // semantic envelope. V5 and later include the sealed verification offset;
+    // V7 also includes the sealed fourth ranked offset.
+    // Aggregate serialization retains its separate four-byte extension and
+    // does not inherit the search wire contract.
+    let manifest_bytes = if image.aggregate.is_some() {
+        4
+    } else if image.search.is_some() {
+        if image.backend_version == BackendVersion::SEARCH_V7 {
+            54
+        } else if matches!(
+            image.backend_version,
+            BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+        ) {
+            52
+        } else {
+            50
+        }
+    } else {
+        0
+    };
     let header = (8_usize + 2 + 6 + 8 + 32 + 16 + 20 + 36)
-        .checked_add(aggregate_bytes)
+        .checked_add(manifest_bytes)
         .ok_or(EmitError::ArithmeticOverflow {
             site: ArithmeticSite::AotSize,
         })?;
@@ -471,8 +566,18 @@ fn enforce(resource: ResourceKind, required: usize, limit: u64) -> Result<(), Em
 
 fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
     let aggregate = image.aggregate;
+    let search = image.search;
     write(if aggregate.is_some() {
         b"FREA64A\x01"
+    } else if search.is_some() {
+        match image.backend_version {
+            BackendVersion::SEARCH_V3 => b"FREA64\0\x03",
+            BackendVersion::SEARCH_V4 => b"FREA64\0\x04",
+            BackendVersion::SEARCH_V5 => b"FREA64\0\x05",
+            BackendVersion::SEARCH_V6 => b"FREA64\0\x06",
+            BackendVersion::SEARCH_V7 => b"FREA64\0\x07",
+            _ => return Err(EmitError::InternalInvariant),
+        }
     } else {
         b"FREA64\0\x01"
     });
@@ -492,6 +597,33 @@ fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), 
     if let Some(manifest) = aggregate {
         write(manifest.source_identity.as_bytes());
         write(&manifest.literal_bytes.to_le_bytes());
+    } else if let Some(manifest) = search {
+        // Retain the legacy source field and also bind the sealed manifest's
+        // copy. Audit requires equality; encoding both makes either mutation
+        // change the artifact identity.
+        write(image.source_identity.as_bytes());
+        write(&manifest.backend_version.0.to_le_bytes());
+        write(&[
+            search_shape_tag(manifest.shape),
+            output_tag(manifest.output),
+            u8::from(manifest.anchors.start) | (u8::from(manifest.anchors.end) << 1),
+            0,
+        ]);
+        write(&manifest.literal_bytes.to_le_bytes());
+        write(&manifest.candidate_policy_version.to_le_bytes());
+        write(&manifest.candidate_block_width.to_le_bytes());
+        write(&manifest.primary_offset.to_le_bytes());
+        write(&manifest.secondary_offset.to_le_bytes());
+        if matches!(
+            image.backend_version,
+            BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6 | BackendVersion::SEARCH_V7
+        ) {
+            write(&manifest.verification_offset.to_le_bytes());
+        }
+        if image.backend_version == BackendVersion::SEARCH_V7 {
+            write(&manifest.quaternary_offset.to_le_bytes());
+        }
+        write(manifest.source_identity.as_bytes());
     } else {
         write(image.source_identity.as_bytes());
     }
@@ -550,6 +682,13 @@ const fn output_tag(output: OutputKind) -> u8 {
         OutputKind::Exists => 1,
         OutputKind::SelectedEnd => 2,
         OutputKind::Span => 3,
+    }
+}
+
+const fn search_shape_tag(shape: SearchShape) -> u8 {
+    match shape {
+        SearchShape::ExactLiteral => 1,
+        SearchShape::ClassSuffix => 2,
     }
 }
 

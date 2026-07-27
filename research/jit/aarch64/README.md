@@ -3,25 +3,37 @@
 `fre-jit-aarch64` is the first executable-ISA lowering layer for validated FRE
 Kernel IR. It emits ordinary pattern-specialized AAPCS64 machine code, not
 regex bytecode and not a dispatch loop. The crate contains no unsafe code and
-does **not** make its output executable. Its current status is a qualified
-native-image prototype, not a production JIT publisher or a default planner
-choice.
+does **not** make its output executable. `fre-jit-runtime` is the separate,
+narrowly unsafe strict-W^X publisher, and `fre-jit-cache` owns bounded
+publication caching. The only high-level route is the explicit
+`fre::QualifiedExactSearch` facade; no default planner selects native
+execution. Search V7 is qualified only for that facade's 16-byte
+large-window/reuse envelope. Its promotion is a direct child of exact measured
+commit `88e9c22c4ac382531bc1026ca0e25587905f5206` and binds external bundle
+SHA-256
+`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
 
 ## Admitted kernels
 
-The v1 emitter recognizes only the two canonical shapes that
+The search-v7 emitter recognizes only the two canonical shapes that
 `fre-kernel-ir` can currently certify:
 
 1. exact byte literals with every combination of absolute start/end anchors;
 2. greedy `[class]+suffix` when the non-empty suffix's first byte is proved not
    to belong to the class.
 
-The exact-literal search uses a NEON 16-byte first-byte filter for unanchored
-literals of at least 16 bytes. Candidate confirmation uses guarded 16-byte
-NEON equality/reduction and a scalar tail. Short literals use a scalar,
-length-specialized loop. Arbitrary byte classes use four little-endian `u64`
-lanes and a variable shift. Class-run extension is monotonic. The disjoint
-delimiter proof means it never backtracks inside a run.
+Unanchored non-empty exact search chooses a deterministic rare byte pair from
+the literal. When at least 16 candidate starts remain, NEON compares the
+primary byte column and consults the secondary column only for primary-hit
+blocks. V7 ranks two additional distinct literal columns, applies them in
+stages only while candidates survive, and then packs the 16 exact candidate
+bytes into a sparse scalar mask. Lowest-set-lane recovery and bit clearing
+preserve exact left-to-right order without rescanning adjacent pairs.
+The final incomplete block is scalar. A 16-byte candidate is confirmed with guarded NEON
+equality/reduction; other widths use the length-specialized confirmation loop.
+Arbitrary byte classes use four little-endian `u64` lanes and a variable shift.
+Class-run extension is monotonic. The disjoint delimiter proof means it never
+backtracks inside a run.
 
 Every vector load is reached only after proving that a complete 16-byte region
 lies inside the checked window or the immutable pattern object. Scalar tails
@@ -43,8 +55,10 @@ x4 = result slot { usize start, usize end }
 w0 = 0 (none) or 1 (found)
 ```
 
-The body uses only caller-saved `x0..x17` and `v0..v1`, makes no calls, uses no
-stack, cannot unwind, and contains no indirect branch. Existence kernels omit
+The body uses only caller-saved `x0..x17` and `v0..v7`, makes no calls, uses no
+stack, cannot unwind, and contains no indirect branch. The independent search
+audit rejects any vector operand outside `v0..v7`, including the AAPCS64
+callee-saved `v8..v15` range. Existence kernels omit
 result stores, selected-end kernels store offset 8, and span kernels store
 offsets 0 and 8. A defensive prologue rejects `start > end` or
 `end > haystack_len` without touching the haystack, although a publisher must
@@ -52,10 +66,23 @@ still validate all pointers and the result slot before entry.
 
 `NativeImage` contains separate code and rodata byte strings, their required
 relative placement/alignment, declared code labels and data symbols, the
-source Kernel IR cache identity, target/feature contract, exact resource
-statistics, and sorted typed relocations. Branch and ADR relocations are fully
-resolved using checked signed-range arithmetic; their symbolic targets remain
-in the manifest. There are no process addresses or external helper targets.
+source Kernel IR cache identity, a sealed search manifest, target/feature
+contract, exact resource statistics, and sorted typed relocations. The search
+manifest binds the backend version, admitted shape, output, anchors, literal
+facts, candidate-policy revision, block width, selected pair and verification
+offsets, and source identity into the artifact identity. Search v6 uses AOT
+wire tag 6 and exact sparse per-lane recovery. Historical search v5 retains
+wire tag 5 and tertiary-filtered pair-group recovery, search v4 retains sealed
+wire tag 4, v3 retains sealed wire tag 3, and search v1 and v2 containers
+retain manifest-free wire tag 1. Golden artifact identities prove that adding
+v6 leaves canonical v1-v5 AOT bytes unchanged. Every version is dispatched to
+a complete versioned template; aggregate wire v1 is unchanged.
+Pre-c4d aggregate images carrying historical backend tag 2 authenticate
+against the same unchanged aggregate-v1 template. Search audit dispatch is
+version- and authenticated-envelope-driven rather than inferred from opcode
+markers or mutable code prefixes. Branch and ADR relocations are fully resolved using checked
+signed-range arithmetic; their symbolic targets remain in the manifest. There
+are no process addresses or external helper targets.
 `AotArtifact` serializes the complete structure deterministically in a
 little-endian, address-free container. It is an FRE interchange container,
 not ELF or Mach-O yet. Its `ArtifactIdentity` is SHA-256 over the complete AOT
@@ -85,6 +112,13 @@ Emission is followed by a small decoder that shares no encoder helpers. The
 audit rejects every instruction outside the admitted scalar/ASIMD subset and
 checks:
 
+- sealed v3, v4, v5, and v6 manifests agree with the target backend, output, anchors,
+  symbols, immutable literal bytes, independently recomputed candidate policy,
+  and rebuilt Kernel IR identity before template dispatch;
+- search v1, v2, v3, v4, v5, and v6 each match a complete, independent per-shape template,
+  including anchored and unanchored exact and class-suffix forms;
+- search and aggregate manifests are mutually exclusive, and aggregate shape,
+  identity, and operation accounting flow through one authenticated envelope;
 - every direct branch target is aligned, in code, and a declared label;
 - every ADR names a declared immutable data object;
 - relocation records are complete, sorted, non-overlapping and byte-exact;
@@ -97,20 +131,21 @@ feed malformed control flow to the upstream total IR validator. The public
 emitter accepts only `ValidatedProgram<O>`, so malformed raw IR is
 unrepresentable at its entry point.
 
-## Qualification evidence
+## Correctness and qualification evidence
 
 The safe test-only ISA model executes the independently decoded emitted bytes,
 including flags, branches, memory bounds and NEON reductions. It is not a
-parallel regex implementation. Current differentials against the Kernel IR
-oracle cover:
+parallel regex implementation. Differentials against the Kernel IR oracle
+cover exact, anchored, class/suffix, all-output, window-boundary and guarded
+native execution. Exact retained counts are generated by the current test run
+and recorded in [`../STATUS.json`](../STATUS.json); this document intentionally
+does not carry stale snapshot counts.
 
-- 107,976 exact-literal combinations across empty/short/16/17-byte literals,
-  all four anchor combinations, exhaustive small haystacks, directed SIMD
-  cases and every valid search window;
-- 347,940 proved-disjoint class/suffix combinations across multiple classes,
-  short and 17-byte suffixes, all anchors, exhaustive ternary haystacks,
-  directed SIMD cases and every valid window;
-- all three output contracts through the same native result ABI.
+Guard-page cases include both rare-pair address orders, first and last vector
+lanes, present and absent results, nonzero windows, fixed-16 false-pair scalar
+confirmation at the right boundary, and resumption to a distant match. Native
+ABI tests preserve `v8..v15`; audit mutation tests reseal hostile images before
+requiring rejection.
 
 Exact-boundary and one-below tests cover code bytes, data bytes, relocations,
 labels, emission work, logical scratch and AOT bytes. Unit tests separately
@@ -122,39 +157,24 @@ exercise the last encodable and first refused PC-relative displacements.
 cargo run -p fre-jit-aarch64 --example code_shapes --quiet
 ```
 
-The current unanchored images are 60 bytes for an empty literal, 172 bytes for
-a 1--15-byte literal, 280 bytes for a SIMD literal, 248 bytes for a scalar
-class/suffix kernel, and 296 bytes for a class kernel with SIMD suffix
-confirmation. Code size is constant with pattern length in each tier; longer
-patterns grow only rodata and emission work.
+The generated table is the authority for current image sizes. Code size is
+constant within each emitted template tier; longer patterns grow rodata and
+metered confirmation work.
 
-## Deliberately remaining outside this crate
+## Layer boundary and remaining blockers
 
-A production publisher must remain a separate, narrowly unsafe platform layer
-and must complete all of the following before any native backend can be called
-or benchmarked as a JIT:
+`fre-jit-runtime` re-audits before publication, checks the target and
+backend-version contract, allocates/copies under RW permissions, transitions
+to RX/RO without a simultaneous writable/executable mapping, performs required
+instruction-cache maintenance, validates calls, and owns mappings through
+typed reference-counted kernels. `fre-jit-cache` exposes only cache-accounted
+leases from its public builder path.
 
-- re-audit the received image and its target/cache key;
-- allocate RW memory, copy code/data with the exact declared layout, then make
-  it RX/RO without any simultaneous writable/executable mapping;
-- implement Apple `MAP_JIT`/write-protect and Linux/BSD protection policies;
-- perform the architecture/OS-required data and instruction-cache maintenance
-  and publish with a synchronization edge;
-- validate non-null/readable/writable call arguments in a safe host shim;
-- add guard pages on both haystack/window boundaries and test every alignment
-  and tail length on actual hardware;
-- contain illegal-instruction and memory faults without unwinding through
-  generated code, and define signal/exception ownership for embeddings;
-- feature-check ASIMD, target ABI, endianness, pointer width, backend version,
-  tail policy and mitigation policy as part of every cache/AOT load;
-- use epochs/hazards or equivalent so concurrent calls cannot race eviction,
-  unmapping or ABA address reuse;
-- qualify actual execution under sanitizers where applicable, hardened runtime,
-  sandbox, fork and code-signing configurations;
-- compare native execution, compile latency, cold-cache behavior, counters,
-  every relevant Rebar job and frozen non-Rebar holdouts before planner
-  admission.
-
-The decoded-ISA differential proves the instruction semantics intended by this
-emitter. It does not substitute for actual-hardware guard-page, cache-coherency,
-fault-containment or performance qualification.
+The decoded-ISA differential still does not substitute for actual-hardware
+guard pages, ABI canaries, cache coherency or performance evidence. The
+qualified explicit leaf passed the full correctness/lint/docs gates, honest
+cold and amortized workload accounting, source-bound alternating A/B matrices
+including all losses and adversarial holdouts, and an independent review.
+Those results do not qualify any other width, operation, architecture, AOT
+loader, or default planner route; the rest of the native facade remains
+experimental.

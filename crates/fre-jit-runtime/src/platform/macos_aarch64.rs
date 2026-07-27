@@ -30,8 +30,58 @@ type EntryFunction = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut N
 type AggregateEntryFunction =
     unsafe extern "C" fn(*const u8, usize, *mut NativeAggregateResult) -> u64;
 
+#[cfg(test)]
+core::arch::global_asm!(
+    r#"
+    .text
+    .p2align 2
+    .globl _fre_jit_test_vector_callee_saved_canary
+_fre_jit_test_vector_callee_saved_canary:
+    sub sp, sp, #80
+    stp x19, x30, [sp, #0]
+    stp d8, d9, [sp, #16]
+    stp d10, d11, [sp, #32]
+    stp d12, d13, [sp, #48]
+    stp d14, d15, [sp, #64]
+    mov x16, x0
+    mov x19, x6
+    ldp d8, d9, [x19, #0]
+    ldp d10, d11, [x19, #16]
+    ldp d12, d13, [x19, #32]
+    ldp d14, d15, [x19, #48]
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, x5
+    blr x16
+    stp d8, d9, [x19, #64]
+    stp d10, d11, [x19, #80]
+    stp d12, d13, [x19, #96]
+    stp d14, d15, [x19, #112]
+    ldp d8, d9, [sp, #16]
+    ldp d10, d11, [sp, #32]
+    ldp d12, d13, [sp, #48]
+    ldp d14, d15, [sp, #64]
+    ldp x19, x30, [sp, #0]
+    add sp, sp, #80
+    ret
+"#
+);
+
 unsafe extern "C" {
     fn sys_icache_invalidate(start: *mut c_void, length: usize);
+
+    #[cfg(test)]
+    fn fre_jit_test_vector_callee_saved_canary(
+        entry: *const c_void,
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        result: *mut NativeResult,
+        canaries: *mut u64,
+    ) -> u64;
 
     #[cfg(test)]
     fn mach_vm_region(
@@ -53,6 +103,43 @@ unsafe extern "C" {
 
 #[cfg(test)]
 static LIVE_CODE_MAPPINGS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn invoke_with_vector_callee_saved_canary(
+    mapping: &ExecutableMapping,
+    haystack: &[u8],
+    window: SearchWindow,
+    canaries: [u64; 8],
+) -> (RawCallResult, [u64; 8]) {
+    let mut result = NativeResult {
+        start: usize::MAX,
+        end: usize::MAX,
+    };
+    let mut slots = [0_u64; 16];
+    slots[..8].copy_from_slice(&canaries);
+    // SAFETY: the test wrapper preserves its own AAPCS64 state, forwards the
+    // same five audited call arguments as `invoke`, and stores only into the
+    // two caller-owned output buffers that remain live for the whole call.
+    let status = unsafe {
+        fre_jit_test_vector_callee_saved_canary(
+            mapping.entry.as_ptr(),
+            haystack.as_ptr(),
+            haystack.len(),
+            window.start(),
+            window.end(),
+            ptr::addr_of_mut!(result),
+            slots.as_mut_ptr(),
+        )
+    };
+    let observed = slots[8..].try_into().expect("eight vector canary slots");
+    (
+        RawCallResult {
+            status,
+            slot: result,
+        },
+        observed,
+    )
+}
 
 #[derive(Debug)]
 pub(crate) struct ExecutableMapping {
@@ -90,7 +177,16 @@ impl Mapping for ExecutableMapping {
     fn call_contract_valid(&self, expected_output: OutputKind) -> bool {
         let expected = TargetSpec::AARCH64_AAPCS64;
         self.reservation.state == MappingState::Executable
-            && self.backend_version == BackendVersion::CURRENT
+            && matches!(
+                self.backend_version,
+                BackendVersion::SEARCH_V1
+                    | BackendVersion::SEARCH_V2
+                    | BackendVersion::SEARCH_V3
+                    | BackendVersion::SEARCH_V4
+                    | BackendVersion::SEARCH_V5
+                    | BackendVersion::SEARCH_V6
+                    | BackendVersion::SEARCH_V7
+            )
             && self.aggregate.is_none()
             && self.output == expected_output
             && self.target.architecture == expected.architecture
@@ -134,7 +230,10 @@ impl Mapping for ExecutableMapping {
     ) -> bool {
         let expected = TargetSpec::AARCH64_AAPCS64;
         self.reservation.state == MappingState::Executable
-            && self.backend_version == BackendVersion::CURRENT
+            && matches!(
+                self.backend_version,
+                BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+            )
             && self.aggregate
                 == Some(AggregateMappingContract {
                     output: expected_output,

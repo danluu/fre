@@ -3,13 +3,14 @@ use fre_kernel_ir::{
     ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, Operation, OutputKind,
     SemanticsVersion, ValidatedProgram,
 };
+use memchr::arch::all::packedpair::Pair;
 
 use crate::{
     ArithmeticSite, BackendVersion, BranchKind, CodeLabel, Condition, ConfirmationKind,
     CpuFeatures, DataSymbol, EmitError, ImageLayout, ImageStats, LabelKind, NativeAggregateImage,
     NativeImage, Relocation, RelocationKind, RelocationTarget, ResourceKind, TargetSpec,
     UnsupportedReason,
-    image::{AggregateManifest, DataSymbolKind, aot_size},
+    image::{AggregateManifest, DataSymbolKind, SearchManifest, SearchShape, aot_size},
 };
 
 const CODE_ALIGNMENT: usize = 16;
@@ -19,10 +20,19 @@ const CLASS_CODE_RESERVE: usize = 1_600;
 const EXACT_LABEL_RESERVE: usize = 32;
 const CLASS_LABEL_RESERVE: usize = 48;
 const EXACT_RELOCATION_RESERVE: usize = 64;
+const V7_EXACT_CODE_RESERVE: usize = 1_536;
+const V7_EXACT_LABEL_RESERVE: usize = 48;
+const V7_EXACT_RELOCATION_RESERVE: usize = 96;
 const CLASS_RELOCATION_RESERVE: usize = 96;
 const AGGREGATE_CODE_RESERVE: usize = 1_600;
 const AGGREGATE_LABEL_RESERVE: usize = 48;
 const AGGREGATE_RELOCATION_RESERVE: usize = 96;
+const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
+const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
+const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
+const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
+const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 
 /// Largest confirmation payload admitted when a search can confirm at more
 /// than one candidate position.
@@ -85,6 +95,39 @@ pub fn emit<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
 ) -> Result<NativeImage, EmitError> {
+    emit_search_version(program, limits, BackendVersion::SEARCH_CURRENT)
+}
+
+#[cfg(test)]
+pub(crate) fn emit_search_version_for_test<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+    backend_version: BackendVersion,
+) -> Result<NativeImage, EmitError> {
+    emit_search_version(program, limits, backend_version)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned search construction keeps one transaction from validation through authenticated image finalization"
+)]
+fn emit_search_version<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+    backend_version: BackendVersion,
+) -> Result<NativeImage, EmitError> {
+    if !matches!(
+        backend_version,
+        BackendVersion::SEARCH_V1
+            | BackendVersion::SEARCH_V2
+            | BackendVersion::SEARCH_V3
+            | BackendVersion::SEARCH_V4
+            | BackendVersion::SEARCH_V5
+            | BackendVersion::SEARCH_V6
+            | BackendVersion::SEARCH_V7
+    ) {
+        return Err(EmitError::InternalInvariant);
+    }
     if program.raw().abi != AbiVersion::CURRENT {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::AbiVersion,
@@ -101,14 +144,21 @@ pub fn emit<O: Operation>(
         });
     }
     let plan = Plan::recognize(program)?;
-    let capacities = plan.capacities();
+    let mut meter = WorkMeter::new(limits.max_emission_work);
+    let v7_policy_scan_admission = plan.admit_v7_policy_scans(backend_version, &mut meter)?;
+    let search_manifest = plan.search_manifest(
+        program.raw().output,
+        program.cache_identity(),
+        backend_version,
+        v7_policy_scan_admission,
+    )?;
+    let capacities = plan.capacities(backend_version);
     let scratch = scratch_bytes(capacities)?;
     enforce_u64(
         ResourceKind::ScratchBytes,
         scratch,
         limits.max_scratch_bytes,
     )?;
-    let mut meter = WorkMeter::new(limits.max_emission_work);
     let data = build_rodata(
         program.raw().data.as_slice(),
         limits.max_data_bytes,
@@ -120,7 +170,15 @@ pub fn emit<O: Operation>(
     let none = assembler.new_label(LabelKind::ReturnNone)?;
     assembler.bind(entry)?;
     emit_preamble(&mut assembler, none)?;
-    emit_plan(&mut assembler, &data, plan, found, none)?;
+    emit_plan(
+        &mut assembler,
+        &data,
+        plan,
+        search_manifest,
+        backend_version,
+        found,
+        none,
+    )?;
     emit_returns(&mut assembler, program.raw().output, found, none)?;
     let finalized = assembler.finalize(data.bytes.len())?;
     let code_len = finalized.code.len();
@@ -147,7 +205,7 @@ pub fn emit<O: Operation>(
         vector_instructions: finalized.vector_instructions,
     };
     let image = NativeImage {
-        backend_version: BackendVersion::CURRENT,
+        backend_version,
         target: TargetSpec {
             features: if finalized.vector_instructions == 0 {
                 CpuFeatures::NONE
@@ -166,6 +224,15 @@ pub fn emit<O: Operation>(
         relocations: finalized.relocations,
         stats,
         artifact_identity: crate::ArtifactIdentity::ZERO,
+        search: matches!(
+            backend_version,
+            BackendVersion::SEARCH_V3
+                | BackendVersion::SEARCH_V4
+                | BackendVersion::SEARCH_V5
+                | BackendVersion::SEARCH_V6
+                | BackendVersion::SEARCH_V7
+        )
+        .then_some(search_manifest),
         aggregate: None,
     };
     finalize_image(image, limits)
@@ -247,7 +314,7 @@ fn build_aggregate_image<A: AggregateOperation>(
         vector_instructions: finalized.vector_instructions,
     };
     Ok(NativeImage {
-        backend_version: BackendVersion::CURRENT,
+        backend_version: BackendVersion::AGGREGATE_CURRENT,
         target: TargetSpec {
             features: if finalized.vector_instructions == 0 {
                 CpuFeatures::NONE
@@ -269,6 +336,7 @@ fn build_aggregate_image<A: AggregateOperation>(
         relocations: finalized.relocations,
         stats,
         artifact_identity: crate::ArtifactIdentity::ZERO,
+        search: None,
         aggregate: Some(AggregateManifest {
             output: A::OUTPUT,
             source_identity: program.cache_identity(),
@@ -490,13 +558,33 @@ fn emit_plan(
     assembler: &mut Assembler,
     data: &Rodata,
     plan: Plan<'_>,
+    manifest: SearchManifest,
+    backend_version: BackendVersion,
     found: Label,
     none: Label,
 ) -> Result<(), EmitError> {
+    let candidate_offsets = (manifest.candidate_policy_version != SEARCH_CANDIDATE_POLICY_NONE)
+        .then_some(CandidateOffsets {
+            primary: manifest.primary_offset,
+            secondary: (manifest.secondary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+                .then_some(manifest.secondary_offset),
+            verification: (manifest.verification_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+                .then_some(manifest.verification_offset),
+            quaternary: (manifest.quaternary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+                .then_some(manifest.quaternary_offset),
+        });
     match plan {
         Plan::Exact { literal, anchors } => {
             assembler.adr(X8, data.symbol_offset(0)?)?;
-            emit_exact(assembler, literal, anchors, found, none)
+            emit_exact(
+                assembler,
+                literal,
+                anchors,
+                candidate_offsets,
+                backend_version,
+                found,
+                none,
+            )
         }
         Plan::ClassSuffix {
             class,
@@ -507,7 +595,15 @@ fn emit_plan(
             assembler.adr(X7, data.symbol_offset(1)?)?;
             if let Some(class_byte) = (!anchors.start).then(|| singleton_byte(class)).flatten() {
                 emit_singleton_class_suffix_first(
-                    assembler, class_byte, suffix, anchors, found, none,
+                    assembler,
+                    class_byte,
+                    suffix,
+                    anchors,
+                    candidate_offsets
+                        .map(|offsets| (offsets.primary, offsets.secondary))
+                        .ok_or(EmitError::InternalInvariant)?,
+                    found,
+                    none,
                 )
             } else {
                 emit_class_suffix(assembler, class, suffix, anchors, found, none)
@@ -527,7 +623,7 @@ fn finalize_aggregate_image(
     limits: EmitLimits,
 ) -> Result<NativeAggregateImage, EmitError> {
     charge_image_identity(&mut image, limits)?;
-    let image = NativeAggregateImage::new(image);
+    let image = NativeAggregateImage::try_new(image)?;
     crate::audit_aggregate(&image).map_err(|_| EmitError::InternalInvariant)?;
     Ok(image)
 }
@@ -574,6 +670,58 @@ enum Plan<'a> {
         anchors: AnchorFlags,
     },
 }
+
+#[derive(Clone, Copy)]
+struct CandidateOffsets {
+    primary: u16,
+    secondary: Option<u16>,
+    verification: Option<u16>,
+    quaternary: Option<u16>,
+}
+
+mod v7_policy_scan_admission {
+    use super::{
+        ArithmeticSite, CandidateOffsets, EmitError, WorkMeter, candidate_byte_pair,
+        candidate_ranked_verification_offsets,
+    };
+
+    /// Move-only proof that both complete V7 policy scans were admitted.
+    ///
+    /// The literal is held inside the unforgeable token so selecting offsets
+    /// cannot be redirected to bytes whose scan work was not admitted.
+    pub(super) struct Admission<'a> {
+        literal: &'a [u8],
+    }
+
+    impl<'a> Admission<'a> {
+        pub(super) fn charge(literal: &'a [u8], meter: &mut WorkMeter) -> Result<Self, EmitError> {
+            let scan_work = u64::try_from(literal.len())
+                .map_err(|_| EmitError::ArithmeticOverflow {
+                    site: ArithmeticSite::EmissionWork,
+                })?
+                .checked_mul(2)
+                .ok_or(EmitError::ArithmeticOverflow {
+                    site: ArithmeticSite::EmissionWork,
+                })?;
+            meter.charge(scan_work)?;
+            Ok(Self { literal })
+        }
+
+        pub(super) fn select_offsets(self) -> CandidateOffsets {
+            let (primary, secondary) = candidate_byte_pair(self.literal);
+            let (verification, quaternary) =
+                candidate_ranked_verification_offsets(self.literal, primary, secondary);
+            CandidateOffsets {
+                primary,
+                secondary,
+                verification,
+                quaternary,
+            }
+        }
+    }
+}
+
+use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
     fn recognize<O: Operation>(program: &'a ValidatedProgram<O>) -> Result<Self, EmitError> {
@@ -633,8 +781,13 @@ impl<'a> Plan<'a> {
         })
     }
 
-    const fn capacities(self) -> Capacities {
+    const fn capacities(self, backend_version: BackendVersion) -> Capacities {
         match self {
+            Self::Exact { .. } if backend_version.0 == BackendVersion::SEARCH_V7.0 => Capacities {
+                code: V7_EXACT_CODE_RESERVE,
+                labels: V7_EXACT_LABEL_RESERVE,
+                relocations: V7_EXACT_RELOCATION_RESERVE,
+            },
             Self::Exact { .. } => Capacities {
                 code: EXACT_CODE_RESERVE,
                 labels: EXACT_LABEL_RESERVE,
@@ -646,6 +799,161 @@ impl<'a> Plan<'a> {
                 relocations: CLASS_RELOCATION_RESERVE,
             },
         }
+    }
+
+    fn admit_v7_policy_scans(
+        self,
+        backend_version: BackendVersion,
+        meter: &mut WorkMeter,
+    ) -> Result<Option<V7PolicyScanAdmission<'a>>, EmitError> {
+        let Self::Exact { literal, anchors } = self else {
+            return Ok(None);
+        };
+        if backend_version != BackendVersion::SEARCH_V7
+            || anchors.start
+            || anchors.end
+            || literal.is_empty()
+        {
+            return Ok(None);
+        }
+
+        // The move-only token is minted by one combined charge and is the only
+        // route to both ranked scans. Older backends retain their historical
+        // receipts and adjacent emission charge.
+        V7PolicyScanAdmission::charge(literal, meter).map(Some)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the versioned manifest construction keeps every historical and current policy field explicit"
+    )]
+    fn search_manifest(
+        self,
+        output: OutputKind,
+        source_identity: fre_kernel_ir::CacheIdentity,
+        backend_version: BackendVersion,
+        v7_policy_scan_admission: Option<V7PolicyScanAdmission<'a>>,
+    ) -> Result<SearchManifest, EmitError> {
+        let (shape, anchors, literal, candidate_policy) = match self {
+            Self::Exact { literal, anchors } => {
+                let policy_enabled = !anchors.start && !anchors.end && !literal.is_empty();
+                let candidate_policy = if !policy_enabled {
+                    if v7_policy_scan_admission.is_some() {
+                        return Err(EmitError::InternalInvariant);
+                    }
+                    None
+                } else if backend_version == BackendVersion::SEARCH_V7 {
+                    Some(
+                        v7_policy_scan_admission
+                            .ok_or(EmitError::InternalInvariant)?
+                            .select_offsets(),
+                    )
+                } else {
+                    if v7_policy_scan_admission.is_some() {
+                        return Err(EmitError::InternalInvariant);
+                    }
+                    let (primary, secondary) = candidate_byte_pair(literal);
+                    let verification = matches!(
+                        backend_version,
+                        BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+                    )
+                    .then(|| candidate_verification_offset(literal, primary, secondary))
+                    .flatten();
+                    Some(CandidateOffsets {
+                        primary,
+                        secondary,
+                        verification,
+                        quaternary: None,
+                    })
+                };
+                (
+                    SearchShape::ExactLiteral,
+                    anchors,
+                    literal,
+                    candidate_policy,
+                )
+            }
+            Self::ClassSuffix {
+                class,
+                suffix,
+                anchors,
+            } => {
+                if v7_policy_scan_admission.is_some() {
+                    return Err(EmitError::InternalInvariant);
+                }
+                let candidate_policy = (!anchors.start
+                    && !suffix.is_empty()
+                    && singleton_byte(class).is_some())
+                .then(|| CandidateOffsets {
+                    primary: 0,
+                    secondary: (suffix.len() > 1).then(|| {
+                        u16::try_from(
+                            suffix
+                                .len()
+                                .checked_sub(1)
+                                .expect("non-empty singleton suffix"),
+                        )
+                        .expect("bounded class suffix offset fits u16")
+                    }),
+                    verification: None,
+                    quaternary: None,
+                });
+                (SearchShape::ClassSuffix, anchors, suffix, candidate_policy)
+            }
+        };
+        let (
+            candidate_policy_version,
+            candidate_block_width,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+        ) = candidate_policy.map_or(
+            (
+                SEARCH_CANDIDATE_POLICY_NONE,
+                0,
+                SEARCH_CANDIDATE_OFFSET_NONE,
+                SEARCH_CANDIDATE_OFFSET_NONE,
+                SEARCH_CANDIDATE_OFFSET_NONE,
+                SEARCH_CANDIDATE_OFFSET_NONE,
+            ),
+            |offsets| {
+                (
+                    if backend_version == BackendVersion::SEARCH_V7
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V3
+                    } else if matches!(
+                        backend_version,
+                        BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6
+                    ) && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V2
+                    } else {
+                        SEARCH_CANDIDATE_POLICY_V1
+                    },
+                    SEARCH_CANDIDATE_BLOCK_WIDTH,
+                    offsets.primary,
+                    offsets.secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                    offsets.verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                    offsets.quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                )
+            },
+        );
+        Ok(SearchManifest {
+            backend_version,
+            shape,
+            output,
+            anchors,
+            source_identity,
+            literal_bytes: to_u32(literal.len(), ArithmeticSite::DataOffset)?,
+            candidate_policy_version,
+            candidate_block_width,
+            primary_offset,
+            secondary_offset,
+            verification_offset,
+            quaternary_offset,
+        })
     }
 }
 
@@ -686,10 +994,16 @@ fn emit_preamble(assembler: &mut Assembler, none: Label) -> Result<(), EmitError
     assembler.branch_cond(Condition::Higher, none)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "explicit version dispatch keeps every authenticated search backend visible"
+)]
 fn emit_exact(
     assembler: &mut Assembler,
     literal: &[u8],
     anchors: AnchorFlags,
+    candidate_offsets: Option<CandidateOffsets>,
+    backend_version: BackendVersion,
     found: Label,
     none: Label,
 ) -> Result<(), EmitError> {
@@ -733,7 +1047,82 @@ fn emit_exact(
     assembler.branch_cond(Condition::CarryClear, none)?;
     assembler.sub_reg(X6, X3, X12)?;
     assembler.mov_reg(X5, X2)?;
-    emit_vector_candidate_skip(assembler, literal, none, found)?;
+    let CandidateOffsets {
+        primary: primary_offset,
+        secondary: secondary_offset,
+        verification: verification_offset,
+        quaternary: quaternary_offset,
+    } = candidate_offsets.ok_or(EmitError::InternalInvariant)?;
+    match backend_version {
+        BackendVersion::SEARCH_V1 => {
+            emit_vector_candidate_skip_v1(assembler, literal, none, found)?;
+        }
+        BackendVersion::SEARCH_V2 => {
+            emit_vector_candidate_skip_v2(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V3 => {
+            emit_vector_candidate_skip_v3(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V4 => {
+            emit_vector_candidate_skip_v4(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V5 => {
+            emit_vector_candidate_skip_v5(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V6 => {
+            emit_vector_candidate_skip_v6(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V7 => {
+            emit_vector_candidate_skip_v7(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                none,
+                found,
+            )?;
+        }
+        _ => return Err(EmitError::InternalInvariant),
+    }
     Ok(())
 }
 
@@ -764,17 +1153,12 @@ fn emit_empty_literal(
     assembler.branch(found)
 }
 
-fn emit_vector_candidate_skip(
+fn emit_vector_candidate_skip_v1(
     assembler: &mut Assembler,
     literal: &[u8],
     none: Label,
     found: Label,
 ) -> Result<(), EmitError> {
-    // These vector loads examine two 16-byte columns of candidate positions,
-    // not one candidate. X6 is the last start at which the complete literal
-    // fits. The remaining-start check proves X5..=X5+15 are valid starts; for
-    // the optional last-byte column it therefore also proves
-    // X5+(length-1)..=X5+(length-1)+15 lies inside the search window.
     let vector = assembler.new_label(LabelKind::Loop)?;
     let scalar = assembler.new_label(LabelKind::SlowPath)?;
     let advance = assembler.new_label(LabelKind::Internal)?;
@@ -785,13 +1169,13 @@ fn emit_vector_candidate_skip(
     };
     assembler.load_byte(X11, X8, 0)?;
     assembler.dup_byte16(1, X11)?;
-    let last_offset = u16::try_from(literal.len().saturating_sub(1)).map_err(|_| {
+    let secondary_offset = u16::try_from(literal.len().saturating_sub(1)).map_err(|_| {
         EmitError::ArithmeticOverflow {
             site: ArithmeticSite::DataOffset,
         }
     })?;
-    if literal.len() > 1 {
-        assembler.load_byte(X11, X8, last_offset)?;
+    if second_filter.is_some() {
+        assembler.load_byte(X11, X8, secondary_offset)?;
         assembler.dup_byte16(3, X11)?;
     }
     assembler.bind(vector)?;
@@ -804,9 +1188,6 @@ fn emit_vector_candidate_skip(
     assembler.load_vector128(0, X15, 0)?;
     assembler.compare_equal_bytes16(0, 0, 1)?;
     if let Some(second_filter) = second_filter {
-        // Preserve the first-byte lane mask in v0 while reducing a copy. Most
-        // blocks contain no first-byte candidate and fall through at exactly
-        // the original one-vector steady-state branch behavior.
         assembler.unsigned_max_bytes16(2, 0)?;
         assembler.move_vector_byte_to32(X10, 2)?;
         assembler.compare_branch_zero(X10, true, second_filter)?;
@@ -820,7 +1201,7 @@ fn emit_vector_candidate_skip(
     assembler.branch(vector)?;
     if let Some(second_filter) = second_filter {
         assembler.bind(second_filter)?;
-        assembler.add_imm(X10, X15, last_offset)?;
+        assembler.add_imm(X10, X15, secondary_offset)?;
         assembler.load_vector128(2, X10, 0)?;
         assembler.compare_equal_bytes16(2, 2, 3)?;
         assembler.and_bytes16(0, 0, 2)?;
@@ -830,12 +1211,86 @@ fn emit_vector_candidate_skip(
         assembler.branch(advance)?;
     }
     assembler.bind(scalar)?;
-    emit_scalar_candidates(assembler, literal, none, found)
+    emit_scalar_candidates_legacy(assembler, literal, false, none, found)
 }
 
-fn emit_scalar_candidates(
+fn emit_vector_candidate_skip_v2(
     assembler: &mut Assembler,
     literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let scalar = assembler.new_label(LabelKind::SlowPath)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let second_filter = if secondary_offset.is_some() {
+        Some(assembler.new_label(LabelKind::SlowPath)?)
+    } else {
+        None
+    };
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, scalar)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.bind(vector)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, scalar)?;
+    }
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(scalar)?;
+    if let Some(second_filter) = second_filter {
+        let secondary_offset = secondary_offset.ok_or(EmitError::InternalInvariant)?;
+        let delta = secondary_offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if secondary_offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, scalar)?;
+        assembler.branch(advance)?;
+    }
+    assembler.bind(scalar)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+fn emit_scalar_candidates_legacy(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    fixed_16: bool,
     none: Label,
     found: Label,
 ) -> Result<(), EmitError> {
@@ -847,7 +1302,11 @@ fn emit_scalar_candidates(
     assembler.cmp_reg32(X10, X11)?;
     assembler.branch_cond(Condition::NotEqual, advance)?;
     assembler.add_reg(X15, X9, X5)?;
-    emit_literal_equality(assembler, X15, X8, literal.len(), advance)?;
+    if fixed_16 && literal.len() == 16 {
+        emit_literal_equality_16(assembler, X15, X8, advance)?;
+    } else {
+        emit_literal_equality(assembler, X15, X8, literal.len(), advance)?;
+    }
     assembler.mov_reg(X13, X5)?;
     assembler.add_reg(X14, X5, X12)?;
     assembler.branch(found)?;
@@ -856,6 +1315,849 @@ fn emit_scalar_candidates(
     assembler.branch_cond(Condition::CarrySet, none)?;
     assembler.add_imm(X5, X5, 1)?;
     assembler.branch(scan)
+}
+
+fn emit_vector_candidate_skip_v3(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    // These vector loads examine two 16-byte columns of candidate positions,
+    // not one candidate. X6 is the last start at which the complete literal
+    // fits. The remaining-start check proves X5..=X5+15 are valid starts; for
+    // either selected byte column at offset P it therefore also proves
+    // X5+P..=X5+P+15 lies inside the search window because P < length.
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let scalar = assembler.new_label(LabelKind::SlowPath)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let block_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let second_filter = if literal.len() > 1 {
+        Some(assembler.new_label(LabelKind::SlowPath)?)
+    } else {
+        None
+    };
+    assembler.meter.charge_usize(literal.len())?;
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.bind(vector)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        // Preserve the first-byte lane mask in v0 while reducing a copy. Most
+        // blocks contain no first-byte candidate and fall through at exactly
+        // the original one-vector steady-state branch behavior.
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, block_setup)?;
+    }
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+    if let Some(second_filter) = second_filter {
+        let secondary_offset = secondary_offset.expect("multi-byte literal has a byte pair");
+        let secondary_delta = secondary_offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if secondary_offset > primary_offset {
+            assembler.add_imm(X10, X15, secondary_delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, secondary_delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, block_setup)?;
+        assembler.branch(advance)?;
+    }
+    // A vector hit proves only that at least one candidate in this block has
+    // the selected byte pair. Bound scalar confirmation to those 16
+    // candidates, then resume vector filtering after a false-positive block.
+    // X13 is otherwise only the eventual output start, so it can carry this
+    // internal block/tail mode until a match is found.
+    assembler.bind(block_setup)?;
+    assembler.mov_imm64(X13, 1)?;
+    assembler.add_imm(X7, X5, 15)?;
+    assembler.branch(scalar)?;
+    assembler.bind(tail_setup)?;
+    assembler.mov_imm64(X13, 0)?;
+    assembler.mov_reg(X7, X6)?;
+    assembler.bind(scalar)?;
+    emit_scalar_candidates(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        vector,
+        tail_setup,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete mask-guided recovery graph keeps every bound and resume edge visible"
+)]
+fn emit_vector_candidate_skip_v4(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    emit_vector_candidate_skip_mask(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        None,
+        none,
+        found,
+    )
+}
+
+fn emit_vector_candidate_skip_v5(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    emit_vector_candidate_skip_mask(
+        assembler,
+        literal,
+        primary_offset,
+        secondary_offset,
+        verification_offset,
+        none,
+        found,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete sparse per-lane recovery graph keeps mask construction, lane order, bounds, and resume edges reviewable"
+)]
+fn emit_vector_candidate_skip_v6(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    // The intersected v0 bytes are exactly 0xff or 0x00. SHRN #4 packs each
+    // adjacent byte pair into one output byte: the low and high nibbles
+    // represent the even and odd candidate lanes. Masking the low 64 bits with
+    // 0x1111... retains one bit at positions 4*lane for all 16 lanes. RBIT/CLZ
+    // then selects the lowest surviving lane, and X0 & (X0 - 1) clears exactly
+    // that lane after a false confirmation.
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let recover = assembler.new_label(LabelKind::SlowPath)?;
+    let lane_loop = assembler.new_label(LabelKind::Loop)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let block_resume = assembler.new_label(LabelKind::Internal)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let second_filter = if literal.len() > 1 {
+        Some(assembler.new_label(LabelKind::SlowPath)?)
+    } else {
+        None
+    };
+    assembler.meter.charge_usize(literal.len())?;
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    if let Some(verification_offset) = verification_offset {
+        assembler.load_byte(X11, X8, verification_offset)?;
+        assembler.dup_byte16(5, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.bind(vector)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        emit_sparse_lane_mask(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+    }
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+    if let Some(second_filter) = second_filter {
+        let secondary_offset = secondary_offset.expect("multi-byte literal has a byte pair");
+        let secondary_delta = secondary_offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if secondary_offset > primary_offset {
+            assembler.add_imm(X10, X15, secondary_delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, secondary_delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        if let Some(verification_offset) = verification_offset {
+            let verification_delta = verification_offset.abs_diff(primary_offset);
+            if verification_offset > primary_offset {
+                assembler.add_imm(X10, X15, verification_delta)?;
+            } else {
+                assembler.sub_imm(X10, X15, verification_delta)?;
+            }
+            assembler.load_vector128(4, X10, 0)?;
+            assembler.compare_equal_bytes16(4, 4, 5)?;
+            assembler.and_bytes16(0, 0, 4)?;
+        }
+        emit_sparse_lane_mask(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+        assembler.branch(advance)?;
+    }
+
+    assembler.bind(recover)?;
+    assembler.mov_reg(X7, X5)?;
+    assembler.bind(lane_loop)?;
+    assembler.rbit(X10, X0)?;
+    assembler.clz(X10, X10)?;
+    assembler.lsr_imm(X10, X10, 2)?;
+    assembler.add_reg(X5, X7, X10)?;
+    assembler.load_byte_reg(X10, X9, X5)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if literal.len() == 16 {
+        emit_literal_equality_16(assembler, X15, X8, candidate_miss)?;
+    } else {
+        emit_literal_equality(assembler, X15, X8, literal.len(), candidate_miss)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.sub_imm(X10, X0, 1)?;
+    assembler.and_reg(X0, X0, X10)?;
+    assembler.compare_branch_zero(X0, true, lane_loop)?;
+    assembler.bind(block_resume)?;
+    assembler.add_imm(X5, X7, 16)?;
+    // Confirmation clobbers v0/v1. Restore every sealed filter constant before
+    // re-entering the vector loop; this keeps later groups independent.
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    if let Some(verification_offset) = verification_offset {
+        assembler.load_byte(X11, X8, verification_offset)?;
+        assembler.dup_byte16(5, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the complete staged sparse-lane graph keeps survivor tests, ranked columns, lane order, and resume bounds explicit"
+)]
+fn emit_vector_candidate_skip_v7(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let recover = assembler.new_label(LabelKind::SlowPath)?;
+    let lane_loop = assembler.new_label(LabelKind::Loop)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let second_filter = secondary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let third_filter = verification_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let fourth_filter = quaternary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let filters_cover_zero = primary_offset == 0
+        || secondary_offset == Some(0)
+        || verification_offset == Some(0)
+        || quaternary_offset == Some(0);
+
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(offset) = secondary_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    if let Some(offset) = verification_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(5, X11)?;
+    }
+    if let Some(offset) = quaternary_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(7, X11)?;
+    }
+    // X14 is otherwise dead until the found return. Full confirmation uses
+    // v16/v17, so this scalar mask and all four vector constants survive every
+    // rejected lane and every later vector block.
+    assembler.mov_imm64(X14, 0x1111_1111_1111_1111)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+
+    assembler.bind(vector)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+    }
+
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    if let Some(second_filter) = second_filter {
+        let offset = secondary_offset.expect("second-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, false, advance)?;
+        if let Some(third_filter) = third_filter {
+            emit_branch_if_mask_has_multiple(assembler, X0, X10, third_filter)?;
+        }
+        assembler.branch(recover)?;
+    }
+
+    if let Some(third_filter) = third_filter {
+        let offset = verification_offset.expect("third-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(third_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(4, X10, 0)?;
+        assembler.compare_equal_bytes16(4, 4, 5)?;
+        assembler.and_bytes16(0, 0, 4)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, false, advance)?;
+        if let Some(fourth_filter) = fourth_filter {
+            emit_branch_if_mask_has_multiple(assembler, X0, X10, fourth_filter)?;
+        }
+        assembler.branch(recover)?;
+    }
+
+    if let Some(fourth_filter) = fourth_filter {
+        let offset = quaternary_offset.expect("fourth-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(fourth_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(6, X10, 0)?;
+        assembler.compare_equal_bytes16(6, 6, 7)?;
+        assembler.and_bytes16(0, 0, 6)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+        assembler.branch(advance)?;
+    }
+
+    assembler.bind(recover)?;
+    assembler.mov_reg(X7, X5)?;
+    assembler.bind(lane_loop)?;
+    assembler.rbit(X10, X0)?;
+    assembler.clz(X10, X10)?;
+    assembler.lsr_imm(X10, X10, 2)?;
+    assembler.add_reg(X5, X7, X10)?;
+    if !filters_cover_zero {
+        assembler.load_byte_reg(X10, X9, X5)?;
+        assembler.load_byte(X11, X8, 0)?;
+        assembler.cmp_reg32(X10, X11)?;
+        assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if literal.len() == 16 {
+        emit_literal_equality_16_with_vectors(assembler, X15, X8, candidate_miss, 16, 17)?;
+    } else {
+        emit_literal_equality_with_vectors(
+            assembler,
+            X15,
+            X8,
+            literal.len(),
+            candidate_miss,
+            16,
+            17,
+        )?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.sub_imm(X10, X0, 1)?;
+    assembler.and_reg(X0, X0, X10)?;
+    assembler.compare_branch_zero(X0, true, lane_loop)?;
+    assembler.add_imm(X5, X7, 16)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+fn emit_branch_if_mask_has_multiple(
+    assembler: &mut Assembler,
+    mask: u8,
+    scratch: u8,
+    target: Label,
+) -> Result<(), EmitError> {
+    assembler.sub_imm(scratch, mask, 1)?;
+    assembler.and_reg(scratch, mask, scratch)?;
+    assembler.compare_branch_zero(scratch, true, target)
+}
+
+fn emit_sparse_lane_mask_v7(assembler: &mut Assembler) -> Result<(), EmitError> {
+    assembler.shift_right_narrow_halfwords_to_bytes8(2, 0)?;
+    assembler.move_vector_double_to64(X0, 2)?;
+    assembler.and_reg(X0, X0, X14)
+}
+
+fn emit_sparse_lane_mask(assembler: &mut Assembler) -> Result<(), EmitError> {
+    assembler.shift_right_narrow_halfwords_to_bytes8(2, 0)?;
+    assembler.move_vector_double_to64(X0, 2)?;
+    assembler.mov_imm64(X11, 0x1111_1111_1111_1111)?;
+    assembler.and_reg(X0, X0, X11)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete mask-guided recovery graph keeps every bound and resume edge visible"
+)]
+fn emit_vector_candidate_skip_mask(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    // UMAXP reduces the 16 candidate lanes into eight adjacent-lane bytes.
+    // The following FMOV therefore carries a compact pair mask in X10. Keep
+    // that mask and confirm only the two candidate starts represented by each
+    // nonzero byte instead of rescanning all 16 starts in every hit block.
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let block_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let block_pairs = assembler.new_label(LabelKind::Loop)?;
+    let pair_confirm = assembler.new_label(LabelKind::SlowPath)?;
+    let scalar = assembler.new_label(LabelKind::Loop)?;
+    let scalar_advance = assembler.new_label(LabelKind::Internal)?;
+    let pair_exhausted = assembler.new_label(LabelKind::Internal)?;
+    let block_resume = assembler.new_label(LabelKind::Internal)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let second_filter = if literal.len() > 1 {
+        Some(assembler.new_label(LabelKind::SlowPath)?)
+    } else {
+        None
+    };
+    assembler.meter.charge_usize(literal.len())?;
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    if let Some(verification_offset) = verification_offset {
+        assembler.load_byte(X11, X8, verification_offset)?;
+        assembler.dup_byte16(5, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.bind(vector)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, block_setup)?;
+    }
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+    if let Some(second_filter) = second_filter {
+        let secondary_offset = secondary_offset.expect("multi-byte literal has a byte pair");
+        let secondary_delta = secondary_offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if secondary_offset > primary_offset {
+            assembler.add_imm(X10, X15, secondary_delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, secondary_delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        if let Some(verification_offset) = verification_offset {
+            let verification_delta = verification_offset.abs_diff(primary_offset);
+            if verification_offset > primary_offset {
+                assembler.add_imm(X10, X15, verification_delta)?;
+            } else {
+                assembler.sub_imm(X10, X15, verification_delta)?;
+            }
+            assembler.load_vector128(4, X10, 0)?;
+            assembler.compare_equal_bytes16(4, 4, 5)?;
+            assembler.and_bytes16(0, 0, 4)?;
+        }
+        assembler.unsigned_max_pairwise_bytes16(0, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 0)?;
+        assembler.compare_branch_zero(X10, true, block_setup)?;
+        assembler.branch(advance)?;
+    }
+
+    assembler.bind(block_setup)?;
+    assembler.mov_reg(X0, X10)?;
+    assembler.add_imm(X7, X5, 15)?;
+    assembler.bind(block_pairs)?;
+    assembler.and_low_bits(X10, X0, 8)?;
+    assembler.lsr_imm(X0, X0, 8)?;
+    assembler.compare_branch_zero(X10, true, pair_confirm)?;
+    assembler.add_imm(X5, X5, 2)?;
+    assembler.compare_branch_zero(X0, true, block_pairs)?;
+    assembler.branch(block_resume)?;
+
+    assembler.bind(pair_confirm)?;
+    assembler.add_imm(X2, X5, 1)?;
+    assembler.bind(scalar)?;
+    assembler.load_byte_reg(X10, X9, X5)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, scalar_advance)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if literal.len() == 16 {
+        emit_literal_equality_16(assembler, X15, X8, scalar_advance)?;
+    } else {
+        emit_literal_equality(assembler, X15, X8, literal.len(), scalar_advance)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+    assembler.bind(scalar_advance)?;
+    assembler.cmp_reg64(X5, X2)?;
+    assembler.branch_cond(Condition::CarrySet, pair_exhausted)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.branch(scalar)?;
+    assembler.bind(pair_exhausted)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.compare_branch_zero(X0, true, block_pairs)?;
+
+    assembler.bind(block_resume)?;
+    assembler.add_imm(X5, X7, 1)?;
+    // Confirmation may clobber v0/v1, so restore the filter constants once
+    // after every flagged pair in the block has been exhausted.
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+fn candidate_byte_pair(literal: &[u8]) -> (u16, Option<u16>) {
+    let Some(pair) = Pair::new(literal) else {
+        return (0, None);
+    };
+    (u16::from(pair.index1()), Some(u16::from(pair.index2())))
+}
+
+fn candidate_verification_offset(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> Option<u16> {
+    let primary_byte = *literal.get(usize::from(primary_offset))?;
+    let secondary_byte = secondary_offset
+        .and_then(|offset| literal.get(usize::from(offset)))
+        .copied();
+    literal
+        .iter()
+        .position(|&byte| byte != primary_byte && Some(byte) != secondary_byte)
+        .map(|offset| u16::try_from(offset).expect("bounded repeated-confirmation offset fits u16"))
+}
+
+fn candidate_ranked_verification_offsets(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>) {
+    let mut selected = [None; 2];
+    for (offset, &byte) in literal.iter().enumerate() {
+        let offset = u16::try_from(offset).expect("bounded repeated-confirmation offset fits u16");
+        if offset == primary_offset || Some(offset) == secondary_offset {
+            continue;
+        }
+        let key = (V7_BYTE_FREQUENCY_RANK[usize::from(byte)], offset);
+        if selected[0].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            selected[1] = selected[0];
+            selected[0] = Some(offset);
+        } else if selected[1].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            selected[1] = Some(offset);
+        }
+    }
+    (selected[0], selected[1])
+}
+
+// Frozen memchr 2.8.3 packed-pair frequency order. V7 uses the same ranking
+// after excluding the already-selected primary and secondary columns.
+const V7_BYTE_FREQUENCY_RANK: [u8; 256] = [
+    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43, 42, 41, 40, 39, 38, 37, 36,
+    35, 34, 33, 56, 32, 31, 30, 29, 28, 255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122,
+    232, 202, 215, 224, 208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174,
+    126, 120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167, 186, 112,
+    175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223, 151, 249, 216, 238, 236,
+    253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244, 231, 139, 245, 243, 251, 235, 201, 196,
+    240, 214, 152, 182, 205, 181, 127, 27, 212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105,
+    80, 98, 96, 97, 81, 207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111, 82,
+    108, 118, 141, 113, 129, 119, 125, 165, 117, 92, 106, 83, 72, 99, 93, 65, 79, 166, 237, 163,
+    199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255,
+];
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the recovery inputs keep every authenticated label and selected-byte offset explicit"
+)]
+fn emit_scalar_candidates(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    vector: Label,
+    tail_setup: Label,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let scan = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let exhausted = assembler.new_label(LabelKind::Internal)?;
+    let block_resume = assembler.new_label(LabelKind::Internal)?;
+    assembler.bind(scan)?;
+    assembler.load_byte_reg(X10, X9, X5)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, advance)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if literal.len() == 16 {
+        emit_literal_equality_16(assembler, X15, X8, advance)?;
+    } else {
+        emit_literal_equality(assembler, X15, X8, literal.len(), advance)?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+    assembler.bind(advance)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::CarrySet, exhausted)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.branch(scan)?;
+    assembler.bind(exhausted)?;
+    assembler.compare_branch_zero(X13, true, block_resume)?;
+    assembler.branch(none)?;
+    assembler.bind(block_resume)?;
+    // Scalar confirmation uses v0/v1, so a false candidate can clobber the
+    // duplicated primary filter. Restore both filter constants before
+    // returning to the vector loop.
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(secondary_offset) = secondary_offset {
+        assembler.load_byte(X11, X8, secondary_offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)
+}
+
+fn emit_literal_equality_16(
+    assembler: &mut Assembler,
+    hay_pointer: u8,
+    needle_pointer: u8,
+    mismatch: Label,
+) -> Result<(), EmitError> {
+    emit_literal_equality_16_with_vectors(assembler, hay_pointer, needle_pointer, mismatch, 0, 1)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit vector temporaries let V7 retain every staged filter constant"
+)]
+fn emit_literal_equality_16_with_vectors(
+    assembler: &mut Assembler,
+    hay_pointer: u8,
+    needle_pointer: u8,
+    mismatch: Label,
+    left_vector: u8,
+    right_vector: u8,
+) -> Result<(), EmitError> {
+    assembler.load_vector128(left_vector, hay_pointer, 0)?;
+    assembler.load_vector128(right_vector, needle_pointer, 0)?;
+    assembler.compare_equal_bytes16(left_vector, left_vector, right_vector)?;
+    assembler.unsigned_min_bytes16(left_vector, left_vector)?;
+    assembler.move_vector_byte_to32(X10, left_vector)?;
+    assembler.cmp_imm32(X10, 255)?;
+    assembler.branch_cond(Condition::NotEqual, mismatch)
 }
 
 fn emit_class_suffix(
@@ -941,6 +2243,7 @@ fn emit_singleton_class_suffix_first(
     class_byte: u8,
     suffix: &[u8],
     anchors: AnchorFlags,
+    candidate_offsets: (u16, Option<u16>),
     found: Label,
     none: Label,
 ) -> Result<(), EmitError> {
@@ -952,11 +2255,22 @@ fn emit_singleton_class_suffix_first(
     let suffix_length = u64::try_from(suffix.len()).map_err(|_| EmitError::ArithmeticOverflow {
         site: ArithmeticSite::DataOffset,
     })?;
-    let last_offset = u16::try_from(suffix.len().saturating_sub(1)).map_err(|_| {
-        EmitError::ArithmeticOverflow {
-            site: ArithmeticSite::DataOffset,
-        }
-    })?;
+    let (primary_offset, secondary_offset) = candidate_offsets;
+    if primary_offset != 0
+        || secondary_offset
+            != (suffix.len() > 1).then(|| {
+                u16::try_from(
+                    suffix
+                        .len()
+                        .checked_sub(1)
+                        .expect("non-empty singleton suffix"),
+                )
+                .expect("bounded class suffix offset fits u16")
+            })
+    {
+        return Err(EmitError::InternalInvariant);
+    }
+    let last_offset = secondary_offset.unwrap_or(0);
     assembler.mov_imm64(X12, suffix_length)?;
     // A match needs at least one class byte followed by the complete suffix.
     assembler.sub_reg(X10, X3, X2)?;
@@ -1608,6 +2922,13 @@ impl Assembler {
         )
     }
 
+    fn and_reg(&mut self, destination: u8, left: u8, right: u8) -> Result<(), EmitError> {
+        self.emit_word(
+            0x8a00_0000 | reg_field(right, 16) | reg_field(left, 5) | u32::from(destination),
+            false,
+        )
+    }
+
     fn and_low_bits(&mut self, destination: u8, source: u8, bits: u8) -> Result<(), EmitError> {
         debug_assert!((1..=63).contains(&bits));
         let immediate_mask = u32::from(bits.checked_sub(1).expect("bits are nonzero")) << 10;
@@ -1702,6 +3023,17 @@ impl Assembler {
         )
     }
 
+    fn shift_right_narrow_halfwords_to_bytes8(
+        &mut self,
+        destination: u8,
+        source: u8,
+    ) -> Result<(), EmitError> {
+        self.emit_word(
+            0x0f0c_8400 | reg_field(source, 5) | u32::from(destination),
+            true,
+        )
+    }
+
     fn unsigned_min_bytes16(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
         self.emit_word(
             0x6e31_a800 | reg_field(source, 5) | u32::from(destination),
@@ -1712,6 +3044,18 @@ impl Assembler {
     fn unsigned_max_bytes16(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
         self.emit_word(
             0x6e30_a800 | reg_field(source, 5) | u32::from(destination),
+            true,
+        )
+    }
+
+    fn unsigned_max_pairwise_bytes16(
+        &mut self,
+        destination: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        self.emit_word(
+            0x6e20_a400 | reg_field(right, 16) | reg_field(left, 5) | u32::from(destination),
             true,
         )
     }
@@ -1727,6 +3071,27 @@ impl Assembler {
         self.emit_word(
             0x0e01_3c00 | reg_field(source, 5) | u32::from(destination),
             true,
+        )
+    }
+
+    fn move_vector_double_to64(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
+        self.emit_word(
+            0x9e66_0000 | reg_field(source, 5) | u32::from(destination),
+            true,
+        )
+    }
+
+    fn rbit(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
+        self.emit_word(
+            0xdac0_0000 | reg_field(source, 5) | u32::from(destination),
+            false,
+        )
+    }
+
+    fn clz(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
+        self.emit_word(
+            0xdac0_1000 | reg_field(source, 5) | u32::from(destination),
+            false,
         )
     }
 
@@ -2084,7 +3449,42 @@ const fn condition_code(condition: Condition) -> u32 {
 
 #[cfg(test)]
 mod encoding_tests {
-    use super::{BranchKind, EmitError, RelocationKind, resolve_word, signed_range};
+    use super::{
+        BranchKind, EmitError, MAX_REPEATED_CONFIRM_BYTES, RelocationKind, candidate_byte_pair,
+        candidate_ranked_verification_offsets, candidate_verification_offset, resolve_word,
+        signed_range,
+    };
+
+    #[test]
+    fn candidate_byte_pair_matches_the_pinned_frequency_ranker() {
+        assert_eq!(candidate_byte_pair(b""), (0, None));
+        assert_eq!(candidate_byte_pair(b"a"), (0, None));
+        assert_eq!(candidate_byte_pair(b"0123456789abcdef"), (7, Some(6)));
+        assert_eq!(candidate_byte_pair(b"Sherlock Holmes"), (9, Some(7)));
+
+        let repeated = [b'a'; MAX_REPEATED_CONFIRM_BYTES];
+        assert_eq!(candidate_byte_pair(&repeated), (0, Some(1)));
+        assert_eq!(
+            candidate_verification_offset(b"0123456789abcdef", 7, Some(6)),
+            Some(0)
+        );
+        assert_eq!(candidate_verification_offset(b"7a e", 0, Some(1)), Some(2));
+        assert_eq!(candidate_verification_offset(b"abab", 0, Some(1)), None);
+        assert_eq!(
+            candidate_ranked_verification_offsets(b"0123456789abcdef", 7, Some(6)),
+            (Some(8), Some(5))
+        );
+        let mut subtract = [b'e'; 16];
+        subtract[8] = 0x1f;
+        subtract[4] = 0x1e;
+        subtract[2] = 0x1d;
+        subtract[1] = 0x1c;
+        assert_eq!(candidate_byte_pair(&subtract), (8, Some(4)));
+        assert_eq!(
+            candidate_ranked_verification_offsets(&subtract, 8, Some(4)),
+            (Some(2), Some(1))
+        );
+    }
 
     #[test]
     fn signed_ranges_are_exact() {

@@ -8,11 +8,13 @@ publish = false
 [workspace]
 
 [dependencies]
+fre = { path = "../../../crates/fre" }
 fre-jit-aarch64 = { path = "../../../crates/fre-jit-aarch64" }
 fre-jit-cache = { path = "../../../crates/fre-jit-cache" }
 fre-jit-runtime = { path = "../../../crates/fre-jit-runtime" }
 fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
 fre-kernels = { path = "../../../crates/fre-kernels" }
+memchr = { version = "=2.8.3", default-features = false }
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 sha2 = "0.10.9"
 

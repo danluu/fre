@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+memchr = { version = "=2.8.3", default-features = false }
 sha2 = "=0.10.9"
 
 [lints]

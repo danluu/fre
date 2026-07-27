@@ -1,6 +1,6 @@
 //! Concurrent single-flight state machine and lease lifetime tracking.
 
-use core::{fmt, ops::Deref};
+use core::fmt;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -11,9 +11,10 @@ use std::{
 };
 
 use fre_jit_runtime::{
-    NativeImage, PublicationAccounting, PublicationLimits, PublishedKernel, RuntimeIdentity,
-    RuntimeOperation, publish,
+    CallError, NativeImage, PublicationAccounting, PublicationLimits, PublishedKernel,
+    RuntimeIdentity, RuntimeOperation, publish,
 };
+use fre_kernel_ir::SearchWindow;
 
 use crate::{
     CacheCreateError, CacheError, CacheLimits, CachePolicyIdentity, CacheResource, CacheSnapshot,
@@ -115,11 +116,22 @@ impl<O: RuntimeOperation> fmt::Debug for KernelLease<O> {
     }
 }
 
-impl<O: RuntimeOperation> Deref for KernelLease<O> {
-    type Target = PublishedKernel<O>;
+impl<O: RuntimeOperation> KernelLease<O> {
+    /// Execute within a checked half-open byte window.
+    pub fn search(&self, haystack: &[u8], window: SearchWindow) -> Result<O::Output, CallError> {
+        self.tracked.kernel.search(haystack, window)
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.tracked.kernel
+    /// Exact page/code/data accounting charged for this mapping.
+    #[must_use]
+    pub fn accounting(&self) -> PublicationAccounting {
+        self.tracked.kernel.accounting()
+    }
+
+    /// Complete authenticated native image identity.
+    #[must_use]
+    pub fn identity(&self) -> RuntimeIdentity {
+        self.tracked.kernel.identity()
     }
 }
 
@@ -194,16 +206,18 @@ impl<O: RuntimeOperation> KernelCache<O> {
         self.get_or_build(image, |source, limits| publish::<O>(source, limits))
     }
 
-    /// Look up or single-flight one caller-supplied typed publisher.
+    /// Look up or single-flight one crate-owned typed publisher.
     ///
     /// The closure runs without a cache lock. Its result is admitted only when
     /// its complete runtime identity matches `image` and its exact accounting
-    /// obeys both the publication and aggregate cache policies.
+    /// obeys both the publication and aggregate cache policies. This seam is
+    /// crate-private so public callers cannot clone a published mapping before
+    /// the cache has accepted and charged its linear ownership transfer.
     #[allow(
         clippy::too_many_lines,
         reason = "the full lookup/wait/build transition is kept together so every exit visibly cleans its flight"
     )]
-    pub fn get_or_build<F>(
+    pub(crate) fn get_or_build<F>(
         &self,
         image: &NativeImage,
         build: F,
@@ -354,6 +368,10 @@ impl<O: RuntimeOperation> KernelCache<O> {
                 expected: identity,
                 actual,
             });
+        }
+        if !kernel.has_unique_mapping_ownership() {
+            self.finish_failed(identity, generation, Failure::Error)?;
+            return Err(CacheError::BuilderSharedMapping { identity });
         }
         enforce_publication_accounting(kernel.accounting(), self.inner.policy.publication_limits)
             .inspect_err(|_| {

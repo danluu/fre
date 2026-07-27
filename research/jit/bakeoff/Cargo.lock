@@ -57,10 +57,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre"
+version = "0.1.0"
+dependencies = [
+ "fre-aggregate",
+ "fre-automata",
+ "fre-capture-lab",
+ "fre-exact-alloc",
+ "fre-jit-aarch64",
+ "fre-jit-runtime",
+ "fre-kernel-ir",
+ "fre-kernels",
+ "fre-lower",
+ "fre-syntax",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fre-aggregate"
+version = "0.1.0"
+dependencies = [
+ "fre-exact-alloc",
+ "fre-kernels",
+ "memchr",
+ "regex-syntax",
+ "sha2",
+]
+
+[[package]]
+name = "fre-automata"
+version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+]
+
+[[package]]
+name = "fre-capture-lab"
+version = "0.1.0"
+dependencies = [
+ "regex-syntax",
+]
+
+[[package]]
+name = "fre-exact-alloc"
+version = "0.1.0"
+
+[[package]]
 name = "fre-jit-aarch64"
 version = "0.1.0"
 dependencies = [
  "fre-kernel-ir",
+ "memchr",
  "sha2",
 ]
 
@@ -68,11 +115,13 @@ dependencies = [
 name = "fre-jit-bakeoff"
 version = "0.1.0"
 dependencies = [
+ "fre",
  "fre-jit-aarch64",
  "fre-jit-cache",
  "fre-jit-runtime",
  "fre-kernel-ir",
  "fre-kernels",
+ "memchr",
  "regex",
  "sha2",
 ]
@@ -82,6 +131,7 @@ name = "fre-jit-cache"
 version = "0.1.0"
 dependencies = [
  "fre-jit-runtime",
+ "fre-kernel-ir",
 ]
 
 [[package]]
@@ -105,7 +155,30 @@ name = "fre-kernels"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "fre-exact-alloc",
  "memchr",
+]
+
+[[package]]
+name = "fre-lower"
+version = "0.1.0"
+dependencies = [
+ "fre-automata",
+ "fre-syntax",
+ "regex-syntax",
+]
+
+[[package]]
+name = "fre-re2-syntax"
+version = "0.1.0"
+
+[[package]]
+name = "fre-syntax"
+version = "0.1.0"
+dependencies = [
+ "fre-re2-syntax",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -153,9 +226,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.15"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f388202e4b80542a0921078cc23b6333bcf1409c1e3f86404cae4766a6131db"
+checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
 dependencies = [
  "aho-corasick",
  "log",

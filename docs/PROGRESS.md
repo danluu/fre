@@ -81,8 +81,9 @@ an open P0 row.
   routes.
 - [x] `fre-jit-runtime`: audited macOS/AArch64 strict-W^X publication with
   inaccessible guards, copy verification, rollback and concurrent-lifetime
-  tests, plus 663,084 actual-hardware/oracle comparisons. Planner promotion
-  and performance qualification remain open.
+  tests, plus 663,084 actual-hardware/oracle comparisons. The explicit
+  16-byte `QualifiedExactSearch` large-window/reuse leaf is performance
+  qualified; default planner selection and every broader shape remain open.
 - [x] `fre-jit-cache`: bounded typed single-flight publication, deterministic
   eviction, exact live mapping/code/data accounting across leases, forced
   retirement-race recovery, and O(1) allocation-free image identity access;
@@ -232,7 +233,22 @@ regress, and ten tie. Authenticated Sherlock remains about 10.8x behind Rust
 because it is an exact-literal 513-call loop, not the optimized class shape.
 All 107 reference-relative losses are retained. Repeated naive confirmation
 remains capped at 32 bytes; larger shapes require a proved-linear Two-Way or
-automaton plan. No native specialization is promoted yet.
+automaton plan.
+
+Search V7 now has one deliberately narrow promotion. Exact Q commit
+`88e9c22c4ac382531bc1026ca0e25587905f5206` passed a fresh complete 90-cell
+main run, the 54-cell alternating adversarial run, the targeted 30-process
+retry, frozen semantic replay, and independent execution/evidence review.
+All 60 facade gates beat the portable kernel, with maximum ratio
+`0.939701493`; all 18 adversarial gates passed at maximum `0.152542373`, and
+the targeted gate passed at `0.971576447`. The direct-child promotion binds
+external canonical bundle SHA-256
+`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`
+and changes only the isolated qualification atom in production source. This
+authorizes only explicit 16-byte searches declaring at least 1,024 calls over
+64 KiB windows or at least 64 calls over 1 MiB windows. It does not select a
+default route or qualify class-plus-suffix, Sherlock/aggregate, other widths,
+x86-64, or AOT.
 
 ## Non-negotiable gates
 

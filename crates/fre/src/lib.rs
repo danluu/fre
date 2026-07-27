@@ -1,7 +1,11 @@
 //! Honest operation-specific facade for the currently certified FRE subsets.
 //!
 //! [`PortableRegex`] provides bounded single-search operations for the HIR
-//! subset that `fre-lower` can prove exact. [`PortableRegexSetBuilder`] and
+//! subset that `fre-lower` can prove exact. [`QualifiedExactSearch`] exposes
+//! an experimental, explicit opt-in 16-byte exact-literal JIT leaf with
+//! portable fallback outside its evidence-gated large-window envelope. No
+//! default facade selects that native route.
+//! [`PortableRegexSetBuilder`] and
 //! [`PortableTextRegexSetBuilder`] compose independently admitted matchers
 //! with exact ascending pattern-ID semantics. [`AggregateBuilder`] constructs
 //! separate complete-span, count, or matched-byte-sum plans for the bounded
@@ -46,6 +50,7 @@ mod line_capture;
 mod literal_assertions;
 mod literal_class_run_literal;
 pub mod operation_session;
+mod qualified_exact_search;
 mod replacement;
 mod required_literal;
 mod set;
@@ -375,6 +380,15 @@ pub use operation_session::{
     OperationSessionConstructionLimits, OperationSessionConstructionReceipt, OperationSessionLeaf,
     OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
     OperationSessionValue,
+};
+pub use qualified_exact_search::{
+    QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
+    QUALIFIED_EXACT_SEARCH_LITERAL_BYTES, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
+    QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
+    QualifiedExactSearch, QualifiedExactSearchBuildError, QualifiedExactSearchBuildReport,
+    QualifiedExactSearchError, QualifiedExactSearchExecution, QualifiedExactSearchNativeIdentity,
+    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
+    QualifiedExactSearchWorkload,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,

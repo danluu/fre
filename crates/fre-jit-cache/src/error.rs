@@ -55,6 +55,9 @@ pub enum CacheError {
         expected: RuntimeIdentity,
         actual: RuntimeIdentity,
     },
+    BuilderSharedMapping {
+        identity: RuntimeIdentity,
+    },
     BuilderPublicationLimit {
         resource: CacheResource,
         limit: u64,

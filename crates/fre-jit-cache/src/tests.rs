@@ -375,6 +375,39 @@ mod native {
     }
 
     #[test]
+    fn internal_builder_rejects_non_linear_mapping_transfer_and_recovers() {
+        let _native = native_lock();
+        let image = image(b"shared-builder-mapping");
+        let identity = RuntimeIdentity::for_image(&image);
+        let cache = cache_for(2, 2, None);
+        let escaped = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&escaped);
+        assert!(matches!(
+            cache.get_or_build(&image, move |source, limits| {
+                let kernel = publish::<Span>(source, limits)?;
+                *captured.lock().expect("escape slot") = Some(kernel.clone());
+                Ok(kernel)
+            }),
+            Err(CacheError::BuilderSharedMapping { identity: actual }) if actual == identity
+        ));
+        // The escaped clone is deliberately outside cache ownership. Drop it
+        // before inspecting live cache resources so the assertion never
+        // represents a process-live executable mapping as nonexistent.
+        drop(escaped.lock().expect("escape slot").take());
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.current.entries, 0);
+        assert_eq!(snapshot.current.live_mappings, 0);
+        assert_eq!(snapshot.current.in_flight_builds, 0);
+        assert_eq!(snapshot.current.reserved_entries, 0);
+        assert_eq!(snapshot.totals.build_failures, 1);
+        let lease = cache
+            .get_or_publish(&image)
+            .expect("retry after escape drop");
+        assert_eq!(lease.identity(), identity);
+        assert!(lease.accounting().total_mapped_bytes > 0);
+    }
+
+    #[test]
     fn current_and_peak_bytes_are_exact_across_cache_only_eviction() {
         let _native = native_lock();
         let first_image = image(b"snapshot-first");

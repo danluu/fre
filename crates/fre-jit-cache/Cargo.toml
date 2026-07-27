@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 fre-jit-runtime = { path = "../fre-jit-runtime" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
 
 [dev-dependencies]
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }

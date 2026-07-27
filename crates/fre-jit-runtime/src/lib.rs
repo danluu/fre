@@ -36,6 +36,14 @@ pub use operation::{RuntimeAggregateOperation, RuntimeOperation};
 
 use crate::{limits::PublicationPlan, platform::ExecutableMapping};
 
+/// Check whether this process implements the native publication target.
+///
+/// Facades may call this before constructing a target-specific image so an
+/// unsupported host pays no Kernel IR, emission, audit, or mapping work.
+pub fn native_host_support() -> Result<(), PublishError> {
+    platform::ensure_host_supported()
+}
+
 /// An immutable, reference-counted native kernel with a typed output contract.
 ///
 /// Cloning is cheap. The executable mapping remains owned for every call
@@ -137,6 +145,16 @@ impl<O: RuntimeOperation> PublishedKernel<O> {
     #[must_use]
     pub const fn identity(&self) -> RuntimeIdentity {
         self.identity
+    }
+
+    /// Whether this handle uniquely owns its executable mapping.
+    ///
+    /// Bounded caches use this only at ownership-transfer admission. It does
+    /// not weaken the mapping's immutable call contract.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_unique_mapping_ownership(&self) -> bool {
+        Arc::strong_count(&self.mapping) == 1
     }
 }
 
@@ -251,13 +269,8 @@ fn publish_aggregate_impl<A: RuntimeAggregateOperation>(
 
 fn preflight<O: RuntimeOperation>(image: &NativeImage) -> Result<(), PublishError> {
     platform::ensure_host_supported()?;
+    preflight_search_backend_version(image)?;
     audit(image).map_err(PublishError::ImageAudit)?;
-    if image.backend_version() != BackendVersion::CURRENT {
-        return Err(PublishError::BackendVersionMismatch {
-            expected: BackendVersion::CURRENT.0,
-            actual: image.backend_version().0,
-        });
-    }
     let target = image.target();
     let baseline = TargetSpec::AARCH64_AAPCS64;
     if target.architecture != baseline.architecture
@@ -289,13 +302,8 @@ fn preflight_aggregate<A: RuntimeAggregateOperation>(
     image: &NativeAggregateImage,
 ) -> Result<(), PublishError> {
     platform::ensure_host_supported()?;
+    preflight_aggregate_backend_version(image)?;
     audit_aggregate(image).map_err(PublishError::ImageAudit)?;
-    if image.backend_version() != BackendVersion::CURRENT {
-        return Err(PublishError::BackendVersionMismatch {
-            expected: BackendVersion::CURRENT.0,
-            actual: image.backend_version().0,
-        });
-    }
     let target = image.target();
     let baseline = TargetSpec::AARCH64_AAPCS64;
     if target.architecture != baseline.architecture
@@ -318,6 +326,35 @@ fn preflight_aggregate<A: RuntimeAggregateOperation>(
         return Err(PublishError::AggregateOutputContractMismatch {
             expected: A::OUTPUT,
             actual: image.output(),
+        });
+    }
+    Ok(())
+}
+
+fn preflight_search_backend_version(image: &NativeImage) -> Result<(), PublishError> {
+    match image.backend_version() {
+        BackendVersion::SEARCH_V1
+        | BackendVersion::SEARCH_V2
+        | BackendVersion::SEARCH_V3
+        | BackendVersion::SEARCH_V4
+        | BackendVersion::SEARCH_V5
+        | BackendVersion::SEARCH_V6
+        | BackendVersion::SEARCH_V7 => Ok(()),
+        actual => Err(PublishError::BackendVersionMismatch {
+            expected: BackendVersion::SEARCH_CURRENT.0,
+            actual: actual.0,
+        }),
+    }
+}
+
+fn preflight_aggregate_backend_version(image: &NativeAggregateImage) -> Result<(), PublishError> {
+    if !matches!(
+        image.backend_version(),
+        BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2
+    ) {
+        return Err(PublishError::BackendVersionMismatch {
+            expected: BackendVersion::AGGREGATE_CURRENT.0,
+            actual: image.backend_version().0,
         });
     }
     Ok(())

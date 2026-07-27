@@ -12,6 +12,9 @@ fre-aggregate = { path = "../fre-aggregate" }
 fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-jit-runtime = { path = "../fre-jit-runtime" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }
