@@ -61,6 +61,35 @@ fn poisoned_state_lock_does_not_escape_safe_api() {
     assert!(snapshot.accounting_consistent);
 }
 
+#[test]
+fn backend_policy_is_part_of_the_complete_cache_key() {
+    use fre_jit_aarch64::{EmitLimits, SearchBackendPolicy, emit_with_backend};
+    use fre_jit_runtime::RuntimeIdentity;
+    use fre_kernel_ir::{AnchorFlags, ValidateLimits, build_exact_literal};
+
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("cache-key program");
+    let images = [
+        SearchBackendPolicy::AsimdV7,
+        SearchBackendPolicy::Sve16,
+        SearchBackendPolicy::Sve2Fixed16,
+    ]
+    .map(|backend| {
+        emit_with_backend(&program, backend, EmitLimits::default()).expect("backend-specific image")
+    });
+    assert_eq!(images[0].source_identity(), images[1].source_identity());
+    assert_eq!(images[0].source_identity(), images[2].source_identity());
+
+    let keys = images.each_ref().map(RuntimeIdentity::for_image);
+    assert_ne!(keys[0], keys[1]);
+    assert_ne!(keys[0], keys[2]);
+    assert_ne!(keys[1], keys[2]);
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     target_os = "macos",

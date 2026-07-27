@@ -5,7 +5,9 @@ use core::fmt;
 #[path = "qualified_exact_search_qualification.rs"]
 mod qualification_subject;
 
-use fre_jit_aarch64::{BackendVersion, EmitError, EmitLimits, ImageStats, TargetSpec, emit};
+use fre_jit_aarch64::{
+    BackendVersion, EmitError, EmitLimits, ImageStats, TargetSpec, emit_with_backend,
+};
 use fre_jit_runtime::{
     CallError, PublicationAccounting, PublicationLimits, PublishError, PublishedKernel,
     native_host_support, publish,
@@ -21,6 +23,7 @@ use fre_kernels::{
 
 use crate::{Match, SearchLimits, SearchWindow};
 
+pub use fre_jit_aarch64::SearchBackendPolicy as QualifiedExactSearchBackendPolicy;
 pub use qualification_subject::QUALIFIED_EXACT_SEARCH_QUALIFICATION;
 
 /// Only this exact literal width is admitted to the qualified JIT route.
@@ -51,8 +54,9 @@ pub const QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES: usize = 64;
 /// `Candidate` is deliberately not authorization. `Qualified` names the
 /// externally hashed, canonical evidence bundle accepted for this exact
 /// source subject. The facade has no caller-controlled setter for this state:
-/// promotion changes the single source constant only after evidence and
-/// independent review exist.
+/// the current V7 policy uses the source-bound constant, while explicitly
+/// selected fixed-lane policies remain `Candidate` until their own evidence
+/// and independent review exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualifiedExactSearchQualification {
     /// A qualification subject that may be measured but is not yet accepted.
@@ -158,6 +162,8 @@ pub enum QualifiedExactSearchRoute {
 /// Concrete identity of one published native route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualifiedExactSearchNativeIdentity {
+    /// Explicit construction policy that selected this backend.
+    pub backend_policy: QualifiedExactSearchBackendPolicy,
     /// Target and required CPU-feature stamp authenticated from the image.
     pub target: TargetSpec,
     /// Backend contract version authenticated from the image.
@@ -208,6 +214,7 @@ pub struct QualifiedExactSearchBuildReport {
     pub jit_literal_bytes: usize,
     pub jit_min_window_bytes: usize,
     pub workload: QualifiedExactSearchWorkload,
+    pub backend_policy: QualifiedExactSearchBackendPolicy,
     pub qualification: QualifiedExactSearchQualification,
     pub native: QualifiedExactSearchNativeStatus,
 }
@@ -323,9 +330,26 @@ impl QualifiedExactSearch {
         literal: &[u8],
         workload: QualifiedExactSearchWorkload,
     ) -> Result<Self, QualifiedExactSearchBuildError> {
-        Self::with_limits(
+        Self::new_with_backend(
             literal,
             workload,
+            QualifiedExactSearchBackendPolicy::CURRENT,
+        )
+    }
+
+    /// Build with an explicit `AArch64` backend policy and production limits.
+    ///
+    /// Fixed-lane SVE policies remain caller opt-ins; [`Self::new`] continues
+    /// to select Advanced SIMD V7.
+    pub fn new_with_backend(
+        literal: &[u8],
+        workload: QualifiedExactSearchWorkload,
+        backend_policy: QualifiedExactSearchBackendPolicy,
+    ) -> Result<Self, QualifiedExactSearchBuildError> {
+        Self::with_backend_and_limits(
+            literal,
+            workload,
+            backend_policy,
             LiteralBuildLimits::default(),
             ValidateLimits::default(),
             EmitLimits::default(),
@@ -333,7 +357,7 @@ impl QualifiedExactSearch {
         )
     }
 
-    /// Build under explicit bounded component policies.
+    /// Build under explicit bounded component policies using default V7.
     pub fn with_limits(
         literal: &[u8],
         workload: QualifiedExactSearchWorkload,
@@ -342,7 +366,33 @@ impl QualifiedExactSearch {
         emission_limits: EmitLimits,
         publication_limits: PublicationLimits,
     ) -> Result<Self, QualifiedExactSearchBuildError> {
+        Self::with_backend_and_limits(
+            literal,
+            workload,
+            QualifiedExactSearchBackendPolicy::CURRENT,
+            literal_limits,
+            validation_limits,
+            emission_limits,
+            publication_limits,
+        )
+    }
+
+    /// Build under explicit backend and bounded component policies.
+    pub fn with_backend_and_limits(
+        literal: &[u8],
+        workload: QualifiedExactSearchWorkload,
+        backend_policy: QualifiedExactSearchBackendPolicy,
+        literal_limits: LiteralBuildLimits,
+        validation_limits: ValidateLimits,
+        emission_limits: EmitLimits,
+        publication_limits: PublicationLimits,
+    ) -> Result<Self, QualifiedExactSearchBuildError> {
         let portable = LiteralPlan::new(literal, literal_limits)?;
+        let qualification = if backend_policy == QualifiedExactSearchBackendPolicy::CURRENT {
+            QUALIFIED_EXACT_SEARCH_QUALIFICATION
+        } else {
+            QualifiedExactSearchQualification::Candidate
+        };
         let (native, native_status) = if literal.len() != QUALIFIED_EXACT_SEARCH_LITERAL_BYTES {
             (
                 None,
@@ -368,16 +418,17 @@ impl QualifiedExactSearch {
                 AnchorFlags::default(),
                 validation_limits,
             )?;
-            let image = emit(&program, emission_limits)?;
+            let image = emit_with_backend(&program, backend_policy, emission_limits)?;
             let image_stats = image.stats();
             match publish::<NativeSpan>(&image, publication_limits) {
                 Ok(kernel) => {
                     let mapping = kernel.accounting();
                     let identity = QualifiedExactSearchNativeIdentity {
+                        backend_policy,
                         target: image.target(),
                         backend: image.backend_version(),
                         artifact_sha256: *image.artifact_identity().as_bytes(),
-                        qualification: QUALIFIED_EXACT_SEARCH_QUALIFICATION,
+                        qualification,
                     };
                     (
                         Some(kernel),
@@ -399,7 +450,8 @@ impl QualifiedExactSearch {
                 jit_literal_bytes: QUALIFIED_EXACT_SEARCH_LITERAL_BYTES,
                 jit_min_window_bytes: QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
                 workload,
-                qualification: QUALIFIED_EXACT_SEARCH_QUALIFICATION,
+                backend_policy,
+                qualification,
                 native: native_status,
             },
         })

@@ -405,10 +405,10 @@ pub use qualified_exact_search::{
     QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
     QUALIFIED_EXACT_SEARCH_LITERAL_BYTES, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
     QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
-    QualifiedExactSearch, QualifiedExactSearchBuildError, QualifiedExactSearchBuildReport,
-    QualifiedExactSearchError, QualifiedExactSearchExecution, QualifiedExactSearchNativeIdentity,
-    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
-    QualifiedExactSearchWorkload,
+    QualifiedExactSearch, QualifiedExactSearchBackendPolicy, QualifiedExactSearchBuildError,
+    QualifiedExactSearchBuildReport, QualifiedExactSearchError, QualifiedExactSearchExecution,
+    QualifiedExactSearchNativeIdentity, QualifiedExactSearchNativeStatus,
+    QualifiedExactSearchQualification, QualifiedExactSearchRoute, QualifiedExactSearchWorkload,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,

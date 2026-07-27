@@ -48,6 +48,37 @@ const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 /// anchored literals and start-anchored class runs do not need this cap.
 pub const MAX_REPEATED_CONFIRM_BYTES: usize = 32;
 
+/// Explicit implementation policy for one search image.
+///
+/// The default remains the qualified Advanced SIMD Search V7 backend. The
+/// fixed-lane SVE policies are opt-in until separate performance evidence
+/// justifies changing [`Self::CURRENT`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchBackendPolicy {
+    /// Advanced SIMD Search V7, including its authenticated AOT contract.
+    #[default]
+    AsimdV7,
+    /// SVE screening with exactly sixteen active byte lanes.
+    Sve16,
+    /// SVE2 `MATCH` screening with exactly sixteen active byte lanes.
+    Sve2Fixed16,
+}
+
+impl SearchBackendPolicy {
+    /// Current production policy. This remains V7 until separately promoted.
+    pub const CURRENT: Self = Self::AsimdV7;
+
+    /// Authenticated backend version selected by this policy.
+    #[must_use]
+    pub const fn backend_version(self) -> BackendVersion {
+        match self {
+            Self::AsimdV7 => BackendVersion::SEARCH_V7,
+            Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
+            Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
+        }
+    }
+}
+
 const X0: u8 = 0;
 const X1: u8 = 1;
 const X2: u8 = 2;
@@ -100,7 +131,19 @@ pub fn emit<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
 ) -> Result<NativeImage, EmitError> {
-    emit_search_version(program, limits, BackendVersion::SEARCH_CURRENT)
+    emit_with_backend(program, SearchBackendPolicy::CURRENT, limits)
+}
+
+/// Emit one search image under an explicit backend policy.
+///
+/// The policy-selected backend version, feature envelope, machine code, and
+/// AOT magic all participate in the resulting artifact identity.
+pub fn emit_with_backend<O: Operation>(
+    program: &ValidatedProgram<O>,
+    backend: SearchBackendPolicy,
+    limits: EmitLimits,
+) -> Result<NativeImage, EmitError> {
+    emit_search_version(program, limits, backend.backend_version())
 }
 
 /// Emit the opt-in SVE search backend with exactly sixteen active byte lanes.
@@ -113,7 +156,7 @@ pub fn emit_sve16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
 ) -> Result<NativeImage, EmitError> {
-    emit_search_version(program, limits, BackendVersion::SEARCH_SVE16_V1)
+    emit_with_backend(program, SearchBackendPolicy::Sve16, limits)
 }
 
 /// Emit the opt-in SVE2 backend with exactly sixteen active byte lanes.
@@ -124,7 +167,7 @@ pub fn emit_sve2_16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
 ) -> Result<NativeImage, EmitError> {
-    emit_search_version(program, limits, BackendVersion::SEARCH_SVE2_16_V1)
+    emit_with_backend(program, SearchBackendPolicy::Sve2Fixed16, limits)
 }
 
 #[cfg(test)]

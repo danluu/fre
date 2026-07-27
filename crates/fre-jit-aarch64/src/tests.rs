@@ -16,9 +16,10 @@ use crate::{
     AggregateResultLayout, AotLimits, AuditError, BackendVersion, Condition, ConfirmationKind,
     CpuFeatures, DataSymbol, DataSymbolKind, DecodeError, DecodedInstruction, EmitError,
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
-    NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout, audit,
-    audit_aggregate, decode, decode_one, emit, emit::emit_search_version_for_test,
-    emit_exact_aggregate, emit_sve2_16, emit_sve16, image::SearchShape,
+    NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
+    SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
+    emit::emit_search_version_for_test, emit_exact_aggregate, emit_sve2_16, emit_sve16,
+    emit_with_backend, image::SearchShape,
 };
 
 const HAYSTACK_BASE: u64 = 0x0010_0000;
@@ -2974,6 +2975,53 @@ fn sve16_backends_are_differentiated_deterministic_and_match_the_oracle() {
         }
     }
     assert_eq!(comparisons, 576);
+}
+
+#[test]
+fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("policy test program");
+    let policies = [
+        (SearchBackendPolicy::AsimdV7, BackendVersion::SEARCH_V7),
+        (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
+        (
+            SearchBackendPolicy::Sve2Fixed16,
+            BackendVersion::SEARCH_SVE2_16_V1,
+        ),
+    ];
+    assert_eq!(SearchBackendPolicy::CURRENT, SearchBackendPolicy::AsimdV7);
+    assert_eq!(SearchBackendPolicy::default(), SearchBackendPolicy::CURRENT);
+    assert_eq!(
+        SearchBackendPolicy::CURRENT.backend_version(),
+        BackendVersion::SEARCH_CURRENT
+    );
+    assert_eq!(
+        emit(&program, EmitLimits::default()).expect("default image"),
+        emit_with_backend(
+            &program,
+            SearchBackendPolicy::CURRENT,
+            EmitLimits::default()
+        )
+        .expect("explicit current image")
+    );
+
+    let mut identities = Vec::new();
+    for (policy, expected_backend) in policies {
+        assert_eq!(policy.backend_version(), expected_backend);
+        let image = emit_with_backend(&program, policy, EmitLimits::default())
+            .expect("policy-selected image");
+        assert_eq!(image.backend_version(), expected_backend);
+        assert_eq!(image.source_identity(), program.cache_identity());
+        audit(&image).expect("policy-selected image audits");
+        identities.push(image.artifact_identity());
+    }
+    assert_ne!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+    assert_ne!(identities[1], identities[2]);
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use fre::{
     QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
-    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QualifiedExactSearch, QualifiedExactSearchError,
-    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
-    QualifiedExactSearchWorkload, SearchLimits, SearchWindow,
+    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QualifiedExactSearch, QualifiedExactSearchBackendPolicy,
+    QualifiedExactSearchError, QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification,
+    QualifiedExactSearchRoute, QualifiedExactSearchWorkload, SearchLimits, SearchWindow,
 };
 use fre_jit_aarch64::{BackendVersion, EmitLimits, TargetSpec};
 use fre_jit_runtime::{CallError, PublicationLimits, PublishError};
@@ -23,6 +23,10 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
     let literal = b"0123456789abcdef";
     let search =
         QualifiedExactSearch::new(literal, QUALIFIED_WORKLOAD).expect("qualified exact matcher");
+    assert_eq!(
+        search.build_report().backend_policy,
+        QualifiedExactSearchBackendPolicy::AsimdV7
+    );
     assert_eq!(
         search.build_report().qualification,
         QualifiedExactSearchQualification::Qualified {
@@ -67,6 +71,10 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
             threshold_execution.route,
             QualifiedExactSearchRoute::NativeJit
         );
+        assert_eq!(
+            identity.backend_policy,
+            QualifiedExactSearchBackendPolicy::AsimdV7
+        );
         assert_eq!(identity.target, TargetSpec::AARCH64_AAPCS64);
         assert_eq!(identity.backend, BackendVersion::SEARCH_V7);
         assert_ne!(identity.artifact_sha256, [0; 32]);
@@ -108,6 +116,38 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
         .find(&threshold, SearchLimits::unlimited())
         .expect("under-reused portable search");
     assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
+}
+
+#[test]
+fn explicit_backend_policy_selects_and_stamps_the_native_identity() {
+    for policy in [
+        QualifiedExactSearchBackendPolicy::AsimdV7,
+        QualifiedExactSearchBackendPolicy::Sve16,
+        QualifiedExactSearchBackendPolicy::Sve2Fixed16,
+    ] {
+        let search =
+            QualifiedExactSearch::new_with_backend(b"0123456789abcdef", QUALIFIED_WORKLOAD, policy)
+                .expect("policy-selected exact matcher");
+        let report = search.build_report();
+        assert_eq!(report.backend_policy, policy);
+        let expected_qualification = if policy == QualifiedExactSearchBackendPolicy::CURRENT {
+            QUALIFIED_EXACT_SEARCH_QUALIFICATION
+        } else {
+            QualifiedExactSearchQualification::Candidate
+        };
+        assert_eq!(report.qualification, expected_qualification);
+
+        match &report.native {
+            QualifiedExactSearchNativeStatus::Published { identity, .. } => {
+                assert_eq!(identity.backend_policy, policy);
+                assert_eq!(identity.backend, policy.backend_version());
+                assert_eq!(identity.qualification, expected_qualification);
+                assert_ne!(identity.artifact_sha256, [0; 32]);
+            }
+            QualifiedExactSearchNativeStatus::Unavailable(_) => {}
+            other => panic!("eligible policy unexpectedly refused: {other:?}"),
+        }
+    }
 }
 
 #[test]
