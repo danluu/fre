@@ -2,28 +2,30 @@
 //!
 //! Construction accepts between two and 64 nonempty byte predicates. Each
 //! predicate is supplied as inclusive ASCII-byte ranges and is compiled into
-//! a byte-to-position mask table. Reduction performs exactly one state
-//! transition per haystack byte, resets after each accepted word, allocates no
-//! operation memory, and materializes no spans.
+//! a full byte-to-position mask table. Non-ASCII entries remain zero, so
+//! reduction performs exactly one state transition per haystack byte, resets
+//! after each accepted word, allocates no operation memory, and materializes no
+//! spans.
 
 use core::{fmt, mem::size_of};
 
 /// Stable identity for the fixed-predicate Shift-And strategy.
-pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.ascii.nonoverlap.v1";
+pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.byte-table.nonoverlap.v2";
 /// Stable identity for the count reducer.
 pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v1";
 /// Stable identity for the matched-byte-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v1";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 2;
 /// Maximum fixed word width representable by one Shift-And state.
 pub const MAX_WIDTH: usize = 64;
+/// Full byte-domain mask slots retained by the plan.
+pub const MASK_SLOTS: usize = 256;
 
-const MASK_SLOTS: usize = 128;
 const MAX_MEMBERS_PER_RANGE: usize = 128;
 const BUILD_FIXED_WORK: usize = 4;
 const RANGE_FIXED_WORK: usize = 2;
@@ -1323,7 +1325,7 @@ impl FixedPredicateWord64Plan {
         let mut state = 0_u64;
         let mut match_events = 0_usize;
         for &byte in haystack {
-            let mask = self.masks.get(usize::from(byte)).copied().unwrap_or(0);
+            let mask = self.masks[usize::from(byte)];
             state = (state.wrapping_shl(1) | 1) & mask;
             if state & self.accepting_bit != 0 {
                 match_events =
@@ -1689,10 +1691,10 @@ mod tests {
         assert_eq!(accounting.reserves, 0);
         assert_eq!(accounting.temporary_copies, 0);
         assert_eq!(accounting.scratch_bytes, 0);
-        // P=2, R=4 and every range has one member: U=128+P+130R+4,
-        // while A=128+P+2R+B+4 with B=4.
-        assert_eq!(accounting.work_upper_bound, 654);
-        assert_eq!(accounting.work_charged, 146);
+        // P=2, R=4 and every range has one member: U=256+P+130R+4,
+        // while A=256+P+2R+B+4 with B=4.
+        assert_eq!(accounting.work_upper_bound, 782);
+        assert_eq!(accounting.work_charged, 274);
         assert!(accounting.work_charged <= accounting.work_upper_bound);
 
         let exact = BuildLimits {
@@ -1761,6 +1763,13 @@ mod tests {
             FixedPredicateWord64Plan::build_attempt(&[A, B], BuildLimits::unlimited()).unwrap();
         assert!(attempt.closes());
         let receipt = *attempt.receipt();
+        let identity = receipt.identity();
+        assert_eq!(identity.plan_id, PLAN_ID);
+        assert_eq!(identity.algorithm_version, BUILD_ATTEMPT_ALGORITHM_VERSION);
+        assert_eq!(
+            identity.accounting_version,
+            BUILD_ATTEMPT_ACCOUNTING_VERSION
+        );
         let accounting = attempt.plan().build_accounting();
         let actual = receipt.actual();
         assert!(receipt.published());

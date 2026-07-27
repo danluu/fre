@@ -10033,7 +10033,7 @@ fn fixed_predicate_word64_plan_identity_matches(
         && (fre::FIXED_PREDICATE_WORD64_MIN_WIDTH..=fre::FIXED_PREDICATE_WORD64_MAX_WIDTH)
             .contains(&build.positions)
         && source_ranges_in_range
-        && build.mask_zero_writes == 128
+        && build.mask_zero_writes == fre::FIXED_PREDICATE_WORD64_MASK_SLOTS
         && build.position_visits == build.positions
         && build.range_inspections == build.source_ranges
         && build.member_writes == build.source_ranges
@@ -19232,6 +19232,10 @@ mod tests {
         };
         assert_eq!(build.positions, 15);
         assert_eq!(build.source_ranges, 29);
+        assert_eq!(
+            build.mask_zero_writes,
+            fre::FIXED_PREDICATE_WORD64_MASK_SLOTS
+        );
         assert!(build.work_charged <= build.work_upper_bound);
         assert_eq!(build.allocations, 0);
         assert_eq!(build.scratch_bytes, 0);
@@ -21243,6 +21247,9 @@ mod tests {
             repetition: fre::UnicodeScalarAggregateRepetition::ExactlyOne,
             range_payload_bytes: 40,
             work: 26,
+            ascii_classifier_build_work: 0,
+            ascii_classifier_bytes: 0,
+            dispatched_owner_bytes: 0,
             temporary_capacity_bytes: 72,
             scratch_bytes: 72,
             persistent_bytes: 123,
