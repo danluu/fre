@@ -438,15 +438,16 @@ pub use text_set::{
 
 use fre_automata::{Automaton, EarliestEnd, Exists, K0Workspace, SelectedEnd, Span};
 use fre_kernels::{
-    AbsoluteEndFixedPlan, ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError,
-    ForwardAnchoredBuildLimits, ForwardAnchoredPlan, ForwardAnchoredSearchAccounting,
-    ForwardAnchoredSearchError, ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits,
-    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
-    PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-    PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
-    RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
-    RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
+    AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, ForwardAnchoredBuildAccounting,
+    ForwardAnchoredBuildError, ForwardAnchoredBuildLimits, ForwardAnchoredPlan,
+    ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
+    LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
+    LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError, LiteralSetPlan,
+    LiteralSetSearchLimits, PackedLiteralSetAccounting, PackedLiteralSetBuildLimits,
+    PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
+    RequiredLiteralBuildAccounting, RequiredLiteralBuildError, RequiredLiteralBuildLimits,
+    RequiredLiteralPlan, RequiredLiteralSearchAccounting, RequiredLiteralSearchError,
+    RequiredLiteralSearchLimits, SimdDispatchContext, Window as LiteralWindow,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -1895,18 +1896,38 @@ impl PortableBuilder {
                         .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                     });
                 }
-                match ForwardAnchoredPlan::build(
-                    shape.class,
-                    shape.suffix,
-                    shape.anchors,
-                    self.limits.forward_anchored,
-                ) {
+                let dispatch = SimdDispatchContext::capture();
+                let forward = if ForwardAnchoredPlan::run_scanner_eligible(dispatch, shape.class) {
+                    ForwardAnchoredPlan::build_with_dispatch(
+                        dispatch,
+                        shape.class,
+                        shape.suffix,
+                        shape.anchors,
+                        self.limits.forward_anchored,
+                    )
+                    .map(PortablePlan::DispatchedForwardAnchored)
+                } else {
+                    ForwardAnchoredPlan::build(
+                        shape.class,
+                        shape.suffix,
+                        shape.anchors,
+                        self.limits.forward_anchored,
+                    )
+                    .map(PortablePlan::ForwardAnchored)
+                };
+                match forward {
                     Ok(plan) => {
-                        let build = plan.build_accounting();
+                        let build = match &plan {
+                            PortablePlan::ForwardAnchored(plan) => plan.build_accounting(),
+                            PortablePlan::DispatchedForwardAnchored(plan) => {
+                                plan.build_accounting()
+                            }
+                            _ => unreachable!("the forward constructor returned another family"),
+                        };
                         return Ok(PortableRegex {
                             source,
                             capture_names,
-                            plan: PortablePlan::ForwardAnchored(plan),
+                            plan,
                             profile: profile.clone(),
                             limits: self.limits,
                             selection: self.selection,
@@ -2360,6 +2381,7 @@ enum PortablePlan {
     LiteralSetDfa(LiteralSetPlan),
     RequiredLiteral(RequiredLiteralPlan),
     ForwardAnchored(ForwardAnchoredPlan),
+    DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
     K0(Automaton),
     UnicodeWordRun(unicode_word_run::Plan),
@@ -2373,6 +2395,7 @@ impl PortablePlan {
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::ForwardAnchored(forward) => forward.plan_id(),
+            Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
             Self::UnicodeWordRun(plan) => plan.plan_id(),
@@ -2686,6 +2709,18 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::DispatchedForwardAnchored(forward) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = forward.find_window(
+                    haystack,
+                    literal_window,
+                    forward_anchored_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
             PortablePlan::ForwardEndFixed(fixed) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) =
@@ -2761,6 +2796,14 @@ impl PortableRegex {
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
             PortablePlan::ForwardAnchored(forward) => forward
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    forward_anchored_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::DispatchedForwardAnchored(forward) => forward
                 .find_window(
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
@@ -2888,6 +2931,18 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::DispatchedForwardAnchored(forward) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = forward.find_window(
+                    haystack,
+                    literal_window,
+                    forward_anchored_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
             PortablePlan::ForwardEndFixed(fixed) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) =
@@ -2957,6 +3012,14 @@ impl PortableRegex {
                 ))
             }
             PortablePlan::ForwardAnchored(forward) => {
+                let (matched, accounting) =
+                    forward.find(haystack, forward_anchored_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::DispatchedForwardAnchored(forward) => {
                 let (matched, accounting) =
                     forward.find(haystack, forward_anchored_limits(limits))?;
                 Ok((
@@ -3201,6 +3264,18 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::DispatchedForwardAnchored(forward) => {
+                let literal_window = LiteralWindow::new(window.start(), window.end());
+                let (matched, accounting) = forward.find_window(
+                    haystack,
+                    literal_window,
+                    forward_anchored_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
             PortablePlan::ForwardEndFixed(fixed) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) =
@@ -3278,6 +3353,20 @@ impl PortableRegex {
                 build_limits: self.limits,
                 search_limits,
             }),
+            PortablePlan::DispatchedForwardAnchored(forward) => {
+                Some(ForwardAnchoredCacheIdentity {
+                    schema_version: EXPLAIN_SCHEMA_VERSION,
+                    plan_id: forward.plan_id(),
+                    profile: self.profile.clone(),
+                    operation,
+                    anchors: forward.anchors(),
+                    class_words: forward.class().words(),
+                    suffix: forward.suffix().to_vec(),
+                    implementation: forward.implementation(),
+                    build_limits: self.limits,
+                    search_limits,
+                })
+            }
             PortablePlan::ForwardEndFixed(fixed) => Some(ForwardAnchoredCacheIdentity {
                 schema_version: EXPLAIN_SCHEMA_VERSION,
                 plan_id: fixed.plan_id(),
@@ -3959,8 +4048,8 @@ fn forward_anchored_limits(limits: SearchLimits) -> ForwardAnchoredSearchLimits 
 mod tests {
     use super::{
         BuildError, BuildLimits, CaptureFreeOperation, PlanKind, PlanSelection, PortableBuilder,
-        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits, PortableRegex,
-        SearchAccounting, SearchError, SearchLimits, SearchWindow,
+        PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits, PortablePlan,
+        PortableRegex, SearchAccounting, SearchError, SearchLimits, SearchWindow,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
@@ -4801,6 +4890,354 @@ mod tests {
                     | fre_kernels::ForwardAnchoredSearchError::WorkLimit { .. }
             ))
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the routing test keeps eligibility, identity, and exact owner accounting together"
+    )]
+    fn forward_facade_dispatch_is_confined_to_sve_ascii_bitsets() {
+        use fre_kernels::{
+            FORWARD_ANCHORED_ASCII_BITSET_RUN_PLAN_ID, FORWARD_ANCHORED_PLAN_ID,
+            ForwardAnchoredAnchors, ForwardAnchoredByteClass, ForwardAnchoredPlan,
+            ForwardClassImplementation, SimdDispatchContext,
+        };
+
+        let dispatch = SimdDispatchContext::capture();
+        let anchors = ForwardAnchoredAnchors {
+            start: true,
+            end: false,
+        };
+        let bitset_class = ForwardAnchoredByteClass::from_bytes(b"0_aceg");
+        let bitset = PortableBuilder::new(r"\A[0_aceg]+Z")
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        let bitset_build = bitset
+            .build_report()
+            .forward_anchored
+            .expect("forced forward plan retains its construction receipt");
+        assert_eq!(
+            bitset_build.implementation,
+            ForwardClassImplementation::Bitset
+        );
+        let eligible = ForwardAnchoredPlan::run_scanner_eligible(dispatch, bitset_class);
+        assert_eq!(
+            matches!(&bitset.plan, PortablePlan::DispatchedForwardAnchored(_)),
+            eligible
+        );
+        assert_eq!(
+            bitset.runtime_implementation_id(),
+            if eligible {
+                FORWARD_ANCHORED_ASCII_BITSET_RUN_PLAN_ID
+            } else {
+                FORWARD_ANCHORED_PLAN_ID
+            }
+        );
+        assert_eq!(
+            bitset
+                .forward_anchored_cache_identity(
+                    CaptureFreeOperation::Span,
+                    SearchLimits::default(),
+                )
+                .unwrap()
+                .plan_id,
+            bitset.runtime_implementation_id()
+        );
+        if eligible {
+            let expected = ForwardAnchoredPlan::build_with_dispatch(
+                dispatch,
+                bitset_class,
+                b"Z",
+                anchors,
+                fre_kernels::ForwardAnchoredBuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(bitset_build, expected.build_accounting());
+        } else {
+            let expected = ForwardAnchoredPlan::build(
+                bitset_class,
+                b"Z",
+                anchors,
+                fre_kernels::ForwardAnchoredBuildLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(bitset_build, expected.build_accounting());
+        }
+        assert_eq!(
+            bitset.build_report().plan_storage_bytes,
+            bitset_build.persistent_bytes
+        );
+
+        let established = [
+            (
+                r"\A[a-z]+Z",
+                ForwardAnchoredByteClass::inclusive(b'a', b'z'),
+                ForwardClassImplementation::InclusiveRange {
+                    start: b'a',
+                    end: b'z',
+                },
+            ),
+            (
+                r"\A[acegi]+Z",
+                ForwardAnchoredByteClass::from_bytes(b"acegi"),
+                ForwardClassImplementation::Quint {
+                    first: b'a',
+                    second: b'c',
+                    third: b'e',
+                    fourth: b'g',
+                    fifth: b'i',
+                },
+            ),
+            (
+                r"(?-u:\A[\x00\x02\x04\x06\x80\xFF]+Z)",
+                ForwardAnchoredByteClass::from_bytes(&[0, 2, 4, 6, 0x80, 0xff]),
+                ForwardClassImplementation::Bitset,
+            ),
+        ];
+        for (pattern, class, implementation) in established {
+            assert!(!ForwardAnchoredPlan::run_scanner_eligible(dispatch, class));
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceForwardAnchored)
+                .build()
+                .unwrap();
+            assert!(matches!(&regex.plan, PortablePlan::ForwardAnchored(_)));
+            assert_eq!(regex.runtime_implementation_id(), FORWARD_ANCHORED_PLAN_ID);
+            let expected = ForwardAnchoredPlan::build(
+                class,
+                b"Z",
+                anchors,
+                fre_kernels::ForwardAnchoredBuildLimits::default(),
+            )
+            .unwrap()
+            .build_accounting();
+            assert_eq!(
+                regex.build_report().forward_anchored,
+                Some(expected),
+                "pattern={pattern:?}"
+            );
+            assert_eq!(expected.implementation, implementation);
+            assert_eq!(
+                regex.build_report().plan_storage_bytes,
+                expected.persistent_bytes
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bounded fixtures exercise scanner and window boundaries"
+    )]
+    fn forward_ascii_bitset_facade_matches_pinned_bytes_at_run_boundaries() {
+        const MEMBERS: &[u8] = b"0_aceg";
+        let pattern = r"\A[0_aceg]+Z";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::ForwardAnchored);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        let mut cases = Vec::new();
+        for run_len in [0_usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257] {
+            let prefix: Vec<u8> = (0..run_len)
+                .map(|index| MEMBERS[index % MEMBERS.len()])
+                .collect();
+
+            let mut success = prefix.clone();
+            success.extend_from_slice(b"Ztail");
+            cases.push(success);
+
+            cases.push(prefix.clone());
+            if !prefix.is_empty() {
+                let mut outsider = prefix;
+                outsider[run_len / 2] = b'Q';
+                outsider.push(b'Z');
+                cases.push(outsider);
+            }
+        }
+
+        for haystack in cases {
+            let expected = upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            let (actual, accounting) = regex.find(&haystack, SearchLimits::unlimited()).unwrap();
+            assert_eq!(
+                actual.map(|matched| (matched.start(), matched.end())),
+                expected,
+                "haystack_len={}",
+                haystack.len()
+            );
+            let SearchAccounting::ForwardAnchored(accounting) = accounting else {
+                panic!("eligible production pattern changed plans")
+            };
+            assert!(accounting.prefix_bytes_examined <= accounting.prefix_bytes_upper_bound);
+            assert_eq!(
+                regex
+                    .is_match_value(&haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.is_some()
+            );
+            assert_eq!(
+                regex
+                    .selected_end(&haystack, SearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                expected.map(|(_, end)| end)
+            );
+
+            for (start, end) in [
+                (0, haystack.len()),
+                (usize::from(!haystack.is_empty()), haystack.len()),
+                (0, haystack.len().saturating_sub(1)),
+            ] {
+                let actual = regex
+                    .find_window(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .0
+                    .map(|matched| (matched.start(), matched.end()));
+                let expected = upstream
+                    .find_at(&haystack, start)
+                    .filter(|matched| matched.end() <= end)
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    actual,
+                    expected,
+                    "haystack_len={} window={start}..{end}",
+                    haystack.len()
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native release benchmark; requires OS-usable SVE"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the ignored benchmark uses bounded iterations and checksum arithmetic"
+    )]
+    fn benchmark_forward_ascii_bitset_facade_dispatch_against_established_path() {
+        use fre_kernels::{
+            FORWARD_ANCHORED_ASCII_BITSET_RUN_PLAN_ID, FORWARD_ANCHORED_PLAN_ID, Feature,
+            ForwardAnchoredAnchors, ForwardAnchoredByteClass, ForwardAnchoredPlan,
+            SimdDispatchContext,
+        };
+        use std::{hint::black_box, time::Instant};
+
+        fn measure(regex: &PortableRegex, haystack: &[u8], iterations: usize) -> f64 {
+            let started = Instant::now();
+            let mut checksum = 0_usize;
+            for iteration in 0..iterations {
+                let (matched, accounting) = black_box(regex)
+                    .find(black_box(haystack), SearchLimits::unlimited())
+                    .unwrap();
+                checksum ^= matched.map_or(0, |matched| matched.end().rotate_left(7))
+                    ^ usize::try_from(accounting.work_or_linear_terms()).unwrap_or(usize::MAX)
+                    ^ iteration;
+            }
+            black_box(checksum);
+            started.elapsed().as_secs_f64() * 1_000_000_000.0
+                / f64::from(u32::try_from(iterations).unwrap())
+        }
+
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            dispatch.capabilities().usable().contains(Feature::ArmSve),
+            "benchmark requires OS-usable SVE"
+        );
+        let pattern = r"\A[0_aceg]+Z";
+        let dispatched = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        assert_eq!(
+            dispatched.runtime_implementation_id(),
+            FORWARD_ANCHORED_ASCII_BITSET_RUN_PLAN_ID
+        );
+
+        let class = ForwardAnchoredByteClass::from_bytes(b"0_aceg");
+        let legacy_plan = ForwardAnchoredPlan::build(
+            class,
+            b"Z",
+            ForwardAnchoredAnchors {
+                start: true,
+                end: false,
+            },
+            fre_kernels::ForwardAnchoredBuildLimits::default(),
+        )
+        .unwrap();
+        let legacy_build = legacy_plan.build_accounting();
+        let mut established = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceForwardAnchored)
+            .build()
+            .unwrap();
+        established.plan = PortablePlan::ForwardAnchored(legacy_plan);
+        established.report.forward_anchored = Some(legacy_build);
+        established.report.plan_storage_bytes = legacy_build.persistent_bytes;
+        established.report.charged_persistent_bytes = established
+            .report
+            .source_storage_bytes
+            .checked_add(established.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(legacy_build.persistent_bytes))
+            .unwrap();
+        assert_eq!(
+            established.runtime_implementation_id(),
+            FORWARD_ANCHORED_PLAN_ID
+        );
+
+        let mut haystack: Vec<u8> = b"0_aceg".iter().copied().cycle().take(65_536).collect();
+        haystack.push(b'Z');
+        assert_eq!(
+            dispatched
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0,
+            established
+                .find(&haystack, SearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        let iterations = std::env::var("FRE_FORWARD_FACADE_BENCH_ITERS").map_or(2_000, |raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|error| panic!("FRE_FORWARD_FACADE_BENCH_ITERS: {error}"))
+        });
+        assert!(iterations > 0 && u32::try_from(iterations).is_ok());
+        let _ = measure(&dispatched, &haystack, iterations / 10 + 1);
+        let _ = measure(&established, &haystack, iterations / 10 + 1);
+
+        let mut dispatched_samples = Vec::with_capacity(8);
+        let mut established_samples = Vec::with_capacity(8);
+        for sample in 0..8 {
+            if sample % 2 == 0 {
+                dispatched_samples.push(measure(&dispatched, &haystack, iterations));
+                established_samples.push(measure(&established, &haystack, iterations));
+            } else {
+                established_samples.push(measure(&established, &haystack, iterations));
+                dispatched_samples.push(measure(&dispatched, &haystack, iterations));
+            }
+        }
+        dispatched_samples.sort_by(f64::total_cmp);
+        established_samples.sort_by(f64::total_cmp);
+        let dispatched_ns = dispatched_samples[dispatched_samples.len() / 2];
+        let established_ns = established_samples[established_samples.len() / 2];
+        eprintln!(
+            "forward-ascii-bitset-facade: dispatched={dispatched_ns:.3}ns established={established_ns:.3}ns speedup={:.3}x",
+            established_ns / dispatched_ns
+        );
     }
 
     #[test]

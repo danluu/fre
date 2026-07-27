@@ -209,6 +209,16 @@ fn select_class_implementation(class: ByteClass) -> Result<ClassImplementation, 
     Ok(implementation)
 }
 
+fn run_scanner_eligible(
+    dispatch: SimdDispatchContext,
+    class: ByteClass,
+    implementation: ClassImplementation,
+) -> bool {
+    implementation == ClassImplementation::Bitset
+        && class.is_ascii()
+        && dispatch.capabilities().usable().contains(Feature::ArmSve)
+}
+
 /// Absolute anchors interpreted against the original haystack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Anchors {
@@ -880,6 +890,23 @@ impl AbsoluteEndFixedPlan {
 }
 
 impl ForwardAnchoredPlan {
+    /// Whether this host and class select the opt-in directional run scanner.
+    ///
+    /// This is the same construction predicate used by
+    /// [`Self::build_with_dispatch`]. Callers that retain distinct legacy and
+    /// dispatched owner types can use it to avoid changing storage accounting
+    /// for classes that keep their established implementation.
+    #[must_use]
+    pub fn run_scanner_eligible(dispatch: SimdDispatchContext, class: ByteClass) -> bool {
+        if class.is_empty() {
+            return false;
+        }
+        let Ok(implementation) = select_class_implementation(class) else {
+            return false;
+        };
+        run_scanner_eligible(dispatch, class, implementation)
+    }
+
     /// Prove eligibility and copy the fixed suffix.
     ///
     /// # Errors
@@ -993,11 +1020,8 @@ impl ForwardAnchoredPlan {
 
         let class_cardinality = class.cardinality();
         let implementation = select_class_implementation(class)?;
-        let scanner_eligible = implementation == ClassImplementation::Bitset
-            && class.is_ascii()
-            && dispatch.is_some_and(|(context, _)| {
-                context.capabilities().usable().contains(Feature::ArmSve)
-            });
+        let scanner_eligible = dispatch
+            .is_some_and(|(context, _)| run_scanner_eligible(context, class, implementation));
         let suffix_u64 =
             u64::try_from(suffix.len()).map_err(|_| BuildError::ArithmeticOverflow {
                 computation: "suffix length as u64",
