@@ -23,9 +23,12 @@ mod error;
 mod history;
 mod inline;
 mod limits;
+mod line;
 mod model;
 mod profile;
 mod runtime;
+mod stream;
+mod tagged;
 
 pub use ast::{Assertion, Ast, Greed};
 pub use compile::{BuildReport, Program};
@@ -36,6 +39,10 @@ pub use history::{
 };
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
+pub use line::{
+    LineMode, LinePartition, LineScanError, LineScanLimits, LineScanProspective, LineScanReport,
+    LineScanResource, LineScanner, SemanticBoundary,
+};
 pub use model::{
     AggregateOutcome, CandidateKind, CaptureCountOutcome, CaptureRecord, GroupRecord,
     HistoryProgramShape, HistorySearchProspective, MatchKind, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
@@ -43,3 +50,15 @@ pub use model::{
     RestartedHistoryProspective, RunReport, SearchConfig, SearchKind, SearchOutcome, Span, Window,
 };
 pub use profile::CaptureProfile;
+pub use stream::{
+    CAPTURE_STREAM_ACCOUNTING_VERSION, CAPTURE_STREAM_ALGORITHM_VERSION, CaptureStream,
+    CaptureStreamAccounting, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
+    CaptureStreamOperationProspective, CaptureStreamProjection, CaptureStreamProspective,
+    CaptureStreamReport, CaptureStreamResource,
+};
+pub use tagged::{
+    HistoryId, ParticipationMask, ParticipationState, ParticipationStorage, ProgramTagAction,
+    ProgramTagActions, TAG_WORKSPACE_ACCOUNTING_VERSION, TAG_WORKSPACE_ALGORITHM_VERSION,
+    TagAction, TagKind, TagRunAccounting, TagRunLimits, TagSnapshot, TagWorkspace,
+    TagWorkspaceError, TagWorkspaceLimits, TagWorkspaceProspective, TagWorkspaceResource,
+};

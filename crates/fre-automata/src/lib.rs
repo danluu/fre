@@ -20,6 +20,8 @@ mod contract;
 mod error;
 mod k0;
 mod plan;
+mod priority;
+mod tagged_many;
 mod unicode_look;
 
 pub use contract::{
@@ -30,5 +32,18 @@ pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{K0Workspace, WorkspaceLayout, WorkspaceLimits};
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
+};
+pub use priority::{
+    ActionCapabilities, DirectCount, DirectReduceLimits, DirectReduceReport,
+    DirectReduceTraceReport, DirectReduceValue, DirectSpanSum, EmptyMatchProgress, ExecutionActual,
+    ExecutionProspective, ForcedExecution, MatchLengthProof, PatternAction, PatternOrdinal,
+    PreparationAccounting, PreparationError, PreparationLimits, PreparationProspective,
+    PreparationResource, PreparedPriorityAutomaton, PriorityAutomataFacts, PriorityExecutionKernel,
+    PriorityMatch, PriorityTarget, ReduceError, PRIORITY_ACCOUNTING_ID,
+};
+pub use tagged_many::{
+    TaggedManyBuildAccounting, TaggedManyBuildError, TaggedManyBuildLimits,
+    TaggedManyExecutionClass, TaggedManyPlan, TaggedManyStats, TAGGED_MANY_ACCOUNTING_ID,
+    TAGGED_MANY_BUILD_ALLOCATION_ATTEMPTS,
 };
 pub use unicode_look::{UnicodeLookError, UnicodeLookMatcher};

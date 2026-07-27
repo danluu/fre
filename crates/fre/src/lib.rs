@@ -45,6 +45,7 @@ pub mod guarded_ascii_word;
 mod line_capture;
 mod literal_assertions;
 mod literal_class_run_literal;
+pub mod operation_session;
 mod replacement;
 mod required_literal;
 mod set;
@@ -93,7 +94,34 @@ pub use aggregate::{
     AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult,
     AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateTokenPhraseIdentity,
     AggregateTokenPhraseSemantics, AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
-    AggregateWordRunIdentity, AggregateWordRunSemantics,
+    AggregateValueCounterResult, AggregateWordRunIdentity, AggregateWordRunSemantics,
+    LITERAL_ANCHOR_AGGREGATE_ACCOUNTING_ID, LITERAL_ANCHOR_AGGREGATE_SCHEMA_VERSION,
+    LiteralAnchorAggregateBuildError, LiteralAnchorAggregateBuildLimits,
+    LiteralAnchorAggregateBuildReport, LiteralAnchorAggregateBuilder,
+    LiteralAnchorAggregateCountRegex, LiteralAnchorAggregateExecutionReceipt,
+    LiteralAnchorAggregateRoute, LiteralAnchorAggregateRunError, LiteralAnchorAggregateRunLimits,
+    LiteralAnchorAggregateSpanSumRegex, LiteralAnchorCandidateBuildReport,
+    LiteralAnchorCandidateExecutionReceipt, LiteralAnchorFallbackReason,
+    PRIORITY_AGGREGATE_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID,
+    PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION, PRIORITY_AGGREGATE_SCHEMA_VERSION,
+    PriorityAggregateAssertionProof, PriorityAggregateBridgeAccounting,
+    PriorityAggregateBridgeLimits, PriorityAggregateBridgeProspective,
+    PriorityAggregateBridgeResource, PriorityAggregateBuildError, PriorityAggregateBuildLimits,
+    PriorityAggregateBuildReport, PriorityAggregateBuilder, PriorityAggregateCountRegex,
+    PriorityAggregateDeterminismProof, PriorityAggregateExecutionReceipt,
+    PriorityAggregateFactReceipt, PriorityAggregateManyBuildError,
+    PriorityAggregateManyBuildLimits, PriorityAggregateManyBuildReport,
+    PriorityAggregateManyBuilder, PriorityAggregateManyCompositionAccounting,
+    PriorityAggregateManyCountRegex, PriorityAggregateManyExecutionReceipt,
+    PriorityAggregateManyOperation, PriorityAggregateManyPatternReport,
+    PriorityAggregateManyRunError, PriorityAggregateManyRunFailure, PriorityAggregateManyRunLimits,
+    PriorityAggregateManySourceOwnerAccounting, PriorityAggregateManySourceOwnerLimits,
+    PriorityAggregateManySourceOwnerResource, PriorityAggregateManySpanSumRegex,
+    PriorityAggregateManyTraceReceipt, PriorityAggregateOperation, PriorityAggregateProofRefusal,
+    PriorityAggregateRouteProof, PriorityAggregateRunError, PriorityAggregateRunFailure,
+    PriorityAggregateRunLimits, PriorityAggregateSourceOwnerAccounting,
+    PriorityAggregateSourceOwnerLimits, PriorityAggregateSourceOwnerResource,
+    PriorityAggregateSpanSumRegex, PriorityAggregateSyntaxEvidence, PriorityAggregateUsizeProof,
 };
 pub use aggregate_construction::{
     AGGREGATE_CONSTRUCTION_ACCOUNTING_VERSION, AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION,
@@ -162,10 +190,10 @@ pub use captures::{
     CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation,
     CaptureParticipationQuotientFallback, CaptureParticipationQuotientProof, CapturePlanIdentity,
     CapturePlanKind, CapturePrefixClassParticipationIdentity, CaptureRegex, CaptureRunLimits,
-    CaptureUnsupported, OrderedRootCaptureManyProof, PortableTextCaptureBuildError,
-    PortableTextCaptureBuildReport, PortableTextCaptureBuilder, PortableTextCaptureIterationError,
-    PortableTextCaptureMatch, PortableTextCaptureRegex, PortableTextCaptureSearchError,
-    PortableTextCaptures,
+    CaptureStreamSession, CaptureUnsupported, OrderedRootCaptureManyProof,
+    PortableTextCaptureBuildError, PortableTextCaptureBuildReport, PortableTextCaptureBuilder,
+    PortableTextCaptureIterationError, PortableTextCaptureMatch, PortableTextCaptureRegex,
+    PortableTextCaptureSearchError, PortableTextCaptures,
 };
 pub use fre_aggregate::{
     CONTINUATION_OPERATION_ACCOUNTING_VERSION as AGGREGATE_CONTINUATION_ACCOUNTING_VERSION,
@@ -178,16 +206,21 @@ pub use fre_aggregate::{
     CompileAttemptReceipt as AggregateCompileAttemptReceipt,
     CompileLimits as AggregateCompileLimits, Error as AggregateEngineError,
     ExecutionAccounting as AggregateExecutionAccounting,
+    OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION as AGGREGATE_OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION,
     OperationAttemptError as AggregateOperationAttemptError,
     OperationAttemptIdentity as AggregateOperationAttemptIdentity,
     OperationAttemptKind as AggregateOperationAttemptKind,
     OperationAttemptReceipt as AggregateOperationAttemptReceipt,
-    OperationCertificate as AggregateOperationCertificate, OperationId as AggregateOperationId,
-    OperationInvocation as AggregateOperationInvocation,
+    OperationCertificate as AggregateOperationCertificate,
+    OperationCounterReceipt as AggregateOperationCounterReceipt,
+    OperationCounterValue as AggregateOperationCounterValue,
+    OperationHotCounterReceipt as AggregateOperationHotCounterReceipt,
+    OperationId as AggregateOperationId, OperationInvocation as AggregateOperationInvocation,
     OperationLimits as AggregateOperationLimits, OperationLimitsId as AggregateOperationLimitsId,
     OperationPhysicalRoute as AggregateOperationPhysicalRoute,
     OperationPrepublicationFallback as AggregateOperationPrepublicationFallback,
     OperationProspective as AggregateOperationProspective,
+    OperationStructuralCounters as AggregateOperationStructuralCounters,
     OperationWorkMode as AggregateOperationWorkMode, PlanId as AggregatePlanId,
     Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
     Unsupported as AggregateUnsupported,
@@ -204,6 +237,12 @@ pub use fre_capture_lab::{
     SearchConfig as CaptureSearchConfig, SearchError as CaptureSearchError,
     SearchKind as CaptureSearchKind, SearchLimits as CaptureSearchLimits,
     SearchOutcome as CaptureSearchOutcome, Span as CaptureSpan, Window as CaptureWindow,
+};
+pub use fre_capture_lab::{
+    CAPTURE_STREAM_ACCOUNTING_VERSION, CAPTURE_STREAM_ALGORITHM_VERSION, CaptureStreamAccounting,
+    CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
+    CaptureStreamOperationProspective, CaptureStreamProjection, CaptureStreamProspective,
+    CaptureStreamReport, CaptureStreamResource,
 };
 pub use fre_kernels::{
     ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_MAX_ATOMS,
@@ -331,6 +370,12 @@ pub use fre_kernels::{
     UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds, UrlAggregateReduceError,
     UrlAggregateReduceUpperBounds, url_aggregate_reduce_upper_bounds,
 };
+pub use operation_session::{
+    OperationSession, OperationSessionAdmission, OperationSessionAttemptReceipt,
+    OperationSessionConstructionLimits, OperationSessionConstructionReceipt, OperationSessionLeaf,
+    OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
+    OperationSessionValue,
+};
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,
     CaptureExpansionReport, CaptureExpansionResult, FunctionalReplacementAccounting,
@@ -391,7 +436,8 @@ pub use line_capture::{
 };
 
 pub use fre_automata::{
-    SearchError as K0SearchError, SearchLimits, SearchWindow,
+    DirectReduceLimits, ForcedExecution, PreparationAccounting, PriorityExecutionKernel,
+    PriorityTarget, ReduceError, SearchError as K0SearchError, SearchLimits, SearchWindow,
     SetupAccounting as SearchSessionSetupAccounting, WorkspaceLimits as SearchSessionLimits,
 };
 pub use unicode_word_run::{

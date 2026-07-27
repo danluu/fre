@@ -5,11 +5,11 @@ use fre::{
     AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionSource,
     AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
     AggregateGuardedAsciiWordSemantics, AggregateLiteralIneligibility, AggregateOperation,
-    AggregateOperationAttemptKind, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    AggregateOperationAttemptKind, AggregateOperationCounterValue, AggregatePlanIdentity,
+    AggregatePlanKind, AggregatePlanSelection, AggregateResource, AggregateRunLimits,
+    AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
+    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
+    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
     LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
@@ -4451,6 +4451,102 @@ fn value_only_success_skips_source_arc_clone_for_both_selected_plans() {
             1
         );
     }
+}
+
+#[test]
+fn counter_value_facade_keeps_selected_values_routes_and_direct_absence() {
+    let haystack = b"aaaabaaaa";
+    let count = aggregate_builder(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let ordinary_count = count
+        .count_value(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let counter_count = count
+        .count_value_with_counters(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counter_count.value(), ordinary_count);
+    let count_receipt = counter_count
+        .continuation_receipt()
+        .expect("forced continuation Count receipt");
+    assert!(count_receipt.closes());
+    assert_eq!(
+        count_receipt.value,
+        AggregateOperationCounterValue::Count(usize::try_from(ordinary_count).unwrap())
+    );
+
+    let span_sum = aggregate_builder(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_span_sum()
+        .unwrap();
+    let ordinary_span_sum = span_sum
+        .span_sum_value(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let counter_span_sum = span_sum
+        .span_sum_value_with_counters(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counter_span_sum.value(), ordinary_span_sum);
+    let span_sum_receipt = counter_span_sum
+        .continuation_receipt()
+        .expect("forced continuation SpanSum receipt");
+    assert!(span_sum_receipt.closes());
+    assert_eq!(
+        span_sum_receipt.value,
+        AggregateOperationCounterValue::SpanSum(usize::try_from(ordinary_span_sum).unwrap())
+    );
+
+    let direct = aggregate_builder("aba")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+        .build_count()
+        .unwrap();
+    let ordinary_direct = direct
+        .count_value(b"ababaaba", AggregateRunLimits::default())
+        .unwrap();
+    let counter_direct = direct
+        .count_value_with_counters(b"ababaaba", AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counter_direct.value(), ordinary_direct);
+    assert!(counter_direct.continuation_receipt().is_none());
+}
+
+#[test]
+fn counter_value_facade_preserves_exact_output_gate_and_one_below_refusal() {
+    let haystack = b"aaaabaaaa";
+    let count = aggregate_builder(r"(?:a+b|a)")
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let audited = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let mut exact = AggregateRunLimits::default();
+    exact.continuation.max_output_matches = usize::try_from(audited.value()).unwrap();
+    let exact_result = count.count_value_with_counters(haystack, exact).unwrap();
+    assert_eq!(exact_result.value(), audited.value());
+    assert!(
+        exact_result
+            .continuation_receipt()
+            .expect("exact continuation receipt")
+            .closes()
+    );
+
+    let mut one_below = exact;
+    one_below.continuation.max_output_matches -= 1;
+    let refusal = count
+        .count_value_with_counters(haystack, one_below)
+        .unwrap_err();
+    assert!(matches!(
+        refusal.source,
+        AggregateExecutionSource::Continuation(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::OutputMatches,
+            ..
+        })
+    ));
 }
 
 fn exact_build_error(limits: &AggregateBuildLimits) -> LiteralAggregateBuildError {

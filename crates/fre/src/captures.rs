@@ -18,13 +18,15 @@ use fre_capture_lab::{
     AggregateLimits, Assertion as CaptureAssertion, Ast, BuildError as EngineBuildError,
     BuildLimits as EngineBuildLimits, BuildReport as EngineBuildReport,
     CandidateKind as EngineCandidateKind, CaptureCountOutcome, CaptureProfile, CaptureRecord,
-    Greed, HistoryRegex, HistorySearchProspective, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
-    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, PARTICIPATION_QUOTIENT_CAPTURE_BITS,
-    PARTICIPATION_QUOTIENT_MASK_BITS, ParticipationSearchProspective, Program,
-    ResourceKind as EngineResource, RunReport as EngineSearchAccounting,
-    SearchConfig as CaptureSearchConfig, SearchError as EngineSearchError,
-    SearchLimits as EngineSearchLimits, SearchOutcome as EngineSearchOutcome, Span as EngineSpan,
-    Window,
+    CaptureStream, CaptureStreamDomains, CaptureStreamError, CaptureStreamLimits,
+    CaptureStreamOperationProspective, CaptureStreamProjection, CaptureStreamProspective,
+    CaptureStreamReport, Greed, HistoryRegex, HistorySearchProspective,
+    PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION, PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+    PARTICIPATION_QUOTIENT_CAPTURE_BITS, PARTICIPATION_QUOTIENT_MASK_BITS,
+    ParticipationSearchProspective, Program, ResourceKind as EngineResource,
+    RunReport as EngineSearchAccounting, SearchConfig as CaptureSearchConfig,
+    SearchError as EngineSearchError, SearchLimits as EngineSearchLimits,
+    SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
 };
 use fre_kernels::{
     LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
@@ -91,6 +93,15 @@ pub enum CapturePlanKind {
     /// participation masks. Tagged offsets are erased because the aggregate
     /// observes only whether each group participated.
     LinearSelectorParticipationQuotientV1,
+    /// One reusable ordered frontier carries only aggregate-observable
+    /// participation masks and applies capture tags before first-arrival
+    /// program-counter deduplication. Source-free construction refusal retains
+    /// the selector/quotient route as its declared generic fallback.
+    FusedCaptureStreamParticipationV1,
+    /// The same reusable ordered frontier with construction-selected bounded
+    /// persistent histories for schemas wider than one participation word.
+    /// Source-free construction refusal retains selector/history replay.
+    FusedCaptureStreamPersistentHistoryV1,
 }
 
 /// Typed compatibility receipt for HIR forms outside the certified capture compiler.
@@ -323,8 +334,11 @@ impl CaptureBuildReport {
     /// artifact or execution identity.
     #[must_use]
     pub fn participation_quotient_proof(&self) -> Option<CaptureParticipationQuotientProof> {
-        if self.plan_identity.plan != CapturePlanKind::LinearSelectorParticipationQuotientV1
-            || self.engine.captures > PARTICIPATION_QUOTIENT_CAPTURE_BITS
+        if !matches!(
+            self.plan_identity.plan,
+            CapturePlanKind::LinearSelectorParticipationQuotientV1
+                | CapturePlanKind::FusedCaptureStreamParticipationV1
+        ) || self.engine.captures > PARTICIPATION_QUOTIENT_CAPTURE_BITS
         {
             return None;
         }
@@ -472,6 +486,8 @@ pub enum CaptureExecutionSource {
     Selector(SelectorError),
     /// Exact-span persistent-history replay or reduction failed.
     History(EngineSearchError),
+    /// Fused ordered-frontier construction or execution failed.
+    Stream(CaptureStreamError),
     /// Selector and tagged replay disagreed despite sharing one canonical HIR.
     InternalInvariant(&'static str),
 }
@@ -486,6 +502,7 @@ impl fmt::Display for CaptureExecutionSource {
             ),
             Self::Selector(error) => error.fmt(formatter),
             Self::History(error) => error.fmt(formatter),
+            Self::Stream(error) => error.fmt(formatter),
             Self::InternalInvariant(detail) => {
                 write!(formatter, "capture operation invariant failed: {detail}")
             }
@@ -500,6 +517,7 @@ impl std::error::Error for CaptureExecutionSource {
             Self::CombinedPeak { .. } | Self::InternalInvariant(_) => None,
             Self::Selector(error) => Some(error),
             Self::History(error) => Some(error),
+            Self::Stream(error) => Some(error),
         }
     }
 }
@@ -597,6 +615,9 @@ pub struct CaptureExecutionReport {
     pub prefix_class_participation_receipt: Option<PrefixClassUniformParticipationAttemptReceipt>,
     /// Whole-operation owner receipt for a sealed positive-width Count route.
     pub count_receipt: Option<CaptureCountAttemptReceipt>,
+    /// Complete fused ordered-frontier construction and execution report.
+    /// Selector/direct routes retain `None`.
+    pub capture_stream: Option<CaptureStreamReport>,
     /// Complete capture-schema entries logically inspected by the reducer.
     pub capture_events: usize,
     /// Conservative retained/operation peak for the selected route, never
@@ -1944,6 +1965,11 @@ impl CaptureBuilder {
         } else {
             None
         };
+        let stream_minimum_match_bytes = rust
+            .hir
+            .properties()
+            .minimum_len()
+            .filter(|minimum| *minimum > 0);
         let plan_identity = CapturePlanIdentity {
             syntax: syntax_key,
             operation: CaptureOperation::CountParticipatingNonempty,
@@ -1953,8 +1979,12 @@ impl CaptureBuilder {
                 CapturePlanKind::UniformPrefixClassParticipation
             } else if uniform_participating_captures.is_some() {
                 CapturePlanKind::LinearSelectorUniformParticipation
+            } else if participation_quotient.is_some() && stream_minimum_match_bytes.is_some() {
+                CapturePlanKind::FusedCaptureStreamParticipationV1
             } else if participation_quotient.is_some() {
                 CapturePlanKind::LinearSelectorParticipationQuotientV1
+            } else if stream_minimum_match_bytes.is_some() {
+                CapturePlanKind::FusedCaptureStreamPersistentHistoryV1
             } else {
                 CapturePlanKind::LinearSelectorPersistentHistory
             },
@@ -1973,9 +2003,8 @@ impl CaptureBuilder {
             .plan
             .as_ref()
             .map(|plan| plan.engine.uniform_participation_build_accounting());
-        let uniform_count_minimum_match_bytes = uniform_participating_captures
-            .and_then(|_| rust.hir.properties().minimum_len())
-            .filter(|minimum| *minimum > 0);
+        let uniform_count_minimum_match_bytes =
+            uniform_participating_captures.and(stream_minimum_match_bytes);
         let count_owner = match (
             uniform_participating_captures,
             uniform_count_minimum_match_bytes,
@@ -2018,7 +2047,9 @@ impl CaptureBuilder {
                             )
                         }
                         CapturePlanKind::LinearSelectorPersistentHistory
-                        | CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+                        | CapturePlanKind::LinearSelectorParticipationQuotientV1
+                        | CapturePlanKind::FusedCaptureStreamParticipationV1
+                        | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1 => {
                             return Err(CaptureBuildError::InternalInvariant(
                                 "uniform positive-width plan selected a nonuniform replay",
                             ));
@@ -2038,7 +2069,9 @@ impl CaptureBuilder {
                             }
                             CapturePlanKind::UniformPrefixClassParticipation
                             | CapturePlanKind::LinearSelectorPersistentHistory
-                            | CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+                            | CapturePlanKind::LinearSelectorParticipationQuotientV1
+                            | CapturePlanKind::FusedCaptureStreamParticipationV1
+                            | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1 => {
                                 fre_aggregate::OperationPhysicalRoute::DenseRows
                             }
                         },
@@ -2131,6 +2164,123 @@ pub struct CaptureRegex {
     report: CaptureBuildReport,
 }
 
+/// Caller-owned reusable execution shell for one source-length/domain/limit
+/// bound fused capture operation.
+///
+/// A [`CaptureRegex`] remains immutable and can be shared freely. Each thread
+/// or public-operation lifecycle that elects the fused route owns one of these
+/// sessions, so steady calls reuse the admitted frontier and tag workspace
+/// without locks, caches, or allocation.
+#[derive(Debug)]
+pub struct CaptureStreamSession {
+    stream: CaptureStream,
+    program: Arc<Program>,
+    identity: CaptureCacheIdentity,
+    domains: CaptureStreamDomains,
+    expected_projection: CaptureStreamProjection,
+    stream_limits: CaptureStreamLimits,
+    /// Immutable selector artifact co-live with this session's workspace.
+    selector_retained_bytes: usize,
+    /// Exact outer peak admitted before source access.
+    combined_peak_bytes: usize,
+}
+
+impl CaptureStreamSession {
+    /// Immutable source-free execution envelope bound during preparation.
+    #[must_use]
+    pub const fn operation_prospective(&self) -> CaptureStreamOperationProspective {
+        self.stream.operation_report()
+    }
+
+    /// Execute one complete operation using the already admitted workspace.
+    ///
+    /// This path never reconstructs a stream and never takes a fallback after
+    /// source access begins.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the established public execution error preserves complete source receipts without an API-breaking box"
+    )]
+    pub fn execute(
+        &mut self,
+        haystack: &[u8],
+    ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        let stream_report =
+            self.stream
+                .execute(haystack)
+                .map_err(|source| CaptureExecutionError {
+                    identity: self.identity.clone(),
+                    source: CaptureExecutionSource::Stream(source),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                })?;
+        if !stream_report.authenticates_program(&self.program) {
+            return Err(CaptureExecutionError {
+                identity: self.identity.clone(),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "capture stream session success failed program/P/A authentication",
+                ),
+                selector_receipt: None,
+                prefix_class_participation_receipt: None,
+                count_receipt: None,
+            });
+        }
+        let result = CaptureExecutionReport {
+            identity: self.identity.clone(),
+            accounting: stream_report.captures.clone(),
+            selector_certificate: None,
+            selector_accounting: None,
+            selector_receipt: None,
+            prefix_class_participation: None,
+            prefix_class_participation_receipt: None,
+            count_receipt: None,
+            capture_events: stream_report.capture_events,
+            capture_stream: Some(stream_report),
+            combined_peak_bytes: self.combined_peak_bytes,
+        };
+        if self.authenticates_success(&result) {
+            Ok(result)
+        } else {
+            Err(CaptureExecutionError {
+                identity: self.identity.clone(),
+                source: CaptureExecutionSource::InternalInvariant(
+                    "capture stream session outer receipt failed identity/peak closure",
+                ),
+                selector_receipt: None,
+                prefix_class_participation_receipt: None,
+                count_receipt: None,
+            })
+        }
+    }
+
+    fn authenticates_success(&self, result: &CaptureExecutionReport) -> bool {
+        let Some(stream) = result.capture_stream.as_ref() else {
+            return false;
+        };
+        let expected_peak = stream
+            .combined_peak_bytes
+            .checked_add(self.selector_retained_bytes);
+        result.identity == self.identity
+            && stream.domains == self.domains
+            && stream.limits == self.stream_limits
+            && stream.prospective.projection == self.expected_projection
+            && stream.prospective.source_bytes
+                == self.operation_prospective().construction.source_bytes
+            && stream.operation == self.operation_prospective()
+            && stream.authenticates_program(&self.program)
+            && stream.captures == result.accounting
+            && stream.capture_events == result.capture_events
+            && expected_peak == Some(self.combined_peak_bytes)
+            && result.combined_peak_bytes == self.combined_peak_bytes
+            && result.selector_certificate.is_none()
+            && result.selector_accounting.is_none()
+            && result.selector_receipt.is_none()
+            && result.prefix_class_participation.is_none()
+            && result.prefix_class_participation_receipt.is_none()
+            && result.count_receipt.is_none()
+    }
+}
+
 impl CaptureRegex {
     /// Construction and plan identity.
     #[must_use]
@@ -2188,6 +2338,293 @@ impl CaptureRegex {
                 .as_ref()
                 .map(|owner| owner.for_limits(&run_limits)),
         }
+    }
+
+    /// Construction-selected fused projection for one LF/CRLF line operation.
+    ///
+    /// The ordinary positive-width uniform Count artifact keeps its existing
+    /// sealed selector route. A line operation may additionally select the
+    /// reusable stream because its fixed participation theorem makes tag
+    /// projection source-independent; this does not relabel the ordinary
+    /// Count route or its owner receipt.
+    #[must_use]
+    pub fn line_stream_projection(&self) -> Option<CaptureStreamProjection> {
+        match self.report.plan_identity.plan {
+            CapturePlanKind::FusedCaptureStreamParticipationV1 => {
+                Some(CaptureStreamProjection::ParticipationMask)
+            }
+            CapturePlanKind::FusedCaptureStreamPersistentHistoryV1 => {
+                Some(CaptureStreamProjection::PersistentHistory)
+            }
+            CapturePlanKind::LinearSelectorUniformParticipation
+                if self.uniform_count_minimum_match_bytes.is_some() =>
+            {
+                CaptureStream::prospective(self.engine.program(), 0)
+                    .ok()
+                    .map(|prospective| prospective.projection)
+            }
+            CapturePlanKind::OrderedRootCaptureManyCount
+            | CapturePlanKind::UniformPrefixClassParticipation
+            | CapturePlanKind::LinearSelectorUniformParticipation
+            | CapturePlanKind::LinearSelectorParticipationQuotientV1
+            | CapturePlanKind::LinearSelectorPersistentHistory => None,
+        }
+    }
+
+    /// Source-free line-stream operation envelope when every fixed-program
+    /// construction and restart dimension fits this exact invocation.
+    /// `Ok(None)` is the declared prepublication fallback edge to the retained
+    /// per-line selector route.
+    pub fn line_stream_operation_prospective(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+    ) -> Result<Option<CaptureStreamOperationProspective>, CaptureStreamError> {
+        let Some(expected_projection) = self.line_stream_projection() else {
+            return Ok(None);
+        };
+        let Some((stream_limits, _)) = self.capture_stream_limits(source_bytes, &limits) else {
+            return Ok(None);
+        };
+        let prospective = CaptureStream::operation_prospective(
+            self.engine.program(),
+            source_bytes,
+            CaptureStreamDomains::RebarLines,
+        )?;
+        if prospective.construction.projection != expected_projection
+            || !prospective.authenticates_program(self.engine.program())
+        {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        Ok(prospective
+            .admits(stream_limits)
+            .is_ok()
+            .then_some(prospective))
+    }
+
+    /// Backwards-compatible construction receipt for an admitted line stream.
+    ///
+    /// New callers that need the complete restart/resource receipt should use
+    /// [`Self::line_stream_operation_prospective`].
+    pub fn line_stream_prospective(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+    ) -> Result<Option<CaptureStreamProspective>, CaptureStreamError> {
+        self.line_stream_operation_prospective(source_bytes, limits)
+            .map(|operation| operation.map(|operation| operation.construction))
+    }
+
+    /// Prepare a reusable caller-owned fused stream before any source byte is
+    /// observed. A `None` result is the declared source-free fallback edge;
+    /// a returned session never allocates or switches routes while executing.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the established public preparation error preserves complete source receipts without an API-breaking box"
+    )]
+    pub fn prepare_capture_stream_session(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+        domains: CaptureStreamDomains,
+    ) -> Result<Option<CaptureStreamSession>, CaptureExecutionError> {
+        let identity = self.cache_identity(limits);
+        let expected_projection = self.capture_stream_session_projection(&identity, domains);
+        let Some(expected_projection) = expected_projection else {
+            return Ok(None);
+        };
+        let Some((stream_limits, selector_retained_bytes)) =
+            self.capture_stream_limits(source_bytes, &limits)
+        else {
+            return Ok(None);
+        };
+        let operation =
+            CaptureStream::operation_prospective(self.engine.program(), source_bytes, domains)
+                .map_err(|source| CaptureExecutionError {
+                    identity: identity.clone(),
+                    source: CaptureExecutionSource::Stream(source),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                })?;
+        if operation.construction.projection != expected_projection
+            || !operation.authenticates_program(self.engine.program())
+        {
+            return Err(CaptureExecutionError {
+                identity,
+                source: CaptureExecutionSource::InternalInvariant(
+                    "capture stream operation prospective diverged from its program/route identity",
+                ),
+                selector_receipt: None,
+                prefix_class_participation_receipt: None,
+                count_receipt: None,
+            });
+        }
+        if operation.admits(stream_limits).is_err() {
+            return Ok(None);
+        }
+        let Some(combined_peak_bytes) = operation
+            .construction
+            .combined_peak_bytes
+            .checked_add(selector_retained_bytes)
+        else {
+            return Ok(None);
+        };
+        if combined_peak_bytes > limits.max_combined_peak_bytes {
+            return Ok(None);
+        }
+        let stream = match CaptureStream::new(
+            Arc::clone(self.engine.program()),
+            source_bytes,
+            domains,
+            stream_limits,
+        ) {
+            Ok(stream) => stream,
+            Err(CaptureStreamError::Resource { .. } | CaptureStreamError::Allocation(_)) => {
+                return Ok(None);
+            }
+            Err(source) => {
+                return Err(CaptureExecutionError {
+                    identity,
+                    source: CaptureExecutionSource::Stream(source),
+                    selector_receipt: None,
+                    prefix_class_participation_receipt: None,
+                    count_receipt: None,
+                });
+            }
+        };
+        if stream.build_report() != operation.construction
+            || stream.operation_report() != operation
+            || !stream
+                .build_report()
+                .authenticates_program(self.engine.program())
+        {
+            return Err(CaptureExecutionError {
+                identity,
+                source: CaptureExecutionSource::InternalInvariant(
+                    "capture stream session construction diverged from its prospective",
+                ),
+                selector_receipt: None,
+                prefix_class_participation_receipt: None,
+                count_receipt: None,
+            });
+        }
+        Ok(Some(CaptureStreamSession {
+            stream,
+            program: Arc::clone(self.engine.program()),
+            identity,
+            domains,
+            expected_projection,
+            stream_limits,
+            selector_retained_bytes,
+            combined_peak_bytes,
+        }))
+    }
+
+    fn capture_stream_session_projection(
+        &self,
+        identity: &CaptureCacheIdentity,
+        domains: CaptureStreamDomains,
+    ) -> Option<CaptureStreamProjection> {
+        match domains {
+            CaptureStreamDomains::Whole
+                if matches!(
+                    identity.plan.plan,
+                    CapturePlanKind::FusedCaptureStreamParticipationV1
+                        | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1
+                ) =>
+            {
+                self.line_stream_projection()
+            }
+            CaptureStreamDomains::Whole => None,
+            CaptureStreamDomains::RebarLines => self.line_stream_projection(),
+        }
+    }
+
+    /// Authenticate the complete fused success, including exact program,
+    /// invocation limits, domain, retained selector bytes and outer peak.
+    #[must_use]
+    pub fn authenticates_capture_stream_success(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+        domains: CaptureStreamDomains,
+        result: &CaptureExecutionReport,
+    ) -> bool {
+        let Some(expected_projection) = self.line_stream_projection() else {
+            return false;
+        };
+        let Some((expected_limits, selector_fallback_bytes)) =
+            self.capture_stream_limits(source_bytes, &limits)
+        else {
+            return false;
+        };
+        let Some(stream) = result.capture_stream.as_ref() else {
+            return false;
+        };
+        let expected_peak = stream
+            .combined_peak_bytes
+            .checked_add(selector_fallback_bytes);
+        result.identity == self.cache_identity(limits)
+            && stream.domains == domains
+            && stream.limits == expected_limits
+            && stream.prospective.projection == expected_projection
+            && stream.prospective.source_bytes == source_bytes
+            && CaptureStream::operation_prospective(self.engine.program(), source_bytes, domains)
+                .is_ok_and(|expected| stream.operation == expected)
+            && stream.authenticates_program(self.engine.program())
+            && stream.captures == result.accounting
+            && stream.capture_events == result.capture_events
+            && expected_peak == Some(result.combined_peak_bytes)
+            && result.selector_certificate.is_none()
+            && result.selector_accounting.is_none()
+            && result.selector_receipt.is_none()
+            && result.prefix_class_participation.is_none()
+            && result.prefix_class_participation_receipt.is_none()
+            && result.count_receipt.is_none()
+    }
+
+    fn capture_stream_limits(
+        &self,
+        source_bytes: usize,
+        limits: &CaptureRunLimits,
+    ) -> Option<(CaptureStreamLimits, usize)> {
+        let selector_fallback_bytes = self.report.selector.program_bytes;
+        let workspace_peak_limit = limits
+            .max_combined_peak_bytes
+            .checked_sub(selector_fallback_bytes)?;
+        Some((
+            CaptureStreamLimits {
+                max_source_bytes: source_bytes,
+                max_states: self.report.engine.states,
+                max_build_work: limits.aggregate.max_total_state_visits,
+                max_persistent_bytes: workspace_peak_limit,
+                max_combined_peak_bytes: workspace_peak_limit,
+                max_allocations: 16,
+                max_line_domains: limits.aggregate.max_searches,
+                max_searches: limits.aggregate.max_searches,
+                max_matches: limits.aggregate.max_results,
+                max_bytes_examined: limits.selector.max_sequential_bytes,
+                max_starts_injected: limits.selector.max_work,
+                max_state_visits: limits.aggregate.max_total_state_visits,
+                max_tag_actions: limits.aggregate.max_total_state_visits,
+                max_history_nodes: limits.aggregate.max_total_history_nodes,
+                max_history_walk: limits.aggregate.max_total_history_walk,
+                max_history_reads: limits.selector.max_work,
+                max_materialization_reads: limits.selector.max_work,
+                max_materialization_writes: limits.selector.max_work,
+                max_materialization_preview_writes: limits.selector.max_work,
+                max_mask_states: limits.selector.max_work,
+                max_mask_word_copies: limits.selector.max_work,
+                max_mask_word_reads: limits.selector.max_work,
+                max_reset_cells: limits.selector.max_work,
+                max_capture_events: limits.aggregate.max_capture_events,
+                max_capture_count: limits.aggregate.max_capture_count,
+                max_line_source_reads: limits.selector.max_sequential_bytes,
+                max_work: limits.selector.max_work,
+            },
+            selector_fallback_bytes,
+        ))
     }
 
     /// Complete identity for one bounded capture-iteration invocation.
@@ -2685,6 +3122,7 @@ impl CaptureRegex {
                 prefix_class_participation: None,
                 prefix_class_participation_receipt: None,
                 count_receipt: None,
+                capture_stream: None,
                 capture_events,
                 combined_peak_bytes: selector_accounting.peak_bytes,
             });
@@ -2705,7 +3143,8 @@ impl CaptureRegex {
         identity: CaptureCacheIdentity,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let use_participation_quotient = match identity.plan.plan {
-            CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+            CapturePlanKind::LinearSelectorParticipationQuotientV1
+            | CapturePlanKind::FusedCaptureStreamParticipationV1 => {
                 let Some(proof) = self.report.participation_quotient_proof() else {
                     return Err(CaptureExecutionError {
                         identity,
@@ -2740,7 +3179,8 @@ impl CaptureRegex {
                 }
                 true
             }
-            CapturePlanKind::LinearSelectorPersistentHistory => {
+            CapturePlanKind::LinearSelectorPersistentHistory
+            | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1 => {
                 if self.report.participation_quotient_proof().is_some()
                     || self.report.engine.captures <= PARTICIPATION_QUOTIENT_CAPTURE_BITS
                 {
@@ -3104,6 +3544,7 @@ impl CaptureRegex {
             prefix_class_participation: None,
             prefix_class_participation_receipt: None,
             count_receipt: None,
+            capture_stream: None,
             capture_events,
             combined_peak_bytes,
         })
@@ -3436,6 +3877,7 @@ impl CaptureRegex {
             prefix_class_participation: Some(result.accounting),
             prefix_class_participation_receipt: Some(receipt),
             count_receipt: Some(count_receipt),
+            capture_stream: None,
             capture_events: result.accounting.actual.capture_events,
             combined_peak_bytes,
         };
@@ -3857,6 +4299,7 @@ impl CaptureRegex {
             prefix_class_participation: None,
             prefix_class_participation_receipt: None,
             count_receipt: Some(count_receipt),
+            capture_stream: None,
             capture_events,
             combined_peak_bytes: selector_accounting.peak_bytes,
         };

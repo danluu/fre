@@ -913,14 +913,14 @@ fn assert_direct_zero_effect_refusal(
 }
 
 #[test]
-fn nullable_and_history_count_routes_remain_outside_the_owner_seal() {
+fn nullable_and_nonuniform_count_routes_remain_outside_the_owner_seal() {
     let history = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)
         .build()
         .expect("history build");
     assert_eq!(
         history.build_report().plan_identity.plan,
-        CapturePlanKind::LinearSelectorParticipationQuotientV1
+        CapturePlanKind::FusedCaptureStreamParticipationV1
     );
     let history_report = history
         .count_captures(b"ab a", CaptureRunLimits::default())

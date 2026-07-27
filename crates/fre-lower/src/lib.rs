@@ -24,12 +24,22 @@
 
 mod compiler;
 mod error;
+pub mod facts;
 
 use fre_automata::{Automaton, CompileLimits, RawPlan};
 use fre_syntax::RustParsed;
 use regex_syntax::hir::Hir;
 
 pub use error::{LowerError, LowerResource, UnsupportedFeature};
+pub use facts::{
+    AffixCertificate, AssertionFacts, BoundedContext, CaptureFacts, CaptureParticipation,
+    CertificatePreconditions, CheckedWidth, DeterminismFacts, DeterministicCertificate,
+    FactCaptureSemantics, FactError, FactIdentity, FactLimits, FactOperation, FactOptionalProofs,
+    FactOutput, FactProof, FactProspective, FactRefusal, FactResource, FactStats, FiniteLanguage,
+    HIR_FACT_ACCOUNTING_VERSION, HIR_FACT_ALGORITHM_VERSION, HirFacts, OnePassCertificate,
+    PositionedAssertion, PositionedCapture, ReductionFacts, RequiredAlternatives, RequiredString,
+    StringEncoding, UnicodeFacts, WidthRange, analyze_facts, analyze_hir_facts,
+};
 
 /// Whether lowering may erase capture annotations.
 ///

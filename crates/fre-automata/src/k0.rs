@@ -713,8 +713,22 @@ fn expand_root(
     Ok(None)
 }
 
-fn zero_width_edge_enabled(
+pub(crate) fn zero_width_edge_enabled(
     automaton: &Automaton,
+    kind: EdgeKind,
+    haystack: &[u8],
+    position: usize,
+) -> Result<bool, SearchError> {
+    zero_width_edge_enabled_with_line_terminator(
+        automaton.line_terminator(),
+        kind,
+        haystack,
+        position,
+    )
+}
+
+pub(crate) fn zero_width_edge_enabled_with_line_terminator(
+    line_terminator: u8,
     kind: EdgeKind,
     haystack: &[u8],
     position: usize,
@@ -727,9 +741,10 @@ fn zero_width_edge_enabled(
             || position
                 .checked_sub(1)
                 .and_then(|index| haystack.get(index))
-                .is_some_and(|&byte| byte == automaton.line_terminator())),
-        EdgeKind::AssertLineEndLf => Ok(position == haystack.len()
-            || haystack.get(position) == Some(&automaton.line_terminator())),
+                .is_some_and(|&byte| byte == line_terminator)),
+        EdgeKind::AssertLineEndLf => {
+            Ok(position == haystack.len() || haystack.get(position) == Some(&line_terminator))
+        }
         EdgeKind::AssertLineStartCrlf => {
             let before = position
                 .checked_sub(1)

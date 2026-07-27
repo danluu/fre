@@ -3,8 +3,8 @@ use std::sync::{Arc, Weak};
 
 use fre_aggregate::{
     AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
-    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt, OperationProspective,
-    RustByteProfile, SpanIter,
+    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt, OperationCounterReceipt,
+    OperationProspective, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
@@ -127,6 +127,46 @@ use crate::{
     BuildError, Match, aggregate_construction::AggregateInspectionAttemptError, blocking_delimiter,
     bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
     literal_assertions, literal_class_run_literal, token_phrase, unicode_word_run,
+};
+
+mod forced_priority;
+mod forced_priority_many;
+mod literal_anchor;
+
+pub use forced_priority::{
+    PRIORITY_AGGREGATE_ACCOUNTING_ID, PRIORITY_AGGREGATE_SCHEMA_VERSION,
+    PriorityAggregateAssertionProof, PriorityAggregateBridgeAccounting,
+    PriorityAggregateBridgeLimits, PriorityAggregateBridgeProspective,
+    PriorityAggregateBridgeResource, PriorityAggregateBuildError, PriorityAggregateBuildLimits,
+    PriorityAggregateBuildReport, PriorityAggregateBuilder, PriorityAggregateCountRegex,
+    PriorityAggregateDeterminismProof, PriorityAggregateExecutionReceipt,
+    PriorityAggregateFactReceipt, PriorityAggregateOperation, PriorityAggregateProofRefusal,
+    PriorityAggregateRouteProof, PriorityAggregateRunError, PriorityAggregateRunFailure,
+    PriorityAggregateRunLimits, PriorityAggregateSourceOwnerAccounting,
+    PriorityAggregateSourceOwnerLimits, PriorityAggregateSourceOwnerResource,
+    PriorityAggregateSpanSumRegex, PriorityAggregateSyntaxEvidence, PriorityAggregateUsizeProof,
+};
+pub use forced_priority_many::{
+    PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION,
+    PriorityAggregateManyBuildError, PriorityAggregateManyBuildLimits,
+    PriorityAggregateManyBuildReport, PriorityAggregateManyBuilder,
+    PriorityAggregateManyCompositionAccounting, PriorityAggregateManyCountRegex,
+    PriorityAggregateManyExecutionReceipt, PriorityAggregateManyOperation,
+    PriorityAggregateManyPatternReport, PriorityAggregateManyRunError,
+    PriorityAggregateManyRunFailure, PriorityAggregateManyRunLimits,
+    PriorityAggregateManySourceOwnerAccounting, PriorityAggregateManySourceOwnerLimits,
+    PriorityAggregateManySourceOwnerResource, PriorityAggregateManySpanSumRegex,
+    PriorityAggregateManyTraceReceipt,
+};
+
+pub use literal_anchor::{
+    LITERAL_ANCHOR_AGGREGATE_ACCOUNTING_ID, LITERAL_ANCHOR_AGGREGATE_SCHEMA_VERSION,
+    LiteralAnchorAggregateBuildError, LiteralAnchorAggregateBuildLimits,
+    LiteralAnchorAggregateBuildReport, LiteralAnchorAggregateBuilder,
+    LiteralAnchorAggregateCountRegex, LiteralAnchorAggregateExecutionReceipt,
+    LiteralAnchorAggregateRoute, LiteralAnchorAggregateRunError, LiteralAnchorAggregateRunLimits,
+    LiteralAnchorAggregateSpanSumRegex, LiteralAnchorCandidateBuildReport,
+    LiteralAnchorCandidateExecutionReceipt, LiteralAnchorFallbackReason,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;
@@ -13818,6 +13858,58 @@ impl AggregatePlan {
         }
     }
 
+    /// Execute the incumbent value-only Count path and retain the optional
+    /// continuation counter receipt that it already sealed. This deliberately
+    /// does not introduce a new selector or a report-building pass.
+    fn execute_count_value_with_counters(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return self.execute_count_value(haystack, limits).map(|value| {
+                AggregateValueCounterResult {
+                    value,
+                    continuation_receipt: None,
+                }
+            });
+        };
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation count plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = engine
+            .count_value_attempt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        let value = u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
+            )
+        })?;
+        let continuation_receipt = attempt.into_counter_receipt().map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "sealed continuation count could not publish structural counters",
+                ),
+            )
+        })?;
+        Ok(AggregateValueCounterResult {
+            value,
+            continuation_receipt: Some(continuation_receipt),
+        })
+    }
+
     fn execute_span_sum_value(
         &self,
         haystack: &[u8],
@@ -13853,6 +13945,60 @@ impl AggregatePlan {
                 ),
             )),
         }
+    }
+
+    /// Execute the incumbent value-only `SpanSum` path and retain the optional
+    /// continuation counter receipt that it already sealed. This deliberately
+    /// does not introduce a new selector or a report-building pass.
+    fn execute_span_sum_value_with_counters(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return self.execute_span_sum_value(haystack, limits).map(|value| {
+                AggregateValueCounterResult {
+                    value,
+                    continuation_receipt: None,
+                }
+            });
+        };
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = engine
+            .span_sum_value_with_receipt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        let value = u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })?;
+        let continuation_receipt = attempt.into_counter_receipt().map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "sealed continuation span-sum could not publish structural counters",
+                ),
+            )
+        })?;
+        Ok(AggregateValueCounterResult {
+            value,
+            continuation_receipt: Some(continuation_receipt),
+        })
     }
 }
 
@@ -16449,6 +16595,20 @@ impl AggregateCountRegex {
         let limits = limits.borrow();
         self.0.execute_count_value(haystack, limits)
     }
+
+    /// Count through the same selected value-only plan as [`Self::count_value`]
+    /// and, when that plan is a continuation, publish its immutable structural
+    /// counters after the operation completes. The counter projection is
+    /// optional and does not add a selector input or construct an execution
+    /// report.
+    pub fn count_value_with_counters(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let limits = limits.borrow();
+        self.0.execute_count_value_with_counters(haystack, limits)
+    }
 }
 
 /// Complete match count and execution certificate.
@@ -16467,6 +16627,32 @@ impl AggregateCountResult {
     #[must_use]
     pub const fn report(&self) -> &AggregateExecutionReport {
         &self.report
+    }
+}
+
+/// Value-only aggregate result with optional immutable continuation counters.
+///
+/// A direct selected plan retains the incumbent value-only behavior and has no
+/// continuation receipt. A continuation selected plan returns the same value
+/// and route as its ordinary value-only API, plus the receipt published after
+/// the completed operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateValueCounterResult {
+    value: u64,
+    continuation_receipt: Option<OperationCounterReceipt>,
+}
+
+impl AggregateValueCounterResult {
+    /// Value-only reducer result.
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Optional immutable continuation attribution/counter receipt.
+    #[must_use]
+    pub const fn continuation_receipt(&self) -> Option<&OperationCounterReceipt> {
+        self.continuation_receipt.as_ref()
     }
 }
 
@@ -16544,6 +16730,21 @@ impl AggregateSpanSumRegex {
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
         self.0.execute_span_sum_value(haystack, limits)
+    }
+
+    /// Sum spans through the same selected value-only plan as
+    /// [`Self::span_sum_value`] and, when that plan is a continuation,
+    /// publish its immutable structural counters after the operation
+    /// completes. The counter projection is optional and does not add a
+    /// selector input or construct an execution report.
+    pub fn span_sum_value_with_counters(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let limits = limits.borrow();
+        self.0
+            .execute_span_sum_value_with_counters(haystack, limits)
     }
 }
 

@@ -18,15 +18,18 @@ mod bounded_class_sequence;
 mod bounded_context;
 mod bounded_literal_pair;
 mod bounded_separated_fields;
+mod byte_candidate_stream;
 mod byte_start_map;
 mod determinize_state_codec;
 mod direct_build_attempt;
 mod fixed_absolute_domain;
 mod fixed_class_sandwich;
 mod fixed_predicate_word64;
+mod folded_literal_trie;
 mod forward_anchored;
 mod grapheme_scalar_dfa;
 mod literal_aggregate;
+mod literal_anchor;
 mod literal_assertions;
 mod literal_class_run_literal;
 mod literal_set;
@@ -134,6 +137,17 @@ pub use blocking_delimiter::{
     SPAN_SUM_OPERATION_ID as BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
     SpanSumResult as BlockingDelimiterSpanSumResult, Topology as BlockingDelimiterTopology,
 };
+pub use byte_candidate_stream::{
+    Algorithm as ByteCandidateAlgorithm, BuildAccounting as ByteCandidateBuildAccounting,
+    BuildAttempt as ByteCandidateBuildAttempt, BuildError as ByteCandidateBuildError,
+    BuildLimits as ByteCandidateBuildLimits, BuildResource as ByteCandidateBuildResource,
+    ByteCandidatePlan, DenseFallback as ByteCandidateDenseFallback,
+    DenseFallbackReason as ByteCandidateDenseFallbackReason, PLAN_ID as BYTE_CANDIDATE_PLAN_ID,
+    ScanActual as ByteCandidateScanActual, ScanAttemptError as ByteCandidateScanAttemptError,
+    ScanError as ByteCandidateScanError, ScanLimits as ByteCandidateScanLimits,
+    ScanReceipt as ByteCandidateScanReceipt, ScanResource as ByteCandidateScanResource,
+    ScanUpperBounds as ByteCandidateScanUpperBounds,
+};
 pub use byte_start_map::{
     BuildAccounting as ByteStartMapBuildAccounting, BuildError as ByteStartMapBuildError,
     BuildLimits as ByteStartMapBuildLimits, ByteStartMap, Direction as ByteStartDirection,
@@ -224,6 +238,19 @@ pub use fixed_predicate_word64::{
     SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     SpanSumResult as FixedPredicateWord64SpanSumResult,
 };
+pub use folded_literal_trie::{
+    BuildAccounting as FoldedLiteralTrieBuildAccounting,
+    BuildAttempt as FoldedLiteralTrieBuildAttempt, BuildError as FoldedLiteralTrieBuildError,
+    BuildLimits as FoldedLiteralTrieBuildLimits, BuildResource as FoldedLiteralTrieBuildResource,
+    DenseFallback as FoldedLiteralTrieDenseFallback,
+    DenseFallbackReason as FoldedLiteralTrieDenseFallbackReason, FoldedLiteral,
+    FoldedLiteralTriePlan, FoldedScalarClass, PLAN_ID as FOLDED_LITERAL_TRIE_PLAN_ID,
+    ScanActual as FoldedLiteralTrieScanActual,
+    ScanAttemptError as FoldedLiteralTrieScanAttemptError, ScanError as FoldedLiteralTrieScanError,
+    ScanLimits as FoldedLiteralTrieScanLimits, ScanReceipt as FoldedLiteralTrieScanReceipt,
+    ScanResource as FoldedLiteralTrieScanResource,
+    ScanUpperBounds as FoldedLiteralTrieScanUpperBounds,
+};
 pub use forward_anchored::{
     ABSOLUTE_END_FIXED_PLAN_ID, AbsoluteEndFixedPlan, Anchors as ForwardAnchoredAnchors,
     BuildAccounting as ForwardAnchoredBuildAccounting, BuildError as ForwardAnchoredBuildError,
@@ -270,6 +297,11 @@ pub use literal_aggregate::{
     SPAN_SUM_OPERATION_ID as LITERAL_AGGREGATE_SPAN_SUM_OPERATION_ID,
     SpanSumAttempt as LiteralAggregateSpanSumAttempt,
     SpanSumResult as LiteralAggregateSpanSumResult,
+};
+pub use literal_anchor::{
+    AnchorError as LiteralAnchorError, AnchorRecovery as LiteralAnchorRecovery,
+    CandidateEmissionOrder as LiteralCandidateEmissionOrder, LiteralAnchor, LiteralCandidate,
+    OffsetBounds as LiteralAnchorOffsetBounds,
 };
 
 pub use literal_assertions::{

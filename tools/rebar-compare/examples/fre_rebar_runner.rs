@@ -974,7 +974,7 @@ fn model_capture_performance_raw_with_measurement<F>(
 ) -> Result<PerformanceRawObservation, DynError>
 where
     F: FnOnce(
-        &rebar_compare::CurrentFreCaptureLifecycle,
+        &mut rebar_compare::CurrentFreCaptureLifecycle,
         &[u8],
     ) -> Result<(Duration, u64), CompareError>,
 {
@@ -982,7 +982,7 @@ where
     let expected_plan = identity.candidate_plan.clone();
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
-        let lifecycle = current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
             &benchmark.model,
             benchmark.pattern(),
             benchmark.unicode,
@@ -999,7 +999,7 @@ where
                 )));
             }
         }
-        measure(&lifecycle, &benchmark.haystack)
+        measure(&mut lifecycle, &benchmark.haystack)
     })
     .map_err(Into::into)
 }
@@ -1173,7 +1173,7 @@ fn model_captures_with_measurement<F>(
 ) -> Result<CaptureLifecycleRawObservation, DynError>
 where
     F: FnOnce(
-        &rebar_compare::CurrentFreCaptureLifecycle,
+        &mut rebar_compare::CurrentFreCaptureLifecycle,
         &[u8],
     ) -> Result<(Duration, u64), CompareError>,
 {
@@ -1213,10 +1213,10 @@ where
             .clone()
             .ok_or("capture process token is absent")?,
     };
-    let lifecycle = capture_lifecycle(benchmark, expectations)?;
+    let mut lifecycle = capture_lifecycle(benchmark, expectations)?;
     produce_capture_lifecycle_observation(
         &identity,
-        &lifecycle,
+        &mut lifecycle,
         benchmark.pattern(),
         &benchmark.haystack,
         boundary,

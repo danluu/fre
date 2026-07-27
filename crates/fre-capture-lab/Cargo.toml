@@ -11,8 +11,10 @@ publish = false
 workspace = true
 
 [dependencies]
+fre-exact-alloc = { path = "../fre-exact-alloc" }
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode-perl"] }
 
 [dev-dependencies]
 regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
 regex-automata = "=0.4.14"
+stats_alloc = "=0.1.10"

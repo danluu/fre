@@ -1937,14 +1937,14 @@ where
 /// measurement failure, zero/overflowed duration, or inconsistent output.
 pub fn produce_capture_lifecycle_observation<F>(
     identity: &CaptureLifecycleObservationIdentity,
-    lifecycle: &CurrentFreCaptureLifecycle,
+    lifecycle: &mut CurrentFreCaptureLifecycle,
     pattern: &str,
     haystack: &[u8],
     boundary: CaptureLifecycleBoundary,
     measure: F,
 ) -> Result<CaptureLifecycleRawObservation, ContractError>
 where
-    F: FnOnce(&CurrentFreCaptureLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
+    F: FnOnce(&mut CurrentFreCaptureLifecycle, &[u8]) -> Result<(Duration, u64), CompareError>,
 {
     validate_capture_identity_shape(identity)?;
     if boundary == CaptureLifecycleBoundary::SteadyPublicOperation {
@@ -6000,7 +6000,7 @@ mod tests {
         let contract = contract();
         let pattern = r"(a)(b)?";
         let haystack = b"a ab";
-        let lifecycle = crate::current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = crate::current_fre_rebar_capture_lifecycle(
             "count-captures",
             pattern,
             false,
@@ -6020,7 +6020,7 @@ mod tests {
         };
         let first = produce_capture_lifecycle_observation(
             &identity,
-            &lifecycle,
+            &mut lifecycle,
             pattern,
             haystack,
             CaptureLifecycleBoundary::FirstPublicOperation,
@@ -6037,7 +6037,7 @@ mod tests {
         steady_identity.process_token_sha256 = digest(b"steady capture process");
         let steady = produce_capture_lifecycle_observation(
             &steady_identity,
-            &lifecycle,
+            &mut lifecycle,
             pattern,
             haystack,
             CaptureLifecycleBoundary::SteadyPublicOperation,
@@ -6060,7 +6060,7 @@ mod tests {
         assert!(
             produce_capture_lifecycle_observation(
                 &wrong_expected,
-                &lifecycle,
+                &mut lifecycle,
                 pattern,
                 haystack,
                 CaptureLifecycleBoundary::SteadyPublicOperation,

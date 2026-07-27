@@ -34,6 +34,38 @@ deduplication does not in general prove ordered nullable-loop priority
 (`(?:|a)*` and `(?:a|)*` select different spans in Rust regex). There is no
 fallback that silently changes those semantics.
 
+## Operation-aware HIR facts
+
+The additive `facts` module derives conservative, typed facts from canonical
+Rust HIR before an operation planner selects a backend. It distinguishes an
+empty language from a nullable one; publishes checked width, complete finite
+languages, positioned required-substring alternatives and assertions; records
+Unicode scalar/UTF-8-width properties; and retains source-ordered capture facts
+with `Never`, `Maybe`, `Always`, or fail-closed `Unknown` participation.
+Determinization, one-pass and finite-language reduction certificates name the
+selected output contract and their priority, greediness, empty-progress,
+assertion-context and capture preconditions. `Unknown` and typed `Refused`
+results are never positive facts.
+
+Analysis uses a separate iterative census before construction. The census
+preflights cumulative work, explicit stack occupancy, HIR nodes, retained,
+temporary and peak logical bytes, and allocation attempts. Optional finite
+language, required-string, assertion and deterministic-state publications have
+independent typed refusal limits, so refusal leaves the remaining conservative
+facts available. Reported construction actuals are checked against the
+immutable prospective envelope. Every report carries the public semantic
+algorithm and exact-accounting versions; consumers reject identities other
+than the versions implemented by their linked `fre-lower`.
+
+These facts begin at canonical HIR, not source syntax. In particular, expanded
+Unicode classes cannot prove whether simple or full case folding produced
+them, and HIR smart constructors can erase a capture nested only under an
+outer exact-zero repetition. The API therefore reports source-schema and fold
+origin as unavailable rather than reconstructing them. Every capture that
+remains in HIR, including captures in impossible alternatives, stays in the
+reported schema; capture-sensitive operations prevent erasure-based
+reductions.
+
 ## Bounded construction
 
 HIR traversal is postorder over an explicit task stack. Repetition and Unicode

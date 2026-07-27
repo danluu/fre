@@ -33,33 +33,34 @@ use fre::{
     AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
     AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
     AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
-    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
-    AggregateRunLimits, AggregateSpanSumRegex, AggregateStrategy, AggregateUnicodeScalarSemantics,
-    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
-    AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
-    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
-    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError,
-    BoundedClassSequenceBuildLimits, BoundedClassSequenceReduceError,
-    BoundedClassSequenceReduceLimits, BoundedSeparatedFieldsBuildError,
-    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
-    BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
-    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
-    CaptureRegex, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralPlan,
-    CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchOperation, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CompatibilityProfile, FixedClassSandwichBuildError,
-    FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
-    FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
-    FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
-    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
-    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
-    GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
-    LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
-    LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LineCaptureBuildError, LineCaptureBuildLimits,
-    LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
-    LineCaptureRunLimits, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateOperation, LiteralAggregateReduceError, LiteralAggregateReduceLimits,
-    LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError, LiteralAssertionsBuildLimits,
-    LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
+    AggregateOperationCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
+    AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
+    AggregateStrategy, AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError,
+    AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder, AnchoredLineCapturePlan,
+    AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, BlockingDelimiterBuildAccounting,
+    BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterReduceError,
+    BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
+    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
+    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
+    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
+    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
+    CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRequiredLiteralBuildLimits,
+    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
+    CaptureRequiredLiteralSearchOperation, CaptureRunLimits, CaptureSearchError,
+    CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession,
+    CompatibilityProfile, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedClassSandwichReduceLimits,
+    FixedPredicateWord64BuildError, FixedPredicateWord64MatchSelection,
+    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
+    FixedPredicateWord64ReduceError, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
+    GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
+    GraphemeScalarDfaReduceLimits, LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+    LITERAL_CLASS_RUN_LITERAL_PLAN_ID, LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuilder, LineCapturePlan,
+    LineCapturePlanKind, LineCaptureRunError, LineCaptureRunLimits, LiteralAggregateBuildError,
+    LiteralAggregateBuildLimits, LiteralAggregateOperation, LiteralAggregateReduceError,
+    LiteralAggregateReduceLimits, LiteralAssertionsBuildAccounting, LiteralAssertionsBuildError,
+    LiteralAssertionsBuildLimits, LiteralAssertionsReduceError, LiteralAssertionsReduceLimits,
     LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
     LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
     LiteralClassRunLiteralReduceLimits, LiteralReplacementErrorSource, LiteralReplacementLimits,
@@ -89,6 +90,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod canonical_case_fold;
+pub mod p128_forced_priority;
+pub mod p128_forced_registry;
+pub mod p128_foundation;
 pub mod performance_contract;
 
 /// Stable schema for deterministic semantic comparison reports.
@@ -115,6 +119,12 @@ pub const CURRENT_FRE_CAPTURE_PLAN: &str = "capture-linear-selector-persistent-h
 /// Stable plan label for aggregate-only capture-history quotient replay.
 pub const CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN: &str =
     "capture-linear-selector-participation-quotient-v1";
+/// Stable plan label for the fused reusable participation frontier.
+pub const CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN: &str =
+    "capture-fused-participation-stream-v1";
+/// Stable plan label for the fused reusable persistent-history frontier.
+pub const CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN: &str =
+    "capture-fused-persistent-history-stream-v1";
 /// Stable plan label for capture-erased selection with proved participation.
 pub const CURRENT_FRE_CAPTURE_UNIFORM_PLAN: &str = "capture-linear-selector-uniform-participation";
 /// Stable plan label for one-pass source-ordered root capture-many counting.
@@ -147,6 +157,8 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
         plan,
         CURRENT_FRE_CAPTURE_PLAN
             | CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
+            | CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
+            | CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN
             | CURRENT_FRE_CAPTURE_UNIFORM_PLAN
             | CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN
             | CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN
@@ -189,7 +201,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v39-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -510,6 +522,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         FRE_ADAPTER
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the immutable adapter receipt enumerates every independently selected physical route"
+    )]
     fn identity(&self) -> AdapterIdentity {
         let profile = rebar_profile();
         let runtime_sha256 = std::env::var("FRE_CANDIDATE_RUNTIME_SHA256")
@@ -544,6 +560,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; nonuniform capture Count schemas fitting the fixed participation mask publish the quotient before source access, while larger schemas publish unchanged persistent-history replay and no execution-time fallback is permitted",
+        );
+        identity.identity.push_str(
+            "; fused-capture-stream-v1 compiles prioritized tag actions once, reuses ordered frontiers and fixed participation masks across whole-input and Rebar LF/CRLF domains, preserves absolute tag offsets and clipped anchor context, and retains a prospectively bounded persistent-history fallback for wide schemas with exact construction and operation receipts",
+        );
+        identity.availability.push_str(
+            "; eligible one-pattern grep-captures may bind one caller-owned authenticated whole-input LF/CRLF stream with reusable state/tag storage at the retained lifecycle boundary; direct one-shot reductions retain the unchanged generic per-line selector/replay, and source-free stream construction refusal selects that same fallback before source access",
         );
         identity.identity.push_str(
             "; anchored-line-capture-v1 lowers generic Unicode-off absolute-start deterministic byte HIRs to fixed inline masks and counts mandatory capture participation in one raw LF/CRLF pass",
@@ -1540,6 +1562,56 @@ enum CurrentFreAggregateOperationInner {
     SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
 }
 
+/// Value produced by the reusable aggregate operation shell together with an
+/// optional immutable continuation counter receipt.
+///
+/// This result intentionally carries no benchmark name, fixture identity,
+/// expected value, result hash, or timing observation. Callers may attach
+/// attribution only after this shell has finished its structurally selected
+/// operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CurrentFreAggregateCounterReceiptStatus {
+    /// The single-pattern continuation route published a sealed P/A receipt.
+    Continuation(Box<AggregateOperationCounterReceipt>),
+    /// A single-pattern direct route completed without a continuation receipt.
+    DirectSelectedPlan,
+    /// A multi-pattern route completed before its native counter receipt is
+    /// implemented. This is deliberately not represented as zero counters.
+    MissingMultiPlanReceipt,
+}
+
+/// Value produced by the reusable aggregate operation shell together with its
+/// explicit native counter-receipt status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentFreAggregateOperationCounterResult {
+    value: u64,
+    receipt_status: CurrentFreAggregateCounterReceiptStatus,
+}
+
+impl CurrentFreAggregateOperationCounterResult {
+    /// Value-only reducer output.
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Optional immutable structural receipt from a continuation operation.
+    #[must_use]
+    pub const fn continuation_receipt(&self) -> Option<&AggregateOperationCounterReceipt> {
+        match &self.receipt_status {
+            CurrentFreAggregateCounterReceiptStatus::Continuation(receipt) => Some(receipt),
+            CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+            | CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt => None,
+        }
+    }
+
+    /// Exact native evidence status after the operation completed.
+    #[must_use]
+    pub const fn receipt_status(&self) -> &CurrentFreAggregateCounterReceiptStatus {
+        &self.receipt_status
+    }
+}
+
 impl CurrentFreAggregateOperationLifecycle {
     /// Exact Rebar model retained by this artifact.
     #[must_use]
@@ -1589,6 +1661,81 @@ impl CurrentFreAggregateOperationLifecycle {
                     CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
                 })
             }
+        }
+    }
+
+    /// Execute the same retained value-only operation as [`Self::execute`]
+    /// and publish an optional continuation counter receipt after completion.
+    ///
+    /// This is deliberately an out-of-timed-boundary diagnostic seam. It
+    /// reuses the same prebuilt artifact and exact derived limits, but is not
+    /// called by the benchmark runner. It cannot steer construction or route
+    /// selection because it receives no benchmark or fixture metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same input-length and retained-plan errors as
+    /// [`Self::execute`].
+    pub fn execute_with_counters(
+        &self,
+        haystack: &[u8],
+    ) -> Result<CurrentFreAggregateOperationCounterResult, CompareError> {
+        if haystack.len() != self.haystack_len {
+            return Err(CompareError::new(format!(
+                "aggregate operation haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        match &self.inner {
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+                .count_value_with_counters(haystack, limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value(),
+                    receipt_status: result.continuation_receipt().cloned().map_or(
+                        CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        |receipt| {
+                            CurrentFreAggregateCounterReceiptStatus::Continuation(Box::new(receipt))
+                        },
+                    ),
+                })
+                .map_err(|error| {
+                    let message = format!("FRE count lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                }),
+            CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
+                .count_value(haystack, *limits)
+                .map(|value| CurrentFreAggregateOperationCounterResult {
+                    value,
+                    receipt_status:
+                        CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
+                })
+                .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
+                .span_sum_value_with_counters(haystack, limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value(),
+                    receipt_status: result.continuation_receipt().cloned().map_or(
+                        CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                        |receipt| {
+                            CurrentFreAggregateCounterReceiptStatus::Continuation(Box::new(receipt))
+                        },
+                    ),
+                })
+                .map_err(|error| {
+                    let message = format!("FRE span-sum lifecycle: {error}");
+                    CompareError::new(aggregate_attempt_error(&error, message).message)
+                }),
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => regex
+                .span_sum_value(haystack, *limits)
+                .map(|value| CurrentFreAggregateOperationCounterResult {
+                    value,
+                    receipt_status:
+                        CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
+                })
+                .map_err(|error| {
+                    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+                }),
         }
     }
 }
@@ -1929,10 +2076,15 @@ enum CurrentFreCaptureModel {
     GrepCaptures,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the caller-owned session stays inline so its exact construction allocation remains receipted"
+)]
 enum CurrentFreCapturePreparation {
     Count(Box<CaptureRunLimits>),
     Grep,
+    Stream(CaptureStreamSession),
     RuffGrep(Box<LineCaptureRunLimits>),
     AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
 }
@@ -1970,7 +2122,7 @@ impl CurrentFreCaptureModel {
 /// The first call to [`Self::execute`] is the contracted first-operation
 /// boundary. Later calls on the same value are steady-operation boundaries.
 /// Construction and input loading are outside both boundaries.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CurrentFreCaptureLifecycle {
     model: CurrentFreCaptureModel,
     regex: CurrentFreCaptureRegex,
@@ -1991,8 +2143,21 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
+        if let CurrentFreCapturePreparation::Stream(session) = &self.preparation {
+            return match session.operation_prospective().construction.projection {
+                CaptureStreamProjection::ParticipationMask => {
+                    CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
+                }
+                CaptureStreamProjection::PersistentHistory => {
+                    CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN
+                }
+            };
+        }
         match &self.regex {
-            CurrentFreCaptureRegex::General(regex) => capture_plan_label(regex),
+            CurrentFreCaptureRegex::General(regex) => match self.model {
+                CurrentFreCaptureModel::CountCaptures => capture_plan_label(regex),
+                CurrentFreCaptureModel::GrepCaptures => capture_grep_plan_label(regex),
+            },
             CurrentFreCaptureRegex::Noqa(regex) => regex.build_report().plan_identity.plan_id,
             CurrentFreCaptureRegex::Ruff(plan) => {
                 plan.build_report().identity.operation.operation_id
@@ -2022,7 +2187,7 @@ impl CurrentFreCaptureLifecycle {
     /// Returns an error if checked reducer limits or the capture engine refuse
     /// the operation, or if the input length differs from the authenticated
     /// preparation. No alternate implementation is selected.
-    pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
+    pub fn execute(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
         if haystack.len() != self.haystack_len {
             return Err(CompareError::new(format!(
                 "capture lifecycle haystack length {} differs from prepared {}",
@@ -2030,13 +2195,27 @@ impl CurrentFreCaptureLifecycle {
                 self.haystack_len
             )));
         }
-        let result = match (&self.regex, &self.preparation) {
+        let result = match (&self.regex, &mut self.preparation) {
             (
                 CurrentFreCaptureRegex::General(regex),
                 CurrentFreCapturePreparation::Count(run_limits),
             ) => execute_count_captures_with_limits(regex, haystack, run_limits),
             (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_grep_captures(regex, haystack, &self.limits)
+            }
+            (CurrentFreCaptureRegex::General(_), CurrentFreCapturePreparation::Stream(session)) => {
+                session
+                    .execute(haystack)
+                    .map_err(|error| {
+                        ExecutionError::fault(format!(
+                            "FRE prepared capture-stream session refused execution: {error}"
+                        ))
+                    })
+                    .and_then(|result| {
+                        u64::try_from(result.accounting.count).map_err(|_| {
+                            ExecutionError::fault("FRE stream capture count does not fit u64")
+                        })
+                    })
             }
             (CurrentFreCaptureRegex::Noqa(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_noqa_grep_captures(regex, haystack, &self.limits)
@@ -2072,6 +2251,11 @@ impl CurrentFreCaptureLifecycle {
             (_, CurrentFreCapturePreparation::AnchoredLineGrep(_)) => {
                 return Err(CompareError::new(
                     "anchored-line grep preparation reached an incompatible capture artifact",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::Stream(_)) => {
+                return Err(CompareError::new(
+                    "prepared capture stream reached an incompatible capture artifact",
                 ));
             }
         };
@@ -2156,9 +2340,33 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             } else {
                 let general = capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
                     .map_err(|error| CompareError::new(error.message))?;
+                let preparation = if active_capture_required_literal_plan(&general).is_some() {
+                    // The certified required-literal route remains its own
+                    // generic lifecycle. A reusable stream is only selected
+                    // where it is the authenticated public operation route.
+                    CurrentFreCapturePreparation::Grep
+                } else {
+                    let run_limits = capture_count_run_limits(&general, haystack_len, &limits)
+                        .map_err(|error| CompareError::new(error.message))?;
+                    general
+                        .prepare_capture_stream_session(
+                            haystack_len,
+                            run_limits,
+                            CaptureStreamDomains::RebarLines,
+                        )
+                        .map_err(|error| {
+                            CompareError::new(format!(
+                                "FRE capture-stream session preflight refused construction: {error}"
+                            ))
+                        })?
+                        .map_or(
+                            CurrentFreCapturePreparation::Grep,
+                            CurrentFreCapturePreparation::Stream,
+                        )
+                };
                 (
                     CurrentFreCaptureRegex::General(Box::new(general)),
-                    CurrentFreCapturePreparation::Grep,
+                    preparation,
                 )
             };
             (regex, preparation)
@@ -4989,14 +5197,15 @@ fn capture_execution_error(
             | fre::PrefixClassUniformParticipationError::PeakLimit { .. },
         )
         | CaptureExecutionSource::CombinedPeak { .. } => ExecutionError::unsupported(message),
-        CaptureExecutionSource::PrefixClassParticipation(_) => ExecutionError::fault(message),
         CaptureExecutionSource::Selector(source) => aggregate_engine_error(source, message),
-        CaptureExecutionSource::History(CaptureSearchError::Resource { .. }) => {
+        CaptureExecutionSource::History(CaptureSearchError::Resource { .. })
+        | CaptureExecutionSource::Stream(fre::CaptureStreamError::Resource { .. }) => {
             ExecutionError::unsupported(message)
         }
-        CaptureExecutionSource::History(_) | CaptureExecutionSource::InternalInvariant(_) => {
-            ExecutionError::fault(message)
-        }
+        CaptureExecutionSource::PrefixClassParticipation(_)
+        | CaptureExecutionSource::History(_)
+        | CaptureExecutionSource::Stream(_)
+        | CaptureExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
 }
 
@@ -5044,6 +5253,8 @@ fn capture_regex_one_with_build_limits(
                 | CapturePlanKind::LinearSelectorUniformParticipation
                 | CapturePlanKind::LinearSelectorParticipationQuotientV1
                 | CapturePlanKind::LinearSelectorPersistentHistory
+                | CapturePlanKind::FusedCaptureStreamParticipationV1
+                | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1
         )
     {
         return Err(ExecutionError::fault(
@@ -5103,11 +5314,24 @@ fn capture_plan_label(regex: &CaptureRegex) -> &'static str {
         CapturePlanKind::OrderedRootCaptureManyCount => CURRENT_FRE_CAPTURE_ORDERED_ROOT_COUNT_PLAN,
         CapturePlanKind::UniformPrefixClassParticipation => CURRENT_FRE_CAPTURE_PREFIX_CLASS_PLAN,
         CapturePlanKind::LinearSelectorUniformParticipation => CURRENT_FRE_CAPTURE_UNIFORM_PLAN,
-        CapturePlanKind::LinearSelectorParticipationQuotientV1 => {
+        CapturePlanKind::LinearSelectorParticipationQuotientV1
+        | CapturePlanKind::FusedCaptureStreamParticipationV1 => {
             CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
         }
-        CapturePlanKind::LinearSelectorPersistentHistory => CURRENT_FRE_CAPTURE_PLAN,
+        CapturePlanKind::LinearSelectorPersistentHistory
+        | CapturePlanKind::FusedCaptureStreamPersistentHistoryV1 => CURRENT_FRE_CAPTURE_PLAN,
     }
+}
+
+const fn capture_stream_plan_label(projection: CaptureStreamProjection) -> &'static str {
+    match projection {
+        CaptureStreamProjection::ParticipationMask => CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN,
+        CaptureStreamProjection::PersistentHistory => CURRENT_FRE_CAPTURE_STREAM_HISTORY_PLAN,
+    }
+}
+
+fn capture_grep_plan_label(regex: &CaptureRegex) -> &'static str {
+    capture_plan_label(regex)
 }
 
 fn active_capture_required_literal_plan(
@@ -5446,9 +5670,19 @@ fn fre_grep_captures(
     }
     let pattern = one_fre_pattern(request)?;
     let regex = capture_grep_regex_one(pattern, request.unicode, request.case_insensitive, limits)?;
-    let plan = capture_plan_label(&regex);
-    let actual = execute_grep_captures(&regex, request.haystack, limits)?;
-    Ok(FreReduction { actual, plan })
+    let report = execute_grep_captures_inner(
+        active_capture_required_literal_plan(&regex),
+        &regex,
+        request.haystack,
+        limits,
+    )?;
+    let plan = report
+        .stream_projection
+        .map_or_else(|| capture_plan_label(&regex), capture_stream_plan_label);
+    Ok(FreReduction {
+        actual: report.count,
+        plan,
+    })
 }
 
 fn noqa_grep_capture_regex(
@@ -6157,6 +6391,7 @@ fn execute_grep_captures(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct GrepCaptureExecutionReport {
     count: u64,
+    stream_projection: Option<CaptureStreamProjection>,
     line_domains: usize,
     candidate_domains: usize,
     selector_executions: usize,
@@ -6173,7 +6408,7 @@ struct GrepCaptureExecutionReport {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "whole-input preflight, one DFA stream, and exact per-domain selector accounting remain one auditable transaction"
+    reason = "whole-input preflight and exact per-domain generic-selector accounting remain one auditable transaction"
 )]
 fn execute_grep_captures_inner(
     prefilter: Option<&CaptureRequiredLiteralPlan>,
@@ -6468,6 +6703,7 @@ fn execute_grep_captures_inner(
         .map_err(|_| ExecutionError::fault("FRE grep-capture count does not fit u64"))?;
     Ok(GrepCaptureExecutionReport {
         count,
+        stream_projection: None,
         line_domains,
         candidate_domains,
         selector_executions,
@@ -15316,7 +15552,7 @@ mod tests {
     }
 
     fn assert_retained_ruff_first_and_steady(haystack: &[u8], expected: u64, limits: RunLimits) {
-        let lifecycle = retained_ruff_lifecycle(haystack.len(), limits);
+        let mut lifecycle = retained_ruff_lifecycle(haystack.len(), limits);
         assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
         assert_eq!(
             lifecycle.execute(haystack).expect("first lifecycle"),
@@ -15565,7 +15801,7 @@ mod tests {
             candidate.plan.as_deref(),
             Some(CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN)
         );
-        let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
             "grep-captures",
             ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
             false,
@@ -15665,6 +15901,121 @@ mod tests {
         assert_eq!(seen.len(), ROWS.len());
     }
 
+    #[test]
+    #[ignore = "requires the exact expanded Rebar corpus and pinned clean Rebar checkout"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated transaction binds all five tracker points, both controls, and first/steady reuse"
+    )]
+    fn authenticated_p128_capture_stream_d_rows_canary() {
+        const ROWS: [(&str, u64, &[&str]); 3] = [
+            (
+                "opt/onepass/first-three-words-russian@rust/regex",
+                19_224,
+                &["316b893df6c697251fef808a", "1392d2f25572eccf26134456"],
+            ),
+            (
+                "opt/onepass/word-boundary-russian@rust/regex",
+                873,
+                &["f43803891f368402e52a2440", "c514b04dc3b7ff886f56f4d8"],
+            ),
+            (
+                "wild/bibleref/short@rust/regex",
+                30,
+                &["43fa59817f1c44d92040848e"],
+            ),
+        ];
+        let manifest_path = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_MANIFEST")
+                .expect("FRE_TEST_REBAR_MANIFEST must name the exact manifest.json"),
+        );
+        let checkout = PathBuf::from(
+            std::env::var_os("FRE_TEST_REBAR_CHECKOUT")
+                .expect("FRE_TEST_REBAR_CHECKOUT must name the pinned clean Rebar checkout"),
+        );
+        let manifest_bytes = read_limited(&manifest_path, 64 * 1_048_576)
+            .expect("read exact expanded Rebar manifest");
+        let manifest_hash = sha256(&manifest_bytes);
+        assert_eq!(manifest_hash, PROGRAM_STATE_SENTINEL_MANIFEST_SHA256);
+        verify_sidecar_hash(&manifest_path, &manifest_hash)
+            .expect("authenticate expanded Rebar manifest sidecar");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("decode expanded Rebar manifest");
+        let limits = RunLimits::default();
+        validate_manifest(&manifest, &checkout, &limits)
+            .expect("authenticate manifest and pinned clean Rebar checkout");
+        let manifest_root = manifest_path.parent().expect("manifest has a parent");
+        let mut loader = Loader::new(manifest_root, &checkout, &limits);
+        let mut seen = BTreeSet::new();
+        for (job_id, expected, point_ids) in ROWS {
+            let mut matching = manifest.jobs.iter().filter(|job| job.id == job_id);
+            let job = matching.next().expect("exact D row");
+            assert!(matching.next().is_none(), "duplicate D row {job_id}");
+            assert!(seen.insert(job_id), "duplicate D fixture {job_id}");
+            assert_eq!(job.expected.count, expected, "{job_id}");
+            assert!(job.regex.unicode, "{job_id}");
+            assert!(!job.regex.case_insensitive, "{job_id}");
+            let input = loader.load(job).expect("load exact D row");
+            let rust = rust_reducer(job, &input, &limits).expect("pinned Rust D result");
+            let candidate =
+                candidate_reducer(&CurrentFreAdapter, job, &input, &limits).expect("FRE D result");
+            assert_eq!(rust, expected, "{job_id}");
+            assert_eq!(candidate.actual, expected, "{job_id}");
+            assert_eq!(job.model, "grep-captures", "{job_id}");
+            let regex = capture_grep_regex_one(
+                input.patterns.first().expect("one D pattern"),
+                job.regex.unicode,
+                job.regex.case_insensitive,
+                &limits,
+            )
+            .expect("D grep artifact");
+            assert_eq!(
+                candidate.plan.as_deref(),
+                Some(capture_grep_plan_label(&regex)),
+                "{job_id}"
+            );
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                &job.model,
+                input.patterns.first().expect("one D pattern"),
+                job.regex.unicode,
+                job.regex.case_insensitive,
+                input.haystack.len(),
+            )
+            .expect("retained D lifecycle");
+            assert_eq!(
+                lifecycle.plan(),
+                CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN,
+                "{job_id}"
+            );
+            assert_eq!(
+                lifecycle
+                    .execute(&input.haystack)
+                    .expect("first D operation"),
+                expected,
+                "{job_id}"
+            );
+            assert_eq!(
+                lifecycle
+                    .execute(&input.haystack)
+                    .expect("steady D operation"),
+                expected,
+                "{job_id}"
+            );
+            let report = execute_grep_captures_inner(None, &regex, &input.haystack, &limits)
+                .expect("D generic line receipt");
+            assert_eq!(report.stream_projection, None);
+            assert_eq!(report.selector_executions, report.candidate_domains);
+            assert_eq!(report.count, expected);
+            println!(
+                "p128-capture-stream-d-canary manifest_sha256={manifest_hash} job={job_id} points={} expected={expected} rust={rust} fre={} plan={}",
+                point_ids.join(","),
+                candidate.actual,
+                candidate.plan.as_deref().expect("D plan"),
+            );
+        }
+        assert_eq!(seen.len(), ROWS.len());
+    }
+
     #[derive(Clone, Copy)]
     struct RuffRealRow {
         id: &'static str,
@@ -15727,7 +16078,7 @@ mod tests {
             .expect("remaining Ruff facade reduction");
         assert_eq!(candidate.actual, rust, "{}", row.id);
         assert_eq!(candidate.plan.as_deref(), Some(row.plan), "{}", row.id);
-        let lifecycle = current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             row.pattern,
             true,
@@ -15910,7 +16261,7 @@ mod tests {
         assert_eq!(reduction.actual, 35_128);
         assert_eq!(reduction.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
 
-        let lifecycle = current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             PATTERN,
             false,
@@ -15940,7 +16291,7 @@ mod tests {
         assert_eq!(neighbor.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
 
         let ambiguous_haystack = b"aaa\n";
-        let control = current_fre_rebar_capture_lifecycle(
+        let mut control = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"^(a+)a",
             false,
@@ -15998,7 +16349,7 @@ mod tests {
             assert_eq!(reduction.actual, expected);
             assert_eq!(reduction.plan, expected_plan);
 
-            let lifecycle = current_fre_rebar_capture_lifecycle(
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
                 "grep-captures",
                 pattern,
                 unicode,
@@ -16100,7 +16451,7 @@ mod tests {
                 grep_captures(&upstream, haystack, u64::MAX).expect("Rust configured Ruff result");
             let (limits, work, reducer_events) =
                 exact_configured_ruff_limits(haystack.len(), rate, groups, inspection);
-            let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+            let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
                 "grep-captures",
                 pattern,
                 true,
@@ -16173,7 +16524,7 @@ mod tests {
             reducer_steps: 24,
             ..RunLimits::default()
         };
-        let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
             "grep-captures",
             pattern,
             false,
@@ -16255,7 +16606,7 @@ mod tests {
         let expected = grep_captures(&upstream, haystack, u64::MAX).expect("Rust Ruff result");
         let (exact_limits, work, sequential, reducer_events) =
             exact_ruff_lifecycle_limits(haystack.len());
-        let lifecycle = retained_ruff_lifecycle(haystack.len(), exact_limits.clone());
+        let mut lifecycle = retained_ruff_lifecycle(haystack.len(), exact_limits.clone());
         assert_eq!(lifecycle.model(), "grep-captures");
         assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_SPACE_OPERATOR_PLAN);
         assert!(is_current_fre_capture_route(
@@ -16329,7 +16680,7 @@ mod tests {
 
     #[test]
     fn capture_lifecycle_reuses_one_authenticated_artifact_across_boundaries() {
-        let count =
+        let mut count =
             current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
                 .expect("count-captures lifecycle");
         assert_eq!(count.model(), "count-captures");
@@ -16342,7 +16693,7 @@ mod tests {
         assert!(count.execute(b"a").is_err());
 
         let haystack = b"foo foo\r\nZ\r\nfoo\r\nfoo";
-        let grep = current_fre_rebar_capture_lifecycle(
+        let mut grep = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             r"([a-z][a-z])([a-z])([\r\n])?",
             false,
@@ -16356,7 +16707,7 @@ mod tests {
         assert_eq!(grep.execute(haystack).expect("steady grep operation"), 12);
 
         assert!(current_fre_rebar_capture_lifecycle("count", "a", false, false, 1).is_err());
-        let unicode =
+        let mut unicode =
             current_fre_rebar_capture_lifecycle("count-captures", r"(\pL)", true, false, 3)
                 .expect("Unicode count-captures lifecycle");
         assert_eq!(unicode.model(), "count-captures");
@@ -16374,7 +16725,7 @@ mod tests {
         let mutated = b"fn as_9 fn is_Z fn is_\xff";
         let reference = rust_compile_options(&[pattern.to_string()], false, false)
             .expect("Rust-functions reference build");
-        let lifecycle = current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "count-captures",
             pattern,
             false,
@@ -16492,7 +16843,7 @@ mod tests {
         let expected =
             grep_captures(&upstream, haystack, u64::MAX).expect("Rust AWS grep-captures");
         assert_eq!(expected, 9);
-        let lifecycle =
+        let mut lifecycle =
             current_fre_rebar_capture_lifecycle("grep-captures", AWS, false, false, haystack.len())
                 .expect("required-literal lifecycle");
         assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
@@ -16523,7 +16874,7 @@ mod tests {
                 fre_aggregate_sequential_bytes: sequential,
                 ..RunLimits::default()
             };
-            let lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
+            let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
                 "grep-captures",
                 AWS,
                 false,
@@ -16587,7 +16938,7 @@ mod tests {
                 .expect("pinned Rust redundant capture pattern");
             let expected =
                 grep_captures(&upstream, haystack, u64::MAX).expect("Rust redundant grep-captures");
-            let lifecycle = current_fre_rebar_capture_lifecycle(
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
                 "grep-captures",
                 pattern,
                 false,
@@ -16607,7 +16958,7 @@ mod tests {
             .expect("pinned Rust distinct capture pattern");
         let expected =
             grep_captures(&upstream, haystack, u64::MAX).expect("Rust distinct grep-captures");
-        let active = current_fre_rebar_capture_lifecycle(
+        let mut active = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             distinct,
             false,
@@ -16625,7 +16976,7 @@ mod tests {
             fre_literal_build_needle_bytes: 3,
             ..RunLimits::default()
         };
-        let fallback = current_fre_rebar_capture_lifecycle_with_limits(
+        let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
             "grep-captures",
             distinct,
             false,
@@ -16850,7 +17201,7 @@ mod tests {
             Some(CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN)
         );
 
-        let lifecycle = current_fre_rebar_capture_lifecycle(
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
             "grep-captures",
             AWS,
             false,
@@ -16968,6 +17319,63 @@ mod tests {
                     .contains("LF scan requires 8 sequential bytes, limit is 7")
             );
         }
+    }
+
+    #[test]
+    fn fused_capture_stream_is_operation_specific_and_reused() {
+        let limits = RunLimits::default();
+        let pattern = r"(\p{L}+)";
+        let haystack = "ab\r\nЖж\ncd".as_bytes();
+        let regex =
+            capture_grep_regex_one(pattern, true, false, &limits).expect("capture stream fixture");
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            CapturePlanKind::LinearSelectorUniformParticipation
+        );
+        assert_eq!(capture_plan_label(&regex), CURRENT_FRE_CAPTURE_UNIFORM_PLAN);
+        assert_eq!(
+            capture_grep_plan_label(&regex),
+            CURRENT_FRE_CAPTURE_UNIFORM_PLAN
+        );
+
+        let run_limits =
+            capture_count_run_limits(&regex, haystack.len(), &limits).expect("stream limits");
+        let report = execute_grep_captures_inner(None, &regex, haystack, &limits)
+            .expect("one-shot generic capture fallback");
+        assert_eq!(report.count, 6);
+        assert_eq!(report.stream_projection, None);
+        assert_eq!(report.line_domains, 3);
+        assert_eq!(report.candidate_domains, 3);
+        assert_eq!(report.selector_executions, 3);
+        assert!(
+            regex
+                .line_stream_prospective(haystack.len(), run_limits)
+                .expect("stream prospective")
+                .is_some()
+        );
+
+        let mut count = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            true,
+            false,
+            haystack.len(),
+        )
+        .expect("ordinary Count lifecycle");
+        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_UNIFORM_PLAN);
+        assert_eq!(count.execute(haystack).expect("ordinary Count"), 6);
+
+        let mut grep = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            pattern,
+            true,
+            false,
+            haystack.len(),
+        )
+        .expect("stream lifecycle");
+        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN);
+        assert_eq!(grep.execute(haystack).expect("first stream operation"), 6);
+        assert_eq!(grep.execute(haystack).expect("steady stream operation"), 6);
     }
 
     #[test]
@@ -18588,7 +18996,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v39-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
+            "fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -18633,6 +19041,12 @@ mod tests {
             identity
                 .identity
                 .contains("exact-span persistent tagged-history replay")
+        );
+        assert!(identity.identity.contains("fused-capture-stream-v1"));
+        assert!(
+            identity
+                .availability
+                .contains("caller-owned authenticated whole-input LF/CRLF stream")
         );
     }
 

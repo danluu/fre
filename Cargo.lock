@@ -143,9 +143,11 @@ dependencies = [
 name = "fre-capture-lab"
 version = "0.1.0"
 dependencies = [
+ "fre-exact-alloc",
  "regex",
  "regex-automata",
  "regex-syntax",
+ "stats_alloc",
 ]
 
 [[package]]
@@ -359,6 +361,8 @@ version = "0.1.0"
 dependencies = [
  "bstr",
  "fre",
+ "fre-automata",
+ "fre-lower",
  "libc",
  "rebar-expand",
  "regex",

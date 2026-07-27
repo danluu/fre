@@ -758,6 +758,309 @@ impl std::error::Error for OperationAttemptError {
     }
 }
 
+/// Version of the optional, post-operation structural counter projection.
+///
+/// This deliberately versioned projection is separate from continuation
+/// accounting. It never participates in route selection, admission, or the
+/// value-only hot loop; it is reconstructed from an already authenticated
+/// terminal receipt after the operation completes.
+pub const OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION: u8 = 1;
+
+/// Value emitted by an optional structural counter receipt.
+///
+/// Keeping the logical reducer kind beside the result makes an attribution
+/// record self-describing without accepting any external benchmark, fixture,
+/// expected-result, or timing metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationCounterValue {
+    Count(usize),
+    SpanSum(usize),
+}
+
+impl OperationCounterValue {
+    const fn operation(self) -> OperationAttemptKind {
+        match self {
+            Self::Count(_) => OperationAttemptKind::Count,
+            Self::SpanSum(_) => OperationAttemptKind::SpanSum,
+        }
+    }
+
+    /// Value-only reducer result retained by this receipt.
+    #[must_use]
+    pub const fn value(self) -> usize {
+        match self {
+            Self::Count(value) | Self::SpanSum(value) => value,
+        }
+    }
+}
+
+/// Optional structural counters projected from one authenticated continuation
+/// attempt.
+///
+/// Fields that are not present in the capture-free continuation executor are
+/// explicitly zero rather than omitted. In particular, accounting v5 has no
+/// DFA cache, line-domain, persistent-history, or reusable-scratch-clear
+/// facility. This makes a zero an auditable statement about the selected
+/// implementation rather than an absent measurement.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OperationStructuralCounters {
+    /// Candidate occurrences accepted by the certified internal-anchor route.
+    pub candidate_occurrences: usize,
+    /// Bytes accessed while verifying accepted internal-anchor candidates.
+    pub verified_bytes: usize,
+    /// Exact transition checks performed by the selected continuation route.
+    pub state_transitions: usize,
+    /// Cache misses in a DFA cache. Accounting v5 has no DFA cache.
+    pub dfa_cache_misses: usize,
+    /// One whole-operation selector invocation, published before source use.
+    pub selector_invocations: usize,
+    /// Line domains visited. The continuation executor is whole-input only.
+    pub line_domains: usize,
+    /// Persistent capture-history nodes. This executor is capture-free.
+    pub history_nodes: usize,
+    /// Exact operation-local allocations committed by the attempt.
+    pub allocations: usize,
+    /// Reusable scratch clears. Accounting v5 owns no reusable scratch arena.
+    pub scratch_clears: usize,
+    /// Complete output events emitted by the reducer.
+    pub output_events: usize,
+}
+
+impl OperationStructuralCounters {
+    fn from_attempt(attempt: &OperationAttemptReceipt) -> Self {
+        Self {
+            candidate_occurrences: attempt.actual.required_anchor_candidates,
+            verified_bytes: attempt.actual.required_anchor_source_accesses,
+            state_transitions: attempt.actual.transition_checks,
+            dfa_cache_misses: 0,
+            selector_invocations: 1,
+            line_domains: 0,
+            history_nodes: 0,
+            allocations: attempt.actual_allocations,
+            scratch_clears: 0,
+            output_events: attempt.actual.emitted_matches,
+        }
+    }
+
+    fn from_certificate(
+        certificate: &OperationCertificate,
+        accounting: &ExecutionAccounting,
+    ) -> Self {
+        Self {
+            candidate_occurrences: accounting.required_anchor_candidates,
+            verified_bytes: accounting.required_anchor_source_accesses,
+            state_transitions: accounting.transition_checks,
+            dfa_cache_misses: 0,
+            selector_invocations: 1,
+            line_domains: 0,
+            history_nodes: 0,
+            allocations: usize::from(certificate.actual_allocations),
+            scratch_clears: 0,
+            output_events: accounting.emitted_matches,
+        }
+    }
+}
+
+/// Immutable attribution and optional structural counters for one successful
+/// value-only continuation operation.
+///
+/// The contained [`OperationAttemptReceipt`] remains the source of truth for
+/// selected route, invocation, exact caller-limit seal, prospective resource
+/// bounds, and actual accounting. This wrapper adds no selector inputs and is
+/// created only after that receipt has authenticated a successful terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationCounterReceipt {
+    /// Schema for the structural projection, independent from accounting v5.
+    pub schema_version: u8,
+    /// Sealed route, invocation, prospective bounds, and actual accounting.
+    pub attempt: OperationAttemptReceipt,
+    /// Logical reducer result paired with the sealed operation kind.
+    pub value: OperationCounterValue,
+    /// Optional counters already collected by the selected operation.
+    pub counters: OperationStructuralCounters,
+    authentication: OperationCounterReceiptAuthentication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationCounterReceiptAuthentication {
+    schema_version: u8,
+    attempt: OperationAttemptReceipt,
+    value: OperationCounterValue,
+    counters: OperationStructuralCounters,
+}
+
+impl OperationCounterReceipt {
+    fn new(attempt: OperationAttemptReceipt, value: OperationCounterValue) -> Result<Self, Error> {
+        if !attempt_counter_components_close(&attempt, value) {
+            return Err(Error::InternalInvariant(
+                "structural counter receipt requires one sealed successful continuation attempt",
+            ));
+        }
+        let counters = OperationStructuralCounters::from_attempt(&attempt);
+        let schema_version = OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION;
+        Ok(Self {
+            schema_version,
+            authentication: OperationCounterReceiptAuthentication {
+                schema_version,
+                attempt: attempt.clone(),
+                value,
+                counters,
+            },
+            attempt,
+            value,
+            counters,
+        })
+    }
+
+    /// Verify the sealed attempt, reducer kind, exact P/A relation, and every
+    /// projected counter. Mutating any public field makes this return `false`.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.schema_version == OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION
+            && self.authentication
+                == (OperationCounterReceiptAuthentication {
+                    schema_version: self.schema_version,
+                    attempt: self.attempt.clone(),
+                    value: self.value,
+                    counters: self.counters,
+                })
+            && attempt_counter_components_close(&self.attempt, self.value)
+            && self.counters == OperationStructuralCounters::from_attempt(&self.attempt)
+    }
+}
+
+fn attempt_counter_components_close(
+    attempt: &OperationAttemptReceipt,
+    value: OperationCounterValue,
+) -> bool {
+    attempt.authenticates_success()
+        && attempt.identity.operation == value.operation()
+        && attempt.prospective.is_some_and(|prospective| {
+            prospective.contains(attempt.actual)
+                && match value {
+                    // Count is already an exact actual-accounting component.
+                    OperationCounterValue::Count(matches) => {
+                        matches == attempt.actual.emitted_matches
+                    }
+                    // The SpanSum value is sealed by SpanSumValueAttempt before
+                    // this projection is constructed. The P/A receipt retains
+                    // its exact resource ceiling, so recheck that bound here.
+                    OperationCounterValue::SpanSum(span_sum) => span_sum <= prospective.span_sum,
+                }
+        })
+}
+
+/// Immutable optional counters from the ordinary value-only hot path.
+///
+/// Unlike [`OperationCounterReceipt`], this receipt is intentionally derived
+/// from the same non-receipt-bearing execution path as `count_value` and
+/// `span_sum_value`. It therefore preserves the incumbent selected route and
+/// merely publishes the certificate and accounting that the completed hot
+/// operation already produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationHotCounterReceipt {
+    /// Schema for the structural projection, independent from accounting v5.
+    pub schema_version: u8,
+    /// Exact route certificate emitted by the ordinary value-only operation.
+    pub certificate: OperationCertificate,
+    /// Exact structural counters collected by that operation.
+    pub accounting: ExecutionAccounting,
+    /// Logical reducer result paired with the certificate operation.
+    pub value: OperationCounterValue,
+    /// Optional counters projected after the hot loop completes.
+    pub counters: OperationStructuralCounters,
+    authentication: OperationHotCounterReceiptAuthentication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OperationHotCounterReceiptAuthentication {
+    schema_version: u8,
+    certificate: OperationCertificate,
+    accounting: ExecutionAccounting,
+    value: OperationCounterValue,
+    counters: OperationStructuralCounters,
+}
+
+impl OperationHotCounterReceipt {
+    fn new(
+        certificate: OperationCertificate,
+        accounting: &ExecutionAccounting,
+        value: OperationCounterValue,
+    ) -> Result<Self, Error> {
+        if !hot_counter_components_close(&certificate, accounting, value) {
+            return Err(Error::InternalInvariant(
+                "value-only counter receipt diverged from its completed operation certificate",
+            ));
+        }
+        let counters = OperationStructuralCounters::from_certificate(&certificate, accounting);
+        let schema_version = OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION;
+        Ok(Self {
+            schema_version,
+            authentication: OperationHotCounterReceiptAuthentication {
+                schema_version,
+                certificate: certificate.clone(),
+                accounting: *accounting,
+                value,
+                counters,
+            },
+            certificate,
+            accounting: *accounting,
+            value,
+            counters,
+        })
+    }
+
+    /// Verify the ordinary hot-path certificate, actual counters, reducer
+    /// kind, and post-operation counter projection. Mutating any public
+    /// field makes this return `false`.
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.schema_version == OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION
+            && self.authentication
+                == (OperationHotCounterReceiptAuthentication {
+                    schema_version: self.schema_version,
+                    certificate: self.certificate.clone(),
+                    accounting: self.accounting,
+                    value: self.value,
+                    counters: self.counters,
+                })
+            && hot_counter_components_close(&self.certificate, &self.accounting, self.value)
+            && self.counters
+                == OperationStructuralCounters::from_certificate(
+                    &self.certificate,
+                    &self.accounting,
+                )
+    }
+}
+
+fn hot_counter_components_close(
+    certificate: &OperationCertificate,
+    accounting: &ExecutionAccounting,
+    value: OperationCounterValue,
+) -> bool {
+    let sequential = accounting
+        .sequential_bytes_written
+        .checked_add(accounting.sequential_bytes_read);
+    certificate.operation == value.operation()
+        && certificate.actual_allocations <= certificate.prospective_allocations
+        && sequential.is_some_and(|bytes| bytes <= certificate.sequential_bytes_bound)
+        && accounting.random_access_peak_bytes <= certificate.random_access_bytes
+        && accounting.scratch_peak_bytes <= certificate.scratch_bytes
+        && accounting.log_bytes <= certificate.log_bytes
+        && accounting.output_bytes <= certificate.output_bytes
+        && accounting.peak_bytes <= certificate.peak_bytes
+        && accounting.work <= certificate.work_bound
+        && accounting.emitted_matches <= certificate.output_matches
+        && match value {
+            OperationCounterValue::Count(matches) => matches == accounting.emitted_matches,
+            // Some ordinary routes retain a prospective span bound in the
+            // certificate, while others retain their actual span sum. The
+            // completed reducer result is sealed below, so its relationship
+            // to either representation is necessarily an upper-bound check.
+            OperationCounterValue::SpanSum(span_sum) => span_sum <= certificate.span_sum,
+        }
+}
+
 #[derive(Debug)]
 struct Common<K> {
     certificate: OperationCertificate,
@@ -921,6 +1224,31 @@ pub struct AdmittedCountAttempt {
 pub struct CountValueAttempt {
     pub value: usize,
     pub receipt: OperationAttemptReceipt,
+    authenticated_value: usize,
+}
+
+impl CountValueAttempt {
+    /// Publish optional immutable structural counters after this value-only
+    /// operation has completed. The hot loop has already finished; this
+    /// projection cannot influence route selection or source consumption.
+    pub fn into_counter_receipt(self) -> Result<OperationCounterReceipt, Error> {
+        if self.value != self.authenticated_value
+            || self.value != self.receipt.actual.emitted_matches
+        {
+            return Err(Error::InternalInvariant(
+                "structural counter receipt Count value differs from its sealed terminal result",
+            ));
+        }
+        OperationCounterReceipt::new(self.receipt, OperationCounterValue::Count(self.value))
+    }
+}
+
+/// Successfully evaluated ordinary value-only Count with optional structural
+/// counters published after the hot loop completes.
+#[derive(Debug)]
+pub struct CountValueCounterAttempt {
+    pub value: usize,
+    pub receipt: OperationHotCounterReceipt,
 }
 
 impl AdmittedCount {
@@ -959,6 +1287,29 @@ pub struct AdmittedSpanSumAttempt {
 pub struct SpanSumValueAttempt {
     pub value: usize,
     pub receipt: OperationAttemptReceipt,
+    authenticated_value: usize,
+}
+
+impl SpanSumValueAttempt {
+    /// Publish optional immutable structural counters after this value-only
+    /// operation has completed. The hot loop has already finished; this
+    /// projection cannot influence route selection or source consumption.
+    pub fn into_counter_receipt(self) -> Result<OperationCounterReceipt, Error> {
+        if self.value != self.authenticated_value {
+            return Err(Error::InternalInvariant(
+                "structural counter receipt SpanSum value differs from its sealed terminal result",
+            ));
+        }
+        OperationCounterReceipt::new(self.receipt, OperationCounterValue::SpanSum(self.value))
+    }
+}
+
+/// Successfully evaluated ordinary value-only `SpanSum` with optional
+/// structural counters published after the hot loop completes.
+#[derive(Debug)]
+pub struct SpanSumValueCounterAttempt {
+    pub value: usize,
+    pub receipt: OperationHotCounterReceipt,
 }
 
 impl AdmittedSpanSum {
@@ -1429,6 +1780,28 @@ impl CompiledRegex {
             .map(|result| result.summary.matches)
     }
 
+    /// Evaluate through the same ordinary value-only Count path as
+    /// [`Self::count_value`] and publish structural counters only after that
+    /// operation has completed. This does not make the selected route
+    /// receipt-bearing and cannot alter its admission or fallback behavior.
+    pub fn count_value_with_counters(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<CountValueCounterAttempt, Error> {
+        let result =
+            self.execute::<true>(haystack, range, strategy, OperationKind::Count, limits)?;
+        let value = result.summary.matches;
+        let receipt = OperationHotCounterReceipt::new(
+            result.certificate,
+            &result.accounting,
+            OperationCounterValue::Count(value),
+        )?;
+        Ok(CountValueCounterAttempt { value, receipt })
+    }
+
     /// Evaluate the ordinary construction-selected continuation Count route
     /// with observed-work admission and a complete P/A receipt.
     #[allow(
@@ -1452,9 +1825,13 @@ impl CompiledRegex {
             usize::MAX,
             None,
         )
-        .map(|(result, receipt)| CountValueAttempt {
-            value: result.summary.matches,
-            receipt,
+        .map(|(result, receipt)| {
+            let value = result.summary.matches;
+            CountValueAttempt {
+                value,
+                receipt,
+                authenticated_value: value,
+            }
         })
     }
 
@@ -1481,9 +1858,13 @@ impl CompiledRegex {
             usize::MAX,
             None,
         )
-        .map(|(result, receipt)| CountValueAttempt {
-            value: result.summary.matches,
-            receipt,
+        .map(|(result, receipt)| {
+            let value = result.summary.matches;
+            CountValueAttempt {
+                value,
+                receipt,
+                authenticated_value: value,
+            }
         })
     }
 
@@ -1512,9 +1893,13 @@ impl CompiledRegex {
             allocation_limit,
             Some(&mut observer),
         )
-        .map(|(result, receipt)| CountValueAttempt {
-            value: result.summary.matches,
-            receipt,
+        .map(|(result, receipt)| {
+            let value = result.summary.matches;
+            CountValueAttempt {
+                value,
+                receipt,
+                authenticated_value: value,
+            }
         })
     }
 
@@ -1770,6 +2155,27 @@ impl CompiledRegex {
             .map(|result| result.summary.span_sum)
     }
 
+    /// Evaluate through the same ordinary value-only `SpanSum` path as
+    /// [`Self::span_sum_value`] and publish structural counters only after
+    /// that operation has completed. This does not make the selected route
+    /// receipt-bearing and cannot alter its admission or fallback behavior.
+    pub fn span_sum_value_with_counters(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<SpanSumValueCounterAttempt, Error> {
+        let result = self.execute::<true>(haystack, range, strategy, OperationKind::Sum, limits)?;
+        let value = result.summary.span_sum;
+        let receipt = OperationHotCounterReceipt::new(
+            result.certificate,
+            &result.accounting,
+            OperationCounterValue::SpanSum(value),
+        )?;
+        Ok(SpanSumValueCounterAttempt { value, receipt })
+    }
+
     /// Evaluate the ordinary construction-selected continuation `SpanSum` route
     /// with observed-work admission and a complete P/A receipt.
     #[allow(
@@ -1793,9 +2199,13 @@ impl CompiledRegex {
             usize::MAX,
             None,
         )
-        .map(|(result, receipt)| SpanSumValueAttempt {
-            value: result.summary.span_sum,
-            receipt,
+        .map(|(result, receipt)| {
+            let value = result.summary.span_sum;
+            SpanSumValueAttempt {
+                value,
+                receipt,
+                authenticated_value: value,
+            }
         })
     }
 
@@ -13910,6 +14320,203 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unicode.compile_accounting().state_byte_span_sum_plans, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one receipt audit keeps each selected route's value, counters, refusal, and sealing check together"
+    )]
+    fn value_only_counter_receipts_are_sealed_after_the_selected_route_finishes() {
+        let pattern = r"(?:a+b|a)";
+        let haystack = b"aaaabaaaa";
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+
+        let hot_value = compiled
+            .count_value(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let hot_counters = compiled
+            .count_value_with_counters(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(hot_counters.value, hot_value);
+        assert!(hot_counters.receipt.closes());
+        assert_eq!(
+            hot_counters.receipt.certificate.operation,
+            OperationAttemptKind::Count
+        );
+        assert_eq!(
+            hot_counters.receipt.counters.output_events,
+            hot_counters.receipt.accounting.emitted_matches
+        );
+        let attempt = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(attempt.value, hot_value);
+        assert!(attempt.receipt.authenticates_success());
+        assert_eq!(
+            hot_counters.receipt.certificate.physical_route,
+            attempt.receipt.identity.physical_route.unwrap()
+        );
+
+        let receipt = attempt.into_counter_receipt().unwrap();
+        assert!(receipt.closes());
+        assert_eq!(
+            receipt.value,
+            super::OperationCounterValue::Count(hot_value)
+        );
+        assert_eq!(receipt.counters.selector_invocations, 1);
+        assert_eq!(
+            receipt.counters.state_transitions,
+            receipt.attempt.actual.transition_checks
+        );
+        assert_eq!(
+            receipt.counters.output_events,
+            receipt.attempt.actual.emitted_matches
+        );
+        assert_eq!(
+            receipt.counters.allocations,
+            receipt.attempt.actual_allocations
+        );
+
+        let mut forged = receipt.clone();
+        forged.counters.output_events = forged.counters.output_events.saturating_add(1);
+        assert!(!forged.closes());
+        let mut relabeled = receipt;
+        relabeled.value = super::OperationCounterValue::SpanSum(hot_value);
+        assert!(!relabeled.closes());
+
+        let mut forged_attempt = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        forged_attempt.value = forged_attempt.value.saturating_add(1);
+        assert!(forged_attempt.into_counter_receipt().is_err());
+
+        // StateByteSpanSum retains its prospective range-length bound in the
+        // ordinary certificate. A no-match value must still be sealed and
+        // admitted: the receipt checks the actual result against that bound,
+        // rather than incorrectly requiring equality with it.
+        let span_compiled = state_byte_span_sum_fixture(r"\w+\s+Holmes");
+        let span_haystack = b"no witness here";
+        let plain_span_sum = span_compiled
+            .span_sum_value(
+                span_haystack,
+                0..span_haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(plain_span_sum, 0);
+        let hot_span_sum = span_compiled
+            .span_sum_value_with_counters(
+                span_haystack,
+                0..span_haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(hot_span_sum.value, plain_span_sum);
+        assert!(hot_span_sum.receipt.closes());
+        assert!(hot_span_sum.value < hot_span_sum.receipt.certificate.span_sum);
+
+        let span_attempt = span_compiled
+            .span_sum_value_with_receipt(
+                span_haystack,
+                0..span_haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert!(span_attempt.into_counter_receipt().unwrap().closes());
+        let mut forged_span_attempt = span_compiled
+            .span_sum_value_with_receipt(
+                span_haystack,
+                0..span_haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        forged_span_attempt.value = forged_span_attempt.value.saturating_add(1);
+        assert!(forged_span_attempt.into_counter_receipt().is_err());
+    }
+
+    #[test]
+    fn counter_projection_preserves_exact_observed_work_admission_and_one_below_refusal() {
+        let haystack = b"alpha Holmes beta\r\nHolmes gamma\tHolmes";
+        let compiled = state_byte_span_sum_fixture(r"\w+\s+Holmes");
+        let baseline = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        let prospective = baseline.receipt.prospective.unwrap();
+        let exact_limits = OperationLimits {
+            max_work: baseline.receipt.actual.work,
+            ..exact_state_byte_limits(&prospective)
+        };
+        let projected = compiled
+            .span_sum_value_with_counters(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact_limits,
+            )
+            .unwrap();
+        assert_eq!(projected.value, baseline.value);
+        assert!(projected.receipt.closes());
+        assert_eq!(projected.receipt.accounting, baseline.receipt.actual);
+
+        let one_below = compiled
+            .span_sum_value_with_counters(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_work: baseline.receipt.actual.work - 1,
+                    ..exact_limits
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            one_below,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            }
+        ));
     }
 
     #[test]

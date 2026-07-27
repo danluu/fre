@@ -1528,7 +1528,14 @@ fn reserve_exact<T>(
         .map_err(|_| LowerError::AllocationFailed {
             structure,
             additional,
-        })
+        })?;
+    if values.capacity() != additional {
+        return Err(LowerError::AllocationFailed {
+            structure,
+            additional: values.capacity(),
+        });
+    }
+    Ok(())
 }
 
 fn resource_limit(resource: LowerResource, needed: usize, limit: usize) -> LowerError {
