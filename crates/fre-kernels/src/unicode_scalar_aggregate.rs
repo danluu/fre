@@ -1910,6 +1910,7 @@ mod tests {
 
         const ITERATIONS: usize = 128;
         const HAYSTACK_BYTES: usize = 1 << 20;
+        let iterations = f64::from(u32::try_from(ITERATIONS).expect("small iteration count"));
 
         let dispatch = SimdDispatchContext::capture();
         assert!(
@@ -1946,7 +1947,7 @@ mod tests {
                     .count,
             ));
         }
-        let scalar_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64;
+        let scalar_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations;
 
         let started = Instant::now();
         let mut classifier_checksum = 0_u64;
@@ -1963,7 +1964,7 @@ mod tests {
             }
             classifier_checksum = classifier_checksum.wrapping_add(black_box(count));
         }
-        let classifier_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64;
+        let classifier_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations;
         assert_eq!(scalar_checksum, classifier_checksum);
         assert_eq!(
             scalar_checksum,
