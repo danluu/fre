@@ -17,10 +17,19 @@
 
 use core::{fmt, mem::size_of};
 
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+use fre_simd_kernels::{
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy,
+    Feature, FeatureSet, SimdDispatchContext,
+};
+
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
 /// Stable identity for the scalar-stream implementation.
 pub const PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.v2";
+/// Stable identity for the SVE2-gated fixed-32 ASCII block owner.
+pub const DISPATCHED_PLAN_ID: &str =
+    "unicode-scalar-aggregate.ascii-block32.sve2-only-utf8-fallback.v1";
 /// Stable identity for the deterministic nonempty run reducer.
 pub const RUN_PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
 /// Stable identity for symbolic counted/lower-bounded repetition.
@@ -40,6 +49,8 @@ pub(crate) const REPEATED_RUN_COUNT_OPERATION_ID: &str =
 /// Stable identity for counted/lower-bounded matched-byte summation.
 pub(crate) const REPEATED_RUN_SPAN_SUM_OPERATION_ID: &str =
     "unicode-scalar-aggregate.span-sum.run-counted.v1";
+
+const SIMD_ASCII_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 
 /// Complete reducer selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +126,12 @@ impl OperationIdentity {
         Self::for_repetition(operation, Repetition::ExactlyOne)
     }
 
+    /// Return the distinct fixed-32 exactly-one identity.
+    #[must_use]
+    pub const fn for_dispatched_operation(operation: Operation) -> Self {
+        dispatched_identity(operation)
+    }
+
     /// Return the immutable identity for an exact atom or proved `+` root.
     #[must_use]
     pub const fn for_repetition(operation: Operation, repetition: Repetition) -> Self {
@@ -188,6 +205,12 @@ pub struct BuildAccounting {
     pub repetition: Repetition,
     pub range_payload_bytes: usize,
     pub work: usize,
+    /// Work used to compile the retained fixed-width ASCII classifier.
+    pub ascii_classifier_build_work: usize,
+    /// Initialized bytes occupied by the retained classifier value.
+    pub ascii_classifier_bytes: usize,
+    /// Exact dispatched-owner allocation, excluding its scalar range payload.
+    pub dispatched_owner_bytes: usize,
     pub temporary_capacity_bytes: usize,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
@@ -252,6 +275,12 @@ impl Default for ReduceLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceUpperBounds {
     pub input_bytes: usize,
+    /// Maximum number of non-overlapping fixed-32 classifier invocations.
+    pub ascii_block_classifications: usize,
+    /// Maximum physical bytes presented to fixed-32 classifier invocations.
+    pub ascii_block_classification_bytes: usize,
+    /// Maximum speculative lanes classified beyond a consumed ASCII prefix.
+    pub ascii_block_lookahead_bytes: usize,
     pub decode_byte_checks: usize,
     pub membership_tests: usize,
     pub range_comparisons: usize,
@@ -270,12 +299,20 @@ pub struct ReduceUpperBounds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub input_bytes_advanced: usize,
+    /// Exact number of non-overlapping fixed-32 classifier invocations.
+    pub ascii_block_classifications: usize,
+    /// Exact physical bytes presented to fixed-32 classifier invocations.
+    pub ascii_block_classification_bytes: usize,
+    /// Exact speculative lanes classified beyond a consumed ASCII prefix.
+    pub ascii_block_lookahead_bytes: usize,
     pub decode_byte_checks: usize,
     pub valid_scalars: usize,
     pub invalid_bytes: usize,
     /// ASCII bytes consumed by maximal-run reduction before the general
     /// UTF-8 decoder. This is also the exact number of ASCII bitmap tests.
     pub ascii_run_bytes: usize,
+    /// Logical ASCII member tests. Speculative fixed-block lanes are reported
+    /// separately by `ascii_block_lookahead_bytes`.
     pub ascii_bitmap_tests: usize,
     pub non_ascii_membership_tests: usize,
     pub range_comparisons: usize,
@@ -314,22 +351,56 @@ pub struct SpanSumResult {
 #[non_exhaustive]
 pub enum BuildError {
     EmptyClass,
-    InvalidRepetition { minimum: u32, maximum: Option<u32> },
-    ReversedRange { start: char, end: char },
+    /// The distinct fixed-32 owner requires an authentic OS-usable SVE2
+    /// capability snapshot.
+    AsciiClassifierDispatchUnavailable,
+    InvalidRepetition {
+        minimum: u32,
+        maximum: Option<u32>,
+    },
+    ReversedRange {
+        start: char,
+        end: char,
+    },
     NonCanonicalRanges,
-    RangeLimit { needed: usize, limit: usize },
-    WorkLimit { needed: usize, limit: usize },
-    ScratchLimit { needed: usize, limit: usize },
-    PersistentLimit { needed: usize, limit: usize },
-    PeakLimit { needed: usize, limit: usize },
-    AllocationFailed { additional: usize },
-    ArithmeticOverflow { computation: &'static str },
+    RangeLimit {
+        needed: usize,
+        limit: usize,
+    },
+    WorkLimit {
+        needed: usize,
+        limit: usize,
+    },
+    ScratchLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PersistentLimit {
+        needed: usize,
+        limit: usize,
+    },
+    PeakLimit {
+        needed: usize,
+        limit: usize,
+    },
+    AllocationFailed {
+        additional: usize,
+    },
+    DispatchedOwnerAllocationFailed {
+        bytes: usize,
+    },
+    ArithmeticOverflow {
+        computation: &'static str,
+    },
 }
 
 impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyClass => f.write_str("Unicode scalar plan needs a nonempty class"),
+            Self::AsciiClassifierDispatchUnavailable => {
+                f.write_str("Unicode scalar fixed-32 owner requires OS-usable SVE2")
+            }
             Self::InvalidRepetition { minimum, maximum } => write!(
                 f,
                 "Unicode scalar repetition must be non-nullable and ordered, got {minimum}..={maximum:?}"
@@ -370,6 +441,10 @@ impl fmt::Display for BuildError {
             Self::AllocationFailed { additional } => {
                 write!(f, "failed to reserve {additional} Unicode scalar ranges")
             }
+            Self::DispatchedOwnerAllocationFailed { bytes } => write!(
+                f,
+                "failed to allocate {bytes} bytes for the dispatched Unicode scalar owner"
+            ),
             Self::ArithmeticOverflow { computation } => {
                 write!(f, "arithmetic overflow while computing {computation}")
             }
@@ -526,6 +601,25 @@ pub struct UnicodeScalarAggregatePlan {
     repetition: Repetition,
     build: BuildAccounting,
 }
+
+/// SVE2-gated owner for exactly-one count and span-sum reduction.
+///
+/// The exact allocation retains the incumbent scalar proof and its immutable
+/// SVE2-only classifier together. The public handle stays one word wide, while the
+/// distinct identity prevents the fixed-block accounting from being confused
+/// with the incumbent pointwise scalar implementation.
+#[derive(Debug)]
+pub struct DispatchedUnicodeScalarAggregatePlan {
+    owner: RetainedDispatchedUnicodeScalarOwner,
+}
+
+#[derive(Debug)]
+struct DispatchedUnicodeScalarOwner {
+    plan: UnicodeScalarAggregatePlan,
+    classifier: AsciiByteSetClassifier,
+}
+
+type RetainedDispatchedUnicodeScalarOwner = ExactBoxOrUsize<DispatchedUnicodeScalarOwner>;
 
 impl UnicodeScalarAggregatePlan {
     /// Copy one canonical sequence of inclusive scalar ranges.
@@ -781,6 +875,9 @@ impl UnicodeScalarAggregatePlan {
                 repetition,
                 range_payload_bytes,
                 work,
+                ascii_classifier_build_work: 0,
+                ascii_classifier_bytes: 0,
+                dispatched_owner_bytes: 0,
                 temporary_capacity_bytes,
                 scratch_bytes: temporary_capacity_bytes,
                 persistent_bytes,
@@ -836,7 +933,7 @@ impl UnicodeScalarAggregatePlan {
         window: Window,
         limits: ReduceLimits,
     ) -> Result<CountResult, ReduceError> {
-        let upper_bounds = self.preflight(haystack, window, Operation::Count, limits)?;
+        let upper_bounds = self.preflight(haystack, window, Operation::Count, limits, false)?;
         let actual = self.execute(haystack, window, upper_bounds)?;
         Ok(CountResult {
             count: actual.count,
@@ -863,7 +960,7 @@ impl UnicodeScalarAggregatePlan {
         window: Window,
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
-        let upper_bounds = self.preflight(haystack, window, Operation::SpanSum, limits)?;
+        let upper_bounds = self.preflight(haystack, window, Operation::SpanSum, limits, false)?;
         let actual = self.execute(haystack, window, upper_bounds)?;
         Ok(SpanSumResult {
             span_sum: actual.matched_bytes,
@@ -886,6 +983,7 @@ impl UnicodeScalarAggregatePlan {
         window: Window,
         operation: Operation,
         limits: ReduceLimits,
+        ascii_blocks: bool,
     ) -> Result<ReduceUpperBounds, ReduceError> {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(ReduceError::InvalidWindow {
@@ -901,12 +999,23 @@ impl UnicodeScalarAggregatePlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "window byte length",
                 })?;
-        let decode_byte_checks =
-            input_bytes
-                .checked_mul(4)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "decode byte check upper bound",
-                })?;
+        let ascii_block_classifications = if ascii_blocks {
+            input_bytes / ASCII_WIDE_BYTES
+        } else {
+            0
+        };
+        let ascii_block_classification_bytes = ascii_block_classifications
+            .checked_mul(ASCII_WIDE_BYTES)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "ASCII block classification byte upper bound",
+            })?;
+        let ascii_block_lookahead_bytes = ascii_block_classification_bytes;
+        let decode_byte_checks = input_bytes
+            .checked_mul(4)
+            .and_then(|checks| checks.checked_add(ascii_block_lookahead_bytes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "decode byte check upper bound",
+            })?;
         let binary_search_comparisons_per_scalar =
             binary_search_comparison_bound(self.non_ascii.len())
                 .checked_add(
@@ -919,7 +1028,11 @@ impl UnicodeScalarAggregatePlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "cached range comparison upper bound",
                 })?;
-        let membership_tests = input_bytes;
+        let membership_tests = input_bytes.checked_add(ascii_block_lookahead_bytes).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "membership test upper bound",
+            },
+        )?;
         let range_comparisons = input_bytes
             .checked_mul(binary_search_comparisons_per_scalar)
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -953,6 +1066,9 @@ impl UnicodeScalarAggregatePlan {
         let peak_bytes = persistent_bytes;
         let upper = ReduceUpperBounds {
             input_bytes,
+            ascii_block_classifications,
+            ascii_block_classification_bytes,
+            ascii_block_lookahead_bytes,
             decode_byte_checks,
             membership_tests,
             range_comparisons,
@@ -1099,6 +1215,9 @@ impl UnicodeScalarAggregatePlan {
         let mut monotone_range_cursor = true;
         let mut actual = ReduceActualCounters {
             input_bytes_advanced: 0,
+            ascii_block_classifications: 0,
+            ascii_block_classification_bytes: 0,
+            ascii_block_lookahead_bytes: 0,
             decode_byte_checks: 0,
             valid_scalars: 0,
             invalid_bytes: 0,
@@ -1352,6 +1471,7 @@ impl UnicodeScalarAggregatePlan {
         let membership_tests = actual
             .ascii_bitmap_tests
             .checked_add(actual.non_ascii_membership_tests)
+            .and_then(|tests| tests.checked_add(actual.ascii_block_lookahead_bytes))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual membership tests",
             })?;
@@ -1364,6 +1484,11 @@ impl UnicodeScalarAggregatePlan {
                 computation: "actual execution work",
             })?;
         debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(actual.ascii_block_classifications <= upper.ascii_block_classifications);
+        debug_assert!(
+            actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
+        );
+        debug_assert!(actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
         debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
         debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
         debug_assert!(membership_tests <= upper.membership_tests);
@@ -1560,6 +1685,574 @@ impl UnicodeScalarAggregatePlan {
         }
         Ok((false, comparisons))
     }
+}
+
+impl DispatchedUnicodeScalarAggregatePlan {
+    /// Whether this authentic host snapshot can retain the fixed-32 owner.
+    #[must_use]
+    pub fn classifier_usable(dispatch: SimdDispatchContext) -> bool {
+        ascii_block_policy(dispatch).is_some()
+    }
+
+    /// Build the SVE2-gated exactly-one owner from one capability snapshot.
+    pub fn build_with_dispatch(
+        dispatch: SimdDispatchContext,
+        ranges: impl IntoIterator<Item = (char, char)>,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_attempt_with_dispatch(dispatch, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the distinct fixed-32 owner with exact observed effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the dispatched envelope keeps source-free capability/storage checks, scalar error mapping, classifier construction, and exact owner publication adjacent"
+    )]
+    pub fn build_attempt_with_dispatch(
+        dispatch: SimdDispatchContext,
+        ranges: impl IntoIterator<Item = (char, char)>,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>> {
+        let empty_actual = DirectBuildAttemptActual::default();
+        if !Self::classifier_usable(dispatch) {
+            return Err(DirectBuildAttemptError::new(
+                BuildError::AsciiClassifierDispatchUnavailable,
+                empty_actual,
+            ));
+        }
+        let owner_bytes = size_of::<DispatchedUnicodeScalarOwner>();
+        let dispatched_inline_bytes =
+            size_of::<Self>()
+                .checked_add(owner_bytes)
+                .ok_or(DirectBuildAttemptError::new(
+                    BuildError::ArithmeticOverflow {
+                        computation: "dispatched Unicode scalar inline bytes",
+                    },
+                    empty_actual,
+                ))?;
+        let storage_delta = dispatched_inline_bytes
+            .checked_sub(size_of::<UnicodeScalarAggregatePlan>())
+            .ok_or(DirectBuildAttemptError::new(
+                BuildError::ArithmeticOverflow {
+                    computation: "dispatched Unicode scalar storage delta",
+                },
+                empty_actual,
+            ))?;
+        for result in [
+            enforce_build(
+                dispatched_inline_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            ),
+            enforce_build(
+                dispatched_inline_bytes,
+                limits.max_peak_bytes,
+                BuildResource::Peak,
+            ),
+        ] {
+            if let Err(source) = result {
+                return Err(DirectBuildAttemptError::new(source, empty_actual));
+            }
+        }
+        let scalar_work_limit = limits
+            .max_build_work
+            .checked_sub(SIMD_ASCII_CLASSIFIER_BUILD_WORK)
+            .ok_or(DirectBuildAttemptError::new(
+                BuildError::WorkLimit {
+                    needed: SIMD_ASCII_CLASSIFIER_BUILD_WORK,
+                    limit: limits.max_build_work,
+                },
+                empty_actual,
+            ))?;
+        let scalar_limits = BuildLimits {
+            max_build_work: scalar_work_limit,
+            max_persistent_bytes: limits
+                .max_persistent_bytes
+                .checked_sub(storage_delta)
+                .expect("the dispatched inline preflight proves the storage reservation"),
+            max_peak_bytes: limits.max_peak_bytes,
+            ..limits
+        };
+        let attempt = match UnicodeScalarAggregatePlan::build_attempt(ranges, scalar_limits) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                let actual = error.actual();
+                let source = match error.into_source() {
+                    BuildError::WorkLimit { needed, .. } => BuildError::WorkLimit {
+                        needed: needed.checked_add(SIMD_ASCII_CLASSIFIER_BUILD_WORK).ok_or(
+                            DirectBuildAttemptError::new(
+                                BuildError::ArithmeticOverflow {
+                                    computation: "dispatched Unicode scalar build work refusal",
+                                },
+                                actual,
+                            ),
+                        )?,
+                        limit: limits.max_build_work,
+                    },
+                    BuildError::PersistentLimit { needed, .. } => BuildError::PersistentLimit {
+                        needed: needed.checked_add(storage_delta).ok_or(
+                            DirectBuildAttemptError::new(
+                                BuildError::ArithmeticOverflow {
+                                    computation: "dispatched Unicode scalar persistent refusal",
+                                },
+                                actual,
+                            ),
+                        )?,
+                        limit: limits.max_persistent_bytes,
+                    },
+                    BuildError::PeakLimit { needed, .. } => BuildError::PeakLimit {
+                        needed,
+                        limit: limits.max_peak_bytes,
+                    },
+                    source => source,
+                };
+                return Err(DirectBuildAttemptError::new(source, actual));
+            }
+        };
+        let (plan, actual) = attempt.into_parts();
+        build_dispatched_unicode_scalar_owner(
+            dispatch,
+            plan,
+            actual,
+            storage_delta,
+            owner_bytes,
+            limits.max_peak_bytes,
+        )
+    }
+
+    #[must_use]
+    pub fn build_accounting(&self) -> BuildAccounting {
+        self.plan().build_accounting()
+    }
+
+    #[must_use]
+    pub const fn count_identity(&self) -> OperationIdentity {
+        OperationIdentity::for_dispatched_operation(Operation::Count)
+    }
+
+    #[must_use]
+    pub const fn span_sum_identity(&self) -> OperationIdentity {
+        OperationIdentity::for_dispatched_operation(Operation::SpanSum)
+    }
+
+    /// Immutable SVE2-only decisions retained for fixed-16 and fixed-32 blocks.
+    #[must_use]
+    pub fn classifier_selection(&self) -> AsciiSelection {
+        self.classifier().selection()
+    }
+
+    pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        self.count_in(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn count_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<CountResult, ReduceError> {
+        let upper_bounds =
+            self.plan()
+                .preflight(haystack, window, Operation::Count, limits, true)?;
+        let actual = self.plan().execute_exactly_one_with_classifier(
+            haystack,
+            window,
+            upper_bounds,
+            self.classifier(),
+        )?;
+        Ok(CountResult {
+            count: actual.count,
+            accounting: ReduceAccounting {
+                identity: self.count_identity(),
+                window,
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        self.span_sum_in(haystack, Window::full(haystack), limits)
+    }
+
+    pub fn span_sum_in(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        let upper_bounds =
+            self.plan()
+                .preflight(haystack, window, Operation::SpanSum, limits, true)?;
+        let actual = self.plan().execute_exactly_one_with_classifier(
+            haystack,
+            window,
+            upper_bounds,
+            self.classifier(),
+        )?;
+        Ok(SpanSumResult {
+            span_sum: actual.matched_bytes,
+            accounting: ReduceAccounting {
+                identity: self.span_sum_identity(),
+                window,
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    fn plan(&self) -> &UnicodeScalarAggregatePlan {
+        &self.owner().plan
+    }
+
+    fn classifier(&self) -> &AsciiByteSetClassifier {
+        &self.owner().classifier
+    }
+
+    fn owner(&self) -> &DispatchedUnicodeScalarOwner {
+        self.owner
+            .boxed()
+            .expect("the dispatched Unicode scalar plan retains its exact owner")
+    }
+}
+
+const fn dispatched_identity(operation: Operation) -> OperationIdentity {
+    OperationIdentity {
+        plan_id: DISPATCHED_PLAN_ID,
+        operation_id: match operation {
+            Operation::Count => COUNT_OPERATION_ID,
+            Operation::SpanSum => SPAN_SUM_OPERATION_ID,
+        },
+        operation,
+        scalar_semantics: ScalarSemantics::RustBytesUnicodeUtf8False,
+        repetition: Repetition::ExactlyOne,
+        non_overlapping: true,
+    }
+}
+
+fn ascii_block_policy(dispatch: SimdDispatchContext) -> Option<DispatchPolicy> {
+    if !cfg!(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little"
+    )) {
+        return None;
+    }
+    let sve2 = FeatureSet::EMPTY
+        .with(Feature::ArmSve)
+        .with(Feature::ArmSve2);
+    dispatch
+        .capabilities()
+        .usable()
+        .contains_all(sve2)
+        .then_some(DispatchPolicy::AllowOnly(sve2))
+}
+
+#[inline(never)]
+fn build_dispatched_unicode_scalar_owner(
+    dispatch: SimdDispatchContext,
+    mut plan: UnicodeScalarAggregatePlan,
+    mut actual: DirectBuildAttemptActual,
+    storage_delta: usize,
+    owner_bytes: usize,
+    max_peak_bytes: usize,
+) -> Result<
+    DirectBuildAttempt<DispatchedUnicodeScalarAggregatePlan>,
+    DirectBuildAttemptError<BuildError>,
+> {
+    let result = (|| {
+        let work = plan
+            .build
+            .work
+            .checked_add(SIMD_ASCII_CLASSIFIER_BUILD_WORK)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched Unicode scalar build work",
+            })?;
+        let persistent_bytes = plan
+            .build
+            .persistent_bytes
+            .checked_add(storage_delta)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched Unicode scalar persistent bytes",
+            })?;
+        let peak_bytes = plan.build.peak_bytes.max(persistent_bytes);
+        enforce_build(peak_bytes, max_peak_bytes, BuildResource::Peak)?;
+        actual.work = actual
+            .work
+            .checked_add(
+                u64::try_from(SIMD_ASCII_CLASSIFIER_BUILD_WORK).map_err(|_| {
+                    BuildError::ArithmeticOverflow {
+                        computation: "ASCII classifier build work as u64",
+                    }
+                })?,
+            )
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual dispatched Unicode scalar build work",
+            })?;
+        let policy =
+            ascii_block_policy(dispatch).expect("the dispatched build proved OS-usable SVE2");
+        let classifier = dispatch
+            .ascii_byte_set_classifier(AsciiByteSet::from_words(plan.ascii), policy)
+            .expect("the SVE2-only policy removes every incompatible wide implementation");
+        plan.build.work = work;
+        plan.build.ascii_classifier_build_work = SIMD_ASCII_CLASSIFIER_BUILD_WORK;
+        plan.build.ascii_classifier_bytes = size_of::<AsciiByteSetClassifier>();
+        plan.build.dispatched_owner_bytes = owner_bytes;
+        plan.build.persistent_bytes = persistent_bytes;
+        plan.build.peak_bytes = peak_bytes;
+        let owner = DispatchedUnicodeScalarOwner { plan, classifier };
+        let owner = RetainedDispatchedUnicodeScalarOwner::try_from_boxed(owner).map_err(
+            |error| match error {
+                CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                    computation: "dispatched Unicode scalar owner allocation layout",
+                },
+                CopyError::AllocationFailed => {
+                    BuildError::DispatchedOwnerAllocationFailed { bytes: owner_bytes }
+                }
+            },
+        )?;
+        actual.allocations =
+            actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual dispatched Unicode scalar allocation count",
+                })?;
+        actual.allocated_bytes = actual.allocated_bytes.checked_add(owner_bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "actual dispatched Unicode scalar allocated bytes",
+            },
+        )?;
+        actual.initialized_bytes = persistent_bytes;
+        actual.live_persistent_bytes = persistent_bytes;
+        actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+        Ok(DispatchedUnicodeScalarAggregatePlan { owner })
+    })();
+    match result {
+        Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+        Err(source) => {
+            actual.live_persistent_bytes = 0;
+            Err(DirectBuildAttemptError::new(source, actual))
+        }
+    }
+}
+
+impl UnicodeScalarAggregatePlan {
+    #[allow(
+        clippy::too_many_lines,
+        clippy::arithmetic_side_effects,
+        reason = "the fixed-block loop keeps mask-prefix consumption, scalar UTF-8 fallback, non-overlapping block scheduling, and exact physical accounting visibly coupled"
+    )]
+    fn execute_exactly_one_with_classifier(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+        classifier: &AsciiByteSetClassifier,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        debug_assert_eq!(self.repetition, Repetition::ExactlyOne);
+        let local = &haystack[window.start()..window.end()];
+        let mut position = 0_usize;
+        let mut scalar_fallback_end = 0_usize;
+        let mut ascii_matches = 0_usize;
+        let mut actual = ReduceActualCounters {
+            input_bytes_advanced: 0,
+            ascii_block_classifications: 0,
+            ascii_block_classification_bytes: 0,
+            ascii_block_lookahead_bytes: 0,
+            decode_byte_checks: 0,
+            valid_scalars: 0,
+            invalid_bytes: 0,
+            ascii_run_bytes: 0,
+            ascii_bitmap_tests: 0,
+            non_ascii_membership_tests: 0,
+            range_comparisons: 0,
+            reducer_steps: 0,
+            run_flushes: 0,
+            match_events: 0,
+            count: 0,
+            matched_bytes: 0,
+            work: 0,
+            scratch_bytes: 0,
+        };
+        while position < local.len() {
+            if position >= scalar_fallback_end && local.len() - position >= ASCII_WIDE_BYTES {
+                let block_end = position + ASCII_WIDE_BYTES;
+                let block: &[u8; ASCII_WIDE_BYTES] = local[position..block_end]
+                    .try_into()
+                    .expect("the fixed-block extent was checked");
+                let masks = classifier.classify_32(block);
+                let ascii_prefix = usize::from(masks.leading_ascii_len());
+                let lookahead = ASCII_WIDE_BYTES - ascii_prefix;
+                let member_count = usize::try_from(masks.ascii_prefix_member_mask().count_ones())
+                    .map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "ASCII block member count",
+                })?;
+                // Blocks never overlap and every prefix is within its block.
+                // Preflight proved all N- and B-bounded accumulators fit.
+                actual.ascii_block_classifications += 1;
+                actual.ascii_block_classification_bytes += ASCII_WIDE_BYTES;
+                actual.ascii_block_lookahead_bytes += lookahead;
+                actual.decode_byte_checks += ASCII_WIDE_BYTES;
+                actual.valid_scalars += ascii_prefix;
+                actual.ascii_run_bytes += ascii_prefix;
+                actual.ascii_bitmap_tests += ascii_prefix;
+                ascii_matches += member_count;
+                position += ascii_prefix;
+                if ascii_prefix == ASCII_WIDE_BYTES {
+                    scalar_fallback_end = position;
+                    continue;
+                }
+                // One mixed block is enough evidence that repeated wide
+                // probes may only add work. Preserve the exact consumed ASCII
+                // prefix, then use the incumbent scalar decoder to EOF.
+                scalar_fallback_end = local.len();
+            }
+
+            if local[position].is_ascii() {
+                let run_start = position;
+                let run_limit = if position < scalar_fallback_end {
+                    scalar_fallback_end
+                } else {
+                    local.len()
+                };
+                let mut run_matches = 0_usize;
+                while position < run_limit {
+                    let byte = local[position];
+                    if !byte.is_ascii() {
+                        break;
+                    }
+                    let word = self.ascii[usize::from(byte / 64)];
+                    run_matches += usize::from(word & (1_u64 << (byte % 64)) != 0);
+                    position += 1;
+                }
+                let run_bytes = position - run_start;
+                // These logical runs partition bytes not consumed by a block
+                // prefix, so the same preflight N-bound covers every sum.
+                actual.decode_byte_checks += run_bytes;
+                actual.valid_scalars += run_bytes;
+                actual.ascii_run_bytes += run_bytes;
+                actual.ascii_bitmap_tests += run_bytes;
+                ascii_matches += run_matches;
+                continue;
+            }
+
+            let decoded = decode_scalar(&local[position..]);
+            actual.decode_byte_checks = actual
+                .decode_byte_checks
+                .checked_add(decoded.byte_checks)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual scalar-fallback decode checks",
+                })?;
+            let matched =
+                if let Some(scalar) = decoded.scalar {
+                    actual.valid_scalars = actual.valid_scalars.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual scalar-fallback valid scalars",
+                        },
+                    )?;
+                    debug_assert!(scalar > 0x7F);
+                    actual.non_ascii_membership_tests = actual
+                        .non_ascii_membership_tests
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual scalar-fallback non-ASCII membership tests",
+                        })?;
+                    let (contains, comparisons) = self.contains_non_ascii(scalar)?;
+                    actual.range_comparisons = actual
+                        .range_comparisons
+                        .checked_add(comparisons)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual scalar-fallback range comparisons",
+                        })?;
+                    contains
+                } else {
+                    actual.invalid_bytes = actual.invalid_bytes.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual scalar-fallback invalid bytes",
+                        },
+                    )?;
+                    false
+                };
+            if matched {
+                record_match(
+                    &mut actual,
+                    u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
+                        computation: "scalar-fallback matched width",
+                    })?,
+                )?;
+            }
+            position += decoded.width;
+        }
+        record_ascii_matches(&mut actual, ascii_matches)?;
+        actual.input_bytes_advanced = position;
+        let membership_tests = actual
+            .ascii_bitmap_tests
+            .checked_add(actual.non_ascii_membership_tests)
+            .and_then(|tests| tests.checked_add(actual.ascii_block_lookahead_bytes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual dispatched membership tests",
+            })?;
+        actual.work = actual
+            .decode_byte_checks
+            .checked_add(membership_tests)
+            .and_then(|work| work.checked_add(actual.range_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual dispatched execution work",
+            })?;
+        debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(actual.ascii_block_classifications <= upper.ascii_block_classifications);
+        debug_assert!(
+            actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
+        );
+        debug_assert!(actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
+        debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
+        debug_assert!(membership_tests <= upper.membership_tests);
+        debug_assert!(actual.range_comparisons <= upper.range_comparisons);
+        debug_assert_eq!(actual.reducer_steps, 0);
+        debug_assert!(actual.match_events <= upper.match_events);
+        debug_assert!(actual.count <= upper.count);
+        debug_assert!(actual.matched_bytes <= upper.span_sum);
+        debug_assert!(actual.work <= upper.work);
+        Ok(actual)
+    }
+}
+
+fn record_ascii_matches(
+    actual: &mut ReduceActualCounters,
+    matches: usize,
+) -> Result<(), ReduceError> {
+    actual.match_events =
+        actual
+            .match_events
+            .checked_add(matches)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual ASCII block match events",
+            })?;
+    let matches = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "actual ASCII block matches as u64",
+    })?;
+    actual.count = actual
+        .count
+        .checked_add(matches)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "actual ASCII block count",
+        })?;
+    actual.matched_bytes =
+        actual
+            .matched_bytes
+            .checked_add(matches)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual ASCII block matched bytes",
+            })?;
+    Ok(())
 }
 
 fn record_match(actual: &mut ReduceActualCounters, width: u64) -> Result<(), ReduceError> {
@@ -1895,12 +2588,15 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
-        REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceError, ReduceLimits, Repetition,
-        UnicodeScalarAggregatePlan, binary_search_comparison_bound,
+        BuildError, BuildLimits, DISPATCHED_PLAN_ID, DispatchedUnicodeScalarAggregatePlan,
+        Operation, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
+        REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceActualCounters, ReduceError,
+        ReduceLimits, Repetition, SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan,
+        binary_search_comparison_bound,
     };
     use crate::{
-        ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext, Window,
+        ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, Feature,
+        SimdDispatchContext, Window,
     };
 
     #[test]
@@ -1978,6 +2674,388 @@ mod tests {
             classifier_ns / scalar_ns,
             classifier.selection().wide()
         );
+    }
+
+    fn classifier_actual(
+        plan: &UnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        window: Window,
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let classifier = AsciiByteSetClassifier::new(AsciiByteSet::from_words(plan.ascii));
+        let upper = plan.preflight(haystack, window, operation, limits, true)?;
+        plan.execute_exactly_one_with_classifier(haystack, window, upper, &classifier)
+    }
+
+    #[test]
+    fn dispatched_gate_precedes_range_access_without_sve2() {
+        let dispatch = SimdDispatchContext::capture();
+        if DispatchedUnicodeScalarAggregatePlan::classifier_usable(dispatch) {
+            return;
+        }
+        let ranges = core::iter::from_fn(|| -> Option<(char, char)> {
+            panic!("the unavailable dispatched gate touched its source")
+        });
+        let error = DispatchedUnicodeScalarAggregatePlan::build_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.source(),
+            &BuildError::AsciiClassifierDispatchUnavailable
+        );
+        assert_eq!(error.actual(), crate::DirectBuildAttemptActual::default());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one conditional authentic-host test closes selection, owner layout, exact effects, identities, and all three build boundaries"
+    )]
+    fn authentic_dispatched_owner_has_exact_build_and_storage_accounting() {
+        let dispatch = SimdDispatchContext::capture();
+        if !DispatchedUnicodeScalarAggregatePlan::classifier_usable(dispatch) {
+            return;
+        }
+        let ranges = [('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z'), ('α', 'ω')];
+        let baseline_attempt =
+            UnicodeScalarAggregatePlan::build_attempt(ranges, BuildLimits::unlimited()).unwrap();
+        let baseline_actual = baseline_attempt.actual();
+        let baseline = baseline_attempt.into_plan();
+        let dispatched_attempt = DispatchedUnicodeScalarAggregatePlan::build_attempt_with_dispatch(
+            dispatch,
+            ranges,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_actual = dispatched_attempt.actual();
+        let dispatched = dispatched_attempt.into_plan();
+        let baseline_build = baseline.build_accounting();
+        let build = dispatched.build_accounting();
+        let owner_bytes = core::mem::size_of::<super::DispatchedUnicodeScalarOwner>();
+        let storage_delta = core::mem::size_of::<DispatchedUnicodeScalarAggregatePlan>()
+            .checked_add(owner_bytes)
+            .unwrap()
+            .checked_sub(core::mem::size_of::<UnicodeScalarAggregatePlan>())
+            .unwrap();
+        assert_eq!(
+            build.work,
+            baseline_build.work + SIMD_ASCII_CLASSIFIER_BUILD_WORK
+        );
+        assert_eq!(
+            build.ascii_classifier_build_work,
+            SIMD_ASCII_CLASSIFIER_BUILD_WORK
+        );
+        assert_eq!(
+            build.ascii_classifier_bytes,
+            core::mem::size_of::<AsciiByteSetClassifier>()
+        );
+        assert_eq!(build.dispatched_owner_bytes, owner_bytes);
+        assert_eq!(
+            build.persistent_bytes,
+            baseline_build.persistent_bytes + storage_delta
+        );
+        assert_eq!(
+            build.peak_bytes,
+            baseline_build.peak_bytes.max(build.persistent_bytes)
+        );
+        assert_eq!(dispatched_actual.work, u64::try_from(build.work).unwrap());
+        assert_eq!(
+            dispatched_actual.allocations,
+            baseline_actual.allocations + 1
+        );
+        assert_eq!(
+            dispatched_actual.allocated_bytes,
+            baseline_actual.allocated_bytes + owner_bytes
+        );
+        assert_eq!(dispatched_actual.copied_bytes, baseline_actual.copied_bytes);
+        assert_eq!(dispatched_actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(
+            dispatched_actual.live_persistent_bytes,
+            build.persistent_bytes
+        );
+        assert!(dispatched_actual.peak_bytes <= build.peak_bytes);
+        assert_eq!(dispatched.count_identity().plan_id, DISPATCHED_PLAN_ID);
+        assert_ne!(dispatched.count_identity(), baseline.count_identity());
+        assert_ne!(dispatched.span_sum_identity(), baseline.span_sum_identity());
+        let selection = dispatched.classifier_selection().wide();
+        assert!(selection.required.contains(Feature::ArmSve));
+        assert!(selection.required.contains(Feature::ArmSve2));
+
+        let rebuild = |limits| {
+            DispatchedUnicodeScalarAggregatePlan::build_with_dispatch(dispatch, ranges, limits)
+        };
+        assert!(
+            rebuild(BuildLimits {
+                max_build_work: build.work,
+                max_persistent_bytes: build.persistent_bytes,
+                max_peak_bytes: build.peak_bytes,
+                ..BuildLimits::unlimited()
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_build_work: build.work - 1,
+                ..BuildLimits::unlimited()
+            }),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == build.work && limit == build.work - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_persistent_bytes: build.persistent_bytes - 1,
+                ..BuildLimits::unlimited()
+            }),
+            Err(BuildError::PersistentLimit { needed, limit })
+                if needed == build.persistent_bytes
+                    && limit == build.persistent_bytes - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_peak_bytes: build.peak_bytes - 1,
+                ..BuildLimits::unlimited()
+            }),
+            Err(BuildError::PeakLimit { needed, limit })
+                if needed == build.peak_bytes && limit == build.peak_bytes - 1
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed-block equivalence test covers exact widths, every dangerous boundary lane, crossing UTF-8, malformed input, windows, physical bounds, and one-below limits"
+    )]
+    fn fixed_ascii_blocks_preserve_exactly_one_utf8_semantics_and_physical_limits() {
+        let plan = UnicodeScalarAggregatePlan::build(
+            [
+                ('0', '9'),
+                ('A', 'Z'),
+                ('_', '_'),
+                ('a', 'z'),
+                ('α', 'ω'),
+                ('雪', '雪'),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut cases = Vec::<Vec<u8>>::new();
+        for length in [0_usize, 1, 31, 32, 33, 63, 64, 65] {
+            cases.push(b"aZ_0!?".iter().copied().cycle().take(length).collect());
+        }
+        for lane in [0_usize, 1, 15, 16, 29, 30, 31] {
+            let mut bytes = b"aZ_0!?"
+                .iter()
+                .copied()
+                .cycle()
+                .take(96)
+                .collect::<Vec<_>>();
+            bytes[lane] = 0xFF;
+            cases.push(bytes);
+        }
+        for lane in [29_usize, 30, 31] {
+            for scalar in ["α", "雪", "🦀"] {
+                let mut bytes = vec![b'a'; lane];
+                bytes.extend_from_slice(scalar.as_bytes());
+                bytes.extend_from_slice(&[b'Z'; 80]);
+                cases.push(bytes);
+            }
+        }
+        cases.extend([
+            b"\xC0\x80a\xED\xA0\x80Z\xF4\x90\x80\x80_\xE2\x82".repeat(8),
+            [("α".as_bytes()), &[b'a'; 30]].concat().repeat(4),
+        ]);
+
+        for haystack in &cases {
+            let scalar_count = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let scalar_sum = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+            let block_count = classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits::unlimited(),
+            )
+            .unwrap();
+            let block_sum = classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::SpanSum,
+                ReduceLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(
+                block_count.count, scalar_count.count,
+                "haystack={haystack:?}"
+            );
+            assert_eq!(
+                block_sum.matched_bytes, scalar_sum.span_sum,
+                "haystack={haystack:?}"
+            );
+            let scalar_upper = scalar_count.accounting.upper_bounds;
+            let block_upper = plan
+                .preflight(
+                    haystack,
+                    Window::full(haystack),
+                    Operation::Count,
+                    ReduceLimits::unlimited(),
+                    true,
+                )
+                .unwrap();
+            let physical_bound = haystack.len() / ASCII_WIDE_BYTES * ASCII_WIDE_BYTES;
+            assert_eq!(block_upper.ascii_block_classification_bytes, physical_bound);
+            assert_eq!(
+                block_upper.decode_byte_checks,
+                scalar_upper.decode_byte_checks + physical_bound
+            );
+            assert_eq!(
+                block_upper.membership_tests,
+                scalar_upper.membership_tests + physical_bound
+            );
+            assert_eq!(block_upper.work, scalar_upper.work + physical_bound * 2);
+            assert_eq!(
+                block_count.ascii_block_classification_bytes,
+                block_count.ascii_block_classifications * ASCII_WIDE_BYTES
+            );
+            assert!(
+                block_count.ascii_block_classification_bytes
+                    <= block_upper.ascii_block_classification_bytes
+            );
+            assert!(
+                block_count.ascii_block_lookahead_bytes
+                    <= block_count.ascii_block_classification_bytes
+            );
+            assert_eq!(block_count.ascii_run_bytes, block_count.ascii_bitmap_tests);
+            assert!(block_count.decode_byte_checks <= block_upper.decode_byte_checks);
+            assert!(block_count.work <= block_upper.work);
+        }
+
+        let mixed_then_ascii = [vec![b'a'; 8], "α".as_bytes().to_vec(), vec![b'Z'; 256]].concat();
+        let mixed_scalar = plan
+            .count(&mixed_then_ascii, ReduceLimits::unlimited())
+            .unwrap();
+        let mixed_blocks = classifier_actual(
+            &plan,
+            &mixed_then_ascii,
+            Window::full(&mixed_then_ascii),
+            Operation::Count,
+            ReduceLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(mixed_blocks.count, mixed_scalar.count);
+        assert_eq!(mixed_blocks.ascii_block_classifications, 1);
+        assert_eq!(
+            mixed_blocks.ascii_block_classification_bytes,
+            ASCII_WIDE_BYTES
+        );
+
+        let all_ascii = vec![b'a'; ASCII_WIDE_BYTES * 4];
+        let all_ascii_blocks = classifier_actual(
+            &plan,
+            &all_ascii,
+            Window::full(&all_ascii),
+            Operation::Count,
+            ReduceLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(all_ascii_blocks.ascii_block_classifications, 4);
+
+        let crossing = [vec![b'x'; 31], "雪".as_bytes().to_vec(), vec![b'Z'; 65]].concat();
+        for start in [0_usize, 1, 29, 30, 31, 32] {
+            for end in [32_usize, 33, 34, crossing.len()] {
+                if start > end || end > crossing.len() {
+                    continue;
+                }
+                let window = Window::new(start, end);
+                let scalar = plan
+                    .count_in(&crossing, window, ReduceLimits::unlimited())
+                    .unwrap();
+                let blocks = classifier_actual(
+                    &plan,
+                    &crossing,
+                    window,
+                    Operation::Count,
+                    ReduceLimits::unlimited(),
+                )
+                .unwrap();
+                assert_eq!(blocks.count, scalar.count, "window={start}..{end}");
+                assert_eq!(blocks.input_bytes_advanced, end - start);
+            }
+        }
+
+        let haystack = &cases[cases.len() - 1];
+        let upper = plan
+            .preflight(
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits::unlimited(),
+                true,
+            )
+            .unwrap();
+        assert!(
+            classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_decode_byte_checks: upper.decode_byte_checks,
+                    max_membership_tests: upper.membership_tests,
+                    max_work: upper.work,
+                    ..ReduceLimits::unlimited()
+                },
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_decode_byte_checks: upper.decode_byte_checks - 1,
+                    ..ReduceLimits::unlimited()
+                },
+            ),
+            Err(ReduceError::DecodeByteChecksLimit { needed, limit })
+                if needed == upper.decode_byte_checks
+                    && limit == upper.decode_byte_checks - 1
+        ));
+        assert!(matches!(
+            classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_membership_tests: upper.membership_tests - 1,
+                    ..ReduceLimits::unlimited()
+                },
+            ),
+            Err(ReduceError::MembershipTestsLimit { needed, limit })
+                if needed == upper.membership_tests
+                    && limit == upper.membership_tests - 1
+        ));
+        assert!(matches!(
+            classifier_actual(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_work: upper.work - 1,
+                    ..ReduceLimits::unlimited()
+                },
+            ),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == upper.work - 1
+        ));
     }
 
     #[test]

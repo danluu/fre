@@ -10,13 +10,14 @@ use fre::{
     AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
     AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
     BoundedContextReduceError, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError,
-    LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
-    LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
-    LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
-    LiteralAggregateReduceError, PlanKind, PortableBuilder, PrefixClassAlternationReduceError,
-    RustProfile, SearchLimits, UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
-    guarded_ascii_word,
+    DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID, FixedClassSandwichOperation,
+    FixedClassSandwichReduceError, LITERAL_AGGREGATE_ACCOUNTING_VERSION,
+    LITERAL_AGGREGATE_ALGORITHM_VERSION, LiteralAggregateActualCounters,
+    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateDeclaredFallback,
+    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceError,
+    PlanKind, PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
+    SimdDispatchContext, SimdFeature, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateReduceError, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -2008,6 +2009,225 @@ fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify
                 .unwrap_or_else(|error| panic!("compile verify {pattern:?}: {error}"))
                 .value(),
             expected_count
+        );
+    }
+}
+
+#[test]
+fn exactly_one_unicode_scalar_facade_gates_the_distinct_owner_on_sve2() {
+    const PATTERN: &str = r"[0-9A-Z_a-zα-ω雪]";
+
+    let dispatch = SimdDispatchContext::capture();
+    let sve2 = dispatch
+        .capabilities()
+        .usable()
+        .contains(SimdFeature::ArmSve)
+        && dispatch
+            .capabilities()
+            .usable()
+            .contains(SimdFeature::ArmSve2);
+    let count = aggregate_builder(PATTERN).build_count().unwrap();
+    let span_sum = aggregate_builder(PATTERN).build_span_sum().unwrap();
+    for identity in [
+        count.build_report().plan_identity,
+        span_sum.build_report().plan_identity,
+    ] {
+        let AggregatePlanIdentity::UnicodeScalar(identity) = identity else {
+            panic!("the exactly-one class selected another plan family");
+        };
+        assert_eq!(
+            identity.kernel.plan_id == DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
+            sve2
+        );
+    }
+    let AggregateBuildAccounting::UnicodeScalar(build) = count.build_report().build else {
+        panic!("the exactly-one class retained another build receipt");
+    };
+    assert_eq!(build.ascii_classifier_build_work, usize::from(sve2) * 132);
+    assert_eq!(build.ascii_classifier_bytes > 0, sve2);
+    assert_eq!(build.dispatched_owner_bytes > 0, sve2);
+
+    let haystack = [
+        b"aZ_09!?".repeat(10),
+        "αω雪🦀".as_bytes().to_vec(),
+        b"\xFFabc".repeat(8),
+    ]
+    .concat();
+    let expected = upstream_profile(PATTERN, &haystack, false, true);
+    let counted = count
+        .count(&haystack, AggregateRunLimits::default())
+        .unwrap();
+    let summed = span_sum
+        .span_sum(&haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
+    assert_eq!(
+        summed.value(),
+        expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum()
+    );
+    let AggregateExecutionDetails::UnicodeScalar(accounting) = counted.report().details() else {
+        panic!("the exactly-one class executed another plan family");
+    };
+    assert_eq!(accounting.actual.ascii_block_classifications > 0, sve2);
+    assert_eq!(
+        accounting.upper_bounds.ascii_block_classifications > 0,
+        sve2
+    );
+    assert!(accounting.actual.work <= accounting.upper_bounds.work);
+}
+
+#[test]
+#[ignore = "manual release-mode end-to-end benchmark; requires Linux/AArch64 with OS-usable SVE2"]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the ignored paired timing harness keeps route proof, alternating batches, checksums, and one parseable record together"
+)]
+fn measure_routed_unicode_scalar_ascii_blocks() {
+    use fre_kernels::{
+        UnicodeScalarAggregateBuildLimits as KernelBuildLimits, UnicodeScalarAggregatePlan,
+        UnicodeScalarAggregateReduceLimits as KernelReduceLimits,
+    };
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    // Retain non-ASCII members so the facade cannot normalize this semantic
+    // class into the finite-literal route while the timed corpus stays ASCII.
+    const PATTERN: &str = r"[0-9A-Z_a-zα-ω雪]";
+    const HAYSTACK_BYTES: usize = 1 << 20;
+
+    let dispatch = SimdDispatchContext::capture();
+    assert!(
+        dispatch
+            .capabilities()
+            .usable()
+            .contains(SimdFeature::ArmSve)
+            && dispatch
+                .capabilities()
+                .usable()
+                .contains(SimdFeature::ArmSve2),
+        "this benchmark requires OS-usable SVE and SVE2"
+    );
+    let scalar = UnicodeScalarAggregatePlan::build(
+        [
+            ('0', '9'),
+            ('A', 'Z'),
+            ('_', '_'),
+            ('a', 'z'),
+            ('α', 'ω'),
+            ('雪', '雪'),
+        ],
+        KernelBuildLimits::unlimited(),
+    )
+    .unwrap();
+    let routed = aggregate_builder(PATTERN).build_count().unwrap();
+    assert_eq!(
+        routed.build_report().plan,
+        AggregatePlanKind::UnicodeScalarClass
+    );
+    assert!(matches!(
+        routed.build_report().plan_identity,
+        AggregatePlanIdentity::UnicodeScalar(identity)
+            if identity.kernel.plan_id == DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID
+    ));
+    let AggregateBuildAccounting::UnicodeScalar(routed_build) = routed.build_report().build else {
+        panic!("routed facade retained another build receipt");
+    };
+    assert_eq!(routed_build.ascii_classifier_build_work, 132);
+    assert!(routed_build.ascii_classifier_bytes > 0);
+    assert!(routed_build.dispatched_owner_bytes > 0);
+
+    let batches = 9_u32;
+    let calls_per_batch = 8_u32;
+    let ascii = b"abc_XYZ0123 !-\t"
+        .iter()
+        .copied()
+        .cycle()
+        .take(HAYSTACK_BYTES)
+        .collect::<Vec<_>>();
+    let mut mixed_unit = b"abc_XYZ0123 !-\t".to_vec();
+    mixed_unit.extend_from_slice("αω雪🦀".as_bytes());
+    let mixed = mixed_unit
+        .iter()
+        .copied()
+        .cycle()
+        .take(HAYSTACK_BYTES)
+        .collect::<Vec<_>>();
+    let unicode = "αω雪🦀"
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(HAYSTACK_BYTES)
+        .collect::<Vec<_>>();
+
+    for (scenario, haystack) in [
+        ("ascii_1m", ascii),
+        ("mixed_1m", mixed),
+        ("unicode_1m", unicode),
+    ] {
+        let expected = scalar
+            .count(&haystack, KernelReduceLimits::unlimited())
+            .unwrap()
+            .count;
+        assert_eq!(
+            routed
+                .count_value(&haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected
+        );
+
+        let mut scalar_elapsed = Duration::ZERO;
+        let mut facade_elapsed = Duration::ZERO;
+        let mut scalar_checksum = 0_u64;
+        let mut facade_checksum = 0_u64;
+        for batch in 0..batches {
+            let mut time_scalar = || {
+                let started = Instant::now();
+                for _ in 0..calls_per_batch {
+                    let value = scalar
+                        .count(black_box(&haystack), KernelReduceLimits::unlimited())
+                        .unwrap()
+                        .count;
+                    scalar_checksum =
+                        scalar_checksum.wrapping_add(black_box(value).wrapping_add(1));
+                }
+                scalar_elapsed += started.elapsed();
+            };
+            let mut time_facade = || {
+                let started = Instant::now();
+                for _ in 0..calls_per_batch {
+                    let value = routed
+                        .count_value(black_box(&haystack), AggregateRunLimits::default())
+                        .unwrap();
+                    facade_checksum =
+                        facade_checksum.wrapping_add(black_box(value).wrapping_add(1));
+                }
+                facade_elapsed += started.elapsed();
+            };
+            if batch & 1 == 0 {
+                time_scalar();
+                time_facade();
+            } else {
+                time_facade();
+                time_scalar();
+            }
+        }
+        assert_eq!(facade_checksum, scalar_checksum);
+        println!(
+            "UNICODE_SCALAR_ASCII_BLOCK_FACADE_BENCH scenario={scenario} operation=count \
+             policy=sve2_only route=unicode_scalar scalar_ns={} facade_ns={} \
+             facade_over_scalar={:.6} classifier_build_work={} classifier_bytes={} \
+             owner_bytes={} checksum={facade_checksum}",
+            scalar_elapsed.as_nanos(),
+            facade_elapsed.as_nanos(),
+            facade_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64(),
+            routed_build.ascii_classifier_build_work,
+            routed_build.ascii_classifier_bytes,
+            routed_build.dispatched_owner_bytes,
         );
     }
 }

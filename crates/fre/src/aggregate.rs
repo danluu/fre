@@ -36,6 +36,7 @@ use fre_kernels::{
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
     DirectBuildAttemptActual, DispatchedLiteralAggregatePlan, DispatchedPrefixClassAlternationPlan,
+    DispatchedUnicodeScalarAggregatePlan,
     FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
     FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
@@ -3674,6 +3675,11 @@ fn unicode_scalar_direct_operation_closes(
             expected_operation,
             identity.repetition,
         )
+        || (identity.repetition == UnicodeScalarAggregateRepetition::ExactlyOne
+            && identity
+                == UnicodeScalarAggregateOperationIdentity::for_dispatched_operation(
+                    expected_operation,
+                ))
 }
 
 #[allow(
@@ -7880,60 +7886,11 @@ impl AggregateBuilder {
                         .iter()
                         .map(|range| (range.start(), range.end()))
                 };
-                let attempt = match repetition {
-                    UnicodeScalarAggregateRepetition::ExactlyOne => {
-                        UnicodeScalarAggregatePlan::build_attempt(ranges(), limits.unicode_scalar)
-                    }
-                    UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
-                        UnicodeScalarAggregatePlan::build_one_or_more_attempt(
-                            ranges(),
-                            true,
-                            limits.unicode_scalar,
-                        )
-                    }
-                    UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
-                        UnicodeScalarAggregatePlan::build_one_or_more_attempt(
-                            ranges(),
-                            false,
-                            limits.unicode_scalar,
-                        )
-                    }
-                    UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated_attempt(
-                            ranges(),
-                            minimum,
-                            maximum,
-                            true,
-                            limits.unicode_scalar,
-                        )
-                    }
-                    UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum } => {
-                        UnicodeScalarAggregatePlan::build_repeated_attempt(
-                            ranges(),
-                            minimum,
-                            maximum,
-                            false,
-                            limits.unicode_scalar,
-                        )
-                    }
-                }
-                .map_err(|error| {
-                    construction.pending_terminal_effect =
-                        direct_build_stage_effect(work, error.actual());
-                    AggregateBuildError::UnicodeScalarBuild {
-                        operation,
-                        selection,
-                        source: error.into_source(),
-                    }
-                })?;
-                let (engine, build_actual) = attempt.into_parts();
-                retain_direct_build_success(construction, work, build_actual);
-                let build = engine.build_accounting();
-                let kernel = match operation {
+                let kernel_operation = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
-                        engine.count_identity()
+                        UnicodeScalarAggregateOperation::Count
                     }
-                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::SpanSum => UnicodeScalarAggregateOperation::SpanSum,
                     AggregateOperation::Spans => {
                         return Err(AggregateBuildError::InternalInvariant {
                             operation,
@@ -7942,6 +7899,100 @@ impl AggregateBuilder {
                         });
                     }
                 };
+                let use_ascii_blocks = repetition == UnicodeScalarAggregateRepetition::ExactlyOne
+                    && DispatchedUnicodeScalarAggregatePlan::classifier_usable(simd_dispatch);
+                let (engine, build_actual, build, kernel) = if use_ascii_blocks {
+                    let attempt =
+                        DispatchedUnicodeScalarAggregatePlan::build_attempt_with_dispatch(
+                            simd_dispatch,
+                            ranges(),
+                            limits.unicode_scalar,
+                        )
+                        .map_err(|error| {
+                            construction.pending_terminal_effect =
+                                direct_build_stage_effect(work, error.actual());
+                            AggregateBuildError::UnicodeScalarBuild {
+                                operation,
+                                selection,
+                                source: error.into_source(),
+                            }
+                        })?;
+                    let (engine, actual) = attempt.into_parts();
+                    let build = engine.build_accounting();
+                    let kernel = match kernel_operation {
+                        UnicodeScalarAggregateOperation::Count => engine.count_identity(),
+                        UnicodeScalarAggregateOperation::SpanSum => engine.span_sum_identity(),
+                    };
+                    (
+                        AggregateEngine::DispatchedUnicodeScalar(engine),
+                        actual,
+                        build,
+                        kernel,
+                    )
+                } else {
+                    let attempt = match repetition {
+                        UnicodeScalarAggregateRepetition::ExactlyOne => {
+                            UnicodeScalarAggregatePlan::build_attempt(
+                                ranges(),
+                                limits.unicode_scalar,
+                            )
+                        }
+                        UnicodeScalarAggregateRepetition::OneOrMoreGreedy => {
+                            UnicodeScalarAggregatePlan::build_one_or_more_attempt(
+                                ranges(),
+                                true,
+                                limits.unicode_scalar,
+                            )
+                        }
+                        UnicodeScalarAggregateRepetition::OneOrMoreLazy => {
+                            UnicodeScalarAggregatePlan::build_one_or_more_attempt(
+                                ranges(),
+                                false,
+                                limits.unicode_scalar,
+                            )
+                        }
+                        UnicodeScalarAggregateRepetition::RepeatedGreedy { minimum, maximum } => {
+                            UnicodeScalarAggregatePlan::build_repeated_attempt(
+                                ranges(),
+                                minimum,
+                                maximum,
+                                true,
+                                limits.unicode_scalar,
+                            )
+                        }
+                        UnicodeScalarAggregateRepetition::RepeatedLazy { minimum, maximum } => {
+                            UnicodeScalarAggregatePlan::build_repeated_attempt(
+                                ranges(),
+                                minimum,
+                                maximum,
+                                false,
+                                limits.unicode_scalar,
+                            )
+                        }
+                    }
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            direct_build_stage_effect(work, error.actual());
+                        AggregateBuildError::UnicodeScalarBuild {
+                            operation,
+                            selection,
+                            source: error.into_source(),
+                        }
+                    })?;
+                    let (engine, actual) = attempt.into_parts();
+                    let build = engine.build_accounting();
+                    let kernel = match kernel_operation {
+                        UnicodeScalarAggregateOperation::Count => engine.count_identity(),
+                        UnicodeScalarAggregateOperation::SpanSum => engine.span_sum_identity(),
+                    };
+                    (
+                        AggregateEngine::UnicodeScalar(engine),
+                        actual,
+                        build,
+                        kernel,
+                    )
+                };
+                retain_direct_build_success(construction, work, build_actual);
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
                     construction_attempt: AggregateClosureEvidence::empty(),
@@ -7994,7 +8045,7 @@ impl AggregateBuilder {
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
-                    engine: AggregateEngine::UnicodeScalar(engine),
+                    engine,
                     minimum_match_bytes,
                     limits,
                     report,
@@ -12490,6 +12541,7 @@ enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     DispatchedExactLiteral(DispatchedLiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
+    DispatchedUnicodeScalar(DispatchedUnicodeScalarAggregatePlan),
     WordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
     LiteralAssertions(LiteralAssertionsPlan),
@@ -12608,7 +12660,9 @@ impl AggregatePlan {
             AggregateEngine::ExactLiteral(_) | AggregateEngine::DispatchedExactLiteral(_) => {
                 Some(AggregateDirectRoute::ExactLiteral)
             }
-            AggregateEngine::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
+            AggregateEngine::UnicodeScalar(_) | AggregateEngine::DispatchedUnicodeScalar(_) => {
+                Some(AggregateDirectRoute::UnicodeScalar)
+            }
             AggregateEngine::WordRun(_) | AggregateEngine::AsciiWordRun(_) => {
                 Some(AggregateDirectRoute::WordRun)
             }
@@ -13322,6 +13376,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::UnicodeScalar(source),
                     )
                 }),
+            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
+                .count(haystack, limits.unicode_scalar)
+                .map(AggregateCountExecution::UnicodeScalar)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
             AggregateEngine::WordRun(engine) => engine
                 .aggregate_count(haystack, limits.word_run)
                 .map(AggregateCountExecution::WordRun)
@@ -13715,6 +13779,16 @@ impl AggregatePlan {
                 }
             }
             AggregateEngine::UnicodeScalar(engine) => engine
+                .span_sum(haystack, limits.unicode_scalar)
+                .map(AggregateSpanSumExecution::UnicodeScalar)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
+            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
                 .span_sum(haystack, limits.unicode_scalar)
                 .map(AggregateSpanSumExecution::UnicodeScalar)
                 .map_err(|source| {
