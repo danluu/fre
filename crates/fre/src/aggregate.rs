@@ -9509,7 +9509,8 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded literal-pair inspection",
                     });
                 }
-                let attempt = BoundedLiteralPairPlan::build_attempt(
+                let attempt = BoundedLiteralPairPlan::build_attempt_with_dispatch(
+                    simd_dispatch,
                     left,
                     class
                         .ranges()

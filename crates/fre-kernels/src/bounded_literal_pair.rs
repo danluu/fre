@@ -14,7 +14,11 @@
 
 use core::{fmt, mem::size_of};
 
-use fre_exact_alloc::CopyError;
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+use fre_simd_kernels::{
+    ASCII_NARROW_BYTES, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet,
+    AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt, SimdDispatchContext,
+};
 use memchr::memchr2;
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
@@ -34,6 +38,8 @@ const COMPARISON_WORK: usize = 2;
 const CLASSIFICATION_WORK: usize = 2;
 const SUFFIX_PROBE_WORK: usize = 3;
 const MATCH_WORK: usize = 8;
+const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
+const SIMD_RUN_SCANNER_MIN_GAP: u32 = 17;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -168,6 +174,7 @@ pub struct ReduceUpperBounds {
     pub input_bytes: usize,
     pub candidate_scan_bytes: usize,
     pub prefix_comparisons: usize,
+    /// Physical byte classifications, including SIMD recovery rescans.
     pub gap_classifications: usize,
     pub suffix_probes: usize,
     pub suffix_comparisons: usize,
@@ -186,6 +193,7 @@ pub struct ReduceUpperBounds {
 pub struct ReduceActualCounters {
     pub candidate_scan_bytes: usize,
     pub prefix_comparisons: usize,
+    /// Physical byte classifications, including SIMD recovery rescans.
     pub gap_classifications: usize,
     pub suffix_probes: usize,
     pub suffix_comparisons: usize,
@@ -487,6 +495,10 @@ impl ByteClass {
         let index = usize::from(byte);
         self.0[index / 64] & (1_u64 << (index % 64)) != 0
     }
+
+    fn ascii_set(self) -> Option<AsciiByteSet> {
+        (self.0[2] == 0 && self.0[3] == 0).then(|| AsciiByteSet::from_words([self.0[0], self.0[1]]))
+    }
 }
 
 #[derive(Debug)]
@@ -496,6 +508,7 @@ pub struct BoundedLiteralPairPlan {
     class: ByteClass,
     gap_max: u32,
     build: BuildAccounting,
+    class_run_scanner: ExactBoxOrUsize<AsciiByteSetRunScanner>,
 }
 
 impl BoundedLiteralPairPlan {
@@ -516,6 +529,65 @@ impl BoundedLiteralPairPlan {
 
     /// Build while retaining exact successful or partial terminal effects.
     pub fn build_attempt<I>(
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(None, left, ranges, right, gap_max, limits)
+    }
+
+    /// Build with one caller-captured capability snapshot and retain an Auto
+    /// directional scanner for an eligible bounded ASCII class run.
+    pub fn build_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_with_dispatch(dispatch, left, ranges, right, gap_max, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the dispatched route while retaining exact successful or partial
+    /// terminal effects.
+    pub fn build_attempt_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        left: &[u8],
+        ranges: I,
+        right: &[u8],
+        gap_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            left,
+            ranges,
+            right,
+            gap_max,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps proof checks, exact optional scanner retention, literal allocations, and terminal effects in one transaction"
+    )]
+    fn build_attempt_inner<I>(
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
         left: &[u8],
         mut ranges: I,
         right: &[u8],
@@ -539,24 +611,24 @@ impl BoundedLiteralPairPlan {
                 limits.max_literal_bytes,
                 BuildResource::LiteralBytes,
             )?;
-            let persistent_bytes = size_of::<Self>().checked_add(literal_bytes).ok_or(
+            let base_persistent_bytes = size_of::<Self>().checked_add(literal_bytes).ok_or(
                 BuildError::ArithmeticOverflow {
                     computation: "persistent bytes",
                 },
             )?;
             let scratch_bytes = 0;
-            let peak_bytes = persistent_bytes;
+            let base_peak_bytes = base_persistent_bytes;
             enforce_build_usize(
                 scratch_bytes,
                 limits.max_scratch_bytes,
                 BuildResource::Scratch,
             )?;
             enforce_build_usize(
-                persistent_bytes,
+                base_persistent_bytes,
                 limits.max_persistent_bytes,
                 BuildResource::Persistent,
             )?;
-            enforce_build_usize(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            enforce_build_usize(base_peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
 
             let literal_work = literal_bytes
                 .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
@@ -567,11 +639,51 @@ impl BoundedLiteralPairPlan {
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
             let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
+            let scanner_eligible = run_scanner_eligible(dispatch, class, gap_max);
+            let scanner_bytes = usize::from(scanner_eligible)
+                .checked_mul(size_of::<AsciiByteSetRunScanner>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "retained class-run scanner bytes",
+                })?;
+            let persistent_bytes = base_persistent_bytes.checked_add(scanner_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes with class-run scanner",
+                },
+            )?;
+            let peak_bytes = persistent_bytes;
+            enforce_build_usize(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            )?;
+            enforce_build_usize(peak_bytes, limits.max_peak_bytes, BuildResource::Peak)?;
+            work.charge(
+                usize::from(scanner_eligible)
+                    .checked_mul(SIMD_RUN_SCANNER_BUILD_WORK)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "class-run scanner build work",
+                    })?,
+            )?;
+            let class_run_scanner = build_run_scanner(dispatch, class, gap_max);
+            debug_assert_eq!(class_run_scanner.is_some(), scanner_eligible);
             let work_upper_bound = work.used;
             let left_owned = copy_literal(left, "left literal")?;
             record_literal_copy(&mut actual, left_owned.len())?;
             let right_owned = copy_literal(right, "right literal")?;
             record_literal_copy(&mut actual, right_owned.len())?;
+            let class_run_scanner =
+                retain_run_scanner(class_run_scanner).map_err(|error| match error {
+                    CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                        computation: "class-run scanner allocation layout",
+                    },
+                    CopyError::AllocationFailed => BuildError::AllocationFailed {
+                        structure: "class-run scanner",
+                        bytes: scanner_bytes,
+                    },
+                })?;
+            if scanner_eligible {
+                record_retained_value(&mut actual, scanner_bytes)?;
+            }
             actual.initialized_bytes = actual
                 .initialized_bytes
                 .checked_add(size_of::<Self>())
@@ -603,6 +715,7 @@ impl BoundedLiteralPairPlan {
                     persistent_bytes,
                     peak_bytes,
                 },
+                class_run_scanner,
             })
         })();
         match result {
@@ -617,6 +730,45 @@ impl BoundedLiteralPairPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    /// Immutable Auto selection retained for the bounded ASCII class run.
+    #[must_use]
+    pub fn class_run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        self.class_run_scanner()
+            .map(AsciiByteSetRunScanner::selection)
+    }
+
+    fn class_run_scanner(&self) -> Option<&AsciiByteSetRunScanner> {
+        self.class_run_scanner.boxed()
+    }
+
+    #[cfg(test)]
+    fn with_test_run_scanner(mut self) -> Self {
+        let scanner = AsciiByteSetRunScanner::new(
+            self.class
+                .ascii_set()
+                .expect("the test scanner requires one ASCII class"),
+        );
+        self.class_run_scanner =
+            retain_run_scanner(Some(scanner)).expect("test scanner retention must allocate");
+        let scanner_bytes = size_of::<AsciiByteSetRunScanner>();
+        self.build.work_upper_bound = self
+            .build
+            .work_upper_bound
+            .checked_add(SIMD_RUN_SCANNER_BUILD_WORK)
+            .expect("test build work fits");
+        self.build.persistent_bytes = self
+            .build
+            .persistent_bytes
+            .checked_add(scanner_bytes)
+            .expect("test persistent bytes fit");
+        self.build.peak_bytes = self
+            .build
+            .peak_bytes
+            .checked_add(scanner_bytes)
+            .expect("test peak bytes fit");
+        self
     }
 
     #[must_use]
@@ -701,12 +853,17 @@ impl BoundedLiteralPairPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "prefix comparisons",
                 })?;
-        let gap_classifications =
-            candidates
-                .checked_mul(gap)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "gap classifications",
-                })?;
+        let scanner_recovery = if self.class_run_scanner().is_some() {
+            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        } else {
+            0
+        };
+        let gap_classifications = gap
+            .checked_add(scanner_recovery)
+            .and_then(|per_candidate| candidates.checked_mul(per_candidate))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "physical gap classifications",
+            })?;
         let probes_per_candidate = gap.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
             computation: "suffix probes per candidate",
         })?;
@@ -886,20 +1043,52 @@ impl BoundedLiteralPairPlan {
                 })?;
         let limit = bound.min(available);
         let mut width = 0_usize;
-        while width < limit {
+        let scalar_limit = if self.class_run_scanner().is_some() {
+            limit.min(ASCII_NARROW_BYTES)
+        } else {
+            limit
+        };
+        while width < scalar_limit {
             let position = start
                 .checked_add(width)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "gap position",
                 })?;
-            actual.gap_classifications =
-                checked_add(actual.gap_classifications, 1, "gap classifications")?;
-            actual.work = checked_add(actual.work, CLASSIFICATION_WORK, "gap classification work")?;
+            charge_gap_classifications(actual, 1)?;
             if !self.class.contains(haystack[position]) {
-                break;
+                return Ok(width);
             }
             width = checked_add(width, 1, "gap width")?;
         }
+        if width == limit {
+            return Ok(width);
+        }
+        let scanner = self
+            .class_run_scanner()
+            .expect("a partial scalar proof requires one retained run scanner");
+        let continuation_start =
+            start
+                .checked_add(width)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "gap scanner start",
+                })?;
+        let continuation_end = start
+            .checked_add(limit)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "gap scanner end",
+            })?;
+        let continuation = haystack.get(continuation_start..continuation_end).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "gap scanner source",
+            },
+        )?;
+        let scan_result = scanner.scan_forward(continuation);
+        charge_gap_classifications(actual, scan_result.examined_bytes())?;
+        width = width.checked_add(scan_result.member_run_len()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "SIMD gap width",
+            },
+        )?;
         Ok(width)
     }
 
@@ -989,6 +1178,24 @@ fn charge_scan(actual: &mut ReduceActualCounters, bytes: usize) -> Result<(), Re
             computation: "candidate scan work",
         })?;
     actual.work = checked_add(actual.work, work, "candidate scan work")?;
+    Ok(())
+}
+
+fn charge_gap_classifications(
+    actual: &mut ReduceActualCounters,
+    bytes: usize,
+) -> Result<(), ReduceError> {
+    actual.gap_classifications = checked_add(
+        actual.gap_classifications,
+        bytes,
+        "physical gap classifications",
+    )?;
+    let work = bytes
+        .checked_mul(CLASSIFICATION_WORK)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "gap classification work",
+        })?;
+    actual.work = checked_add(actual.work, work, "gap classification work")?;
     Ok(())
 }
 
@@ -1101,6 +1308,47 @@ where
         return Err(BuildError::EmptyClass);
     }
     Ok((class, range_count, members))
+}
+
+fn run_scanner_eligible(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    class: ByteClass,
+    gap_max: u32,
+) -> bool {
+    gap_max >= SIMD_RUN_SCANNER_MIN_GAP
+        && class.ascii_set().is_some()
+        && dispatch
+            .is_some_and(|(context, _)| context.capabilities().usable().contains(Feature::ArmSve))
+}
+
+fn build_run_scanner(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    class: ByteClass,
+    gap_max: u32,
+) -> Option<AsciiByteSetRunScanner> {
+    if !run_scanner_eligible(dispatch, class, gap_max) {
+        return None;
+    }
+    let (context, policy) = dispatch.expect("scanner eligibility requires a dispatch context");
+    Some(
+        context
+            .ascii_byte_set_run_scanner(
+                class
+                    .ascii_set()
+                    .expect("scanner eligibility proves one ASCII class"),
+                policy,
+            )
+            .expect("the caller supplied an authentic compatible dispatch policy"),
+    )
+}
+
+fn retain_run_scanner(
+    scanner: Option<AsciiByteSetRunScanner>,
+) -> Result<ExactBoxOrUsize<AsciiByteSetRunScanner>, CopyError> {
+    match scanner {
+        Some(scanner) => ExactBoxOrUsize::try_from_boxed(scanner),
+        None => ExactBoxOrUsize::try_from_usize(0),
+    }
 }
 
 struct BuildWork<'a> {
@@ -1226,6 +1474,42 @@ fn record_literal_copy(
             .checked_add(bytes)
             .ok_or(BuildError::ArithmeticOverflow {
                 computation: "exact live persistent bytes",
+            })?;
+    actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
+    Ok(())
+}
+
+fn record_retained_value(
+    actual: &mut DirectBuildAttemptActual,
+    bytes: usize,
+) -> Result<(), BuildError> {
+    actual.allocations =
+        actual
+            .allocations
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "retained value allocation count",
+            })?;
+    actual.allocated_bytes =
+        actual
+            .allocated_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "retained value allocated bytes",
+            })?;
+    actual.initialized_bytes =
+        actual
+            .initialized_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "retained value initialized bytes",
+            })?;
+    actual.live_persistent_bytes =
+        actual
+            .live_persistent_bytes
+            .checked_add(bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "retained value live persistent bytes",
             })?;
     actual.peak_bytes = actual.peak_bytes.max(actual.live_persistent_bytes);
     Ok(())
@@ -1397,7 +1681,8 @@ fn checked_add(left: usize, right: usize, computation: &'static str) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedLiteralPairPlan, BuildError, BuildLimits, Operation, ReduceError, ReduceLimits,
+        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, BoundedLiteralPairPlan, BuildError, BuildLimits,
+        CLASSIFICATION_WORK, Operation, ReduceError, ReduceLimits, SIMD_RUN_SCANNER_BUILD_WORK,
     };
 
     fn plan() -> BoundedLiteralPairPlan {
@@ -1406,6 +1691,17 @@ mod tests {
             [(b'x', b'x')].into_iter(),
             b"b",
             2,
+            BuildLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn long_plan() -> BoundedLiteralPairPlan {
+        BoundedLiteralPairPlan::build(
+            b"a",
+            [(b'x', b'y')].into_iter(),
+            b"b",
+            64,
             BuildLimits::default(),
         )
         .unwrap()
@@ -1509,6 +1805,283 @@ mod tests {
                 expected.1
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one construction test closes dispatch selection, exact effects, identities, and one-below resource boundaries"
+    )]
+    fn dispatched_ascii_build_charges_one_exact_sve_scanner() {
+        use fre_simd_kernels::{Feature, SimdDispatchContext};
+
+        let dispatch = SimdDispatchContext::capture();
+        let sve_usable = dispatch.capabilities().usable().contains(Feature::ArmSve);
+        let baseline = BoundedLiteralPairPlan::build_attempt(
+            b"a",
+            [(b'x', b'y')].into_iter(),
+            b"b",
+            64,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedLiteralPairPlan::build_attempt_with_dispatch(
+            dispatch,
+            b"a",
+            [(b'x', b'y')].into_iter(),
+            b"b",
+            64,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let baseline_actual = baseline.actual();
+        let baseline = baseline.into_plan();
+        let dispatched_actual = dispatched.actual();
+        let dispatched = dispatched.into_plan();
+        assert_eq!(
+            dispatched.class_run_scanner_selection().is_some(),
+            sve_usable
+        );
+        if let Some(selection) = dispatched.class_run_scanner_selection() {
+            assert_eq!(selection.policy, fre_simd_kernels::DispatchPolicy::Auto);
+            assert_eq!(selection.selection_input_bytes, 16);
+        }
+        let scanner_work = usize::from(sve_usable) * SIMD_RUN_SCANNER_BUILD_WORK;
+        let scanner_bytes = usize::from(sve_usable)
+            * core::mem::size_of::<fre_simd_kernels::AsciiByteSetRunScanner>();
+        let baseline_build = baseline.build_accounting();
+        let dispatched_build = dispatched.build_accounting();
+        assert_eq!(
+            dispatched_build.work_upper_bound,
+            baseline_build.work_upper_bound + scanner_work
+        );
+        assert_eq!(
+            dispatched_build.persistent_bytes,
+            baseline_build.persistent_bytes + scanner_bytes
+        );
+        assert_eq!(
+            dispatched_build.peak_bytes,
+            baseline_build.peak_bytes + scanner_bytes
+        );
+        assert_eq!(
+            dispatched_actual.work,
+            u64::try_from(dispatched_build.work_upper_bound).unwrap()
+        );
+        assert_eq!(
+            dispatched_actual.allocations,
+            baseline_actual.allocations + usize::from(sve_usable)
+        );
+        assert_eq!(
+            dispatched_actual.allocated_bytes,
+            baseline_actual.allocated_bytes + scanner_bytes
+        );
+        assert_eq!(dispatched_actual.copied_bytes, baseline_actual.copied_bytes);
+        assert_eq!(
+            dispatched_actual.initialized_bytes,
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(
+            dispatched_actual.live_persistent_bytes,
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(dispatched_actual.peak_bytes, dispatched_build.peak_bytes);
+        assert_eq!(dispatched.count_identity(), baseline.count_identity());
+        assert_eq!(dispatched.span_sum_identity(), baseline.span_sum_identity());
+
+        let rebuild = |limits| {
+            BoundedLiteralPairPlan::build_with_dispatch(
+                dispatch,
+                b"a",
+                [(b'x', b'y')].into_iter(),
+                b"b",
+                64,
+                limits,
+            )
+        };
+        assert!(
+            rebuild(BuildLimits {
+                max_build_work: dispatched_build.work_upper_bound,
+                max_persistent_bytes: dispatched_build.persistent_bytes,
+                max_peak_bytes: dispatched_build.peak_bytes,
+                ..BuildLimits::default()
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_build_work: dispatched_build.work_upper_bound - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == dispatched_build.work_upper_bound
+                    && limit == dispatched_build.work_upper_bound - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_persistent_bytes: dispatched_build.persistent_bytes - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::PersistentLimit { needed, limit })
+                if needed == dispatched_build.persistent_bytes
+                    && limit == dispatched_build.persistent_bytes - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_peak_bytes: dispatched_build.peak_bytes - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::PeakLimit { needed, limit })
+                if needed == dispatched_build.peak_bytes
+                    && limit == dispatched_build.peak_bytes - 1
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one differential closes count, span sum, physical classifications, and exact execution limits over the same run boundaries"
+    )]
+    fn retained_scanner_preserves_results_and_closes_physical_byte_limits() {
+        let scalar = long_plan();
+        let accelerated = long_plan().with_test_run_scanner();
+        let mut long = Vec::new();
+        long.push(b'a');
+        long.extend(core::iter::repeat_n(b'x', 64));
+        long.extend_from_slice(b"b--b");
+        long.extend(core::iter::repeat_n(b'y', 63));
+        long.push(b'a');
+        for haystack in [
+            long.as_slice(),
+            b"axxxxxb",
+            b"a\xFFb",
+            b"ayyyyyyyyyyyyyyyyyb",
+            b"",
+        ] {
+            let scalar_count = scalar.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let accelerated_count = accelerated
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(accelerated_count.count, scalar_count.count);
+            assert_eq!(
+                accelerated_count.accounting.identity,
+                scalar_count.accounting.identity
+            );
+            assert!(
+                accelerated_count.accounting.actual.gap_classifications
+                    <= accelerated_count
+                        .accounting
+                        .upper_bounds
+                        .gap_classifications
+            );
+            assert!(
+                accelerated_count.accounting.actual.source_reads
+                    <= accelerated_count.accounting.upper_bounds.source_reads
+            );
+            assert!(
+                accelerated_count.accounting.actual.work
+                    <= accelerated_count.accounting.upper_bounds.work
+            );
+            let recovery = haystack
+                .len()
+                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .unwrap();
+            assert_eq!(
+                accelerated_count
+                    .accounting
+                    .upper_bounds
+                    .gap_classifications,
+                scalar_count.accounting.upper_bounds.gap_classifications + recovery
+            );
+            assert_eq!(
+                accelerated_count.accounting.upper_bounds.source_reads,
+                scalar_count.accounting.upper_bounds.source_reads + recovery
+            );
+            assert_eq!(
+                accelerated_count.accounting.upper_bounds.work,
+                scalar_count.accounting.upper_bounds.work
+                    + recovery.checked_mul(CLASSIFICATION_WORK).unwrap()
+            );
+            let scalar_span = scalar
+                .span_sum(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            let accelerated_span = accelerated
+                .span_sum(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(accelerated_span.span_sum, scalar_span.span_sum);
+            assert_eq!(
+                accelerated_span.accounting.identity,
+                scalar_span.accounting.identity
+            );
+            assert!(
+                accelerated_span.accounting.actual.gap_classifications
+                    <= accelerated_span.accounting.upper_bounds.gap_classifications
+            );
+        }
+
+        let result = accelerated.count(&long, ReduceLimits::unlimited()).unwrap();
+        let upper = result.accounting.upper_bounds;
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_candidate_events: upper.candidate_events,
+            max_suffix_probes: upper.suffix_probes,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: u64::MAX,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert!(accelerated.count(&long, exact).is_ok());
+        let mut below = exact;
+        below.max_source_reads -= 1;
+        assert!(matches!(
+            accelerated.count(&long, below),
+            Err(ReduceError::SourceReadsLimit { needed, limit })
+                if needed == upper.source_reads && limit == upper.source_reads - 1
+        ));
+        let mut below = exact;
+        below.max_work -= 1;
+        assert!(matches!(
+            accelerated.count(&long, below),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == upper.work - 1
+        ));
+    }
+
+    #[test]
+    fn dispatched_non_ascii_class_preserves_scalar_build_and_execution() {
+        use fre_simd_kernels::SimdDispatchContext;
+
+        let scalar = BoundedLiteralPairPlan::build(
+            b"a",
+            [(0x80, 0x80)].into_iter(),
+            b"b",
+            64,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedLiteralPairPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"a",
+            [(0x80, 0x80)].into_iter(),
+            b"b",
+            64,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(dispatched.class_run_scanner_selection().is_none());
+        assert_eq!(dispatched.build_accounting(), scalar.build_accounting());
+        assert_eq!(dispatched.count_identity(), scalar.count_identity());
+        assert_eq!(
+            dispatched
+                .count(b"a\x80\x80b", ReduceLimits::unlimited())
+                .unwrap(),
+            scalar
+                .count(b"a\x80\x80b", ReduceLimits::unlimited())
+                .unwrap()
+        );
     }
 
     #[test]
