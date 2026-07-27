@@ -265,7 +265,7 @@ pub use fre_kernels::{
 };
 pub use fre_kernels::{
     AsciiSelection as SimdAsciiSelection, DispatchPolicy as SimdDispatchPolicy,
-    Feature as SimdFeature, FeatureSet as SimdFeatureSet,
+    Feature as SimdFeature, FeatureSet as SimdFeatureSet, SimdDispatchContext,
 };
 pub use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_PLAN_ID,
@@ -447,7 +447,7 @@ use fre_kernels::{
     PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
     RequiredLiteralBuildAccounting, RequiredLiteralBuildError, RequiredLiteralBuildLimits,
     RequiredLiteralPlan, RequiredLiteralSearchAccounting, RequiredLiteralSearchError,
-    RequiredLiteralSearchLimits, SimdDispatchContext, Window as LiteralWindow,
+    RequiredLiteralSearchLimits, Window as LiteralWindow,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{

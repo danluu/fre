@@ -16,6 +16,10 @@
 use core::{cmp::Ordering, fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, ExactVec};
+use fre_kernels::{
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, FeatureSet, SelectionReceipt,
+    SimdDispatchContext,
+};
 
 /// Stable identity for this prerequisite representation.
 pub const PLAN_ID: &str = "guarded-ascii-word-dictionary.exact-packed.v1";
@@ -39,6 +43,8 @@ const LOOKUP_SLOT_WRITE_WORK: u64 = 4;
 const SORT_COMPARISON_WORK: u64 = 2;
 const SORT_SWAP_WORK: u64 = 4;
 const ENTRY_IDENTITY_BYTES: usize = 10;
+const ASCII_WORD_SET: AsciiByteSet =
+    AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
 
 /// One accepted directional ASCII word-boundary assertion.
 ///
@@ -501,6 +507,18 @@ pub struct Dictionary {
     accounting_actual: ErrorActual,
 }
 
+/// Borrowed execution view that may retain a fixed-16 SVE word-run scanner.
+///
+/// Dispatch construction is explicit and allocation-free. The underlying
+/// dictionary remains the sole persistent artifact, so build accounting,
+/// operation accounting, and cache identity are byte-for-byte identical to
+/// direct [`Dictionary`] execution.
+#[derive(Debug)]
+pub struct DispatchedDictionary<'a> {
+    dictionary: &'a Dictionary,
+    word_run_scanner: Option<AsciiByteSetRunScanner>,
+}
+
 struct BuildState {
     packed: ExactVec<u8>,
     entries: ExactVec<EntryIdentity>,
@@ -606,6 +624,31 @@ impl Dictionary {
             fingerprint_id: FINGERPRINT_ID,
             packed_bytes: self.packed.as_slice(),
             entries: self.entries.as_slice(),
+        }
+    }
+
+    /// Construct an allocation-free execution view from authentic host facts.
+    ///
+    /// OS-usable SVE selects the fixed-16 SVE run scanner. Every host without
+    /// SVE retains the incumbent scalar segmentation path.
+    #[must_use]
+    pub fn with_dispatch(&self, dispatch: SimdDispatchContext) -> DispatchedDictionary<'_> {
+        let usable = dispatch.capabilities().usable();
+        let word_run_scanner = if usable.contains(Feature::ArmSve) {
+            Some(
+                dispatch
+                    .ascii_byte_set_run_scanner(
+                        ASCII_WORD_SET,
+                        DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve)),
+                    )
+                    .expect("allow-only dispatch cannot require unavailable host features"),
+            )
+        } else {
+            None
+        };
+        DispatchedDictionary {
+            dictionary: self,
+            word_run_scanner,
         }
     }
 
@@ -1937,6 +1980,67 @@ struct Reduction {
     accounting: ReduceAccounting,
 }
 
+impl DispatchedDictionary<'_> {
+    /// The immutable dictionary behind this execution view.
+    #[must_use]
+    pub const fn dictionary(&self) -> &Dictionary {
+        self.dictionary
+    }
+
+    /// The unchanged dictionary construction receipt.
+    #[must_use]
+    pub fn build_accounting(&self) -> BuildAccounting {
+        self.dictionary.build_accounting()
+    }
+
+    /// The unchanged proof and cache identity.
+    #[must_use]
+    pub fn identity(&self) -> Identity<'_> {
+        self.dictionary.identity()
+    }
+
+    /// Selection receipt when this host bound an SVE-family run scanner.
+    #[must_use]
+    pub const fn run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        match self.word_run_scanner {
+            Some(scanner) => Some(scanner.selection()),
+            None => None,
+        }
+    }
+
+    /// Count complete non-overlapping maximal ASCII-word matches.
+    pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        let reduction = self.dictionary.reduce_with_run_scanner(
+            haystack,
+            ReduceOperation::Count,
+            limits,
+            self.word_run_scanner.as_ref(),
+        )?;
+        Ok(CountResult {
+            count: reduction.accounting.actual.matches,
+            accounting: reduction.accounting,
+        })
+    }
+
+    /// Sum the byte lengths of complete non-overlapping maximal-word matches.
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        let reduction = self.dictionary.reduce_with_run_scanner(
+            haystack,
+            ReduceOperation::SpanSum,
+            limits,
+            self.word_run_scanner.as_ref(),
+        )?;
+        Ok(SpanSumResult {
+            span_sum: reduction.accounting.actual.span_sum,
+            accounting: reduction.accounting,
+        })
+    }
+}
+
 impl Dictionary {
     /// Count complete non-overlapping matches of the proved guarded language.
     ///
@@ -1976,6 +2080,20 @@ impl Dictionary {
         operation: ReduceOperation,
         limits: ReduceLimits,
     ) -> Result<Reduction, ReduceError> {
+        self.reduce_with_run_scanner(haystack, operation, limits, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "scalar and dispatched segmentation share one reducer so lookup, accounting, and limit closure cannot drift"
+    )]
+    fn reduce_with_run_scanner(
+        &self,
+        haystack: &[u8],
+        operation: ReduceOperation,
+        limits: ReduceLimits,
+        word_run_scanner: Option<&AsciiByteSetRunScanner>,
+    ) -> Result<Reduction, ReduceError> {
         let upper_bounds = reduce_upper_bounds(self.build_accounting(), haystack.len())?;
         enforce_reduce_limits(upper_bounds, operation, limits)?;
 
@@ -1994,11 +2112,23 @@ impl Dictionary {
             index = index.checked_add(1).ok_or_else(|| {
                 reduce_invariant(actual, "word cursor overflowed admitted haystack")
             })?;
-            while index < haystack.len() && is_ascii_word(haystack[index]) {
-                increment(&mut actual.bytes_classified, "classified haystack bytes")?;
-                index = index.checked_add(1).ok_or_else(|| {
+            if let Some(scanner) = word_run_scanner {
+                let member_run = scanner.scan_forward(&haystack[index..]).member_run_len();
+                actual.bytes_classified = add(
+                    actual.bytes_classified,
+                    member_run,
+                    "classified haystack bytes",
+                )?;
+                index = index.checked_add(member_run).ok_or_else(|| {
                     reduce_invariant(actual, "word cursor overflowed admitted haystack")
                 })?;
+            } else {
+                while index < haystack.len() && is_ascii_word(haystack[index]) {
+                    increment(&mut actual.bytes_classified, "classified haystack bytes")?;
+                    index = index.checked_add(1).ok_or_else(|| {
+                        reduce_invariant(actual, "word cursor overflowed admitted haystack")
+                    })?;
+                }
             }
             increment(&mut actual.candidate_words, "candidate words")?;
             let (found, lookup) = self.lookup_counted(&haystack[start..index])?;
@@ -2429,6 +2559,133 @@ mod tests {
         Dictionary::build_precounted(dimensions(words), words.iter().copied(), limits)
     }
 
+    fn with_portable_run_scanner(dictionary: &Dictionary) -> DispatchedDictionary<'_> {
+        let scanner = SimdDispatchContext::capture()
+            .ascii_byte_set_run_scanner(ASCII_WORD_SET, DispatchPolicy::Portable)
+            .expect("portable policy always retains the scalar scanner");
+        DispatchedDictionary {
+            dictionary,
+            word_run_scanner: Some(scanner),
+        }
+    }
+
+    #[test]
+    fn ascii_word_scanner_set_matches_the_scalar_predicate() {
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(
+                ASCII_WORD_SET.contains(byte),
+                is_ascii_word(byte),
+                "byte={byte:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatched_run_segmentation_preserves_results_accounting_and_identity() {
+        let long_word = vec![b'x'; 257];
+        let words = [
+            word(b"as"),
+            word(b"break"),
+            word(b"Self"),
+            word(b"a"),
+            word(&long_word),
+        ];
+        let dictionary = build(&words, BuildLimits::unlimited()).unwrap();
+        let dispatched = with_portable_run_scanner(&dictionary);
+        assert_eq!(dispatched.build_accounting(), dictionary.build_accounting());
+        assert_eq!(dispatched.identity(), dictionary.identity());
+        assert_eq!(
+            dispatched
+                .run_scanner_selection()
+                .expect("test binds a scanner")
+                .variant_id,
+            "ascii-byte-set.run.scalar.v1"
+        );
+
+        let alphabet = [b'a', b's', b'b', b'_', b' ', 0xff];
+        let mut haystack = Vec::new();
+        for length in 0..=5 {
+            let cases = alphabet.len().pow(length);
+            for mut case in 0..cases {
+                haystack.clear();
+                for _ in 0..length {
+                    haystack.push(alphabet[case % alphabet.len()]);
+                    case /= alphabet.len();
+                }
+                assert_eq!(
+                    dispatched
+                        .count(&haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    dictionary
+                        .count(&haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    "count haystack={haystack:?}"
+                );
+                assert_eq!(
+                    dispatched
+                        .span_sum(&haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    dictionary
+                        .span_sum(&haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    "span-sum haystack={haystack:?}"
+                );
+            }
+        }
+
+        for alignment in [0_usize, 1, 15, 16, 31, 63] {
+            for run_len in [1_usize, 2, 15, 16, 17, 31, 32, 33, 256, 257, 258] {
+                let mut storage = vec![b' '; alignment];
+                storage.extend(core::iter::repeat_n(b'x', run_len));
+                storage.extend_from_slice(b" !tail");
+                let haystack = &storage[alignment..];
+                assert_eq!(
+                    dispatched
+                        .count(haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    dictionary
+                        .count(haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    "alignment={alignment} run_len={run_len}"
+                );
+                assert_eq!(
+                    dispatched
+                        .span_sum(haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    dictionary
+                        .span_sum(haystack, ReduceLimits::unlimited())
+                        .unwrap(),
+                    "alignment={alignment} run_len={run_len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_dispatch_binds_only_os_usable_sve() {
+        let dictionary = build(&[word(b"as")], BuildLimits::unlimited()).unwrap();
+        let dispatch = SimdDispatchContext::capture();
+        let usable = dispatch.capabilities().usable();
+        let dispatched = dictionary.with_dispatch(dispatch);
+        match dispatched.run_scanner_selection() {
+            Some(selection) => {
+                assert!(usable.contains(Feature::ArmSve));
+                assert!(selection.required.contains(Feature::ArmSve));
+                assert_eq!(selection.variant_id, "ascii-byte-set.run.sve.v1");
+            }
+            None => assert!(!usable.contains(Feature::ArmSve)),
+        }
+        let haystack = b"as _as as! \xffas";
+        assert_eq!(
+            dispatched
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap(),
+            dictionary
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap()
+        );
+    }
+
     #[test]
     fn maximal_word_count_matches_unicode_off_rust_bytes_exhaustively() {
         let words = [
@@ -2482,6 +2739,153 @@ mod tests {
                 assert_eq!(span_sum.accounting.actual.bytes_classified, haystack.len());
             }
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    fn benchmark_count(
+        mut count: impl FnMut(&[u8]) -> CountResult,
+        haystack: &[u8],
+        iterations: u32,
+    ) -> f64 {
+        let started = std::time::Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            let result = count(std::hint::black_box(haystack));
+            checksum ^= std::hint::black_box(result.count)
+                ^ u64::try_from(result.accounting.actual.total_work).unwrap();
+        }
+        std::hint::black_box(checksum);
+        started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    fn median(samples: &[f64]) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted[sorted.len() / 2]
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native release qualification benchmark; requires OS-usable SVE"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the ignored qualification benchmark keeps validation, balanced long/short samples, and its parseable receipt together"
+    )]
+    fn benchmark_dispatched_word_runs_long_and_short() {
+        let long_word = vec![b'x'; 257];
+        let dictionary = build(&[word(b"a"), word(&long_word)], BuildLimits::unlimited()).unwrap();
+        let dispatched = dictionary.with_dispatch(SimdDispatchContext::capture());
+        let selection = dispatched
+            .run_scanner_selection()
+            .expect("benchmark requires OS-usable SVE");
+        assert_eq!(selection.variant_id, "ascii-byte-set.run.sve.v1");
+
+        let short_haystack = b"a ".repeat(2_048);
+        let mut long_haystack = Vec::with_capacity((long_word.len() + 1) * 16);
+        for _ in 0..16 {
+            long_haystack.extend_from_slice(&long_word);
+            long_haystack.push(b' ');
+        }
+        for haystack in [&short_haystack[..], &long_haystack] {
+            assert_eq!(
+                dispatched
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap(),
+                dictionary
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+            );
+        }
+
+        let iterations = std::env::var("FRE_GUARDED_WORD_BENCH_ITERS").map_or(2_000, |raw| {
+            raw.parse::<u32>()
+                .unwrap_or_else(|error| panic!("FRE_GUARDED_WORD_BENCH_ITERS: {error}"))
+        });
+        let samples = std::env::var("FRE_GUARDED_WORD_BENCH_SAMPLES").map_or(8, |raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|error| panic!("FRE_GUARDED_WORD_BENCH_SAMPLES: {error}"))
+        });
+        assert!(iterations > 0 && samples >= 4);
+
+        let mut scalar_short = Vec::with_capacity(samples);
+        let mut sve_short = Vec::with_capacity(samples);
+        let mut scalar_long = Vec::with_capacity(samples);
+        let mut sve_long = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let measure_scalar_short = || {
+                benchmark_count(
+                    |haystack| {
+                        dictionary
+                            .count(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                    },
+                    &short_haystack,
+                    iterations,
+                )
+            };
+            let measure_sve_short = || {
+                benchmark_count(
+                    |haystack| {
+                        dispatched
+                            .count(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                    },
+                    &short_haystack,
+                    iterations,
+                )
+            };
+            let measure_scalar_long = || {
+                benchmark_count(
+                    |haystack| {
+                        dictionary
+                            .count(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                    },
+                    &long_haystack,
+                    iterations,
+                )
+            };
+            let measure_sve_long = || {
+                benchmark_count(
+                    |haystack| {
+                        dispatched
+                            .count(haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                    },
+                    &long_haystack,
+                    iterations,
+                )
+            };
+            if sample.is_multiple_of(2) {
+                scalar_short.push(measure_scalar_short());
+                sve_short.push(measure_sve_short());
+                scalar_long.push(measure_scalar_long());
+                sve_long.push(measure_sve_long());
+            } else {
+                sve_long.push(measure_sve_long());
+                scalar_long.push(measure_scalar_long());
+                sve_short.push(measure_sve_short());
+                scalar_short.push(measure_scalar_short());
+            }
+        }
+        let scalar_short_ns = median(&scalar_short);
+        let sve_short_ns = median(&sve_short);
+        let scalar_long_ns = median(&scalar_long);
+        let sve_long_ns = median(&sve_long);
+        eprintln!(
+            "GUARDED_ASCII_WORD_SVE_BENCH variant={} iterations={iterations} samples={samples} \
+             short_bytes={} long_bytes={} scalar_short_ns={scalar_short_ns:.9} \
+             sve_short_ns={sve_short_ns:.9} short_over_scalar={:.9} \
+             scalar_long_ns={scalar_long_ns:.9} sve_long_ns={sve_long_ns:.9} \
+             long_over_scalar={:.9}",
+            selection.variant_id,
+            short_haystack.len(),
+            long_haystack.len(),
+            sve_short_ns / scalar_short_ns,
+            sve_long_ns / scalar_long_ns,
+        );
     }
 
     #[test]
