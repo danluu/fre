@@ -17,7 +17,7 @@ use core::{cmp::Ordering, fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_kernels::{
-    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, FeatureSet, SelectionReceipt,
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt,
     SimdDispatchContext,
 };
 
@@ -507,7 +507,7 @@ pub struct Dictionary {
     accounting_actual: ErrorActual,
 }
 
-/// Borrowed execution view that may retain a fixed-16 SVE word-run scanner.
+/// Borrowed execution view that may retain an auto-selected word-run scanner.
 ///
 /// Dispatch construction is explicit and allocation-free. The underlying
 /// dictionary remains the sole persistent artifact, so build accounting,
@@ -629,7 +629,8 @@ impl Dictionary {
 
     /// Construct an allocation-free execution view from authentic host facts.
     ///
-    /// OS-usable SVE selects the fixed-16 SVE run scanner. Every host without
+    /// OS-usable SVE admits scanner construction, after which the qualified
+    /// automatic policy selects the tuned implementation. Every host without
     /// SVE retains the incumbent scalar segmentation path.
     #[must_use]
     pub fn with_dispatch(&self, dispatch: SimdDispatchContext) -> DispatchedDictionary<'_> {
@@ -637,11 +638,8 @@ impl Dictionary {
         let word_run_scanner = if usable.contains(Feature::ArmSve) {
             Some(
                 dispatch
-                    .ascii_byte_set_run_scanner(
-                        ASCII_WORD_SET,
-                        DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve)),
-                    )
-                    .expect("allow-only dispatch cannot require unavailable host features"),
+                    .ascii_byte_set_run_scanner(ASCII_WORD_SET, DispatchPolicy::Auto)
+                    .expect("automatic dispatch always retains a scalar fallback"),
             )
         } else {
             None
@@ -2662,7 +2660,7 @@ mod tests {
     }
 
     #[test]
-    fn host_dispatch_binds_only_os_usable_sve() {
+    fn host_dispatch_gates_on_sve_then_uses_auto_policy() {
         let dictionary = build(&[word(b"as")], BuildLimits::unlimited()).unwrap();
         let dispatch = SimdDispatchContext::capture();
         let usable = dispatch.capabilities().usable();
@@ -2670,8 +2668,25 @@ mod tests {
         match dispatched.run_scanner_selection() {
             Some(selection) => {
                 assert!(usable.contains(Feature::ArmSve));
-                assert!(selection.required.contains(Feature::ArmSve));
-                assert_eq!(selection.variant_id, "ascii-byte-set.run.sve.v1");
+                assert_eq!(selection.policy, DispatchPolicy::Auto);
+                assert!(matches!(
+                    selection.variant_id,
+                    "ascii-byte-set.run.sve.v1"
+                        | "ascii-byte-set.run.neon.v1"
+                        | "ascii-byte-set.run.neon-sve2.arm-41-d84.v1"
+                ));
+                if usable.contains(Feature::ArmNeon) {
+                    assert!(matches!(
+                        selection.variant_id,
+                        "ascii-byte-set.run.neon.v1" | "ascii-byte-set.run.neon-sve2.arm-41-d84.v1"
+                    ));
+                } else {
+                    assert_eq!(selection.variant_id, "ascii-byte-set.run.sve.v1");
+                }
+                if selection.variant_id == "ascii-byte-set.run.neon-sve2.arm-41-d84.v1" {
+                    assert!(usable.contains(Feature::ArmNeon));
+                    assert!(usable.contains(Feature::ArmSve2));
+                }
             }
             None => assert!(!usable.contains(Feature::ArmSve)),
         }
@@ -2773,14 +2788,14 @@ mod tests {
         clippy::too_many_lines,
         reason = "the ignored qualification benchmark keeps validation, balanced long/short samples, and its parseable receipt together"
     )]
-    fn benchmark_dispatched_word_runs_long_and_short() {
+    fn benchmark_auto_dispatched_word_runs_long_and_short() {
         let long_word = vec![b'x'; 257];
         let dictionary = build(&[word(b"a"), word(&long_word)], BuildLimits::unlimited()).unwrap();
         let dispatched = dictionary.with_dispatch(SimdDispatchContext::capture());
         let selection = dispatched
             .run_scanner_selection()
             .expect("benchmark requires OS-usable SVE");
-        assert_eq!(selection.variant_id, "ascii-byte-set.run.sve.v1");
+        assert_eq!(selection.policy, DispatchPolicy::Auto);
 
         let short_haystack = b"a ".repeat(2_048);
         let mut long_haystack = Vec::with_capacity((long_word.len() + 1) * 16);
@@ -2810,9 +2825,9 @@ mod tests {
         assert!(iterations > 0 && samples >= 4);
 
         let mut scalar_short = Vec::with_capacity(samples);
-        let mut sve_short = Vec::with_capacity(samples);
+        let mut auto_short = Vec::with_capacity(samples);
         let mut scalar_long = Vec::with_capacity(samples);
-        let mut sve_long = Vec::with_capacity(samples);
+        let mut auto_long = Vec::with_capacity(samples);
         for sample in 0..samples {
             let measure_scalar_short = || {
                 benchmark_count(
@@ -2825,7 +2840,7 @@ mod tests {
                     iterations,
                 )
             };
-            let measure_sve_short = || {
+            let measure_auto_short = || {
                 benchmark_count(
                     |haystack| {
                         dispatched
@@ -2847,7 +2862,7 @@ mod tests {
                     iterations,
                 )
             };
-            let measure_sve_long = || {
+            let measure_auto_long = || {
                 benchmark_count(
                     |haystack| {
                         dispatched
@@ -2860,31 +2875,31 @@ mod tests {
             };
             if sample.is_multiple_of(2) {
                 scalar_short.push(measure_scalar_short());
-                sve_short.push(measure_sve_short());
+                auto_short.push(measure_auto_short());
                 scalar_long.push(measure_scalar_long());
-                sve_long.push(measure_sve_long());
+                auto_long.push(measure_auto_long());
             } else {
-                sve_long.push(measure_sve_long());
+                auto_long.push(measure_auto_long());
                 scalar_long.push(measure_scalar_long());
-                sve_short.push(measure_sve_short());
+                auto_short.push(measure_auto_short());
                 scalar_short.push(measure_scalar_short());
             }
         }
         let scalar_short_ns = median(&scalar_short);
-        let sve_short_ns = median(&sve_short);
+        let auto_short_ns = median(&auto_short);
         let scalar_long_ns = median(&scalar_long);
-        let sve_long_ns = median(&sve_long);
+        let auto_long_ns = median(&auto_long);
         eprintln!(
-            "GUARDED_ASCII_WORD_SVE_BENCH variant={} iterations={iterations} samples={samples} \
+            "GUARDED_ASCII_WORD_AUTO_RUN_BENCH variant={} iterations={iterations} samples={samples} \
              short_bytes={} long_bytes={} scalar_short_ns={scalar_short_ns:.9} \
-             sve_short_ns={sve_short_ns:.9} short_over_scalar={:.9} \
-             scalar_long_ns={scalar_long_ns:.9} sve_long_ns={sve_long_ns:.9} \
-             long_over_scalar={:.9}",
+             auto_short_ns={auto_short_ns:.9} auto_short_over_scalar={:.9} \
+             scalar_long_ns={scalar_long_ns:.9} auto_long_ns={auto_long_ns:.9} \
+             auto_long_over_scalar={:.9}",
             selection.variant_id,
             short_haystack.len(),
             long_haystack.len(),
-            sve_short_ns / scalar_short_ns,
-            sve_long_ns / scalar_long_ns,
+            auto_short_ns / scalar_short_ns,
+            auto_long_ns / scalar_long_ns,
         );
     }
 
