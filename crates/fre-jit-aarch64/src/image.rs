@@ -26,6 +26,13 @@ impl BackendVersion {
     pub const SEARCH_V6: Self = Self(6);
     /// Exact per-lane recovery with ranked, staged four-column filtering.
     pub const SEARCH_V7: Self = Self(7);
+    /// SVE exact-literal screening with exactly sixteen active byte lanes.
+    ///
+    /// Tag 8 remains reserved for the separately developed Search V8 wire
+    /// contract; these opt-in backends do not change [`Self::SEARCH_CURRENT`].
+    pub const SEARCH_SVE16_V1: Self = Self(9);
+    /// SVE2 exact-literal screening with exactly sixteen active byte lanes.
+    pub const SEARCH_SVE2_16_V1: Self = Self(10);
     /// Compatibility name for the original search backend.
     pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
     /// Current search backend and AOT wire contract.
@@ -59,6 +66,18 @@ impl TargetSpec {
         abi: 1,
         features: CpuFeatures::ASIMD,
     };
+
+    /// AAPCS64 plus the complete feature envelope used by SVE16 search.
+    pub const AARCH64_AAPCS64_SVE16: Self = Self {
+        features: CpuFeatures::ASIMD_SVE,
+        ..Self::AARCH64_AAPCS64
+    };
+
+    /// AAPCS64 plus the complete feature envelope used by SVE2-16 search.
+    pub const AARCH64_AAPCS64_SVE2_16: Self = Self {
+        features: CpuFeatures::ASIMD_SVE2,
+        ..Self::AARCH64_AAPCS64
+    };
 }
 
 /// Required architectural feature bitmap.
@@ -68,6 +87,10 @@ pub struct CpuFeatures(u64);
 impl CpuFeatures {
     pub const NONE: Self = Self(0);
     pub const ASIMD: Self = Self(1);
+    pub const SVE: Self = Self(1 << 1);
+    pub const SVE2: Self = Self(1 << 2);
+    pub const ASIMD_SVE: Self = Self(Self::ASIMD.0 | Self::SVE.0);
+    pub const ASIMD_SVE2: Self = Self(Self::ASIMD.0 | Self::SVE.0 | Self::SVE2.0);
 
     #[must_use]
     pub const fn bits(self) -> u64 {
@@ -77,6 +100,11 @@ impl CpuFeatures {
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -515,13 +543,19 @@ impl fmt::Display for ArtifactIdentity {
 pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     // Search v3 and later add an independently authenticated, source-bound
     // semantic envelope. V5 and later include the sealed verification offset;
-    // V7 also includes the sealed fourth ranked offset.
+    // V7 and the fixed-lane SVE backends also include the sealed fourth
+    // ranked offset.
     // Aggregate serialization retains its separate four-byte extension and
     // does not inherit the search wire contract.
     let manifest_bytes = if image.aggregate.is_some() {
         4
     } else if image.search.is_some() {
-        if image.backend_version == BackendVersion::SEARCH_V7 {
+        if matches!(
+            image.backend_version,
+            BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
+        ) {
             54
         } else if matches!(
             image.backend_version,
@@ -564,23 +598,29 @@ fn enforce(resource: ResourceKind, required: usize, limit: u64) -> Result<(), Em
     Ok(())
 }
 
+fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
+    if image.aggregate.is_some() {
+        Ok(b"FREA64A\x01")
+    } else if image.search.is_some() {
+        match image.backend_version {
+            BackendVersion::SEARCH_V3 => Ok(b"FREA64\0\x03"),
+            BackendVersion::SEARCH_V4 => Ok(b"FREA64\0\x04"),
+            BackendVersion::SEARCH_V5 => Ok(b"FREA64\0\x05"),
+            BackendVersion::SEARCH_V6 => Ok(b"FREA64\0\x06"),
+            BackendVersion::SEARCH_V7 => Ok(b"FREA64\0\x07"),
+            BackendVersion::SEARCH_SVE16_V1 => Ok(b"FREA64\0\x09"),
+            BackendVersion::SEARCH_SVE2_16_V1 => Ok(b"FREA64\0\x0a"),
+            _ => Err(EmitError::InternalInvariant),
+        }
+    } else {
+        Ok(b"FREA64\0\x01")
+    }
+}
+
 fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
     let aggregate = image.aggregate;
     let search = image.search;
-    write(if aggregate.is_some() {
-        b"FREA64A\x01"
-    } else if search.is_some() {
-        match image.backend_version {
-            BackendVersion::SEARCH_V3 => b"FREA64\0\x03",
-            BackendVersion::SEARCH_V4 => b"FREA64\0\x04",
-            BackendVersion::SEARCH_V5 => b"FREA64\0\x05",
-            BackendVersion::SEARCH_V6 => b"FREA64\0\x06",
-            BackendVersion::SEARCH_V7 => b"FREA64\0\x07",
-            _ => return Err(EmitError::InternalInvariant),
-        }
-    } else {
-        b"FREA64\0\x01"
-    });
+    write(aot_magic(image)?);
     write(&image.backend_version.0.to_le_bytes());
     write(&[
         image.target.architecture,
@@ -616,11 +656,20 @@ fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), 
         write(&manifest.secondary_offset.to_le_bytes());
         if matches!(
             image.backend_version,
-            BackendVersion::SEARCH_V5 | BackendVersion::SEARCH_V6 | BackendVersion::SEARCH_V7
+            BackendVersion::SEARCH_V5
+                | BackendVersion::SEARCH_V6
+                | BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
         ) {
             write(&manifest.verification_offset.to_le_bytes());
         }
-        if image.backend_version == BackendVersion::SEARCH_V7 {
+        if matches!(
+            image.backend_version,
+            BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
+        ) {
             write(&manifest.quaternary_offset.to_le_bytes());
         }
         write(manifest.source_identity.as_bytes());

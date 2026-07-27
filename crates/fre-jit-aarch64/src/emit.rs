@@ -23,6 +23,9 @@ const EXACT_RELOCATION_RESERVE: usize = 64;
 const V7_EXACT_CODE_RESERVE: usize = 1_536;
 const V7_EXACT_LABEL_RESERVE: usize = 48;
 const V7_EXACT_RELOCATION_RESERVE: usize = 96;
+const SVE16_EXACT_CODE_RESERVE: usize = 1_536;
+const SVE16_EXACT_LABEL_RESERVE: usize = 48;
+const SVE16_EXACT_RELOCATION_RESERVE: usize = 96;
 const CLASS_RELOCATION_RESERVE: usize = 96;
 const AGGREGATE_CODE_RESERVE: usize = 1_600;
 const AGGREGATE_LABEL_RESERVE: usize = 48;
@@ -31,6 +34,8 @@ const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
 const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
 const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
 const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
+const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 
@@ -98,6 +103,30 @@ pub fn emit<O: Operation>(
     emit_search_version(program, limits, BackendVersion::SEARCH_CURRENT)
 }
 
+/// Emit the opt-in SVE search backend with exactly sixteen active byte lanes.
+///
+/// The physical architectural vector length may be larger; emitted code uses
+/// `PTRUE ..., VL16` and never changes thread vector-length state. This
+/// backend admits only non-empty, unanchored exact literals. [`emit`] remains
+/// the deterministic Search V7 default for every shape.
+pub fn emit_sve16<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+) -> Result<NativeImage, EmitError> {
+    emit_search_version(program, limits, BackendVersion::SEARCH_SVE16_V1)
+}
+
+/// Emit the opt-in SVE2 backend with exactly sixteen active byte lanes.
+///
+/// Candidate comparison uses the SVE2-only `MATCH` instruction, so the image
+/// carries an explicit SVE2 feature requirement.
+pub fn emit_sve2_16<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+) -> Result<NativeImage, EmitError> {
+    emit_search_version(program, limits, BackendVersion::SEARCH_SVE2_16_V1)
+}
+
 #[cfg(test)]
 pub(crate) fn emit_search_version_for_test<O: Operation>(
     program: &ValidatedProgram<O>,
@@ -125,6 +154,8 @@ fn emit_search_version<O: Operation>(
             | BackendVersion::SEARCH_V5
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
+            | BackendVersion::SEARCH_SVE16_V1
+            | BackendVersion::SEARCH_SVE2_16_V1
     ) {
         return Err(EmitError::InternalInvariant);
     }
@@ -144,6 +175,20 @@ fn emit_search_version<O: Operation>(
         });
     }
     let plan = Plan::recognize(program)?;
+    if matches!(
+        backend_version,
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+    ) && !plan.is_unanchored_nonempty_exact()
+    {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
+    let sve_confirmation_features = if plan.uses_asimd_confirmation() {
+        CpuFeatures::ASIMD
+    } else {
+        CpuFeatures::NONE
+    };
     let mut meter = WorkMeter::new(limits.max_emission_work);
     let v7_policy_scan_admission = plan.admit_v7_policy_scans(backend_version, &mut meter)?;
     let search_manifest = plan.search_manifest(
@@ -207,10 +252,15 @@ fn emit_search_version<O: Operation>(
     let image = NativeImage {
         backend_version,
         target: TargetSpec {
-            features: if finalized.vector_instructions == 0 {
-                CpuFeatures::NONE
-            } else {
-                CpuFeatures::ASIMD
+            features: match backend_version {
+                BackendVersion::SEARCH_SVE16_V1 => {
+                    CpuFeatures::SVE.union(sve_confirmation_features)
+                }
+                BackendVersion::SEARCH_SVE2_16_V1 => CpuFeatures::SVE
+                    .union(CpuFeatures::SVE2)
+                    .union(sve_confirmation_features),
+                _ if finalized.vector_instructions == 0 => CpuFeatures::NONE,
+                _ => CpuFeatures::ASIMD,
             },
             ..TargetSpec::AARCH64_AAPCS64
         },
@@ -231,6 +281,8 @@ fn emit_search_version<O: Operation>(
                 | BackendVersion::SEARCH_V5
                 | BackendVersion::SEARCH_V6
                 | BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
         )
         .then_some(search_manifest),
         aggregate: None,
@@ -724,6 +776,23 @@ mod v7_policy_scan_admission {
 use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
+    const fn is_unanchored_nonempty_exact(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal: [_, ..],
+                anchors: AnchorFlags {
+                    start: false,
+                    end: false
+                }
+            }
+        )
+    }
+
+    const fn uses_asimd_confirmation(self) -> bool {
+        matches!(self, Self::Exact { literal, .. } if literal.len() >= 16)
+    }
+
     fn recognize<O: Operation>(program: &'a ValidatedProgram<O>) -> Result<Self, EmitError> {
         let raw = program.raw();
         let mut literal = None;
@@ -788,6 +857,18 @@ impl<'a> Plan<'a> {
                 labels: V7_EXACT_LABEL_RESERVE,
                 relocations: V7_EXACT_RELOCATION_RESERVE,
             },
+            Self::Exact { .. }
+                if matches!(
+                    backend_version,
+                    BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+                ) =>
+            {
+                Capacities {
+                    code: SVE16_EXACT_CODE_RESERVE,
+                    labels: SVE16_EXACT_LABEL_RESERVE,
+                    relocations: SVE16_EXACT_RELOCATION_RESERVE,
+                }
+            }
             Self::Exact { .. } => Capacities {
                 code: EXACT_CODE_RESERVE,
                 labels: EXACT_LABEL_RESERVE,
@@ -809,8 +890,12 @@ impl<'a> Plan<'a> {
         let Self::Exact { literal, anchors } = self else {
             return Ok(None);
         };
-        if backend_version != BackendVersion::SEARCH_V7
-            || anchors.start
+        if !matches!(
+            backend_version,
+            BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
+        ) || anchors.start
             || anchors.end
             || literal.is_empty()
         {
@@ -842,7 +927,12 @@ impl<'a> Plan<'a> {
                         return Err(EmitError::InternalInvariant);
                     }
                     None
-                } else if backend_version == BackendVersion::SEARCH_V7 {
+                } else if matches!(
+                    backend_version,
+                    BackendVersion::SEARCH_V7
+                        | BackendVersion::SEARCH_SVE16_V1
+                        | BackendVersion::SEARCH_SVE2_16_V1
+                ) {
                     Some(
                         v7_policy_scan_admission
                             .ok_or(EmitError::InternalInvariant)?
@@ -919,7 +1009,15 @@ impl<'a> Plan<'a> {
             ),
             |offsets| {
                 (
-                    if backend_version == BackendVersion::SEARCH_V7
+                    if backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_SVE2_16_V1
+                    } else if backend_version == BackendVersion::SEARCH_SVE16_V1
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_SVE16_V1
+                    } else if backend_version == BackendVersion::SEARCH_V7
                         && shape == SearchShape::ExactLiteral
                     {
                         SEARCH_CANDIDATE_POLICY_V3
@@ -1117,6 +1215,19 @@ fn emit_exact(
                 secondary_offset,
                 verification_offset,
                 quaternary_offset,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1 => {
+            emit_vector_candidate_skip_sve16(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                backend_version,
                 none,
                 found,
             )?;
@@ -1808,6 +1919,109 @@ fn emit_vector_candidate_skip_v7(
     assembler.branch(tail_setup)?;
 
     assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the authenticated ranked offsets and differentiated backend tag are explicit inputs to the fixed-lane SVE graph"
+)]
+fn emit_vector_candidate_skip_sve16(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    backend_version: BackendVersion,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let tail = assembler.new_label(LabelKind::SlowPath)?;
+    let offsets = [
+        Some(primary_offset),
+        secondary_offset,
+        verification_offset,
+        quaternary_offset,
+    ];
+
+    // P0 is deliberately limited to sixteen byte lanes. This contract is
+    // independent of the thread's physical architectural VL and does not
+    // mutate any process or thread vector-length state.
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let Some(offset) = offset else {
+            continue;
+        };
+        let constant = u8::try_from(
+            index
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(EmitError::InternalInvariant)?,
+        )
+        .map_err(|_| EmitError::InternalInvariant)?;
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.sve_duplicate_byte(constant, X11)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail)?;
+    assembler.add_reg(X15, X9, X5)?;
+
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let Some(offset) = offset else {
+            continue;
+        };
+        let loaded = u8::try_from(index.checked_mul(2).ok_or(EmitError::InternalInvariant)?)
+            .map_err(|_| EmitError::InternalInvariant)?;
+        let constant = loaded.checked_add(1).ok_or(EmitError::InternalInvariant)?;
+        let result_predicate = if index == 0 { 1 } else { 2 };
+        let base = if offset == 0 {
+            X15
+        } else {
+            assembler.add_imm(X10, X15, offset)?;
+            X10
+        };
+        assembler.sve_load_bytes(loaded, 0, base)?;
+        if backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            assembler.sve2_match_bytes(result_predicate, 0, loaded, constant)?;
+        } else {
+            assembler.sve_compare_equal_bytes(result_predicate, 0, loaded, constant)?;
+        }
+        if index != 0 {
+            assembler.sve_and_predicate_bytes(1, 0, 1, result_predicate)?;
+        }
+        assembler.sve_test_predicate_bytes(0, 1)?;
+        assembler.branch_cond(Condition::Equal, advance)?;
+    }
+
+    // P3 contains exactly the active lanes preceding the first candidate.
+    // CNTP therefore materializes that candidate's zero-based lane index
+    // without assuming anything about inactive lanes above VL16.
+    assembler.sve_break_before_bytes(3, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X10, 0, 3)?;
+    assembler.add_reg(X13, X5, X10)?;
+    assembler.add_reg(X15, X9, X13)?;
+    emit_literal_equality_with_vectors(assembler, X15, X8, literal.len(), candidate_miss, 0, 2)?;
+    assembler.add_reg(X14, X13, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.add_imm(X5, X13, 1)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(tail)?;
     emit_scalar_candidates_legacy(assembler, literal, true, none, found)
 }
 
@@ -3000,6 +3214,128 @@ impl Assembler {
     fn dup_byte16(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
         self.emit_word(
             0x4e01_0c00 | reg_field(source, 5) | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_ptrue_bytes_vl16(&mut self, destination: u8) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15);
+        self.emit_word(0x2518_e120 | u32::from(destination), true)
+    }
+
+    fn sve_duplicate_byte(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
+        self.emit_word(
+            0x0520_3800 | reg_field(source, 5) | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_load_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        base: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(predicate <= 7);
+        self.emit_word(
+            0xa400_a000
+                | (u32::from(predicate) << 10)
+                | reg_field(base, 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_compare_equal_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7);
+        self.emit_word(
+            0x2400_a000
+                | reg_field(right, 16)
+                | (u32::from(predicate) << 10)
+                | reg_field(left, 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve2_match_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7);
+        self.emit_word(
+            0x4520_8000
+                | reg_field(right, 16)
+                | (u32::from(predicate) << 10)
+                | reg_field(left, 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_and_predicate_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7 && left <= 15 && right <= 15);
+        self.emit_word(
+            0x2500_4000
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_test_predicate_bytes(&mut self, predicate: u8, tested: u8) -> Result<(), EmitError> {
+        debug_assert!(predicate <= 7 && tested <= 15);
+        self.emit_word(
+            0x2550_c000 | (u32::from(predicate) << 10) | (u32::from(tested) << 5),
+            true,
+        )
+    }
+
+    fn sve_break_before_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7 && source <= 15);
+        self.emit_word(
+            0x2590_4000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_count_predicate_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(predicate <= 7 && source <= 15);
+        self.emit_word(
+            0x2520_8000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
             true,
         )
     }

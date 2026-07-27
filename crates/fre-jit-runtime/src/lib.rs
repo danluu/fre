@@ -280,7 +280,7 @@ fn preflight<O: RuntimeOperation>(image: &NativeImage) -> Result<(), PublishErro
     {
         return Err(PublishError::TargetMismatch);
     }
-    let known_features = CpuFeatures::ASIMD.bits();
+    let known_features = CpuFeatures::ASIMD_SVE2.bits();
     if target.features.bits() & !known_features != 0 {
         return Err(PublishError::UnknownCpuFeatures {
             bits: target.features.bits(),
@@ -288,6 +288,12 @@ fn preflight<O: RuntimeOperation>(image: &NativeImage) -> Result<(), PublishErro
     }
     if target.features.contains(CpuFeatures::ASIMD) && !platform::has_asimd() {
         return Err(PublishError::CpuFeatureUnavailable { feature: "asimd" });
+    }
+    if target.features.contains(CpuFeatures::SVE) && !platform::has_sve() {
+        return Err(PublishError::CpuFeatureUnavailable { feature: "sve" });
+    }
+    if target.features.contains(CpuFeatures::SVE2) && !platform::has_sve2() {
+        return Err(PublishError::CpuFeatureUnavailable { feature: "sve2" });
     }
     if image.output() != O::KIND {
         return Err(PublishError::OutputContractMismatch {
@@ -339,7 +345,9 @@ fn preflight_search_backend_version(image: &NativeImage) -> Result<(), PublishEr
         | BackendVersion::SEARCH_V4
         | BackendVersion::SEARCH_V5
         | BackendVersion::SEARCH_V6
-        | BackendVersion::SEARCH_V7 => Ok(()),
+        | BackendVersion::SEARCH_V7
+        | BackendVersion::SEARCH_SVE16_V1
+        | BackendVersion::SEARCH_SVE2_16_V1 => Ok(()),
         actual => Err(PublishError::BackendVersionMismatch {
             expected: BackendVersion::SEARCH_CURRENT.0,
             actual: actual.0,

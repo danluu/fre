@@ -117,6 +117,14 @@ pub(crate) fn has_asimd() -> bool {
     implementation::has_asimd()
 }
 
+pub(crate) fn has_sve() -> bool {
+    implementation::has_sve()
+}
+
+pub(crate) fn has_sve2() -> bool {
+    implementation::has_sve2()
+}
+
 pub(crate) fn publish(
     image: &NativeImage,
     plan: PublicationPlan,

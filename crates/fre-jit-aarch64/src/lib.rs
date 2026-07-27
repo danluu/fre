@@ -28,7 +28,9 @@ pub use abi::{
 };
 pub use audit::{AuditError, AuditReport, audit, audit_aggregate};
 pub use decode::{Condition, DecodeError, DecodedInstruction, decode, decode_one};
-pub use emit::{EmitLimits, MAX_REPEATED_CONFIRM_BYTES, emit, emit_exact_aggregate};
+pub use emit::{
+    EmitLimits, MAX_REPEATED_CONFIRM_BYTES, emit, emit_exact_aggregate, emit_sve2_16, emit_sve16,
+};
 pub use error::{
     ArithmeticSite, BranchKind, ConfirmationKind, EmitError, ResourceKind, UnsupportedReason,
 };

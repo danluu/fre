@@ -24,6 +24,166 @@ fn native_test_lock() -> MutexGuard<'static, ()> {
     NATIVE_TEST_LOCK.lock().expect("native test lock")
 }
 
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+#[ignore = "qualification receipt: requires a native Linux host with SVE2"]
+fn fixed_16_sve_qualification_receipt() {
+    use std::{hint::black_box, time::Instant};
+
+    use fre_jit_aarch64::{NativeImage, emit_sve2_16, emit_sve16};
+
+    const HAYSTACK_BYTES: usize = 1 << 20;
+    const ITERATIONS: usize = 64;
+
+    fn measure(
+        kernel: &crate::PublishedKernel<Span>,
+        haystack: &[u8],
+        iterations: usize,
+    ) -> (u128, usize) {
+        let window = SearchWindow::new(0, haystack.len());
+        let started = Instant::now();
+        let mut checksum = 0_usize;
+        for _ in 0..iterations {
+            let found = kernel
+                .search(black_box(haystack), black_box(window))
+                .expect("native qualification call")
+                .expect("qualification haystack contains the literal");
+            checksum ^= black_box(found.start());
+        }
+        (started.elapsed().as_nanos(), checksum)
+    }
+
+    fn instruction_mix(image: &NativeImage) -> (usize, usize, usize) {
+        let instructions = decode(image.code()).expect("audited image decodes");
+        (
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_asimd())
+                .count(),
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_sve())
+                .count(),
+            instructions
+                .iter()
+                .filter(|instruction| instruction.is_sve2())
+                .count(),
+        )
+    }
+
+    let _lock = native_test_lock();
+    println!(
+        "fre_sve16_receipt,backend,width,code_bytes,rodata_bytes,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
+    );
+    for width in [1_usize, 3, 15, 16, 17, 31, 32] {
+        let literal: Vec<u8> = (0..width)
+            .map(|index| {
+                u8::try_from(index)
+                    .expect("qualification widths fit u8")
+                    .wrapping_mul(37)
+                    .wrapping_add(11)
+            })
+            .collect();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("qualification program");
+        let images = [
+            ("asimd_v7", emit(&program, EmitLimits::default())),
+            ("sve16", emit_sve16(&program, EmitLimits::default())),
+            ("sve2_16", emit_sve2_16(&program, EmitLimits::default())),
+        ];
+        let mut haystack = vec![0xe7; HAYSTACK_BYTES];
+        let expected_start = HAYSTACK_BYTES
+            .checked_sub(width)
+            .and_then(|value| value.checked_sub(31))
+            .expect("bounded qualification dimensions");
+        haystack[expected_start..expected_start + width].copy_from_slice(&literal);
+
+        for (backend, image) in images {
+            let image = image.expect("qualification image");
+            let kernel = publish::<Span>(&image, PublicationLimits::default())
+                .expect("host must advertise every qualification backend");
+            let found = kernel
+                .search(&haystack, SearchWindow::new(0, haystack.len()))
+                .expect("qualification correctness call")
+                .expect("qualification match");
+            assert_eq!(found.start(), expected_start);
+            assert_eq!(found.end(), expected_start + width);
+
+            let (asimd, sve, sve2) = instruction_mix(&image);
+            let (elapsed_ns, checksum) = measure(&kernel, &haystack, ITERATIONS);
+            println!(
+                "fre_sve16_receipt,{backend},{width},{},{},{asimd},{sve},{sve2},{ITERATIONS},{HAYSTACK_BYTES},{elapsed_ns},{checksum},{:?}",
+                image.code().len(),
+                image.rodata().len(),
+                kernel.identity()
+            );
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+fn fixed_16_sve_native_execution_matches_v7() {
+    use fre_jit_aarch64::{emit_sve2_16, emit_sve16};
+
+    if !platform::has_sve() || !platform::has_sve2() {
+        eprintln!("skipped: Linux auxv does not advertise SVE2");
+        return;
+    }
+    let _lock = native_test_lock();
+    for width in [1_usize, 3, 15, 16, 17, 31, 32] {
+        let literal: Vec<u8> = (0..width)
+            .map(|index| {
+                u8::try_from(index)
+                    .expect("native test widths fit u8")
+                    .wrapping_mul(37)
+                    .wrapping_add(11)
+            })
+            .collect();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("native SVE test program");
+        let images = [
+            emit(&program, EmitLimits::default()).expect("V7 image"),
+            emit_sve16(&program, EmitLimits::default()).expect("SVE16 image"),
+            emit_sve2_16(&program, EmitLimits::default()).expect("SVE2-16 image"),
+        ];
+        for alignment in [0_usize, 1, 15, 16, 31] {
+            let mut storage = vec![0xe7; alignment + 127 + width];
+            let expected_start = alignment + 63;
+            storage[expected_start..expected_start + width].copy_from_slice(&literal);
+            let haystack = &storage[alignment..];
+            let window = SearchWindow::new(0, haystack.len());
+            let expected = program
+                .execute(haystack, window, ExecutionLimits::unlimited())
+                .expect("oracle")
+                .into_output();
+            for image in &images {
+                let kernel = publish::<Span>(image, PublicationLimits::default())
+                    .expect("native SVE publication");
+                assert_eq!(kernel.search(haystack, window), Ok(expected));
+            }
+        }
+    }
+}
+
 #[test]
 fn strict_wx_smoke_matches_kernel_ir() {
     let _lock = native_test_lock();

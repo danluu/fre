@@ -180,6 +180,8 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::SEARCH_V5
                     | BackendVersion::SEARCH_V6
                     | BackendVersion::SEARCH_V7
+                    | BackendVersion::SEARCH_SVE16_V1
+                    | BackendVersion::SEARCH_SVE2_16_V1
             )
             && self.aggregate.is_none()
             && self.output == expected_output
@@ -187,8 +189,10 @@ impl Mapping for ExecutableMapping {
             && self.target.little_endian == expected.little_endian
             && self.target.pointer_width == expected.pointer_width
             && self.target.abi == expected.abi
-            && self.target.features.bits() & !CpuFeatures::ASIMD.bits() == 0
+            && self.target.features.bits() & !CpuFeatures::ASIMD_SVE2.bits() == 0
             && (!self.target.features.contains(CpuFeatures::ASIMD) || has_asimd())
+            && (!self.target.features.contains(CpuFeatures::SVE) || has_sve())
+            && (!self.target.features.contains(CpuFeatures::SVE2) || has_sve2())
     }
 
     fn invoke(&self, haystack: &[u8], window: SearchWindow) -> Result<RawCallResult, CallError> {
@@ -324,6 +328,14 @@ pub(crate) fn page_size() -> Result<usize, PublishError> {
 
 pub(crate) fn has_asimd() -> bool {
     host::has_asimd()
+}
+
+pub(crate) fn has_sve() -> bool {
+    host::has_sve()
+}
+
+pub(crate) fn has_sve2() -> bool {
+    host::has_sve2()
 }
 
 #[derive(Clone, Copy)]

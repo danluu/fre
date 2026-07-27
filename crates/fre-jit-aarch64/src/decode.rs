@@ -174,6 +174,50 @@ pub enum DecodedInstruction {
         destination: u8,
         source: u8,
     },
+    SvePtrueBytesVl16 {
+        destination: u8,
+    },
+    SveDuplicateByte {
+        destination: u8,
+        source: u8,
+    },
+    SveLoadBytes {
+        destination: u8,
+        predicate: u8,
+        base: u8,
+    },
+    SveCompareEqualBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    Sve2MatchBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveAndPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveTestPredicateBytes {
+        predicate: u8,
+        tested: u8,
+    },
+    SveBreakBeforeBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
+    SveCountPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
     LogicalShiftRightVariable64 {
         destination: u8,
         source: u8,
@@ -207,7 +251,7 @@ pub enum DecodedInstruction {
 }
 
 impl DecodedInstruction {
-    /// Whether this instruction uses baseline Advanced SIMD.
+    /// Whether this instruction uses any Advanced SIMD or SVE vector state.
     #[must_use]
     pub const fn is_vector(self) -> bool {
         matches!(
@@ -223,7 +267,58 @@ impl DecodedInstruction {
                 | Self::AddAcrossBytes16 { .. }
                 | Self::MoveVectorByteTo32 { .. }
                 | Self::MoveVectorDoubleTo64 { .. }
+                | Self::SvePtrueBytesVl16 { .. }
+                | Self::SveDuplicateByte { .. }
+                | Self::SveLoadBytes { .. }
+                | Self::SveCompareEqualBytes { .. }
+                | Self::Sve2MatchBytes { .. }
+                | Self::SveAndPredicateBytes { .. }
+                | Self::SveTestPredicateBytes { .. }
+                | Self::SveBreakBeforeBytes { .. }
+                | Self::SveCountPredicateBytes { .. }
         )
+    }
+
+    /// Whether this instruction specifically requires baseline Advanced SIMD.
+    #[must_use]
+    pub const fn is_asimd(self) -> bool {
+        matches!(
+            self,
+            Self::LoadVector128 { .. }
+                | Self::DuplicateByte16 { .. }
+                | Self::CompareEqualBytes16 { .. }
+                | Self::AndBytes16 { .. }
+                | Self::ShiftRightNarrowHalfwordsToBytes8 { .. }
+                | Self::UnsignedMinBytes16 { .. }
+                | Self::UnsignedMaxBytes16 { .. }
+                | Self::UnsignedMaxPairwiseBytes16 { .. }
+                | Self::AddAcrossBytes16 { .. }
+                | Self::MoveVectorByteTo32 { .. }
+                | Self::MoveVectorDoubleTo64 { .. }
+        )
+    }
+
+    /// Whether this instruction requires SVE (including SVE2 instructions).
+    #[must_use]
+    pub const fn is_sve(self) -> bool {
+        matches!(
+            self,
+            Self::SvePtrueBytesVl16 { .. }
+                | Self::SveDuplicateByte { .. }
+                | Self::SveLoadBytes { .. }
+                | Self::SveCompareEqualBytes { .. }
+                | Self::Sve2MatchBytes { .. }
+                | Self::SveAndPredicateBytes { .. }
+                | Self::SveTestPredicateBytes { .. }
+                | Self::SveBreakBeforeBytes { .. }
+                | Self::SveCountPredicateBytes { .. }
+        )
+    }
+
+    /// Whether this instruction requires an SVE2-only encoding.
+    #[must_use]
+    pub const fn is_sve2(self) -> bool {
+        matches!(self, Self::Sve2MatchBytes { .. })
     }
 
     /// Direct PC-relative target displacement, if any.
@@ -262,6 +357,7 @@ impl DecodedInstruction {
             | Self::Load64RegisterScaled { destination, .. }
             | Self::MoveVectorByteTo32 { destination, .. }
             | Self::MoveVectorDoubleTo64 { destination, .. }
+            | Self::SveCountPredicateBytes { destination, .. }
             | Self::LogicalShiftRightVariable64 { destination, .. }
             | Self::ReverseBits64 { destination, .. }
             | Self::CountLeadingZeros64 { destination, .. }
@@ -280,6 +376,14 @@ impl DecodedInstruction {
             | Self::UnsignedMaxBytes16 { .. }
             | Self::UnsignedMaxPairwiseBytes16 { .. }
             | Self::AddAcrossBytes16 { .. }
+            | Self::SvePtrueBytesVl16 { .. }
+            | Self::SveDuplicateByte { .. }
+            | Self::SveLoadBytes { .. }
+            | Self::SveCompareEqualBytes { .. }
+            | Self::Sve2MatchBytes { .. }
+            | Self::SveAndPredicateBytes { .. }
+            | Self::SveTestPredicateBytes { .. }
+            | Self::SveBreakBeforeBytes { .. }
             | Self::Branch { .. }
             | Self::BranchCondition { .. }
             | Self::CompareBranchZero64 { .. }
@@ -490,6 +594,59 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
         DecodedInstruction::MoveVectorDoubleTo64 {
             destination: rd,
             source: rn,
+        }
+    } else if word & 0xffff_fff0 == 0x2518_e120 {
+        DecodedInstruction::SvePtrueBytesVl16 {
+            destination: predicate(word),
+        }
+    } else if word & 0xffff_fc00 == 0x0520_3800 {
+        DecodedInstruction::SveDuplicateByte {
+            destination: rd,
+            source: rn,
+        }
+    } else if word & 0xffff_e000 == 0xa400_a000 {
+        DecodedInstruction::SveLoadBytes {
+            destination: rd,
+            predicate: governing_predicate(word),
+            base: rn,
+        }
+    } else if word & 0xffe0_e010 == 0x2400_a000 {
+        DecodedInstruction::SveCompareEqualBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xffe0_e010 == 0x4520_8000 {
+        DecodedInstruction::Sve2MatchBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: rn,
+            right: rm,
+        }
+    } else if word & 0xfff0_e210 == 0x2500_4000 {
+        DecodedInstruction::SveAndPredicateBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
+    } else if word & 0xffff_e21f == 0x2550_c000 {
+        DecodedInstruction::SveTestPredicateBytes {
+            predicate: governing_predicate(word),
+            tested: predicate(word >> 5),
+        }
+    } else if word & 0xffff_e210 == 0x2590_4000 {
+        DecodedInstruction::SveBreakBeforeBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            source: predicate(word >> 5),
+        }
+    } else if word & 0xffff_e200 == 0x2520_8000 {
+        DecodedInstruction::SveCountPredicateBytes {
+            destination: rd,
+            predicate: governing_predicate(word),
+            source: predicate(word >> 5),
         }
     } else if word & 0xffe0_fc00 == 0x9ac0_2400 {
         DecodedInstruction::LogicalShiftRightVariable64 {
@@ -736,6 +893,82 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             destination,
             source,
         } => 0x9e66_0000 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::SvePtrueBytesVl16 { destination } => {
+            0x2518_e120 | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveDuplicateByte {
+            destination,
+            source,
+        } => 0x0520_3800 | field(source, 5)? | field(destination, 0)?,
+        DecodedInstruction::SveLoadBytes {
+            destination,
+            predicate,
+            base,
+        } => {
+            0xa400_a000
+                | governing_predicate_field(predicate)?
+                | field(base, 5)?
+                | field(destination, 0)?
+        }
+        DecodedInstruction::SveCompareEqualBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2400_a000
+                | field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x4520_8000
+                | field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveAndPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2500_4000
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+            0x2550_c000 | governing_predicate_field(predicate)? | predicate_field(tested, 5)?
+        }
+        DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        } => {
+            0x2590_4000
+                | governing_predicate_field(predicate)?
+                | predicate_field(source, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveCountPredicateBytes {
+            destination,
+            predicate,
+            source,
+        } => {
+            0x2520_8000
+                | governing_predicate_field(predicate)?
+                | predicate_field(source, 5)?
+                | field(destination, 0)?
+        }
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination,
             source,
@@ -781,6 +1014,14 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
 
 fn field(value: u8, shift: u8) -> Option<u32> {
     (value < 32).then(|| u32::from(value) << shift)
+}
+
+fn predicate_field(value: u8, shift: u8) -> Option<u32> {
+    (value < 16).then(|| u32::from(value) << shift)
+}
+
+fn governing_predicate_field(value: u8) -> Option<u32> {
+    (value < 8).then(|| u32::from(value) << 10)
 }
 
 fn immediate_field(value: u16, bits: u8, shift: u8) -> Option<u32> {
@@ -844,6 +1085,14 @@ fn decode_bitfield(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeE
 
 fn reg(word: u32) -> u8 {
     u8::try_from(word & 0x1f).expect("five-bit field")
+}
+
+fn predicate(word: u32) -> u8 {
+    u8::try_from(word & 0xf).expect("four-bit predicate field")
+}
+
+fn governing_predicate(word: u32) -> u8 {
+    u8::try_from((word >> 10) & 7).expect("three-bit governing predicate field")
 }
 
 fn imm12(word: u32) -> u16 {

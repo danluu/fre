@@ -11,15 +11,48 @@ const CTR_EL0_DMINLINE_SHIFT: u32 = 16;
 const CTR_EL0_IDC: usize = 1 << 28;
 const CTR_EL0_DIC: usize = 1 << 29;
 
-static HAS_ASIMD: OnceLock<bool> = OnceLock::new();
+// Linux UAPI values from asm/hwcap.h and linux/auxvec.h. The pinned libc
+// exposes HWCAP_SVE but does not expose the SVE2 selector and bit on every
+// supported toolchain.
+const AT_HWCAP2: libc::c_ulong = 26;
+const HWCAP2_SVE2: libc::c_ulong = 1 << 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostFeatures {
+    asimd: bool,
+    sve: bool,
+    sve2: bool,
+}
+
+static HOST_FEATURES: OnceLock<HostFeatures> = OnceLock::new();
+
+fn host_features() -> HostFeatures {
+    *HOST_FEATURES.get_or_init(|| {
+        // SAFETY: `getauxval` takes scalar selectors with no pointer contract.
+        let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        // SAFETY: `AT_HWCAP2` is the Linux UAPI scalar selector.
+        let hwcap2 = unsafe { libc::getauxval(AT_HWCAP2) };
+        let sve = hwcap & libc::HWCAP_SVE != 0;
+        HostFeatures {
+            asimd: hwcap & libc::HWCAP_ASIMD != 0,
+            sve,
+            // SVE2 architecturally depends on SVE. Preserve that dependency
+            // even if a malformed or virtualized auxv advertises only SVE2.
+            sve2: sve && hwcap2 & HWCAP2_SVE2 != 0,
+        }
+    })
+}
 
 pub(super) fn has_asimd() -> bool {
-    *HAS_ASIMD.get_or_init(|| {
-        // SAFETY: `getauxval` takes a scalar selector. `AT_HWCAP` is provided
-        // by the pinned libc for Linux/AArch64 and has no pointer contract.
-        let capabilities = unsafe { libc::getauxval(libc::AT_HWCAP) };
-        capabilities & libc::HWCAP_ASIMD != 0
-    })
+    host_features().asimd
+}
+
+pub(super) fn has_sve() -> bool {
+    host_features().sve
+}
+
+pub(super) fn has_sve2() -> bool {
+    host_features().sve2
 }
 
 /// Synchronize one initialized code range before its entry becomes callable.
@@ -163,9 +196,16 @@ pub(super) fn query_protection(pointer: usize) -> Result<i32, PublishError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn cached_asimd_detection_matches_linux_auxv() {
-        // SAFETY: `getauxval` takes only the scalar `AT_HWCAP` selector.
-        let capabilities = unsafe { libc::getauxval(libc::AT_HWCAP) };
-        assert_eq!(super::has_asimd(), capabilities & libc::HWCAP_ASIMD != 0);
+    fn cached_feature_detection_matches_linux_auxv() {
+        // SAFETY: `getauxval` takes only scalar auxv selectors.
+        let hwcap = unsafe { libc::getauxval(libc::AT_HWCAP) };
+        // SAFETY: `AT_HWCAP2` is the Linux UAPI scalar selector.
+        let hwcap2 = unsafe { libc::getauxval(super::AT_HWCAP2) };
+        assert_eq!(super::has_asimd(), hwcap & libc::HWCAP_ASIMD != 0);
+        assert_eq!(super::has_sve(), hwcap & libc::HWCAP_SVE != 0);
+        assert_eq!(
+            super::has_sve2(),
+            super::has_sve() && hwcap2 & super::HWCAP2_SVE2 != 0
+        );
     }
 }

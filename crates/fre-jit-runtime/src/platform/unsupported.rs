@@ -63,6 +63,14 @@ pub(crate) const fn has_asimd() -> bool {
     false
 }
 
+pub(crate) const fn has_sve() -> bool {
+    false
+}
+
+pub(crate) const fn has_sve2() -> bool {
+    false
+}
+
 pub(crate) fn publish(
     _image: &NativeImage,
     _plan: PublicationPlan,

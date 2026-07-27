@@ -34,6 +34,14 @@ pub(super) const fn has_asimd() -> bool {
     true
 }
 
+pub(super) const fn has_sve() -> bool {
+    false
+}
+
+pub(super) const fn has_sve2() -> bool {
+    false
+}
+
 /// Synchronize one initialized code range before its entry becomes callable.
 ///
 /// # Safety

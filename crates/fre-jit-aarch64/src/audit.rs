@@ -234,7 +234,9 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V4
         | BackendVersion::SEARCH_V5
         | BackendVersion::SEARCH_V6
-        | BackendVersion::SEARCH_V7 => Ok(image.backend_version),
+        | BackendVersion::SEARCH_V7
+        | BackendVersion::SEARCH_SVE16_V1
+        | BackendVersion::SEARCH_SVE2_16_V1 => Ok(image.backend_version),
         actual => Err(AuditError::SearchBackendVersionMismatch {
             expected: BackendVersion::SEARCH_CURRENT.0,
             actual: actual.0,
@@ -262,6 +264,8 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V5
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
+            | BackendVersion::SEARCH_SVE16_V1
+            | BackendVersion::SEARCH_SVE2_16_V1
     ) {
         let manifest = validate_sealed_search_manifest(image)?;
         let literal = authenticate_search_manifest(image, manifest, work)?;
@@ -541,6 +545,8 @@ const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
 const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
 const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
 const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
+const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 
@@ -584,9 +590,12 @@ fn authenticate_search_candidate_policy(
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary) = if manifest.backend_version
-                    == BackendVersion::SEARCH_V7
-                {
+                let (verification, quaternary) = if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_V7
+                        | BackendVersion::SEARCH_SVE16_V1
+                        | BackendVersion::SEARCH_SVE2_16_V1
+                ) {
                     independent_ranked_verification_offsets(literal, primary, secondary)
                 } else {
                     (
@@ -637,7 +646,15 @@ fn authenticate_search_candidate_policy(
         ),
         |(primary, secondary, verification, quaternary)| {
             (
-                if manifest.backend_version == BackendVersion::SEARCH_V7
+                if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_SVE2_16_V1
+                } else if manifest.backend_version == BackendVersion::SEARCH_SVE16_V1
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_SVE16_V1
+                } else if manifest.backend_version == BackendVersion::SEARCH_V7
                     && manifest.shape == SearchShape::ExactLiteral
                 {
                     SEARCH_CANDIDATE_POLICY_V3
@@ -2069,6 +2086,7 @@ fn audit_impl(
         stores: 0,
         returns: 0,
     };
+    let mut required_features = CpuFeatures::NONE;
     let mut relocation_index = 0_usize;
     if instructions.len() != image.code.len() / 4 {
         return Err(AuditError::InvalidLayout);
@@ -2100,6 +2118,15 @@ fn audit_impl(
                 .vector_instructions
                 .checked_add(1)
                 .ok_or(AuditError::ArithmeticOverflow)?;
+        }
+        if instruction.is_asimd() {
+            required_features = required_features.union(CpuFeatures::ASIMD);
+        }
+        if instruction.is_sve() {
+            required_features = required_features.union(CpuFeatures::SVE);
+        }
+        if instruction.is_sve2() {
+            required_features = required_features.union(CpuFeatures::SVE2);
         }
         let result_pointer = match store_contract {
             StoreContract::Search => 4,
@@ -2240,8 +2267,7 @@ fn audit_impl(
             .map_or(u32::MAX, |relocation| relocation.code_offset);
         return Err(AuditError::UnexpectedRelocation { offset });
     }
-    let needs_vector = report.vector_instructions != 0;
-    if image.target.features.contains(CpuFeatures::ASIMD) != needs_vector
+    if image.target.features != required_features
         || report.vector_instructions != image.stats.vector_instructions
     {
         return Err(AuditError::FeatureMismatch);
@@ -3414,6 +3440,7 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         }
         | DecodedInstruction::MoveVectorByteTo32 { destination, .. }
         | DecodedInstruction::MoveVectorDoubleTo64 { destination, .. }
+        | DecodedInstruction::SveCountPredicateBytes { destination, .. }
         | DecodedInstruction::Address { destination, .. }
         | DecodedInstruction::CompareBranchZero64 {
             register: destination,
@@ -3484,7 +3511,9 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
             index,
         } => forbidden(&[destination, base, index]),
         DecodedInstruction::Store64 { source, base, .. } => forbidden(&[source, base]),
-        DecodedInstruction::DuplicateByte16 { source, .. } => forbidden(&[source]),
+        DecodedInstruction::DuplicateByte16 { source, .. }
+        | DecodedInstruction::SveDuplicateByte { source, .. } => forbidden(&[source]),
+        DecodedInstruction::SveLoadBytes { base, .. } => forbidden(&[base]),
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination,
             source,
@@ -3497,6 +3526,12 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         | DecodedInstruction::UnsignedMaxBytes16 { .. }
         | DecodedInstruction::UnsignedMaxPairwiseBytes16 { .. }
         | DecodedInstruction::AddAcrossBytes16 { .. }
+        | DecodedInstruction::SvePtrueBytesVl16 { .. }
+        | DecodedInstruction::SveCompareEqualBytes { .. }
+        | DecodedInstruction::Sve2MatchBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveTestPredicateBytes { .. }
+        | DecodedInstruction::SveBreakBeforeBytes { .. }
         | DecodedInstruction::Branch { .. }
         | DecodedInstruction::BranchCondition { .. }
         | DecodedInstruction::Return => None,
@@ -3506,6 +3541,9 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
 fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) -> Option<u8> {
     fn forbidden(registers: &[u8]) -> Option<u8> {
         registers.iter().copied().find(|&register| register > 5)
+    }
+    if instruction.is_sve() {
+        return Some(0);
     }
     match instruction {
         DecodedInstruction::LoadVector128 { destination, .. }
@@ -3547,6 +3585,10 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned ASIMD, SVE vector, and SVE predicate ABI policy is kept exhaustive in one gate"
+)]
 fn first_forbidden_search_vector_register(
     instruction: DecodedInstruction,
     backend_version: BackendVersion,
@@ -3557,9 +3599,21 @@ fn first_forbidden_search_vector_register(
                 && !(backend_version == BackendVersion::SEARCH_V7 && matches!(register, 16 | 17))
         })
     }
+    fn forbidden_predicates(registers: &[u8]) -> Option<u8> {
+        registers.iter().copied().find(|&register| register > 3)
+    }
+    if instruction.is_sve()
+        && !matches!(
+            backend_version,
+            BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+        )
+    {
+        return Some(0);
+    }
     match instruction {
         DecodedInstruction::LoadVector128 { destination, .. }
-        | DecodedInstruction::DuplicateByte16 { destination, .. } => {
+        | DecodedInstruction::DuplicateByte16 { destination, .. }
+        | DecodedInstruction::SveDuplicateByte { destination, .. } => {
             forbidden(&[destination], backend_version)
         }
         DecodedInstruction::CompareEqualBytes16 {
@@ -3597,6 +3651,45 @@ fn first_forbidden_search_vector_register(
         | DecodedInstruction::MoveVectorDoubleTo64 { source, .. } => {
             forbidden(&[source], backend_version)
         }
+        DecodedInstruction::SvePtrueBytesVl16 { destination } => {
+            forbidden_predicates(&[destination])
+        }
+        DecodedInstruction::SveLoadBytes {
+            destination,
+            predicate,
+            ..
+        } => forbidden(&[destination], backend_version)
+            .or_else(|| forbidden_predicates(&[predicate])),
+        DecodedInstruction::SveCompareEqualBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => forbidden(&[left, right], backend_version)
+            .or_else(|| forbidden_predicates(&[destination, predicate])),
+        DecodedInstruction::SveAndPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => forbidden_predicates(&[destination, predicate, left, right]),
+        DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+            forbidden_predicates(&[predicate, tested])
+        }
+        DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        } => forbidden_predicates(&[destination, predicate, source]),
+        DecodedInstruction::SveCountPredicateBytes {
+            predicate, source, ..
+        } => forbidden_predicates(&[predicate, source]),
         _ => None,
     }
 }
@@ -4383,7 +4476,9 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
             register_mask(&[base, index])
         }
         DecodedInstruction::Store64 { source, base, .. } => register_mask(&[source, base]),
-        DecodedInstruction::DuplicateByte16 { source, .. } => register_mask(&[source]),
+        DecodedInstruction::DuplicateByte16 { source, .. }
+        | DecodedInstruction::SveDuplicateByte { source, .. } => register_mask(&[source]),
+        DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),
         DecodedInstruction::LogicalShiftRightVariable64 { source, shift, .. } => {
             register_mask(&[source, shift])
         }
@@ -4397,6 +4492,13 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::UnsignedMaxBytes16 { .. }
         | DecodedInstruction::UnsignedMaxPairwiseBytes16 { .. }
         | DecodedInstruction::AddAcrossBytes16 { .. }
+        | DecodedInstruction::SvePtrueBytesVl16 { .. }
+        | DecodedInstruction::SveCompareEqualBytes { .. }
+        | DecodedInstruction::Sve2MatchBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveTestPredicateBytes { .. }
+        | DecodedInstruction::SveBreakBeforeBytes { .. }
+        | DecodedInstruction::SveCountPredicateBytes { .. }
         | DecodedInstruction::Address { .. }
         | DecodedInstruction::Branch { .. }
         | DecodedInstruction::BranchCondition { .. }

@@ -18,7 +18,7 @@ use crate::{
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout, audit,
     audit_aggregate, decode, decode_one, emit, emit::emit_search_version_for_test,
-    emit_exact_aggregate, image::SearchShape,
+    emit_exact_aggregate, emit_sve2_16, emit_sve16, image::SearchShape,
 };
 
 const HAYSTACK_BASE: u64 = 0x0010_0000;
@@ -2840,6 +2840,374 @@ fn v7_rejects_downgrades_and_every_staged_recovery_mutation() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixed-lane semantic matrix keeps widths, windows, backend identities, and oracle comparisons together"
+)]
+fn sve16_backends_are_differentiated_deterministic_and_match_the_oracle() {
+    let mut comparisons = 0_u64;
+    for width in [1_usize, 2, 3, 15, 16, 17, 31, 32] {
+        let literal: Vec<u8> = (0..width)
+            .map(|index| {
+                u8::try_from(index)
+                    .expect("bounded width")
+                    .wrapping_mul(37)
+                    .wrapping_add(11)
+            })
+            .collect();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("SVE exact program");
+        let sve = emit_sve16(&program, EmitLimits::default()).expect("SVE16 image");
+        let sve_repeat = emit_sve16(&program, EmitLimits::default()).expect("repeat SVE16 image");
+        let sve2 = emit_sve2_16(&program, EmitLimits::default()).expect("SVE2-16 image");
+        assert_eq!(sve, sve_repeat);
+        assert_eq!(sve.backend_version(), BackendVersion::SEARCH_SVE16_V1);
+        assert_eq!(sve2.backend_version(), BackendVersion::SEARCH_SVE2_16_V1);
+        assert_eq!(BackendVersion::SEARCH_CURRENT, BackendVersion::SEARCH_V7);
+        assert_eq!(
+            sve.search_manifest()
+                .expect("SVE manifest")
+                .candidate_policy_version,
+            5
+        );
+        assert_eq!(
+            sve2.search_manifest()
+                .expect("SVE2 manifest")
+                .candidate_policy_version,
+            6
+        );
+        let expected_asimd = width >= 16;
+        for image in [&sve, &sve2] {
+            let report = audit(image).expect("independent SVE whole-template audit");
+            assert!(report.vector_instructions > 0);
+            assert_eq!(
+                image.target().features.contains(CpuFeatures::ASIMD),
+                expected_asimd
+            );
+            assert!(image.target().features.contains(CpuFeatures::SVE));
+            assert_eq!(
+                image.target().features.contains(CpuFeatures::SVE2),
+                image.backend_version() == BackendVersion::SEARCH_SVE2_16_V1
+            );
+        }
+        let baseline_instructions = decode(sve.code()).expect("SVE decode");
+        let match_instructions = decode(sve2.code()).expect("SVE2 decode");
+        assert!(baseline_instructions.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstruction::SvePtrueBytesVl16 { destination: 0 }
+        )));
+        assert!(baseline_instructions.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstruction::SveCompareEqualBytes { .. }
+        )));
+        assert!(
+            !baseline_instructions
+                .iter()
+                .any(|instruction| instruction.is_sve2())
+        );
+        assert!(
+            match_instructions.iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstruction::Sve2MatchBytes { .. }
+            ))
+        );
+        assert!(!match_instructions.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstruction::SveCompareEqualBytes { .. }
+        )));
+        assert_eq!(
+            &sve.to_aot(AotLimits::default()).unwrap().as_bytes()[..8],
+            b"FREA64\0\x09"
+        );
+        assert_eq!(
+            &sve2.to_aot(AotLimits::default()).unwrap().as_bytes()[..8],
+            b"FREA64\0\x0a"
+        );
+
+        let mut haystacks = vec![
+            Vec::new(),
+            literal.clone(),
+            vec![0x55; width.saturating_sub(1)],
+            vec![literal[0]; 79],
+        ];
+        for start in [0_usize, 1, 15, 16, 17, 31, 32, 63] {
+            let mut haystack = vec![literal[0]; start + width + 19];
+            for candidate in (0..start).step_by(3) {
+                let available = haystack.len().saturating_sub(candidate).min(width);
+                haystack[candidate..candidate + available].copy_from_slice(&literal[..available]);
+                if available == width {
+                    haystack[candidate + width - 1] ^= 1;
+                }
+            }
+            haystack[start..start + width].copy_from_slice(&literal);
+            haystacks.push(haystack);
+        }
+        for haystack in &haystacks {
+            for (start, end) in [
+                (0, haystack.len()),
+                (0, haystack.len().saturating_sub(1)),
+                (haystack.len().min(1), haystack.len()),
+            ] {
+                let window = SearchWindow::new(start, end);
+                let expected = program
+                    .execute(haystack, window, ExecutionLimits::unlimited())
+                    .expect("oracle execution")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                for image in [&sve, &sve2] {
+                    let actual =
+                        simulate(image, haystack, start, end).expect("fixed-lane SVE ISA model");
+                    assert_eq!(
+                        span_output(actual),
+                        expected,
+                        "backend={:?} width={width} haystack_len={} window={start}..{end}",
+                        image.backend_version(),
+                        haystack.len()
+                    );
+                    comparisons = comparisons.checked_add(1).expect("bounded matrix");
+                }
+            }
+        }
+    }
+    assert_eq!(comparisons, 576);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "admission, feature, relabeling, and every SVE1 operand mutation form one fail-closed contract"
+)]
+fn sve16_admission_features_relabels_and_operands_fail_closed() {
+    let literal = b"0123456789abcdef";
+    let span =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("SVE mutation program");
+    let canonical = emit_sve16(&span, EmitLimits::default()).expect("canonical SVE");
+    let canonical_sve2 = emit_sve2_16(&span, EmitLimits::default()).expect("canonical SVE2");
+
+    let empty = build_exact_literal::<Span>(b"", AnchorFlags::default(), ValidateLimits::default())
+        .expect("empty exact");
+    let anchored = build_exact_literal::<Span>(
+        literal,
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        ValidateLimits::default(),
+    )
+    .expect("anchored exact");
+    for refused in [
+        emit_sve16(&empty, EmitLimits::default()),
+        emit_sve2_16(&empty, EmitLimits::default()),
+        emit_sve16(&anchored, EmitLimits::default()),
+        emit_sve2_16(&anchored, EmitLimits::default()),
+    ] {
+        assert_eq!(
+            refused,
+            Err(EmitError::Unsupported {
+                reason: crate::UnsupportedReason::KernelShape
+            })
+        );
+    }
+
+    for (feature, description) in [
+        (CpuFeatures::ASIMD, "missing SVE"),
+        (CpuFeatures::SVE, "missing ASIMD"),
+        (CpuFeatures::ASIMD_SVE2, "extra SVE2"),
+    ] {
+        let mut image = canonical.clone();
+        image.target.features = feature;
+        reseal_test_image(&mut image);
+        assert_eq!(
+            audit(&image),
+            Err(AuditError::FeatureMismatch),
+            "{description}"
+        );
+    }
+
+    let mut sve_as_sve2 = canonical.clone();
+    sve_as_sve2.backend_version = BackendVersion::SEARCH_SVE2_16_V1;
+    sve_as_sve2.target.features = CpuFeatures::ASIMD_SVE2;
+    {
+        let manifest = sve_as_sve2.search.as_mut().expect("SVE manifest");
+        manifest.backend_version = BackendVersion::SEARCH_SVE2_16_V1;
+        manifest.candidate_policy_version = 6;
+    }
+    assert_resealed_search_rejected(sve_as_sve2, "SVE code relabeled SVE2");
+
+    let mut sve2_as_sve = canonical_sve2.clone();
+    sve2_as_sve.backend_version = BackendVersion::SEARCH_SVE16_V1;
+    sve2_as_sve.target.features = CpuFeatures::ASIMD_SVE;
+    {
+        let manifest = sve2_as_sve.search.as_mut().expect("SVE2 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_SVE16_V1;
+        manifest.candidate_policy_version = 5;
+    }
+    assert_resealed_search_rejected(sve2_as_sve, "SVE2 code relabeled SVE");
+
+    let decoded = decode(canonical.code()).expect("canonical SVE decode");
+    for (index, instruction) in decoded.into_iter().enumerate() {
+        let replacement = match instruction {
+            DecodedInstruction::SvePtrueBytesVl16 { destination } => {
+                Some(DecodedInstruction::SvePtrueBytesVl16 {
+                    destination: destination ^ 1,
+                })
+            }
+            DecodedInstruction::SveDuplicateByte {
+                destination,
+                source,
+            } => Some(DecodedInstruction::SveDuplicateByte {
+                destination: destination ^ 2,
+                source,
+            }),
+            DecodedInstruction::SveLoadBytes {
+                destination,
+                predicate,
+                base,
+            } => Some(DecodedInstruction::SveLoadBytes {
+                destination,
+                predicate,
+                base: base ^ 1,
+            }),
+            DecodedInstruction::SveCompareEqualBytes {
+                destination,
+                predicate,
+                left,
+                right,
+            } => Some(DecodedInstruction::SveCompareEqualBytes {
+                destination: destination ^ 1,
+                predicate,
+                left,
+                right,
+            }),
+            DecodedInstruction::SveAndPredicateBytes {
+                destination,
+                predicate,
+                left,
+                right,
+            } => Some(DecodedInstruction::SveAndPredicateBytes {
+                destination,
+                predicate: predicate ^ 1,
+                left,
+                right,
+            }),
+            DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+                Some(DecodedInstruction::SveTestPredicateBytes {
+                    predicate,
+                    tested: tested ^ 1,
+                })
+            }
+            DecodedInstruction::SveBreakBeforeBytes {
+                destination,
+                predicate,
+                source,
+            } => Some(DecodedInstruction::SveBreakBeforeBytes {
+                destination,
+                predicate,
+                source: source ^ 1,
+            }),
+            DecodedInstruction::SveCountPredicateBytes {
+                destination,
+                predicate,
+                source,
+            } => Some(DecodedInstruction::SveCountPredicateBytes {
+                destination: destination ^ 1,
+                predicate,
+                source,
+            }),
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            let mut image = canonical.clone();
+            replace_test_decoded_at(&mut image, index, replacement);
+            assert_resealed_search_rejected(image, "SVE operand mutation");
+        }
+    }
+}
+
+#[test]
+fn sve2_operands_and_non_vl16_predicate_patterns_fail_closed() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("SVE2 mutation program");
+    let canonical = emit_sve2_16(&program, EmitLimits::default()).expect("canonical SVE2 image");
+    let instructions = decode(canonical.code()).expect("canonical SVE2 decode");
+    let (match_index, matched) = instructions
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, instruction)| matches!(instruction, DecodedInstruction::Sve2MatchBytes { .. }))
+        .expect("SVE2 backend contains MATCH");
+    let DecodedInstruction::Sve2MatchBytes {
+        destination,
+        predicate,
+        left,
+        right,
+    } = matched
+    else {
+        unreachable!("MATCH search above fixes the variant");
+    };
+    for replacement in [
+        DecodedInstruction::Sve2MatchBytes {
+            destination: destination ^ 1,
+            predicate,
+            left,
+            right,
+        },
+        DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate: predicate ^ 1,
+            left,
+            right,
+        },
+        DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left: left ^ 2,
+            right,
+        },
+        DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left,
+            right: right ^ 2,
+        },
+    ] {
+        let mut image = canonical.clone();
+        replace_test_decoded_at(&mut image, match_index, replacement);
+        assert_resealed_search_rejected(image, "SVE2 MATCH operand mutation");
+    }
+
+    let mut non_vl16 = canonical;
+    let ptrue_offset = decoded_position(non_vl16.code(), |instruction| {
+        matches!(
+            instruction,
+            DecodedInstruction::SvePtrueBytesVl16 { destination: 0 }
+        )
+    });
+    let ptrue_end = ptrue_offset.checked_add(4).expect("small code offset");
+    let bytes = non_vl16
+        .code
+        .get_mut(ptrue_offset..ptrue_end)
+        .expect("PTRUE word");
+    let mut word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // PTRUE's pattern is bits 9:5. Toggle VL16 (pattern 9) to VL8
+    // (pattern 8); this remains architectural but is outside this contract.
+    word ^= 1 << 5;
+    bytes.copy_from_slice(&word.to_le_bytes());
+    reseal_test_image(&mut non_vl16);
+    assert!(decode(non_vl16.code()).is_err());
+    assert!(audit(&non_vl16).is_err());
+}
+
+#[test]
 fn v6_sparse_recovery_widths_authenticate_for_every_output() {
     for width in [1_usize, 15, 17, 31, 32] {
         let mut literal = vec![b'a'; width];
@@ -4692,6 +5060,75 @@ fn decoder_matches_independently_assembled_instruction_words() {
                 displacement: -148,
             },
         ),
+        (
+            0x2518_e120,
+            DecodedInstruction::SvePtrueBytesVl16 { destination: 0 },
+        ),
+        (
+            0x0520_3967,
+            DecodedInstruction::SveDuplicateByte {
+                destination: 7,
+                source: 11,
+            },
+        ),
+        (
+            0xa400_a146,
+            DecodedInstruction::SveLoadBytes {
+                destination: 6,
+                predicate: 0,
+                base: 10,
+            },
+        ),
+        (
+            0x2407_a0c2,
+            DecodedInstruction::SveCompareEqualBytes {
+                destination: 2,
+                predicate: 0,
+                left: 6,
+                right: 7,
+            },
+        ),
+        (
+            0x4527_80c2,
+            DecodedInstruction::Sve2MatchBytes {
+                destination: 2,
+                predicate: 0,
+                left: 6,
+                right: 7,
+            },
+        ),
+        (
+            0x2502_4021,
+            DecodedInstruction::SveAndPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+        ),
+        (
+            0x2550_c020,
+            DecodedInstruction::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 1,
+            },
+        ),
+        (
+            0x2590_4023,
+            DecodedInstruction::SveBreakBeforeBytes {
+                destination: 3,
+                predicate: 0,
+                source: 1,
+            },
+        ),
+        (
+            0x2520_806a,
+            DecodedInstruction::SveCountPredicateBytes {
+                destination: 10,
+                predicate: 0,
+                source: 3,
+            },
+        ),
     ];
     for (word, expected) in fixtures {
         let decoded = decode_one(word, 0).expect("known clang word");
@@ -5349,6 +5786,7 @@ fn simulate(
     let mut machine = SimMachine {
         registers: [0; 32],
         vectors: [[0; 16]; 32],
+        predicates: [0; 16],
         zero: false,
         carry: false,
         pc: 0,
@@ -5375,6 +5813,7 @@ fn simulate_aggregate(
     let mut machine = SimMachine {
         registers: [0; 32],
         vectors: [[0; 16]; 32],
+        predicates: [0; 16],
         zero: false,
         carry: false,
         pc: 0,
@@ -5393,6 +5832,7 @@ fn simulate_aggregate(
 struct SimMachine<'a> {
     registers: [u64; 32],
     vectors: [[u8; 16]; 32],
+    predicates: [u16; 16],
     zero: bool,
     carry: bool,
     pc: u32,
@@ -5577,6 +6017,10 @@ impl SimMachine<'_> {
                 DecodedInstruction::DuplicateByte16 {
                     destination,
                     source,
+                }
+                | DecodedInstruction::SveDuplicateByte {
+                    destination,
+                    source,
                 } => {
                     let byte = u8::try_from(self.get(source) & 0xff).expect("masked byte");
                     self.vectors[usize::from(destination)] = [byte; 16];
@@ -5683,6 +6127,108 @@ impl SimMachine<'_> {
                             .expect("fixed vector prefix"),
                     ),
                 ),
+                DecodedInstruction::SvePtrueBytesVl16 { destination } => {
+                    self.predicates[usize::from(destination)] = u16::MAX;
+                }
+                DecodedInstruction::SveLoadBytes {
+                    destination,
+                    predicate,
+                    base,
+                } => {
+                    let active = self.predicates[usize::from(predicate)];
+                    let address = self.get(base);
+                    let mut result = [0_u8; 16];
+                    for (lane, value) in result.iter_mut().enumerate() {
+                        if active & (1_u16 << lane) != 0 {
+                            *value = self.load(
+                                address
+                                    .checked_add(
+                                        u64::try_from(lane).map_err(|_| SimError::Arithmetic)?,
+                                    )
+                                    .ok_or(SimError::Arithmetic)?,
+                                1,
+                            )?[0];
+                        }
+                    }
+                    self.vectors[usize::from(destination)] = result;
+                }
+                DecodedInstruction::SveCompareEqualBytes {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    let active = self.predicates[usize::from(predicate)];
+                    let mut result = 0_u16;
+                    for lane in 0..16 {
+                        if active & (1_u16 << lane) != 0
+                            && self.vectors[usize::from(left)][lane]
+                                == self.vectors[usize::from(right)][lane]
+                        {
+                            result |= 1_u16 << lane;
+                        }
+                    }
+                    self.predicates[usize::from(destination)] = result;
+                }
+                DecodedInstruction::Sve2MatchBytes {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    let active = self.predicates[usize::from(predicate)];
+                    let right = self.vectors[usize::from(right)];
+                    let mut result = 0_u16;
+                    for lane in 0..16 {
+                        if active & (1_u16 << lane) != 0
+                            && right.contains(&self.vectors[usize::from(left)][lane])
+                        {
+                            result |= 1_u16 << lane;
+                        }
+                    }
+                    self.predicates[usize::from(destination)] = result;
+                }
+                DecodedInstruction::SveAndPredicateBytes {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    self.predicates[usize::from(destination)] = self.predicates
+                        [usize::from(predicate)]
+                        & self.predicates[usize::from(left)]
+                        & self.predicates[usize::from(right)];
+                }
+                DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+                    self.zero = self.predicates[usize::from(predicate)]
+                        & self.predicates[usize::from(tested)]
+                        == 0;
+                }
+                DecodedInstruction::SveBreakBeforeBytes {
+                    destination,
+                    predicate,
+                    source,
+                } => {
+                    let active = self.predicates[usize::from(predicate)];
+                    let matches = active & self.predicates[usize::from(source)];
+                    let before = if matches == 0 {
+                        u16::MAX
+                    } else {
+                        let first = matches.trailing_zeros();
+                        1_u16.checked_shl(first).unwrap_or(0).wrapping_sub(1)
+                    };
+                    self.predicates[usize::from(destination)] = active & before;
+                }
+                DecodedInstruction::SveCountPredicateBytes {
+                    destination,
+                    predicate,
+                    source,
+                } => {
+                    let count = (self.predicates[usize::from(predicate)]
+                        & self.predicates[usize::from(source)])
+                    .count_ones();
+                    self.set(destination, u64::from(count));
+                }
                 DecodedInstruction::LogicalShiftRightVariable64 {
                     destination,
                     source,

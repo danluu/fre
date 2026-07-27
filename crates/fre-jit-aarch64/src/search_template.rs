@@ -297,6 +297,72 @@ impl Template {
         });
     }
 
+    fn sve_ptrue_bytes_vl16(&mut self, destination: u8) {
+        self.push(DecodedInstruction::SvePtrueBytesVl16 { destination });
+    }
+
+    fn sve_duplicate_byte(&mut self, destination: u8, source: u8) {
+        self.push(DecodedInstruction::SveDuplicateByte {
+            destination,
+            source,
+        });
+    }
+
+    fn sve_load_bytes(&mut self, destination: u8, predicate: u8, base: u8) {
+        self.push(DecodedInstruction::SveLoadBytes {
+            destination,
+            predicate,
+            base,
+        });
+    }
+
+    fn sve_compare_equal_bytes(&mut self, destination: u8, predicate: u8, left: u8, right: u8) {
+        self.push(DecodedInstruction::SveCompareEqualBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        });
+    }
+
+    fn sve2_match_bytes(&mut self, destination: u8, predicate: u8, left: u8, right: u8) {
+        self.push(DecodedInstruction::Sve2MatchBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        });
+    }
+
+    fn sve_and_predicate_bytes(&mut self, destination: u8, predicate: u8, left: u8, right: u8) {
+        self.push(DecodedInstruction::SveAndPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        });
+    }
+
+    fn sve_test_predicate_bytes(&mut self, predicate: u8, tested: u8) {
+        self.push(DecodedInstruction::SveTestPredicateBytes { predicate, tested });
+    }
+
+    fn sve_break_before_bytes(&mut self, destination: u8, predicate: u8, source: u8) {
+        self.push(DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        });
+    }
+
+    fn sve_count_predicate_bytes(&mut self, destination: u8, predicate: u8, source: u8) {
+        self.push(DecodedInstruction::SveCountPredicateBytes {
+            destination,
+            predicate,
+            source,
+        });
+    }
+
     fn rbit(&mut self, destination: u8, source: u8) {
         self.push(DecodedInstruction::ReverseBits64 {
             destination,
@@ -615,6 +681,9 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_V7 => {
             emit_exact_candidates_v7(template, manifest, literal, none, found)
+        }
+        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1 => {
+            emit_exact_candidates_sve16(template, manifest, literal, none, found)
         }
         _ => Err(AuditError::InvalidSearchManifest),
     }
@@ -1375,6 +1444,97 @@ fn emit_exact_candidates_v7(
     template.branch(tail_setup);
 
     template.bind(tail_setup)?;
+    emit_scalar_candidates_v2(template, literal, none, found)
+}
+
+fn emit_exact_candidates_sve16(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let vector = template.new_label(LabelKind::Loop);
+    let advance = template.new_label(LabelKind::Internal);
+    let candidate_miss = template.new_label(LabelKind::Internal);
+    let tail = template.new_label(LabelKind::SlowPath);
+    let offsets = [
+        Some(manifest.primary_offset),
+        (manifest.secondary_offset != u16::MAX).then_some(manifest.secondary_offset),
+        (manifest.verification_offset != u16::MAX).then_some(manifest.verification_offset),
+        (manifest.quaternary_offset != u16::MAX).then_some(manifest.quaternary_offset),
+    ];
+
+    template.sve_ptrue_bytes_vl16(0);
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let Some(offset) = offset else {
+            continue;
+        };
+        let constant = u8::try_from(
+            index
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(AuditError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| AuditError::ArithmeticOverflow)?;
+        template.load_byte(11, 8, offset);
+        template.sve_duplicate_byte(constant, 11);
+    }
+
+    template.bind(vector)?;
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.sub_reg(10, 6, 5);
+    template.cmp_imm64(10, 15);
+    template.branch_cond(Condition::CarryClear, tail);
+    template.add_reg(15, 9, 5);
+
+    for (index, offset) in offsets.into_iter().enumerate() {
+        let Some(offset) = offset else {
+            continue;
+        };
+        let loaded = u8::try_from(index.checked_mul(2).ok_or(AuditError::ArithmeticOverflow)?)
+            .map_err(|_| AuditError::ArithmeticOverflow)?;
+        let constant = loaded
+            .checked_add(1)
+            .ok_or(AuditError::ArithmeticOverflow)?;
+        let result_predicate = if index == 0 { 1 } else { 2 };
+        let base = if offset == 0 {
+            15
+        } else {
+            template.add_imm(10, 15, offset);
+            10
+        };
+        template.sve_load_bytes(loaded, 0, base);
+        if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1 {
+            template.sve2_match_bytes(result_predicate, 0, loaded, constant);
+        } else {
+            template.sve_compare_equal_bytes(result_predicate, 0, loaded, constant);
+        }
+        if index != 0 {
+            template.sve_and_predicate_bytes(1, 0, 1, result_predicate);
+        }
+        template.sve_test_predicate_bytes(0, 1);
+        template.branch_cond(Condition::Equal, advance);
+    }
+
+    template.sve_break_before_bytes(3, 0, 1);
+    template.sve_count_predicate_bytes(10, 0, 3);
+    template.add_reg(13, 5, 10);
+    template.add_reg(15, 9, 13);
+    emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 0, 2)?;
+    template.add_reg(14, 13, 12);
+    template.branch(found);
+
+    template.bind(candidate_miss)?;
+    template.add_imm(5, 13, 1);
+    template.branch(vector);
+
+    template.bind(advance)?;
+    template.add_imm(5, 5, 16);
+    template.branch(vector);
+
+    template.bind(tail)?;
     emit_scalar_candidates_v2(template, literal, none, found)
 }
 
