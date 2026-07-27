@@ -14,12 +14,16 @@
 //! `Q = max(0, N-A+1)` overlapping anchor starts exist. Restarting one byte
 //! after a rejection makes finder service at most `N + Q*(A-1)`. Adjacent
 //! class probes plus all disjoint maximal runs cost at most `N+Q` logical
-//! classifications. Plans built with a caller-captured SIMD context retain one
-//! compiled ASCII classifier. After a 32-byte scalar proof prefix, full
-//! interior blocks use its construction-selected leaf; a terminating vector
-//! load can inspect at most 31 bytes beyond the logical run, so physical
-//! classifications remain prospectively bounded. Only the opposite literal is
-//! compared for at most `ceil(N/2)` run events.
+//! classifications. On hosts with OS-usable SVE, plans built with a
+//! caller-captured SIMD context retain one compiled directional ASCII run
+//! scanner. Its construction-selected leaf returns both the maximal member-run
+//! length and the exact number of bytes physically classified. A predicate
+//! leaf can inspect at most 15 extra lanes in its terminating load. A
+//! fixed-width leaf probes that block and rescans only through the failure, for
+//! a combined overhead of exactly 16 classifications beyond the logical run on
+//! that path. Other hosts retain the established fixed-width classifier and
+//! scalar proof prefix. Only the opposite literal is compared for at most
+//! `ceil(N/2)` run events.
 //! These bounds, every finder call/candidate, results, persistent owner bytes,
 //! and zero operation scratch are admitted before source access and checked
 //! against cumulative actual counters after execution.
@@ -33,15 +37,16 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
 use fre_simd_kernels::{
-    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
+    AsciiByteSetRunScanner, DispatchPolicy, Feature, SimdDispatchContext,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
-pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v1";
-pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v1";
-pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v1";
+pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v2";
+pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v2";
+pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v2";
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
@@ -57,18 +62,31 @@ const CLASSIFICATION_WORK: usize = 2;
 const LITERAL_COMPARISON_WORK: usize = 2;
 const RUN_WORK: usize = 12;
 const MATCH_WORK: usize = 8;
-// Building the reusable byte-set lookup charges its 128 nibble-column
-// membership probes, two narrow/wide selections, and two installed receipts.
-// This stays independent of how many target variants the dispatcher knows.
-const SIMD_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
+// Building either reusable byte-set lookup charges its 128 nibble-column
+// membership probes. The fixed classifier additionally chooses and records
+// narrow and wide leaves; the run scanner makes one paired-direction choice
+// and records it. These stay independent of the dispatcher's variant count.
+const SIMD_FIXED_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
+const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const SIMD_SCALAR_PROOF_BYTES: usize = ASCII_WIDE_BYTES;
 
-/// Stable identity of the compiled class-scan implementations in one plan.
+/// Stable identity of the compiled class-scan implementation in one plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ClassScanIdentity {
-    pub narrow_variant_id: &'static str,
-    pub wide_variant_id: &'static str,
-    pub wide_delegate_variant_id: Option<&'static str>,
+pub enum ClassScanIdentity {
+    /// Fixed-width classifier retained on hosts without usable SVE.
+    Fixed {
+        narrow_variant_id: &'static str,
+        wide_variant_id: &'static str,
+        wide_delegate_variant_id: Option<&'static str>,
+    },
+    /// Directional maximal-run scanner used on SVE-capable hosts.
+    Run { variant_id: &'static str },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AsciiClassScanner {
+    Fixed(AsciiByteSetClassifier),
+    Run(AsciiByteSetRunScanner),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,7 +435,7 @@ pub struct LiteralClassRunLiteralPlan {
     opposite_literal: Box<[u8]>,
     anchor_kind: Anchor,
     class: ByteClass,
-    ascii_classifier: Option<AsciiByteSetClassifier>,
+    ascii_scanner: Option<AsciiClassScanner>,
     build: BuildAccounting,
 }
 
@@ -482,7 +500,30 @@ impl LiteralClassRunLiteralPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt_inner(Some(dispatch), prefix, ranges, suffix, limits)
+        Self::build_attempt_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            prefix,
+            ranges,
+            suffix,
+            limits,
+        )
+    }
+
+    #[cfg(test)]
+    fn build_with_dispatch_policy<I>(
+        dispatch: SimdDispatchContext,
+        policy: DispatchPolicy,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(Some((dispatch, policy)), prefix, ranges, suffix, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
     }
 
     #[allow(
@@ -490,7 +531,7 @@ impl LiteralClassRunLiteralPlan {
         reason = "construction keeps admission, exact allocation, optional classifier compilation, finder publication, and the terminal receipt in one auditable transaction"
     )]
     fn build_attempt_inner<I>(
-        dispatch: Option<SimdDispatchContext>,
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
         prefix: &[u8],
         mut ranges: I,
         suffix: &[u8],
@@ -566,16 +607,8 @@ impl LiteralClassRunLiteralPlan {
             if class.contains(*suffix.first().ok_or(BuildError::EmptySuffix)?) {
                 return Err(BuildError::SuffixBoundaryInClass);
             }
-            let ascii_classifier = if let Some(dispatch) = dispatch.filter(|_| class.is_ascii()) {
-                work.charge(SIMD_CLASSIFIER_BUILD_WORK)?;
-                Some(
-                    dispatch
-                        .ascii_byte_set_classifier(class.ascii_set(), DispatchPolicy::Auto)
-                        .expect("automatic dispatch always retains a scalar fallback"),
-                )
-            } else {
-                None
-            };
+            let ascii_scanner =
+                build_ascii_scanner(dispatch.filter(|_| class.is_ascii()), class, &mut work)?;
             let work_upper_bound = work.used;
 
             let prefix = copy_literal(prefix, "prefix")?;
@@ -607,7 +640,7 @@ impl LiteralClassRunLiteralPlan {
                 opposite_literal,
                 anchor_kind,
                 class,
-                ascii_classifier,
+                ascii_scanner,
                 build: BuildAccounting {
                     prefix_bytes,
                     suffix_bytes,
@@ -652,15 +685,21 @@ impl LiteralClassRunLiteralPlan {
             prefix_bytes: self.build.prefix_bytes,
             suffix_bytes: self.build.suffix_bytes,
             class_words: self.class.0,
-            class_scan: match self.ascii_classifier {
-                Some(classifier) => {
+            class_scan: match self.ascii_scanner {
+                Some(AsciiClassScanner::Fixed(classifier)) => {
                     let selection = classifier.selection();
                     let narrow = selection.narrow();
                     let wide = selection.wide();
-                    Some(ClassScanIdentity {
+                    Some(ClassScanIdentity::Fixed {
                         narrow_variant_id: narrow.variant_id,
                         wide_variant_id: wide.variant_id,
                         wide_delegate_variant_id: wide.delegate_variant_id,
+                    })
+                }
+                Some(AsciiClassScanner::Run(scanner)) => {
+                    let selection = scanner.selection();
+                    Some(ClassScanIdentity::Run {
+                        variant_id: selection.variant_id,
                     })
                 }
                 None => None,
@@ -764,21 +803,33 @@ impl LiteralClassRunLiteralPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "class run plus adjacent class probes",
                 })?;
-        // A scan must first consume 32 logical class members before it can
-        // issue a vector load. Therefore no more than
-        // `logical_classifications / 32` scans can reach the SIMD loop. Each
-        // such scan has at most one terminating vector whose unused suffix is
-        // at most 31 lanes; all complete vectors are logical run bytes.
-        let classifications = if self.ascii_classifier.is_some() {
-            logical_classifications
+        let classifications = match self.ascii_scanner {
+            // Every anchor occurrence can initiate one run scan. Complete
+            // vectors are logical run bytes. On failure, predicate-native
+            // leaves add at most 15 loaded lanes beyond the logical boundary;
+            // the fixed-width probe plus scalar recovery adds exactly 16.
+            Some(AsciiClassScanner::Run(_)) => logical_classifications
+                .checked_add(
+                    anchor_candidates
+                        .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "SIMD class-run recovery classification bound",
+                        })?,
+                )
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "SIMD class-run physical classification bound",
+                })?,
+            // A fixed classifier first proves 32 scalar members. Therefore no
+            // more than logical/32 scans reach its vector loop, and only one
+            // terminating 32-byte load per such scan can overread the run.
+            Some(AsciiClassScanner::Fixed(_)) => logical_classifications
                 .checked_div(SIMD_SCALAR_PROOF_BYTES)
                 .and_then(|terminating_vectors| terminating_vectors.checked_mul(31))
                 .and_then(|overread| logical_classifications.checked_add(overread))
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "SIMD class-run physical classification bound",
-                })?
-        } else {
-            logical_classifications
+                    computation: "fixed SIMD class-run physical classification bound",
+                })?,
+            None => logical_classifications,
         };
         let literal_comparisons = run_events.checked_mul(opposite_literal_bytes).ok_or(
             ReduceError::ArithmeticOverflow {
@@ -1020,7 +1071,7 @@ impl LiteralClassRunLiteralPlan {
         let Some(run_end) = scan_class_run_forward(
             haystack,
             self.class,
-            self.ascii_classifier.as_ref(),
+            self.ascii_scanner.as_ref(),
             anchor_end,
             actual,
         )?
@@ -1056,7 +1107,7 @@ impl LiteralClassRunLiteralPlan {
         let Some(run_start) = scan_class_run_backward(
             haystack,
             self.class,
-            self.ascii_classifier.as_ref(),
+            self.ascii_scanner.as_ref(),
             anchor_start,
             actual,
         )?
@@ -1083,6 +1134,30 @@ impl LiteralClassRunLiteralPlan {
 enum Operation {
     Count,
     SpanSum,
+}
+
+fn build_ascii_scanner(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    class: ByteClass,
+    work: &mut BuildWork<'_>,
+) -> Result<Option<AsciiClassScanner>, BuildError> {
+    let Some((dispatch, policy)) = dispatch else {
+        return Ok(None);
+    };
+    if dispatch.capabilities().usable().contains(Feature::ArmSve) {
+        work.charge(SIMD_RUN_SCANNER_BUILD_WORK)?;
+        return Ok(Some(AsciiClassScanner::Run(
+            dispatch
+                .ascii_byte_set_run_scanner(class.ascii_set(), policy)
+                .expect("the caller supplied an authentic compatible dispatch policy"),
+        )));
+    }
+    work.charge(SIMD_FIXED_CLASSIFIER_BUILD_WORK)?;
+    Ok(Some(AsciiClassScanner::Fixed(
+        dispatch
+            .ascii_byte_set_classifier(class.ascii_set(), policy)
+            .expect("the caller supplied an authentic compatible dispatch policy"),
+    )))
 }
 
 fn build_class<I>(
@@ -1145,13 +1220,53 @@ where
 fn scan_class_run_forward(
     haystack: &[u8],
     class: ByteClass,
-    classifier: Option<&AsciiByteSetClassifier>,
+    scanner: Option<&AsciiClassScanner>,
     start: usize,
     actual: &mut ReduceActualCounters,
 ) -> Result<Option<usize>, ReduceError> {
-    let Some(classifier) = classifier else {
-        return scan_class_run_forward_scalar(haystack, class, start, actual);
-    };
+    match scanner {
+        Some(AsciiClassScanner::Run(scanner)) => {
+            scan_class_run_forward_direct(haystack, scanner, start, actual)
+        }
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_forward_fixed(haystack, class, classifier, start, actual)
+        }
+        None => scan_class_run_forward_scalar(haystack, class, start, actual),
+    }
+}
+
+fn scan_class_run_forward_direct(
+    haystack: &[u8],
+    scanner: &AsciiByteSetRunScanner,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let remaining = haystack
+        .get(start..)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "forward class run source window",
+        })?;
+    let result = scanner.scan_forward(remaining);
+    charge_classifications(actual, result.examined_bytes())?;
+    let run = result.member_run_len();
+    if run == 0 {
+        return Ok(None);
+    }
+    start
+        .checked_add(run)
+        .map(Some)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "forward class run boundary",
+        })
+}
+
+fn scan_class_run_forward_fixed(
+    haystack: &[u8],
+    class: ByteClass,
+    classifier: &AsciiByteSetClassifier,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
     let mut end = start;
     for _ in 0..SIMD_SCALAR_PROOF_BYTES {
         if end == haystack.len() {
@@ -1224,13 +1339,50 @@ fn scan_class_run_forward_scalar(
 fn scan_class_run_backward(
     haystack: &[u8],
     class: ByteClass,
-    classifier: Option<&AsciiByteSetClassifier>,
+    scanner: Option<&AsciiClassScanner>,
     end: usize,
     actual: &mut ReduceActualCounters,
 ) -> Result<Option<usize>, ReduceError> {
-    let Some(classifier) = classifier else {
-        return scan_class_run_backward_scalar(haystack, class, end, actual);
-    };
+    match scanner {
+        Some(AsciiClassScanner::Run(scanner)) => {
+            scan_class_run_backward_direct(haystack, scanner, end, actual)
+        }
+        Some(AsciiClassScanner::Fixed(classifier)) => {
+            scan_class_run_backward_fixed(haystack, class, classifier, end, actual)
+        }
+        None => scan_class_run_backward_scalar(haystack, class, end, actual),
+    }
+}
+
+fn scan_class_run_backward_direct(
+    haystack: &[u8],
+    scanner: &AsciiByteSetRunScanner,
+    end: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let preceding = haystack.get(..end).ok_or(ReduceError::ArithmeticOverflow {
+        computation: "backward class run source window",
+    })?;
+    let result = scanner.scan_backward(preceding);
+    charge_classifications(actual, result.examined_bytes())?;
+    let run = result.member_run_len();
+    if run == 0 {
+        return Ok(None);
+    }
+    end.checked_sub(run)
+        .map(Some)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "backward class run boundary",
+        })
+}
+
+fn scan_class_run_backward_fixed(
+    haystack: &[u8],
+    class: ByteClass,
+    classifier: &AsciiByteSetClassifier,
+    end: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
     let mut start = end;
     for _ in 0..SIMD_SCALAR_PROOF_BYTES {
         if start == 0 {
@@ -1905,6 +2057,10 @@ mod tests {
         assert_eq!(dispatched.anchor_kind, Anchor::Prefix);
         assert!(scalar.count_identity().class_scan.is_none());
         assert!(dispatched.count_identity().class_scan.is_some());
+        let dispatched_scan = dispatched
+            .count_identity()
+            .class_scan
+            .expect("an ASCII dispatched plan installs a class scanner");
 
         let mut haystack = vec![b'A'];
         haystack.extend(core::iter::repeat_n(b'x', 1_000));
@@ -1917,7 +2073,15 @@ mod tests {
         assert_eq!(dispatched.count, scalar.count);
         assert_eq!(dispatched.count, 1);
         assert_eq!(scalar.accounting.actual.classifications, 1_001);
-        assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+        match dispatched_scan {
+            ClassScanIdentity::Run { .. } => assert!(
+                (1_001..=1_017).contains(&dispatched.accounting.actual.classifications),
+                "the selected run leaf must report its exact physical work"
+            ),
+            ClassScanIdentity::Fixed { .. } => {
+                assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+            }
+        }
         assert!(
             dispatched.accounting.actual.classifications
                 <= dispatched.accounting.upper_bounds.classifications
@@ -1948,6 +2112,10 @@ mod tests {
         .unwrap();
         assert_eq!(scalar.anchor_kind, Anchor::Suffix);
         assert_eq!(dispatched.anchor_kind, Anchor::Suffix);
+        let dispatched_scan = dispatched
+            .span_sum_identity()
+            .class_scan
+            .expect("an ASCII dispatched plan installs a class scanner");
 
         let mut haystack = vec![b'q'; 31];
         haystack.push(b'A');
@@ -1962,7 +2130,15 @@ mod tests {
         assert_eq!(dispatched.span_sum, scalar.span_sum);
         assert_eq!(dispatched.span_sum, 1_003);
         assert_eq!(scalar.accounting.actual.classifications, 1_001);
-        assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+        match dispatched_scan {
+            ClassScanIdentity::Run { .. } => assert!(
+                (1_001..=1_017).contains(&dispatched.accounting.actual.classifications),
+                "the selected run leaf must report its exact physical work"
+            ),
+            ClassScanIdentity::Fixed { .. } => {
+                assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+            }
+        }
         assert!(
             dispatched.accounting.actual.classifications
                 <= dispatched.accounting.upper_bounds.classifications
@@ -2088,26 +2264,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual release-mode paired scalar/SIMD no-regression measurement"]
+    #[ignore = "manual release-mode paired scalar/forced-ISA no-regression measurement"]
     #[allow(
         clippy::too_many_lines,
         reason = "the ignored qualification keeps forward, backward, short-run, and build measurements under one identical paired timing harness"
     )]
     fn measure_dispatched_class_run_scans_against_scalar() {
+        use fre_simd_kernels::{Feature, FeatureSet};
         use std::hint::black_box;
         use std::time::{Duration, Instant};
 
         fn measure(
-            name: &str,
+            scenario: &str,
+            policy: &str,
+            variant: &str,
             batches: u32,
             calls_per_batch: u32,
             mut scalar: impl FnMut() -> u64,
-            mut dispatched: impl FnMut() -> u64,
+            mut candidate: impl FnMut() -> u64,
         ) {
             let mut scalar_elapsed = Duration::ZERO;
-            let mut dispatched_elapsed = Duration::ZERO;
+            let mut candidate_elapsed = Duration::ZERO;
             let mut scalar_checksum = 0_u64;
-            let mut dispatched_checksum = 0_u64;
+            let mut candidate_checksum = 0_u64;
             for batch in 0..batches {
                 let mut time_scalar = || {
                     let start = Instant::now();
@@ -2117,41 +2296,68 @@ mod tests {
                     }
                     scalar_elapsed += start.elapsed();
                 };
-                let mut time_dispatched = || {
+                let mut time_candidate = || {
                     let start = Instant::now();
                     for _ in 0..calls_per_batch {
-                        dispatched_checksum = dispatched_checksum
-                            .wrapping_add(black_box(dispatched()).wrapping_add(1));
+                        candidate_checksum =
+                            candidate_checksum.wrapping_add(black_box(candidate()).wrapping_add(1));
                     }
-                    dispatched_elapsed += start.elapsed();
+                    candidate_elapsed += start.elapsed();
                 };
                 if batch & 1 == 0 {
                     time_scalar();
-                    time_dispatched();
+                    time_candidate();
                 } else {
-                    time_dispatched();
+                    time_candidate();
                     time_scalar();
                 }
             }
-            assert_eq!(scalar_checksum, dispatched_checksum);
+            assert_eq!(scalar_checksum, candidate_checksum);
             eprintln!(
-                "{name}: scalar_ns={} dispatched_ns={} dispatched_over_scalar={:.4}",
+                "LITERAL_CLASS_RUN_BENCH scenario={scenario} policy={policy} \
+                 variant={variant} scalar_ns={} candidate_ns={} candidate_over_scalar={:.6} \
+                 checksum={candidate_checksum}",
                 scalar_elapsed.as_nanos(),
-                dispatched_elapsed.as_nanos(),
-                dispatched_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64()
+                candidate_elapsed.as_nanos(),
+                candidate_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64(),
             );
         }
 
         let dispatch = SimdDispatchContext::capture();
+        let usable = dispatch.capabilities().usable();
+        assert!(
+            usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2),
+            "this qualification benchmark requires an OS-usable SVE2 host"
+        );
+        let mut policies = vec![(
+            "portable",
+            DispatchPolicy::Portable,
+            Some("ascii-byte-set.run.scalar.v1"),
+        )];
+        if usable.contains(Feature::ArmNeon) {
+            policies.push((
+                "neon",
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmNeon)),
+                Some("ascii-byte-set.run.neon.v1"),
+            ));
+        }
+        if usable.contains(Feature::ArmSve) {
+            policies.push((
+                "sve",
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve)),
+                Some("ascii-byte-set.run.sve.v1"),
+            ));
+        }
+        if usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2) {
+            policies.push((
+                "sve2",
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2)),
+                Some("ascii-byte-set.run.sve2-match16.v1"),
+            ));
+        }
+        policies.push(("auto", DispatchPolicy::Auto, None));
+
         let scalar_forward = LiteralClassRunLiteralPlan::build(
-            b"A",
-            [(b'x', b'x')].into_iter(),
-            b"Z",
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
-        let dispatched_forward = LiteralClassRunLiteralPlan::build_with_dispatch(
-            dispatch,
             b"A",
             [(b'x', b'x')].into_iter(),
             b"Z",
@@ -2161,33 +2367,8 @@ mod tests {
         let mut forward_long = vec![b'A'];
         forward_long.extend(core::iter::repeat_n(b'x', (256 << 10) - 2));
         forward_long.push(b'Z');
-        measure(
-            "forward-long",
-            16,
-            4,
-            || {
-                scalar_forward
-                    .count(black_box(&forward_long), ReduceLimits::unlimited())
-                    .unwrap()
-                    .count
-            },
-            || {
-                dispatched_forward
-                    .count(black_box(&forward_long), ReduceLimits::unlimited())
-                    .unwrap()
-                    .count
-            },
-        );
 
         let scalar_backward = LiteralClassRunLiteralPlan::build(
-            b"A",
-            [(b'x', b'x')].into_iter(),
-            b"ZZ",
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
-        let dispatched_backward = LiteralClassRunLiteralPlan::build_with_dispatch(
-            dispatch,
             b"A",
             [(b'x', b'x')].into_iter(),
             b"ZZ",
@@ -2197,74 +2378,144 @@ mod tests {
         let mut backward_long = vec![b'A'];
         backward_long.extend(core::iter::repeat_n(b'x', (256 << 10) - 3));
         backward_long.extend_from_slice(b"ZZ");
-        measure(
-            "backward-long",
-            16,
-            4,
-            || {
-                scalar_backward
-                    .count(black_box(&backward_long), ReduceLimits::unlimited())
-                    .unwrap()
-                    .count
-            },
-            || {
-                dispatched_backward
-                    .count(black_box(&backward_long), ReduceLimits::unlimited())
-                    .unwrap()
-                    .count
-            },
-        );
 
         let short_runs = b"AxZ!AxxZ!AxxxZ!AxxxxZ!".repeat(2_048);
-        measure(
-            "forward-short-runs",
-            32,
-            8,
-            || {
-                scalar_forward
-                    .count(black_box(&short_runs), ReduceLimits::unlimited())
+
+        for (policy_name, policy, expected_variant) in policies {
+            let candidate_forward = LiteralClassRunLiteralPlan::build_with_dispatch_policy(
+                dispatch,
+                policy,
+                b"A",
+                [(b'x', b'x')].into_iter(),
+                b"Z",
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let candidate_backward = LiteralClassRunLiteralPlan::build_with_dispatch_policy(
+                dispatch,
+                policy,
+                b"A",
+                [(b'x', b'x')].into_iter(),
+                b"ZZ",
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let ClassScanIdentity::Run {
+                variant_id: variant,
+            } = candidate_forward
+                .count_identity()
+                .class_scan
+                .expect("an ASCII dispatched plan installs a run scanner")
+            else {
+                panic!("an SVE2 host must install the directional run scanner");
+            };
+            let ClassScanIdentity::Run {
+                variant_id: backward_variant,
+            } = candidate_backward
+                .count_identity()
+                .class_scan
+                .expect("an ASCII dispatched plan installs a run scanner")
+            else {
+                panic!("an SVE2 host must install the directional run scanner");
+            };
+            assert_eq!(backward_variant, variant);
+            if let Some(expected) = expected_variant {
+                assert_eq!(variant, expected, "forced policy {policy_name}");
+            }
+
+            measure(
+                "forward-long",
+                policy_name,
+                variant,
+                16,
+                4,
+                || {
+                    scalar_forward
+                        .count(black_box(&forward_long), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+                || {
+                    candidate_forward
+                        .count(black_box(&forward_long), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+            );
+            measure(
+                "backward-long",
+                policy_name,
+                variant,
+                16,
+                4,
+                || {
+                    scalar_backward
+                        .count(black_box(&backward_long), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+                || {
+                    candidate_backward
+                        .count(black_box(&backward_long), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+            );
+            measure(
+                "forward-short-runs",
+                policy_name,
+                variant,
+                32,
+                8,
+                || {
+                    scalar_forward
+                        .count(black_box(&short_runs), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+                || {
+                    candidate_forward
+                        .count(black_box(&short_runs), ReduceLimits::unlimited())
+                        .unwrap()
+                        .count
+                },
+            );
+            measure(
+                "ascii-plan-build",
+                policy_name,
+                variant,
+                16,
+                256,
+                || {
+                    LiteralClassRunLiteralPlan::build(
+                        black_box(b"A"),
+                        [(b'x', b'x')].into_iter(),
+                        black_box(b"Z"),
+                        BuildLimits::unlimited(),
+                    )
                     .unwrap()
-                    .count
-            },
-            || {
-                dispatched_forward
-                    .count(black_box(&short_runs), ReduceLimits::unlimited())
+                    .build_accounting()
+                    .literal_bytes
+                    .try_into()
                     .unwrap()
-                    .count
-            },
-        );
-        measure(
-            "ascii-plan-build",
-            16,
-            256,
-            || {
-                LiteralClassRunLiteralPlan::build(
-                    black_box(b"A"),
-                    [(b'x', b'x')].into_iter(),
-                    black_box(b"Z"),
-                    BuildLimits::unlimited(),
-                )
-                .unwrap()
-                .build_accounting()
-                .literal_bytes
-                .try_into()
-                .unwrap()
-            },
-            || {
-                LiteralClassRunLiteralPlan::build_with_dispatch(
-                    dispatch,
-                    black_box(b"A"),
-                    [(b'x', b'x')].into_iter(),
-                    black_box(b"Z"),
-                    BuildLimits::unlimited(),
-                )
-                .unwrap()
-                .build_accounting()
-                .literal_bytes
-                .try_into()
-                .unwrap()
-            },
-        );
+                },
+                || {
+                    LiteralClassRunLiteralPlan::build_with_dispatch_policy(
+                        dispatch,
+                        policy,
+                        black_box(b"A"),
+                        [(b'x', b'x')].into_iter(),
+                        black_box(b"Z"),
+                        BuildLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .build_accounting()
+                    .literal_bytes
+                    .try_into()
+                    .unwrap()
+                },
+            );
+        }
     }
 
     #[test]
