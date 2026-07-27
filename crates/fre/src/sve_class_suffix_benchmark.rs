@@ -18,6 +18,7 @@ const SAMPLES: usize = 8;
 const SUFFIX_ALPHABET: &[u8] = b"!bcdefghijklmnopqrstuvwxyz0123456789";
 
 fn measure_portable(plan: &DispatchedRequiredLiteralPlan, haystack: &[u8]) -> (f64, usize) {
+    let iterations = f64::from(u32::try_from(ITERATIONS).expect("small iteration count"));
     let started = Instant::now();
     let mut checksum = 0_usize;
     for _ in 0..ITERATIONS {
@@ -34,12 +35,13 @@ fn measure_portable(plan: &DispatchedRequiredLiteralPlan, haystack: &[u8]) -> (f
             .wrapping_add(black_box(found.1));
     }
     (
-        started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64,
+        started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations,
         checksum,
     )
 }
 
 fn measure_sve2(kernel: &PublishedKernel<Span>, haystack: &[u8]) -> (f64, usize) {
+    let iterations = f64::from(u32::try_from(ITERATIONS).expect("small iteration count"));
     let window = SearchWindow::new(0, haystack.len());
     let started = Instant::now();
     let mut checksum = 0_usize;
@@ -53,7 +55,7 @@ fn measure_sve2(kernel: &PublishedKernel<Span>, haystack: &[u8]) -> (f64, usize)
             .wrapping_add(black_box(found.end()));
     }
     (
-        started.elapsed().as_secs_f64() * 1_000_000_000.0 / ITERATIONS as f64,
+        started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations,
         checksum,
     )
 }

@@ -5346,6 +5346,7 @@ mod tests {
     #[ignore = "native release benchmark; requires OS-usable SVE"]
     #[allow(
         clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
         reason = "the ignored benchmark uses bounded iterations and checksum arithmetic"
     )]
     fn benchmark_forward_ascii_bitset_facade_dispatch_against_established_path() {
