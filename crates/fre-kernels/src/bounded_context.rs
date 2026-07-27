@@ -14,13 +14,23 @@
 //! every literal byte in `MIDDLE`. It scans maximal middle runs once and tests
 //! only the suffix before a right endpoint. Those tests consume disjoint
 //! `LITERAL+RIGHT` regions, bounding literal-byte comparisons by input length.
+//! A caller-captured SIMD context can additionally retain Auto directional
+//! scanners for ASCII prefix, separator/middle, and tail classes on OS-usable
+//! SVE. Each vector entry follows a 16-member scalar proof, and prospective
+//! accounting includes its exact compiled storage, construction work, and
+//! maximum failed-load recovery classifications. Legacy constructors and
+//! non-SVE or non-ASCII classes retain their scalar paths.
 //!
 //! rebar-row:curated/10-bounded-repeat/context@rust/regex
 //! rebar-row:imported/leipzig/ing-whitespace@rust/regex
 
 use core::{fmt, mem::size_of};
 
-use fre_exact_alloc::{CopyError, copy_exact, zeroed_exact};
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize, copy_exact, zeroed_exact};
+use fre_simd_kernels::{
+    ASCII_NARROW_BYTES, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet,
+    AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt, SimdDispatchContext,
+};
 use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
@@ -32,6 +42,12 @@ pub const BOUNDED_AFFIX_PLAN_ID: &str = "bounded-affix-count.direct.v1";
 
 const INTERVAL_BYTES: usize = 12;
 const MIN_FIXED_WIDTH: u32 = 2;
+// One complete ASCII-domain table pass, one paired-direction selection, and
+// one immutable selection receipt.
+const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
+// A failed run scan classifies its boundary once before the scalar control
+// loop consumes that same byte, in addition to the scanner's recovery lanes.
+const SIMD_RUN_MAX_RESCAN_INSPECTIONS: usize = ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD + 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ByteClass {
@@ -116,6 +132,24 @@ impl ByteClass {
 
     fn is_empty(self) -> bool {
         self.words.iter().all(|&word| word == 0)
+    }
+
+    fn ascii_set(self) -> Option<AsciiByteSet> {
+        (self.words[2] == 0 && self.words[3] == 0)
+            .then(|| AsciiByteSet::from_words([self.words[0], self.words[1]]))
+    }
+}
+
+#[derive(Debug)]
+struct RunScanners {
+    prefix: Option<AsciiByteSetRunScanner>,
+    separator: Option<AsciiByteSetRunScanner>,
+    tail: Option<AsciiByteSetRunScanner>,
+}
+
+impl RunScanners {
+    fn selection(scanner: Option<&AsciiByteSetRunScanner>) -> Option<SelectionReceipt> {
+        scanner.map(AsciiByteSetRunScanner::selection)
     }
 }
 
@@ -485,6 +519,26 @@ impl<'a> BuildTraversalBudget<'a> {
         Ok(())
     }
 
+    fn charge(&mut self, amount: usize) -> Result<(), BuildError> {
+        let work = self
+            .work
+            .checked_add(amount)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "build work",
+            })?;
+        if work > self.max_work {
+            return Err(BuildError::WorkLimit {
+                needed: work,
+                limit: self.max_work,
+            });
+        }
+        self.work = work;
+        *self.actual_work = u64::try_from(work).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "actual bounded-context work as u64",
+        })?;
+        Ok(())
+    }
+
     const fn into_totals(self) -> (usize, usize) {
         (self.source_ranges, self.work)
     }
@@ -550,6 +604,7 @@ pub struct BoundedContextPlan {
     tail_width: u32,
     build: BuildAccounting,
     bounded_affix: bool,
+    run_scanners: ExactBoxOrUsize<RunScanners>,
 }
 
 impl BoundedContextPlan {
@@ -592,10 +647,121 @@ impl BoundedContextPlan {
     /// Build the bounded-context route with exact observed construction effects.
     #[allow(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
-        reason = "construction keeps the complete admitted shape, exact attempt accounting, and publication adjacent"
+        reason = "the admitted bounded-context shape has four independent bounds and three classes"
     )]
     pub fn build_attempt<Prefix, Separator, Tail>(
+        prefix: Prefix,
+        separator: Separator,
+        tail: Tail,
+        literal: &[u8],
+        prefix_width: u32,
+        left_gap_max: u32,
+        right_gap_max: u32,
+        tail_width: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Prefix: IntoIterator<Item = (u8, u8)>,
+        Separator: IntoIterator<Item = (u8, u8)>,
+        Tail: IntoIterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(
+            None,
+            prefix,
+            separator,
+            tail,
+            literal,
+            prefix_width,
+            left_gap_max,
+            right_gap_max,
+            tail_width,
+            limits,
+        )
+    }
+
+    /// Build with one caller-captured capability snapshot and retain Auto
+    /// directional scanners for eligible ASCII classes on OS-usable SVE.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the admitted bounded-context shape has four independent bounds and three classes"
+    )]
+    pub fn build_with_dispatch<Prefix, Separator, Tail>(
+        dispatch: SimdDispatchContext,
+        prefix: Prefix,
+        separator: Separator,
+        tail: Tail,
+        literal: &[u8],
+        prefix_width: u32,
+        left_gap_max: u32,
+        right_gap_max: u32,
+        tail_width: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        Prefix: IntoIterator<Item = (u8, u8)>,
+        Separator: IntoIterator<Item = (u8, u8)>,
+        Tail: IntoIterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_with_dispatch(
+            dispatch,
+            prefix,
+            separator,
+            tail,
+            literal,
+            prefix_width,
+            left_gap_max,
+            right_gap_max,
+            tail_width,
+            limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build with a pre-captured dispatch context while retaining exact
+    /// successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the admitted bounded-context shape has four independent bounds and three classes"
+    )]
+    pub fn build_attempt_with_dispatch<Prefix, Separator, Tail>(
+        dispatch: SimdDispatchContext,
+        prefix: Prefix,
+        separator: Separator,
+        tail: Tail,
+        literal: &[u8],
+        prefix_width: u32,
+        left_gap_max: u32,
+        right_gap_max: u32,
+        tail_width: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Prefix: IntoIterator<Item = (u8, u8)>,
+        Separator: IntoIterator<Item = (u8, u8)>,
+        Tail: IntoIterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            prefix,
+            separator,
+            tail,
+            literal,
+            prefix_width,
+            left_gap_max,
+            right_gap_max,
+            tail_width,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "construction keeps the complete admitted shape, exact attempt accounting, optional scanner compilation, and publication adjacent"
+    )]
+    fn build_attempt_inner<Prefix, Separator, Tail>(
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
         prefix: Prefix,
         separator: Separator,
         tail: Tail,
@@ -645,12 +811,12 @@ impl BoundedContextPlan {
                     limit: limits.max_literal_bytes,
                 });
             }
-            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+            let base_persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
                 BuildError::ArithmeticOverflow {
                     computation: "persistent bytes",
                 },
             )?;
-            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+            let base_peak_bytes = base_persistent_bytes.checked_add(literal.len()).ok_or(
                 BuildError::ArithmeticOverflow {
                     computation: "construction peak bytes",
                 },
@@ -661,15 +827,15 @@ impl BoundedContextPlan {
                     limit: limits.max_scratch_bytes,
                 });
             }
-            if persistent_bytes > limits.max_persistent_bytes {
+            if base_persistent_bytes > limits.max_persistent_bytes {
                 return Err(BuildError::PersistentLimit {
-                    needed: persistent_bytes,
+                    needed: base_persistent_bytes,
                     limit: limits.max_persistent_bytes,
                 });
             }
-            if peak_bytes > limits.max_peak_bytes {
+            if base_peak_bytes > limits.max_peak_bytes {
                 return Err(BuildError::PeakLimit {
-                    needed: peak_bytes,
+                    needed: base_peak_bytes,
                     limit: limits.max_peak_bytes,
                 });
             }
@@ -692,7 +858,6 @@ impl BoundedContextPlan {
             if tail_class.is_empty() {
                 return Err(BuildError::EmptyClass { role: "tail" });
             }
-            let (source_ranges, work) = budget.into_totals();
             if separator_class.overlaps(prefix_class) {
                 return Err(BuildError::OverlappingSeparator { role: "prefix" });
             }
@@ -707,6 +872,56 @@ impl BoundedContextPlan {
                     repeated_first: literal[0],
                 });
             }
+            let scanner_count = [
+                run_scanner_eligible(dispatch, prefix_class),
+                run_scanner_eligible(dispatch, separator_class),
+                run_scanner_eligible(dispatch, tail_class),
+            ]
+            .into_iter()
+            .map(usize::from)
+            .sum::<usize>();
+            let scanner_bytes = usize::from(scanner_count != 0)
+                .checked_mul(size_of::<RunScanners>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "retained run scanner bytes",
+                })?;
+            let persistent_bytes = base_persistent_bytes.checked_add(scanner_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes with run scanners",
+                },
+            )?;
+            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "construction peak bytes with run scanners",
+                },
+            )?;
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+            budget.charge(
+                scanner_count
+                    .checked_mul(SIMD_RUN_SCANNER_BUILD_WORK)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "run scanner build work",
+                    })?,
+            )?;
+            let run_scanners = build_run_scanners(
+                dispatch,
+                Some(prefix_class),
+                Some(separator_class),
+                Some(tail_class),
+            );
+            debug_assert_eq!(run_scanners.is_some(), scanner_count != 0);
+            let (source_ranges, work) = budget.into_totals();
             let owned = copy_exact(literal).map_err(|error| {
                 allocation_build_error(error, "retained literal", literal.len())
             })?;
@@ -715,6 +930,34 @@ impl BoundedContextPlan {
             actual.copied_bytes = literal.len();
             actual.initialized_bytes = literal.len();
             actual.peak_bytes = literal.len();
+            let run_scanners = retain_run_scanners(run_scanners).map_err(|error| {
+                allocation_build_error(error, "retained run scanners", scanner_bytes)
+            })?;
+            if scanner_bytes != 0 {
+                actual.allocations =
+                    actual
+                        .allocations
+                        .checked_add(1)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "bounded-context allocation count",
+                        })?;
+                actual.allocated_bytes = actual.allocated_bytes.checked_add(scanner_bytes).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "bounded-context allocated bytes",
+                    },
+                )?;
+                actual.initialized_bytes = actual
+                    .initialized_bytes
+                    .checked_add(scanner_bytes)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "bounded-context initialized bytes",
+                    })?;
+                actual.peak_bytes = actual.peak_bytes.checked_add(scanner_bytes).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "bounded-context allocation peak",
+                    },
+                )?;
+            }
             let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
             let plan = Self {
                 prefix: prefix_class,
@@ -741,6 +984,7 @@ impl BoundedContextPlan {
                     peak_bytes,
                 },
                 bounded_affix: false,
+                run_scanners,
             };
             actual.initialized_bytes = actual
                 .initialized_bytes
@@ -802,6 +1046,79 @@ impl BoundedContextPlan {
         Middle: IntoIterator<Item = (u8, u8)>,
         Right: IntoIterator<Item = (u8, u8)>,
     {
+        Self::build_bounded_affix_attempt_inner(
+            None, left, middle, right, literal, middle_max, limits,
+        )
+    }
+
+    /// Build the bounded-affix route with one caller-captured capability
+    /// snapshot and an Auto scanner for an eligible ASCII middle class.
+    pub fn build_bounded_affix_with_dispatch<Left, Middle, Right>(
+        dispatch: SimdDispatchContext,
+        left: Left,
+        middle: Middle,
+        right: Right,
+        literal: &[u8],
+        middle_max: u32,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        Left: IntoIterator<Item = (u8, u8)>,
+        Middle: IntoIterator<Item = (u8, u8)>,
+        Right: IntoIterator<Item = (u8, u8)>,
+    {
+        Self::build_bounded_affix_attempt_with_dispatch(
+            dispatch, left, middle, right, literal, middle_max, limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the dispatched bounded-affix route with exact observed
+    /// construction effects.
+    pub fn build_bounded_affix_attempt_with_dispatch<Left, Middle, Right>(
+        dispatch: SimdDispatchContext,
+        left: Left,
+        middle: Middle,
+        right: Right,
+        literal: &[u8],
+        middle_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Left: IntoIterator<Item = (u8, u8)>,
+        Middle: IntoIterator<Item = (u8, u8)>,
+        Right: IntoIterator<Item = (u8, u8)>,
+    {
+        Self::build_bounded_affix_attempt_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            left,
+            middle,
+            right,
+            literal,
+            middle_max,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "fail-closed affix construction keeps exact attempt accounting, optional scanner compilation, quota, and publication together"
+    )]
+    fn build_bounded_affix_attempt_inner<Left, Middle, Right>(
+        dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+        left: Left,
+        middle: Middle,
+        right: Right,
+        literal: &[u8],
+        middle_max: u32,
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        Left: IntoIterator<Item = (u8, u8)>,
+        Middle: IntoIterator<Item = (u8, u8)>,
+        Right: IntoIterator<Item = (u8, u8)>,
+    {
         let mut actual = DirectBuildAttemptActual::default();
         let result = (|| {
             if literal.is_empty() {
@@ -819,12 +1136,12 @@ impl BoundedContextPlan {
                     limit: limits.max_literal_bytes,
                 });
             }
-            let persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
+            let base_persistent_bytes = size_of::<Self>().checked_add(literal.len()).ok_or(
                 BuildError::ArithmeticOverflow {
                     computation: "bounded-affix persistent bytes",
                 },
             )?;
-            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+            let base_peak_bytes = base_persistent_bytes.checked_add(literal.len()).ok_or(
                 BuildError::ArithmeticOverflow {
                     computation: "bounded-affix construction peak bytes",
                 },
@@ -835,15 +1152,15 @@ impl BoundedContextPlan {
                     limit: limits.max_scratch_bytes,
                 });
             }
-            if persistent_bytes > limits.max_persistent_bytes {
+            if base_persistent_bytes > limits.max_persistent_bytes {
                 return Err(BuildError::PersistentLimit {
-                    needed: persistent_bytes,
+                    needed: base_persistent_bytes,
                     limit: limits.max_persistent_bytes,
                 });
             }
-            if peak_bytes > limits.max_peak_bytes {
+            if base_peak_bytes > limits.max_peak_bytes {
                 return Err(BuildError::PeakLimit {
-                    needed: peak_bytes,
+                    needed: base_peak_bytes,
                     limit: limits.max_peak_bytes,
                 });
             }
@@ -873,6 +1190,41 @@ impl BoundedContextPlan {
             if let Some(&byte) = literal.iter().find(|&&byte| !middle.contains(byte)) {
                 return Err(BuildError::LiteralOutsideMiddle { byte });
             }
+            let scanner_count = usize::from(run_scanner_eligible(dispatch, middle));
+            let scanner_bytes = usize::from(scanner_count != 0)
+                .checked_mul(size_of::<RunScanners>())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix retained run scanner bytes",
+                })?;
+            let persistent_bytes = base_persistent_bytes.checked_add(scanner_bytes).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix persistent bytes with run scanner",
+                },
+            )?;
+            let peak_bytes = persistent_bytes.checked_add(literal.len()).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "bounded-affix construction peak with run scanner",
+                },
+            )?;
+            if persistent_bytes > limits.max_persistent_bytes {
+                return Err(BuildError::PersistentLimit {
+                    needed: persistent_bytes,
+                    limit: limits.max_persistent_bytes,
+                });
+            }
+            if peak_bytes > limits.max_peak_bytes {
+                return Err(BuildError::PeakLimit {
+                    needed: peak_bytes,
+                    limit: limits.max_peak_bytes,
+                });
+            }
+            budget.charge(
+                scanner_count
+                    .checked_mul(SIMD_RUN_SCANNER_BUILD_WORK)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "bounded-affix run scanner build work",
+                    })?,
+            )?;
             let copy_charged_work =
                 budget
                     .work
@@ -891,6 +1243,8 @@ impl BoundedContextPlan {
                 u64::try_from(copy_charged_work).map_err(|_| BuildError::ArithmeticOverflow {
                     computation: "actual bounded-affix work as u64",
                 })?;
+            let run_scanners = build_run_scanners(dispatch, None, Some(middle), None);
+            debug_assert_eq!(run_scanners.is_some(), scanner_count != 0);
             let (source_ranges, work) = budget.into_totals();
             let owned = copy_exact(literal).map_err(|error| {
                 allocation_build_error(error, "bounded-affix literal", literal.len())
@@ -900,6 +1254,34 @@ impl BoundedContextPlan {
             actual.copied_bytes = literal.len();
             actual.initialized_bytes = literal.len();
             actual.peak_bytes = literal.len();
+            let run_scanners = retain_run_scanners(run_scanners).map_err(|error| {
+                allocation_build_error(error, "bounded-affix retained run scanner", scanner_bytes)
+            })?;
+            if scanner_bytes != 0 {
+                actual.allocations =
+                    actual
+                        .allocations
+                        .checked_add(1)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "bounded-affix allocation count",
+                        })?;
+                actual.allocated_bytes = actual.allocated_bytes.checked_add(scanner_bytes).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "bounded-affix allocated bytes",
+                    },
+                )?;
+                actual.initialized_bytes = actual
+                    .initialized_bytes
+                    .checked_add(scanner_bytes)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "bounded-affix initialized bytes",
+                    })?;
+                actual.peak_bytes = actual.peak_bytes.checked_add(scanner_bytes).ok_or(
+                    BuildError::ArithmeticOverflow {
+                        computation: "bounded-affix allocation peak",
+                    },
+                )?;
+            }
             let finder = FinderBuilder::new().build_forward_owned(owned.into_boxed_slice());
             let plan = Self {
                 prefix: left,
@@ -926,6 +1308,7 @@ impl BoundedContextPlan {
                     peak_bytes,
                 },
                 bounded_affix: true,
+                run_scanners,
             };
             actual.initialized_bytes = actual
                 .initialized_bytes
@@ -949,6 +1332,73 @@ impl BoundedContextPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    /// Immutable selection retained for prefix runs, when this dispatched
+    /// general-context plan admitted one.
+    #[must_use]
+    pub fn prefix_run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        RunScanners::selection(self.prefix_run_scanner())
+    }
+
+    /// Immutable selection retained for separator runs. In a bounded-affix
+    /// plan this is the middle-run scanner.
+    #[must_use]
+    pub fn separator_run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        RunScanners::selection(self.separator_run_scanner())
+    }
+
+    /// Immutable selection retained for tail runs, when this dispatched
+    /// general-context plan admitted one.
+    #[must_use]
+    pub fn tail_run_scanner_selection(&self) -> Option<SelectionReceipt> {
+        RunScanners::selection(self.tail_run_scanner())
+    }
+
+    fn prefix_run_scanner(&self) -> Option<&AsciiByteSetRunScanner> {
+        self.run_scanners
+            .boxed()
+            .and_then(|scanners| scanners.prefix.as_ref())
+    }
+
+    fn separator_run_scanner(&self) -> Option<&AsciiByteSetRunScanner> {
+        self.run_scanners
+            .boxed()
+            .and_then(|scanners| scanners.separator.as_ref())
+    }
+
+    fn tail_run_scanner(&self) -> Option<&AsciiByteSetRunScanner> {
+        self.run_scanners
+            .boxed()
+            .and_then(|scanners| scanners.tail.as_ref())
+    }
+
+    fn run_scanner_recovery_bound(&self, input_bytes: usize) -> Result<usize, ReduceError> {
+        let scanner_streams = if self.bounded_affix {
+            usize::from(self.separator_run_scanner().is_some())
+        } else {
+            usize::from(self.prefix_run_scanner().is_some())
+                .checked_add(
+                    usize::from(self.separator_run_scanner().is_some())
+                        .checked_mul(2)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "separator run scanner stream count",
+                        })?,
+                )
+                .and_then(|value| value.checked_add(usize::from(self.tail_run_scanner().is_some())))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-context run scanner stream count",
+                })?
+        };
+        // Every vector entry is preceded by a disjoint 16-member scalar proof.
+        // Thus each stream can enter the scanner at most floor(N/16) times.
+        let run_events = input_bytes / ASCII_NARROW_BYTES;
+        run_events
+            .checked_mul(scanner_streams)
+            .and_then(|value| value.checked_mul(SIMD_RUN_MAX_RESCAN_INSPECTIONS))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "run scanner recovery classification bound",
+            })
     }
 
     #[must_use]
@@ -1082,13 +1532,18 @@ impl BoundedContextPlan {
         while cursor < haystack.len() {
             let byte = haystack[cursor];
             if self.separator.contains(byte) {
-                middle_run = middle_run
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "bounded-affix middle run",
-                    })?;
+                let run = self.separator_run_scanner().map_or(1, |scanner| {
+                    scan_hot_member_run(haystack, cursor, self.separator, scanner)
+                });
+                debug_assert!(run != 0);
+                middle_run =
+                    middle_run
+                        .checked_add(run)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix middle run",
+                        })?;
                 cursor = cursor
-                    .checked_add(1)
+                    .checked_add(run)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "bounded-affix scan cursor",
                     })?;
@@ -1231,13 +1686,18 @@ impl BoundedContextPlan {
         while cursor < haystack.len() {
             let byte = haystack[cursor];
             if self.separator.contains(byte) {
-                middle_run = middle_run
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "bounded-affix middle run",
-                    })?;
+                let run = self.separator_run_scanner().map_or(1, |scanner| {
+                    scan_hot_member_run(haystack, cursor, self.separator, scanner)
+                });
+                debug_assert!(run != 0);
+                middle_run =
+                    middle_run
+                        .checked_add(run)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-affix middle run",
+                        })?;
                 cursor = cursor
-                    .checked_add(1)
+                    .checked_add(run)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "bounded-affix scan cursor",
                     })?;
@@ -1359,9 +1819,11 @@ impl BoundedContextPlan {
                 computation: "bounded-affix candidate bound",
             },
         )?;
+        let scanner_recovery = self.run_scanner_recovery_bound(input_bytes)?;
         let inspections = input_bytes
             .checked_mul(2)
             .and_then(|value| value.checked_add(suffix_candidates))
+            .and_then(|value| value.checked_add(scanner_recovery))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "bounded-affix inspections",
             })?;
@@ -1498,9 +1960,11 @@ impl BoundedContextPlan {
                 computation: "interval bytes",
             },
         )?;
+        let scanner_recovery = self.run_scanner_recovery_bound(input_bytes)?;
         let inspections = input_bytes
             .checked_mul(3)
             .and_then(|value| value.checked_add(literal_bytes))
+            .and_then(|value| value.checked_add(scanner_recovery))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "inspection bound",
             })?;
@@ -1512,6 +1976,7 @@ impl BoundedContextPlan {
                     .and_then(|term| value.checked_add(term))
             })
             .and_then(|value| value.checked_add(16))
+            .and_then(|value| value.checked_add(scanner_recovery))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "branch bound",
             })?;
@@ -1523,6 +1988,7 @@ impl BoundedContextPlan {
                     .and_then(|term| value.checked_add(term))
             })
             .and_then(|value| value.checked_add(8))
+            .and_then(|value| value.checked_add(scanner_recovery))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "comparison bound",
             })?;
@@ -1550,6 +2016,11 @@ impl BoundedContextPlan {
                     .and_then(|term| value.checked_add(term))
             })
             .and_then(|value| value.checked_add(40))
+            .and_then(|value| {
+                scanner_recovery
+                    .checked_mul(3)
+                    .and_then(|term| value.checked_add(term))
+            })
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "execution work",
             })?;
@@ -1778,20 +2249,42 @@ impl BoundedContextPlan {
                 continue;
             }
             let start = cursor;
-            while cursor < haystack.len() && self.separator.contains(haystack[cursor]) {
+            if let Some(scanner) = self.separator_run_scanner() {
+                let run = scan_hot_member_run(haystack, cursor, self.separator, scanner);
+                debug_assert!(run != 0);
                 cursor = cursor
-                    .checked_add(1)
+                    .checked_add(run)
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "separator run cursor",
                     })?;
+            } else {
+                while cursor < haystack.len() && self.separator.contains(haystack[cursor]) {
+                    cursor = cursor
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "separator run cursor",
+                        })?;
+                }
             }
             let end = cursor;
-            while cursor < haystack.len() && self.tail.contains(haystack[cursor]) {
-                cursor = cursor
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "tail run cursor",
-                    })?;
+            if cursor < haystack.len() && self.tail.contains(haystack[cursor]) {
+                if let Some(scanner) = self.tail_run_scanner() {
+                    let run = scan_hot_member_run(haystack, cursor, self.tail, scanner);
+                    debug_assert!(run != 0);
+                    cursor = cursor
+                        .checked_add(run)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "tail run cursor",
+                        })?;
+                } else {
+                    while cursor < haystack.len() && self.tail.contains(haystack[cursor]) {
+                        cursor = cursor
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "tail run cursor",
+                            })?;
+                    }
+                }
             }
             if cursor.saturating_sub(end) >= tail_width {
                 let match_end =
@@ -1830,17 +2323,21 @@ impl BoundedContextPlan {
         while scanner.cursor < haystack.len() {
             let byte = haystack[scanner.cursor];
             if self.prefix.contains(byte) {
+                let run = self.prefix_run_scanner().map_or(1, |run_scanner| {
+                    scan_hot_member_run(haystack, scanner.cursor, self.prefix, run_scanner)
+                });
+                debug_assert!(run != 0);
                 scanner.prefix_run =
                     scanner
                         .prefix_run
-                        .checked_add(1)
+                        .checked_add(run)
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "prefix run length",
                         })?;
                 scanner.cursor =
                     scanner
                         .cursor
-                        .checked_add(1)
+                        .checked_add(run)
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "prefix scan cursor",
                         })?;
@@ -1848,16 +2345,27 @@ impl BoundedContextPlan {
             }
             if self.separator.contains(byte) {
                 let separator_start = scanner.cursor;
-                while scanner.cursor < haystack.len()
-                    && self.separator.contains(haystack[scanner.cursor])
-                {
+                if let Some(run_scanner) = self.separator_run_scanner() {
+                    let run =
+                        scan_hot_member_run(haystack, scanner.cursor, self.separator, run_scanner);
+                    debug_assert!(run != 0);
                     scanner.cursor =
                         scanner
                             .cursor
-                            .checked_add(1)
+                            .checked_add(run)
                             .ok_or(ReduceError::ArithmeticOverflow {
                                 computation: "prefix separator cursor",
                             })?;
+                } else {
+                    while scanner.cursor < haystack.len()
+                        && self.separator.contains(haystack[scanner.cursor])
+                    {
+                        scanner.cursor = scanner.cursor.checked_add(1).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "prefix separator cursor",
+                            },
+                        )?;
+                    }
                 }
                 let separator_end = scanner.cursor;
                 let prefix_run = core::mem::take(&mut scanner.prefix_run);
@@ -1894,6 +2402,51 @@ impl BoundedContextPlan {
     }
 
     #[cfg(test)]
+    fn with_test_run_scanners(mut self, prefix: bool, separator: bool, tail: bool) -> Self {
+        let scanner = |enabled: bool, class: ByteClass| {
+            enabled.then(|| {
+                AsciiByteSetRunScanner::new(
+                    class
+                        .ascii_set()
+                        .expect("the test requests scanners only for ASCII classes"),
+                )
+            })
+        };
+        let scanners = RunScanners {
+            prefix: scanner(prefix, self.prefix),
+            separator: scanner(separator, self.separator),
+            tail: scanner(tail, self.tail),
+        };
+        let scanner_count = usize::from(prefix)
+            .checked_add(usize::from(separator))
+            .and_then(|value| value.checked_add(usize::from(tail)))
+            .expect("three test scanner roles fit usize");
+        let scanner_bytes = size_of::<RunScanners>();
+        self.run_scanners =
+            retain_run_scanners(Some(scanners)).expect("test scanner retention must allocate");
+        self.build.work = self
+            .build
+            .work
+            .checked_add(
+                scanner_count
+                    .checked_mul(SIMD_RUN_SCANNER_BUILD_WORK)
+                    .expect("test scanner work fits"),
+            )
+            .expect("test build work fits");
+        self.build.persistent_bytes = self
+            .build
+            .persistent_bytes
+            .checked_add(scanner_bytes)
+            .expect("test persistent bytes fit");
+        self.build.peak_bytes = self
+            .build
+            .peak_bytes
+            .checked_add(scanner_bytes)
+            .expect("test peak bytes fit");
+        self
+    }
+
+    #[cfg(test)]
     fn spans_for_test(
         &self,
         haystack: &[u8],
@@ -1909,6 +2462,88 @@ impl BoundedContextPlan {
         })?;
         Ok(spans)
     }
+}
+
+fn run_scanner_eligible(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    class: ByteClass,
+) -> bool {
+    class.ascii_set().is_some()
+        && dispatch
+            .is_some_and(|(context, _)| context.capabilities().usable().contains(Feature::ArmSve))
+}
+
+fn build_run_scanner(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    class: Option<ByteClass>,
+) -> Option<AsciiByteSetRunScanner> {
+    let class = class?;
+    if !run_scanner_eligible(dispatch, class) {
+        return None;
+    }
+    let (context, policy) = dispatch.expect("scanner eligibility requires a dispatch context");
+    Some(
+        context
+            .ascii_byte_set_run_scanner(
+                class
+                    .ascii_set()
+                    .expect("scanner eligibility proves one ASCII class"),
+                policy,
+            )
+            .expect("the caller supplied an authentic compatible dispatch policy"),
+    )
+}
+
+fn build_run_scanners(
+    dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+    prefix: Option<ByteClass>,
+    separator: Option<ByteClass>,
+    tail: Option<ByteClass>,
+) -> Option<RunScanners> {
+    let scanners = RunScanners {
+        prefix: build_run_scanner(dispatch, prefix),
+        separator: build_run_scanner(dispatch, separator),
+        tail: build_run_scanner(dispatch, tail),
+    };
+    (scanners.prefix.is_some() || scanners.separator.is_some() || scanners.tail.is_some())
+        .then_some(scanners)
+}
+
+fn retain_run_scanners(
+    scanners: Option<RunScanners>,
+) -> Result<ExactBoxOrUsize<RunScanners>, CopyError> {
+    match scanners {
+        Some(scanners) => ExactBoxOrUsize::try_from_boxed(scanners),
+        None => ExactBoxOrUsize::try_from_usize(0),
+    }
+}
+
+fn scan_hot_member_run(
+    haystack: &[u8],
+    start: usize,
+    class: ByteClass,
+    scanner: &AsciiByteSetRunScanner,
+) -> usize {
+    let remaining = &haystack[start..];
+    debug_assert!(remaining.first().is_some_and(|&byte| class.contains(byte)));
+    let mut proof = 1_usize;
+    for &byte in remaining[1..]
+        .iter()
+        .take(ASCII_NARROW_BYTES.saturating_sub(1))
+    {
+        if !class.contains(byte) {
+            return proof;
+        }
+        proof = proof
+            .checked_add(1)
+            .expect("the fixed scalar proof length fits usize");
+    }
+    if proof < ASCII_NARROW_BYTES || proof == remaining.len() {
+        return proof;
+    }
+    proof
+        .checked_add(scanner.scan_forward(&remaining[proof..]).member_run_len())
+        .expect("a run within one source slice fits usize")
 }
 
 fn span_sum_upper_bounds(
@@ -2140,7 +2775,8 @@ mod tests {
 
     use super::{
         BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildError, BuildLimits, ReduceError,
-        ReduceLimits, SPAN_SUM_OPERATION_ID, SpanSumLimits,
+        ReduceLimits, RunScanners, SIMD_RUN_MAX_RESCAN_INSPECTIONS, SIMD_RUN_SCANNER_BUILD_WORK,
+        SPAN_SUM_OPERATION_ID, SpanSumLimits,
     };
 
     #[test]
@@ -2163,7 +2799,7 @@ mod tests {
         assert_eq!(plan_align, finder_align);
         assert_eq!(
             plan_bytes,
-            (finder_bytes + 208).next_multiple_of(plan_align)
+            (finder_bytes + 224).next_multiple_of(plan_align)
         );
         assert!(plan_bytes <= 512);
 
@@ -2243,6 +2879,184 @@ mod tests {
         );
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one construction test closes scanner selections, exact effects, identities, and all one-below resource boundaries"
+    )]
+    fn dispatched_build_charges_one_exact_bundle_and_each_ascii_sve_scanner() {
+        use fre_simd_kernels::{Feature, SimdDispatchContext};
+
+        let dispatch = SimdDispatchContext::capture();
+        let sve_usable = dispatch.capabilities().usable().contains(Feature::ArmSve);
+        let baseline = BoundedContextPlan::build_attempt(
+            [(b'a', b'z')],
+            [(b' ', b' ')],
+            [(b'0', b'9')],
+            b"R",
+            2,
+            2,
+            2,
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedContextPlan::build_attempt_with_dispatch(
+            dispatch,
+            [(b'a', b'z')],
+            [(b' ', b' ')],
+            [(b'0', b'9')],
+            b"R",
+            2,
+            2,
+            2,
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let baseline_actual = baseline.actual();
+        let baseline = baseline.into_plan();
+        let dispatched_actual = dispatched.actual();
+        let dispatched = dispatched.into_plan();
+        let selections = [
+            dispatched.prefix_run_scanner_selection(),
+            dispatched.separator_run_scanner_selection(),
+            dispatched.tail_run_scanner_selection(),
+        ];
+        assert_eq!(
+            selections.into_iter().flatten().count(),
+            if sve_usable { 3 } else { 0 }
+        );
+        for selection in selections.into_iter().flatten() {
+            assert_eq!(selection.policy, fre_simd_kernels::DispatchPolicy::Auto);
+            assert_eq!(selection.selection_input_bytes, 16);
+        }
+        let scanner_work = usize::from(sve_usable)
+            .checked_mul(3 * SIMD_RUN_SCANNER_BUILD_WORK)
+            .unwrap();
+        let scanner_bytes = usize::from(sve_usable) * core::mem::size_of::<RunScanners>();
+        let baseline_build = baseline.build_accounting();
+        let dispatched_build = dispatched.build_accounting();
+        assert_eq!(dispatched_build.work, baseline_build.work + scanner_work);
+        assert_eq!(
+            dispatched_build.persistent_bytes,
+            baseline_build.persistent_bytes + scanner_bytes
+        );
+        assert_eq!(
+            dispatched_build.peak_bytes,
+            baseline_build.peak_bytes + scanner_bytes
+        );
+        assert_eq!(
+            dispatched_actual.allocations,
+            baseline_actual.allocations + usize::from(sve_usable)
+        );
+        assert_eq!(
+            dispatched_actual.allocated_bytes,
+            baseline_actual.allocated_bytes + scanner_bytes
+        );
+        assert_eq!(
+            dispatched_actual.initialized_bytes,
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(
+            dispatched_actual.live_persistent_bytes,
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(
+            dispatched_actual.peak_bytes,
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(dispatched.count_identity(), baseline.count_identity());
+
+        let rebuild = |limits| {
+            BoundedContextPlan::build_with_dispatch(
+                dispatch,
+                [(b'a', b'z')],
+                [(b' ', b' ')],
+                [(b'0', b'9')],
+                b"R",
+                2,
+                2,
+                2,
+                2,
+                limits,
+            )
+        };
+        assert!(
+            rebuild(BuildLimits {
+                max_build_work: dispatched_build.work,
+                max_persistent_bytes: dispatched_build.persistent_bytes,
+                max_peak_bytes: dispatched_build.peak_bytes,
+                ..BuildLimits::default()
+            })
+            .is_ok()
+        );
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_build_work: dispatched_build.work - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == dispatched_build.work && limit == dispatched_build.work - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_persistent_bytes: dispatched_build.persistent_bytes - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::PersistentLimit { needed, limit })
+                if needed == dispatched_build.persistent_bytes
+                    && limit == dispatched_build.persistent_bytes - 1
+        ));
+        assert!(matches!(
+            rebuild(BuildLimits {
+                max_peak_bytes: dispatched_build.peak_bytes - 1,
+                ..BuildLimits::default()
+            }),
+            Err(BuildError::PeakLimit { needed, limit })
+                if needed == dispatched_build.peak_bytes
+                    && limit == dispatched_build.peak_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn dispatched_non_ascii_middle_preserves_the_scalar_affix_path() {
+        use fre_simd_kernels::SimdDispatchContext;
+
+        let scalar = BoundedContextPlan::build_bounded_affix(
+            [(b'x', b'x')],
+            [(0x80, 0x80)],
+            [(b'y', b'y')],
+            b"\x80",
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let dispatched = BoundedContextPlan::build_bounded_affix_with_dispatch(
+            SimdDispatchContext::capture(),
+            [(b'x', b'x')],
+            [(0x80, 0x80)],
+            [(b'y', b'y')],
+            b"\x80",
+            2,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(dispatched.prefix_run_scanner_selection().is_none());
+        assert!(dispatched.separator_run_scanner_selection().is_none());
+        assert!(dispatched.tail_run_scanner_selection().is_none());
+        assert_eq!(dispatched.build_accounting(), scalar.build_accounting());
+        assert_eq!(dispatched.count_identity(), scalar.count_identity());
+        assert_eq!(
+            dispatched
+                .count(b"x\x80\x80y", ReduceLimits::default())
+                .unwrap(),
+            scalar
+                .count(b"x\x80\x80y", ReduceLimits::default())
+                .unwrap()
+        );
+    }
+
     #[derive(Clone)]
     struct DeceptiveRanges<'a> {
         ranges: &'a [(u8, u8)],
@@ -2300,6 +3114,178 @@ mod tests {
             .find_iter(haystack)
             .map(|matched| (matched.start(), matched.end()))
             .collect()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one differential keeps both bounded-context execution shapes and every accounting projection under the same adversarial inputs"
+    )]
+    fn retained_run_scanners_preserve_general_and_affix_results_and_receipts() {
+        let scalar = plan();
+        let accelerated = plan().with_test_run_scanners(true, true, true);
+        let mut general = Vec::new();
+        general.extend(core::iter::repeat_n(b'a', 97));
+        general.extend(core::iter::repeat_n(b' ', 131));
+        general.extend_from_slice(b"R");
+        general.extend(core::iter::repeat_n(b' ', 73));
+        general.extend(core::iter::repeat_n(b'z', 89));
+        general.extend_from_slice(b"!\xFF");
+        general.extend_from_slice(b"aaaa R zzzz");
+        for haystack in [
+            general.as_slice(),
+            b"aaaa R zzzz",
+            b"\xFFaaaa  R  zzzz\xFF",
+            b"no bounded context here",
+            b"",
+        ] {
+            let scalar_count = scalar.count(haystack, ReduceLimits::default()).unwrap();
+            let accelerated_count = accelerated
+                .count(haystack, ReduceLimits::default())
+                .unwrap();
+            assert_eq!(accelerated_count.count, scalar_count.count);
+            assert_eq!(
+                accelerated_count.accounting.identity,
+                scalar_count.accounting.identity
+            );
+            assert_eq!(
+                accelerated_count.accounting.actual,
+                scalar_count.accounting.actual
+            );
+            let scalar_upper = scalar_count.accounting.upper_bounds;
+            let accelerated_upper = accelerated_count.accounting.upper_bounds;
+            let run_events = haystack.len() / fre_simd_kernels::ASCII_NARROW_BYTES;
+            let recovery = run_events * 4 * SIMD_RUN_MAX_RESCAN_INSPECTIONS;
+            assert_eq!(
+                (
+                    accelerated_upper.input_bytes,
+                    accelerated_upper.literal_bytes,
+                    accelerated_upper.interval_records,
+                    accelerated_upper.interval_bytes,
+                    accelerated_upper.state_writes,
+                    accelerated_upper.match_events,
+                    accelerated_upper.count,
+                    accelerated_upper.scratch_bytes,
+                ),
+                (
+                    scalar_upper.input_bytes,
+                    scalar_upper.literal_bytes,
+                    scalar_upper.interval_records,
+                    scalar_upper.interval_bytes,
+                    scalar_upper.state_writes,
+                    scalar_upper.match_events,
+                    scalar_upper.count,
+                    scalar_upper.scratch_bytes,
+                )
+            );
+            assert_eq!(
+                accelerated_upper.inspections,
+                scalar_upper.inspections + recovery
+            );
+            assert_eq!(
+                accelerated_upper.comparisons,
+                scalar_upper.comparisons + recovery
+            );
+            assert_eq!(accelerated_upper.branches, scalar_upper.branches + recovery);
+            assert_eq!(accelerated_upper.work, scalar_upper.work + 3 * recovery);
+            assert_eq!(
+                accelerated_upper.persistent_bytes,
+                scalar_upper.persistent_bytes + core::mem::size_of::<RunScanners>()
+            );
+            assert_eq!(
+                accelerated_upper.peak_bytes,
+                scalar_upper.peak_bytes + core::mem::size_of::<RunScanners>()
+            );
+            assert_eq!(
+                accelerated.spans_for_test(haystack, ReduceLimits::default()),
+                scalar.spans_for_test(haystack, ReduceLimits::default())
+            );
+            let scalar_span = scalar.span_sum(haystack, SpanSumLimits::default()).unwrap();
+            let accelerated_span = accelerated
+                .span_sum(haystack, SpanSumLimits::default())
+                .unwrap();
+            assert_eq!(accelerated_span.span_sum, scalar_span.span_sum);
+            assert_eq!(
+                accelerated_span.accounting.identity,
+                scalar_span.accounting.identity
+            );
+            assert_eq!(
+                accelerated_span.accounting.actual,
+                scalar_span.accounting.actual
+            );
+            assert_eq!(
+                accelerated_span.accounting.upper_bounds.work,
+                scalar_span.accounting.upper_bounds.work + 3 * recovery
+            );
+            assert_eq!(
+                accelerated_span.accounting.upper_bounds.span_sum,
+                scalar_span.accounting.upper_bounds.span_sum
+            );
+        }
+
+        let scalar_affix = BoundedContextPlan::build_bounded_affix(
+            [(b'x', b'x')],
+            [(b'a', b'b')],
+            [(b'y', b'y')],
+            b"ab",
+            300,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let accelerated_affix = BoundedContextPlan::build_bounded_affix(
+            [(b'x', b'x')],
+            [(b'a', b'b')],
+            [(b'y', b'y')],
+            b"ab",
+            300,
+            BuildLimits::default(),
+        )
+        .unwrap()
+        .with_test_run_scanners(false, true, false);
+        let mut affix = Vec::new();
+        affix.push(b'x');
+        affix.extend(core::iter::repeat_n(b'a', 257));
+        affix.extend_from_slice(b"aby\xFFxaby");
+        for haystack in [affix.as_slice(), b"xaby", b"x\xFFaby", b""] {
+            let scalar_count = scalar_affix
+                .count(haystack, ReduceLimits::default())
+                .unwrap();
+            let accelerated_count = accelerated_affix
+                .count(haystack, ReduceLimits::default())
+                .unwrap();
+            assert_eq!(accelerated_count.count, scalar_count.count);
+            assert_eq!(
+                accelerated_count.accounting.actual,
+                scalar_count.accounting.actual
+            );
+            assert_eq!(
+                accelerated_count.accounting.identity,
+                scalar_count.accounting.identity
+            );
+            assert!(
+                accelerated_count.accounting.actual.match_events
+                    <= accelerated_count.accounting.upper_bounds.match_events
+            );
+            let scalar_span = scalar_affix
+                .span_sum(haystack, SpanSumLimits::default())
+                .unwrap();
+            let accelerated_span = accelerated_affix
+                .span_sum(haystack, SpanSumLimits::default())
+                .unwrap();
+            assert_eq!(accelerated_span.span_sum, scalar_span.span_sum);
+            assert_eq!(
+                accelerated_span.accounting.actual,
+                scalar_span.accounting.actual
+            );
+            assert!(
+                accelerated_span.accounting.actual.match_events
+                    <= accelerated_span.accounting.upper_bounds.match_events
+            );
+            assert!(
+                accelerated_span.accounting.actual.span_sum
+                    <= accelerated_span.accounting.upper_bounds.span_sum
+            );
+        }
     }
 
     #[test]
@@ -2762,6 +3748,188 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode scalar/Auto SVE qualification"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ignored qualification keeps the affix and general-context scenarios under one paired timing harness"
+    )]
+    fn measure_bounded_context_auto_run_scanners() {
+        use fre_simd_kernels::{Feature, SimdDispatchContext};
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the parseable paired timing record carries its scenario metadata beside both measured closures"
+        )]
+        fn measure(
+            scenario: &str,
+            variant: &str,
+            scanner_count: usize,
+            build_work_delta: usize,
+            batches: u32,
+            calls_per_batch: u32,
+            mut scalar: impl FnMut() -> u64,
+            mut automatic: impl FnMut() -> u64,
+        ) {
+            let mut scalar_elapsed = Duration::ZERO;
+            let mut automatic_elapsed = Duration::ZERO;
+            let mut scalar_checksum = 0_u64;
+            let mut automatic_checksum = 0_u64;
+            for batch in 0..batches {
+                let mut time_scalar = || {
+                    let start = Instant::now();
+                    for _ in 0..calls_per_batch {
+                        scalar_checksum =
+                            scalar_checksum.wrapping_add(black_box(scalar()).wrapping_add(1));
+                    }
+                    scalar_elapsed += start.elapsed();
+                };
+                let mut time_automatic = || {
+                    let start = Instant::now();
+                    for _ in 0..calls_per_batch {
+                        automatic_checksum =
+                            automatic_checksum.wrapping_add(black_box(automatic()).wrapping_add(1));
+                    }
+                    automatic_elapsed += start.elapsed();
+                };
+                if batch & 1 == 0 {
+                    time_scalar();
+                    time_automatic();
+                } else {
+                    time_automatic();
+                    time_scalar();
+                }
+            }
+            assert_eq!(automatic_checksum, scalar_checksum);
+            eprintln!(
+                "BOUNDED_CONTEXT_AUTO_RUN_BENCH scenario={scenario} policy=auto \
+                 variant={variant} scanner_count={scanner_count} \
+                 build_work_delta={build_work_delta} scalar_ns={} auto_ns={} \
+                 auto_over_scalar={:.6} checksum={automatic_checksum}",
+                scalar_elapsed.as_nanos(),
+                automatic_elapsed.as_nanos(),
+                automatic_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64(),
+            );
+        }
+
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            dispatch.capabilities().usable().contains(Feature::ArmSve),
+            "this qualification benchmark requires an OS-usable SVE host"
+        );
+
+        let scalar_affix = BoundedContextPlan::build_bounded_affix(
+            [(b'x', b'x')],
+            [(b'a', b'b')],
+            [(b'y', b'y')],
+            b"ab",
+            512,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let automatic_affix = BoundedContextPlan::build_bounded_affix_with_dispatch(
+            dispatch,
+            [(b'x', b'x')],
+            [(b'a', b'b')],
+            [(b'y', b'y')],
+            b"ab",
+            512,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let mut affix_haystack = Vec::new();
+        for _ in 0..1_024 {
+            affix_haystack.push(b'x');
+            affix_haystack.extend(core::iter::repeat_n(b'a', 256));
+            affix_haystack.extend_from_slice(b"aby!");
+        }
+        let affix_variant = automatic_affix
+            .separator_run_scanner_selection()
+            .expect("OS-usable SVE must retain the ASCII middle scanner")
+            .variant_id;
+        measure(
+            "bounded_affix_middle_258",
+            affix_variant,
+            1,
+            automatic_affix.build_accounting().work - scalar_affix.build_accounting().work,
+            9,
+            32,
+            || {
+                scalar_affix
+                    .count(black_box(&affix_haystack), ReduceLimits::default())
+                    .unwrap()
+                    .count
+            },
+            || {
+                automatic_affix
+                    .count(black_box(&affix_haystack), ReduceLimits::default())
+                    .unwrap()
+                    .count
+            },
+        );
+
+        let scalar_context = BoundedContextPlan::build(
+            [(b'A', b'A')],
+            [(b' ', b' ')],
+            [(b'z', b'z')],
+            b"R",
+            4,
+            2,
+            2,
+            4,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let automatic_context = BoundedContextPlan::build_with_dispatch(
+            dispatch,
+            [(b'A', b'A')],
+            [(b' ', b' ')],
+            [(b'z', b'z')],
+            b"R",
+            4,
+            2,
+            2,
+            4,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let mut context_haystack = Vec::new();
+        for _ in 0..1_024 {
+            context_haystack.extend(core::iter::repeat_n(b'A', 64));
+            context_haystack.extend(core::iter::repeat_n(b' ', 64));
+            context_haystack.push(b'R');
+            context_haystack.extend(core::iter::repeat_n(b' ', 64));
+            context_haystack.extend(core::iter::repeat_n(b'z', 64));
+            context_haystack.push(b'!');
+        }
+        let context_variant = automatic_context
+            .separator_run_scanner_selection()
+            .expect("OS-usable SVE must retain the ASCII separator scanner")
+            .variant_id;
+        measure(
+            "general_prefix_separator_tail_64",
+            context_variant,
+            3,
+            automatic_context.build_accounting().work - scalar_context.build_accounting().work,
+            9,
+            32,
+            || {
+                scalar_context
+                    .count(black_box(&context_haystack), ReduceLimits::default())
+                    .unwrap()
+                    .count
+            },
+            || {
+                automatic_context
+                    .count(black_box(&context_haystack), ReduceLimits::default())
+                    .unwrap()
+                    .count
+            },
+        );
     }
 
     #[test]

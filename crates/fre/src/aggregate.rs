@@ -9808,7 +9808,8 @@ impl AggregateBuilder {
                             detail: "syntax summary differs from bounded-affix inspection",
                         });
                     }
-                    let attempt = BoundedContextPlan::build_bounded_affix_attempt(
+                    let attempt = BoundedContextPlan::build_bounded_affix_attempt_with_dispatch(
+                        simd_dispatch,
                         left.ranges()
                             .iter()
                             .map(|range| (range.start(), range.end())),
@@ -9971,7 +9972,8 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from bounded-context inspection",
                     });
                 }
-                let attempt = BoundedContextPlan::build_attempt(
+                let attempt = BoundedContextPlan::build_attempt_with_dispatch(
+                    simd_dispatch,
                     prefix
                         .ranges()
                         .iter()
