@@ -8,15 +8,29 @@
 //! Empty matching is deliberately a separate Unicode-disabled byte-boundary
 //! formula: a haystack of `N` bytes has `N + 1` empty matches and zero matched
 //! bytes. The operation identity records that scope explicitly.
+//!
+//! The distinct c9g SVE2 owner is available only for a one-byte ASCII needle.
+//! It retains this finder as its complete sparse/no-match proof and uses a
+//! fixed-prefix density guard before counting dense sources in 32-byte SVE2
+//! blocks. Its separate plan identity and storage formula leave every
+//! incumbent literal untouched.
 
 use core::{fmt, mem::size_of};
 
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use memchr::memmem::{Finder, FinderBuilder};
 
-use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
+use crate::{
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DirectBuildAttempt,
+    DirectBuildAttemptActual, DirectBuildAttemptError, DispatchPolicy, Feature, FeatureSet,
+    SelectionReceipt, SimdDispatchContext, TuningClass,
+};
 
 /// Stable identity for the exact-literal whole-haystack strategy.
 pub const PLAN_ID: &str = "exact-literal-aggregate.memmem-find-iter.v1";
+/// Stable identity for the SVE2 width-one hybrid owner.
+pub const DISPATCHED_PLAN_ID: &str =
+    "exact-literal-aggregate.ascii-width-one.sve2-block-count-hybrid.v1";
 /// Version of the exact-literal reduction algorithm.
 pub const ALGORITHM_VERSION: u32 = 1;
 /// Version of the exact-literal prospective/actual attempt protocol.
@@ -25,6 +39,17 @@ pub const ACCOUNTING_VERSION: u32 = 1;
 pub const COUNT_OPERATION_ID: &str = "exact-literal-aggregate.count.byte-boundary.v1";
 /// Stable identity for the checked matched-byte span-sum reducer.
 pub const SPAN_SUM_OPERATION_ID: &str = "exact-literal-aggregate.span-sum.byte-boundary.v1";
+
+// Building a reusable classifier probes all 128 ASCII values and selects its
+// narrow and wide leaves. This is the same exact abstract charge used by the
+// other classifier-owning direct kernels.
+const SIMD_CLASSIFIER_BUILD_WORK: u64 = 128 + 2 + 2;
+// A short source or a low-density prefix stays on memmem. This preserves the
+// incumbent sparse/no-match path while dense sources amortize one SVE2 block
+// count per 32 bytes. The probe's classifications are reused on the SIMD path.
+const SIMD_MIN_HAYSTACK_BYTES: usize = ASCII_WIDE_BYTES * 8;
+const SIMD_PROBE_BLOCKS: usize = 4;
+const SIMD_MIN_PROBE_MATCHES: u32 = 8;
 
 /// Complete reducer selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,12 +142,22 @@ impl OperationIdentity {
     /// Return the immutable identity for one reducer.
     #[must_use]
     pub const fn for_operation(operation: Operation) -> Self {
+        Self::for_plan(operation, PLAN_ID)
+    }
+
+    /// Return the immutable identity for the SVE2 width-one hybrid reducer.
+    #[must_use]
+    pub const fn for_dispatched_operation(operation: Operation) -> Self {
+        Self::for_plan(operation, DISPATCHED_PLAN_ID)
+    }
+
+    const fn for_plan(operation: Operation, plan_id: &'static str) -> Self {
         let operation_id = match operation {
             Operation::Count => COUNT_OPERATION_ID,
             Operation::SpanSum => SPAN_SUM_OPERATION_ID,
         };
         Self {
-            plan_id: PLAN_ID,
+            plan_id,
             operation_id,
             operation,
             boundary_semantics: BoundarySemantics::EveryByteBoundaryUnicodeOff,
@@ -131,6 +166,13 @@ impl OperationIdentity {
             accounting_version: ACCOUNTING_VERSION,
             declared_fallback: DeclaredFallback::None,
         }
+    }
+
+    /// Whether this is one of the two authentic exact-literal owners for the
+    /// requested operation.
+    #[must_use]
+    pub fn authenticates_operation(self, operation: Operation) -> bool {
+        self == Self::for_operation(operation) || self == Self::for_dispatched_operation(operation)
     }
 }
 
@@ -257,7 +299,8 @@ pub struct ReduceUpperBounds {
     pub count: u64,
     /// Maximum sum of matched byte lengths.
     pub span_sum: u64,
-    /// Maximum calls to iterator `next`, or one direct-formula step.
+    /// Maximum logical match-event observations plus termination, or one
+    /// direct-formula step.
     pub reducer_steps: usize,
     /// Caller-visible dynamic operation scratch.
     pub scratch_bytes: usize,
@@ -283,7 +326,9 @@ impl ReduceUpperBounds {
 pub struct ReduceActualCounters {
     /// Semantic matches represented by the reduction.
     pub match_events: usize,
-    /// Calls made to the pinned iterator's `next` method.
+    /// Logical match-event observations plus termination. The established
+    /// owner makes these pinned-iterator `next` calls physically; the
+    /// dispatched block owner retains the equivalent logical ledger.
     pub iterator_next_calls: usize,
     /// Direct formula evaluations; one for an empty needle, otherwise zero.
     pub empty_formula_evaluations: usize,
@@ -466,8 +511,10 @@ impl ReduceAttemptReceipt {
     /// formulas, exact published P (when present), and release P/A invariant.
     #[must_use]
     pub fn authenticates_canonical(&self) -> bool {
-        if self.identity != OperationIdentity::for_operation(self.identity.operation)
-            || !build_accounting_is_canonical(self.invocation.build)
+        if !self
+            .identity
+            .authenticates_operation(self.identity.operation)
+            || !build_accounting_is_canonical(self.identity, self.invocation.build)
             || !self.retains_bounded_actual()
         {
             return false;
@@ -962,15 +1009,31 @@ fn receipt_invariant_closes(
     }
 }
 
-fn build_accounting_is_canonical(build: BuildAccounting) -> bool {
-    let Some(work_upper_bound) = u64::try_from(build.needle_bytes)
+fn build_accounting_is_canonical(identity: OperationIdentity, build: BuildAccounting) -> bool {
+    let Some(established_work) = u64::try_from(build.needle_bytes)
         .ok()
         .and_then(|needle| needle.checked_add(1))
     else {
         return false;
     };
-    let Some(persistent_bytes) = size_of::<LiteralAggregatePlan>().checked_add(build.needle_bytes)
-    else {
+    let (work_upper_bound, owner_bytes) = if identity.plan_id == DISPATCHED_PLAN_ID {
+        if build.needle_bytes != 1 {
+            return false;
+        }
+        let Some(work) = established_work.checked_add(SIMD_CLASSIFIER_BUILD_WORK) else {
+            return false;
+        };
+        (
+            work,
+            size_of::<DispatchedLiteralAggregatePlan>()
+                .saturating_add(size_of::<DispatchedLiteralAggregateOwner>()),
+        )
+    } else if identity.plan_id == PLAN_ID {
+        (established_work, size_of::<LiteralAggregatePlan>())
+    } else {
+        return false;
+    };
+    let Some(persistent_bytes) = owner_bytes.checked_add(build.needle_bytes) else {
         return false;
     };
     let Some(peak_bytes) = persistent_bytes.checked_add(build.temporary_capacity_bytes) else {
@@ -1039,8 +1102,16 @@ impl CountAttempt {
     #[must_use]
     pub fn closes(&self) -> bool {
         self.receipt.authenticates_canonical()
-            && self.receipt.identity == OperationIdentity::for_operation(Operation::Count)
-            && self.result.accounting.identity == OperationIdentity::for_operation(Operation::Count)
+            && self
+                .receipt
+                .identity
+                .authenticates_operation(Operation::Count)
+            && self
+                .result
+                .accounting
+                .identity
+                .authenticates_operation(Operation::Count)
+            && self.receipt.identity == self.result.accounting.identity
             && self.result.accounting.closes_receipt(&self.receipt)
             && self.result.count == self.receipt.actual.count
     }
@@ -1085,9 +1156,16 @@ impl SpanSumAttempt {
     #[must_use]
     pub fn closes(&self) -> bool {
         self.receipt.authenticates_canonical()
-            && self.receipt.identity == OperationIdentity::for_operation(Operation::SpanSum)
-            && self.result.accounting.identity
-                == OperationIdentity::for_operation(Operation::SpanSum)
+            && self
+                .receipt
+                .identity
+                .authenticates_operation(Operation::SpanSum)
+            && self
+                .result
+                .accounting
+                .identity
+                .authenticates_operation(Operation::SpanSum)
+            && self.receipt.identity == self.result.accounting.identity
             && self.result.accounting.closes_receipt(&self.receipt)
             && self.result.span_sum == self.receipt.actual.matched_bytes
     }
@@ -1294,6 +1372,572 @@ pub struct LiteralAggregatePlan {
     finder: Finder<'static>,
     build: BuildAccounting,
     plan_origin: PlanOrigin,
+}
+
+/// Width-one ASCII owner that retains both the established finder and an
+/// OS-authorized SVE2 block classifier.
+///
+/// Execution samples a fixed prefix. Sparse and no-match sources continue
+/// through the established finder; dense sources reuse that sample and count
+/// the remainder in 32-byte SVE2 blocks. The owner is deliberately distinct
+/// so every other literal shape keeps the original implementation identity,
+/// storage formula, build work, and execution path.
+#[derive(Debug)]
+pub struct DispatchedLiteralAggregatePlan {
+    owner: ExactBoxOrUsize<DispatchedLiteralAggregateOwner>,
+}
+
+#[derive(Debug)]
+struct DispatchedLiteralAggregateOwner {
+    established: LiteralAggregatePlan,
+    classifier: AsciiByteSetClassifier,
+}
+
+impl DispatchedLiteralAggregatePlan {
+    /// Exact classifier construction work added to the established literal.
+    #[must_use]
+    pub const fn classifier_build_work() -> u64 {
+        SIMD_CLASSIFIER_BUILD_WORK
+    }
+
+    /// Exact retained allocation size for facade storage reconstruction.
+    #[must_use]
+    pub const fn retained_owner_bytes() -> usize {
+        size_of::<DispatchedLiteralAggregateOwner>()
+    }
+
+    /// Whether this exact needle and captured host can construct the SVE2
+    /// width-one owner.
+    #[must_use]
+    pub fn is_eligible(dispatch: SimdDispatchContext, needle: &[u8]) -> bool {
+        needle.len() == 1
+            && needle[0].is_ascii()
+            && dispatch
+                .capabilities()
+                .usable()
+                .contains_all(sve2_features())
+            && matches!(
+                dispatch.capabilities().tuning(),
+                TuningClass::ArmServer { cpu: Some(cpu) }
+                    if cpu.implementer == 0x41 && cpu.part == 0xd84
+            )
+    }
+
+    /// Build the dispatched owner when its exact shape and host facts admit it.
+    ///
+    /// `None` is a source-free ineligibility: callers must retain the
+    /// established owner. `Some(Err(_))` is a terminal resource/allocation
+    /// refusal after the dispatched owner was selected.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the direct build error retains its complete fixed accounting"
+    )]
+    #[must_use]
+    pub fn build_attempt_with_dispatch(
+        dispatch: SimdDispatchContext,
+        needle: &[u8],
+        limits: BuildLimits,
+    ) -> Option<Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>> {
+        if !Self::is_eligible(dispatch, needle) {
+            return None;
+        }
+        if !dispatched_limits_admit(limits) {
+            return None;
+        }
+        Some(build_dispatched_attempt(dispatch, needle, limits))
+    }
+
+    /// Construction certificate retained by this owner.
+    #[must_use]
+    pub fn build_accounting(&self) -> BuildAccounting {
+        self.owner().established.build
+    }
+
+    /// Bind one nonzero allocation-free external construction origin.
+    pub fn bind_external_origin(&mut self, origin: PlanOrigin) -> bool {
+        self.owner_mut().established.bind_external_origin(origin)
+    }
+
+    /// Opaque external construction origin, or zero for a standalone plan.
+    #[must_use]
+    pub fn external_origin(&self) -> PlanOrigin {
+        self.owner().established.plan_origin
+    }
+
+    /// Stable count-operation identity.
+    #[must_use]
+    pub const fn count_identity(&self) -> OperationIdentity {
+        OperationIdentity::for_dispatched_operation(Operation::Count)
+    }
+
+    /// Stable span-sum-operation identity.
+    #[must_use]
+    pub const fn span_sum_identity(&self) -> OperationIdentity {
+        OperationIdentity::for_dispatched_operation(Operation::SpanSum)
+    }
+
+    /// Exact wide-leaf selection retained by this owner.
+    #[must_use]
+    pub fn wide_selection(&self) -> SelectionReceipt {
+        self.owner().classifier.selection().wide()
+    }
+
+    /// Reduce the whole haystack to its count.
+    pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        self.count_attempt(haystack, limits)
+            .map(|attempt| attempt.result)
+            .map_err(|error| error.source)
+    }
+
+    /// Count while retaining the complete prospective/actual receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free error is the complete identity/invocation/P/A receipt"
+    )]
+    pub fn count_attempt(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<CountAttempt, ReduceAttemptError> {
+        let identity = self.count_identity();
+        let invocation = self.invocation(haystack.len(), limits);
+        let mut receipt = initial_attempt_receipt(identity, invocation);
+        let upper_bounds = match self.owner().established.preflight(&mut receipt) {
+            Ok(upper) => upper,
+            Err(source) => {
+                return Err(attempt_error(
+                    source,
+                    receipt,
+                    identity,
+                    invocation,
+                    AttemptFailurePhase::Preflight,
+                ));
+            }
+        };
+        if let Err(source) = self.execute(haystack, &mut receipt) {
+            return Err(attempt_error(
+                source,
+                receipt,
+                identity,
+                invocation,
+                AttemptFailurePhase::Execution,
+            ));
+        }
+        let actual = receipt.actual;
+        let result = CountResult {
+            count: actual.count,
+            accounting: ReduceAccounting {
+                identity,
+                invocation,
+                upper_bounds,
+                actual,
+                actual_allocations: receipt.actual_allocations,
+            },
+        };
+        let attempt = CountAttempt { result, receipt };
+        if attempt.closes() {
+            Ok(attempt)
+        } else {
+            Err(attempt_error(
+                ReduceError::ReceiptInvariant {
+                    detail: "count success did not close its identity/invocation/P/A receipt",
+                },
+                attempt.receipt,
+                identity,
+                invocation,
+                AttemptFailurePhase::CountPublication,
+            ))
+        }
+    }
+
+    /// Reduce the whole haystack to its matched-byte span sum.
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        self.span_sum_attempt(haystack, limits)
+            .map(|attempt| attempt.result)
+            .map_err(|error| error.source)
+    }
+
+    /// Span-sum while retaining the complete prospective/actual receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the allocation-free error is the complete identity/invocation/P/A receipt"
+    )]
+    pub fn span_sum_attempt(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumAttempt, ReduceAttemptError> {
+        let identity = self.span_sum_identity();
+        let invocation = self.invocation(haystack.len(), limits);
+        let mut receipt = initial_attempt_receipt(identity, invocation);
+        let upper_bounds = match self.owner().established.preflight(&mut receipt) {
+            Ok(upper) => upper,
+            Err(source) => {
+                return Err(attempt_error(
+                    source,
+                    receipt,
+                    identity,
+                    invocation,
+                    AttemptFailurePhase::Preflight,
+                ));
+            }
+        };
+        if let Err(source) = self.execute(haystack, &mut receipt) {
+            return Err(attempt_error(
+                source,
+                receipt,
+                identity,
+                invocation,
+                AttemptFailurePhase::Execution,
+            ));
+        }
+        let actual = receipt.actual;
+        let result = SpanSumResult {
+            span_sum: actual.matched_bytes,
+            accounting: ReduceAccounting {
+                identity,
+                invocation,
+                upper_bounds,
+                actual,
+                actual_allocations: receipt.actual_allocations,
+            },
+        };
+        let attempt = SpanSumAttempt { result, receipt };
+        if attempt.closes() {
+            Ok(attempt)
+        } else {
+            Err(attempt_error(
+                ReduceError::ReceiptInvariant {
+                    detail: "span-sum success did not close its identity/invocation/P/A receipt",
+                },
+                attempt.receipt,
+                identity,
+                invocation,
+                AttemptFailurePhase::SpanSumPublication,
+            ))
+        }
+    }
+
+    fn invocation(&self, haystack_bytes: usize, limits: ReduceLimits) -> ReduceInvocation {
+        ReduceInvocation {
+            haystack_bytes,
+            build: self.owner().established.build,
+            plan_origin: self.owner().established.plan_origin,
+            limits,
+        }
+    }
+
+    fn execute(
+        &self,
+        haystack: &[u8],
+        receipt: &mut ReduceAttemptReceipt,
+    ) -> Result<(), ReduceError> {
+        let Some(probe_count) = self.classifier_probe(haystack) else {
+            return self.owner().established.execute(haystack, receipt);
+        };
+        let Some(upper) = receipt.prospective else {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "execution started before prospective publication",
+            });
+        };
+        if receipt.invocation.haystack_bytes != haystack.len()
+            || receipt.identity != Self::identity_for(receipt.identity.operation)
+        {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "execution identity or source length differs from admitted invocation",
+            });
+        }
+
+        let count = self.classifier_count(haystack, probe_count)?;
+        let match_events = usize::try_from(count).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "actual match events",
+        })?;
+        let logical_steps = match_events
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual reducer steps",
+            })?;
+        commit_actual(receipt, |actual| {
+            actual.operation_allocations = 0;
+            actual.scratch_bytes = upper.scratch_bytes;
+            actual.persistent_bytes = upper.persistent_bytes;
+            actual.peak_bytes = upper.peak_bytes;
+            actual.match_events = match_events;
+            // These preserve the established logical non-overlapping event
+            // ledger: one event observation per width-one match plus the
+            // terminal observation. Physical block calls allocate no state.
+            actual.iterator_next_calls = logical_steps;
+            actual.reducer_steps = logical_steps;
+            actual.count = count;
+            actual.matched_bytes = count;
+            Ok(())
+        })?;
+        ensure_actual_is_bounded(&receipt.actual, &upper)
+    }
+
+    const fn identity_for(operation: Operation) -> OperationIdentity {
+        OperationIdentity::for_dispatched_operation(operation)
+    }
+
+    #[cfg(test)]
+    fn should_use_classifier(&self, haystack: &[u8]) -> bool {
+        self.classifier_probe(haystack).is_some()
+    }
+
+    fn classifier_probe(&self, haystack: &[u8]) -> Option<u64> {
+        if haystack.len() < SIMD_MIN_HAYSTACK_BYTES {
+            return None;
+        }
+        let mut chunks = haystack.chunks_exact(ASCII_WIDE_BYTES);
+        let probe_matches: u64 = chunks
+            .by_ref()
+            .take(SIMD_PROBE_BLOCKS)
+            .map(|chunk| {
+                let block: &[u8; ASCII_WIDE_BYTES] = chunk
+                    .try_into()
+                    .expect("an exact chunk has the classifier width");
+                u64::from(self.owner().classifier.count_32(block))
+            })
+            .sum();
+        (probe_matches >= u64::from(SIMD_MIN_PROBE_MATCHES)).then_some(probe_matches)
+    }
+
+    fn classifier_count(&self, haystack: &[u8], probe_count: u64) -> Result<u64, ReduceError> {
+        let mut count = probe_count;
+        let mut chunks = haystack.chunks_exact(ASCII_WIDE_BYTES);
+        for chunk in chunks.by_ref().skip(SIMD_PROBE_BLOCKS) {
+            let block: &[u8; ASCII_WIDE_BYTES] = chunk
+                .try_into()
+                .expect("an exact chunk has the classifier width");
+            count = count
+                .checked_add(u64::from(self.owner().classifier.count_32(block)))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual count",
+                })?;
+        }
+        let needle = self.owner().established.needle()[0];
+        for &byte in chunks.remainder() {
+            count = count.checked_add(u64::from(byte == needle)).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "actual count",
+                },
+            )?;
+        }
+        Ok(count)
+    }
+
+    fn owner(&self) -> &DispatchedLiteralAggregateOwner {
+        self.owner
+            .boxed()
+            .expect("the dispatched literal plan retains its exact owner allocation")
+    }
+
+    fn owner_mut(&mut self) -> &mut DispatchedLiteralAggregateOwner {
+        self.owner
+            .boxed_mut()
+            .expect("the dispatched literal plan retains its exact owner allocation")
+    }
+}
+
+const fn sve2_features() -> FeatureSet {
+    FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2)
+}
+
+fn singleton_ascii_set(byte: u8) -> AsciiByteSet {
+    debug_assert!(byte.is_ascii());
+    let mut words = [0_u64; 2];
+    let word = usize::from(byte / 64);
+    words[word] = 1_u64 << u32::from(byte % 64);
+    AsciiByteSet::from_words(words)
+}
+
+fn dispatched_limits_admit(limits: BuildLimits) -> bool {
+    let Some(persistent_bytes) = size_of::<DispatchedLiteralAggregatePlan>()
+        .checked_add(size_of::<DispatchedLiteralAggregateOwner>())
+        .and_then(|bytes| bytes.checked_add(1))
+    else {
+        return false;
+    };
+    let Some(minimum_peak) = persistent_bytes.checked_add(1) else {
+        return false;
+    };
+    limits.max_needle_bytes >= 1
+        && limits.max_build_work >= 1 + 1 + SIMD_CLASSIFIER_BUILD_WORK
+        && limits.max_scratch_bytes >= 1
+        && limits.max_persistent_bytes >= persistent_bytes
+        && limits.max_peak_bytes >= minimum_peak
+}
+
+fn initial_attempt_receipt(
+    identity: OperationIdentity,
+    invocation: ReduceInvocation,
+) -> ReduceAttemptReceipt {
+    ReduceAttemptReceipt {
+        identity,
+        invocation,
+        prospective: None,
+        actual: ReduceActualCounters::default(),
+        actual_allocations: 0,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the wrapper preserves the established preflight precedence and exact partial effects"
+)]
+fn build_dispatched_attempt(
+    dispatch: SimdDispatchContext,
+    needle: &[u8],
+    limits: BuildLimits,
+) -> Result<DirectBuildAttempt<DispatchedLiteralAggregatePlan>, DirectBuildAttemptError<BuildError>>
+{
+    debug_assert!(DispatchedLiteralAggregatePlan::is_eligible(
+        dispatch, needle
+    ));
+    let mut actual = DirectBuildAttemptActual::default();
+    let result = (|| {
+        let needle_u64 =
+            u64::try_from(needle.len()).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "needle length as u64",
+            })?;
+        let established_work = needle_u64
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "build work upper bound",
+            })?;
+        let work_upper_bound = established_work
+            .checked_add(SIMD_CLASSIFIER_BUILD_WORK)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched build work upper bound",
+            })?;
+        let persistent_bytes = size_of::<DispatchedLiteralAggregatePlan>()
+            .checked_add(size_of::<DispatchedLiteralAggregateOwner>())
+            .and_then(|bytes| bytes.checked_add(needle.len()))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched persistent plan bytes",
+            })?;
+
+        if needle.len() > limits.max_needle_bytes {
+            return Err(BuildError::NeedleLimit {
+                needed: needle.len(),
+                limit: limits.max_needle_bytes,
+            });
+        }
+        if work_upper_bound > limits.max_build_work {
+            return Err(BuildError::WorkLimit {
+                needed: work_upper_bound,
+                limit: limits.max_build_work,
+            });
+        }
+        if persistent_bytes > limits.max_persistent_bytes {
+            return Err(BuildError::PersistentLimit {
+                needed: persistent_bytes,
+                limit: limits.max_persistent_bytes,
+            });
+        }
+        let minimum_peak =
+            persistent_bytes
+                .checked_add(needle.len())
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "dispatched minimum construction peak",
+                })?;
+        if needle.len() > limits.max_scratch_bytes {
+            return Err(BuildError::ScratchLimit {
+                needed: needle.len(),
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        if minimum_peak > limits.max_peak_bytes {
+            return Err(BuildError::PeakLimit {
+                needed: minimum_peak,
+                limit: limits.max_peak_bytes,
+            });
+        }
+
+        let established_limits = BuildLimits {
+            max_build_work: u64::MAX,
+            max_persistent_bytes: usize::MAX,
+            max_peak_bytes: usize::MAX,
+            ..limits
+        };
+        let attempt = match LiteralAggregatePlan::build_attempt(needle, established_limits) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                actual = error.actual();
+                return Err(error.into_source());
+            }
+        };
+        let (mut established, established_actual) = attempt.into_parts();
+        actual = established_actual;
+        let peak_bytes = persistent_bytes
+            .checked_add(established.build.temporary_capacity_bytes)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched actual construction peak",
+            })?;
+        if peak_bytes > limits.max_peak_bytes {
+            return Err(BuildError::PeakLimit {
+                needed: peak_bytes,
+                limit: limits.max_peak_bytes,
+            });
+        }
+
+        let classifier = dispatch
+            .ascii_byte_set_classifier(singleton_ascii_set(needle[0]), DispatchPolicy::Auto)
+            .expect("automatic classifier dispatch retains a portable fallback");
+        debug_assert!(
+            classifier
+                .selection()
+                .wide()
+                .required
+                .contains_all(sve2_features())
+        );
+        debug_assert!(classifier.selection().wide().delegate_variant_id.is_none());
+        established.build.work_upper_bound = work_upper_bound;
+        established.build.persistent_bytes = persistent_bytes;
+        established.build.peak_bytes = peak_bytes;
+        actual.work = work_upper_bound;
+        let owner_bytes = size_of::<DispatchedLiteralAggregateOwner>();
+        let owner = ExactBoxOrUsize::try_from_boxed(DispatchedLiteralAggregateOwner {
+            established,
+            classifier,
+        })
+        .map_err(|error| match error {
+            CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                computation: "exact dispatched literal owner allocation layout",
+            },
+            CopyError::AllocationFailed => BuildError::AllocationFailed {
+                structure: "dispatched literal aggregate owner",
+                additional: owner_bytes,
+            },
+        })?;
+        actual.allocations =
+            actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual dispatched owner allocation count",
+                })?;
+        actual.allocated_bytes = actual.allocated_bytes.checked_add(owner_bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative dispatched owner allocated bytes",
+            },
+        )?;
+        actual.initialized_bytes = persistent_bytes;
+        actual.live_persistent_bytes = persistent_bytes;
+        actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+        Ok(DispatchedLiteralAggregatePlan { owner })
+    })();
+    match result {
+        Ok(plan) => Ok(DirectBuildAttempt::new(plan, actual)),
+        Err(source) => {
+            actual.live_persistent_bytes = 0;
+            Err(DirectBuildAttemptError::new(source, actual))
+        }
+    }
 }
 
 impl LiteralAggregatePlan {
@@ -1758,7 +2402,9 @@ impl LiteralAggregatePlan {
             });
         };
         if receipt.invocation.haystack_bytes != haystack.len()
-            || receipt.identity != OperationIdentity::for_operation(receipt.identity.operation)
+            || !receipt
+                .identity
+                .authenticates_operation(receipt.identity.operation)
         {
             return Err(ReduceError::ReceiptInvariant {
                 detail: "execution identity or source length differs from admitted invocation",
@@ -1848,7 +2494,7 @@ fn attempt_error(
     phase: AttemptFailurePhase,
 ) -> ReduceAttemptError {
     let signature = if receipt.authenticates(identity, invocation)
-        && identity == OperationIdentity::for_operation(identity.operation)
+        && identity.authenticates_operation(identity.operation)
         && receipt.source_closes_error(&source)
     {
         FailureSignature::from_source(phase, &source)
@@ -2063,9 +2709,11 @@ mod tests {
 
     use super::{
         ACCOUNTING_VERSION, ALGORITHM_VERSION, AttemptFailurePhase, BoundarySemantics, BuildError,
-        BuildLimits, DeclaredFallback, LiteralAggregatePlan, Operation, OperationIdentity,
+        BuildLimits, DeclaredFallback, DispatchedLiteralAggregateOwner,
+        DispatchedLiteralAggregatePlan, LiteralAggregatePlan, Operation, OperationIdentity,
         PlanOrigin, ReduceActualCounters, ReduceAttemptError, ReduceAttemptReceipt, ReduceError,
-        ReduceInvocation, ReduceLimits, attempt_error, commit_actual, compute_upper_bounds,
+        ReduceInvocation, ReduceLimits, SIMD_CLASSIFIER_BUILD_WORK, attempt_error, commit_actual,
+        compute_upper_bounds,
     };
     use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
 
@@ -2144,6 +2792,118 @@ mod tests {
             classifier_ns / aggregate_ns,
             classifier.selection().wide()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the host gate, storage ledger, hybrid split, identities, results, and limit fallback are one route proof"
+    )]
+    fn dispatched_owner_is_c9g_sve2_width_one_only_and_matches_incumbent() {
+        let dispatch = SimdDispatchContext::capture();
+        for needle in [&b""[..], &b"xx"[..], &[0x80][..]] {
+            assert!(
+                DispatchedLiteralAggregatePlan::build_attempt_with_dispatch(
+                    dispatch,
+                    needle,
+                    BuildLimits::unlimited(),
+                )
+                .is_none()
+            );
+        }
+        if !DispatchedLiteralAggregatePlan::is_eligible(dispatch, b"x") {
+            assert!(
+                DispatchedLiteralAggregatePlan::build_attempt_with_dispatch(
+                    dispatch,
+                    b"x",
+                    BuildLimits::unlimited(),
+                )
+                .is_none()
+            );
+            return;
+        }
+
+        let attempt = DispatchedLiteralAggregatePlan::build_attempt_with_dispatch(
+            dispatch,
+            b"x",
+            BuildLimits::unlimited(),
+        )
+        .expect("the qualified host is eligible")
+        .unwrap();
+        let actual = attempt.actual();
+        let dispatched = attempt.into_plan();
+        let build = dispatched.build_accounting();
+        assert_eq!(build.needle_bytes, 1);
+        assert_eq!(build.work_upper_bound, 2 + SIMD_CLASSIFIER_BUILD_WORK);
+        assert_eq!(
+            build.persistent_bytes,
+            core::mem::size_of::<DispatchedLiteralAggregatePlan>()
+                + core::mem::size_of::<DispatchedLiteralAggregateOwner>()
+                + 1
+        );
+        assert_eq!(actual.allocations, 2);
+        assert_eq!(
+            actual.allocated_bytes,
+            build.temporary_capacity_bytes
+                + core::mem::size_of::<DispatchedLiteralAggregateOwner>()
+        );
+        assert_eq!(actual.initialized_bytes, build.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, build.persistent_bytes);
+        let wide = dispatched.wide_selection();
+        assert!(wide.required.contains(Feature::ArmSve));
+        assert!(wide.required.contains(Feature::ArmSve2));
+        assert!(wide.delegate_variant_id.is_none());
+
+        let established = plan(b"x");
+        let dense = b"xxxxyxxxx-xxxx_xx".repeat(64);
+        let sparse = b"................................x".repeat(64);
+        let no_match = b"................................".repeat(64);
+        assert!(dispatched.should_use_classifier(&dense));
+        assert!(!dispatched.should_use_classifier(&sparse));
+        assert!(!dispatched.should_use_classifier(&no_match));
+        for haystack in [
+            &dense[..],
+            &sparse[..],
+            &no_match[..],
+            &b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"[..],
+            &b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"[..],
+            &b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"[..],
+        ] {
+            let expected_count = established
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            let actual_count = dispatched
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(actual_count.count, expected_count.count);
+            assert_eq!(
+                actual_count.accounting.actual.match_events,
+                expected_count.accounting.actual.match_events
+            );
+            assert_eq!(
+                actual_count.accounting.actual.matched_bytes,
+                expected_count.accounting.actual.matched_bytes
+            );
+            assert_eq!(
+                dispatched
+                    .span_sum(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .span_sum,
+                expected_count.count
+            );
+        }
+        assert_ne!(
+            established.count_identity().plan_id,
+            dispatched.count_identity().plan_id
+        );
+
+        let mut limits = BuildLimits::unlimited();
+        limits.max_build_work = 2;
+        assert!(
+            DispatchedLiteralAggregatePlan::build_attempt_with_dispatch(dispatch, b"x", limits)
+                .is_none()
+        );
+        assert!(LiteralAggregatePlan::build_attempt(b"x", limits).is_ok());
     }
 
     #[test]

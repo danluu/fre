@@ -86,6 +86,23 @@ impl<T> ExactBoxOrUsize<T> {
         // a live, aligned `Box<T>` allocation retained exclusively by `self`.
         unsafe { ptr::with_exposed_provenance::<T>(address).as_ref() }
     }
+
+    /// Mutably borrow the owned value, or `None` when this word contains an
+    /// integer.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the exclusive handle borrow recovers only the exposed provenance of its live exclusively owned allocation"
+    )]
+    pub fn boxed_mut(&mut self) -> Option<&mut T> {
+        if self.encoded & 1 == 0 {
+            return None;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: the odd variant exclusively owns this live allocation and
+        // `&mut self` prevents any overlapping borrow through the handle.
+        unsafe { ptr::with_exposed_provenance_mut::<T>(address).as_mut() }
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for ExactBoxOrUsize<T> {
@@ -396,6 +413,9 @@ mod tests {
         let inline = ExactBoxOrUsize::<DropSpy>::try_from_usize(17).unwrap();
         assert_eq!(inline.as_usize(), Some(17));
         assert!(inline.boxed().is_none());
+        let mut mutable = ExactBoxOrUsize::try_from_boxed(17_usize).unwrap();
+        *mutable.boxed_mut().unwrap() = 23;
+        assert_eq!(mutable.boxed(), Some(&23));
         let drops = Rc::new(Cell::new(0));
         let value = ExactBoxOrUsize::try_from_boxed(DropSpy(Rc::clone(&drops))).unwrap();
         assert!(value.as_usize().is_none());

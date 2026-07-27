@@ -13,17 +13,12 @@
 
 use core::fmt;
 
-#[cfg(any(
-    test,
-    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
-))]
-use fre_target_features::TuningClass;
 use fre_target_features::{
     Architecture, ArchitectureRequirement, KernelVariant, SelectedKernel, VectorKind, host,
     select_kernel,
 };
 pub use fre_target_features::{
-    CpuCapabilities, DispatchPolicy, Feature, FeatureSet, SelectionReceipt,
+    CpuCapabilities, DispatchPolicy, Feature, FeatureSet, SelectionReceipt, TuningClass,
     UnsupportedRequiredFeatures,
 };
 

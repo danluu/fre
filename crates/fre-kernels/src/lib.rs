@@ -15,7 +15,7 @@ use memchr::memmem::{Finder, FinderBuilder};
 pub use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
     AsciiByteSetRunScanner, AsciiSelection, DispatchPolicy, Feature, FeatureSet, SelectionReceipt,
-    SimdDispatchContext, UnsupportedRequiredFeatures,
+    SimdDispatchContext, TuningClass, UnsupportedRequiredFeatures,
 };
 
 mod anchored_line_capture;
@@ -292,10 +292,11 @@ pub use literal_aggregate::{
     BuildLimits as LiteralAggregateBuildLimits,
     COUNT_OPERATION_ID as LITERAL_AGGREGATE_COUNT_OPERATION_ID,
     CountAttempt as LiteralAggregateCountAttempt, CountResult as LiteralAggregateCountResult,
-    DeclaredFallback as LiteralAggregateDeclaredFallback, LiteralAggregatePlan,
-    Operation as LiteralAggregateOperation, OperationIdentity as LiteralAggregateOperationIdentity,
-    PLAN_ID as LITERAL_AGGREGATE_PLAN_ID, PlanOrigin as LiteralAggregatePlanOrigin,
-    ReduceAccounting as LiteralAggregateReduceAccounting,
+    DISPATCHED_PLAN_ID as DISPATCHED_LITERAL_AGGREGATE_PLAN_ID,
+    DeclaredFallback as LiteralAggregateDeclaredFallback, DispatchedLiteralAggregatePlan,
+    LiteralAggregatePlan, Operation as LiteralAggregateOperation,
+    OperationIdentity as LiteralAggregateOperationIdentity, PLAN_ID as LITERAL_AGGREGATE_PLAN_ID,
+    PlanOrigin as LiteralAggregatePlanOrigin, ReduceAccounting as LiteralAggregateReduceAccounting,
     ReduceActualCounters as LiteralAggregateActualCounters,
     ReduceAttemptError as LiteralAggregateReduceAttemptError,
     ReduceAttemptReceipt as LiteralAggregateReduceAttemptReceipt,
