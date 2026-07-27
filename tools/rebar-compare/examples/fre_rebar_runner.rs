@@ -16,15 +16,16 @@ use std::{
 use bstr::ByteSlice;
 use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind,
-    BOUNDED_AFFIX_PLAN_ID, PlanKind, PortableGrepBuildError, PortableGrepSession, PortableRegex,
-    PortableSearchSession, SearchLimits, SearchSessionLimits, SimdDispatchContext,
-    simd_dispatch_profile,
+    AggregateManyBuilder, AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits,
+    AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID,
+    PlanKind, PortableGrepBuildError, PortableGrepSession, PortableRegex, PortableSearchSession,
+    SearchLimits, SearchSessionLimits, SimdDispatchContext, simd_dispatch_profile,
 };
 use rebar_compare::{
-    AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateCompileArtifact,
-    CurrentFreAggregateCompileLifecycle, CurrentFreAggregateOperationLifecycle,
-    CurrentFreHotByteOperationLifecycle, InputReceipt, REPORT_SCHEMA,
+    AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
+    CurrentFreAdapter, CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
+    CurrentFreAggregateOperationLifecycle, CurrentFreHotByteOperationLifecycle, InputReceipt,
+    REPORT_SCHEMA, RunLimits,
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
     current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
     current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_aggregate_run_limits,
@@ -187,6 +188,16 @@ fn main() -> Result<(), DynError> {
         io::stdout().lock().write_all(&bytes)?;
         return Ok(());
     }
+    if benchmark.model == "regex-redux"
+        || (benchmark.model == "count-captures" && benchmark.patterns.len() > 1)
+    {
+        return Err(format!(
+            "FRE model {:?} with {} patterns requires --performance-raw",
+            benchmark.model,
+            benchmark.patterns.len()
+        )
+        .into());
+    }
     require_runtime_expectation(&benchmark.model, expectations.runtime.as_deref())?;
     require_capture_metadata(&benchmark.model, &expectations)?;
     if matches!(benchmark.model.as_str(), "count-captures" | "grep-captures") {
@@ -305,7 +316,13 @@ fn require_performance_raw_metadata(
 ) -> Result<(), DynError> {
     if !matches!(
         model,
-        "compile" | "count" | "count-spans" | "grep" | "count-captures" | "grep-captures"
+        "compile"
+            | "count"
+            | "count-spans"
+            | "grep"
+            | "count-captures"
+            | "grep-captures"
+            | "regex-redux"
     ) {
         return Err(
             format!("all-model raw mode does not yet implement FRE model {model:?}").into(),
@@ -426,21 +443,21 @@ impl Benchmark {
         if benchmark.max_iters != 1 || benchmark.max_warmup_iters != 0 {
             return Err("formal FRE timing requires max-iters=1 and max-warmup-iters=0".into());
         }
-        if benchmark.patterns.is_empty() {
-            return Err("FRE KLV runner requires at least one pattern".into());
-        }
-        if benchmark.patterns.len() != 1
-            && !matches!(
-                benchmark.model.as_str(),
-                "compile" | "count" | "count-spans"
-            )
-        {
-            return Err(format!(
-                "FRE KLV model {:?} requires one pattern, got {}",
-                benchmark.model,
-                benchmark.patterns.len()
-            )
-            .into());
+        match (benchmark.model.as_str(), benchmark.patterns.len()) {
+            ("regex-redux", 0) => {}
+            ("regex-redux", count) => {
+                return Err(format!(
+                    "FRE KLV regex-redux requires no external patterns, got {count}"
+                )
+                .into());
+            }
+            (_, 0) => return Err("FRE KLV runner requires at least one pattern".into()),
+            ("compile" | "count" | "count-spans" | "count-captures", _) | (_, 1) => {}
+            (model, count) => {
+                return Err(
+                    format!("FRE KLV model {model:?} requires one pattern, got {count}").into(),
+                );
+            }
         }
         Ok(benchmark)
     }
@@ -648,6 +665,10 @@ fn aggregate_many_plan(model: &str, report: &AggregateManyBuildReport) -> &'stat
         ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
         ("compile", AggregateManyPlanKind::ContinuationProgram) => {
             "compile-many-continuation-program"
+        }
+        ("count-captures", AggregateManyPlanKind::OrderedLiteral) => "capture-many-ordered-literal",
+        ("count-captures", AggregateManyPlanKind::ContinuationProgram) => {
+            "capture-many-continuation-program"
         }
         (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
         (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
@@ -948,13 +969,41 @@ fn model_performance_raw(
                 Ok((start.elapsed(), actual))
             },
         ),
-        "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
+        "count-captures" if benchmark.patterns.len() > 1 => {
+            model_many_capture_performance_raw_with_measurement(
+                benchmark,
+                expectations,
+                |regex, haystack, limits| {
+                    let start = Instant::now();
+                    let actual = regex
+                        .count_captures_value(haystack, limits)
+                        .map_err(|error| {
+                            CompareError::new(format!(
+                                "FRE aggregate-many capture lifecycle execution: {error}"
+                            ))
+                        })?;
+                    Ok((start.elapsed(), actual))
+                },
+            )
+        }
+        "count-captures" | "grep-captures" => {
+            model_capture_performance_raw_with_measurement(
+                benchmark,
+                expectations,
+                |lifecycle, haystack| {
+                    let start = Instant::now();
+                    let actual = lifecycle.execute(haystack)?;
+                    Ok((start.elapsed(), actual))
+                },
+            )
+        }
+        "regex-redux" => model_regex_redux_performance_raw_with_measurement(
             benchmark,
             expectations,
-            |lifecycle, haystack| {
+            |request, limits| {
                 let start = Instant::now();
-                let actual = lifecycle.execute(haystack)?;
-                Ok((start.elapsed(), actual))
+                let outcome = CurrentFreAdapter.execute(request, limits);
+                Ok((start.elapsed(), outcome))
             },
         ),
         model => Err(format!("all-model raw candidate route rejects model {model:?}").into()),
@@ -1103,6 +1152,121 @@ where
             }
         }
         measure(&mut lifecycle, &benchmark.haystack)
+    })
+    .map_err(Into::into)
+}
+
+fn model_many_capture_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        &AggregateManyCaptureCountRegex,
+        &[u8],
+        AggregateManyCaptureRunLimits,
+    ) -> Result<(Duration, u64), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let steady = identity.boundary == "steady-public-operation";
+    produce_performance_candidate_observation(&identity, || {
+        let regex = aggregate_many_builder(benchmark)
+            .build_capture_count()
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE aggregate-many capture lifecycle build: {error}"
+                ))
+            })?;
+        current_fre_rebar_validate_aggregate_many_identity(
+            &benchmark.patterns,
+            regex.build_report(),
+            benchmark.unicode,
+            benchmark.case_insensitive,
+            "count-captures",
+        )?;
+        require_performance_plan(
+            &expected_plan,
+            aggregate_many_plan("count-captures", regex.build_report()),
+        )?;
+        let selector = current_fre_rebar_aggregate_many_run_limits(
+            benchmark.haystack.len(),
+            regex.build_report(),
+        )?;
+        let limits = AggregateManyCaptureRunLimits {
+            selector,
+            ..AggregateManyCaptureRunLimits::default()
+        };
+        if steady {
+            let primed = regex
+                .count_captures_value(&benchmark.haystack, limits)
+                .map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE aggregate-many capture lifecycle prime: {error}"
+                    ))
+                })?;
+            if primed != identity.expected {
+                return Err(CompareError::new(format!(
+                    "aggregate-many capture lifecycle prime returned {primed}, expected {}",
+                    identity.expected
+                )));
+            }
+        }
+        measure(&regex, &benchmark.haystack, limits)
+    })
+    .map_err(Into::into)
+}
+
+fn model_regex_redux_performance_raw_with_measurement<F>(
+    benchmark: &Benchmark,
+    expectations: &Expectations,
+    measure: F,
+) -> Result<PerformanceRawObservation, DynError>
+where
+    F: FnOnce(
+        CandidateRequest<'_>,
+        &RunLimits,
+    ) -> Result<(Duration, CandidateOutcome), CompareError>,
+{
+    let identity = performance_candidate_identity(benchmark, expectations)?;
+    let expected_plan = identity.candidate_plan.clone();
+    let request = CandidateRequest {
+        job_id: &identity.job_id,
+        model: &benchmark.model,
+        patterns: &benchmark.patterns,
+        haystack: &benchmark.haystack,
+        unicode: benchmark.unicode,
+        case_insensitive: benchmark.case_insensitive,
+    };
+    let limits = RunLimits::default();
+    produce_performance_candidate_observation(&identity, || {
+        let (elapsed, outcome) = measure(request, &limits)?;
+        let (actual, plan) = match outcome {
+            CandidateOutcome::ExecutedWithPlan { actual, plan } => (actual, plan),
+            CandidateOutcome::Executed(actual) => {
+                return Err(CompareError::new(format!(
+                    "FRE regex-redux lifecycle returned unplanned reducer {actual}"
+                )));
+            }
+            CandidateOutcome::Unsupported(reason) => {
+                return Err(CompareError::new(format!(
+                    "FRE regex-redux lifecycle was unsupported: {reason}"
+                )));
+            }
+            CandidateOutcome::Unresolved(reason) => {
+                return Err(CompareError::new(format!(
+                    "FRE regex-redux lifecycle was unresolved: {reason}"
+                )));
+            }
+            CandidateOutcome::Fault(reason) => {
+                return Err(CompareError::new(format!(
+                    "FRE regex-redux lifecycle faulted: {reason}"
+                )));
+            }
+        };
+        require_performance_plan(&expected_plan, &plan)?;
+        Ok((elapsed, actual))
     })
     .map_err(Into::into)
 }
@@ -1556,6 +1720,20 @@ mod tests {
         output
     }
 
+    fn zero_pattern_klv(model: &str) -> Vec<u8> {
+        let mut output = Vec::new();
+        field(&mut output, "name", b"test/model/zero-pattern");
+        field(&mut output, "model", model.as_bytes());
+        field(&mut output, "case-insensitive", b"false");
+        field(&mut output, "unicode", b"false");
+        field(&mut output, "max-iters", b"1");
+        field(&mut output, "max-warmup-iters", b"0");
+        field(&mut output, "max-time", b"1000");
+        field(&mut output, "max-warmup-time", b"100");
+        field(&mut output, "haystack", b"tHaN");
+        output
+    }
+
     fn capture_benchmark(model: &str, pattern: &str, haystack: &[u8]) -> Benchmark {
         Benchmark {
             name: format!("test/model/{model}"),
@@ -1628,14 +1806,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_patterns_only_for_aggregate_models() {
-        for model in ["compile", "count", "count-spans"] {
+    fn parses_model_specific_pattern_cardinality() {
+        for model in ["compile", "count", "count-spans", "count-captures"] {
             let benchmark = Benchmark::parse(&multi_klv(model)).expect("aggregate multi KLV");
             assert_eq!(benchmark.patterns, ["cat", "dog"]);
         }
-        for model in ["grep", "count-captures", "grep-captures"] {
+        for model in ["grep", "grep-captures"] {
             assert!(Benchmark::parse(&multi_klv(model)).is_err());
         }
+        let regex_redux =
+            Benchmark::parse(&zero_pattern_klv("regex-redux")).expect("regex-redux KLV");
+        assert!(regex_redux.patterns.is_empty());
+        assert!(Benchmark::parse(&zero_pattern_klv("count")).is_err());
+        assert!(Benchmark::parse(&multi_klv("regex-redux")).is_err());
     }
 
     #[test]
@@ -2033,6 +2216,146 @@ mod tests {
         let mut missing = complete;
         missing.comparator = None;
         assert!(require_performance_raw_metadata("count", &missing).is_err());
+    }
+
+    #[test]
+    fn aggregate_many_capture_raw_mode_preserves_first_and_steady_lifecycles() {
+        let benchmark = Benchmark {
+            name: "test/model/multi-count-captures".to_string(),
+            model: "count-captures".to_string(),
+            patterns: vec!["(a+)".to_string(), "(a)".to_string()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: b"aa".to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        };
+        for (boundary, preparation, priming_operations, elapsed) in [
+            (
+                "first-public-operation",
+                PerformanceLifecyclePreparation::BuiltArtifact,
+                0,
+                47,
+            ),
+            (
+                "steady-public-operation",
+                PerformanceLifecyclePreparation::PrimedArtifact,
+                1,
+                49,
+            ),
+        ] {
+            let expectations =
+                performance_expectations(boundary, "capture-many-continuation-program", 2);
+            let measured = std::cell::Cell::new(0_u8);
+            let observation = model_many_capture_performance_raw_with_measurement(
+                &benchmark,
+                &expectations,
+                |regex, haystack, limits| {
+                    measured.set(measured.get() + 1);
+                    let actual = regex
+                        .count_captures_value(haystack, limits)
+                        .map_err(|error| CompareError::new(error.to_string()))?;
+                    Ok((Duration::from_nanos(elapsed), actual))
+                },
+            )
+            .expect("aggregate-many capture raw arm");
+            assert_eq!(measured.get(), 1);
+            assert_eq!(observation.preparation, preparation);
+            assert_eq!(observation.priming_operations, priming_operations);
+            assert_eq!(observation.elapsed_ns, elapsed);
+            assert_eq!(observation.actual, 2);
+            assert_eq!(
+                observation.candidate_plan.as_deref(),
+                Some("capture-many-continuation-program")
+            );
+            assert_eq!(
+                observation.input.pattern_sha256,
+                vec![sha256(b"(a+)"), sha256(b"(a)")]
+            );
+        }
+
+        let wrong_plan =
+            performance_expectations("first-public-operation", "capture-many-ordered-literal", 2);
+        let measured = std::cell::Cell::new(false);
+        assert!(
+            model_many_capture_performance_raw_with_measurement(
+                &benchmark,
+                &wrong_plan,
+                |regex, haystack, limits| {
+                    measured.set(true);
+                    let actual = regex
+                        .count_captures_value(haystack, limits)
+                        .map_err(|error| CompareError::new(error.to_string()))?;
+                    Ok((Duration::from_nanos(1), actual))
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            !measured.get(),
+            "wrong capture-many plan reached measurement"
+        );
+    }
+
+    #[test]
+    fn regex_redux_raw_mode_times_one_complete_generic_composite() {
+        let benchmark =
+            Benchmark::parse(&zero_pattern_klv("regex-redux")).expect("regex-redux KLV");
+        let expectations = performance_expectations(
+            "complete-regex-redux",
+            "regex-redux-sequential-composite-v1",
+            1,
+        );
+        require_performance_raw_metadata("regex-redux", &expectations)
+            .expect("regex-redux raw metadata");
+        let measured = std::cell::Cell::new(0_u8);
+        let observation = model_regex_redux_performance_raw_with_measurement(
+            &benchmark,
+            &expectations,
+            |request, limits| {
+                measured.set(measured.get() + 1);
+                Ok((
+                    Duration::from_nanos(53),
+                    CurrentFreAdapter.execute(request, limits),
+                ))
+            },
+        )
+        .expect("regex-redux raw arm");
+        assert_eq!(measured.get(), 1);
+        assert_eq!(
+            observation.preparation,
+            PerformanceLifecyclePreparation::CompositeFresh
+        );
+        assert_eq!(observation.priming_operations, 0);
+        assert_eq!(observation.measured_operations, 1);
+        assert_eq!(observation.elapsed_ns, 53);
+        assert_eq!(observation.actual, 1);
+        assert!(observation.input.pattern_sha256.is_empty());
+        assert_eq!(observation.input.haystack_sha256, sha256(b"tHaN"));
+
+        let wrong_plan =
+            performance_expectations("complete-regex-redux", "regex-redux-composite-alias", 1);
+        let measured = std::cell::Cell::new(false);
+        assert!(
+            model_regex_redux_performance_raw_with_measurement(
+                &benchmark,
+                &wrong_plan,
+                |request, limits| {
+                    measured.set(true);
+                    Ok((
+                        Duration::from_nanos(1),
+                        CurrentFreAdapter.execute(request, limits),
+                    ))
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            measured.get(),
+            "regex-redux plan is authenticated from the measured composite"
+        );
     }
 
     #[test]

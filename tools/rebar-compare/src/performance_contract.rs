@@ -809,12 +809,14 @@ pub struct PerformanceResourcePairEvidence {
 pub enum PerformanceRunnerRoute {
     /// One-pattern aggregate compile/count/span-sum lifecycle.
     AggregateSingle,
-    /// Ordered multi-pattern aggregate compile/count/span-sum lifecycle.
+    /// Ordered multi-pattern aggregate compile/count/span-sum/capture-count lifecycle.
     AggregateMany,
     /// Portable line-oriented grep lifecycle.
     PortableGrep,
     /// Persistent-history capture lifecycle.
     Capture,
+    /// Complete fresh composite lifecycle.
+    Composite,
 }
 
 /// One supported row's exact candidate runner admission record.
@@ -2615,12 +2617,20 @@ fn performance_runner_route(
             "count" | "count-spans",
             "aggregate-many-ordered-literal" | "aggregate-many-continuation-program",
             2..,
+        )
+        | (
+            "count-captures",
+            "capture-many-ordered-literal" | "capture-many-continuation-program",
+            2..,
         ) => PerformanceRunnerRoute::AggregateMany,
         ("grep", "portable-single-search", 1) => PerformanceRunnerRoute::PortableGrep,
         (model @ ("count-captures" | "grep-captures"), plan, 1)
             if crate::is_current_fre_capture_route(model, plan) =>
         {
             PerformanceRunnerRoute::Capture
+        }
+        ("regex-redux", "regex-redux-sequential-composite-v1", 0) => {
+            PerformanceRunnerRoute::Composite
         }
         _ => {
             return Err(ContractError::new(format!(
@@ -3001,7 +3011,7 @@ pub fn validate_performance_candidate_observation_request(
         (_, None) => {}
     }
     require_digest(&identity.process_token_sha256, "performance process token")?;
-    validate_performance_input_shape(&identity.input)?;
+    validate_performance_input_shape(&identity.model, &identity.input)?;
     let _ = raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
     Ok(())
 }
@@ -3025,7 +3035,7 @@ fn validate_performance_reference_identity_shape(
     require_token(&identity.boundary, "performance boundary")?;
     require_token(&identity.comparator, "performance comparator")?;
     require_digest(&identity.process_token_sha256, "performance process token")?;
-    validate_performance_input_shape(&identity.input)?;
+    validate_performance_input_shape(&identity.model, &identity.input)?;
     let _ = raw_lifecycle_preparation(&identity.model, &identity.boundary)?;
     Ok(())
 }
@@ -3062,7 +3072,7 @@ fn validate_performance_raw_observation_shape(
         "performance raw process token",
     )?;
     require_digest(&observation.result_sha256, "performance raw result digest")?;
-    validate_performance_input_shape(&observation.input)?;
+    validate_performance_input_shape(&observation.model, &observation.input)?;
     match expected_arm {
         CapturePairArm::Candidate => {
             require_token(
@@ -3116,11 +3126,22 @@ fn validate_performance_raw_observation_shape(
     Ok(())
 }
 
-fn validate_performance_input_shape(input: &InputReceipt) -> Result<(), ContractError> {
-    if input.pattern_sha256.is_empty() {
-        return Err(ContractError::new(
-            "performance input has no pattern identities",
-        ));
+fn validate_performance_input_shape(
+    model: &str,
+    input: &InputReceipt,
+) -> Result<(), ContractError> {
+    match (model, input.pattern_sha256.is_empty()) {
+        ("regex-redux", false) => {
+            return Err(ContractError::new(
+                "regex-redux performance input has external pattern identities",
+            ));
+        }
+        ("regex-redux", true) | (_, false) => {}
+        (_, true) => {
+            return Err(ContractError::new(
+                "performance input has no pattern identities",
+            ));
+        }
     }
     for pattern in &input.pattern_sha256 {
         require_digest(pattern, "performance input pattern digest")?;
@@ -3131,7 +3152,9 @@ fn validate_performance_input_shape(input: &InputReceipt) -> Result<(), Contract
 fn require_performance_grep_runtime(runtime: &str) -> Result<(), ContractError> {
     require_token(runtime, "candidate performance grep runtime")?;
     match runtime {
-        "k0" | "ascii-word-run-linear-v1" | "unicode-word-run-linear-v1" => Ok(()),
+        "exact-literal" | "k0" | "ascii-word-run-linear-v1" | "unicode-word-run-linear-v1" => {
+            Ok(())
+        }
         other => Err(ContractError::new(format!(
             "unrecognized candidate performance grep runtime {other:?}"
         ))),
@@ -5974,6 +5997,35 @@ mod tests {
                 performance_runner_route("grep-captures", &format!("{plan}-alias"), 1).is_err()
             );
         }
+    }
+
+    #[test]
+    fn composite_and_capture_many_runner_routes_require_exact_shape() {
+        for plan in [
+            "capture-many-ordered-literal",
+            "capture-many-continuation-program",
+        ] {
+            assert_eq!(
+                performance_runner_route("count-captures", plan, 88)
+                    .expect("exact capture-many route"),
+                PerformanceRunnerRoute::AggregateMany
+            );
+            assert!(performance_runner_route("count-captures", plan, 1).is_err());
+            assert!(performance_runner_route("grep-captures", plan, 88).is_err());
+            assert!(
+                performance_runner_route("count-captures", &format!("{plan}-alias"), 88).is_err()
+            );
+        }
+        assert_eq!(
+            performance_runner_route("regex-redux", "regex-redux-sequential-composite-v1", 0)
+                .expect("exact regex-redux composite route"),
+            PerformanceRunnerRoute::Composite
+        );
+        assert!(
+            performance_runner_route("regex-redux", "regex-redux-sequential-composite-v1", 1)
+                .is_err()
+        );
+        assert!(performance_runner_route("regex-redux", "regex-redux-composite-alias", 0).is_err());
     }
 
     #[test]
