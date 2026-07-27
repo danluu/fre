@@ -1834,10 +1834,40 @@ impl PortableBuilder {
         if self.selection == PlanSelection::Auto
             && let Some(plan) = unicode_word_run::extract(&rust.hir)
         {
+            let planner_work = u64::try_from(plan.portable_build_work()).map_err(|_| {
+                BuildError::InternalInvariant("word-run build work does not fit u64")
+            })?;
+            if planner_work > self.limits.max_planner_work {
+                return Err(BuildError::PlannerWorkLimit {
+                    needed: planner_work,
+                    limit: self.limits.max_planner_work,
+                });
+            }
+            let plan_storage_bytes = plan.portable_storage_bytes();
             return Ok(PortableRegex {
                 source,
                 capture_names,
-                plan: PortablePlan::UnicodeWordRun(plan),
+                plan: if plan.is_ascii_word() {
+                    PortablePlan::AsciiWordRun(
+                        unicode_word_run::AsciiPlan::build_auto(plan).map_err(
+                            |error| match error {
+                                fre_exact_alloc::CopyError::LayoutOverflow => {
+                                    BuildError::InternalInvariant(
+                                        "exact ASCII word-run owner layout overflowed",
+                                    )
+                                }
+                                fre_exact_alloc::CopyError::AllocationFailed => {
+                                    BuildError::AllocationFailed {
+                                        structure: "ASCII word-run owner",
+                                        additional: 1,
+                                    }
+                                }
+                            },
+                        )?,
+                    )
+                } else {
+                    PortablePlan::UnicodeWordRun(plan)
+                },
                 profile: profile.clone(),
                 limits: self.limits,
                 selection: self.selection,
@@ -1846,11 +1876,11 @@ impl PortableBuilder {
                     admission,
                     syntax,
                     plan: PlanKind::UnicodeWordRun,
-                    planner_work: 1,
+                    planner_work,
                     lowering: None,
                     states: 0,
                     edges: 0,
-                    plan_storage_bytes: core::mem::size_of::<unicode_word_run::Plan>(),
+                    plan_storage_bytes,
                     source_storage_bytes,
                     capture_name_storage_bytes,
                     charged_persistent_bytes: 0,
@@ -2424,6 +2454,7 @@ enum PortablePlan {
     ForwardEndFixed(AbsoluteEndFixedPlan),
     K0(Automaton),
     UnicodeWordRun(unicode_word_run::Plan),
+    AsciiWordRun(unicode_word_run::AsciiPlan),
 }
 
 impl PortablePlan {
@@ -2439,6 +2470,7 @@ impl PortablePlan {
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
             Self::UnicodeWordRun(plan) => plan.plan_id(),
+            Self::AsciiWordRun(_) => unicode_word_run::ASCII_PLAN_ID,
         }
     }
 }
@@ -2800,6 +2832,13 @@ impl PortableRegex {
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
             }
+            PortablePlan::AsciiWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
         }
     }
 
@@ -2889,6 +2928,10 @@ impl PortableRegex {
                 .map(fre_automata::SearchReport::into_output)
                 .map_err(SearchError::from),
             PortablePlan::UnicodeWordRun(plan) => plan
+                .find_window(haystack, window, limits)
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::AsciiWordRun(plan) => plan
                 .find_window(haystack, window, limits)
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
@@ -3046,6 +3089,13 @@ impl PortableRegex {
                     SearchAccounting::UnicodeWordRun(accounting),
                 ))
             }
+            PortablePlan::AsciiWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
         }
     }
 
@@ -3131,6 +3181,14 @@ impl PortableRegex {
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
             PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) =
+                    plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::UnicodeWordRun(accounting),
+                ))
+            }
+            PortablePlan::AsciiWordRun(plan) => {
                 let (matched, accounting) =
                     plan.find_window(haystack, SearchWindow::full(haystack), limits)?;
                 Ok((
@@ -3401,6 +3459,10 @@ impl PortableRegex {
                 Ok((matched, SearchAccounting::K0(accounting)))
             }
             PortablePlan::UnicodeWordRun(plan) => {
+                let (matched, accounting) = plan.find_window(haystack, window, limits)?;
+                Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
+            }
+            PortablePlan::AsciiWordRun(plan) => {
                 let (matched, accounting) = plan.find_window(haystack, window, limits)?;
                 Ok((matched, SearchAccounting::UnicodeWordRun(accounting)))
             }

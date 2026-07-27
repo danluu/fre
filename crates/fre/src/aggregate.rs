@@ -7987,8 +7987,8 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from word-run inspection",
                     });
                 }
-                let engine = inspection.plan;
-                let attempt = engine
+                let descriptor = inspection.plan;
+                let attempt = descriptor
                     .aggregate_build_attempt(limits.word_run)
                     .map_err(|error| {
                         construction.pending_terminal_effect =
@@ -8003,9 +8003,9 @@ impl AggregateBuilder {
                 retain_direct_build_success(construction, inspection.work, build_actual);
                 let kernel = match operation {
                     AggregateOperation::Compile | AggregateOperation::Count => {
-                        engine.aggregate_count_identity()
+                        descriptor.aggregate_count_identity()
                     }
-                    AggregateOperation::SpanSum => engine.aggregate_span_sum_identity(),
+                    AggregateOperation::SpanSum => descriptor.aggregate_span_sum_identity(),
                     AggregateOperation::Spans => {
                         return Err(AggregateBuildError::InternalInvariant {
                             operation,
@@ -8076,7 +8076,29 @@ impl AggregateBuilder {
                     retained_capacity_bytes: build.persistent_bytes,
                 };
                 return Ok(AggregatePlan {
-                    engine: AggregateEngine::WordRun(engine),
+                    engine: if descriptor.is_ascii_word() {
+                        let engine = unicode_word_run::AsciiPlan::build_auto(descriptor).map_err(
+                            |error| AggregateBuildError::WordRunBuild {
+                                operation,
+                                selection,
+                                source: match error {
+                                    fre_exact_alloc::CopyError::LayoutOverflow => {
+                                        unicode_word_run::AggregateBuildError::ArithmeticOverflow {
+                                            computation: "exact ASCII word-run owner layout",
+                                        }
+                                    }
+                                    fre_exact_alloc::CopyError::AllocationFailed => {
+                                        unicode_word_run::AggregateBuildError::AllocationFailed {
+                                            bytes: unicode_word_run::AsciiPlan::allocation_bytes(),
+                                        }
+                                    }
+                                },
+                            },
+                        )?;
+                        AggregateEngine::AsciiWordRun(engine)
+                    } else {
+                        AggregateEngine::WordRun(descriptor)
+                    },
                     minimum_match_bytes,
                     limits,
                     report,
@@ -12390,6 +12412,7 @@ enum AggregateEngine {
     ExactLiteral(LiteralAggregatePlan),
     UnicodeScalar(UnicodeScalarAggregatePlan),
     WordRun(unicode_word_run::Plan),
+    AsciiWordRun(unicode_word_run::AsciiPlan),
     LiteralAssertions(LiteralAssertionsPlan),
     BlockingDelimiter(BlockingDelimiterPlan),
     TokenPhrase(TokenPhrasePlan),
@@ -12505,7 +12528,9 @@ impl AggregatePlan {
         match self.engine {
             AggregateEngine::ExactLiteral(_) => Some(AggregateDirectRoute::ExactLiteral),
             AggregateEngine::UnicodeScalar(_) => Some(AggregateDirectRoute::UnicodeScalar),
-            AggregateEngine::WordRun(_) => Some(AggregateDirectRoute::WordRun),
+            AggregateEngine::WordRun(_) | AggregateEngine::AsciiWordRun(_) => {
+                Some(AggregateDirectRoute::WordRun)
+            }
             AggregateEngine::LiteralAssertions(_) => Some(AggregateDirectRoute::LiteralAssertions),
             AggregateEngine::BlockingDelimiter(_) => Some(AggregateDirectRoute::BlockingDelimiter),
             AggregateEngine::TokenPhrase(_) => Some(AggregateDirectRoute::TokenPhrase),
@@ -13192,6 +13217,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::WordRun(source),
                     )
                 }),
+            AggregateEngine::AsciiWordRun(engine) => engine
+                .aggregate_count(haystack, limits.word_run)
+                .map(AggregateCountExecution::WordRun)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
             AggregateEngine::LiteralAssertions(engine) => engine
                 .count(haystack, limits.literal_assertions)
                 .map(AggregateCountExecution::LiteralAssertions)
@@ -13565,6 +13600,16 @@ impl AggregatePlan {
                     )
                 }),
             AggregateEngine::WordRun(engine) => engine
+                .aggregate_span_sum(haystack, limits.word_run)
+                .map(AggregateSpanSumExecution::WordRun)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
+            AggregateEngine::AsciiWordRun(engine) => engine
                 .aggregate_span_sum(haystack, limits.word_run)
                 .map(AggregateSpanSumExecution::WordRun)
                 .map_err(|source| {

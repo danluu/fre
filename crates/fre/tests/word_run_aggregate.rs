@@ -610,10 +610,10 @@ fn fixed_class_chunk_planner_build_and_execution_fences_body() {
         })
         .expect("selected incumbent word-run construction effect")
         .effect;
-    assert_eq!(selected.effect.allocations, incumbent_effect.allocations);
-    assert_eq!(
-        selected.effect.allocated_bytes,
-        incumbent_effect.allocated_bytes
-    );
     assert_eq!(selected.effect.allocations, 1);
+    assert_eq!(incumbent_effect.allocations, 2);
+    assert!(
+        incumbent_effect.allocated_bytes > selected.effect.allocated_bytes,
+        "the ASCII incumbent additionally retains its exact run-scanner owner"
+    );
 }

@@ -1,4 +1,8 @@
-use fre_kernels::DirectBuildAttemptActual;
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+use fre_kernels::{
+    AsciiByteSet, AsciiByteSetRunScanner, DirectBuildAttemptActual, DispatchPolicy,
+    SimdDispatchContext,
+};
 use regex_syntax::{
     ParserBuilder,
     hir::{Class, Hir, HirKind, Look},
@@ -17,6 +21,9 @@ pub const FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID: &str = "fixed-byte-class-chunks
 pub const FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID: &str = "fixed-byte-class-chunks.span-sum.v1";
 
 const FIXED_BUILD_WORK: usize = 1;
+// The scanner compiles both run-table representations in one complete
+// 128-byte-domain pass and makes one paired-direction dispatch choice.
+const ASCII_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const FIXED_REDUCE_WORK: usize = 8;
 const UNIT_WORK: usize = 4;
 const RUN_WORK: usize = 2;
@@ -42,6 +49,22 @@ pub(crate) enum Plan {
         chunk_bytes: usize,
         class_words: [u64; 4],
     },
+}
+
+/// Production owner for the ASCII word-run shape.
+///
+/// Keeping this distinct from [`Plan`] leaves the Unicode and fixed-class
+/// artifacts at their established exact storage while the ASCII route retains
+/// its immutable automatic dispatch choice.
+#[derive(Debug)]
+pub(crate) struct AsciiPlan {
+    owner: ExactBoxOrUsize<AsciiPlanOwner>,
+}
+
+#[derive(Debug)]
+struct AsciiPlanOwner {
+    plan: Plan,
+    run_scanner: AsciiByteSetRunScanner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,7 +132,7 @@ pub struct AggregateBuildAccounting {
     pub peak_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct AggregateBuildAttempt {
     accounting: AggregateBuildAccounting,
     actual: DirectBuildAttemptActual,
@@ -242,6 +265,7 @@ pub enum AggregateBuildError {
     ScratchLimit { needed: usize, limit: usize },
     PersistentLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
+    AllocationFailed { bytes: usize },
     ArithmeticOverflow { computation: &'static str },
 }
 
@@ -401,6 +425,79 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl AsciiPlan {
+    #[inline(never)]
+    pub(crate) fn build_auto(plan: Plan) -> Result<Self, CopyError> {
+        debug_assert!(plan.is_ascii_word());
+        let run_scanner = SimdDispatchContext::capture()
+            .ascii_byte_set_run_scanner(ascii_word_set(), DispatchPolicy::Auto)
+            .expect("automatic ASCII run dispatch always retains a scalar fallback");
+        ExactBoxOrUsize::try_from_boxed(AsciiPlanOwner { plan, run_scanner })
+            .map(|owner| Self { owner })
+    }
+
+    const fn persistent_bytes() -> usize {
+        core::mem::size_of::<Self>()
+            .checked_add(core::mem::size_of::<AsciiPlanOwner>())
+            .expect("the fixed ASCII plan layouts fit usize")
+    }
+
+    pub(crate) const fn allocation_bytes() -> usize {
+        core::mem::size_of::<AsciiPlanOwner>()
+    }
+
+    fn owner(&self) -> &AsciiPlanOwner {
+        self.owner
+            .boxed()
+            .expect("the ASCII plan retains its exact owner allocation")
+    }
+
+    fn run_scanner(&self) -> &AsciiByteSetRunScanner {
+        &self.owner().run_scanner
+    }
+
+    pub(crate) fn aggregate_count(
+        &self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Result<AggregateCountResult, AggregateReduceError> {
+        self.owner().plan.aggregate_count_with_ascii_scanner(
+            haystack,
+            limits,
+            self.run_scanner(),
+            Self::persistent_bytes(),
+        )
+    }
+
+    pub(crate) fn aggregate_span_sum(
+        &self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+    ) -> Result<AggregateSpanSumResult, AggregateReduceError> {
+        self.owner().plan.aggregate_span_sum_with_ascii_scanner(
+            haystack,
+            limits,
+            self.run_scanner(),
+            Self::persistent_bytes(),
+        )
+    }
+
+    pub(crate) fn find_window(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, Accounting), Error> {
+        validate_window(haystack, window)?;
+        self.owner().plan.find_ascii_window_with_scanner(
+            haystack,
+            window,
+            limits,
+            self.run_scanner(),
+        )
+    }
+}
+
 impl Plan {
     const fn new(minimum_scalars: usize, mode: WordMode) -> Self {
         Self::Word {
@@ -430,6 +527,35 @@ impl Plan {
         }
     }
 
+    pub(crate) const fn is_ascii_word(self) -> bool {
+        matches!(
+            self,
+            Self::Word {
+                mode: WordMode::Ascii,
+                ..
+            }
+        )
+    }
+
+    pub(crate) const fn portable_build_work(self) -> usize {
+        let scanner_work = if self.is_ascii_word() {
+            ASCII_RUN_SCANNER_BUILD_WORK
+        } else {
+            0
+        };
+        FIXED_BUILD_WORK
+            .checked_add(scanner_work)
+            .expect("the fixed word-run build work fits usize")
+    }
+
+    pub(crate) const fn portable_storage_bytes(self) -> usize {
+        if self.is_ascii_word() {
+            AsciiPlan::persistent_bytes()
+        } else {
+            core::mem::size_of::<Self>()
+        }
+    }
+
     const fn minimum_match_units(self) -> usize {
         match self {
             Self::Word {
@@ -455,11 +581,23 @@ impl Plan {
         limits: AggregateBuildLimits,
     ) -> Result<AggregateBuildAttempt, AggregateBuildAttemptError> {
         let attempt = || -> Result<AggregateBuildAttempt, AggregateBuildError> {
+            let retains_ascii_scanner = self.is_ascii_word();
+            let scanner_work = if retains_ascii_scanner {
+                ASCII_RUN_SCANNER_BUILD_WORK
+            } else {
+                0
+            };
+            let work_upper_bound = FIXED_BUILD_WORK.checked_add(scanner_work).ok_or(
+                AggregateBuildError::ArithmeticOverflow {
+                    computation: "word-run build work",
+                },
+            )?;
+            let persistent_bytes = self.portable_storage_bytes();
             let accounting = AggregateBuildAccounting {
-                work_upper_bound: FIXED_BUILD_WORK,
+                work_upper_bound,
                 scratch_bytes: 0,
-                persistent_bytes: core::mem::size_of_val(&self),
-                peak_bytes: core::mem::size_of_val(&self),
+                persistent_bytes,
+                peak_bytes: persistent_bytes,
             };
             enforce_build(
                 accounting.work_upper_bound,
@@ -481,7 +619,7 @@ impl Plan {
                 limits.max_peak_bytes,
                 AggregateBuildResource::Peak,
             )?;
-            let work = u64::try_from(FIXED_BUILD_WORK).map_err(|_| {
+            let work = u64::try_from(work_upper_bound).map_err(|_| {
                 AggregateBuildError::ArithmeticOverflow {
                     computation: "word-run build work as u64",
                 }
@@ -490,8 +628,12 @@ impl Plan {
                 accounting,
                 actual: DirectBuildAttemptActual {
                     work,
-                    allocations: 0,
-                    allocated_bytes: 0,
+                    allocations: usize::from(retains_ascii_scanner),
+                    allocated_bytes: if retains_ascii_scanner {
+                        core::mem::size_of::<AsciiPlanOwner>()
+                    } else {
+                        0
+                    },
                     copied_bytes: 0,
                     initialized_bytes: accounting.persistent_bytes,
                     live_persistent_bytes: accounting.persistent_bytes,
@@ -566,7 +708,12 @@ impl Plan {
         haystack: &[u8],
         limits: AggregateReduceLimits,
     ) -> Result<AggregateCountResult, AggregateReduceError> {
-        let upper = self.aggregate_preflight(haystack.len(), AggregateOperation::Count, limits)?;
+        let upper = self.aggregate_preflight(
+            haystack.len(),
+            AggregateOperation::Count,
+            limits,
+            core::mem::size_of::<Self>(),
+        )?;
         let actual = self.aggregate_scan(haystack, AggregateOperation::Count, upper)?;
         Ok(AggregateCountResult {
             count: actual.count,
@@ -583,9 +730,63 @@ impl Plan {
         haystack: &[u8],
         limits: AggregateReduceLimits,
     ) -> Result<AggregateSpanSumResult, AggregateReduceError> {
-        let upper =
-            self.aggregate_preflight(haystack.len(), AggregateOperation::SpanSum, limits)?;
+        let upper = self.aggregate_preflight(
+            haystack.len(),
+            AggregateOperation::SpanSum,
+            limits,
+            core::mem::size_of::<Self>(),
+        )?;
         let actual = self.aggregate_scan(haystack, AggregateOperation::SpanSum, upper)?;
+        Ok(AggregateSpanSumResult {
+            span_sum: actual.span_sum,
+            accounting: AggregateReduceAccounting {
+                identity: self.aggregate_span_sum_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    fn aggregate_count_with_ascii_scanner(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+        scanner: &AsciiByteSetRunScanner,
+        persistent_bytes: usize,
+    ) -> Result<AggregateCountResult, AggregateReduceError> {
+        let upper = self.aggregate_preflight(
+            haystack.len(),
+            AggregateOperation::Count,
+            limits,
+            persistent_bytes,
+        )?;
+        let actual =
+            self.aggregate_scan_ascii(haystack, AggregateOperation::Count, upper, scanner)?;
+        Ok(AggregateCountResult {
+            count: actual.count,
+            accounting: AggregateReduceAccounting {
+                identity: self.aggregate_count_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    fn aggregate_span_sum_with_ascii_scanner(
+        self,
+        haystack: &[u8],
+        limits: AggregateReduceLimits,
+        scanner: &AsciiByteSetRunScanner,
+        persistent_bytes: usize,
+    ) -> Result<AggregateSpanSumResult, AggregateReduceError> {
+        let upper = self.aggregate_preflight(
+            haystack.len(),
+            AggregateOperation::SpanSum,
+            limits,
+            persistent_bytes,
+        )?;
+        let actual =
+            self.aggregate_scan_ascii(haystack, AggregateOperation::SpanSum, upper, scanner)?;
         Ok(AggregateSpanSumResult {
             span_sum: actual.span_sum,
             accounting: AggregateReduceAccounting {
@@ -601,8 +802,9 @@ impl Plan {
         input_bytes: usize,
         operation: AggregateOperation,
         limits: AggregateReduceLimits,
+        persistent_bytes: usize,
     ) -> Result<AggregateReduceUpperBounds, AggregateReduceError> {
-        let upper = self.aggregate_upper_bounds(input_bytes, operation)?;
+        let upper = self.aggregate_upper_bounds(input_bytes, operation, persistent_bytes)?;
         enforce_reduce(upper, limits)?;
         Ok(upper)
     }
@@ -611,6 +813,7 @@ impl Plan {
         self,
         input_bytes: usize,
         operation: AggregateOperation,
+        persistent_bytes: usize,
     ) -> Result<AggregateReduceUpperBounds, AggregateReduceError> {
         let unit_events = input_bytes;
         let run_events = input_bytes;
@@ -647,7 +850,6 @@ impl Plan {
             .ok_or(AggregateReduceError::ArithmeticOverflow {
                 computation: "complete reduction work bound",
             })?;
-        let persistent_bytes = core::mem::size_of::<Self>();
         Ok(AggregateReduceUpperBounds {
             input_bytes,
             source_reads: input_bytes,
@@ -731,6 +933,51 @@ impl Plan {
         Ok(actual)
     }
 
+    fn aggregate_scan_ascii(
+        self,
+        haystack: &[u8],
+        operation: AggregateOperation,
+        upper: AggregateReduceUpperBounds,
+        scanner: &AsciiByteSetRunScanner,
+    ) -> Result<AggregateReduceActual, AggregateReduceError> {
+        debug_assert!(self.is_ascii_word());
+        let mut actual = AggregateReduceActual {
+            source_reads: 0,
+            work: FIXED_REDUCE_WORK,
+            units: 0,
+            runs: 0,
+            matches: 0,
+            count: 0,
+            span_sum: 0,
+            scratch_bytes: 0,
+        };
+        let mut position = 0_usize;
+        while position < haystack.len() {
+            if !is_ascii_word(haystack[position]) {
+                aggregate_charge_units(&mut actual, 1)?;
+                position = checked_add(position, 1, "actual ASCII input cursor")?;
+                continue;
+            }
+            // This authenticated ledger is logical: every source byte is
+            // charged exactly once. A leaf's possible failed-block recovery
+            // remains an implementation detail of the retained scanner.
+            let run = scanner.scan_forward(&haystack[position..]).member_run_len();
+            if run == 0 {
+                return Err(AggregateReduceError::AccountingInvariant {
+                    resource: AggregateReduceResource::UnitEvents,
+                    actual: 0,
+                    upper: 1,
+                });
+            }
+            aggregate_charge_units(&mut actual, run)?;
+            let end = checked_add(position, run, "actual ASCII run boundary")?;
+            self.aggregate_finish_run(position, end, run, operation, &mut actual)?;
+            position = end;
+        }
+        verify_aggregate_actual(actual, upper)?;
+        Ok(actual)
+    }
+
     fn aggregate_finish_run(
         self,
         start: usize,
@@ -805,13 +1052,7 @@ impl Plan {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, Accounting), Error> {
-        if window.start() > window.end() || window.end() > haystack.len() {
-            return Err(Error::InvalidWindow {
-                start: window.start(),
-                end: window.end(),
-                haystack_len: haystack.len(),
-            });
-        }
+        validate_window(haystack, window)?;
         match self {
             Self::Word {
                 mode: WordMode::Ascii,
@@ -871,6 +1112,74 @@ impl Plan {
                     limit: limits.max_work,
                 })?;
             }
+            if position.saturating_sub(start) >= minimum_scalars
+                && !haystack
+                    .get(position)
+                    .is_some_and(|&byte| is_ascii_word(byte))
+            {
+                return Ok((
+                    Some(Match {
+                        start,
+                        end: position,
+                    }),
+                    accounting,
+                ));
+            }
+        }
+        Ok((None, accounting))
+    }
+
+    fn find_ascii_window_with_scanner(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        scanner: &AsciiByteSetRunScanner,
+    ) -> Result<(Option<Match>, Accounting), Error> {
+        debug_assert!(self.is_ascii_word());
+        let minimum_scalars = self.word_minimum_scalars();
+        let mut accounting = Accounting {
+            work: 0,
+            bytes_examined: 0,
+            scalars_decoded: 0,
+        };
+        let mut position = window.start();
+        while position < window.end() {
+            charge(&mut accounting, limits)?;
+            let byte = haystack[position];
+            accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
+            accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
+            if !is_ascii_word(byte)
+                || position
+                    .checked_sub(1)
+                    .is_some_and(|before| is_ascii_word(haystack[before]))
+            {
+                position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
+                continue;
+            }
+
+            let start = position;
+            position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
+                needed: u64::MAX,
+                limit: limits.max_work,
+            })?;
+            let continuation = scanner
+                .scan_forward(&haystack[position..window.end()])
+                .member_run_len();
+            // Preserve the incumbent SearchLimits contract by charging the
+            // logically consumed continuation, not physical recovery probes.
+            charge_many(&mut accounting, continuation, limits)?;
+            accounting.bytes_examined = accounting.bytes_examined.saturating_add(continuation);
+            accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(continuation);
+            position = position
+                .checked_add(continuation)
+                .ok_or(Error::WorkLimitExceeded {
+                    needed: u64::MAX,
+                    limit: limits.max_work,
+                })?;
             if position.saturating_sub(start) >= minimum_scalars
                 && !haystack
                     .get(position)
@@ -1301,6 +1610,22 @@ fn parse_unicode_word_class() -> Option<regex_syntax::hir::ClassUnicode> {
     Some(class.clone())
 }
 
+const fn ascii_word_set() -> AsciiByteSet {
+    // 0..=63 contains 0-9; 64..=127 contains A-Z, _, and a-z.
+    AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe])
+}
+
+fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), Error> {
+    if window.start() > window.end() || window.end() > haystack.len() {
+        return Err(Error::InvalidWindow {
+            start: window.start(),
+            end: window.end(),
+            haystack_len: haystack.len(),
+        });
+    }
+    Ok(())
+}
+
 fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error> {
     let needed = accounting.work.saturating_add(1);
     if needed > limits.max_work {
@@ -1310,6 +1635,43 @@ fn charge(accounting: &mut Accounting, limits: SearchLimits) -> Result<(), Error
         });
     }
     accounting.work = needed;
+    Ok(())
+}
+
+fn charge_many(
+    accounting: &mut Accounting,
+    units: usize,
+    limits: SearchLimits,
+) -> Result<(), Error> {
+    if units == 0 {
+        return Ok(());
+    }
+    let units = u64::try_from(units).unwrap_or(u64::MAX);
+    let needed = accounting.work.saturating_add(units);
+    if needed > limits.max_work {
+        return Err(Error::WorkLimitExceeded {
+            // The established scalar loop refuses at the first inadmissible
+            // unit, rather than reporting the end of a batched run.
+            needed: limits.max_work.saturating_add(1),
+            limit: limits.max_work,
+        });
+    }
+    accounting.work = needed;
+    Ok(())
+}
+
+fn aggregate_charge_units(
+    actual: &mut AggregateReduceActual,
+    units: usize,
+) -> Result<(), AggregateReduceError> {
+    actual.source_reads = checked_add(actual.source_reads, units, "actual source reads")?;
+    actual.units = checked_add(actual.units, units, "actual decoded units")?;
+    let work = units
+        .checked_mul(UNIT_WORK)
+        .ok_or(AggregateReduceError::ArithmeticOverflow {
+            computation: "actual ASCII unit work",
+        })?;
+    actual.work = checked_add(actual.work, work, "actual unit work")?;
     Ok(())
 }
 
@@ -1507,9 +1869,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    };
+
     use regex::bytes::RegexBuilder;
 
-    use super::{AggregateReduceLimits, Plan};
+    use super::{
+        ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildLimits, AggregateReduceLimits, AsciiPlan,
+        AsciiPlanOwner, FIXED_BUILD_WORK, Plan, WordMode, ascii_word_set,
+    };
+    use crate::{SearchLimits, SearchWindow};
 
     fn class_words(bytes: &[u8]) -> [u64; 4] {
         let mut words = [0_u64; 4];
@@ -1595,5 +1966,188 @@ mod tests {
         ] {
             assert_plan_matches(r"[\x61-\x63\x80\xff]{3}", plan, haystack);
         }
+    }
+
+    #[test]
+    fn ascii_auto_scanner_preserves_scalar_windows_limits_and_accounting() {
+        let scalar = Plan::new(3, WordMode::Ascii);
+        let auto = AsciiPlan::build_auto(scalar).expect("exact ASCII owner");
+        assert_eq!(auto.run_scanner().set(), ascii_word_set());
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"---abc---",
+            b"a_b 012345 x",
+            &[0xFF, b'a', b'b', b'c', 0x80, b'd', b'e', b'f'],
+            b"word_that_crosses_several_fixed_blocks!",
+        ];
+        for &haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let scalar_result = scalar
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .expect("scalar search");
+                    let auto_result = auto
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .expect("automatic search");
+                    assert_eq!(auto_result, scalar_result, "{haystack:?}/{start}..{end}");
+                    let work = scalar_result.1.work();
+                    for limit in [0, work.saturating_sub(1), work, work.saturating_add(1)] {
+                        let limits = SearchLimits {
+                            max_work: limit,
+                            max_scratch_bytes: usize::MAX,
+                        };
+                        assert_eq!(
+                            auto.find_window(haystack, window, limits),
+                            scalar.find_window(haystack, window, limits),
+                            "limit={limit} {haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+        let invalid = SearchWindow::new(2, 1);
+        assert_eq!(
+            auto.find_window(b"abc", invalid, SearchLimits::unlimited()),
+            scalar.find_window(b"abc", invalid, SearchLimits::unlimited())
+        );
+    }
+
+    #[test]
+    fn ascii_auto_scanner_preserves_aggregate_results_and_logical_ledgers() {
+        let scalar = Plan::new(12, WordMode::Ascii);
+        let auto = AsciiPlan::build_auto(scalar).expect("exact ASCII owner");
+        let mut long = Vec::new();
+        long.extend(std::iter::repeat_n(b'a', 4_097));
+        long.push(b'!');
+        long.extend(std::iter::repeat_n(b'7', 257));
+        long.extend_from_slice(&[0xFF, b'_', b'x']);
+        for haystack in [
+            b"---abcdefghijkl---123456789012---".as_slice(),
+            &[0x80, b'a', b'b', b'c', b'_', b'1', 0xFF],
+            long.as_slice(),
+        ] {
+            let scalar_count = scalar
+                .aggregate_count(haystack, AggregateReduceLimits::unlimited())
+                .expect("scalar count");
+            let auto_count = auto
+                .aggregate_count(haystack, AggregateReduceLimits::unlimited())
+                .expect("automatic count");
+            assert_eq!(auto_count.count, scalar_count.count);
+            assert_eq!(auto_count.accounting.actual, scalar_count.accounting.actual);
+            assert_eq!(auto_count.accounting.actual.source_reads, haystack.len());
+
+            let scalar_sum = scalar
+                .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
+                .expect("scalar span sum");
+            let auto_sum = auto
+                .aggregate_span_sum(haystack, AggregateReduceLimits::unlimited())
+                .expect("automatic span sum");
+            assert_eq!(auto_sum.span_sum, scalar_sum.span_sum);
+            assert_eq!(auto_sum.accounting.actual, scalar_sum.accounting.actual);
+            assert_eq!(auto_sum.accounting.actual.source_reads, haystack.len());
+        }
+    }
+
+    #[test]
+    fn ascii_scanner_build_storage_is_exact_and_unicode_storage_is_unchanged() {
+        let ascii = Plan::new(3, WordMode::Ascii);
+        let ascii_attempt = ascii
+            .aggregate_build_attempt(AggregateBuildLimits::unlimited())
+            .expect("ASCII build");
+        let (accounting, actual) = ascii_attempt.into_parts();
+        let built = AsciiPlan::build_auto(ascii).expect("exact ASCII owner");
+        assert_eq!(built.run_scanner().set(), ascii_word_set());
+        assert_eq!(
+            accounting.work_upper_bound,
+            FIXED_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK
+        );
+        assert_eq!(accounting.persistent_bytes, AsciiPlan::persistent_bytes());
+        assert_eq!(accounting.peak_bytes, accounting.persistent_bytes);
+        assert_eq!(
+            actual.work,
+            u64::try_from(accounting.work_upper_bound).expect("small fixed work")
+        );
+        assert_eq!(actual.initialized_bytes, accounting.persistent_bytes);
+        assert_eq!(actual.live_persistent_bytes, accounting.persistent_bytes);
+        assert_eq!(actual.allocations, 1);
+        assert_eq!(
+            actual.allocated_bytes,
+            core::mem::size_of::<AsciiPlanOwner>()
+        );
+
+        let unicode = Plan::new(3, WordMode::Unicode);
+        let unicode_attempt = unicode
+            .aggregate_build_attempt(AggregateBuildLimits::unlimited())
+            .expect("Unicode build");
+        let (accounting, actual) = unicode_attempt.into_parts();
+        assert_eq!(accounting.work_upper_bound, FIXED_BUILD_WORK);
+        assert_eq!(accounting.persistent_bytes, core::mem::size_of::<Plan>());
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.initialized_bytes, core::mem::size_of::<Plan>());
+    }
+
+    fn measure_ascii_search(
+        mut search: impl FnMut() -> Result<(Option<crate::Match>, super::Accounting), super::Error>,
+        iterations: u32,
+    ) -> (Duration, u64) {
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            let (matched, accounting) = black_box(search()).expect("benchmark search");
+            checksum = checksum.wrapping_add(accounting.work());
+            checksum = checksum.wrapping_add(
+                u64::try_from(matched.map_or(0, crate::Match::end)).expect("match end fits u64"),
+            );
+        }
+        (started.elapsed(), checksum)
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark for the retained automatic ASCII run scanner"]
+    fn benchmark_unicode_word_run_ascii_auto_against_scalar() {
+        let scalar = Plan::new(1, WordMode::Ascii);
+        let auto = AsciiPlan::build_auto(scalar).expect("exact ASCII owner");
+        let mut haystack = Vec::with_capacity((256 << 10) + 2);
+        haystack.push(b'!');
+        haystack.extend(std::iter::repeat_n(b'a', 256 << 10));
+        haystack.push(b'!');
+        let window = SearchWindow::full(&haystack);
+        let limits = SearchLimits::unlimited();
+        assert_eq!(
+            auto.find_window(&haystack, window, limits),
+            scalar.find_window(&haystack, window, limits)
+        );
+        let iterations =
+            std::env::var("FRE_UNICODE_WORD_RUN_ASCII_BENCH_ITERS").map_or(256, |raw| {
+                raw.parse::<u32>().unwrap_or_else(|error| {
+                    panic!("FRE_UNICODE_WORD_RUN_ASCII_BENCH_ITERS: {error}")
+                })
+            });
+        assert!(iterations > 0);
+        let _ = measure_ascii_search(
+            || scalar.find_window(black_box(&haystack), window, limits),
+            2,
+        );
+        let _ = measure_ascii_search(|| auto.find_window(black_box(&haystack), window, limits), 2);
+        let (scalar_elapsed, scalar_checksum) = measure_ascii_search(
+            || scalar.find_window(black_box(&haystack), window, limits),
+            iterations,
+        );
+        let (auto_elapsed, auto_checksum) = measure_ascii_search(
+            || auto.find_window(black_box(&haystack), window, limits),
+            iterations,
+        );
+        assert_eq!(auto_checksum, scalar_checksum);
+        let scalar_ns = scalar_elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations);
+        let auto_ns = auto_elapsed.as_secs_f64() * 1_000_000_000.0 / f64::from(iterations);
+        eprintln!(
+            "UNICODE_WORD_RUN_ASCII_BENCH iterations={iterations} bytes={} \
+             scalar_ns={scalar_ns:.9} auto_ns={auto_ns:.9} auto_over_scalar={:.9} \
+             variant={}",
+            haystack.len(),
+            auto_ns / scalar_ns,
+            auto.run_scanner().selection().variant_id,
+        );
     }
 }
