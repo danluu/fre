@@ -45,6 +45,9 @@ const SORT_SWAP_WORK: u64 = 4;
 const ENTRY_IDENTITY_BYTES: usize = 10;
 const ASCII_WORD_SET: AsciiByteSet =
     AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
+// Calling a retained scanner for every tiny maximal word costs more than the
+// scalar loop. Prove a useful continuation before paying that fixed cost.
+const RUN_SCANNER_SCALAR_PROBE_BYTES: usize = 16;
 
 /// One accepted directional ASCII word-boundary assertion.
 ///
@@ -2111,15 +2114,27 @@ impl Dictionary {
                 reduce_invariant(actual, "word cursor overflowed admitted haystack")
             })?;
             if let Some(scanner) = word_run_scanner {
-                let member_run = scanner.scan_forward(&haystack[index..]).member_run_len();
-                actual.bytes_classified = add(
-                    actual.bytes_classified,
-                    member_run,
-                    "classified haystack bytes",
-                )?;
-                index = index.checked_add(member_run).ok_or_else(|| {
-                    reduce_invariant(actual, "word cursor overflowed admitted haystack")
-                })?;
+                let probe_end = index
+                    .checked_add(RUN_SCANNER_SCALAR_PROBE_BYTES)
+                    .unwrap_or(haystack.len())
+                    .min(haystack.len());
+                while index < probe_end && is_ascii_word(haystack[index]) {
+                    increment(&mut actual.bytes_classified, "classified haystack bytes")?;
+                    index = index.checked_add(1).ok_or_else(|| {
+                        reduce_invariant(actual, "word cursor overflowed admitted haystack")
+                    })?;
+                }
+                if index == probe_end && index < haystack.len() {
+                    let member_run = scanner.scan_forward(&haystack[index..]).member_run_len();
+                    actual.bytes_classified = add(
+                        actual.bytes_classified,
+                        member_run,
+                        "classified haystack bytes",
+                    )?;
+                    index = index.checked_add(member_run).ok_or_else(|| {
+                        reduce_invariant(actual, "word cursor overflowed admitted haystack")
+                    })?;
+                }
             } else {
                 while index < haystack.len() && is_ascii_word(haystack[index]) {
                     increment(&mut actual.bytes_classified, "classified haystack bytes")?;
