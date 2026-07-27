@@ -8,8 +8,8 @@
 //! successful greedy continuation scans disjoint after normal regex
 //! non-overlap. Execution therefore streams one candidate and one continuation
 //! state without a queue, active set, scratch allocation, or input rewind.
-//! A caller-captured dispatch context may retain one fixed-16 SVE/SVE2 scanner
-//! for an all-ASCII tail class. Its reported physical classifications,
+//! A caller-captured dispatch context may retain one fixed-16 automatic SIMD
+//! scanner for an all-ASCII tail class on an SVE-capable host. Its reported physical classifications,
 //! including terminating-load recovery, are charged exactly; the prospective
 //! envelope admits the scanner's bounded per-candidate overhead. Non-SVE hosts
 //! and classes containing non-ASCII bytes retain the scalar loop unchanged.
@@ -18,7 +18,7 @@ use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, FeatureSet, SimdDispatchContext,
+    Feature, SimdDispatchContext,
 };
 
 use crate::required_literal::ByteClass;
@@ -357,7 +357,7 @@ impl RequiredInternalAnchorPlan {
     }
 
     /// Build with one capability snapshot captured before the accounted
-    /// transaction. Eligible ASCII tails retain an SVE/SVE2 run scanner;
+    /// transaction. Eligible ASCII tails retain an automatic run scanner;
     /// every other host and tail retains the scalar loop.
     pub fn build_with_dispatch(
         dispatch: SimdDispatchContext,
@@ -1041,11 +1041,7 @@ fn tail_run_policy(dispatch: SimdDispatchContext, class: ByteClass) -> Option<Di
     if !usable.contains(Feature::ArmSve) {
         return None;
     }
-    let mut allowed = FeatureSet::of(Feature::ArmSve);
-    if usable.contains(Feature::ArmSve2) {
-        allowed = allowed.with(Feature::ArmSve2);
-    }
-    Some(DispatchPolicy::AllowOnly(allowed))
+    Some(DispatchPolicy::Auto)
 }
 
 fn build_work_upper_bound(
@@ -1997,7 +1993,10 @@ mod tests {
         let scalar_long = scalar.count(&long, CountLimits::default()).unwrap();
         let dispatched_long = dispatched.count(&long, CountLimits::default()).unwrap();
         if let Some(scanner) = dispatched.tail_run_scanner.as_ref() {
-            assert!(scanner.selection().variant_id.contains(".sve"));
+            assert_ne!(
+                scanner.selection().variant_id,
+                "ascii-byte-set.run.scalar.v1"
+            );
             assert_eq!(
                 dispatched.build.tail_run_scanner_build_work,
                 SIMD_RUN_SCANNER_BUILD_WORK
@@ -2026,7 +2025,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the ignored qualification benchmark keeps alternating scalar/SVE2 samples and its authenticated receipt together"
     )]
-    fn benchmark_required_internal_anchor_ascii_tail_scalar_against_sve2() {
+    fn benchmark_required_internal_anchor_ascii_tail_scalar_against_auto() {
         use std::hint::black_box;
         use std::time::Instant;
 
@@ -2075,7 +2074,7 @@ mod tests {
         let scalar =
             RequiredInternalAnchorPlan::build(prefix, b"X", continuation, BuildLimits::default())
                 .unwrap();
-        let sve2 = RequiredInternalAnchorPlan::build_with_dispatch(
+        let dispatched = RequiredInternalAnchorPlan::build_with_dispatch(
             dispatch,
             prefix,
             b"X",
@@ -2083,10 +2082,9 @@ mod tests {
             BuildLimits::default(),
         )
         .unwrap();
-        assert_eq!(
-            sve2.tail_run_variant_id(),
-            Some("ascii-byte-set.run.sve2-match16.v1")
-        );
+        let candidate_variant = dispatched
+            .tail_run_variant_id()
+            .expect("an SVE host retains an automatic run scanner");
 
         let mut haystack = Vec::with_capacity((256 << 10) + 3);
         haystack.extend_from_slice(b"aX");
@@ -2100,7 +2098,10 @@ mod tests {
             1
         );
         assert_eq!(
-            sve2.count(&haystack, CountLimits::default()).unwrap().count,
+            dispatched
+                .count(&haystack, CountLimits::default())
+                .unwrap()
+                .count,
             1
         );
 
@@ -2110,34 +2111,35 @@ mod tests {
         });
         assert!(iterations > 0);
         let _ = measure(&scalar, &haystack, iterations / 8 + 1);
-        let _ = measure(&sve2, &haystack, iterations / 8 + 1);
+        let _ = measure(&dispatched, &haystack, iterations / 8 + 1);
 
         let samples = 16;
         let mut scalar_samples = Vec::with_capacity(samples);
-        let mut sve2_samples = Vec::with_capacity(samples);
+        let mut auto_samples = Vec::with_capacity(samples);
         let mut orders = Vec::with_capacity(samples);
         for sample in 0..samples {
             if sample & 1 == 0 {
                 scalar_samples.push(measure(&scalar, &haystack, iterations).0);
-                sve2_samples.push(measure(&sve2, &haystack, iterations).0);
-                orders.push("scalar>sve2");
+                auto_samples.push(measure(&dispatched, &haystack, iterations).0);
+                orders.push("scalar>auto");
             } else {
-                sve2_samples.push(measure(&sve2, &haystack, iterations).0);
+                auto_samples.push(measure(&dispatched, &haystack, iterations).0);
                 scalar_samples.push(measure(&scalar, &haystack, iterations).0);
-                orders.push("sve2>scalar");
+                orders.push("auto>scalar");
             }
         }
         let scalar_median = median(&scalar_samples);
-        let sve2_median = median(&sve2_samples);
+        let auto_median = median(&auto_samples);
         eprintln!(
             "REQUIRED_INTERNAL_ANCHOR_RUN_BENCH iterations={iterations} samples={samples} \
-             bytes={} scalar_ns={scalar_median:.9} sve2_ns={sve2_median:.9} \
-             sve2_over_scalar={:.9} orders={} scalar_samples={} sve2_samples={}",
+             bytes={} candidate_variant={candidate_variant} scalar_ns={scalar_median:.9} \
+             auto_ns={auto_median:.9} auto_over_scalar={:.9} orders={} \
+             scalar_samples={} auto_samples={}",
             haystack.len(),
-            sve2_median / scalar_median,
+            auto_median / scalar_median,
             orders.join(","),
             serialize(&scalar_samples),
-            serialize(&sve2_samples),
+            serialize(&auto_samples),
         );
     }
 }
