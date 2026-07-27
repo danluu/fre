@@ -885,6 +885,10 @@ impl OperationSessionAttempt<'_, Slot> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::items_after_test_module,
+    reason = "the test-only slot canary API remains private and adjacent to the owning type"
+)]
 mod stream_tests {
     use super::*;
     use crate::operation_session::{
@@ -1336,9 +1340,8 @@ mod stream_tests {
         let run_limits =
             OperationSessionRunLimits::exact(OperationSessionExecutionProspective::default());
         let mut forced = session.forced_grep();
-        let error = match forced.begin_count(request(1, 2, prospective, run_limits)) {
-            Ok(_) => panic!("one-below request unexpectedly reached the slot"),
-            Err(error) => error,
+        let Err(error) = forced.begin_count(request(1, 2, prospective, run_limits)) else {
+            panic!("one-below request unexpectedly reached the slot");
         };
         let receipt = match error {
             OperationSessionAttemptError::Refused(receipt)

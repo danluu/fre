@@ -1150,6 +1150,10 @@ where
     .map_err(Into::into)
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the runner keeps the admitted reusable session inline instead of adding an unaccounted box allocation"
+)]
 enum CurrentFreGrepSession<'r> {
     Stream(PortableGrepSession<'r>),
     SearchFallback(PortableSearchSession<'r>),
@@ -1164,10 +1168,10 @@ impl CurrentFreGrepSession<'_> {
     }
 }
 
-fn build_grep_session<'r>(
-    regex: &'r PortableRegex,
+fn build_grep_session(
+    regex: &PortableRegex,
     limits: SearchLimits,
-) -> Result<CurrentFreGrepSession<'r>, CompareError> {
+) -> Result<CurrentFreGrepSession<'_>, CompareError> {
     match regex.grep_stream_session() {
         Ok(session) => Ok(CurrentFreGrepSession::Stream(session)),
         Err(PortableGrepBuildError::UnsupportedRuntime { .. }) => regex

@@ -1404,9 +1404,9 @@ impl OperationSessionAttemptReceipt {
                     )
             }
             (OperationSessionTerminal::ExecutionFailed, Some(prospective), None) => {
-                let failure = match evidence.failure {
-                    OperationSessionFailureEvidence::ExecutionFailed(failure) => failure,
-                    _ => return false,
+                let OperationSessionFailureEvidence::ExecutionFailed(failure) = evidence.failure
+                else {
+                    return false;
                 };
                 self.identity == expected_identity
                     && self.identity.leaf == OperationSessionLeaf::Grep

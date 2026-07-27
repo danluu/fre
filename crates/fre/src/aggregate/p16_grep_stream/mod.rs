@@ -825,19 +825,16 @@ fn finish_k0(
     let matched = report.matched();
     let first_match = matched.first().map(k0_match);
     let last_match = matched.last().map(k0_match);
-    let source_line_domains = match usize::try_from(actual.domains_examined()) {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(close_execution(
-                attempt,
-                k0_actual(actual),
-                order,
-                GrepStreamFailure::Protocol,
-                PortableGrepExecutionError::Protocol {
-                    detail: "K0 source-domain count does not fit usize",
-                },
-            ));
-        }
+    let Ok(source_line_domains) = usize::try_from(actual.domains_examined()) else {
+        return Err(close_execution(
+            attempt,
+            k0_actual(actual),
+            order,
+            GrepStreamFailure::Protocol,
+            PortableGrepExecutionError::Protocol {
+                detail: "K0 source-domain count does not fit usize",
+            },
+        ));
     };
     let common_report = GrepStreamExecutionReport {
         source_line_domains,

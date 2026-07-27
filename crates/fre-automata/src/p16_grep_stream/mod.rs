@@ -694,6 +694,10 @@ pub fn count_matching_lines(
     clippy::too_many_lines,
     reason = "the single source traversal keeps CRLF state and every terminal path in one audit scope"
 )]
+#[allow(
+    clippy::result_large_err,
+    reason = "the closed receipt-bearing error stays inline so failure paths allocate nothing"
+)]
 pub fn count_matching_lines_with_observer<E, F>(
     automaton: &Automaton,
     haystack: &[u8],
@@ -1221,6 +1225,10 @@ fn process_content_byte(
 #[allow(
     clippy::too_many_arguments,
     reason = "line close binds both source and semantic boundaries plus fixed execution state"
+)]
+#[allow(
+    clippy::result_large_err,
+    reason = "the closed receipt-bearing error stays inline so failure paths allocate nothing"
 )]
 fn finish_line<E, F>(
     automaton: &Automaton,

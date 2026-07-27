@@ -257,6 +257,10 @@ pub(crate) fn count_matching_lines(
 }
 
 /// Count matching lines through the shared literal plan and observe each hit.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one shared literal traversal keeps CRLF state and every terminal ledger in one audit scope"
+)]
 pub(crate) fn count_matching_lines_with_observer<E, F>(
     plan: &LiteralPlan,
     haystack: &[u8],
