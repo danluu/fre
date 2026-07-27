@@ -55,6 +55,49 @@ fn reference_32(set: AsciiByteSet, bytes: &[u8; ASCII_WIDE_BYTES]) -> AsciiMasks
     AsciiMasks32::new(ascii, members)
 }
 
+fn reference_run_forward(set: AsciiByteSet, bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .position(|&byte| !set.contains(byte))
+        .unwrap_or(bytes.len())
+}
+
+fn reference_run_backward(set: AsciiByteSet, bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .rev()
+        .position(|&byte| !set.contains(byte))
+        .unwrap_or(bytes.len())
+}
+
+fn assert_run_result(
+    scanner: &AsciiByteSetRunScanner,
+    bytes: &[u8],
+    forward: AsciiRunResult,
+    backward: AsciiRunResult,
+) {
+    let forward_len = reference_run_forward(scanner.set(), bytes);
+    let backward_len = reference_run_backward(scanner.set(), bytes);
+    assert_eq!(forward.member_run_len(), forward_len);
+    assert_eq!(backward.member_run_len(), backward_len);
+
+    for result in [forward, backward] {
+        let logical = result
+            .member_run_len()
+            .checked_add(usize::from(result.member_run_len() != bytes.len()))
+            .unwrap();
+        let maximum = logical
+            .checked_add(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+            .unwrap();
+        assert!(
+            (logical..=maximum).contains(&result.examined_bytes()),
+            "bytes={} result={result:?} selection={:?}",
+            bytes.len(),
+            scanner.selection()
+        );
+    }
+}
+
 fn assert_matches_reference(
     classifier: &AsciiByteSetClassifier,
     narrow: &[u8; ASCII_NARROW_BYTES],
@@ -168,6 +211,45 @@ fn nibble_columns_round_trip_dense_sparse_and_random_sets() {
 }
 
 #[test]
+fn run_tables_share_one_exact_representation_pass_and_match_only_small_sets() {
+    let mut sets = vec![
+        AsciiByteSet::EMPTY,
+        AsciiByteSet::ALL,
+        singleton(0),
+        singleton(0x7f),
+        AsciiByteSet::from_words([0x0123_4567_89ab_cdef, 0]),
+        AsciiByteSet::from_words([0xffff, 0]),
+        AsciiByteSet::from_words([0x1_ffff, 0]),
+    ];
+    let mut state = 0xe35a_7bd1_924c_086f;
+    for _ in 0..256 {
+        sets.push(AsciiByteSet::from_words([
+            next_random(&mut state),
+            next_random(&mut state),
+        ]));
+    }
+
+    for set in sets {
+        let (tables, match_eligible) = set.run_tables();
+        assert_eq!(tables.set, set);
+        assert_eq!(tables.columns, set.nibble_columns());
+        let members: Vec<_> = (0_u8..=0x7f).filter(|&byte| set.contains(byte)).collect();
+        assert_eq!(
+            match_eligible,
+            (1..=ASCII_NARROW_BYTES).contains(&members.len())
+        );
+        if match_eligible {
+            assert_eq!(&tables.match_values[..members.len()], members.as_slice());
+            assert!(
+                tables.match_values[members.len()..]
+                    .iter()
+                    .all(|&byte| byte == members[0])
+            );
+        }
+    }
+}
+
+#[test]
 fn scalar_oracle_maps_every_ascii_bit_and_every_lane() {
     for selected in 0_u8..=0x7f {
         let set = singleton(selected);
@@ -233,6 +315,117 @@ fn portable_policy_forces_scalar_and_split_narrow() {
     let narrow = core::array::from_fn(|lane| u8::try_from(lane * 17).unwrap());
     let wide = core::array::from_fn(|lane| u8::try_from(lane * 7).unwrap());
     assert_matches_reference(&classifier, &narrow, &wide);
+}
+
+#[test]
+fn portable_run_scanner_exhausts_ascii_members_lanes_lengths_and_alignments() {
+    for selected in 0_u8..=0x7f {
+        let scanner =
+            AsciiByteSetRunScanner::with_policy(singleton(selected), DispatchPolicy::Portable)
+                .unwrap();
+        assert_eq!(
+            scanner.selection().variant_id,
+            "ascii-byte-set.run.scalar.v1"
+        );
+        assert!(scanner.selection().required.is_empty());
+        assert_eq!(scanner.selection().vector, VectorKind::Scalar);
+        assert_eq!(
+            scanner.selection().selection_input_bytes,
+            ASCII_NARROW_BYTES
+        );
+        assert_eq!(scanner.selection().minimum_input_bytes, 0);
+
+        let outsider = u8::from(selected == 0);
+        for len in 0..=ASCII_WIDE_BYTES + 1 {
+            for offset in 0..ASCII_NARROW_BYTES {
+                let mut storage = vec![0xa5; offset + len];
+                storage[offset..].fill(selected);
+                let input = &mut storage[offset..];
+
+                for prefix_len in 0..=len {
+                    input.fill(selected);
+                    if prefix_len < len {
+                        input[prefix_len] = outsider;
+                    }
+                    let result = scanner.scan_forward(input);
+                    assert_eq!(
+                        result,
+                        AsciiRunResult::new(prefix_len, prefix_len + usize::from(prefix_len < len)),
+                        "selected={selected:#04x} len={len} offset={offset} prefix={prefix_len}"
+                    );
+                }
+
+                for suffix_len in 0..=len {
+                    input.fill(selected);
+                    if suffix_len < len {
+                        input[len - suffix_len - 1] = outsider;
+                    }
+                    let result = scanner.scan_backward(input);
+                    assert_eq!(
+                        result,
+                        AsciiRunResult::new(suffix_len, suffix_len + usize::from(suffix_len < len)),
+                        "selected={selected:#04x} len={len} offset={offset} suffix={suffix_len}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn portable_run_scanner_random_sets_and_arbitrary_bytes_match_reference() {
+    let mut state = 0x0f42_68bd_e315_97ac;
+    for _ in 0..10_000 {
+        let set = AsciiByteSet::from_words([next_random(&mut state), next_random(&mut state)]);
+        let scanner = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).unwrap();
+        let len = usize::from(next_random(&mut state).to_le_bytes()[0]);
+        let offset = usize::from(next_random(&mut state).to_le_bytes()[0] & 0x1f);
+        let mut storage = vec![0_u8; offset + len];
+        for byte in &mut storage[offset..] {
+            *byte = next_random(&mut state).to_le_bytes()[0];
+        }
+        let bytes = &storage[offset..];
+        let forward = scanner.scan_forward(bytes);
+        let backward = scanner.scan_backward(bytes);
+        assert_run_result(&scanner, bytes, forward, backward);
+        assert_eq!(
+            forward.examined_bytes(),
+            forward.member_run_len() + usize::from(forward.member_run_len() != bytes.len())
+        );
+        assert_eq!(
+            backward.examined_bytes(),
+            backward.member_run_len() + usize::from(backward.member_run_len() != bytes.len())
+        );
+    }
+}
+
+#[test]
+fn run_scanner_empty_full_clone_context_and_non_ascii_semantics_are_stable() {
+    let context = SimdDispatchContext::capture();
+    for set in [AsciiByteSet::EMPTY, AsciiByteSet::ALL] {
+        let explicit = context
+            .ascii_byte_set_run_scanner(set, DispatchPolicy::Portable)
+            .unwrap();
+        let convenience =
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).unwrap();
+        assert_eq!(explicit.selection(), convenience.selection());
+        assert_eq!(explicit.set(), set);
+        let cloned = explicit;
+        for bytes in [
+            b"".as_slice(),
+            b"ascii".as_slice(),
+            b"\x00\x7f\x80\xff".as_slice(),
+        ] {
+            assert_eq!(cloned.scan_forward(bytes), explicit.scan_forward(bytes));
+            assert_eq!(cloned.scan_backward(bytes), explicit.scan_backward(bytes));
+            assert_run_result(
+                &explicit,
+                bytes,
+                explicit.scan_forward(bytes),
+                explicit.scan_backward(bytes),
+            );
+        }
+    }
 }
 
 #[test]
@@ -324,6 +517,80 @@ fn host_auto_selection_receipt_matches_usable_features() {
 }
 
 #[test]
+fn host_auto_run_selection_is_authorized_and_keeps_neon_conservative_preference() {
+    let sparse = AsciiByteSetRunScanner::new(singleton(b'x'));
+    let dense = AsciiByteSetRunScanner::new(AsciiByteSet::ALL);
+    #[cfg(target_arch = "aarch64")]
+    let usable = host().usable();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if usable.contains(Feature::ArmNeon) {
+            for scanner in [sparse, dense] {
+                assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.neon.v1");
+                assert_eq!(
+                    scanner.selection().required,
+                    FeatureSet::of(Feature::ArmNeon)
+                );
+                assert_eq!(
+                    scanner.selection().vector,
+                    VectorKind::Fixed {
+                        bytes: u16::try_from(ASCII_NARROW_BYTES).unwrap()
+                    }
+                );
+            }
+        } else {
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            {
+                if usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2) {
+                    assert_eq!(
+                        sparse.selection().variant_id,
+                        "ascii-byte-set.run.sve2-match16.v1"
+                    );
+                    assert_eq!(
+                        sparse.selection().required,
+                        FeatureSet::EMPTY
+                            .with(Feature::ArmSve)
+                            .with(Feature::ArmSve2)
+                    );
+                } else if usable.contains(Feature::ArmSve) {
+                    assert_eq!(sparse.selection().variant_id, "ascii-byte-set.run.sve.v1");
+                    assert_eq!(sparse.selection().required, FeatureSet::of(Feature::ArmSve));
+                } else {
+                    assert_eq!(
+                        sparse.selection().variant_id,
+                        "ascii-byte-set.run.scalar.v1"
+                    );
+                }
+                let expected_dense = if usable.contains(Feature::ArmSve) {
+                    "ascii-byte-set.run.sve.v1"
+                } else {
+                    "ascii-byte-set.run.scalar.v1"
+                };
+                assert_eq!(dense.selection().variant_id, expected_dense);
+            }
+            #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+            for scanner in [sparse, dense] {
+                assert_eq!(
+                    scanner.selection().variant_id,
+                    "ascii-byte-set.run.scalar.v1"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for scanner in [sparse, dense] {
+        assert_eq!(
+            scanner.selection().variant_id,
+            "ascii-byte-set.run.scalar.v1"
+        );
+        assert!(scanner.selection().required.is_empty());
+        assert_eq!(scanner.selection().vector, VectorKind::Scalar);
+    }
+}
+
+#[test]
 fn explicit_host_snapshot_matches_the_convenience_wrapper_exactly() {
     let set = AsciiByteSet::from_words([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
     let policy = DispatchPolicy::Auto;
@@ -358,6 +625,12 @@ fn requiring_an_absent_cross_architecture_feature_fails_before_execution() {
             .unwrap_err();
     assert_eq!(error.required, required);
     assert!(!error.usable.contains_all(required));
+
+    let run_error =
+        AsciiByteSetRunScanner::with_policy(AsciiByteSet::ALL, DispatchPolicy::Require(required))
+            .unwrap_err();
+    assert_eq!(run_error.required, required);
+    assert!(!run_error.usable.contains_all(required));
 }
 
 #[test]
@@ -495,6 +768,86 @@ fn forced_neon_and_direct_leaf_match_scalar() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test gates both private NEON run leaves on the same immutable OS-usable feature used by production dispatch"
+)]
+fn forced_neon_run_scanner_exhausts_boundaries_and_reports_recovery_work() {
+    let required = FeatureSet::of(Feature::ArmNeon);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let set = singleton(b'a');
+    let scanner =
+        AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(required)).unwrap();
+    assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.neon.v1");
+    assert_eq!(scanner.selection().required, required);
+    assert_eq!(
+        scanner.selection().vector,
+        VectorKind::Fixed {
+            bytes: u16::try_from(ASCII_NARROW_BYTES).unwrap()
+        }
+    );
+    let (tables, match_eligible) = set.run_tables();
+    assert!(match_eligible);
+
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        for offset in 0..64 {
+            let mut storage = vec![0xcc; offset + len];
+            let bytes = &mut storage[offset..];
+
+            for prefix_len in 0..=len {
+                bytes.fill(b'a');
+                if prefix_len < len {
+                    bytes[prefix_len] = b'!';
+                }
+                let observed = scanner.scan_forward(bytes);
+                let logical = prefix_len + usize::from(prefix_len < len);
+                let failed_full_block =
+                    prefix_len < len && prefix_len < len / ASCII_NARROW_BYTES * ASCII_NARROW_BYTES;
+                let expected = AsciiRunResult::new(
+                    prefix_len,
+                    logical
+                        + usize::from(failed_full_block) * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                );
+                assert_eq!(observed, expected);
+                // SAFETY: the host gate proves NEON usable and `tables` and the
+                // slice satisfy the private direct entry's exact invariants.
+                assert_eq!(
+                    unsafe { aarch64::scan_run_forward_neon(&tables, bytes) },
+                    expected
+                );
+            }
+
+            for suffix_len in 0..=len {
+                bytes.fill(b'a');
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = b'!';
+                }
+                let observed = scanner.scan_backward(bytes);
+                let logical = suffix_len + usize::from(suffix_len < len);
+                let failure_index = len.checked_sub(suffix_len + 1);
+                let failed_full_block =
+                    failure_index.is_some_and(|index| index >= len % ASCII_NARROW_BYTES);
+                let expected = AsciiRunResult::new(
+                    suffix_len,
+                    logical
+                        + usize::from(failed_full_block) * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                );
+                assert_eq!(observed, expected);
+                // SAFETY: identical NEON, table, and source-extent proof to the
+                // direct forward assertion above.
+                assert_eq!(
+                    unsafe { aarch64::scan_run_backward_neon(&tables, bytes) },
+                    expected
+                );
+            }
+        }
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 #[test]
 #[allow(
@@ -577,6 +930,442 @@ fn forced_sve2_vl_agnostic_leaf_matches_scalar_and_tuned_auto_policy() {
         assert_eq!(direct, scalar::classify_32(&columns, &bytes));
         assert_eq!(classifier.classify_32(&bytes), direct);
     }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+fn expected_sve_forward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
+    if member_run_len == input_len {
+        return AsciiRunResult::new(input_len, input_len);
+    }
+    let block_start = (member_run_len / ASCII_NARROW_BYTES)
+        .checked_mul(ASCII_NARROW_BYTES)
+        .unwrap();
+    let active = input_len
+        .checked_sub(block_start)
+        .unwrap()
+        .min(ASCII_NARROW_BYTES);
+    AsciiRunResult::new(member_run_len, block_start.checked_add(active).unwrap())
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+fn expected_sve_backward_result(member_run_len: usize, input_len: usize) -> AsciiRunResult {
+    if member_run_len == input_len {
+        return AsciiRunResult::new(input_len, input_len);
+    }
+    let loaded_blocks = (member_run_len / ASCII_NARROW_BYTES)
+        .checked_add(1)
+        .unwrap();
+    AsciiRunResult::new(
+        member_run_len,
+        input_len.min(loaded_blocks.checked_mul(ASCII_NARROW_BYTES).unwrap()),
+    )
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test gates private base-SVE run leaves on the same immutable OS-usable feature used by production dispatch"
+)]
+fn forced_base_sve_run_scanner_exhausts_fixed_sixteen_lane_boundaries() {
+    let required = FeatureSet::of(Feature::ArmSve);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let set = AsciiByteSet::from_words([0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa]);
+    let scanner =
+        AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(required)).unwrap();
+    assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.sve.v1");
+    assert_eq!(scanner.selection().required, required);
+    assert_eq!(scanner.selection().vector, VectorKind::Scalable);
+    let (tables, match_eligible) = set.run_tables();
+    assert!(!match_eligible);
+
+    let member = (0_u8..=0x7f).find(|&byte| set.contains(byte)).unwrap();
+    let outsider = (0_u8..=u8::MAX).find(|&byte| !set.contains(byte)).unwrap();
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        for offset in 0..64 {
+            let mut storage = vec![0xdd; offset + len];
+            let bytes = &mut storage[offset..];
+            for prefix_len in 0..=len {
+                bytes.fill(member);
+                if prefix_len < len {
+                    bytes[prefix_len] = outsider;
+                }
+                let expected = expected_sve_forward_result(prefix_len, len);
+                assert_eq!(scanner.scan_forward(bytes), expected);
+                // SAFETY: the host gate proves SVE usable and the private leaf
+                // receives its construction-time tables and exact source slice.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_forward_sve(&tables, bytes) },
+                    expected
+                );
+            }
+            for suffix_len in 0..=len {
+                bytes.fill(member);
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = outsider;
+                }
+                let expected = expected_sve_backward_result(suffix_len, len);
+                assert_eq!(scanner.scan_backward(bytes), expected);
+                // SAFETY: identical SVE, table, and source proof to the direct
+                // forward assertion.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_backward_sve(&tables, bytes) },
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+#[allow(
+    unsafe_code,
+    clippy::arithmetic_side_effects,
+    reason = "the test gates private SVE2 MATCH run leaves on independently proved immutable SVE and SVE2 host facts"
+)]
+fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
+    let required = FeatureSet::EMPTY
+        .with(Feature::ArmSve)
+        .with(Feature::ArmSve2);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+
+    for cardinality in 1..=ASCII_NARROW_BYTES {
+        let mut words = [0_u64; 2];
+        for member in 0..cardinality {
+            let byte = u8::try_from(member * 7).unwrap();
+            words[usize::from(byte >> 6)] |= 1_u64 << (byte & 0x3f);
+        }
+        let set = AsciiByteSet::from_words(words);
+        let scanner =
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(required)).unwrap();
+        assert_eq!(
+            scanner.selection().variant_id,
+            "ascii-byte-set.run.sve2-match16.v1"
+        );
+        assert_eq!(scanner.selection().required, required);
+        assert_eq!(scanner.selection().vector, VectorKind::Scalable);
+        let (tables, match_eligible) = set.run_tables();
+        assert!(match_eligible);
+        let member = tables.match_values[cardinality - 1];
+        let outsider = (0_u8..=u8::MAX).find(|&byte| !set.contains(byte)).unwrap();
+
+        for len in 0..=ASCII_WIDE_BYTES * 2 + 1 {
+            let mut bytes = vec![member; len];
+            for prefix_len in 0..=len {
+                bytes.fill(member);
+                if prefix_len < len {
+                    bytes[prefix_len] = outsider;
+                }
+                let expected = expected_sve_forward_result(prefix_len, len);
+                assert_eq!(scanner.scan_forward(&bytes), expected);
+                // SAFETY: SVE and SVE2 are proved usable, the compiled set is
+                // nonempty and at most 16 values, and the slice proves loads.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_forward_sve2(&tables, &bytes) },
+                    expected
+                );
+            }
+            for suffix_len in 0..=len {
+                bytes.fill(member);
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = outsider;
+                }
+                let expected = expected_sve_backward_result(suffix_len, len);
+                assert_eq!(scanner.scan_backward(&bytes), expected);
+                // SAFETY: identical feature, compiled-set, and source proof to
+                // the direct forward call.
+                assert_eq!(
+                    unsafe { aarch64_sve2::scan_run_backward_sve2(&tables, &bytes) },
+                    expected
+                );
+            }
+        }
+    }
+
+    let aligned_set = singleton(b'a');
+    let aligned_scanner =
+        AsciiByteSetRunScanner::with_policy(aligned_set, DispatchPolicy::AllowOnly(required))
+            .unwrap();
+    let (aligned_tables, match_eligible) = aligned_set.run_tables();
+    assert!(match_eligible);
+    let len = ASCII_WIDE_BYTES + 1;
+    let mut storage = vec![b'a'; 64 + len];
+    let mut observed_alignments = [false; 64];
+    for offset in 0..64 {
+        let bytes = &mut storage[offset..offset + len];
+        observed_alignments[bytes.as_ptr().addr() & 63] = true;
+        bytes.fill(b'a');
+        bytes[17] = b'!';
+        let forward = expected_sve_forward_result(17, len);
+        assert_eq!(aligned_scanner.scan_forward(bytes), forward);
+        // SAFETY: the feature and compiled-set gate above applies at every
+        // address modulo a cache line.
+        assert_eq!(
+            unsafe { aarch64_sve2::scan_run_forward_sve2(&aligned_tables, bytes) },
+            forward
+        );
+        bytes.fill(b'a');
+        bytes[len - 17 - 1] = b'!';
+        let backward = expected_sve_backward_result(17, len);
+        assert_eq!(aligned_scanner.scan_backward(bytes), backward);
+        // SAFETY: identical gate and exact slice extent to the forward call.
+        assert_eq!(
+            unsafe { aarch64_sve2::scan_run_backward_sve2(&aligned_tables, bytes) },
+            backward
+        );
+    }
+    assert!(observed_alignments.into_iter().all(core::convert::identity));
+
+    let dense = AsciiByteSet::ALL;
+    let fallback =
+        AsciiByteSetRunScanner::with_policy(dense, DispatchPolicy::AllowOnly(required)).unwrap();
+    assert_eq!(
+        fallback.selection().variant_id,
+        "ascii-byte-set.run.sve.v1",
+        "SVE2 MATCH must not receive more than 16 construction-time values"
+    );
+    assert_eq!(
+        fallback.selection().required,
+        FeatureSet::of(Feature::ArmSve)
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[derive(Debug)]
+struct RunBenchmarkCase {
+    bytes: Box<[u8]>,
+    backward: bool,
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the bounded benchmark fixtures use small compile-time lengths and lane indices"
+)]
+fn run_benchmark_cases() -> Vec<RunBenchmarkCase> {
+    let mut cases = Vec::new();
+    for len in [0, 1, 7, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 257, 1024] {
+        for backward in [false, true] {
+            cases.push(RunBenchmarkCase {
+                bytes: vec![b'a'; len].into_boxed_slice(),
+                backward,
+            });
+        }
+    }
+    for lane in 0..ASCII_NARROW_BYTES {
+        let len = ASCII_NARROW_BYTES * 8 + 7;
+        let distance = ASCII_NARROW_BYTES * 2 + lane;
+        let mut forward = vec![b'a'; len];
+        forward[distance] = b'!';
+        cases.push(RunBenchmarkCase {
+            bytes: forward.into_boxed_slice(),
+            backward: false,
+        });
+        let mut backward = vec![b'a'; len];
+        backward[len - distance - 1] = b'!';
+        cases.push(RunBenchmarkCase {
+            bytes: backward.into_boxed_slice(),
+            backward: true,
+        });
+    }
+    for len in [3, 9, 14, 18, 23, 30, 34, 41, 62, 70] {
+        let mut forward = vec![b'a'; len];
+        forward[len / 2] = b'!';
+        cases.push(RunBenchmarkCase {
+            bytes: forward.into_boxed_slice(),
+            backward: false,
+        });
+        let mut backward = vec![b'a'; len];
+        backward[len / 2] = b'!';
+        cases.push(RunBenchmarkCase {
+            bytes: backward.into_boxed_slice(),
+            backward: true,
+        });
+    }
+    cases
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the benchmark loop uses proved nonempty case arrays and bounded timing/checksum arithmetic"
+)]
+fn measure_run_scanner(
+    scanner: &AsciiByteSetRunScanner,
+    cases: &[RunBenchmarkCase],
+    iterations: u32,
+) -> f64 {
+    assert!(iterations > 0);
+    assert!(!cases.is_empty());
+    let started = std::time::Instant::now();
+    let mut checksum = 0_usize;
+    for iteration in 0..iterations {
+        let index = usize::try_from(std::hint::black_box(iteration)).unwrap() % cases.len();
+        let case = &cases[index];
+        let result = if case.backward {
+            std::hint::black_box(scanner).scan_backward(std::hint::black_box(&case.bytes))
+        } else {
+            std::hint::black_box(scanner).scan_forward(std::hint::black_box(&case.bytes))
+        };
+        checksum ^= result
+            .member_run_len()
+            .rotate_left(u32::try_from(index % usize::try_from(usize::BITS).unwrap()).unwrap())
+            ^ result.examined_bytes();
+    }
+    std::hint::black_box(checksum);
+    started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+fn serialize_run_samples(samples: &[f64]) -> String {
+    samples
+        .iter()
+        .map(|sample| format!("{sample:.9}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+#[ignore = "native release qualification benchmark; requires NEON, SVE and SVE2 with the scanner's fixed 16 active lanes"]
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "the ignored native benchmark keeps its four-way parity gate, alternating schedule, raw samples, and machine receipt together"
+)]
+fn benchmark_direct_run_scanners_scalar_neon_sve_and_sve2() {
+    let sve = FeatureSet::of(Feature::ArmSve);
+    let sve2 = sve.with(Feature::ArmSve2);
+    let neon = FeatureSet::of(Feature::ArmNeon);
+    let usable = host().usable();
+    assert!(
+        usable.contains_all(neon) && usable.contains_all(sve2),
+        "run benchmark requires OS-usable NEON, SVE and SVE2; usable={usable:?}"
+    );
+
+    let set = AsciiByteSet::from_words([
+        1_u64 << b'0',
+        (1_u64 << b'_'.wrapping_sub(64))
+            | (1_u64 << b'a'.wrapping_sub(64))
+            | (1_u64 << b'b'.wrapping_sub(64)),
+    ]);
+    let scalar =
+        AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).expect("scalar scanner");
+    let neon_scanner = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(neon))
+        .expect("NEON scanner");
+    let base_sve_scanner = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(sve))
+        .expect("base-SVE scanner");
+    let match_scanner = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(sve2))
+        .expect("SVE2 scanner");
+    assert_eq!(
+        scalar.selection().variant_id,
+        "ascii-byte-set.run.scalar.v1"
+    );
+    assert_eq!(
+        neon_scanner.selection().variant_id,
+        "ascii-byte-set.run.neon.v1"
+    );
+    assert_eq!(
+        base_sve_scanner.selection().variant_id,
+        "ascii-byte-set.run.sve.v1"
+    );
+    assert_eq!(
+        match_scanner.selection().variant_id,
+        "ascii-byte-set.run.sve2-match16.v1"
+    );
+
+    let cases = run_benchmark_cases();
+    for case in &cases {
+        let reference = if case.backward {
+            scalar.scan_backward(&case.bytes).member_run_len()
+        } else {
+            scalar.scan_forward(&case.bytes).member_run_len()
+        };
+        for scanner in [&neon_scanner, &base_sve_scanner, &match_scanner] {
+            let observed = if case.backward {
+                scanner.scan_backward(&case.bytes)
+            } else {
+                scanner.scan_forward(&case.bytes)
+            };
+            assert_eq!(observed.member_run_len(), reference);
+            let logical = reference + usize::from(reference != case.bytes.len());
+            assert!(
+                (logical..=logical + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                    .contains(&observed.examined_bytes())
+            );
+        }
+    }
+
+    let iterations = std::env::var("FRE_SIMD_RUN_BENCH_ITERS").map_or(2_000_000, |raw| {
+        raw.parse::<u32>()
+            .unwrap_or_else(|error| panic!("FRE_SIMD_RUN_BENCH_ITERS: {error}"))
+    });
+    let samples = std::env::var("FRE_SIMD_RUN_BENCH_SAMPLES").map_or(16, |raw| {
+        raw.parse::<usize>()
+            .unwrap_or_else(|error| panic!("FRE_SIMD_RUN_BENCH_SAMPLES: {error}"))
+    });
+    assert!(iterations > 0);
+    assert!(samples >= 16 && samples.is_multiple_of(4));
+
+    let scanners = [
+        ("scalar", &scalar),
+        ("neon", &neon_scanner),
+        ("sve", &base_sve_scanner),
+        ("sve2", &match_scanner),
+    ];
+    for (_, scanner) in scanners {
+        let _ = measure_run_scanner(scanner, &cases, iterations / 10 + 1);
+    }
+
+    let mut raw = [
+        Vec::with_capacity(samples),
+        Vec::with_capacity(samples),
+        Vec::with_capacity(samples),
+        Vec::with_capacity(samples),
+    ];
+    let mut orders = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let mut order = Vec::with_capacity(scanners.len());
+        for slot in 0..scanners.len() {
+            let index = (slot + sample) % scanners.len();
+            let (name, scanner) = scanners[index];
+            order.push(name);
+            raw[index].push(measure_run_scanner(scanner, &cases, iterations));
+        }
+        orders.push(order.join(">"));
+    }
+    assert!(
+        raw.iter()
+            .flatten()
+            .all(|value| value.is_finite() && *value > 0.0)
+    );
+    let medians = raw.each_ref().map(|samples| benchmark_median(samples));
+    let receipt = format!(
+        "SIMD_RUN_BENCH iterations={iterations} samples={samples} cases={} active_bytes=16 \
+         scalar_ns={:.9} neon_ns={:.9} sve_ns={:.9} sve2_ns={:.9} \
+         neon_over_scalar={:.9} sve_over_neon={:.9} sve2_over_neon={:.9} \
+         orders={} scalar_samples={} neon_samples={} sve_samples={} sve2_samples={}",
+        cases.len(),
+        medians[0],
+        medians[1],
+        medians[2],
+        medians[3],
+        medians[1] / medians[0],
+        medians[2] / medians[1],
+        medians[3] / medians[1],
+        orders.join(","),
+        serialize_run_samples(&raw[0]),
+        serialize_run_samples(&raw[1]),
+        serialize_run_samples(&raw[2]),
+        serialize_run_samples(&raw[3]),
+    );
+    assert_eq!(receipt.matches('\n').count(), 0);
+    eprintln!("{receipt}");
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]

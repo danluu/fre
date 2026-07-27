@@ -1,4 +1,4 @@
-use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32};
+use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables};
 
 // This is a leaf AAPCS64 function. Its two pointer arguments arrive in x0/x1
 // and its packed u64 result returns in x0: member lanes occupy bits 0..31 and
@@ -15,7 +15,7 @@ use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32};
 // four. A fixed slot also permits ordinary constant-CFA unwind metadata.
 #[allow(
     unsafe_code,
-    reason = "this module contains only the reviewed global assembly boundary; private Rust dispatch proves SVE and SVE2 usable before entry"
+    reason = "this module contains only reviewed global assembly boundaries; private Rust dispatch proves each leaf's exact SVE or SVE2 feature set usable before entry"
 )]
 mod reviewed_assembly {
     use core::arch::global_asm;
@@ -102,14 +102,240 @@ fre_ascii_mask32_sve2_asm:
     .popsection
 "#
     );
+
+    global_asm!(
+        r#"
+    // Run leaves deliberately activate at most 16 byte lanes per load. That
+    // preserves the operation's published +16 accounting bound and makes
+    // qualification at the requested 128-bit shape independent of hardware VL.
+
+    // Direct base-SVE prefix scanner. It returns AsciiRunResult in x0/x1:
+    // member prefix length followed by exact physically classified bytes.
+    .pushsection .text.fre_ascii_run_forward_sve_asm, "ax", %progbits
+    .arch armv8-a+sve
+    .p2align 2
+    .hidden fre_ascii_run_forward_sve_asm
+    .global fre_ascii_run_forward_sve_asm
+    .type fre_ascii_run_forward_sve_asm, %function
+fre_ascii_run_forward_sve_asm:
+    .cfi_startproc
+    mov x8, #0
+    mov x10, #16
+    whilelo p3.b, xzr, x10
+    ld1b z0.b, p3/z, [x0]
+    mov x9, #16
+1:
+    cmp x8, x2
+    b.hs 3f
+    sub x10, x2, x8
+    cmp x10, x9
+    csel x10, x10, x9, lo
+    whilelo p0.b, xzr, x10
+    ld1b z2.b, p0/z, [x1, x8]
+
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 2f
+
+    // BRKB retains active lanes strictly before the first nonmember.
+    brkb p3.b, p0/z, p2.b
+    cntp x10, p0, p3.b
+    add x0, x8, x10
+    cntp x11, p0, p0.b
+    add x1, x8, x11
+    ret
+2:
+    incp x8, p0.b
+    b 1b
+3:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_forward_sve_asm, .-fre_ascii_run_forward_sve_asm
+    .popsection
+
+    // Direct base-SVE suffix scanner. LASTB obtains the final nonmember lane
+    // from a byte index vector without serializing a predicate.
+    .pushsection .text.fre_ascii_run_backward_sve_asm, "ax", %progbits
+    .arch armv8-a+sve
+    .p2align 2
+    .hidden fre_ascii_run_backward_sve_asm
+    .global fre_ascii_run_backward_sve_asm
+    .type fre_ascii_run_backward_sve_asm, %function
+fre_ascii_run_backward_sve_asm:
+    .cfi_startproc
+    mov x10, #16
+    whilelo p3.b, xzr, x10
+    ld1b z0.b, p3/z, [x0]
+    index z6.b, #0, #1
+    mov x9, #16
+    mov x8, x2
+1:
+    cbz x8, 3f
+    cmp x8, x9
+    csel x10, x8, x9, lo
+    sub x11, x8, x10
+    whilelo p0.b, xzr, x10
+    ld1b z2.b, p0/z, [x1, x11]
+
+    mov z3.d, z2.d
+    and z3.b, z3.b, #0x0f
+    mov z4.d, z2.d
+    lsr z4.b, z4.b, #4
+    tbl z3.b, {{z0.b}}, z3.b
+    mov z5.b, #1
+    lsl z5.b, p0/m, z5.b, z4.b
+    and z3.d, z3.d, z5.d
+    cmpne p1.b, p0/z, z3.b, #0
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 2f
+
+    lastb w12, p2, z6.b
+    uxtb x12, w12
+    add x12, x11, x12
+    add x12, x12, #1
+    sub x0, x2, x12
+    sub x1, x2, x11
+    ret
+2:
+    mov x8, x11
+    b 1b
+3:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_backward_sve_asm, .-fre_ascii_run_backward_sve_asm
+    .popsection
+
+    // SVE2 MATCH compares each input lane with the construction-time set of
+    // 1..=16 ASCII values. LD1RQB repeats that set in every 128-bit segment,
+    // preserving correctness at every architectural vector length.
+    .pushsection .text.fre_ascii_run_forward_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_run_forward_sve2_asm
+    .global fre_ascii_run_forward_sve2_asm
+    .type fre_ascii_run_forward_sve2_asm, %function
+fre_ascii_run_forward_sve2_asm:
+    .cfi_startproc
+    ptrue p3.b
+    ld1rqb z0.b, p3/z, [x0]
+    mov x8, #0
+    mov x9, #16
+1:
+    cmp x8, x2
+    b.hs 3f
+    sub x10, x2, x8
+    cmp x10, x9
+    csel x10, x10, x9, lo
+    whilelo p0.b, xzr, x10
+    ld1b z2.b, p0/z, [x1, x8]
+    match p1.b, p0/z, z2.b, z0.b
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 2f
+
+    brkb p3.b, p0/z, p2.b
+    cntp x10, p0, p3.b
+    add x0, x8, x10
+    cntp x11, p0, p0.b
+    add x1, x8, x11
+    ret
+2:
+    incp x8, p0.b
+    b 1b
+3:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_forward_sve2_asm, .-fre_ascii_run_forward_sve2_asm
+    .popsection
+
+    .pushsection .text.fre_ascii_run_backward_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_ascii_run_backward_sve2_asm
+    .global fre_ascii_run_backward_sve2_asm
+    .type fre_ascii_run_backward_sve2_asm, %function
+fre_ascii_run_backward_sve2_asm:
+    .cfi_startproc
+    ptrue p3.b
+    ld1rqb z0.b, p3/z, [x0]
+    index z6.b, #0, #1
+    mov x9, #16
+    mov x8, x2
+1:
+    cbz x8, 3f
+    cmp x8, x9
+    csel x10, x8, x9, lo
+    sub x11, x8, x10
+    whilelo p0.b, xzr, x10
+    ld1b z2.b, p0/z, [x1, x11]
+    match p1.b, p0/z, z2.b, z0.b
+    not p2.b, p0/z, p1.b
+    ptest p0, p2.b
+    b.none 2f
+
+    lastb w12, p2, z6.b
+    uxtb x12, w12
+    add x12, x11, x12
+    add x12, x12, #1
+    sub x0, x2, x12
+    sub x1, x2, x11
+    ret
+2:
+    mov x8, x11
+    b 1b
+3:
+    mov x0, x2
+    mov x1, x2
+    ret
+    .cfi_endproc
+    .size fre_ascii_run_backward_sve2_asm, .-fre_ascii_run_backward_sve2_asm
+    .popsection
+"#
+    );
 }
 
 #[allow(
     unsafe_code,
-    reason = "this private declaration is implemented by the reviewed SVE2 global assembly above"
+    reason = "these private declarations are implemented by the reviewed base-SVE and SVE2 global assembly above"
 )]
 unsafe extern "C" {
     fn fre_ascii_mask32_sve2_asm(columns: *const u8, bytes: *const u8) -> u64;
+    fn fre_ascii_run_forward_sve_asm(
+        columns: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
+    fn fre_ascii_run_backward_sve_asm(
+        columns: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
+    fn fre_ascii_run_forward_sve2_asm(
+        match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
+    fn fre_ascii_run_backward_sve2_asm(
+        match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> AsciiRunResult;
 }
 
 #[allow(
@@ -132,4 +358,64 @@ pub(super) unsafe fn classify_32_sve2(
         .expect("the low half of a u64 always fits in u32");
     let ascii = u32::try_from(packed >> 32).expect("the high half of a u64 always fits in u32");
     AsciiMasks32::new(ascii, members)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed base-SVE assembly only after retained dispatch proved SVE usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_sve(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
+    // SAFETY: the table has exactly 16 initialized bytes, the slice pointer and
+    // length describe every predicated source load, and retained dispatch
+    // independently proved SVE OS-usable.
+    unsafe { fre_ascii_run_forward_sve_asm(tables.columns.as_ptr(), bytes.as_ptr(), bytes.len()) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed base-SVE assembly only after retained dispatch proved SVE usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_sve(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: identical table, slice-extent, and feature proof to the forward
+    // base-SVE operation.
+    unsafe { fre_ascii_run_backward_sve_asm(tables.columns.as_ptr(), bytes.as_ptr(), bytes.len()) }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed SVE2 assembly only after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_sve2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: construction selects this entry only for a nonempty set of at
+    // most 16 values, fills every table lane with a valid member, and retained
+    // dispatch proves SVE plus SVE2 OS-usable. The slice proves every source
+    // extent.
+    unsafe {
+        fre_ascii_run_forward_sve2_asm(tables.match_values.as_ptr(), bytes.as_ptr(), bytes.len())
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf calls reviewed SVE2 assembly only after retained dispatch proved SVE and SVE2 usable"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_sve2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: identical compiled-set, source-extent, and feature proof to the
+    // forward SVE2 operation.
+    unsafe {
+        fre_ascii_run_backward_sve2_asm(tables.match_values.as_ptr(), bytes.as_ptr(), bytes.len())
+    }
 }

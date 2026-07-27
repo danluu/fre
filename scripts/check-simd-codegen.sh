@@ -150,6 +150,17 @@ case "$host" in
         extract_function "classify_16_neon" "$temporary/neon.s"
         require_count '\btbl\b' 2 "$temporary/neon.s" "NEON nibble table lookups"
         require_count '\baddv\b' 2 "$temporary/neon.s" "NEON lane-mask reductions"
+
+        extract_function "scan_run_forward_neon" "$temporary/run-neon-forward.s"
+        require_exact_count '\btbl\b' 2 "$temporary/run-neon-forward.s" "forward NEON run membership table lookups"
+        require_exact_count '\bumaxv\b' 1 "$temporary/run-neon-forward.s" "forward NEON failed-block reduction"
+        reject_count '\baddv\b' "$temporary/run-neon-forward.s" "forward NEON run leaf materializing a lane mask"
+
+        extract_function "scan_run_backward_neon" "$temporary/run-neon-backward.s"
+        require_exact_count '\btbl\b' 2 "$temporary/run-neon-backward.s" "backward NEON run membership table lookups"
+        require_exact_count '\bumaxv\b' 1 "$temporary/run-neon-backward.s" "backward NEON failed-block reduction"
+        reject_count '\baddv\b' "$temporary/run-neon-backward.s" "backward NEON run leaf materializing a lane mask"
+
         if [[ "$host" == aarch64-unknown-linux-* ]]; then
             extract_function "fre_ascii_mask32_sve2_asm" "$temporary/sve2.s"
             require_count '\bwhilelo\b' 2 "$temporary/sve2.s" "SVE exact-bound predicates"
@@ -160,9 +171,56 @@ case "$host" in
             require_count '\.cfi_startproc\b' 1 "$temporary/sve2.s" "SVE unwind start"
             require_count '\.cfi_def_cfa_offset[[:space:]]+32\b' 1 "$temporary/sve2.s" "SVE fixed-frame unwind extent"
             require_count '\.size[[:space:]]+fre_ascii_mask32_sve2_asm\b' 1 "$temporary/sve2.s" "SVE symbol boundary"
-            authenticated_leaf="$temporary/sve2.s"
+
+            extract_function "fre_ascii_run_forward_sve_asm" "$temporary/run-sve-forward.s"
+            require_exact_count '\bwhilelo\b' 2 "$temporary/run-sve-forward.s" "forward base-SVE table and fixed-width source predicates"
+            require_exact_count '\bld1b\b' 2 "$temporary/run-sve-forward.s" "forward base-SVE exact table and source loads"
+            require_exact_count '\btbl\b' 1 "$temporary/run-sve-forward.s" "forward base-SVE membership table lookup"
+            require_exact_count '\bptest\b' 1 "$temporary/run-sve-forward.s" "forward base-SVE all-member predicate test"
+            require_exact_count '\bbrkb\b' 1 "$temporary/run-sve-forward.s" "forward base-SVE first-nonmember prefix"
+            require_exact_count '\bcntp\b' 2 "$temporary/run-sve-forward.s" "forward base-SVE boundary and examined counts"
+            require_exact_count '\bincp\b' 1 "$temporary/run-sve-forward.s" "forward base-SVE fixed-block progress"
+            require_exact_count '\bmov[[:space:]]+x9,[[:space:]]*#16\b' 1 "$temporary/run-sve-forward.s" "forward base-SVE 16-active-lane cap"
+            reject_count '\b(match|ld1rqb|cntb)\b' "$temporary/run-sve-forward.s" "forward base-SVE leaf using SVE2 or hardware-VL chunking"
+            reject_count '\bstr[[:space:]]+p[0-9]+\b' "$temporary/run-sve-forward.s" "forward base-SVE predicate serialization"
+
+            extract_function "fre_ascii_run_backward_sve_asm" "$temporary/run-sve-backward.s"
+            require_exact_count '\bwhilelo\b' 2 "$temporary/run-sve-backward.s" "backward base-SVE table and fixed-width source predicates"
+            require_exact_count '\bld1b\b' 2 "$temporary/run-sve-backward.s" "backward base-SVE exact table and source loads"
+            require_exact_count '\btbl\b' 1 "$temporary/run-sve-backward.s" "backward base-SVE membership table lookup"
+            require_exact_count '\bptest\b' 1 "$temporary/run-sve-backward.s" "backward base-SVE all-member predicate test"
+            require_exact_count '\blastb\b' 1 "$temporary/run-sve-backward.s" "backward base-SVE last-nonmember lane"
+            require_exact_count '\bmov[[:space:]]+x9,[[:space:]]*#16\b' 1 "$temporary/run-sve-backward.s" "backward base-SVE 16-active-lane cap"
+            reject_count '\b(match|ld1rqb|cntb)\b' "$temporary/run-sve-backward.s" "backward base-SVE leaf using SVE2 or hardware-VL chunking"
+            reject_count '\bstr[[:space:]]+p[0-9]+\b' "$temporary/run-sve-backward.s" "backward base-SVE predicate serialization"
+
+            extract_function "fre_ascii_run_forward_sve2_asm" "$temporary/run-sve2-forward.s"
+            require_exact_count '\bld1rqb\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 repeated small-set load"
+            require_exact_count '\bwhilelo\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 fixed-width source predicate"
+            require_exact_count '\bld1b\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 exact source load"
+            require_exact_count '\bmatch\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 small-set membership"
+            require_exact_count '\bptest\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 all-member predicate test"
+            require_exact_count '\bbrkb\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 first-nonmember prefix"
+            require_exact_count '\bcntp\b' 2 "$temporary/run-sve2-forward.s" "forward SVE2 boundary and examined counts"
+            require_exact_count '\bincp\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 fixed-block progress"
+            require_exact_count '\bmov[[:space:]]+x9,[[:space:]]*#16\b' 1 "$temporary/run-sve2-forward.s" "forward SVE2 16-active-lane cap"
+            reject_count '\b(tbl|cntb)\b' "$temporary/run-sve2-forward.s" "forward SVE2 MATCH leaf using table lookup or hardware-VL chunking"
+            reject_count '\bstr[[:space:]]+p[0-9]+\b' "$temporary/run-sve2-forward.s" "forward SVE2 predicate serialization"
+
+            extract_function "fre_ascii_run_backward_sve2_asm" "$temporary/run-sve2-backward.s"
+            require_exact_count '\bld1rqb\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 repeated small-set load"
+            require_exact_count '\bwhilelo\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 fixed-width source predicate"
+            require_exact_count '\bld1b\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 exact source load"
+            require_exact_count '\bmatch\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 small-set membership"
+            require_exact_count '\bptest\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 all-member predicate test"
+            require_exact_count '\blastb\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 last-nonmember lane"
+            require_exact_count '\bmov[[:space:]]+x9,[[:space:]]*#16\b' 1 "$temporary/run-sve2-backward.s" "backward SVE2 16-active-lane cap"
+            reject_count '\b(tbl|cntb)\b' "$temporary/run-sve2-backward.s" "backward SVE2 MATCH leaf using table lookup or hardware-VL chunking"
+            reject_count '\bstr[[:space:]]+p[0-9]+\b' "$temporary/run-sve2-backward.s" "backward SVE2 predicate serialization"
+
+            authenticated_leaf="$temporary/run-sve2-forward.s"
         else
-            authenticated_leaf="$temporary/neon.s"
+            authenticated_leaf="$temporary/run-neon-forward.s"
         fi
         ;;
     x86_64-*)

@@ -1,4 +1,4 @@
-use super::{ASCII_NARROW_BYTES, AsciiMasks16, HIGH_NIBBLE_BITS};
+use super::{ASCII_NARROW_BYTES, AsciiByteSet, AsciiMasks16, AsciiRunResult, HIGH_NIBBLE_BITS};
 #[cfg(test)]
 use super::{ASCII_WIDE_BYTES, AsciiMasks32};
 
@@ -22,6 +22,42 @@ pub(super) fn classify_16(
         }
     }
     AsciiMasks16::new(ascii, members)
+}
+
+pub(super) fn scan_run_forward(set: AsciiByteSet, bytes: &[u8]) -> AsciiRunResult {
+    for (index, &byte) in bytes.iter().enumerate() {
+        if !set.contains(byte) {
+            return AsciiRunResult::new(
+                index,
+                index
+                    .checked_add(1)
+                    .expect("a live slice index is below usize::MAX"),
+            );
+        }
+    }
+    AsciiRunResult::new(bytes.len(), bytes.len())
+}
+
+pub(super) fn scan_run_backward(set: AsciiByteSet, bytes: &[u8]) -> AsciiRunResult {
+    for (index, &byte) in bytes.iter().enumerate().rev() {
+        if !set.contains(byte) {
+            let member_run_len = bytes
+                .len()
+                .checked_sub(
+                    index
+                        .checked_add(1)
+                        .expect("a live slice index is below usize::MAX"),
+                )
+                .expect("the nonmember index is within the slice");
+            return AsciiRunResult::new(
+                member_run_len,
+                member_run_len
+                    .checked_add(1)
+                    .expect("a suffix shorter than its slice can include one nonmember"),
+            );
+        }
+    }
+    AsciiRunResult::new(bytes.len(), bytes.len())
 }
 
 #[cfg(test)]

@@ -2,10 +2,11 @@
 //!
 //! [`AsciiByteSetClassifier`] turns one 128-bit ASCII byte set into nibble
 //! lookup tables and chooses its 16-byte and 32-byte implementations once.
-//! Classification calls do not detect CPU features or inspect haystack
-//! lengths. Fixed-array inputs prove the exact load width at the safe API
-//! boundary, while private target-feature leaves are reachable only through a
-//! handle built from [`fre_target_features::host`] facts.
+//! [`AsciiByteSetRunScanner`] retains a separate operation-specific choice and
+//! finds maximal member prefixes or suffixes without materializing positional
+//! lane masks. Calls do not detect CPU features or make dispatch decisions from
+//! varying haystack lengths. Private target-feature leaves are reachable only
+//! through handles built from [`fre_target_features::host`] facts.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -42,6 +43,15 @@ pub const ASCII_NARROW_BYTES: usize = 16;
 
 /// Number of bytes consumed by the wide classifier operation.
 pub const ASCII_WIDE_BYTES: usize = 32;
+
+/// Maximum physical classification work beyond the logically necessary run.
+///
+/// On failure, the logical minimum is `member_run_len + 1`; on an all-member
+/// input it is `member_run_len`. Scalar adds no overhead. SVE/SVE2 classify
+/// every active lane in the failed predicated load and therefore add at most
+/// 15. NEON adds exactly 16 when it scalar-recovers a failed full block and
+/// otherwise adds none.
+pub const ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD: usize = ASCII_NARROW_BYTES;
 
 const ASCII_NARROW_VECTOR_BYTES: u16 = 16;
 #[cfg(target_arch = "x86_64")]
@@ -102,6 +112,15 @@ impl SimdDispatchContext {
     ) -> Result<AsciiByteSetClassifier, UnsupportedRequiredFeatures> {
         AsciiByteSetClassifier::with_capabilities(set, self.capabilities, policy)
     }
+
+    /// Build a forward/backward ASCII byte-set run scanner from this snapshot.
+    pub fn ascii_byte_set_run_scanner(
+        self,
+        set: AsciiByteSet,
+        policy: DispatchPolicy,
+    ) -> Result<AsciiByteSetRunScanner, UnsupportedRequiredFeatures> {
+        AsciiByteSetRunScanner::with_capabilities(set, self.capabilities, policy)
+    }
 }
 
 /// A set over the 128 ASCII byte values.
@@ -153,6 +172,84 @@ impl AsciiByteSet {
             }
         }
         columns
+    }
+
+    fn run_tables(self) -> (AsciiRunTables, bool) {
+        let mut columns = [0_u8; ASCII_NARROW_BYTES];
+        let mut values = [0_u8; ASCII_NARROW_BYTES];
+        let mut values_len = 0_usize;
+        let mut values_overflowed = false;
+        for byte in 0_u8..=0x7f {
+            if !self.contains(byte) {
+                continue;
+            }
+            let low_nibble = usize::from(byte & 0x0f);
+            let high_bit = HIGH_NIBBLE_BITS[usize::from(byte >> 4)];
+            columns[low_nibble] |= high_bit;
+
+            if let Some(slot) = values.get_mut(values_len) {
+                *slot = byte;
+                values_len = values_len
+                    .checked_add(1)
+                    .expect("an ASCII set cardinality fits in usize");
+            } else {
+                values_overflowed = true;
+            }
+        }
+        let match_eligible = values_len != 0 && !values_overflowed;
+        if match_eligible {
+            let duplicate = values[0];
+            values[values_len..].fill(duplicate);
+        }
+        (
+            AsciiRunTables {
+                set: self,
+                columns,
+                match_values: values,
+            },
+            match_eligible,
+        )
+    }
+}
+
+/// Result of scanning one maximal ASCII byte-set member run.
+///
+/// For [`AsciiByteSetRunScanner::scan_forward`], `member_run_len` is the
+/// member prefix length. For [`AsciiByteSetRunScanner::scan_backward`], it is
+/// the member suffix length. `examined_bytes` counts physical byte
+/// classifications, including a vector-width probe and scalar recovery of the
+/// same failed block when the selected implementation requires both.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AsciiRunResult {
+    member_run_len: usize,
+    examined_bytes: usize,
+}
+
+impl AsciiRunResult {
+    const fn new(member_run_len: usize, examined_bytes: usize) -> Self {
+        debug_assert!(member_run_len <= examined_bytes);
+        Self {
+            member_run_len,
+            examined_bytes,
+        }
+    }
+
+    /// Length of the maximal member prefix or suffix.
+    #[must_use]
+    pub const fn member_run_len(self) -> usize {
+        self.member_run_len
+    }
+
+    /// Exact number of physical byte classifications performed by the leaf.
+    ///
+    /// This may exceed the source length when NEON classifies a failed block
+    /// once as a vector and again during scalar recovery. The excess over the
+    /// logically necessary run is bounded by
+    /// [`ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD`].
+    #[must_use]
+    pub const fn examined_bytes(self) -> usize {
+        self.examined_bytes
     }
 }
 
@@ -296,6 +393,136 @@ impl AsciiSelection {
     #[must_use]
     pub const fn wide(self) -> SelectionReceipt {
         self.wide
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AsciiRunTables {
+    set: AsciiByteSet,
+    columns: [u8; ASCII_NARROW_BYTES],
+    #[cfg_attr(
+        not(all(target_arch = "aarch64", target_os = "linux", target_endian = "little")),
+        allow(
+            dead_code,
+            reason = "the compiled MATCH table is retained on every target so scanner layout and construction accounting remain target-independent"
+        )
+    )]
+    match_values: [u8; ASCII_NARROW_BYTES],
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the private function-pointer type represents a target-feature proof retained by a successfully constructed run scanner"
+)]
+type ScanRunEntry = unsafe fn(&AsciiRunTables, &[u8]) -> AsciiRunResult;
+
+#[derive(Clone, Copy, Debug)]
+struct AsciiRunEntries {
+    forward: ScanRunEntry,
+    backward: ScanRunEntry,
+}
+
+/// A compiled ASCII byte-set run scanner with immutable one-time dispatch.
+///
+/// The scanner accepts arbitrary slice lengths. Dispatch nevertheless uses the
+/// invariant 16-byte kernel block shape at construction, never a caller's
+/// varying slice length.
+#[derive(Clone, Copy)]
+pub struct AsciiByteSetRunScanner {
+    tables: AsciiRunTables,
+    entries: AsciiRunEntries,
+    selection: SelectionReceipt,
+}
+
+impl fmt::Debug for AsciiByteSetRunScanner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsciiByteSetRunScanner")
+            .field("set", &self.tables.set)
+            .field("selection", &self.selection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsciiByteSetRunScanner {
+    /// Build a run scanner using all OS-usable host features.
+    #[must_use]
+    pub fn new(set: AsciiByteSet) -> Self {
+        Self::with_policy(set, DispatchPolicy::Auto)
+            .expect("automatic dispatch always retains a scalar fallback")
+    }
+
+    /// Build a run scanner under an authentic host-feature policy.
+    pub fn with_policy(
+        set: AsciiByteSet,
+        policy: DispatchPolicy,
+    ) -> Result<Self, UnsupportedRequiredFeatures> {
+        SimdDispatchContext::capture().ascii_byte_set_run_scanner(set, policy)
+    }
+
+    /// Build a scanner from one already-captured capability snapshot.
+    ///
+    /// Both table representations are compiled together in exactly one pass
+    /// over the 128 possible ASCII values.
+    pub fn with_capabilities(
+        set: AsciiByteSet,
+        capabilities: CpuCapabilities,
+        policy: DispatchPolicy,
+    ) -> Result<Self, UnsupportedRequiredFeatures> {
+        // One complete 128-byte-domain pass builds both representations so
+        // resource-accounted callers can charge exactly 128 membership probes.
+        let (tables, match_eligible) = set.run_tables();
+        let selected = select_run(capabilities, policy, match_eligible)?;
+        Ok(Self {
+            tables,
+            entries: selected.entry(),
+            selection: selected.receipt(),
+        })
+    }
+
+    /// The byte set compiled into this scanner.
+    #[must_use]
+    pub const fn set(&self) -> AsciiByteSet {
+        self.tables.set
+    }
+
+    /// Stable receipt for the paired forward/backward implementation.
+    #[must_use]
+    pub const fn selection(&self) -> SelectionReceipt {
+        self.selection
+    }
+
+    /// Scan the maximal member prefix.
+    ///
+    /// The returned run length is in `0..=bytes.len()`. A nonempty slice with
+    /// a zero run still examines the first nonmember. The selected leaf may
+    /// inspect a complete vector block before recovering the exact boundary;
+    /// [`AsciiRunResult::examined_bytes`] reports that work exactly.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "construction retained this private entry only after proving every required target feature against immutable host facts"
+    )]
+    pub fn scan_forward(&self, bytes: &[u8]) -> AsciiRunResult {
+        // SAFETY: callers cannot forge or replace the retained entry or tables.
+        // The slice proves the source extent for every scalar, fixed-width, or
+        // predicated load performed by the selected private leaf.
+        unsafe { (self.entries.forward)(&self.tables, bytes) }
+    }
+
+    /// Scan the maximal member suffix.
+    ///
+    /// The result's run length is subtracted from `bytes.len()` to obtain the
+    /// suffix start. Examination accounting follows [`Self::scan_forward`].
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "construction retained this private entry only after proving every required target feature against immutable host facts"
+    )]
+    pub fn scan_backward(&self, bytes: &[u8]) -> AsciiRunResult {
+        // SAFETY: identical retained-entry and source-extent proof to the
+        // forward operation.
+        unsafe { (self.entries.backward)(&self.tables, bytes) }
     }
 }
 
@@ -500,6 +727,152 @@ impl AsciiByteSetClassifier {
     unsafe_code,
     reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
 )]
+unsafe fn scan_run_forward_scalar_entry(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
+    scalar::scan_run_forward(tables.set, bytes)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
+)]
+unsafe fn scan_run_backward_scalar_entry(tables: &AsciiRunTables, bytes: &[u8]) -> AsciiRunResult {
+    scalar::scan_run_backward(tables.set, bytes)
+}
+
+const SCALAR_RUN_ENTRIES: AsciiRunEntries = AsciiRunEntries {
+    forward: scan_run_forward_scalar_entry,
+    backward: scan_run_backward_scalar_entry,
+};
+
+const SCALAR_RUN: KernelVariant<AsciiRunEntries> = KernelVariant::new(
+    "ascii-byte-set.run.scalar.v1",
+    ArchitectureRequirement::Any,
+    FeatureSet::EMPTY,
+    VectorKind::Scalar,
+    0,
+    0,
+    SCALAR_RUN_ENTRIES,
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
+    SCALAR_RUN,
+    // Base SVE remains independently force-selectable for qualification.
+    // Generic automatic policy retains NEON until paired direct-run and
+    // end-to-end consumer measurements justify a narrower tuning promotion.
+    KernelVariant::new(
+        "ascii-byte-set.run.sve.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmSve),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        50,
+        AsciiRunEntries {
+            forward: aarch64_sve2::scan_run_forward_sve,
+            backward: aarch64_sve2::scan_run_backward_sve,
+        },
+    ),
+    KernelVariant::new(
+        "ascii-byte-set.run.neon.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiRunEntries {
+            forward: aarch64::scan_run_forward_neon,
+            backward: aarch64::scan_run_backward_neon,
+        },
+    ),
+];
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 4] = [
+    SCALAR_RUN,
+    KernelVariant::new(
+        "ascii-byte-set.run.sve.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmSve),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        50,
+        AsciiRunEntries {
+            forward: aarch64_sve2::scan_run_forward_sve,
+            backward: aarch64_sve2::scan_run_backward_sve,
+        },
+    ),
+    KernelVariant::new(
+        "ascii-byte-set.run.sve2-match16.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        60,
+        AsciiRunEntries {
+            forward: aarch64_sve2::scan_run_forward_sve2,
+            backward: aarch64_sve2::scan_run_backward_sve2,
+        },
+    ),
+    // See RUN_VARIANTS: unqualified hardware availability authorizes entry but
+    // does not itself establish that either SVE implementation beats NEON.
+    KernelVariant::new(
+        "ascii-byte-set.run.neon.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiRunEntries {
+            forward: aarch64::scan_run_forward_neon,
+            backward: aarch64::scan_run_backward_neon,
+        },
+    ),
+];
+
+#[cfg(all(
+    target_arch = "aarch64",
+    not(all(target_os = "linux", target_endian = "little"))
+))]
+const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = [
+    SCALAR_RUN,
+    KernelVariant::new(
+        "ascii-byte-set.run.neon.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::of(Feature::ArmNeon),
+        VectorKind::Fixed {
+            bytes: ASCII_NARROW_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiRunEntries {
+            forward: aarch64::scan_run_forward_neon,
+            backward: aarch64::scan_run_backward_neon,
+        },
+    ),
+];
+
+#[cfg(all(
+    target_arch = "aarch64",
+    not(all(target_os = "linux", target_endian = "little"))
+))]
+const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = RUN_VARIANTS;
+
+#[cfg(not(target_arch = "aarch64"))]
+const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
+
+#[cfg(not(target_arch = "aarch64"))]
+const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
+
+#[allow(
+    unsafe_code,
+    reason = "the scalar function uses the uniform private entry ABI but executes no unsafe operation or target-specific instruction"
+)]
 unsafe fn classify_16_scalar_entry(
     columns: &[u8; ASCII_NARROW_BYTES],
     bytes: &[u8; ASCII_NARROW_BYTES],
@@ -694,5 +1067,23 @@ fn select_wide(
     Ok(
         select_kernel(capabilities, policy, ASCII_WIDE_BYTES, &WIDE_VARIANTS)?
             .expect("the private table always contains its split-narrow fallback"),
+    )
+}
+
+fn select_run(
+    capabilities: CpuCapabilities,
+    policy: DispatchPolicy,
+    match_eligible: bool,
+) -> Result<SelectedKernel<AsciiRunEntries>, UnsupportedRequiredFeatures> {
+    let variants = if match_eligible {
+        &RUN_MATCH_VARIANTS[..]
+    } else {
+        &RUN_VARIANTS[..]
+    };
+    // Sixteen bytes is the retained implementation's invariant block shape.
+    // Calls may contain any number of bytes and never participate in selection.
+    Ok(
+        select_kernel(capabilities, policy, ASCII_NARROW_BYTES, variants)?
+            .expect("the private table always contains its scalar fallback"),
     )
 }
