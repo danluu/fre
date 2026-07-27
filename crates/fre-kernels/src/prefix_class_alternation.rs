@@ -3287,7 +3287,10 @@ mod tests {
         let dispatched_elapsed = started.elapsed();
         assert_eq!(established_count, dispatched_count);
         eprintln!(
-            "prefix/class scalar={established_elapsed:?} sve={dispatched_elapsed:?} bytes={} iterations={} selections={:?}",
+            "PREFIX_CLASS_ALTERNATION_BENCH scalar_ns={} sve_ns={} sve_over_scalar={:.9} bytes={} iterations={} selections={:?}",
+            established_elapsed.as_nanos(),
+            dispatched_elapsed.as_nanos(),
+            dispatched_elapsed.as_secs_f64() / established_elapsed.as_secs_f64(),
             haystack.len(),
             iterations,
             dispatched.run_scanner_selections()
