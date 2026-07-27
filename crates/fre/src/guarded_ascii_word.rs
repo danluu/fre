@@ -2058,6 +2058,20 @@ impl Dictionary {
         })
     }
 
+    /// Count with the authentic host-selected long-run scanner.
+    ///
+    /// Scanner construction is allocation-free. Small maximal words stay on
+    /// the scalar probe, while proved-long continuations use the retained
+    /// automatic SIMD policy.
+    pub fn count_auto(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<CountResult, ReduceError> {
+        self.with_dispatch(SimdDispatchContext::capture())
+            .count(haystack, limits)
+    }
+
     /// Sum the byte lengths of complete non-overlapping matches of the proved
     /// guarded language.
     ///
@@ -2073,6 +2087,16 @@ impl Dictionary {
             span_sum: reduction.accounting.actual.span_sum,
             accounting: reduction.accounting,
         })
+    }
+
+    /// Sum match spans with the authentic host-selected long-run scanner.
+    pub fn span_sum_auto(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        self.with_dispatch(SimdDispatchContext::capture())
+            .span_sum(haystack, limits)
     }
 
     fn reduce(
@@ -2858,8 +2882,8 @@ mod tests {
             let measure_auto_short = || {
                 benchmark_count(
                     |haystack| {
-                        dispatched
-                            .count(haystack, ReduceLimits::unlimited())
+                        dictionary
+                            .count_auto(haystack, ReduceLimits::unlimited())
                             .unwrap()
                     },
                     &short_haystack,
@@ -2880,8 +2904,8 @@ mod tests {
             let measure_auto_long = || {
                 benchmark_count(
                     |haystack| {
-                        dispatched
-                            .count(haystack, ReduceLimits::unlimited())
+                        dictionary
+                            .count_auto(haystack, ReduceLimits::unlimited())
                             .unwrap()
                     },
                     &long_haystack,

@@ -13693,7 +13693,7 @@ impl AggregatePlan {
                 ),
             )),
             AggregateEngine::GuardedAsciiWord(engine) => engine
-                .count(
+                .count_auto(
                     haystack,
                     guarded_ascii_word_reduce_limits(limits.finite_literal),
                 )
@@ -13976,7 +13976,7 @@ impl AggregatePlan {
                 ),
             )),
             AggregateEngine::GuardedAsciiWord(engine) => engine
-                .span_sum(
+                .span_sum_auto(
                     haystack,
                     guarded_ascii_word_reduce_limits(limits.finite_literal),
                 )
