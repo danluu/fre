@@ -132,6 +132,34 @@ pub struct AggregateBuildAccounting {
     pub peak_bytes: usize,
 }
 
+/// Authenticate build accounting against the storage and scanner retained by
+/// an operation identity.
+///
+/// Keeping this check beside the private owner layouts prevents adapters from
+/// freezing the pre-dispatch scalar work or storage formula.
+#[must_use]
+pub fn aggregate_build_accounting_matches(
+    identity: AggregateOperationIdentity,
+    accounting: AggregateBuildAccounting,
+) -> bool {
+    let (scanner_work, persistent_bytes) = match identity.plan_id {
+        ASCII_PLAN_ID => (ASCII_RUN_SCANNER_BUILD_WORK, AsciiPlan::persistent_bytes()),
+        UNICODE_PLAN_ID | FIXED_CLASS_CHUNKS_PLAN_ID => (0, core::mem::size_of::<Plan>()),
+        _ => return false,
+    };
+    FIXED_BUILD_WORK
+        .checked_add(scanner_work)
+        .is_some_and(|work_upper_bound| {
+            accounting
+                == AggregateBuildAccounting {
+                    work_upper_bound,
+                    scratch_bytes: 0,
+                    persistent_bytes,
+                    peak_bytes: persistent_bytes,
+                }
+        })
+}
+
 #[derive(Debug)]
 pub(crate) struct AggregateBuildAttempt {
     accounting: AggregateBuildAccounting,
@@ -1877,8 +1905,9 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildLimits, AggregateReduceLimits, AsciiPlan,
-        AsciiPlanOwner, FIXED_BUILD_WORK, Plan, WordMode, ascii_word_set,
+        ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildAccounting, AggregateBuildLimits,
+        AggregateOperationIdentity, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner,
+        FIXED_BUILD_WORK, Plan, WordMode, aggregate_build_accounting_matches, ascii_word_set,
     };
     use crate::{SearchLimits, SearchWindow};
 
@@ -1930,6 +1959,56 @@ mod tests {
         assert_eq!(summed.accounting.actual.source_reads, haystack.len());
         assert_eq!(counted.accounting.actual.scratch_bytes, 0);
         assert_eq!(summed.accounting.actual.scratch_bytes, 0);
+    }
+
+    fn assert_build_accounting_closes_every_operation(
+        plan: Plan,
+        accounting: AggregateBuildAccounting,
+    ) {
+        for identity in [
+            plan.aggregate_count_identity(),
+            plan.aggregate_span_sum_identity(),
+        ] {
+            assert!(aggregate_build_accounting_matches(identity, accounting));
+            for field in 0..4 {
+                let mut forged = accounting;
+                match field {
+                    0 => {
+                        forged.work_upper_bound = forged
+                            .work_upper_bound
+                            .checked_sub(1)
+                            .expect("word-run build work is positive");
+                    }
+                    1 => {
+                        forged.scratch_bytes = forged
+                            .scratch_bytes
+                            .checked_add(1)
+                            .expect("test scratch mutation fits");
+                    }
+                    2 => {
+                        forged.persistent_bytes = forged
+                            .persistent_bytes
+                            .checked_sub(1)
+                            .expect("word-run persistent storage is positive");
+                    }
+                    3 => {
+                        forged.peak_bytes = forged
+                            .peak_bytes
+                            .checked_sub(1)
+                            .expect("word-run peak storage is positive");
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!aggregate_build_accounting_matches(identity, forged));
+            }
+            assert!(!aggregate_build_accounting_matches(
+                AggregateOperationIdentity {
+                    plan_id: "forged-word-run-plan",
+                    ..identity
+                },
+                accounting,
+            ));
+        }
     }
 
     #[test]
@@ -2050,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn ascii_scanner_build_storage_is_exact_and_unicode_storage_is_unchanged() {
+    fn aggregate_build_accounting_is_exact_for_every_plan_and_operation() {
         let ascii = Plan::new(3, WordMode::Ascii);
         let ascii_attempt = ascii
             .aggregate_build_attempt(AggregateBuildLimits::unlimited())
@@ -2064,6 +2143,7 @@ mod tests {
         );
         assert_eq!(accounting.persistent_bytes, AsciiPlan::persistent_bytes());
         assert_eq!(accounting.peak_bytes, accounting.persistent_bytes);
+        assert_build_accounting_closes_every_operation(ascii, accounting);
         assert_eq!(
             actual.work,
             u64::try_from(accounting.work_upper_bound).expect("small fixed work")
@@ -2083,6 +2163,18 @@ mod tests {
         let (accounting, actual) = unicode_attempt.into_parts();
         assert_eq!(accounting.work_upper_bound, FIXED_BUILD_WORK);
         assert_eq!(accounting.persistent_bytes, core::mem::size_of::<Plan>());
+        assert_build_accounting_closes_every_operation(unicode, accounting);
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.initialized_bytes, core::mem::size_of::<Plan>());
+
+        let fixed = Plan::fixed_class_chunks(256, class_words(b"0_az"));
+        let fixed_attempt = fixed
+            .aggregate_build_attempt(AggregateBuildLimits::unlimited())
+            .expect("fixed-class build");
+        let (accounting, actual) = fixed_attempt.into_parts();
+        assert_eq!(accounting.work_upper_bound, FIXED_BUILD_WORK);
+        assert_eq!(accounting.persistent_bytes, core::mem::size_of::<Plan>());
+        assert_build_accounting_closes_every_operation(fixed, accounting);
         assert_eq!(actual.allocations, 0);
         assert_eq!(actual.initialized_bytes, core::mem::size_of::<Plan>());
     }

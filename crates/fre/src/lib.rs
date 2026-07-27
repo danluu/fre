@@ -506,6 +506,7 @@ pub use unicode_word_run::{
     AggregateSpanSumResult as WordRunSpanSumResult, Error as UnicodeWordRunError,
     FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID, FIXED_CLASS_CHUNKS_PLAN_ID,
     FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID, UNICODE_PLAN_ID as UNICODE_WORD_RUN_PLAN_ID,
+    aggregate_build_accounting_matches as word_run_build_accounting_matches,
 };
 
 /// Stable schema for facade-level explanation records.

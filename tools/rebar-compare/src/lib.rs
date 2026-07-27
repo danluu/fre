@@ -9800,10 +9800,7 @@ fn word_run_plan_identity_matches(
         && identity.kernel.greedy
         && identity.kernel.non_overlapping
         && (unicode || !identity.kernel.unicode)
-        && build.work_upper_bound == 1
-        && build.scratch_bytes == 0
-        && build.persistent_bytes > 0
-        && build.peak_bytes == build.persistent_bytes
+        && fre::word_run_build_accounting_matches(identity.kernel, build)
         && report.retained_capacity_bytes == build.persistent_bytes
 }
 
@@ -19300,6 +19297,112 @@ mod tests {
             unicode.build_report().plan,
             AggregatePlanKind::FixedPredicateWord64
         );
+    }
+
+    #[test]
+    fn current_fre_word_run_build_accounting_is_plan_owned_and_operation_complete() {
+        for (pattern, unicode, expected_semantics) in [
+            (
+                r"\b\w{12,}\b",
+                false,
+                fre::AggregateWordRunSemantics::AsciiWordBytes,
+            ),
+            (
+                r"\b\w{12,}\b",
+                true,
+                fre::AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord,
+            ),
+            (
+                r"[0-9A-Za-z_]{256}",
+                false,
+                fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
+            ),
+        ] {
+            for operation in [
+                LiteralAggregateOperation::Count,
+                LiteralAggregateOperation::SpanSum,
+            ] {
+                let builder = current_fre_rebar_aggregate_builder(pattern, unicode, false);
+                let report = match operation {
+                    LiteralAggregateOperation::Count => builder
+                        .build_count()
+                        .expect("word-run count build")
+                        .build_report()
+                        .clone(),
+                    LiteralAggregateOperation::SpanSum => builder
+                        .build_span_sum()
+                        .expect("word-run span-sum build")
+                        .build_report()
+                        .clone(),
+                };
+                let model = match operation {
+                    LiteralAggregateOperation::Count => "count",
+                    LiteralAggregateOperation::SpanSum => "count-spans",
+                };
+                current_fre_rebar_validate_aggregate_identity(&report, unicode, model)
+                    .expect("exact word-run identity");
+                let (
+                    AggregatePlanIdentity::WordRun(identity),
+                    AggregateBuildAccounting::WordRun(build),
+                ) = (report.plan_identity, report.build)
+                else {
+                    panic!("word-run test retained another plan or build receipt");
+                };
+                assert_eq!(identity.semantics, expected_semantics);
+                assert!(fre::word_run_build_accounting_matches(
+                    identity.kernel,
+                    build
+                ));
+
+                for field in 0..4 {
+                    let mut forged = report.clone();
+                    let AggregateBuildAccounting::WordRun(build) = &mut forged.build else {
+                        unreachable!("word-run build receipt checked above");
+                    };
+                    match field {
+                        0 => {
+                            build.work_upper_bound = build
+                                .work_upper_bound
+                                .checked_sub(1)
+                                .expect("word-run build work is positive");
+                        }
+                        1 => {
+                            build.scratch_bytes = build
+                                .scratch_bytes
+                                .checked_add(1)
+                                .expect("test scratch mutation fits");
+                        }
+                        2 => {
+                            build.persistent_bytes = build
+                                .persistent_bytes
+                                .checked_sub(1)
+                                .expect("word-run persistent storage is positive");
+                        }
+                        3 => {
+                            build.peak_bytes = build
+                                .peak_bytes
+                                .checked_sub(1)
+                                .expect("word-run peak storage is positive");
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        current_fre_rebar_validate_aggregate_identity(&forged, unicode, model)
+                            .is_err()
+                    );
+                }
+
+                let mut wrong_plan = report;
+                let AggregatePlanIdentity::WordRun(identity) = &mut wrong_plan.plan_identity else {
+                    unreachable!("word-run identity checked above");
+                };
+                identity.kernel.plan_id = "forged-word-run-plan";
+                assert!(
+                    current_fre_rebar_validate_aggregate_identity(&wrong_plan, unicode, model)
+                        .is_err()
+                );
+            }
+        }
     }
 
     #[test]
