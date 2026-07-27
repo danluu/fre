@@ -1,4 +1,7 @@
-use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables};
+use super::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks32, AsciiRunResult, AsciiRunTables, aarch64,
+    scalar,
+};
 
 // This is a leaf AAPCS64 function. Its two pointer arguments arrive in x0/x1
 // and its packed u64 result returns in x0: member lanes occupy bits 0..31 and
@@ -468,4 +471,89 @@ pub(super) unsafe fn scan_run_backward_sve2(
     unsafe {
         fre_ascii_run_backward_sve2_asm(tables.match_values.as_ptr(), bytes.as_ptr(), bytes.len())
     }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "retained dispatch proves both NEON and SVE2 before this hybrid performs one exact NEON probe and calls the reviewed SVE2 leaf"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_neon_sve2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let Some((first, tail)) = bytes.split_at_checked(ASCII_NARROW_BYTES) else {
+        return scalar::scan_run_forward(tables.set, bytes);
+    };
+    let first: &[u8; ASCII_NARROW_BYTES] = first
+        .try_into()
+        .expect("split_at_checked produced one exact NEON block");
+    // SAFETY: this hybrid is selected only with retained NEON authorization,
+    // and `first` proves the exact 16-byte load extent.
+    if !unsafe { aarch64::block_all_members_neon(&tables.columns, first) } {
+        let recovery = scalar::scan_run_forward(tables.set, first);
+        return AsciiRunResult::new(
+            recovery.member_run_len(),
+            ASCII_NARROW_BYTES
+                .checked_add(recovery.examined_bytes())
+                .expect("one fixed probe plus its recovery fits usize"),
+        );
+    }
+    if tail.is_empty() {
+        return AsciiRunResult::new(ASCII_NARROW_BYTES, ASCII_NARROW_BYTES);
+    }
+    // SAFETY: retained dispatch also proves SVE and SVE2, while `tail`
+    // carries its complete source extent.
+    let continuation = unsafe { scan_run_forward_sve2(tables, tail) };
+    AsciiRunResult::new(
+        ASCII_NARROW_BYTES
+            .checked_add(continuation.member_run_len())
+            .expect("the first block and continuation partition one slice"),
+        ASCII_NARROW_BYTES
+            .checked_add(continuation.examined_bytes())
+            .expect("the first probe and continuation work fit one slice bound"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "retained dispatch proves both NEON and SVE2 before this hybrid performs one exact NEON probe and calls the reviewed SVE2 leaf"
+)]
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_neon_sve2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let Some(split) = bytes.len().checked_sub(ASCII_NARROW_BYTES) else {
+        return scalar::scan_run_backward(tables.set, bytes);
+    };
+    let (head, last) = bytes.split_at(split);
+    let last: &[u8; ASCII_NARROW_BYTES] = last
+        .try_into()
+        .expect("checked split retained one exact NEON block");
+    // SAFETY: this hybrid is selected only with retained NEON authorization,
+    // and `last` proves the exact 16-byte load extent.
+    if !unsafe { aarch64::block_all_members_neon(&tables.columns, last) } {
+        let recovery = scalar::scan_run_backward(tables.set, last);
+        return AsciiRunResult::new(
+            recovery.member_run_len(),
+            ASCII_NARROW_BYTES
+                .checked_add(recovery.examined_bytes())
+                .expect("one fixed probe plus its recovery fits usize"),
+        );
+    }
+    if head.is_empty() {
+        return AsciiRunResult::new(ASCII_NARROW_BYTES, ASCII_NARROW_BYTES);
+    }
+    // SAFETY: retained dispatch also proves SVE and SVE2, while `head`
+    // carries its complete source extent.
+    let continuation = unsafe { scan_run_backward_sve2(tables, head) };
+    AsciiRunResult::new(
+        ASCII_NARROW_BYTES
+            .checked_add(continuation.member_run_len())
+            .expect("the last block and continuation partition one slice"),
+        ASCII_NARROW_BYTES
+            .checked_add(continuation.examined_bytes())
+            .expect("the last probe and continuation work fit one slice bound"),
+    )
 }

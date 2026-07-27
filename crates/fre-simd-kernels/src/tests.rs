@@ -517,7 +517,7 @@ fn host_auto_selection_receipt_matches_usable_features() {
 }
 
 #[test]
-fn host_auto_run_selection_is_authorized_and_keeps_neon_conservative_preference() {
+fn host_auto_run_selection_is_authorized_and_uses_only_qualified_tuning() {
     let sparse = AsciiByteSetRunScanner::new(singleton(b'x'));
     let dense = AsciiByteSetRunScanner::new(AsciiByteSet::ALL);
     #[cfg(target_arch = "aarch64")]
@@ -526,19 +526,46 @@ fn host_auto_run_selection_is_authorized_and_keeps_neon_conservative_preference(
     #[cfg(target_arch = "aarch64")]
     {
         if usable.contains(Feature::ArmNeon) {
-            for scanner in [sparse, dense] {
-                assert_eq!(scanner.selection().variant_id, "ascii-byte-set.run.neon.v1");
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            let tuned_hybrid = is_neoverse_v3(host().tuning())
+                && usable.contains(Feature::ArmSve)
+                && usable.contains(Feature::ArmSve2);
+            #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+            let tuned_hybrid = false;
+            if tuned_hybrid {
                 assert_eq!(
-                    scanner.selection().required,
+                    sparse.selection().variant_id,
+                    "ascii-byte-set.run.neon-sve2.arm-41-d84.v1"
+                );
+                assert_eq!(
+                    sparse.selection().required,
+                    FeatureSet::EMPTY
+                        .with(Feature::ArmNeon)
+                        .with(Feature::ArmSve)
+                        .with(Feature::ArmSve2)
+                );
+                assert_eq!(sparse.selection().vector, VectorKind::Scalable);
+            } else {
+                assert_eq!(sparse.selection().variant_id, "ascii-byte-set.run.neon.v1");
+                assert_eq!(
+                    sparse.selection().required,
                     FeatureSet::of(Feature::ArmNeon)
                 );
                 assert_eq!(
-                    scanner.selection().vector,
+                    sparse.selection().vector,
                     VectorKind::Fixed {
                         bytes: u16::try_from(ASCII_NARROW_BYTES).unwrap()
                     }
                 );
             }
+            assert_eq!(dense.selection().variant_id, "ascii-byte-set.run.neon.v1");
+            assert_eq!(dense.selection().required, FeatureSet::of(Feature::ArmNeon));
+            assert_eq!(
+                dense.selection().vector,
+                VectorKind::Fixed {
+                    bytes: u16::try_from(ASCII_NARROW_BYTES).unwrap()
+                }
+            );
         } else {
             #[cfg(all(target_os = "linux", target_endian = "little"))]
             {
@@ -1133,6 +1160,47 @@ fn forced_sve2_match_run_scanner_covers_every_small_set_size_and_lane() {
         fallback.selection().required,
         FeatureSet::of(Feature::ArmSve)
     );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+#[test]
+fn neoverse_v3_hybrid_run_scanner_preserves_boundaries_and_work_envelope() {
+    let scanner = AsciiByteSetRunScanner::new(singleton(b'a'));
+    if scanner.selection().variant_id != "ascii-byte-set.run.neon-sve2.arm-41-d84.v1" {
+        return;
+    }
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        for offset in 0..ASCII_NARROW_BYTES {
+            let mut storage = vec![0xcc; offset + len];
+            let bytes = &mut storage[offset..];
+            for prefix_len in 0..=len {
+                bytes.fill(b'a');
+                if prefix_len < len {
+                    bytes[prefix_len] = b'!';
+                }
+                let observed = scanner.scan_forward(bytes);
+                assert_eq!(observed.member_run_len(), prefix_len);
+                let logical = prefix_len + usize::from(prefix_len < len);
+                assert!(
+                    (logical..=logical + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        .contains(&observed.examined_bytes())
+                );
+            }
+            for suffix_len in 0..=len {
+                bytes.fill(b'a');
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = b'!';
+                }
+                let observed = scanner.scan_backward(bytes);
+                assert_eq!(observed.member_run_len(), suffix_len);
+                let logical = suffix_len + usize::from(suffix_len < len);
+                assert!(
+                    (logical..=logical + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        .contains(&observed.examined_bytes())
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]

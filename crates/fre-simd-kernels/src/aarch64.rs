@@ -65,7 +65,7 @@ unsafe fn boolean_lanes_to_mask(lanes: uint8x16_t, weights: uint8x16_t) -> u16 {
     reason = "this private target-feature helper reads one exact 16-byte block after its retained scanner proved NEON usable"
 )]
 #[target_feature(enable = "neon")]
-unsafe fn block_all_members_neon(
+pub(super) unsafe fn block_all_members_neon(
     columns: &[u8; ASCII_NARROW_BYTES],
     bytes: &[u8; ASCII_NARROW_BYTES],
 ) -> bool {

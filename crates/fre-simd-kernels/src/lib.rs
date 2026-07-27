@@ -789,7 +789,7 @@ const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
 ];
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
-const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 4] = [
+const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 5] = [
     SCALAR_RUN,
     KernelVariant::new(
         "ascii-byte-set.run.sve.v1",
@@ -833,6 +833,26 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 4] = [
             backward: aarch64::scan_run_backward_neon,
         },
     ),
+    // Neoverse V3 qualification found SVE2 decisively ahead once a run
+    // survives its first block, while NEON retains the lower failed-first-block
+    // cost. This composite keeps NEON's exact recovery for short runs and
+    // hands only sustained runs to the fixed-16 SVE2 leaf.
+    KernelVariant::new(
+        "ascii-byte-set.run.neon-sve2.arm-41-d84.v1",
+        ArchitectureRequirement::Exact(Architecture::Aarch64),
+        FeatureSet::EMPTY
+            .with(Feature::ArmNeon)
+            .with(Feature::ArmSve)
+            .with(Feature::ArmSve2),
+        VectorKind::Scalable,
+        ASCII_NARROW_BYTES,
+        150,
+        AsciiRunEntries {
+            forward: aarch64_sve2::scan_run_forward_neon_sve2,
+            backward: aarch64_sve2::scan_run_backward_neon_sve2,
+        },
+    )
+    .when_tuning(is_neoverse_v3),
 ];
 
 #[cfg(all(
