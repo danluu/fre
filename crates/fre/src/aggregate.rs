@@ -17283,13 +17283,27 @@ mod tests {
             routed_span.0.engine,
             super::AggregateEngine::DispatchedExactLiteral(_)
         ));
-        let established = fre_kernels::LiteralAggregatePlan::build(
-            b"x",
-            fre_kernels::LiteralAggregateBuildLimits::unlimited(),
-        )
-        .unwrap();
+        let mut established_limits = AggregateBuildLimits::default();
+        established_limits.exact_literal.max_build_work = 2;
+        let established_count = AggregateBuilder::new("x")
+            .unicode(false)
+            .limits(established_limits)
+            .build_count()
+            .unwrap();
+        let established_span = AggregateBuilder::new("x")
+            .unicode(false)
+            .limits(established_limits)
+            .build_span_sum()
+            .unwrap();
+        assert!(matches!(
+            established_count.0.engine,
+            super::AggregateEngine::ExactLiteral(_)
+        ));
+        assert!(matches!(
+            established_span.0.engine,
+            super::AggregateEngine::ExactLiteral(_)
+        ));
         let run_limits = AggregateRunLimits::default();
-        let kernel_limits = fre_kernels::LiteralAggregateReduceLimits::unlimited();
 
         let cases = [
             ("dense", b"xxxxyxxxx-xxxx_xx".as_slice()),
@@ -17343,10 +17357,9 @@ mod tests {
                             .count_value(black_box(&haystack), black_box(run_limits))
                             .unwrap()
                     } else {
-                        established
-                            .count(black_box(&haystack), black_box(kernel_limits))
+                        established_count
+                            .count_value(black_box(&haystack), black_box(run_limits))
                             .unwrap()
-                            .count
                     };
                     let elapsed = started.elapsed();
                     if routed {
@@ -17367,10 +17380,9 @@ mod tests {
                             .span_sum_value(black_box(&haystack), black_box(run_limits))
                             .unwrap()
                     } else {
-                        established
-                            .span_sum(black_box(&haystack), black_box(kernel_limits))
+                        established_span
+                            .span_sum_value(black_box(&haystack), black_box(run_limits))
                             .unwrap()
-                            .span_sum
                     };
                     let elapsed = started.elapsed();
                     if routed {
