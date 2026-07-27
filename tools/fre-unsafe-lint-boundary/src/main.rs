@@ -17,6 +17,10 @@ const KERNEL_PACKAGE: &str = "fre-kernels";
 const KERNEL_LIBRARY: &str = "fre_kernels";
 const EXACT_ALLOC_PACKAGE: &str = "fre-exact-alloc";
 const EXACT_ALLOC_LIBRARY: &str = "fre_exact_alloc";
+const TARGET_FEATURES_PACKAGE: &str = "fre-target-features";
+const TARGET_FEATURES_LIBRARY: &str = "fre_target_features";
+const SIMD_KERNELS_PACKAGE: &str = "fre-simd-kernels";
+const SIMD_KERNELS_LIBRARY: &str = "fre_simd_kernels";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
 const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
@@ -173,6 +177,146 @@ const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 6] = [
     COPY_EXACT_REVIEWED_BLOCK,
 ];
 const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 7;
+const TARGET_FEATURES_UNSAFE_CODE_SPELLINGS: usize = 3;
+const TARGET_FEATURES_SOURCE_SHA256: [u8; 32] = [
+    0xb4, 0xdd, 0xb0, 0xd6, 0x14, 0xf6, 0xbb, 0x59, 0x40, 0xc1, 0xcd, 0xcc, 0x25, 0xf0, 0xec, 0xa6,
+    0x91, 0x7b, 0x09, 0x0c, 0xc2, 0x4d, 0x2c, 0xe8, 0x53, 0x62, 0xab, 0xcb, 0x0a, 0x61, 0xab, 0xdd,
+];
+const TARGET_FEATURES_X86_REVIEWED_BLOCK: &str = r#"#[cfg(target_arch = "x86_64")]
+#[allow(
+    unsafe_code,
+    reason = "CPUID leaf 0/1 are architecture-defined, side-effect-free tuning queries; instruction safety still comes from std feature detection"
+)]
+fn x86_tuning() -> TuningClass {
+    use core::arch::x86_64::__cpuid;
+
+    // SAFETY: CPUID is architecturally available on x86-64. Leaf 0 reports
+    // the maximum basic leaf before leaf 1 is queried.
+    let leaf0 = unsafe { __cpuid(0) };
+    let mut vendor_bytes = [0_u8; 12];
+    vendor_bytes[..4].copy_from_slice(&leaf0.ebx.to_ne_bytes());
+    vendor_bytes[4..8].copy_from_slice(&leaf0.edx.to_ne_bytes());
+    vendor_bytes[8..].copy_from_slice(&leaf0.ecx.to_ne_bytes());
+    let vendor = match &vendor_bytes {
+        b"AuthenticAMD" => X86Vendor::Amd,
+        b"GenuineIntel" => X86Vendor::Intel,
+        _ => X86Vendor::Other(vendor_bytes),
+    };
+    if leaf0.eax < 1 {
+        return TuningClass::X86 {
+            vendor,
+            family: 0,
+            model: 0,
+        };
+    }
+    // SAFETY: leaf 0 proved that basic leaf 1 exists.
+    let leaf1 = unsafe { __cpuid(1) };
+    let base_family = u16::try_from((leaf1.eax >> 8) & 0x0F).expect("four bits fit");
+    let extended_family = u16::try_from((leaf1.eax >> 20) & 0xFF).expect("eight bits fit");
+    let family = if base_family == 0x0F {
+        base_family.saturating_add(extended_family)
+    } else {
+        base_family
+    };
+    let base_model = u16::try_from((leaf1.eax >> 4) & 0x0F).expect("four bits fit");
+    let extended_model = u16::try_from((leaf1.eax >> 16) & 0x0F).expect("four bits fit");
+    let model = if base_family == 0x06 || base_family == 0x0F {
+        (extended_model << 4) | base_model
+    } else {
+        base_model
+    };
+    TuningClass::X86 {
+        vendor,
+        family,
+        model,
+    }
+}"#;
+const TARGET_FEATURES_MACOS_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "read-only sysctlbyname writes into one initialized fixed-size integer and receives no mutable input"
+    )]
+    fn integer(name: &CStr) -> Option<i32> {
+        let mut value = 0_i32;
+        let mut length = size_of::<i32>();
+        // SAFETY: `name` is NUL terminated. `value` and `length` point to
+        // initialized writable objects of the declared size. Null new-value
+        // arguments make this a read-only query.
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut value).cast(),
+                &raw mut length,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        (status == 0 && length == size_of::<i32>()).then_some(value)
+    }"#;
+
+#[derive(Clone, Copy, Debug)]
+struct ReviewedFile {
+    relative: &'static str,
+    sha256: [u8; 32],
+}
+
+const SIMD_KERNELS_REVIEWED_FILES: [ReviewedFile; 7] = [
+    ReviewedFile {
+        relative: "Cargo.toml",
+        sha256: [
+            0xcb, 0x4e, 0x04, 0xe2, 0x44, 0x62, 0x91, 0xd8, 0x98, 0x39, 0xac, 0xd3, 0xcf, 0x63,
+            0x48, 0x9f, 0xfc, 0x6c, 0x6c, 0x52, 0x02, 0xe5, 0x42, 0x53, 0xdb, 0x18, 0x44, 0x1e,
+            0xc0, 0x94, 0xff, 0x9f,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/lib.rs",
+        sha256: [
+            0x5e, 0xca, 0x2c, 0x25, 0xfe, 0xce, 0xf2, 0xf8, 0x29, 0x51, 0x61, 0x25, 0x3b, 0x93,
+            0x18, 0xc6, 0xdc, 0x12, 0x91, 0xc8, 0x59, 0x44, 0x86, 0xc3, 0x26, 0x14, 0xfc, 0xb4,
+            0xd9, 0x3e, 0x09, 0x29,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/scalar.rs",
+        sha256: [
+            0x11, 0x8c, 0xa7, 0xf7, 0x9c, 0x78, 0xd1, 0xcc, 0x5f, 0x68, 0xc6, 0x97, 0x0c, 0xa8,
+            0x70, 0x24, 0x9c, 0xdb, 0x93, 0x20, 0x06, 0x07, 0x19, 0x5b, 0x31, 0xf0, 0x82, 0x80,
+            0x7e, 0x57, 0xa4, 0x8f,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/aarch64.rs",
+        sha256: [
+            0xc5, 0xa7, 0xd1, 0x15, 0x3b, 0x1d, 0x7c, 0x23, 0xff, 0xe4, 0x06, 0x3c, 0xe9, 0x4b,
+            0x55, 0x14, 0x8a, 0xc0, 0x5d, 0xbf, 0x90, 0x34, 0x55, 0x53, 0xcc, 0x5f, 0x23, 0xf0,
+            0x98, 0xa8, 0x3c, 0xa9,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/aarch64_sve2.rs",
+        sha256: [
+            0x23, 0xbe, 0xf0, 0x1e, 0xe7, 0x4c, 0x3d, 0xca, 0xa2, 0x0d, 0xc4, 0xe6, 0x7c, 0xb9,
+            0x84, 0x2a, 0x81, 0xc3, 0x58, 0x78, 0x6f, 0x8d, 0x16, 0xb9, 0xab, 0x3e, 0x88, 0xd1,
+            0x3e, 0x91, 0x43, 0x1d,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/x86_64.rs",
+        sha256: [
+            0x01, 0x72, 0x72, 0x7a, 0x3c, 0xe7, 0x6b, 0xe5, 0xe7, 0x45, 0xb7, 0xcd, 0x5e, 0xfe,
+            0x8a, 0x32, 0xa1, 0x4c, 0xa0, 0x4f, 0x2e, 0x80, 0x4a, 0x92, 0x5c, 0x09, 0x43, 0xb3,
+            0xfb, 0x87, 0x28, 0x34,
+        ],
+    },
+    ReviewedFile {
+        relative: "src/tests.rs",
+        sha256: [
+            0x58, 0x7f, 0xc6, 0x99, 0x41, 0xf4, 0x19, 0xb1, 0x42, 0xc2, 0xce, 0xea, 0x43, 0x07,
+            0xb4, 0x4c, 0x0e, 0xc8, 0x54, 0xa1, 0x1a, 0x07, 0x19, 0x40, 0x90, 0x3d, 0xb6, 0xe7,
+            0x4e, 0x82, 0xe3, 0x5b,
+        ],
+    },
+];
 
 const KERNEL_LINTS: &str = r#"
 [lints.rust]
@@ -229,6 +373,25 @@ missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 "#;
 
+const TARGET_FEATURES_LINTS: &str = r#"
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+"#;
+
 #[derive(Debug, Deserialize)]
 struct Metadata {
     workspace_root: PathBuf,
@@ -259,7 +422,7 @@ struct LocalException {
     expected_lints: &'static str,
 }
 
-const LOCAL_EXCEPTIONS: [LocalException; 3] = [
+const LOCAL_EXCEPTIONS: [LocalException; 5] = [
     LocalException {
         package: "fre-capi",
         manifest: "crates/fre-capi/Cargo.toml",
@@ -274,6 +437,16 @@ const LOCAL_EXCEPTIONS: [LocalException; 3] = [
         package: EXACT_ALLOC_PACKAGE,
         manifest: "crates/fre-exact-alloc/Cargo.toml",
         expected_lints: EXACT_ALLOC_LINTS,
+    },
+    LocalException {
+        package: TARGET_FEATURES_PACKAGE,
+        manifest: "crates/fre-target-features/Cargo.toml",
+        expected_lints: TARGET_FEATURES_LINTS,
+    },
+    LocalException {
+        package: SIMD_KERNELS_PACKAGE,
+        manifest: "crates/fre-simd-kernels/Cargo.toml",
+        expected_lints: TARGET_FEATURES_LINTS,
     },
 ];
 
@@ -364,6 +537,8 @@ fn audit(metadata: &Metadata) -> Result<AuditSummary, String> {
     let protected_kernel_targets = audit_kernel_targets(kernel, &workspace_root)?;
     audit_kernel_sources(&workspace_root)?;
     audit_exact_allocator(&packages_by_name, &workspace_root)?;
+    audit_target_features(&packages_by_name, &workspace_root)?;
+    audit_simd_kernels(&packages_by_name, &workspace_root)?;
 
     Ok(AuditSummary {
         workspace_packages: members.len(),
@@ -683,6 +858,229 @@ fn audit_exact_allocator_source_text(source: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn audit_target_features(
+    packages: &BTreeMap<&str, &Package>,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let package = packages
+        .get(TARGET_FEATURES_PACKAGE)
+        .ok_or_else(|| format!("missing {TARGET_FEATURES_PACKAGE} workspace package"))?;
+    if package.dependencies.len() != 1
+        || package.dependencies[0]
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            != Some("libc")
+    {
+        return Err(format!(
+            "{TARGET_FEATURES_PACKAGE} must have only its audited macOS libc dependency"
+        ));
+    }
+
+    let package_root = canonical(
+        &workspace_root.join("crates/fre-target-features"),
+        "fre-target-features package root",
+    )?;
+    let expected_library = canonical(
+        &package_root.join("src/lib.rs"),
+        "fre-target-features library source",
+    )?;
+    let expected_example = canonical(
+        &package_root.join("examples/host_features.rs"),
+        "fre-target-features host evidence example",
+    )?;
+    let mut library_count = 0_usize;
+    let mut example_count = 0_usize;
+    for target in &package.targets {
+        let source = canonical(
+            &target.src_path,
+            &format!("source for fre-target-features target {}", target.name),
+        )?;
+        if target.name == TARGET_FEATURES_LIBRARY
+            && target.kind.as_slice() == ["lib"]
+            && source == expected_library
+        {
+            library_count = library_count
+                .checked_add(1)
+                .ok_or_else(|| "fre-target-features library count overflow".to_owned())?;
+        } else if target.name == "host_features"
+            && target.kind.as_slice() == ["example"]
+            && source == expected_example
+        {
+            example_count = example_count
+                .checked_add(1)
+                .ok_or_else(|| "fre-target-features example count overflow".to_owned())?;
+            require_attribute(&source, FORBID_ATTRIBUTE, true, &target.name)?;
+        } else {
+            return Err(format!(
+                "unexpected fre-target-features target {} kind {:?} source {}",
+                target.name,
+                target.kind,
+                target.src_path.display()
+            ));
+        }
+    }
+    if library_count != 1 || example_count != 1 || package.targets.len() != 2 {
+        return Err(format!(
+            "fre-target-features target inventory drifted: libraries={library_count} examples={example_count} total={}",
+            package.targets.len()
+        ));
+    }
+
+    let mut files = BTreeSet::new();
+    collect_regular_files(&package_root, &package_root, &mut files)?;
+    let expected_files = BTreeSet::from([
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("examples/host_features.rs"),
+        PathBuf::from("src/lib.rs"),
+    ]);
+    if files != expected_files {
+        return Err(format!(
+            "fre-target-features file inventory drifted: actual={files:?} expected={expected_files:?}"
+        ));
+    }
+
+    let source_bytes = fs::read(&expected_library)
+        .map_err(|error| format!("read target feature source: {error}"))?;
+    if Sha256::digest(&source_bytes)[..] != TARGET_FEATURES_SOURCE_SHA256 {
+        return Err("target feature complete source digest drifted".to_owned());
+    }
+    let source = std::str::from_utf8(&source_bytes)
+        .map_err(|error| format!("target feature source is not UTF-8: {error}"))?;
+    audit_target_feature_source_text(source)
+}
+
+fn audit_target_feature_source_text(source: &str) -> Result<(), String> {
+    if source.matches(DENY_ATTRIBUTE).count() != 1
+        || source
+            .lines()
+            .filter(|line| *line == DENY_ATTRIBUTE)
+            .count()
+            != 1
+    {
+        return Err(format!(
+            "target feature source must contain exactly one {DENY_ATTRIBUTE}"
+        ));
+    }
+    if source.matches("unsafe_code").count() != TARGET_FEATURES_UNSAFE_CODE_SPELLINGS {
+        return Err("target feature unsafe-lint lowering inventory drifted".to_owned());
+    }
+    for block in [
+        TARGET_FEATURES_X86_REVIEWED_BLOCK,
+        TARGET_FEATURES_MACOS_REVIEWED_BLOCK,
+    ] {
+        if source.matches(block).count() != 1 {
+            return Err("target feature reviewed unsafe site binding drifted".to_owned());
+        }
+    }
+    if source.matches("unsafe {").count() != 3 {
+        return Err("target feature unsafe block inventory drifted".to_owned());
+    }
+    for forbidden in [
+        "unsafe fn",
+        "unsafe impl",
+        "unsafe trait",
+        "unsafe extern",
+        "#[unsafe(",
+        "include!",
+        "include_bytes!",
+        "include_str!",
+        "#[path",
+        "proc_macro",
+        "env!",
+        "option_env!",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "target feature source contains forbidden unsafe or expansion path {forbidden:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn audit_simd_kernels(
+    packages: &BTreeMap<&str, &Package>,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let package = packages
+        .get(SIMD_KERNELS_PACKAGE)
+        .ok_or_else(|| format!("missing {SIMD_KERNELS_PACKAGE} workspace package"))?;
+    if package.dependencies.len() != 1
+        || package.dependencies[0]
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            != Some(TARGET_FEATURES_PACKAGE)
+    {
+        return Err(format!(
+            "{SIMD_KERNELS_PACKAGE} must depend only on {TARGET_FEATURES_PACKAGE}"
+        ));
+    }
+    if package.targets.len() != 1 {
+        return Err(format!(
+            "{SIMD_KERNELS_PACKAGE} must have exactly one target, observed {}",
+            package.targets.len()
+        ));
+    }
+
+    let package_root = canonical(
+        &workspace_root.join("crates/fre-simd-kernels"),
+        "fre-simd-kernels package root",
+    )?;
+    let expected_manifest = canonical(
+        &package_root.join("Cargo.toml"),
+        "fre-simd-kernels manifest",
+    )?;
+    if canonical(&package.manifest_path, "fre-simd-kernels package manifest")? != expected_manifest
+    {
+        return Err("fre-simd-kernels manifest path drifted".to_owned());
+    }
+    let expected_library = canonical(
+        &package_root.join("src/lib.rs"),
+        "fre-simd-kernels library source",
+    )?;
+    let target = &package.targets[0];
+    if target.name != SIMD_KERNELS_LIBRARY
+        || target.kind.as_slice() != ["lib"]
+        || canonical(&target.src_path, "fre-simd-kernels target source")? != expected_library
+    {
+        return Err(format!(
+            "unexpected fre-simd-kernels target {} kind {:?} source {}",
+            target.name,
+            target.kind,
+            target.src_path.display()
+        ));
+    }
+
+    let mut files = BTreeSet::new();
+    collect_regular_files(&package_root, &package_root, &mut files)?;
+    let expected_files: BTreeSet<_> = SIMD_KERNELS_REVIEWED_FILES
+        .iter()
+        .map(|reviewed| PathBuf::from(reviewed.relative))
+        .collect();
+    if files != expected_files {
+        return Err(format!(
+            "fre-simd-kernels file inventory drifted: actual={files:?} expected={expected_files:?}"
+        ));
+    }
+    for reviewed in SIMD_KERNELS_REVIEWED_FILES {
+        let path = package_root.join(reviewed.relative);
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read reviewed SIMD kernel {}: {error}", path.display()))?;
+        if Sha256::digest(&bytes)[..] != reviewed.sha256 {
+            return Err(format!(
+                "reviewed SIMD kernel digest drifted: {}",
+                reviewed.relative
+            ));
+        }
+    }
+    require_attribute(
+        &expected_library,
+        DENY_ATTRIBUTE,
+        false,
+        SIMD_KERNELS_LIBRARY,
+    )
+}
+
 fn collect_regular_files(
     root: &Path,
     directory: &Path,
@@ -754,9 +1152,10 @@ fn canonical(path: &Path, description: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::{
         DENY_ATTRIBUTE, EXACT_ALLOC_LINTS, EXACT_ALLOC_REVIEWED_BLOCKS, EXACT_VEC_REVIEWED_BLOCK,
-        Package, Target, WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
+        Package, TARGET_FEATURES_MACOS_REVIEWED_BLOCK, TARGET_FEATURES_X86_REVIEWED_BLOCK, Target,
+        WARN_UNSAFE_LINTS, ZEROED_EXACT_REVIEWED_BLOCK, audit_exact_allocator,
         audit_exact_allocator_source, audit_exact_allocator_source_text, audit_kernel_targets,
-        require_exact_lints,
+        audit_target_feature_source_text, require_exact_lints,
     };
     use std::{
         collections::BTreeMap,
@@ -850,6 +1249,10 @@ mod tests {
         include_str!("../../../crates/fre-exact-alloc/src/lib.rs")
     }
 
+    fn canonical_target_feature_source() -> &'static str {
+        include_str!("../../../crates/fre-target-features/src/lib.rs")
+    }
+
     fn assert_exact_source_rejected(source: &str) {
         assert!(audit_exact_allocator_source_text(source).is_err());
     }
@@ -933,6 +1336,31 @@ mod tests {
         );
         let error = audit_exact_allocator_source_text(&source).unwrap_err();
         assert!(error.contains("lowering inventory drifted"));
+    }
+
+    #[test]
+    fn canonical_target_feature_unsafe_inventory_is_accepted() {
+        assert_eq!(
+            audit_target_feature_source_text(canonical_target_feature_source()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn target_feature_unsafe_inventory_and_reviewed_sites_are_fail_closed() {
+        let canonical = canonical_target_feature_source();
+        for mutation in [
+            canonical.replace(
+                TARGET_FEATURES_X86_REVIEWED_BLOCK,
+                &TARGET_FEATURES_X86_REVIEWED_BLOCK.replace("__cpuid(1)", "__cpuid(2)"),
+            ),
+            canonical.replace(TARGET_FEATURES_MACOS_REVIEWED_BLOCK, ""),
+            format!(
+                "{canonical}\n#[allow(unsafe_code, reason = \"unreviewed\")]\nfn extra() {{ unsafe {{ core::hint::unreachable_unchecked() }} }}\n"
+            ),
+        ] {
+            assert!(audit_target_feature_source_text(&mutation).is_err());
+        }
     }
 
     #[test]

@@ -87,6 +87,32 @@ fn feature_tiers_have_independently_decoded_instruction_shapes() {
 }
 
 #[test]
+fn shared_capability_facts_map_to_existing_emitter_tiers() {
+    use fre_target_features::{Architecture as HostArchitecture, Feature, FeatureSet};
+
+    assert_eq!(
+        FeatureTier::for_usable_features(HostArchitecture::Other, FeatureSet::EMPTY),
+        FeatureTier::Scalar
+    );
+    assert_eq!(
+        FeatureTier::for_usable_features(
+            HostArchitecture::X86_64,
+            FeatureSet::of(Feature::X86Sse2)
+        ),
+        FeatureTier::Sse2
+    );
+    assert_eq!(
+        FeatureTier::for_usable_features(
+            HostArchitecture::X86_64,
+            FeatureSet::EMPTY
+                .with(Feature::X86Sse2)
+                .with(Feature::X86Avx2)
+        ),
+        FeatureTier::Avx2
+    );
+}
+
+#[test]
 fn short_class_confirmation_preserves_run_end_register() {
     let program = build_class_suffix::<Span>(
         ByteClass::from_bytes(b"abcde"),

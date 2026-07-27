@@ -1,27 +1,21 @@
 [package]
-name = "fre-kernels"
+name = "fre-target-features"
 version.workspace = true
-description = "Bounded operation-specific search kernels for FRE"
+description = "Runtime CPU capability facts and reusable kernel-variant selection for FRE"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
-[dependencies]
-aho-corasick = "=1.1.4"
-fre-exact-alloc = { path = "../fre-exact-alloc" }
-fre-simd-kernels = { path = "../fre-simd-kernels" }
-memchr = "=2.8.3"
-
-[dev-dependencies]
-regex = { version = "=1.12.4", features = ["logging", "perf-dfa-full"] }
-regex-automata = "=0.4.14"
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+libc = "=0.2.186"
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

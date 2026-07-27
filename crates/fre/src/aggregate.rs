@@ -90,14 +90,15 @@ use fre_kernels::{
     PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
-    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildAttemptActual,
-    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
-    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
-    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
-    SparseOrderedLiteralSpanSumPlan, TOKEN_PHRASE_COUNT_OPERATION_ID,
-    TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseBuildAccounting, TokenPhraseBuildError,
-    TokenPhraseBuildLimits, TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
+    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
+    SparseOrderedLiteralAggregateBuildAttemptActual, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
+    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
+    TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
     TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
@@ -172,7 +173,7 @@ pub use literal_anchor::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 37;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 38;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
@@ -7084,7 +7085,8 @@ impl AggregateBuilder {
     pub fn build_compile_attempt(
         self,
     ) -> Result<AggregateCompileRegex, AggregateConstructionAttemptError> {
-        self.build_transaction(AggregateOperation::Compile)
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_transaction(AggregateOperation::Compile, simd_dispatch)
             .map(AggregateCompileRegex)
     }
 
@@ -7098,7 +7100,8 @@ impl AggregateBuilder {
     pub fn build_spans_attempt(
         self,
     ) -> Result<AggregateSpansRegex, AggregateConstructionAttemptError> {
-        self.build_transaction(AggregateOperation::Spans)
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_transaction(AggregateOperation::Spans, simd_dispatch)
             .map(AggregateSpansRegex)
     }
 
@@ -7112,7 +7115,8 @@ impl AggregateBuilder {
     pub fn build_count_attempt(
         self,
     ) -> Result<AggregateCountRegex, AggregateConstructionAttemptError> {
-        self.build_transaction(AggregateOperation::Count)
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_transaction(AggregateOperation::Count, simd_dispatch)
             .map(AggregateCountRegex)
     }
 
@@ -7126,7 +7130,8 @@ impl AggregateBuilder {
     pub fn build_span_sum_attempt(
         self,
     ) -> Result<AggregateSpanSumRegex, AggregateConstructionAttemptError> {
-        self.build_transaction(AggregateOperation::SpanSum)
+        let simd_dispatch = SimdDispatchContext::capture();
+        self.build_transaction(AggregateOperation::SpanSum, simd_dispatch)
             .map(AggregateSpanSumRegex)
     }
 
@@ -7137,6 +7142,7 @@ impl AggregateBuilder {
     fn build_transaction(
         mut self,
         operation: AggregateOperation,
+        simd_dispatch: SimdDispatchContext,
     ) -> Result<AggregatePlan, AggregateConstructionAttemptError> {
         let selection = self.selection;
         let profile = CompatibilityProfile::RustBytes(self.profile.clone());
@@ -7325,6 +7331,7 @@ impl AggregateBuilder {
 
         let result = self.build_inner(
             operation,
+            simd_dispatch,
             syntax_key,
             admission_status,
             summary,
@@ -7454,12 +7461,14 @@ impl AggregateBuilder {
     }
 
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "construction keeps eligibility, no-fallback selection, and both auditable reports together"
+        reason = "construction keeps the pre-captured dispatch context, eligibility, no-fallback selection, and both auditable reports together"
     )]
     fn build_inner(
         self,
         operation: AggregateOperation,
+        simd_dispatch: SimdDispatchContext,
         syntax_key: Arc<CacheKey>,
         admission: AdmissionStatus,
         syntax: ParseSummary,
@@ -9584,7 +9593,8 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from literal/class-run/literal inspection",
                     });
                 }
-                let attempt = LiteralClassRunLiteralPlan::build_attempt(
+                let attempt = LiteralClassRunLiteralPlan::build_attempt_with_dispatch(
+                    simd_dispatch,
                     inspection.prefix,
                     inspection
                         .class

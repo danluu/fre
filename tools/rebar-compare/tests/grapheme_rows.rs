@@ -85,7 +85,7 @@ fn adapter_runner_and_typed_plan_identity_agree() {
             .count(),
         1,
     );
-    assert_eq!(runner.matches("aggregate-explain=37").count(), 1);
+    assert_eq!(runner.matches("aggregate-explain=38").count(), 1);
     assert!(!runner.contains("aggregate-explain=31"));
     assert_eq!(
         runner

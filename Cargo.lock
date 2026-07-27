@@ -220,6 +220,7 @@ name = "fre-jit-x86_64"
 version = "0.1.0"
 dependencies = [
  "fre-kernel-ir",
+ "fre-target-features",
 ]
 
 [[package]]
@@ -238,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
+ "fre-simd-kernels",
  "memchr",
  "regex",
  "regex-automata",
@@ -270,12 +272,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fre-simd-kernels"
+version = "0.1.0"
+dependencies = [
+ "fre-target-features",
+]
+
+[[package]]
 name = "fre-syntax"
 version = "0.1.0"
 dependencies = [
  "fre-re2-syntax",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fre-target-features"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -13,8 +13,13 @@
 //! For haystack width `N`, anchor width `A`, at most
 //! `Q = max(0, N-A+1)` overlapping anchor starts exist. Restarting one byte
 //! after a rejection makes finder service at most `N + Q*(A-1)`. Adjacent
-//! class probes plus all disjoint maximal runs cost at most `N+Q` reads, and
-//! only the opposite literal is compared for at most `ceil(N/2)` run events.
+//! class probes plus all disjoint maximal runs cost at most `N+Q` logical
+//! classifications. Plans built with a caller-captured SIMD context retain one
+//! compiled ASCII classifier. After a 32-byte scalar proof prefix, full
+//! interior blocks use its construction-selected leaf; a terminating vector
+//! load can inspect at most 31 bytes beyond the logical run, so physical
+//! classifications remain prospectively bounded. Only the opposite literal is
+//! compared for at most `ceil(N/2)` run events.
 //! These bounds, every finder call/candidate, results, persistent owner bytes,
 //! and zero operation scratch are admitted before source access and checked
 //! against cumulative actual counters after execution.
@@ -27,6 +32,9 @@
 use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
+use fre_simd_kernels::{
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+};
 use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
@@ -49,6 +57,19 @@ const CLASSIFICATION_WORK: usize = 2;
 const LITERAL_COMPARISON_WORK: usize = 2;
 const RUN_WORK: usize = 12;
 const MATCH_WORK: usize = 8;
+// Building the reusable byte-set lookup charges its 128 nibble-column
+// membership probes, two narrow/wide selections, and two installed receipts.
+// This stays independent of how many target variants the dispatcher knows.
+const SIMD_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
+const SIMD_SCALAR_PROOF_BYTES: usize = ASCII_WIDE_BYTES;
+
+/// Stable identity of the compiled class-scan implementations in one plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClassScanIdentity {
+    pub narrow_variant_id: &'static str,
+    pub wide_variant_id: &'static str,
+    pub wide_delegate_variant_id: Option<&'static str>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -57,6 +78,7 @@ pub struct OperationIdentity {
     pub prefix_bytes: usize,
     pub suffix_bytes: usize,
     pub class_words: [u64; 4],
+    pub class_scan: Option<ClassScanIdentity>,
     pub unicode: bool,
     pub greedy: bool,
     pub non_overlapping: bool,
@@ -373,6 +395,14 @@ impl ByteClass {
         let bit = u32::from(byte) & 63;
         self.0[word] & (1_u64 << bit) != 0
     }
+
+    const fn is_ascii(self) -> bool {
+        self.0[2] == 0 && self.0[3] == 0
+    }
+
+    const fn ascii_set(self) -> AsciiByteSet {
+        AsciiByteSet::from_words([self.0[0], self.0[1]])
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,6 +417,7 @@ pub struct LiteralClassRunLiteralPlan {
     opposite_literal: Box<[u8]>,
     anchor_kind: Anchor,
     class: ByteClass,
+    ascii_classifier: Option<AsciiByteSetClassifier>,
     build: BuildAccounting,
 }
 
@@ -405,12 +436,61 @@ impl LiteralClassRunLiteralPlan {
             .map_err(DirectBuildAttemptError::into_source)
     }
 
+    /// Build a plan whose eligible ASCII class scan uses one immutable host
+    /// capability snapshot captured before this accounted transaction.
+    pub fn build_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_with_dispatch(dispatch, prefix, ranges, suffix, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
     /// Build while retaining exact successful or partial terminal effects.
     #[allow(
         clippy::too_many_lines,
         reason = "construction keeps admission, exact allocation, finder publication, and the terminal receipt in one auditable transaction"
     )]
     pub fn build_attempt<I>(
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(None, prefix, ranges, suffix, limits)
+    }
+
+    /// Build with a pre-captured dispatch context while retaining exact
+    /// successful or partial terminal effects.
+    pub fn build_attempt_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(Some(dispatch), prefix, ranges, suffix, limits)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "construction keeps admission, exact allocation, optional classifier compilation, finder publication, and the terminal receipt in one auditable transaction"
+    )]
+    fn build_attempt_inner<I>(
+        dispatch: Option<SimdDispatchContext>,
         prefix: &[u8],
         mut ranges: I,
         suffix: &[u8],
@@ -486,6 +566,16 @@ impl LiteralClassRunLiteralPlan {
             if class.contains(*suffix.first().ok_or(BuildError::EmptySuffix)?) {
                 return Err(BuildError::SuffixBoundaryInClass);
             }
+            let ascii_classifier = if let Some(dispatch) = dispatch.filter(|_| class.is_ascii()) {
+                work.charge(SIMD_CLASSIFIER_BUILD_WORK)?;
+                Some(
+                    dispatch
+                        .ascii_byte_set_classifier(class.ascii_set(), DispatchPolicy::Auto)
+                        .expect("automatic dispatch always retains a scalar fallback"),
+                )
+            } else {
+                None
+            };
             let work_upper_bound = work.used;
 
             let prefix = copy_literal(prefix, "prefix")?;
@@ -517,6 +607,7 @@ impl LiteralClassRunLiteralPlan {
                 opposite_literal,
                 anchor_kind,
                 class,
+                ascii_classifier,
                 build: BuildAccounting {
                     prefix_bytes,
                     suffix_bytes,
@@ -561,6 +652,19 @@ impl LiteralClassRunLiteralPlan {
             prefix_bytes: self.build.prefix_bytes,
             suffix_bytes: self.build.suffix_bytes,
             class_words: self.class.0,
+            class_scan: match self.ascii_classifier {
+                Some(classifier) => {
+                    let selection = classifier.selection();
+                    let narrow = selection.narrow();
+                    let wide = selection.wide();
+                    Some(ClassScanIdentity {
+                        narrow_variant_id: narrow.variant_id,
+                        wide_variant_id: wide.variant_id,
+                        wide_delegate_variant_id: wide.delegate_variant_id,
+                    })
+                }
+                None => None,
+            },
             unicode: false,
             greedy: true,
             non_overlapping: true,
@@ -654,12 +758,28 @@ impl LiteralClassRunLiteralPlan {
             },
         )?;
         let run_events = input_bytes / 2 + input_bytes % 2;
-        let classifications =
+        let logical_classifications =
             input_bytes
                 .checked_add(anchor_candidates)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "class run plus adjacent class probes",
                 })?;
+        // A scan must first consume 32 logical class members before it can
+        // issue a vector load. Therefore no more than
+        // `logical_classifications / 32` scans can reach the SIMD loop. Each
+        // such scan has at most one terminating vector whose unused suffix is
+        // at most 31 lanes; all complete vectors are logical run bytes.
+        let classifications = if self.ascii_classifier.is_some() {
+            logical_classifications
+                .checked_div(SIMD_SCALAR_PROOF_BYTES)
+                .and_then(|terminating_vectors| terminating_vectors.checked_mul(31))
+                .and_then(|overread| logical_classifications.checked_add(overread))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "SIMD class-run physical classification bound",
+                })?
+        } else {
+            logical_classifications
+        };
         let literal_comparisons = run_events.checked_mul(opposite_literal_bytes).ok_or(
             ReduceError::ArithmeticOverflow {
                 computation: "run events times opposite literal bytes",
@@ -897,7 +1017,13 @@ impl LiteralClassRunLiteralPlan {
         restart: usize,
         actual: &mut ReduceActualCounters,
     ) -> Result<Option<(usize, usize)>, ReduceError> {
-        let Some(run_end) = scan_class_run_forward(haystack, self.class, anchor_end, actual)?
+        let Some(run_end) = scan_class_run_forward(
+            haystack,
+            self.class,
+            self.ascii_classifier.as_ref(),
+            anchor_end,
+            actual,
+        )?
         else {
             return Ok(None);
         };
@@ -927,7 +1053,13 @@ impl LiteralClassRunLiteralPlan {
         restart: usize,
         actual: &mut ReduceActualCounters,
     ) -> Result<Option<(usize, usize)>, ReduceError> {
-        let Some(run_start) = scan_class_run_backward(haystack, self.class, anchor_start, actual)?
+        let Some(run_start) = scan_class_run_backward(
+            haystack,
+            self.class,
+            self.ascii_classifier.as_ref(),
+            anchor_start,
+            actual,
+        )?
         else {
             return Ok(None);
         };
@@ -1013,10 +1145,48 @@ where
 fn scan_class_run_forward(
     haystack: &[u8],
     class: ByteClass,
+    classifier: Option<&AsciiByteSetClassifier>,
     start: usize,
     actual: &mut ReduceActualCounters,
 ) -> Result<Option<usize>, ReduceError> {
+    let Some(classifier) = classifier else {
+        return scan_class_run_forward_scalar(haystack, class, start, actual);
+    };
     let mut end = start;
+    for _ in 0..SIMD_SCALAR_PROOF_BYTES {
+        if end == haystack.len() {
+            return Ok((end != start).then_some(end));
+        }
+        let byte = read_classified(haystack, end, actual)?;
+        if !class.contains(byte) {
+            return Ok((end != start).then_some(end));
+        }
+        end = end.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+            computation: "forward class run scalar proof advance",
+        })?;
+    }
+    while haystack.len().saturating_sub(end) >= ASCII_WIDE_BYTES {
+        let members = read_classified_block(haystack, end, classifier, actual)?;
+        if members == u32::MAX {
+            end = end
+                .checked_add(ASCII_WIDE_BYTES)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "forward class run SIMD advance",
+                })?;
+            continue;
+        }
+        let prefix = usize::try_from(members.trailing_ones()).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "forward SIMD member prefix",
+            }
+        })?;
+        end = end
+            .checked_add(prefix)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "forward class run terminating SIMD prefix",
+            })?;
+        return Ok(Some(end));
+    }
     while end < haystack.len() {
         let byte = read_classified(haystack, end, actual)?;
         if !class.contains(byte) {
@@ -1032,7 +1202,91 @@ fn scan_class_run_forward(
     Ok(Some(end))
 }
 
+fn scan_class_run_forward_scalar(
+    haystack: &[u8],
+    class: ByteClass,
+    start: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let mut end = start;
+    while end < haystack.len() {
+        let byte = read_classified(haystack, end, actual)?;
+        if !class.contains(byte) {
+            break;
+        }
+        end = end.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+            computation: "forward scalar class run cursor advance",
+        })?;
+    }
+    Ok((end != start).then_some(end))
+}
+
 fn scan_class_run_backward(
+    haystack: &[u8],
+    class: ByteClass,
+    classifier: Option<&AsciiByteSetClassifier>,
+    end: usize,
+    actual: &mut ReduceActualCounters,
+) -> Result<Option<usize>, ReduceError> {
+    let Some(classifier) = classifier else {
+        return scan_class_run_backward_scalar(haystack, class, end, actual);
+    };
+    let mut start = end;
+    for _ in 0..SIMD_SCALAR_PROOF_BYTES {
+        if start == 0 {
+            return Ok((start != end).then_some(start));
+        }
+        let previous = start
+            .checked_sub(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "backward class run scalar proof position",
+            })?;
+        let byte = read_classified(haystack, previous, actual)?;
+        if !class.contains(byte) {
+            return Ok((start != end).then_some(start));
+        }
+        start = previous;
+    }
+    while start >= ASCII_WIDE_BYTES {
+        let block_start =
+            start
+                .checked_sub(ASCII_WIDE_BYTES)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "backward class run SIMD block start",
+                })?;
+        let members = read_classified_block(haystack, block_start, classifier, actual)?;
+        if members == u32::MAX {
+            start = block_start;
+            continue;
+        }
+        let suffix = usize::try_from(members.leading_ones()).map_err(|_| {
+            ReduceError::ArithmeticOverflow {
+                computation: "backward SIMD member suffix",
+            }
+        })?;
+        start = start
+            .checked_sub(suffix)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "backward class run terminating SIMD suffix",
+            })?;
+        return Ok(Some(start));
+    }
+    while start > 0 {
+        let previous = start
+            .checked_sub(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "backward class run scalar tail position",
+            })?;
+        let byte = read_classified(haystack, previous, actual)?;
+        if !class.contains(byte) {
+            break;
+        }
+        start = previous;
+    }
+    Ok(Some(start))
+}
+
+fn scan_class_run_backward_scalar(
     haystack: &[u8],
     class: ByteClass,
     end: usize,
@@ -1043,7 +1297,7 @@ fn scan_class_run_backward(
         let previous = start
             .checked_sub(1)
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "backward class run previous position",
+                computation: "backward scalar class run previous position",
             })?;
         let byte = read_classified(haystack, previous, actual)?;
         if !class.contains(byte) {
@@ -1051,10 +1305,31 @@ fn scan_class_run_backward(
         }
         start = previous;
     }
-    if start == end {
-        return Ok(None);
-    }
-    Ok(Some(start))
+    Ok((start != end).then_some(start))
+}
+
+fn read_classified_block(
+    haystack: &[u8],
+    start: usize,
+    classifier: &AsciiByteSetClassifier,
+    actual: &mut ReduceActualCounters,
+) -> Result<u32, ReduceError> {
+    let end = start
+        .checked_add(ASCII_WIDE_BYTES)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "classified SIMD block end",
+        })?;
+    let block: &[u8; ASCII_WIDE_BYTES] = haystack
+        .get(start..end)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "classified SIMD block source",
+        })?
+        .try_into()
+        .map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "classified SIMD block width",
+        })?;
+    charge_classifications(actual, ASCII_WIDE_BYTES)?;
+    Ok(classifier.classify_32(block).member_mask())
 }
 
 fn charge_finder_scan(actual: &mut ReduceActualCounters, bytes: usize) -> Result<(), ReduceError> {
@@ -1082,9 +1357,22 @@ fn read_classified(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "classified source position",
         })?;
-    actual.classifications = checked_add(actual.classifications, 1, "actual classifications")?;
-    actual.work = checked_add(actual.work, CLASSIFICATION_WORK, "classification work")?;
+    charge_classifications(actual, 1)?;
     Ok(byte)
+}
+
+fn charge_classifications(
+    actual: &mut ReduceActualCounters,
+    amount: usize,
+) -> Result<(), ReduceError> {
+    actual.classifications = checked_add(actual.classifications, amount, "actual classifications")?;
+    let work = amount
+        .checked_mul(CLASSIFICATION_WORK)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "classification work",
+        })?;
+    actual.work = checked_add(actual.work, work, "classification work")?;
+    Ok(())
 }
 
 fn literal_equals(
@@ -1594,6 +1882,389 @@ mod tests {
             );
         }
         assert_exhaustive_matches(&plan, r"ax+aaaa", b"axy", 9);
+    }
+
+    #[test]
+    fn dispatched_forward_scan_matches_scalar_and_accounts_terminating_vector() {
+        let scalar = LiteralClassRunLiteralPlan::build(
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = LiteralClassRunLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(scalar.anchor_kind, Anchor::Prefix);
+        assert_eq!(dispatched.anchor_kind, Anchor::Prefix);
+        assert!(scalar.count_identity().class_scan.is_none());
+        assert!(dispatched.count_identity().class_scan.is_some());
+
+        let mut haystack = vec![b'A'];
+        haystack.extend(core::iter::repeat_n(b'x', 1_000));
+        haystack.push(b'Z');
+        haystack.extend(core::iter::repeat_n(b'q', 40));
+        let scalar = scalar.count(&haystack, ReduceLimits::unlimited()).unwrap();
+        let dispatched = dispatched
+            .count(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(dispatched.count, scalar.count);
+        assert_eq!(dispatched.count, 1);
+        assert_eq!(scalar.accounting.actual.classifications, 1_001);
+        assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+        assert!(
+            dispatched.accounting.actual.classifications
+                <= dispatched.accounting.upper_bounds.classifications
+        );
+        assert!(
+            dispatched.accounting.actual.source_reads
+                <= dispatched.accounting.upper_bounds.source_reads
+        );
+        assert!(dispatched.accounting.actual.work <= dispatched.accounting.upper_bounds.work);
+    }
+
+    #[test]
+    fn dispatched_backward_scan_matches_scalar_and_accounts_terminating_vector() {
+        let scalar = LiteralClassRunLiteralPlan::build(
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = LiteralClassRunLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(scalar.anchor_kind, Anchor::Suffix);
+        assert_eq!(dispatched.anchor_kind, Anchor::Suffix);
+
+        let mut haystack = vec![b'q'; 31];
+        haystack.push(b'A');
+        haystack.extend(core::iter::repeat_n(b'x', 1_000));
+        haystack.extend_from_slice(b"ZZ");
+        let scalar = scalar
+            .span_sum(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        let dispatched = dispatched
+            .span_sum(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(dispatched.span_sum, scalar.span_sum);
+        assert_eq!(dispatched.span_sum, 1_003);
+        assert_eq!(scalar.accounting.actual.classifications, 1_001);
+        assert_eq!(dispatched.accounting.actual.classifications, 1_024);
+        assert!(
+            dispatched.accounting.actual.classifications
+                <= dispatched.accounting.upper_bounds.classifications
+        );
+        assert!(
+            dispatched.accounting.actual.source_reads
+                <= dispatched.accounting.upper_bounds.source_reads
+        );
+        assert!(dispatched.accounting.actual.work <= dispatched.accounting.upper_bounds.work);
+    }
+
+    #[test]
+    fn dispatched_vector_boundaries_match_scalar_in_both_directions() {
+        const RANGES: [(u8, u8); 3] = [(b'0', b'9'), (b'_', b'_'), (b'a', b'f')];
+        const MEMBERS: [u8; 5] = [b'0', b'9', b'_', b'a', b'f'];
+
+        let dispatch = SimdDispatchContext::capture();
+        let scalar_forward = LiteralClassRunLiteralPlan::build(
+            b"P",
+            RANGES.into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_forward = LiteralClassRunLiteralPlan::build_with_dispatch(
+            dispatch,
+            b"P",
+            RANGES.into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let scalar_backward = LiteralClassRunLiteralPlan::build(
+            b"P",
+            RANGES.into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_backward = LiteralClassRunLiteralPlan::build_with_dispatch(
+            dispatch,
+            b"P",
+            RANGES.into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+
+        for run_bytes in 0..=100 {
+            let run: Vec<u8> = (0..run_bytes)
+                .map(|index| MEMBERS[index % MEMBERS.len()])
+                .collect();
+
+            let mut forward = vec![b'P'];
+            forward.extend_from_slice(&run);
+            forward.push(b'Z');
+            // Keep a complete vector readable after the terminating suffix so
+            // run lengths 32..=63 and 64..=95 terminate at every SIMD lane.
+            forward.extend(core::iter::repeat_n(b'!', ASCII_WIDE_BYTES));
+            let scalar = scalar_forward
+                .count(&forward, ReduceLimits::unlimited())
+                .unwrap();
+            let dispatched = dispatched_forward
+                .count(&forward, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                dispatched.count, scalar.count,
+                "forward run length {run_bytes}"
+            );
+            assert!(
+                dispatched.accounting.actual.classifications
+                    <= dispatched.accounting.upper_bounds.classifications
+            );
+            assert!(
+                dispatched.accounting.actual.source_reads
+                    <= dispatched.accounting.upper_bounds.source_reads
+            );
+            assert!(dispatched.accounting.actual.work <= dispatched.accounting.upper_bounds.work);
+
+            let mut backward = vec![b'!'; ASCII_WIDE_BYTES];
+            backward.push(b'P');
+            backward.extend_from_slice(&run);
+            backward.extend_from_slice(b"ZZ");
+            let scalar = scalar_backward
+                .span_sum(&backward, ReduceLimits::unlimited())
+                .unwrap();
+            let dispatched = dispatched_backward
+                .span_sum(&backward, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                dispatched.span_sum, scalar.span_sum,
+                "backward run length {run_bytes}"
+            );
+            assert!(
+                dispatched.accounting.actual.classifications
+                    <= dispatched.accounting.upper_bounds.classifications
+            );
+            assert!(
+                dispatched.accounting.actual.source_reads
+                    <= dispatched.accounting.upper_bounds.source_reads
+            );
+            assert!(dispatched.accounting.actual.work <= dispatched.accounting.upper_bounds.work);
+        }
+    }
+
+    #[test]
+    fn dispatched_build_keeps_non_ascii_classes_on_exact_scalar_path() {
+        let plan = LiteralClassRunLiteralPlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            b"A",
+            [(0x80, 0x80)].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(plan.count_identity().class_scan.is_none());
+        assert_eq!(
+            plan.count(b"A\x80\x80Z", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode paired scalar/SIMD no-regression measurement"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ignored qualification keeps forward, backward, short-run, and build measurements under one identical paired timing harness"
+    )]
+    fn measure_dispatched_class_run_scans_against_scalar() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        fn measure(
+            name: &str,
+            batches: u32,
+            calls_per_batch: u32,
+            mut scalar: impl FnMut() -> u64,
+            mut dispatched: impl FnMut() -> u64,
+        ) {
+            let mut scalar_elapsed = Duration::ZERO;
+            let mut dispatched_elapsed = Duration::ZERO;
+            let mut scalar_checksum = 0_u64;
+            let mut dispatched_checksum = 0_u64;
+            for batch in 0..batches {
+                let mut time_scalar = || {
+                    let start = Instant::now();
+                    for _ in 0..calls_per_batch {
+                        scalar_checksum =
+                            scalar_checksum.wrapping_add(black_box(scalar()).wrapping_add(1));
+                    }
+                    scalar_elapsed += start.elapsed();
+                };
+                let mut time_dispatched = || {
+                    let start = Instant::now();
+                    for _ in 0..calls_per_batch {
+                        dispatched_checksum = dispatched_checksum
+                            .wrapping_add(black_box(dispatched()).wrapping_add(1));
+                    }
+                    dispatched_elapsed += start.elapsed();
+                };
+                if batch & 1 == 0 {
+                    time_scalar();
+                    time_dispatched();
+                } else {
+                    time_dispatched();
+                    time_scalar();
+                }
+            }
+            assert_eq!(scalar_checksum, dispatched_checksum);
+            eprintln!(
+                "{name}: scalar_ns={} dispatched_ns={} dispatched_over_scalar={:.4}",
+                scalar_elapsed.as_nanos(),
+                dispatched_elapsed.as_nanos(),
+                dispatched_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64()
+            );
+        }
+
+        let dispatch = SimdDispatchContext::capture();
+        let scalar_forward = LiteralClassRunLiteralPlan::build(
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_forward = LiteralClassRunLiteralPlan::build_with_dispatch(
+            dispatch,
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"Z",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut forward_long = vec![b'A'];
+        forward_long.extend(core::iter::repeat_n(b'x', (256 << 10) - 2));
+        forward_long.push(b'Z');
+        measure(
+            "forward-long",
+            16,
+            4,
+            || {
+                scalar_forward
+                    .count(black_box(&forward_long), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+            || {
+                dispatched_forward
+                    .count(black_box(&forward_long), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+        );
+
+        let scalar_backward = LiteralClassRunLiteralPlan::build(
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_backward = LiteralClassRunLiteralPlan::build_with_dispatch(
+            dispatch,
+            b"A",
+            [(b'x', b'x')].into_iter(),
+            b"ZZ",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut backward_long = vec![b'A'];
+        backward_long.extend(core::iter::repeat_n(b'x', (256 << 10) - 3));
+        backward_long.extend_from_slice(b"ZZ");
+        measure(
+            "backward-long",
+            16,
+            4,
+            || {
+                scalar_backward
+                    .count(black_box(&backward_long), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+            || {
+                dispatched_backward
+                    .count(black_box(&backward_long), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+        );
+
+        let short_runs = b"AxZ!AxxZ!AxxxZ!AxxxxZ!".repeat(2_048);
+        measure(
+            "forward-short-runs",
+            32,
+            8,
+            || {
+                scalar_forward
+                    .count(black_box(&short_runs), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+            || {
+                dispatched_forward
+                    .count(black_box(&short_runs), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count
+            },
+        );
+        measure(
+            "ascii-plan-build",
+            16,
+            256,
+            || {
+                LiteralClassRunLiteralPlan::build(
+                    black_box(b"A"),
+                    [(b'x', b'x')].into_iter(),
+                    black_box(b"Z"),
+                    BuildLimits::unlimited(),
+                )
+                .unwrap()
+                .build_accounting()
+                .literal_bytes
+                .try_into()
+                .unwrap()
+            },
+            || {
+                LiteralClassRunLiteralPlan::build_with_dispatch(
+                    dispatch,
+                    black_box(b"A"),
+                    [(b'x', b'x')].into_iter(),
+                    black_box(b"Z"),
+                    BuildLimits::unlimited(),
+                )
+                .unwrap()
+                .build_accounting()
+                .literal_bytes
+                .try_into()
+                .unwrap()
+            },
+        );
     }
 
     #[test]

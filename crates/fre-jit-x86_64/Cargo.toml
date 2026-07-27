@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+fre-target-features = { path = "../fre-target-features" }
 
 [lints]
 workspace = true

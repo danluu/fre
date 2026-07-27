@@ -34,6 +34,12 @@ an open P0 row.
 - [x] `fre-kernels`: bounded exact-literal and ordered finite-literal plans over
   pinned native/SIMD-aware primitives, with forced small differentials and
   separate build/search accounting.
+- [x] `fre-simd-kernels`: exact 16/32-byte runtime-dispatched byte-set
+  classification now includes an independently forceable AVX-512F/BW/VL YMM
+  leaf, exact receipts and fallback-lattice tests. Generic dispatch retains
+  AVX2 preference pending the mandatory provider-neutral native qualification
+  described in
+  [`SIMD_X86_AVX512_QUALIFICATION.md`](SIMD_X86_AVX512_QUALIFICATION.md).
 - [x] Proof-restricted required-literal production plan: exact HIR extraction,
   distinct cache/accounting identity, no search fallback, 590,220 forced
   operation comparisons and retained positive/negative release evidence.

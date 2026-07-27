@@ -2151,7 +2151,21 @@ mod tests {
         assert_eq!(core::mem::size_of::<super::ReduceActualCounters>(), 48);
         assert_eq!(core::mem::size_of::<super::ReduceAccounting>(), 216);
         assert_eq!(core::mem::size_of::<super::CountResult>(), 224);
-        assert_eq!(core::mem::size_of::<BoundedContextPlan>(), 352);
+        // `Finder` deliberately has target-specific SIMD state and alignment
+        // (144 bytes on AArch64; 288 bytes aligned to 32 on x86-64 in the
+        // locked memchr release). Keep the FRE-owned part exact, account for
+        // the dependency's trailing alignment, and enforce the largest
+        // supported frame.
+        let finder_bytes = core::mem::size_of::<memchr::memmem::Finder<'static>>();
+        let finder_align = core::mem::align_of::<memchr::memmem::Finder<'static>>();
+        let plan_bytes = core::mem::size_of::<BoundedContextPlan>();
+        let plan_align = core::mem::align_of::<BoundedContextPlan>();
+        assert_eq!(plan_align, finder_align);
+        assert_eq!(
+            plan_bytes,
+            (finder_bytes + 208).next_multiple_of(plan_align)
+        );
+        assert!(plan_bytes <= 512);
 
         assert_eq!(core::mem::size_of::<SpanSumLimits>(), 48);
         assert_eq!(core::mem::size_of::<super::SpanSumUpperBounds>(), 112);

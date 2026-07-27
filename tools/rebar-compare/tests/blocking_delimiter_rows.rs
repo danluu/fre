@@ -83,7 +83,7 @@ fn exact_sherlock_quotes_row_uses_blocking_delimiter() {
         regex.build_report().plan,
         AggregatePlanKind::BlockingDelimiter
     );
-    assert_eq!(regex.build_report().schema_version, 37);
+    assert_eq!(regex.build_report().schema_version, 38);
     assert!(matches!(
         regex.build_report().plan_identity,
         AggregatePlanIdentity::BlockingDelimiter(_)

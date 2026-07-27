@@ -12,6 +12,8 @@ use core::fmt;
 use fre_exact_alloc::CopyError;
 use memchr::memmem::{Finder, FinderBuilder};
 
+pub use fre_simd_kernels::SimdDispatchContext;
+
 mod anchored_line_capture;
 mod blocking_delimiter;
 mod bounded_class_sequence;
@@ -323,6 +325,7 @@ pub use literal_class_run_literal::{
     BuildError as LiteralClassRunLiteralBuildError,
     BuildLimits as LiteralClassRunLiteralBuildLimits,
     COUNT_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
+    ClassScanIdentity as LiteralClassRunLiteralClassScanIdentity,
     CountResult as LiteralClassRunLiteralCountResult, LiteralClassRunLiteralPlan,
     OperationIdentity as LiteralClassRunLiteralOperationIdentity,
     PLAN_ID as LITERAL_CLASS_RUN_LITERAL_PLAN_ID,

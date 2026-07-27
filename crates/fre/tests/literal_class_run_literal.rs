@@ -50,6 +50,10 @@ fn exact_sherlock_rows_select_one_operation_typed_leaf() {
     };
     assert_eq!(count_identity.kernel.prefix_bytes, b"Sherlock".len());
     assert_eq!(count_identity.kernel.suffix_bytes, b"Holmes".len());
+    assert!(
+        count_identity.kernel.class_scan.is_some(),
+        "the production aggregate route must retain its construction-selected SIMD classifier"
+    );
     assert_eq!(
         count
             .count_value(haystack, AggregateRunLimits::default())
@@ -70,6 +74,10 @@ fn exact_sherlock_rows_select_one_operation_typed_leaf() {
     assert_ne!(
         count_identity.kernel.operation_id,
         sum_identity.kernel.operation_id
+    );
+    assert_eq!(
+        count_identity.kernel.class_scan,
+        sum_identity.kernel.class_scan
     );
     assert_eq!(
         sum.span_sum_value(haystack, AggregateRunLimits::default())

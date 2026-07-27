@@ -51,7 +51,7 @@ impl TargetStamp {
     }
 }
 
-/// Maximum x86 feature tier selected at compile time.
+/// Maximum x86 feature tier requested from the deterministic emitter.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum FeatureTier {
@@ -64,6 +64,29 @@ pub enum FeatureTier {
 }
 
 impl FeatureTier {
+    /// Map externally supplied OS-usable capability facts to an existing
+    /// emitter tier.
+    ///
+    /// This backend remains host-independent. A native publisher may call this
+    /// pure adapter with FRE's shared capability snapshot, while cross/AOT
+    /// producers continue to choose a target explicitly.
+    #[must_use]
+    pub const fn for_usable_features(
+        architecture: fre_target_features::Architecture,
+        features: fre_target_features::FeatureSet,
+    ) -> Self {
+        if !matches!(architecture, fre_target_features::Architecture::X86_64) {
+            return Self::Scalar;
+        }
+        if features.contains(fre_target_features::Feature::X86Avx2) {
+            Self::Avx2
+        } else if features.contains(fre_target_features::Feature::X86Sse2) {
+            Self::Sse2
+        } else {
+            Self::Scalar
+        }
+    }
+
     #[must_use]
     pub(crate) const fn vector_width(self) -> usize {
         match self {
