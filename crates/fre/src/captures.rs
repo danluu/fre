@@ -29,13 +29,15 @@ use fre_capture_lab::{
     SearchOutcome as EngineSearchOutcome, Span as EngineSpan, Window,
 };
 use fre_kernels::{
-    LiteralSetError, PrefixClassAlternationBuildError, PrefixClassAlternationPlan,
-    PrefixClassUniformParticipationAccounting, PrefixClassUniformParticipationAttemptError,
+    DispatchedPrefixClassAlternationPlan, LiteralSetError, PrefixClassAlternationBuildError,
+    PrefixClassAlternationPlan, PrefixClassUniformParticipationAccounting,
+    PrefixClassUniformParticipationAttempt, PrefixClassUniformParticipationAttemptError,
     PrefixClassUniformParticipationAttemptReceipt, PrefixClassUniformParticipationBuildAccounting,
     PrefixClassUniformParticipationBuildError, PrefixClassUniformParticipationBuildLimits,
     PrefixClassUniformParticipationError, PrefixClassUniformParticipationIdentity,
     PrefixClassUniformParticipationInvocation, PrefixClassUniformParticipationLimits,
     PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationSchema,
+    SimdDispatchContext,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
@@ -1626,9 +1628,104 @@ fn optional_required_literal_refusal(error: &CaptureRequiredLiteralBuildError) -
 
 #[derive(Debug)]
 struct CapturePrefixClassParticipationPlan {
-    engine: PrefixClassAlternationPlan,
+    engine: CapturePrefixClassParticipationEngine,
     schema: PrefixClassUniformParticipationSchema,
     participating_capture_indices: [u32; 2],
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "both direct owners remain allocation-free and retain their separately accounted inline kernel artifacts"
+)]
+enum CapturePrefixClassParticipationEngine {
+    Established(PrefixClassAlternationPlan),
+    Dispatched(DispatchedPrefixClassAlternationPlan),
+}
+
+impl CapturePrefixClassParticipationEngine {
+    fn uniform_participation_build_accounting(
+        &self,
+    ) -> PrefixClassUniformParticipationBuildAccounting {
+        match self {
+            Self::Established(engine) => engine.uniform_participation_build_accounting(),
+            Self::Dispatched(engine) => engine.uniform_participation_build_accounting(),
+        }
+    }
+
+    const fn uniform_participation_identity(
+        &self,
+        schema: PrefixClassUniformParticipationSchema,
+    ) -> PrefixClassUniformParticipationIdentity {
+        match self {
+            Self::Established(engine) => engine.uniform_participation_identity(schema),
+            Self::Dispatched(engine) => engine.uniform_participation_identity(schema),
+        }
+    }
+
+    fn uniform_participation_attempt_receipt(
+        &self,
+        haystack_bytes: usize,
+        schema: PrefixClassUniformParticipationSchema,
+        limits: PrefixClassUniformParticipationLimits,
+    ) -> PrefixClassUniformParticipationAttemptReceipt {
+        match self {
+            Self::Established(engine) => {
+                engine.uniform_participation_attempt_receipt(haystack_bytes, schema, limits)
+            }
+            Self::Dispatched(engine) => {
+                engine.uniform_participation_attempt_receipt(haystack_bytes, schema, limits)
+            }
+        }
+    }
+
+    fn uniform_participation_prospective(
+        &self,
+        haystack_len: usize,
+        schema: PrefixClassUniformParticipationSchema,
+    ) -> Result<PrefixClassUniformParticipationProspective, PrefixClassUniformParticipationError>
+    {
+        match self {
+            Self::Established(engine) => {
+                engine.uniform_participation_prospective(haystack_len, schema)
+            }
+            Self::Dispatched(engine) => {
+                engine.uniform_participation_prospective(haystack_len, schema)
+            }
+        }
+    }
+
+    fn enforce_uniform_participation(
+        &self,
+        prospective: PrefixClassUniformParticipationProspective,
+        limits: PrefixClassUniformParticipationLimits,
+    ) -> Result<(), PrefixClassUniformParticipationError> {
+        match self {
+            Self::Established(engine) => engine.enforce_uniform_participation(prospective, limits),
+            Self::Dispatched(engine) => engine.enforce_uniform_participation(prospective, limits),
+        }
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the fixed-layout terminal receipt deliberately preserves complete direct P/A without allocating"
+    )]
+    fn count_uniform_participation_attempt(
+        &self,
+        haystack: &[u8],
+        schema: PrefixClassUniformParticipationSchema,
+        limits: PrefixClassUniformParticipationLimits,
+    ) -> Result<PrefixClassUniformParticipationAttempt, PrefixClassUniformParticipationAttemptError>
+    {
+        match self {
+            Self::Established(engine) => {
+                engine.count_uniform_participation_attempt(haystack, schema, limits)
+            }
+            Self::Dispatched(engine) => {
+                engine.count_uniform_participation_attempt(haystack, schema, limits)
+            }
+        }
+    }
 }
 
 impl CapturePrefixClassParticipationPlan {
@@ -1654,6 +1751,9 @@ fn optional_prefix_class_build_refusal(error: &PrefixClassUniformParticipationBu
                 | PrefixClassAlternationBuildError::SelfOverlappingPrefix { .. }
                 | PrefixClassAlternationBuildError::EmptyClass { .. }
                 | PrefixClassAlternationBuildError::NonCanonicalClass { .. }
+                | PrefixClassAlternationBuildError::RunScannerDispatchUnavailable
+                | PrefixClassAlternationBuildError::NonAsciiRunScannerClass { .. }
+                | PrefixClassAlternationBuildError::RunScannerAllocationFailed { .. }
                 | PrefixClassAlternationBuildError::ShapeLimit { .. }
                 | PrefixClassAlternationBuildError::WorkLimit { .. }
                 | PrefixClassAlternationBuildError::ScratchLimit { .. }
@@ -1664,6 +1764,7 @@ fn optional_prefix_class_build_refusal(error: &PrefixClassUniformParticipationBu
         | PrefixClassUniformParticipationBuildError::CopiedPrefixBytesLimit { .. }
         | PrefixClassUniformParticipationBuildError::FinderPreprocessInputBytesLimit { .. }
         | PrefixClassUniformParticipationBuildError::InitializedBitmapBytesLimit { .. }
+        | PrefixClassUniformParticipationBuildError::InitializedRunScannerBytesLimit { .. }
         | PrefixClassUniformParticipationBuildError::RetainedCapacityBytesLimit { .. } => true,
         _ => false,
     }
@@ -1675,6 +1776,7 @@ fn optional_prefix_class_build_refusal(error: &PrefixClassUniformParticipationBu
     reason = "direct eligibility and fallible construction retain all canonical-HIR inputs and accounting in one transactional helper"
 )]
 fn build_prefix_class_participation(
+    simd_dispatch: SimdDispatchContext,
     hir: &Hir,
     syntax: &ParseSummary,
     unicode: bool,
@@ -1761,31 +1863,66 @@ fn build_prefix_class_participation(
                     planner_work: work,
                 });
             };
-            let engine = match PrefixClassAlternationPlan::build_uniform_participation(
-                prefixes,
-                [
-                    classes[0]
-                        .ranges()
-                        .iter()
-                        .copied()
-                        .map(capture_class_bytes_range_tuple),
-                    classes[1]
-                        .ranges()
-                        .iter()
-                        .copied()
-                        .map(capture_class_bytes_range_tuple),
-                ],
-                limits.prefix_class_participation,
-            ) {
-                Ok(engine) => engine,
-                Err(error) if optional_prefix_class_build_refusal(&error) => {
-                    return Ok(CapturePrefixClassParticipationBuild {
-                        plan: None,
-                        planner_work: work,
-                    });
+            let use_run_scanners = PrefixClassAlternationPlan::run_scanners_usable(simd_dispatch)
+                && classes
+                    .iter()
+                    .all(|class| class.ranges().iter().all(|range| range.end() <= 0x7f));
+            let engine = if use_run_scanners {
+                match DispatchedPrefixClassAlternationPlan::build_uniform_participation_with_dispatch(
+                    simd_dispatch,
+                    prefixes,
+                    [
+                        classes[0]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(capture_class_bytes_range_tuple),
+                        classes[1]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(capture_class_bytes_range_tuple),
+                    ],
+                    limits.prefix_class_participation,
+                ) {
+                    Ok(engine) => CapturePrefixClassParticipationEngine::Dispatched(engine),
+                    Err(error) if optional_prefix_class_build_refusal(&error) => {
+                        return Ok(CapturePrefixClassParticipationBuild {
+                            plan: None,
+                            planner_work: work,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(CaptureBuildError::PrefixClassParticipation(error));
+                    }
                 }
-                Err(error) => {
-                    return Err(CaptureBuildError::PrefixClassParticipation(error));
+            } else {
+                match PrefixClassAlternationPlan::build_uniform_participation(
+                    prefixes,
+                    [
+                        classes[0]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(capture_class_bytes_range_tuple),
+                        classes[1]
+                            .ranges()
+                            .iter()
+                            .copied()
+                            .map(capture_class_bytes_range_tuple),
+                    ],
+                    limits.prefix_class_participation,
+                ) {
+                    Ok(engine) => CapturePrefixClassParticipationEngine::Established(engine),
+                    Err(error) if optional_prefix_class_build_refusal(&error) => {
+                        return Ok(CapturePrefixClassParticipationBuild {
+                            plan: None,
+                            planner_work: work,
+                        });
+                    }
+                    Err(error) => {
+                        return Err(CaptureBuildError::PrefixClassParticipation(error));
+                    }
                 }
             };
             Ok(CapturePrefixClassParticipationBuild {
@@ -1862,6 +1999,7 @@ impl CaptureBuilder {
         reason = "the single-parse proof, selector, replay, identity, and accounting publication remain locally auditable"
     )]
     pub fn build(self) -> Result<CaptureRegex, CaptureBuildError> {
+        let simd_dispatch = SimdDispatchContext::capture();
         let limits = self.limits;
         let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
@@ -1956,6 +2094,7 @@ impl CaptureBuilder {
             ));
         }
         let prefix_class_participation = build_prefix_class_participation(
+            simd_dispatch,
             &rust.hir,
             &syntax,
             unicode,

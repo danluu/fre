@@ -35,6 +35,16 @@
 //! two next-candidate slots, and scalar counters form an `O(1)` fixed frame.
 //! Allocation failure is typed and never changes the selected route.
 //!
+//! A distinct dispatched owner is available only from one caller-captured
+//! context with OS-usable SVE and two proved ASCII classes. It retains one
+//! fixed-16 SVE/SVE2 run scanner per alternative. Construction adds exactly
+//! two 130-unit scanner compilations and one fallible exact dispatched-owner
+//! allocation; execution
+//! adds at most 15 physical classifications per selected run to both aggregate
+//! and uniform-participation prospective work. Non-SVE and non-ASCII
+//! production routes keep the incumbent scalar owner, identity, layout, and
+//! receipt values.
+//!
 //! The capture-aware uniform-participation operation has a distinct identity
 //! and receipt. Before source access it reserves each complete Finder service
 //! separately, all candidates and start arbitration, first-class probes,
@@ -52,15 +62,23 @@
 
 use core::{fmt, mem::size_of, ops::Range};
 
-use fre_exact_alloc::CopyError;
+use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+use fre_simd_kernels::{
+    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
+    Feature, FeatureSet, SelectionReceipt, SimdDispatchContext,
+};
 use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
 pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams.v1";
+pub const DISPATCHED_PLAN_ID: &str =
+    "prefix-class-alternation.two-monotone-literal-streams.sve-run16.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
     "prefix-class-alternation.uniform-participation.two-finder.v1";
+pub const DISPATCHED_UNIFORM_PARTICIPATION_PLAN_ID: &str =
+    "prefix-class-alternation.uniform-participation.two-finder.sve-run16.v1";
 pub const UNIFORM_PARTICIPATION_OPERATION_ID: &str =
     "prefix-class-alternation.capture-participation.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_ALGORITHM_VERSION: u32 = 1;
@@ -70,6 +88,8 @@ const FIXED_BUILD_WORK: usize = 64;
 const PREFIX_BUILD_WORK_PER_BYTE: usize = 8;
 const RANGE_ITEM_BASE_WORK: usize = 6;
 const BITMAP_WORK_PER_WORD: usize = 4;
+const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
+const RUN_SCANNERS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -125,6 +145,26 @@ pub struct BuildAccounting {
     pub peak_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunScannerBuildAccounting {
+    pub build_work: usize,
+    pub scanners: usize,
+    pub allocations: usize,
+    pub initialized_bytes: usize,
+    pub retained_allocation_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoredBuildAccounting {
+    prefix_bytes: usize,
+    class_ranges: usize,
+    shape_units: usize,
+    work_upper_bound: usize,
+    scratch_bytes: usize,
+    persistent_bytes: usize,
+    peak_bytes: usize,
+}
+
 /// Construction receipt exposed only by the distinct capture-aware operation.
 /// The incumbent aggregate build accounting remains unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +177,7 @@ pub struct UniformParticipationBuildAccounting {
     pub copied_prefix_bytes: usize,
     pub finder_preprocess_input_bytes: usize,
     pub initialized_bitmap_bytes: usize,
+    pub initialized_run_scanner_bytes: usize,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub retained_capacity_bytes: usize,
@@ -157,6 +198,7 @@ pub struct UniformParticipationBuildLimits {
     pub max_copied_prefix_bytes: usize,
     pub max_finder_preprocess_input_bytes: usize,
     pub max_initialized_bitmap_bytes: usize,
+    pub max_initialized_run_scanner_bytes: usize,
     pub max_retained_capacity_bytes: usize,
 }
 
@@ -173,6 +215,7 @@ impl UniformParticipationBuildLimits {
             max_copied_prefix_bytes: usize::MAX,
             max_finder_preprocess_input_bytes: usize::MAX,
             max_initialized_bitmap_bytes: usize::MAX,
+            max_initialized_run_scanner_bytes: usize::MAX,
             max_retained_capacity_bytes: usize::MAX,
         }
     }
@@ -197,10 +240,11 @@ impl Default for UniformParticipationBuildLimits {
             max_scratch_bytes: kernel.max_scratch_bytes,
             max_persistent_bytes: kernel.max_persistent_bytes,
             max_peak_bytes: kernel.max_peak_bytes,
-            max_allocations: 2,
+            max_allocations: 3,
             max_copied_prefix_bytes: 4 * 1024 * 1024,
             max_finder_preprocess_input_bytes: 4 * 1024 * 1024,
             max_initialized_bitmap_bytes: size_of::<[u64; 8]>(),
+            max_initialized_run_scanner_bytes: size_of::<[AsciiByteSetRunScanner; RUN_SCANNERS]>(),
             max_retained_capacity_bytes: 32 * 1024 * 1024,
         }
     }
@@ -214,6 +258,7 @@ pub enum UniformParticipationBuildError {
     CopiedPrefixBytesLimit { needed: usize, limit: usize },
     FinderPreprocessInputBytesLimit { needed: usize, limit: usize },
     InitializedBitmapBytesLimit { needed: usize, limit: usize },
+    InitializedRunScannerBytesLimit { needed: usize, limit: usize },
     RetainedCapacityBytesLimit { needed: usize, limit: usize },
     ArithmeticOverflow { computation: &'static str },
 }
@@ -655,6 +700,9 @@ pub enum BuildError {
     SelfOverlappingPrefix { alternative: usize },
     EmptyClass { alternative: usize },
     NonCanonicalClass { alternative: usize },
+    RunScannerDispatchUnavailable,
+    NonAsciiRunScannerClass { alternative: usize },
+    RunScannerAllocationFailed { bytes: usize },
     ShapeLimit { needed: usize, limit: usize },
     WorkLimit { needed: usize, limit: usize },
     ScratchLimit { needed: usize, limit: usize },
@@ -734,6 +782,14 @@ impl ByteClass {
         let bit = u32::from(byte) & 63;
         self.words[word] & (1_u64 << bit) != 0
     }
+
+    const fn is_ascii(self) -> bool {
+        self.words[2] == 0 && self.words[3] == 0
+    }
+
+    const fn ascii_set(self) -> AsciiByteSet {
+        AsciiByteSet::from_words([self.words[0], self.words[1]])
+    }
 }
 
 #[derive(Debug)]
@@ -745,10 +801,41 @@ struct Alternative {
 #[derive(Debug)]
 pub struct PrefixClassAlternationPlan {
     alternatives: [Alternative; 2],
-    build: BuildAccounting,
+    // Keep the incumbent scalar owner layout stable. Dispatched-only scanner
+    // dimensions are projected by its distinct owner instead of widening this
+    // embedded receipt.
+    build: StoredBuildAccounting,
 }
 
+/// SVE-only owner for the same two-alternative proof.
+///
+/// The embedded legacy plan retains both Finders and classes. Exactly one
+/// fixed-16 directional scanner is compiled for each proved ASCII class and
+/// both are retained with the embedded scalar proof in one exact allocation
+/// so the public handle and aggregate owner stay stack-neutral.
+#[derive(Debug)]
+pub struct DispatchedPrefixClassAlternationPlan {
+    owner: RetainedDispatchedPrefixClassAlternationOwner,
+}
+
+type RunScanners = [AsciiByteSetRunScanner; RUN_SCANNERS];
+
+#[derive(Debug)]
+struct DispatchedPrefixClassAlternationOwner {
+    plan: PrefixClassAlternationPlan,
+    run_scanners: RunScanners,
+}
+
+type RetainedDispatchedPrefixClassAlternationOwner =
+    ExactBoxOrUsize<DispatchedPrefixClassAlternationOwner>;
+
 impl PrefixClassAlternationPlan {
+    /// Whether this captured host can retain the fixed-16 SVE scanner pair.
+    #[must_use]
+    pub fn run_scanners_usable(dispatch: SimdDispatchContext) -> bool {
+        run_scanner_policy(dispatch).is_some()
+    }
+
     /// Build the shared kernel under the capture-aware construction envelope.
     /// Every direct-only construction limit is checked before range traversal,
     /// allocation, copying, bitmap initialization, or Finder preprocessing.
@@ -774,61 +861,7 @@ impl PrefixClassAlternationPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
-            DirectBuildAttemptError::new(
-                UniformParticipationBuildError::ArithmeticOverflow {
-                    computation: "direct prefix byte total",
-                },
-                DirectBuildAttemptActual::default(),
-            ),
-        )?;
-        let allocations = 2;
-        let initialized_bitmap_bytes = size_of::<[u64; 8]>();
-        if allocations > limits.max_allocations {
-            return Err(DirectBuildAttemptError::new(
-                UniformParticipationBuildError::AllocationsLimit {
-                    needed: allocations,
-                    limit: limits.max_allocations,
-                },
-                DirectBuildAttemptActual::default(),
-            ));
-        }
-        if prefix_bytes > limits.max_copied_prefix_bytes {
-            return Err(DirectBuildAttemptError::new(
-                UniformParticipationBuildError::CopiedPrefixBytesLimit {
-                    needed: prefix_bytes,
-                    limit: limits.max_copied_prefix_bytes,
-                },
-                DirectBuildAttemptActual::default(),
-            ));
-        }
-        if prefix_bytes > limits.max_finder_preprocess_input_bytes {
-            return Err(DirectBuildAttemptError::new(
-                UniformParticipationBuildError::FinderPreprocessInputBytesLimit {
-                    needed: prefix_bytes,
-                    limit: limits.max_finder_preprocess_input_bytes,
-                },
-                DirectBuildAttemptActual::default(),
-            ));
-        }
-        if initialized_bitmap_bytes > limits.max_initialized_bitmap_bytes {
-            return Err(DirectBuildAttemptError::new(
-                UniformParticipationBuildError::InitializedBitmapBytesLimit {
-                    needed: initialized_bitmap_bytes,
-                    limit: limits.max_initialized_bitmap_bytes,
-                },
-                DirectBuildAttemptActual::default(),
-            ));
-        }
-        if prefix_bytes > limits.max_retained_capacity_bytes {
-            return Err(DirectBuildAttemptError::new(
-                UniformParticipationBuildError::RetainedCapacityBytesLimit {
-                    needed: prefix_bytes,
-                    limit: limits.max_retained_capacity_bytes,
-                },
-                DirectBuildAttemptActual::default(),
-            ));
-        }
+        preflight_uniform_participation_build(prefixes, 0, 0, 0, limits)?;
         match Self::build_attempt(prefixes, ranges, limits.kernel()) {
             Ok(attempt) => Ok(attempt),
             Err(error) => {
@@ -860,12 +893,23 @@ impl PrefixClassAlternationPlan {
     }
 
     /// Build two prefix/class alternatives with exact observed effects.
+    pub fn build_attempt<I>(
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(prefixes, ranges, limits)
+    }
+
     #[allow(
         clippy::needless_range_loop,
         clippy::too_many_lines,
         reason = "the exact two-alternative attempt keeps validation, observed allocation, and publication adjacent"
     )]
-    pub fn build_attempt<I>(
+    fn build_attempt_inner<I>(
         prefixes: [&[u8]; 2],
         ranges: [I; 2],
         limits: BuildLimits,
@@ -887,11 +931,13 @@ impl PrefixClassAlternationPlan {
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "fixed and prefix build work",
                 })?;
-            let persistent_bytes = size_of::<Self>().checked_add(prefix_bytes).ok_or(
-                BuildError::ArithmeticOverflow {
-                    computation: "persistent bytes",
-                },
-            )?;
+            let owner_bytes = size_of::<Self>();
+            let persistent_bytes =
+                owner_bytes
+                    .checked_add(prefix_bytes)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "persistent bytes",
+                    })?;
             let scratch_bytes = 0;
             let peak_bytes = persistent_bytes;
 
@@ -974,9 +1020,9 @@ impl PrefixClassAlternationPlan {
                 }
             }
 
-            // Admission above covers both exact allocations, every copied byte,
-            // both Finder preprocessors, and all eight zero-initialized bitmap
-            // words before any of that work occurs.
+            // Admission above covers both exact prefix allocations, every
+            // copied byte, both Finder preprocessors, and all eight
+            // zero-initialized bitmap words before any of that work occurs.
             let first = copy_prefix(prefixes[0], 0)?;
             work.tracker.observe_prefix_copy(prefixes[0].len())?;
             let second = copy_prefix(prefixes[1], 1)?;
@@ -994,7 +1040,7 @@ impl PrefixClassAlternationPlan {
             ];
             let plan = Self {
                 alternatives,
-                build: BuildAccounting {
+                build: StoredBuildAccounting {
                     prefix_bytes,
                     class_ranges,
                     shape_units,
@@ -1004,7 +1050,7 @@ impl PrefixClassAlternationPlan {
                     peak_bytes,
                 },
             };
-            tracker.publish(persistent_bytes)?;
+            tracker.publish(persistent_bytes, owner_bytes)?;
             Ok(plan)
         })();
         match result {
@@ -1018,7 +1064,15 @@ impl PrefixClassAlternationPlan {
 
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
-        self.build
+        BuildAccounting {
+            prefix_bytes: self.build.prefix_bytes,
+            class_ranges: self.build.class_ranges,
+            shape_units: self.build.shape_units,
+            work_upper_bound: self.build.work_upper_bound,
+            scratch_bytes: self.build.scratch_bytes,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.peak_bytes,
+        }
     }
 
     #[must_use]
@@ -1034,6 +1088,7 @@ impl PrefixClassAlternationPlan {
             copied_prefix_bytes: self.build.prefix_bytes,
             finder_preprocess_input_bytes: self.build.prefix_bytes,
             initialized_bitmap_bytes: size_of::<[u64; 8]>(),
+            initialized_run_scanner_bytes: 0,
             scratch_bytes: self.build.scratch_bytes,
             persistent_bytes: self.build.persistent_bytes,
             retained_capacity_bytes: self.build.prefix_bytes,
@@ -1053,12 +1108,23 @@ impl PrefixClassAlternationPlan {
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
-        let upper_bounds = self.preflight(haystack.len(), limits)?;
-        let actual = self.scan(haystack, upper_bounds, |_| {})?;
+        self.count_with_run_scanners(haystack, limits, self.count_identity(), [None, None])
+    }
+
+    fn count_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<CountResult, ReduceError> {
+        let upper_bounds =
+            self.preflight_with_run_scanners(haystack.len(), limits, run_scanners[0].is_some())?;
+        let actual = self.scan_with_run_scanners(haystack, upper_bounds, run_scanners, |_| {})?;
         Ok(CountResult {
             count: actual.count,
             accounting: ReduceAccounting {
-                identity: self.count_identity(),
+                identity,
                 upper_bounds,
                 actual,
             },
@@ -1097,6 +1163,19 @@ impl PrefixClassAlternationPlan {
         haystack_len: usize,
         schema: UniformParticipationSchema,
     ) -> Result<UniformParticipationProspective, UniformParticipationError> {
+        self.uniform_participation_prospective_with_run_scanners(haystack_len, schema, false)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the scalar and dispatched paths share one source-free prospective ledger"
+    )]
+    fn uniform_participation_prospective_with_run_scanners(
+        &self,
+        haystack_len: usize,
+        schema: UniformParticipationSchema,
+        run_scanners: bool,
+    ) -> Result<UniformParticipationProspective, UniformParticipationError> {
         if schema.participating_with_overall == 0
             || schema.capture_schema_slots < schema.participating_with_overall
         {
@@ -1123,12 +1202,21 @@ impl PrefixClassAlternationPlan {
                 .ok_or(UniformParticipationError::ArithmeticOverflow {
                     computation: "first-class probes",
                 })?;
-        let greedy_extension_reads =
+        let scanner_overhead = if run_scanners {
             haystack_len
-                .checked_mul(2)
+                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
                 .ok_or(UniformParticipationError::ArithmeticOverflow {
-                    computation: "greedy extension reads",
-                })?;
+                    computation: "greedy extension scanner overhead",
+                })?
+        } else {
+            0
+        };
+        let greedy_extension_reads = haystack_len
+            .checked_mul(2)
+            .and_then(|reads| reads.checked_add(scanner_overhead))
+            .ok_or(UniformParticipationError::ArithmeticOverflow {
+                computation: "greedy extension reads",
+            })?;
         let minimum_match_bytes = self.alternatives[0]
             .finder
             .needle()
@@ -1359,21 +1447,47 @@ impl PrefixClassAlternationPlan {
         schema: UniformParticipationSchema,
         limits: UniformParticipationLimits,
     ) -> Result<UniformParticipationAttempt, UniformParticipationAttemptError> {
+        self.count_uniform_participation_attempt_with_run_scanners(
+            haystack,
+            schema,
+            limits,
+            self.uniform_participation_identity(schema),
+            [None, None],
+        )
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the fixed-layout terminal receipt deliberately preserves complete direct P/A without allocating"
+    )]
+    fn count_uniform_participation_attempt_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+        identity: UniformParticipationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<UniformParticipationAttempt, UniformParticipationAttemptError> {
         let mut receipt =
             self.uniform_participation_attempt_receipt(haystack.len(), schema, limits);
-        let identity = receipt.identity;
+        receipt.identity = identity;
         let invocation = receipt.invocation;
         let prospective = self
-            .uniform_participation_prospective(haystack.len(), schema)
+            .uniform_participation_prospective_with_run_scanners(
+                haystack.len(),
+                schema,
+                run_scanners[0].is_some(),
+            )
             .map_err(|source| uniform_attempt_error(source, receipt, identity, invocation))?;
         receipt.prospective = Some(prospective);
         self.enforce_uniform_participation(prospective, limits)
             .map_err(|source| uniform_attempt_error(source, receipt, identity, invocation))?;
-        let matches = match self.scan_uniform_participation(
+        let matches = match self.scan_uniform_participation_with_run_scanners(
             haystack,
             schema,
             prospective,
             &mut receipt,
+            run_scanners,
             |_| Ok(()),
         ) {
             Ok(matches) => matches,
@@ -1407,12 +1521,37 @@ impl PrefixClassAlternationPlan {
         clippy::too_many_lines,
         reason = "the fixed two-stream scan keeps each source read and its checked direct-operation counter adjacent"
     )]
+    #[cfg(test)]
     fn scan_uniform_participation(
         &self,
         haystack: &[u8],
         schema: UniformParticipationSchema,
         prospective: UniformParticipationProspective,
         receipt: &mut UniformParticipationAttemptReceipt,
+        emit: impl FnMut(Range<usize>) -> Result<(), UniformParticipationError>,
+    ) -> Result<usize, UniformParticipationError> {
+        self.scan_uniform_participation_with_run_scanners(
+            haystack,
+            schema,
+            prospective,
+            receipt,
+            [None, None],
+            emit,
+        )
+    }
+
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        reason = "the fixed two-stream scan keeps each source read and its checked direct-operation counter adjacent"
+    )]
+    fn scan_uniform_participation_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        prospective: UniformParticipationProspective,
+        receipt: &mut UniformParticipationAttemptReceipt,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
         mut emit: impl FnMut(Range<usize>) -> Result<(), UniformParticipationError>,
     ) -> Result<usize, UniformParticipationError> {
         let actual = &mut receipt.actual;
@@ -1494,28 +1633,29 @@ impl PrefixClassAlternationPlan {
             {
                 continue;
             }
-            let mut end =
+            let extension_start =
                 prefix_end
                     .checked_add(1)
                     .ok_or(UniformParticipationError::ArithmeticOverflow {
                         computation: "direct first class byte end",
                     })?;
-            while let Some(&byte) = haystack.get(end) {
-                uniform_actual_add(
-                    &mut actual.greedy_extension_reads,
-                    1,
-                    "actual greedy extension reads",
-                )?;
-                uniform_actual_add(&mut actual.work, 1, "actual greedy extension read work")?;
-                if !self.alternatives[alternative].class.contains(byte) {
-                    break;
-                }
-                end = end
-                    .checked_add(1)
-                    .ok_or(UniformParticipationError::ArithmeticOverflow {
-                        computation: "direct greedy class end",
-                    })?;
-            }
+            let extension = extend_greedy_class(
+                haystack,
+                extension_start,
+                self.alternatives[alternative].class,
+                run_scanners[alternative],
+            );
+            uniform_actual_add(
+                &mut actual.greedy_extension_reads,
+                extension.physical_classifications,
+                "actual greedy extension reads",
+            )?;
+            uniform_actual_add(
+                &mut actual.work,
+                extension.physical_classifications,
+                "actual greedy extension read work",
+            )?;
+            let end = extension.end;
             uniform_actual_add(&mut actual.results, 1, "direct match count")?;
             uniform_actual_add(&mut actual.work, 1, "direct result work")?;
             uniform_actual_add(
@@ -1552,11 +1692,31 @@ impl PrefixClassAlternationPlan {
         Ok(actual.results)
     }
 
+    #[cfg(test)]
     fn preflight(
         &self,
         haystack_len: usize,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
+        self.preflight_with_run_scanners(haystack_len, limits, false)
+    }
+
+    fn preflight_with_run_scanners(
+        &self,
+        haystack_len: usize,
+        limits: ReduceLimits,
+        run_scanners: bool,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let match_events = haystack_len;
+        let scanner_overhead = if run_scanners {
+            match_events
+                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "run scanner classification overhead",
+                })?
+        } else {
+            0
+        };
         let work = haystack_len
             .checked_mul(16)
             .and_then(|work| {
@@ -1566,10 +1726,10 @@ impl PrefixClassAlternationPlan {
                     .and_then(|shape| work.checked_add(shape))
             })
             .and_then(|work| work.checked_add(64))
+            .and_then(|work| work.checked_add(scanner_overhead))
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "16N + 8Q + 64 work bound",
+                computation: "16N + 8Q + 64 + scanner overhead work bound",
             })?;
-        let match_events = haystack_len;
         let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "match event bound as u64",
         })?;
@@ -1609,10 +1769,25 @@ impl PrefixClassAlternationPlan {
         clippy::needless_range_loop,
         reason = "numeric indices preserve stable alternative priority across paired iterator and candidate arrays"
     )]
+    #[cfg(test)]
     fn scan(
         &self,
         haystack: &[u8],
         upper: ReduceUpperBounds,
+        emit: impl FnMut(Range<usize>),
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        self.scan_with_run_scanners(haystack, upper, [None, None], emit)
+    }
+
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "numeric indices preserve stable alternative priority across paired iterator, candidate, and scanner arrays"
+    )]
+    fn scan_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
         mut emit: impl FnMut(Range<usize>),
     ) -> Result<ReduceActualCounters, ReduceError> {
         let mut streams = [
@@ -1665,25 +1840,24 @@ impl PrefixClassAlternationPlan {
             {
                 continue;
             }
-            let mut end = prefix_end
-                .checked_add(1)
+            let extension_start =
+                prefix_end
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "first class byte end",
+                    })?;
+            let extension = extend_greedy_class(
+                haystack,
+                extension_start,
+                self.alternatives[alternative].class,
+                run_scanners[alternative],
+            );
+            class_bytes = class_bytes
+                .checked_add(extension.physical_classifications)
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "first class byte end",
+                    computation: "class byte count",
                 })?;
-            while let Some(&byte) = haystack.get(end) {
-                class_bytes =
-                    class_bytes
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "class byte count",
-                        })?;
-                if !self.alternatives[alternative].class.contains(byte) {
-                    break;
-                }
-                end = end.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "greedy class end",
-                })?;
-            }
+            let end = extension.end;
             emit(start..end);
             matches = matches
                 .checked_add(1)
@@ -1703,6 +1877,589 @@ impl PrefixClassAlternationPlan {
             count,
         })
     }
+}
+
+impl DispatchedPrefixClassAlternationPlan {
+    /// Build the distinct fixed-16 SVE owner from one caller-captured host
+    /// snapshot. Hosts without OS-usable SVE are rejected before input access.
+    pub fn build_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_with_dispatch(dispatch, prefixes, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the fixed-16 SVE owner with exact observed construction effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free dispatched envelope, scalar attempt mapping, ASCII proof, and exact owner publication remain adjacent"
+    )]
+    pub fn build_attempt_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        let Some(policy) = run_scanner_policy(dispatch) else {
+            return Err(DirectBuildAttemptError::new(
+                BuildError::RunScannerDispatchUnavailable,
+                DirectBuildAttemptActual::default(),
+            ));
+        };
+        let empty_actual = DirectBuildAttemptActual::default();
+        let scanner_work = SIMD_RUN_SCANNER_BUILD_WORK
+            .checked_mul(RUN_SCANNERS)
+            .ok_or(DirectBuildAttemptError::new(
+                BuildError::ArithmeticOverflow {
+                    computation: "run scanner construction work",
+                },
+                empty_actual,
+            ))?;
+        let scalar_work_limit =
+            limits
+                .max_build_work
+                .checked_sub(scanner_work)
+                .ok_or(DirectBuildAttemptError::new(
+                    BuildError::WorkLimit {
+                        needed: scanner_work,
+                        limit: limits.max_build_work,
+                    },
+                    empty_actual,
+                ))?;
+        let prefix_bytes = prefixes[0].len().checked_add(prefixes[1].len()).ok_or(
+            DirectBuildAttemptError::new(
+                BuildError::ArithmeticOverflow {
+                    computation: "dispatched prefix byte total",
+                },
+                empty_actual,
+            ),
+        )?;
+        let persistent_bytes = size_of::<Self>()
+            .checked_add(size_of::<DispatchedPrefixClassAlternationOwner>())
+            .and_then(|bytes| bytes.checked_add(prefix_bytes))
+            .ok_or(DirectBuildAttemptError::new(
+                BuildError::ArithmeticOverflow {
+                    computation: "dispatched persistent bytes",
+                },
+                empty_actual,
+            ))?;
+        for result in [
+            enforce_build(
+                persistent_bytes,
+                limits.max_persistent_bytes,
+                BuildResource::Persistent,
+            ),
+            enforce_build(persistent_bytes, limits.max_peak_bytes, BuildResource::Peak),
+        ] {
+            if let Err(source) = result {
+                return Err(DirectBuildAttemptError::new(source, empty_actual));
+            }
+        }
+        let scalar_limits = BuildLimits {
+            max_build_work: scalar_work_limit,
+            ..limits
+        };
+        let attempt =
+            match PrefixClassAlternationPlan::build_attempt(prefixes, ranges, scalar_limits) {
+                Ok(attempt) => attempt,
+                Err(error) => {
+                    let actual = error.actual();
+                    let source = match error.into_source() {
+                        BuildError::WorkLimit { needed, .. } => {
+                            let needed = needed.checked_add(scanner_work).ok_or(
+                                DirectBuildAttemptError::new(
+                                    BuildError::ArithmeticOverflow {
+                                        computation: "dispatched build work refusal",
+                                    },
+                                    actual,
+                                ),
+                            )?;
+                            BuildError::WorkLimit {
+                                needed,
+                                limit: limits.max_build_work,
+                            }
+                        }
+                        source => source,
+                    };
+                    return Err(DirectBuildAttemptError::new(source, actual));
+                }
+            };
+        let (plan, mut actual) = attempt.into_parts();
+        for (alternative, candidate) in plan.alternatives.iter().enumerate() {
+            if !candidate.class.is_ascii() {
+                actual.live_persistent_bytes = 0;
+                return Err(DirectBuildAttemptError::new(
+                    BuildError::NonAsciiRunScannerClass { alternative },
+                    actual,
+                ));
+            }
+        }
+        build_dispatched_prefix_class_owner(
+            dispatch,
+            policy,
+            plan,
+            actual,
+            persistent_bytes,
+            scanner_work,
+        )
+    }
+
+    /// Build the dispatched owner under the complete capture-aware envelope.
+    pub fn build_uniform_participation_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: UniformParticipationBuildLimits,
+    ) -> Result<Self, UniformParticipationBuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_uniform_participation_attempt_with_dispatch(dispatch, prefixes, ranges, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the dispatched capture-aware owner with exact observed effects.
+    pub fn build_uniform_participation_attempt_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefixes: [&[u8]; 2],
+        ranges: [I; 2],
+        limits: UniformParticipationBuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<UniformParticipationBuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        preflight_uniform_participation_build(
+            prefixes,
+            1,
+            size_of::<RunScanners>(),
+            size_of::<DispatchedPrefixClassAlternationOwner>(),
+            limits,
+        )?;
+        match Self::build_attempt_with_dispatch(dispatch, prefixes, ranges, limits.kernel()) {
+            Ok(attempt) => Ok(attempt),
+            Err(error) => {
+                let actual = error.actual();
+                Err(DirectBuildAttemptError::new(
+                    UniformParticipationBuildError::Kernel(error.into_source()),
+                    actual,
+                ))
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn build_accounting(&self) -> BuildAccounting {
+        let established = self.plan().build_accounting();
+        BuildAccounting {
+            prefix_bytes: established.prefix_bytes,
+            class_ranges: established.class_ranges,
+            shape_units: established.shape_units,
+            work_upper_bound: established.work_upper_bound,
+            scratch_bytes: established.scratch_bytes,
+            persistent_bytes: established.persistent_bytes,
+            peak_bytes: established.peak_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn run_scanner_build_accounting(&self) -> RunScannerBuildAccounting {
+        RunScannerBuildAccounting {
+            build_work: SIMD_RUN_SCANNER_BUILD_WORK * RUN_SCANNERS,
+            scanners: RUN_SCANNERS,
+            allocations: 1,
+            initialized_bytes: size_of::<RunScanners>(),
+            retained_allocation_bytes: size_of::<DispatchedPrefixClassAlternationOwner>(),
+        }
+    }
+
+    #[must_use]
+    pub fn uniform_participation_build_accounting(&self) -> UniformParticipationBuildAccounting {
+        let established = self.plan().uniform_participation_build_accounting();
+        UniformParticipationBuildAccounting {
+            prefix_bytes: established.prefix_bytes,
+            class_ranges: established.class_ranges,
+            shape_units: established.shape_units,
+            work_upper_bound: established.work_upper_bound,
+            allocations: established.allocations + 1,
+            copied_prefix_bytes: established.copied_prefix_bytes,
+            finder_preprocess_input_bytes: established.finder_preprocess_input_bytes,
+            initialized_bitmap_bytes: established.initialized_bitmap_bytes,
+            initialized_run_scanner_bytes: size_of::<RunScanners>(),
+            scratch_bytes: established.scratch_bytes,
+            persistent_bytes: established.persistent_bytes,
+            retained_capacity_bytes: established.retained_capacity_bytes
+                + size_of::<DispatchedPrefixClassAlternationOwner>(),
+            peak_bytes: established.peak_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn count_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: DISPATCHED_PLAN_ID,
+            operation_id: COUNT_OPERATION_ID,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
+    pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        self.plan().count_with_run_scanners(
+            haystack,
+            limits,
+            self.count_identity(),
+            self.scanner_refs(),
+        )
+    }
+
+    #[must_use]
+    pub const fn uniform_participation_identity(
+        &self,
+        schema: UniformParticipationSchema,
+    ) -> UniformParticipationIdentity {
+        UniformParticipationIdentity {
+            plan_id: DISPATCHED_UNIFORM_PARTICIPATION_PLAN_ID,
+            operation_id: UNIFORM_PARTICIPATION_OPERATION_ID,
+            algorithm_version: UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
+            accounting_version: UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
+            alternatives: 2,
+            unicode: false,
+            case_insensitive: false,
+            ordered_branch_priority: true,
+            greedy_class: true,
+            non_overlapping: true,
+            participating_with_overall: schema.participating_with_overall,
+            capture_schema_slots: schema.capture_schema_slots,
+        }
+    }
+
+    pub fn uniform_participation_prospective(
+        &self,
+        haystack_len: usize,
+        schema: UniformParticipationSchema,
+    ) -> Result<UniformParticipationProspective, UniformParticipationError> {
+        self.plan()
+            .uniform_participation_prospective_with_run_scanners(haystack_len, schema, true)
+    }
+
+    pub fn enforce_uniform_participation(
+        &self,
+        prospective: UniformParticipationProspective,
+        limits: UniformParticipationLimits,
+    ) -> Result<(), UniformParticipationError> {
+        self.plan()
+            .enforce_uniform_participation(prospective, limits)
+    }
+
+    #[must_use]
+    pub fn uniform_participation_attempt_receipt(
+        &self,
+        haystack_bytes: usize,
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+    ) -> UniformParticipationAttemptReceipt {
+        let mut receipt =
+            self.plan()
+                .uniform_participation_attempt_receipt(haystack_bytes, schema, limits);
+        receipt.identity = self.uniform_participation_identity(schema);
+        receipt
+    }
+
+    pub fn count_uniform_participation(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+    ) -> Result<UniformParticipationResult, UniformParticipationError> {
+        self.count_uniform_participation_attempt(haystack, schema, limits)
+            .map(|attempt| attempt.result)
+            .map_err(|error| error.source)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the fixed-layout terminal receipt deliberately preserves complete direct P/A without allocating"
+    )]
+    pub fn count_uniform_participation_attempt(
+        &self,
+        haystack: &[u8],
+        schema: UniformParticipationSchema,
+        limits: UniformParticipationLimits,
+    ) -> Result<UniformParticipationAttempt, UniformParticipationAttemptError> {
+        self.plan()
+            .count_uniform_participation_attempt_with_run_scanners(
+                haystack,
+                schema,
+                limits,
+                self.uniform_participation_identity(schema),
+                self.scanner_refs(),
+            )
+    }
+
+    /// Stable proof of the two retained SVE/SVE2 scanner selections.
+    #[must_use]
+    pub fn run_scanner_selections(&self) -> [SelectionReceipt; RUN_SCANNERS] {
+        let scanners = self.scanners();
+        [scanners[0].selection(), scanners[1].selection()]
+    }
+
+    fn scanner_refs(&self) -> [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS] {
+        let scanners = self.scanners();
+        [Some(&scanners[0]), Some(&scanners[1])]
+    }
+
+    fn plan(&self) -> &PrefixClassAlternationPlan {
+        &self.owner().plan
+    }
+
+    fn scanners(&self) -> &RunScanners {
+        &self.owner().run_scanners
+    }
+
+    fn owner(&self) -> &DispatchedPrefixClassAlternationOwner {
+        self.owner
+            .boxed()
+            .expect("the dispatched plan retains its exact owner allocation")
+    }
+}
+
+#[inline(never)]
+fn build_dispatched_prefix_class_owner(
+    dispatch: SimdDispatchContext,
+    policy: DispatchPolicy,
+    mut plan: PrefixClassAlternationPlan,
+    mut actual: DirectBuildAttemptActual,
+    persistent_bytes: usize,
+    scanner_work: usize,
+) -> Result<
+    DirectBuildAttempt<DispatchedPrefixClassAlternationPlan>,
+    DirectBuildAttemptError<BuildError>,
+> {
+    let result = (|| {
+        let work_upper_bound = plan
+            .build
+            .work_upper_bound
+            .checked_add(scanner_work)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "dispatched build work",
+            })?;
+        actual.work = actual
+            .work
+            .checked_add(u64::try_from(scanner_work).map_err(|_| {
+                BuildError::ArithmeticOverflow {
+                    computation: "run scanner work as u64",
+                }
+            })?)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "actual dispatched build work",
+            })?;
+        let run_scanners = [
+            dispatch
+                .ascii_byte_set_run_scanner(plan.alternatives[0].class.ascii_set(), policy)
+                .expect("the caller supplied an authentic compatible dispatch policy"),
+            dispatch
+                .ascii_byte_set_run_scanner(plan.alternatives[1].class.ascii_set(), policy)
+                .expect("the caller supplied an authentic compatible dispatch policy"),
+        ];
+        plan.build.work_upper_bound = work_upper_bound;
+        plan.build.persistent_bytes = persistent_bytes;
+        plan.build.peak_bytes = persistent_bytes;
+        let owner = DispatchedPrefixClassAlternationOwner { plan, run_scanners };
+        let owner_bytes = size_of::<DispatchedPrefixClassAlternationOwner>();
+        let owner = RetainedDispatchedPrefixClassAlternationOwner::try_from_boxed(owner).map_err(
+            |error| match error {
+                CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                    computation: "exact dispatched owner allocation layout",
+                },
+                CopyError::AllocationFailed => {
+                    BuildError::RunScannerAllocationFailed { bytes: owner_bytes }
+                }
+            },
+        )?;
+        actual.allocations =
+            actual
+                .allocations
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "actual dispatched owner allocation count",
+                })?;
+        actual.allocated_bytes = actual.allocated_bytes.checked_add(owner_bytes).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "cumulative dispatched owner allocated bytes",
+            },
+        )?;
+        actual.initialized_bytes = persistent_bytes;
+        actual.live_persistent_bytes = persistent_bytes;
+        actual.peak_bytes = actual.peak_bytes.max(persistent_bytes);
+        Ok(DispatchedPrefixClassAlternationPlan { owner })
+    })();
+    match result {
+        Ok(owner) => Ok(DirectBuildAttempt::new(owner, actual)),
+        Err(source) => {
+            actual.live_persistent_bytes = 0;
+            Err(DirectBuildAttemptError::new(source, actual))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClassExtension {
+    end: usize,
+    physical_classifications: usize,
+}
+
+fn run_scanner_policy(dispatch: SimdDispatchContext) -> Option<DispatchPolicy> {
+    let usable = dispatch.capabilities().usable();
+    if !usable.contains(Feature::ArmSve) {
+        return None;
+    }
+    let mut allowed = FeatureSet::of(Feature::ArmSve);
+    if usable.contains(Feature::ArmSve2) {
+        allowed = allowed.with(Feature::ArmSve2);
+    }
+    Some(DispatchPolicy::AllowOnly(allowed))
+}
+
+fn extend_greedy_class(
+    haystack: &[u8],
+    start: usize,
+    class: ByteClass,
+    scanner: Option<&AsciiByteSetRunScanner>,
+) -> ClassExtension {
+    let remaining = haystack
+        .get(start..)
+        .expect("the validated first class byte precedes the extension");
+    if let Some(scanner) = scanner {
+        let result = scanner.scan_forward(remaining);
+        return ClassExtension {
+            end: start
+                .checked_add(result.member_run_len())
+                .expect("a run within one slice fits its end offset"),
+            physical_classifications: result.examined_bytes(),
+        };
+    }
+    let mut end = start;
+    let mut physical_classifications = 0_usize;
+    while let Some(&byte) = haystack.get(end) {
+        physical_classifications = physical_classifications
+            .checked_add(1)
+            .expect("classifications cannot exceed the source length");
+        if !class.contains(byte) {
+            break;
+        }
+        end = end
+            .checked_add(1)
+            .expect("a cursor within one slice fits usize");
+    }
+    ClassExtension {
+        end,
+        physical_classifications,
+    }
+}
+
+fn preflight_uniform_participation_build(
+    prefixes: [&[u8]; 2],
+    additional_allocations: usize,
+    initialized_run_scanner_bytes: usize,
+    retained_run_scanner_bytes: usize,
+    limits: UniformParticipationBuildLimits,
+) -> Result<(), DirectBuildAttemptError<UniformParticipationBuildError>> {
+    let empty_actual = DirectBuildAttemptActual::default();
+    let prefix_bytes =
+        prefixes[0]
+            .len()
+            .checked_add(prefixes[1].len())
+            .ok_or(DirectBuildAttemptError::new(
+                UniformParticipationBuildError::ArithmeticOverflow {
+                    computation: "direct prefix byte total",
+                },
+                empty_actual,
+            ))?;
+    let allocations =
+        2_usize
+            .checked_add(additional_allocations)
+            .ok_or(DirectBuildAttemptError::new(
+                UniformParticipationBuildError::ArithmeticOverflow {
+                    computation: "direct allocation total",
+                },
+                empty_actual,
+            ))?;
+    let retained_capacity_bytes = prefix_bytes.checked_add(retained_run_scanner_bytes).ok_or(
+        DirectBuildAttemptError::new(
+            UniformParticipationBuildError::ArithmeticOverflow {
+                computation: "direct retained capacity bytes",
+            },
+            empty_actual,
+        ),
+    )?;
+    let initialized_bitmap_bytes = size_of::<[u64; 8]>();
+    for (needed, limit, error) in [
+        (
+            allocations,
+            limits.max_allocations,
+            UniformParticipationBuildError::AllocationsLimit {
+                needed: allocations,
+                limit: limits.max_allocations,
+            },
+        ),
+        (
+            prefix_bytes,
+            limits.max_copied_prefix_bytes,
+            UniformParticipationBuildError::CopiedPrefixBytesLimit {
+                needed: prefix_bytes,
+                limit: limits.max_copied_prefix_bytes,
+            },
+        ),
+        (
+            prefix_bytes,
+            limits.max_finder_preprocess_input_bytes,
+            UniformParticipationBuildError::FinderPreprocessInputBytesLimit {
+                needed: prefix_bytes,
+                limit: limits.max_finder_preprocess_input_bytes,
+            },
+        ),
+        (
+            initialized_bitmap_bytes,
+            limits.max_initialized_bitmap_bytes,
+            UniformParticipationBuildError::InitializedBitmapBytesLimit {
+                needed: initialized_bitmap_bytes,
+                limit: limits.max_initialized_bitmap_bytes,
+            },
+        ),
+        (
+            initialized_run_scanner_bytes,
+            limits.max_initialized_run_scanner_bytes,
+            UniformParticipationBuildError::InitializedRunScannerBytesLimit {
+                needed: initialized_run_scanner_bytes,
+                limit: limits.max_initialized_run_scanner_bytes,
+            },
+        ),
+        (
+            retained_capacity_bytes,
+            limits.max_retained_capacity_bytes,
+            UniformParticipationBuildError::RetainedCapacityBytesLimit {
+                needed: retained_capacity_bytes,
+                limit: limits.max_retained_capacity_bytes,
+            },
+        ),
+    ] {
+        if needed > limit {
+            return Err(DirectBuildAttemptError::new(error, empty_actual));
+        }
+    }
+    Ok(())
 }
 
 fn copy_prefix(prefix: &[u8], alternative: usize) -> Result<Vec<u8>, BuildError> {
@@ -1773,13 +2530,13 @@ impl DirectBuildTracker {
         Ok(())
     }
 
-    fn publish(&mut self, persistent_bytes: usize) -> Result<(), BuildError> {
+    fn publish(&mut self, persistent_bytes: usize, owner_bytes: usize) -> Result<(), BuildError> {
         self.actual.initialized_bytes = self
             .actual
             .initialized_bytes
-            .checked_add(size_of::<PrefixClassAlternationPlan>())
+            .checked_add(owner_bytes)
             .ok_or(BuildError::ArithmeticOverflow {
-                computation: "published prefix plan inline initialized bytes",
+                computation: "published prefix owner inline initialized bytes",
             })?;
         self.actual.live_persistent_bytes = persistent_bytes;
         self.actual.peak_bytes = self.actual.peak_bytes.max(persistent_bytes);
@@ -2136,11 +2893,12 @@ mod uniform_scan_fault {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, hint::black_box, rc::Rc, time::Instant};
 
     use regex::bytes::RegexBuilder;
 
     use super::*;
+    use fre_simd_kernels::ASCII_NARROW_BYTES;
 
     fn plan() -> PrefixClassAlternationPlan {
         PrefixClassAlternationPlan::build(
@@ -2247,6 +3005,293 @@ mod tests {
             max_scratch_bytes: prospective.scratch_bytes,
             max_peak_bytes: prospective.peak_bytes,
         }
+    }
+
+    #[test]
+    fn shared_class_extension_preserves_every_alignment_and_exact_boundary() {
+        let established = plan();
+        let class = established.alternatives[0].class;
+        let scanner =
+            AsciiByteSetRunScanner::with_policy(class.ascii_set(), DispatchPolicy::Portable)
+                .expect("the portable scanner is always available");
+        for leading in 0..32 {
+            for run_len in 0..65 {
+                let mut haystack = vec![b'!'; leading];
+                haystack.extend(std::iter::repeat_n(b'a', run_len));
+                haystack.extend(std::iter::repeat_n(b'!', 32));
+                let scalar = extend_greedy_class(&haystack, leading, class, None);
+                let vector_result = extend_greedy_class(&haystack, leading, class, Some(&scanner));
+                assert_eq!(leading + run_len, scalar.end);
+                assert_eq!(scalar.end, vector_result.end);
+                assert!(
+                    vector_result.physical_classifications
+                        <= scalar.physical_classifications + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+                );
+            }
+        }
+
+        for run_len in 0..65 {
+            let haystack = vec![b'z'; run_len];
+            let scalar = extend_greedy_class(&haystack, 0, class, None);
+            let vector_result = extend_greedy_class(&haystack, 0, class, Some(&scanner));
+            assert_eq!(run_len, scalar.end);
+            assert_eq!(scalar.end, vector_result.end);
+            assert!(
+                vector_result.physical_classifications
+                    <= scalar.physical_classifications + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+            );
+        }
+    }
+
+    #[test]
+    fn dispatched_owner_refuses_before_range_access_without_usable_sve() {
+        let dispatch = SimdDispatchContext::capture();
+        if PrefixClassAlternationPlan::run_scanners_usable(dispatch) {
+            return;
+        }
+        let (first, first_next, first_len) = deceptive_ranges(&[(b'a', b'z')]);
+        let (second, second_next, second_len) = deceptive_ranges(&[(b'0', b'9')]);
+        let failure = DispatchedPrefixClassAlternationPlan::build_attempt_with_dispatch(
+            dispatch,
+            [b"ab", b"xy"],
+            [first, second],
+            BuildLimits::unlimited(),
+        )
+        .expect_err("a non-SVE host must retain the established scalar owner");
+        assert_eq!(failure.source(), &BuildError::RunScannerDispatchUnavailable);
+        assert_eq!(failure.actual(), DirectBuildAttemptActual::default());
+        assert_eq!(first_next.get(), 0);
+        assert_eq!(second_next.get(), 0);
+        assert_eq!(first_len.get(), 0);
+        assert_eq!(second_len.get(), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the SVE gate keeps construction, boundary, aggregate, uniform, and accounting equivalence under one captured host receipt"
+    )]
+    fn sve_owner_matches_scalar_and_shares_physical_classification_accounting() {
+        let dispatch = SimdDispatchContext::capture();
+        if !PrefixClassAlternationPlan::run_scanners_usable(dispatch) {
+            return;
+        }
+        let word = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
+        let established_attempt = PrefixClassAlternationPlan::build_attempt(
+            [b"fn is_", b"fn as_"],
+            [word.into_iter(), word.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let established_actual = established_attempt.actual();
+        let established = established_attempt.into_plan();
+        let dispatched_attempt = DispatchedPrefixClassAlternationPlan::build_attempt_with_dispatch(
+            dispatch,
+            [b"fn is_", b"fn as_"],
+            [word.into_iter(), word.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched_actual = dispatched_attempt.actual();
+        let dispatched = dispatched_attempt.into_plan();
+
+        let established_build = established.build_accounting();
+        let dispatched_build = dispatched.build_accounting();
+        let scanner_build = dispatched.run_scanner_build_accounting();
+        assert_eq!(RUN_SCANNERS, scanner_build.scanners);
+        assert_eq!(1, scanner_build.allocations);
+        assert_eq!(
+            SIMD_RUN_SCANNER_BUILD_WORK * RUN_SCANNERS,
+            scanner_build.build_work
+        );
+        assert_eq!(size_of::<RunScanners>(), scanner_build.initialized_bytes);
+        assert_eq!(
+            size_of::<DispatchedPrefixClassAlternationOwner>(),
+            scanner_build.retained_allocation_bytes
+        );
+        assert_eq!(
+            established_build.work_upper_bound + SIMD_RUN_SCANNER_BUILD_WORK * RUN_SCANNERS,
+            dispatched_build.work_upper_bound
+        );
+        assert_eq!(
+            size_of::<DispatchedPrefixClassAlternationPlan>()
+                + dispatched_build.prefix_bytes
+                + size_of::<DispatchedPrefixClassAlternationOwner>(),
+            dispatched_build.persistent_bytes
+        );
+        assert_eq!(
+            established_build.persistent_bytes,
+            established_actual.live_persistent_bytes
+        );
+        assert_eq!(
+            dispatched_build.persistent_bytes,
+            dispatched_actual.live_persistent_bytes
+        );
+        assert_eq!(
+            dispatched_build.persistent_bytes,
+            dispatched_actual.initialized_bytes
+        );
+        assert_eq!(3, dispatched_actual.allocations);
+        assert_eq!(
+            dispatched_build.prefix_bytes + size_of::<DispatchedPrefixClassAlternationOwner>(),
+            dispatched_actual.allocated_bytes
+        );
+        assert_eq!(PLAN_ID, established.count_identity().plan_id);
+        assert_eq!(DISPATCHED_PLAN_ID, dispatched.count_identity().plan_id);
+        for selection in dispatched.run_scanner_selections() {
+            assert!(selection.required.contains(Feature::ArmSve));
+            assert!(selection.variant_id.contains("sve"));
+            assert_eq!(ASCII_NARROW_BYTES, selection.minimum_input_bytes);
+        }
+
+        let schema = rust_functions_schema();
+        let pattern = r"fn is_(\w+)|fn as_(\w+)";
+        let mut cases = vec![
+            Vec::new(),
+            b"fn is_alpha fn as_beta".to_vec(),
+            b"fn is_ fn as_".to_vec(),
+            b"fn as_9fn is_Z".to_vec(),
+            b"fn is_a\x00fn as_b\xfffn is_c".to_vec(),
+        ];
+        for leading in 0..32 {
+            let mut haystack = vec![b'!'; leading];
+            haystack.extend_from_slice(b"fn is_");
+            haystack.extend(std::iter::repeat_n(b'a', 97));
+            haystack.extend_from_slice(b"!fn as_");
+            haystack.extend(std::iter::repeat_n(b'7', 33));
+            haystack.extend_from_slice(b"\x80fn is_z!");
+            cases.push(haystack);
+        }
+        for haystack in cases {
+            let reference = reference_spans(pattern, &haystack);
+            let established_count = established
+                .count(&haystack, ReduceLimits::unlimited())
+                .unwrap();
+            let dispatched_count = dispatched
+                .count(&haystack, ReduceLimits::unlimited())
+                .unwrap();
+            assert_eq!(
+                u64::try_from(reference.len()).unwrap(),
+                established_count.count
+            );
+            assert_eq!(established_count.count, dispatched_count.count);
+            assert_eq!(
+                established_count.accounting.upper_bounds.work
+                    + haystack.len() * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                dispatched_count.accounting.upper_bounds.work
+            );
+
+            let established_uniform = established
+                .count_uniform_participation(
+                    &haystack,
+                    schema,
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap();
+            let dispatched_uniform = dispatched
+                .count_uniform_participation(
+                    &haystack,
+                    schema,
+                    UniformParticipationLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(reference.len(), established_uniform.matches);
+            assert_eq!(established_uniform.matches, dispatched_uniform.matches);
+            assert_eq!(
+                established_uniform.capture_count,
+                dispatched_uniform.capture_count
+            );
+            assert_eq!(
+                dispatched_count.accounting.actual.class_bytes,
+                dispatched_uniform.accounting.actual.first_class_probes
+                    + dispatched_uniform.accounting.actual.greedy_extension_reads
+            );
+            assert_eq!(
+                established_uniform
+                    .accounting
+                    .prospective
+                    .greedy_extension_reads
+                    + haystack.len() * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                dispatched_uniform
+                    .accounting
+                    .prospective
+                    .greedy_extension_reads
+            );
+            assert!(
+                dispatched_uniform.accounting.closes_receipt(
+                    &dispatched
+                        .count_uniform_participation_attempt(
+                            &haystack,
+                            schema,
+                            UniformParticipationLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .receipt
+                )
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; requires an OS-usable fixed-16 SVE run scanner"]
+    fn benchmark_scalar_and_sve_prefix_class_extension() {
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            PrefixClassAlternationPlan::run_scanners_usable(dispatch),
+            "benchmark requires OS-usable SVE"
+        );
+        let word = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
+        let established = PrefixClassAlternationPlan::build(
+            [b"fn is_", b"fn as_"],
+            [word.into_iter(), word.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let dispatched = DispatchedPrefixClassAlternationPlan::build_with_dispatch(
+            dispatch,
+            [b"fn is_", b"fn as_"],
+            [word.into_iter(), word.into_iter()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let mut haystack = Vec::new();
+        for _ in 0..4_096 {
+            haystack.extend_from_slice(b"fn is_");
+            haystack.extend(std::iter::repeat_n(b'a', 128));
+            haystack.extend_from_slice(b"!fn as_");
+            haystack.extend(std::iter::repeat_n(b'7', 128));
+            haystack.push(b'!');
+        }
+        let iterations = 200;
+        let started = Instant::now();
+        let mut established_count = 0_u64;
+        for _ in 0..iterations {
+            established_count = established_count.wrapping_add(black_box(
+                established
+                    .count(black_box(&haystack), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+            ));
+        }
+        let established_elapsed = started.elapsed();
+        let started = Instant::now();
+        let mut dispatched_count = 0_u64;
+        for _ in 0..iterations {
+            dispatched_count = dispatched_count.wrapping_add(black_box(
+                dispatched
+                    .count(black_box(&haystack), ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+            ));
+        }
+        let dispatched_elapsed = started.elapsed();
+        assert_eq!(established_count, dispatched_count);
+        eprintln!(
+            "prefix/class scalar={established_elapsed:?} sve={dispatched_elapsed:?} bytes={} iterations={} selections={:?}",
+            haystack.len(),
+            iterations,
+            dispatched.run_scanner_selections()
+        );
     }
 
     #[test]
@@ -2692,6 +3737,32 @@ mod tests {
             UniformParticipationBuildError::AllocationsLimit {
                 needed: 2,
                 limit: 1,
+            }
+        );
+        assert_eq!(first_next.get(), 0);
+        assert_eq!(second_next.get(), 0);
+        assert_eq!(first_len.get(), 0);
+        assert_eq!(second_len.get(), 0);
+
+        let scanner_bytes = size_of::<RunScanners>();
+        let (first, first_next, first_len) = deceptive_ranges(&[(b'a', b'z')]);
+        let (second, second_next, second_len) = deceptive_ranges(&[(b'0', b'9')]);
+        let error =
+            DispatchedPrefixClassAlternationPlan::build_uniform_participation_with_dispatch(
+                SimdDispatchContext::capture(),
+                [b"ab", b"xy"],
+                [first, second],
+                UniformParticipationBuildLimits {
+                    max_initialized_run_scanner_bytes: scanner_bytes - 1,
+                    ..UniformParticipationBuildLimits::unlimited()
+                },
+            )
+            .expect_err("scanner initialization one-below must preflight");
+        assert_eq!(
+            error,
+            UniformParticipationBuildError::InitializedRunScannerBytesLimit {
+                needed: scanner_bytes,
+                limit: scanner_bytes - 1,
             }
         );
         assert_eq!(first_next.get(), 0);

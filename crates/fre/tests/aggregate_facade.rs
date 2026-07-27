@@ -9,7 +9,8 @@ use fre::{
     AggregatePlanKind, AggregatePlanSelection, AggregateResource, AggregateRunLimits,
     AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
     AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
-    BoundedContextReduceError, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    BoundedContextReduceError, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError,
     LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
     LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
     LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
@@ -5009,6 +5010,10 @@ fn capture_compile_work_limit_is_exact_and_single_search_routing_is_unchanged() 
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the route witness keeps exact scalar and dispatched SVE accounting beside the complete compatibility table"
+)]
 fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() {
     // rebar-row:imported/leipzig/huck-saw@rust/regex
     let huck_saw = aggregate_builder(r"Huck[a-zA-Z]+|Saw[a-zA-Z]+")
@@ -5036,24 +5041,35 @@ fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() 
     // Independent exact-limit witness: N=9 and
     // Q=(2+2 prefix bytes)+(1+1 class ranges)=6, so
     // W=16*N+8*Q+64=16*9+8*6+64=256. Complete spans: 0..4, 6..9.
+    // The distinct fixed-16 SVE owner reserves its worst-case 15*N physical
+    // classification recovery overhead as part of its own receipt.
     let witness = aggregate_builder(r"ab[a-z]+|xy[0-9]+")
         .unicode(false)
         .build_count()
         .unwrap();
+    let work = if matches!(
+        witness.build_report().plan_identity,
+        AggregatePlanIdentity::PrefixClassAlternation(identity)
+            if identity.kernel.plan_id == DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
+    ) {
+        256 + 9 * 15
+    } else {
+        256
+    };
     let mut exact = AggregateRunLimits::default();
-    exact.prefix_class_alternation.max_work = 256;
+    exact.prefix_class_alternation.max_work = work;
     assert_eq!(2, witness.count_value(b"abcz--xy7", exact).unwrap());
-    exact.prefix_class_alternation.max_work = 255;
+    exact.prefix_class_alternation.max_work = work - 1;
     let terminal = witness.count_value(b"abcz--xy7", exact).unwrap_err();
     assert!(terminal.has_closed_direct_attempt());
     assert!(matches!(
         terminal.source,
         AggregateExecutionSource::PrefixClassAlternation(
             PrefixClassAlternationReduceError::WorkLimit {
-                needed: 256,
-                limit: 255,
+                needed,
+                limit,
             }
-        )
+        ) if needed == work && limit == work - 1
     ));
 
     // Complete upstream span equality covers boundary windows, captures,

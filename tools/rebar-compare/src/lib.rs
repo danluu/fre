@@ -49,13 +49,14 @@ use fre::{
     CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
     CaptureRequiredLiteralSearchOperation, CaptureRunLimits, CaptureSearchError,
     CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession,
-    CompatibilityProfile, FixedClassSandwichBuildError, FixedClassSandwichBuildLimits,
-    FixedClassSandwichOperation, FixedClassSandwichReduceError, FixedClassSandwichReduceLimits,
-    FixedPredicateWord64BuildError, FixedPredicateWord64MatchSelection,
-    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
-    FixedPredicateWord64ReduceError, GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError,
-    GraphemeScalarDfaBuildLimits, GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError,
-    GraphemeScalarDfaReduceLimits, HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
+    CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
+    FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
+    FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
+    GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
+    GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
+    HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID, LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
     LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID, LineCaptureBuildError, LineCaptureBuildLimits,
     LineCaptureBuilder, LineCapturePlan, LineCapturePlanKind, LineCaptureRunError,
@@ -5516,10 +5517,13 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
             max_scratch_bytes: 0,
             max_persistent_bytes: limits.fre_aggregate_program_bytes,
             max_peak_bytes: limits.fre_aggregate_peak_bytes,
-            max_allocations: 2,
+            max_allocations: 3,
             max_copied_prefix_bytes: limits.pattern_bytes_per_job,
             max_finder_preprocess_input_bytes: limits.pattern_bytes_per_job,
             max_initialized_bitmap_bytes: 64,
+            max_initialized_run_scanner_bytes: defaults
+                .prefix_class_participation
+                .max_initialized_run_scanner_bytes,
             max_retained_capacity_bytes: limits.fre_aggregate_program_bytes,
         },
         ..defaults
@@ -10825,7 +10829,10 @@ fn require_unicode_plan_identity(
         }
         if let AggregatePlanIdentity::PrefixClassAlternation(identity) = report.plan_identity {
             if operation == LiteralAggregateOperation::Count
-                && identity.kernel.plan_id == PREFIX_CLASS_ALTERNATION_PLAN_ID
+                && matches!(
+                    identity.kernel.plan_id,
+                    PREFIX_CLASS_ALTERNATION_PLAN_ID | DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
+                )
                 && identity.kernel.operation_id == PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID
                 && !identity.kernel.unicode
                 && identity.kernel.alternatives == 2
@@ -20860,7 +20867,7 @@ mod tests {
         assert_eq!(mapped.prefix_class_participation.max_scratch_bytes, 0);
         assert_eq!(mapped.prefix_class_participation.max_persistent_bytes, 19);
         assert_eq!(mapped.prefix_class_participation.max_peak_bytes, 37);
-        assert_eq!(mapped.prefix_class_participation.max_allocations, 2);
+        assert_eq!(mapped.prefix_class_participation.max_allocations, 3);
         assert_eq!(
             mapped.prefix_class_participation.max_copied_prefix_bytes,
             31

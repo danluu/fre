@@ -35,10 +35,10 @@ use fre_kernels::{
     BoundedSeparatedFieldsFieldSource, BoundedSeparatedFieldsOperationIdentity,
     BoundedSeparatedFieldsPlan, BoundedSeparatedFieldsReduceAccounting,
     BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits,
-    DirectBuildAttemptActual, FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID,
-    FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID, FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
-    FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID, FixedAbsoluteDomainActual,
-    FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
+    DirectBuildAttemptActual, DispatchedPrefixClassAlternationPlan,
+    FIXED_CLASS_SANDWICH_COUNT_OPERATION_ID, FIXED_CLASS_SANDWICH_SPAN_SUM_OPERATION_ID,
+    FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID, FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
+    FixedAbsoluteDomainActual, FixedAbsoluteDomainBuildAccounting, FixedAbsoluteDomainBuildActual,
     FixedAbsoluteDomainBuildError, FixedAbsoluteDomainBuildErrorKind,
     FixedAbsoluteDomainBuildLimits, FixedAbsoluteDomainBuildProspective,
     FixedAbsoluteDomainBuildResource, FixedAbsoluteDomainCountOutcome,
@@ -9294,34 +9294,85 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from prefix/class inspection",
                     });
                 }
-                let attempt = PrefixClassAlternationPlan::build_attempt(
-                    prefixes,
-                    [
-                        classes[0]
-                            .ranges()
+                let use_run_scanners =
+                    PrefixClassAlternationPlan::run_scanners_usable(simd_dispatch)
+                        && classes
                             .iter()
-                            .copied()
-                            .map(class_bytes_range_tuple),
-                        classes[1]
-                            .ranges()
-                            .iter()
-                            .copied()
-                            .map(class_bytes_range_tuple),
-                    ],
-                    limits.prefix_class_alternation,
-                )
-                .map_err(|error| {
-                    construction.pending_terminal_effect =
-                        direct_build_stage_effect(work, error.actual());
-                    AggregateBuildError::PrefixClassAlternationBuild {
-                        operation,
-                        selection,
-                        source: error.into_source(),
-                    }
-                })?;
-                let (engine, build_actual) = attempt.into_parts();
+                            .all(|class| class.ranges().iter().all(|range| range.end() <= 0x7f));
+                let (engine, build, kernel_identity, build_actual) = if use_run_scanners {
+                    let attempt =
+                        DispatchedPrefixClassAlternationPlan::build_attempt_with_dispatch(
+                            simd_dispatch,
+                            prefixes,
+                            [
+                                classes[0]
+                                    .ranges()
+                                    .iter()
+                                    .copied()
+                                    .map(class_bytes_range_tuple),
+                                classes[1]
+                                    .ranges()
+                                    .iter()
+                                    .copied()
+                                    .map(class_bytes_range_tuple),
+                            ],
+                            limits.prefix_class_alternation,
+                        )
+                        .map_err(|error| {
+                            construction.pending_terminal_effect =
+                                direct_build_stage_effect(work, error.actual());
+                            AggregateBuildError::PrefixClassAlternationBuild {
+                                operation,
+                                selection,
+                                source: error.into_source(),
+                            }
+                        })?;
+                    let (dispatched, actual) = attempt.into_parts();
+                    let build = dispatched.build_accounting();
+                    let identity = dispatched.count_identity();
+                    (
+                        AggregatePrefixClassAlternationEngine::Dispatched(dispatched),
+                        build,
+                        identity,
+                        actual,
+                    )
+                } else {
+                    let attempt = PrefixClassAlternationPlan::build_attempt(
+                        prefixes,
+                        [
+                            classes[0]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(class_bytes_range_tuple),
+                            classes[1]
+                                .ranges()
+                                .iter()
+                                .copied()
+                                .map(class_bytes_range_tuple),
+                        ],
+                        limits.prefix_class_alternation,
+                    )
+                    .map_err(|error| {
+                        construction.pending_terminal_effect =
+                            direct_build_stage_effect(work, error.actual());
+                        AggregateBuildError::PrefixClassAlternationBuild {
+                            operation,
+                            selection,
+                            source: error.into_source(),
+                        }
+                    })?;
+                    let (established, actual) = attempt.into_parts();
+                    let build = established.build_accounting();
+                    let identity = established.count_identity();
+                    (
+                        AggregatePrefixClassAlternationEngine::Established(established),
+                        build,
+                        identity,
+                        actual,
+                    )
+                };
                 retain_direct_build_success(construction, work, build_actual);
-                let build = engine.build_accounting();
                 let report = AggregateBuildReport {
                     schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
                     construction_attempt: AggregateClosureEvidence::empty(),
@@ -9359,7 +9410,7 @@ impl AggregateBuilder {
                     build: AggregateBuildAccounting::PrefixClassAlternation(build),
                     plan_identity: AggregatePlanIdentity::PrefixClassAlternation(
                         AggregatePrefixClassAlternationIdentity {
-                            kernel: engine.count_identity(),
+                            kernel: kernel_identity,
                         },
                     ),
                     sealed_bounded_separated_fields_identity: None,
@@ -12299,6 +12350,29 @@ fn tagged_grapheme_ranges(
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
+    reason = "both prefix/class owners remain allocation-accounted by their kernels; boxing the established owner would change incumbent construction effects"
+)]
+enum AggregatePrefixClassAlternationEngine {
+    Established(PrefixClassAlternationPlan),
+    Dispatched(DispatchedPrefixClassAlternationPlan),
+}
+
+impl AggregatePrefixClassAlternationEngine {
+    fn count(
+        &self,
+        haystack: &[u8],
+        limits: PrefixClassAlternationReduceLimits,
+    ) -> Result<PrefixClassAlternationCountResult, PrefixClassAlternationReduceError> {
+        match self {
+            Self::Established(engine) => engine.count(haystack, limits),
+            Self::Dispatched(engine) => engine.count(haystack, limits),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
     reason = "selected engines retain their already-budgeted artifacts inline; boxing would add an unaccounted allocation"
 )]
 enum AggregateEngine {
@@ -12312,7 +12386,7 @@ enum AggregateEngine {
     GraphemeScalarDfa(GraphemeScalarDfaPlan),
     BoundedClassSequence(BoundedClassSequencePlan),
     BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
-    PrefixClassAlternation(PrefixClassAlternationPlan),
+    PrefixClassAlternation(AggregatePrefixClassAlternationEngine),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
     BoundedLiteralPair(BoundedLiteralPairPlan),
     BoundedContext(BoundedContextPlan),
