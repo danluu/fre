@@ -12,6 +12,7 @@ use fre_jit_aarch64::{
 ))]
 use fre_jit_aarch64::{
     emit_exact_aggregate_sve2_fixed16_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental,
 };
 use fre_kernel_ir::{
@@ -137,6 +138,155 @@ fn fixed_16_sve_qualification_receipt() {
                 kernel.identity()
             );
         }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+#[ignore = "parseable qualification benchmark: requires a native Linux/AArch64 host with SVE2"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the parseable native receipt keeps setup, correctness, measurement, and both backend rows together"
+)]
+fn sve2_fixed16_pair_count_benchmark_receipt() {
+    use std::{env, hint::black_box, time::Instant};
+
+    use fre_jit_aarch64::{
+        NativeAggregateImage, emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
+    };
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        env::var(name).map_or(default, |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"))
+        })
+    }
+
+    fn measure(
+        kernel: &crate::PublishedAggregateKernel<Count>,
+        haystack: &[u8],
+        iterations: usize,
+    ) -> (u128, u64) {
+        let limits = AggregateExecutionLimits::unlimited();
+        for _ in 0..16 {
+            black_box(
+                kernel
+                    .aggregate(black_box(haystack), limits)
+                    .expect("warm aggregate call"),
+            );
+        }
+        let started = Instant::now();
+        let mut checksum = 0_u64;
+        for _ in 0..iterations {
+            checksum = checksum.wrapping_add(black_box(
+                kernel
+                    .aggregate(black_box(haystack), limits)
+                    .expect("measured aggregate call"),
+            ));
+        }
+        (started.elapsed().as_nanos(), checksum)
+    }
+
+    fn report(
+        pair_kind: &str,
+        backend: &str,
+        kernel: &crate::PublishedAggregateKernel<Count>,
+        image: &NativeAggregateImage,
+        haystack: &[u8],
+        iterations: usize,
+        expected: u64,
+    ) {
+        let (total_ns, checksum) = measure(kernel, haystack, iterations);
+        let iteration_count = u128::try_from(iterations).expect("iterations fit u128");
+        let total_bytes = u128::try_from(haystack.len())
+            .expect("length fits u128")
+            .checked_mul(iteration_count)
+            .expect("bounded benchmark bytes");
+        let ns_per_iter = total_ns
+            .checked_div(iteration_count)
+            .expect("positive iteration count");
+        let bytes_per_second = total_bytes
+            .checked_mul(1_000_000_000)
+            .expect("bounded benchmark rate numerator")
+            .checked_div(total_ns.max(1))
+            .expect("nonzero elapsed denominator");
+        println!(
+            "fre-sve2-pair-count16-v1,{pair_kind},{backend},{},{},{iterations},{total_ns},{ns_per_iter},{bytes_per_second},{checksum},{expected},{},{}",
+            haystack.len(),
+            haystack.as_ptr().addr() & 15,
+            image.stats().code_bytes,
+            image.stats().vector_instructions,
+        );
+    }
+
+    let _lock = native_test_lock();
+    assert!(platform::has_sve2(), "qualification host must expose SVE2");
+    let haystack_bytes = env_usize("FRE_SVE2_PAIR_COUNT16_BENCH_BYTES", 1 << 20);
+    let iterations = env_usize("FRE_SVE2_PAIR_COUNT16_BENCH_ITERS", 200);
+    let alignment = env_usize("FRE_SVE2_PAIR_COUNT16_BENCH_ALIGNMENT", 0);
+    assert!(haystack_bytes > 0 && iterations > 0 && alignment < 16);
+    println!(
+        "schema,pair_kind,backend,haystack_bytes,alignment_mod16,iterations,total_ns,ns_per_iter,bytes_per_second,checksum,result,code_bytes,vector_instructions"
+    );
+
+    for (pair_kind, literal) in [
+        ("non_self_overlapping", b"ab".as_slice()),
+        ("equal_byte_recovery", b"aa".as_slice()),
+    ] {
+        let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+            .expect("pair benchmark program");
+        let current_image =
+            emit_exact_aggregate(&program, EmitLimits::default()).expect("current image");
+        let sve2_image = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+            &program,
+            EmitLimits::default(),
+        )
+        .expect("SVE2 pair image");
+        let current = publish_aggregate::<Count>(&current_image, PublicationLimits::default())
+            .expect("current publication");
+        let sve2 = publish_aggregate::<Count>(&sve2_image, PublicationLimits::default())
+            .expect("SVE2 pair publication");
+
+        let storage_bytes = alignment
+            .checked_add(haystack_bytes)
+            .expect("bounded benchmark allocation");
+        let mut storage = vec![b'x'; storage_bytes];
+        let haystack = &mut storage[alignment..];
+        for start in (3..haystack.len().saturating_sub(1)).step_by(97) {
+            haystack[start..start + 2].copy_from_slice(literal);
+        }
+        let expected = current
+            .aggregate(haystack, AggregateExecutionLimits::unlimited())
+            .expect("current result");
+        assert_eq!(
+            sve2.aggregate(haystack, AggregateExecutionLimits::unlimited())
+                .expect("SVE2 result"),
+            expected
+        );
+        report(
+            pair_kind,
+            "aarch64-current",
+            &current,
+            &current_image,
+            haystack,
+            iterations,
+            expected,
+        );
+        report(
+            pair_kind,
+            "sve2-fixed16-pair-count-experimental-v1",
+            &sve2,
+            &sve2_image,
+            haystack,
+            iterations,
+            expected,
+        );
     }
 }
 
@@ -557,6 +707,64 @@ fn experimental_sve2_fixed16_count_hardware_matches_oracle() {
     target_pointer_width = "64",
     target_endian = "little"
 ))]
+fn experimental_sve2_fixed16_pair_count_hardware_matches_oracle_and_guard_pages() {
+    if !platform::has_sve2() {
+        return;
+    }
+    let _lock = native_test_lock();
+    for literal in [b"ab".as_slice(), b"aa", b"\0\0", b"\xff\0"] {
+        let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+            .expect("pair count program");
+        let image = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+            &program,
+            EmitLimits::default(),
+        )
+        .expect("SVE2 pair image");
+        let kernel = publish_aggregate::<Count>(&image, PublicationLimits::default())
+            .expect("OS-usable SVE2 pair publication");
+
+        for alignment in 0..16 {
+            for length in [0, 1, 2, 3, 15, 16, 17, 18, 31, 32, 33, 34, 255, 256, 257] {
+                let mut storage = vec![0x5a; alignment + length + 16];
+                let haystack = &mut storage[alignment..alignment + length];
+                for (index, byte) in haystack.iter_mut().enumerate() {
+                    *byte = if (index + alignment) % 5 < 3 {
+                        literal[(index + alignment) % 2]
+                    } else {
+                        u8::try_from((index * 37 + alignment * 19) & 0xff).expect("masked byte")
+                    };
+                }
+                assert_aggregate_matches(&program, &kernel, haystack);
+            }
+        }
+
+        for length in [0, 1, 2, 15, 16, 17, 18, 31, 32, 33, 34, 63, 64, 65] {
+            let guarded: Vec<u8> = (0..length)
+                .map(|index| {
+                    if index % 5 < 3 {
+                        literal[index % 2]
+                    } else {
+                        0x5a
+                    }
+                })
+                .collect();
+            for right in [false, true] {
+                platform::with_guarded_haystack(&guarded, right, |haystack| {
+                    assert_aggregate_matches(&program, &kernel, haystack);
+                })
+                .expect("guarded SVE2 pair haystack");
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
 fn experimental_sve2_fixed16_span_sum_hardware_matches_oracle() {
     if !platform::has_sve2() {
         return;
@@ -597,18 +805,27 @@ fn experimental_sve2_fixed16_aggregates_require_os_usable_sve() {
         build_exact_aggregate::<Count>(b"x", ValidateLimits::default()).expect("count program");
     let spans = build_exact_aggregate::<SpanSum>(b"x", ValidateLimits::default())
         .expect("span-sum program");
+    let pair =
+        build_exact_aggregate::<Count>(b"ab", ValidateLimits::default()).expect("pair program");
     let count_image =
         emit_exact_aggregate_sve2_fixed16_count_experimental(&count, EmitLimits::default())
             .expect("SVE2 count image");
     let span_image =
         emit_exact_aggregate_sve2_fixed16_span_sum_experimental(&spans, EmitLimits::default())
             .expect("SVE2 span-sum image");
+    let pair_image =
+        emit_exact_aggregate_sve2_fixed16_pair_count_experimental(&pair, EmitLimits::default())
+            .expect("SVE2 pair image");
     assert!(matches!(
         publish_aggregate::<Count>(&count_image, PublicationLimits::default()),
         Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
     ));
     assert!(matches!(
         publish_aggregate::<SpanSum>(&span_image, PublicationLimits::default()),
+        Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+    ));
+    assert!(matches!(
+        publish_aggregate::<Count>(&pair_image, PublicationLimits::default()),
         Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
     ));
 }

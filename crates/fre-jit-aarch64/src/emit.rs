@@ -375,6 +375,25 @@ pub fn emit_exact_aggregate_sve2_fixed16_count_experimental(
     )
 }
 
+/// Emit the experimental fixed-16-lane SVE2 backend for a two-byte Count.
+///
+/// The vector loop forms an exact predicate for adjacent literal-byte pairs.
+/// It counts that predicate directly when the two bytes differ, because such
+/// matches cannot overlap. Equal-byte literals use the predicate as a screen
+/// and recover matches in ascending order to preserve non-overlap semantics.
+/// This remains an explicit experiment and does not change
+/// [`emit_exact_aggregate`] or [`BackendVersion::AGGREGATE_CURRENT`].
+pub fn emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+    program: &ExactAggregateProgram<Count>,
+    limits: EmitLimits,
+) -> Result<NativeAggregateImage, EmitError> {
+    emit_exact_aggregate_backend(
+        program,
+        limits,
+        AggregateBackend::Sve2Fixed16PairCountExperimental,
+    )
+}
+
 /// Emit the experimental fixed-16-lane SVE2 backend for one-byte `SpanSum`.
 ///
 /// Every admitted match has width one, so predicate population is exactly the
@@ -394,6 +413,7 @@ pub fn emit_exact_aggregate_sve2_fixed16_span_sum_experimental(
 enum AggregateBackend {
     Current,
     Sve2Fixed16CountExperimental,
+    Sve2Fixed16PairCountExperimental,
     Sve2Fixed16SpanSumExperimental,
 }
 
@@ -403,6 +423,9 @@ impl AggregateBackend {
             Self::Current => BackendVersion::AGGREGATE_CURRENT,
             Self::Sve2Fixed16CountExperimental => {
                 BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
+            }
+            Self::Sve2Fixed16PairCountExperimental => {
+                BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
             }
             Self::Sve2Fixed16SpanSumExperimental => {
                 BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
@@ -414,9 +437,9 @@ impl AggregateBackend {
         match self {
             Self::Current if vector_instructions == 0 => CpuFeatures::NONE,
             Self::Current => CpuFeatures::ASIMD,
-            Self::Sve2Fixed16CountExperimental | Self::Sve2Fixed16SpanSumExperimental => {
-                CpuFeatures::SVE.union(CpuFeatures::SVE2)
-            }
+            Self::Sve2Fixed16CountExperimental
+            | Self::Sve2Fixed16PairCountExperimental
+            | Self::Sve2Fixed16SpanSumExperimental => CpuFeatures::SVE.union(CpuFeatures::SVE2),
         }
     }
 }
@@ -438,6 +461,8 @@ fn emit_exact_aggregate_backend<A: AggregateOperation>(
         AggregateBackend::Current => {}
         AggregateBackend::Sve2Fixed16CountExperimental
             if literal.len() == 1 && A::OUTPUT == AggregateOutput::Count => {}
+        AggregateBackend::Sve2Fixed16PairCountExperimental
+            if literal.len() == 2 && A::OUTPUT == AggregateOutput::Count => {}
         AggregateBackend::Sve2Fixed16SpanSumExperimental
             if literal.len() == 1 && A::OUTPUT == AggregateOutput::SpanSum => {}
         _ => {
@@ -578,13 +603,152 @@ fn emit_aggregate_exact(
             | AggregateBackend::Sve2Fixed16SpanSumExperimental => {
                 emit_aggregate_single_byte_sve2_fixed16_count(assembler, done, overflow)
             }
+            AggregateBackend::Sve2Fixed16PairCountExperimental => Err(EmitError::InternalInvariant),
         }
+    } else if literal.len() == 2 && backend == AggregateBackend::Sve2Fixed16PairCountExperimental {
+        emit_aggregate_two_byte_sve2_fixed16_count(assembler, literal, done, overflow)
     } else {
         if backend != AggregateBackend::Current {
             return Err(EmitError::InternalInvariant);
         }
         emit_aggregate_multi_byte(assembler, literal, output, done, overflow)
     }
+}
+
+fn emit_aggregate_two_byte_sve2_fixed16_count(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    done: Label,
+    overflow: Label,
+) -> Result<(), EmitError> {
+    if literal.len() != 2 {
+        return Err(EmitError::InternalInvariant);
+    }
+    if literal[0] == literal[1] {
+        emit_aggregate_equal_pair_sve2_fixed16_count(assembler, done, overflow)
+    } else {
+        emit_aggregate_non_self_overlapping_pair_sve2_fixed16_count(assembler, done, overflow)
+    }
+}
+
+fn emit_aggregate_pair_sve2_fixed16_setup(
+    assembler: &mut Assembler,
+    done: Label,
+) -> Result<(), EmitError> {
+    assembler.cmp_reg64(X1, X12)?;
+    assembler.branch_cond(Condition::CarryClear, done)?;
+    // X6 is the final valid start. A sixteen-start vector iteration is
+    // admitted only when X6 - X5 >= 15, which proves that the second load's
+    // final active byte (start + 16) is at most haystack_len - 1.
+    assembler.sub_reg(X6, X1, X12)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    assembler.sve_duplicate_byte(1, X11)?;
+    assembler.load_byte(X11, X8, 1)?;
+    assembler.sve_duplicate_byte(3, X11)?;
+    assembler.mov_imm64(X5, 0)
+}
+
+fn emit_aggregate_pair_sve2_fixed16_predicate(assembler: &mut Assembler) -> Result<(), EmitError> {
+    assembler.add_reg(X15, X0, X5)?;
+    assembler.sve_load_bytes(0, 0, X15)?;
+    assembler.add_imm(X10, X15, 1)?;
+    assembler.sve_load_bytes(2, 0, X10)?;
+    assembler.sve2_match_bytes(1, 0, 0, 1)?;
+    assembler.sve2_match_bytes(2, 0, 2, 3)?;
+    assembler.sve_and_predicate_bytes(1, 0, 1, 2)
+}
+
+fn emit_aggregate_pair_scalar_candidate(
+    assembler: &mut Assembler,
+    candidate_miss: Label,
+    overflow: Label,
+) -> Result<(), EmitError> {
+    assembler.load_byte_reg(X10, X0, X5)?;
+    assembler.load_byte(X11, X8, 0)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    assembler.add_reg(X15, X0, X5)?;
+    assembler.load_byte(X10, X15, 1)?;
+    assembler.load_byte(X11, X8, 1)?;
+    assembler.cmp_reg32(X10, X11)?;
+    assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    emit_aggregate_add_immediate(assembler, 1, overflow)
+}
+
+fn emit_aggregate_non_self_overlapping_pair_sve2_fixed16_count(
+    assembler: &mut Assembler,
+    done: Label,
+    overflow: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let tail = assembler.new_label(LabelKind::SlowPath)?;
+    let tail_miss = assembler.new_label(LabelKind::Internal)?;
+    emit_aggregate_pair_sve2_fixed16_setup(assembler, done)?;
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, done)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail)?;
+    emit_aggregate_pair_sve2_fixed16_predicate(assembler)?;
+    assembler.sve_count_predicate_bytes(X10, 0, 1)?;
+    emit_aggregate_add_register(assembler, X10, overflow)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(tail)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, done)?;
+    emit_aggregate_pair_scalar_candidate(assembler, tail_miss, overflow)?;
+    assembler.add_imm(X5, X5, 2)?;
+    assembler.branch(tail)?;
+    assembler.bind(tail_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.branch(tail)
+}
+
+fn emit_aggregate_equal_pair_sve2_fixed16_count(
+    assembler: &mut Assembler,
+    done: Label,
+    overflow: Label,
+) -> Result<(), EmitError> {
+    let vector = assembler.new_label(LabelKind::Loop)?;
+    let scalar_block = assembler.new_label(LabelKind::SlowPath)?;
+    let scalar_tail = assembler.new_label(LabelKind::SlowPath)?;
+    let scalar_scan = assembler.new_label(LabelKind::Loop)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let advance_block = assembler.new_label(LabelKind::Internal)?;
+    emit_aggregate_pair_sve2_fixed16_setup(assembler, done)?;
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, done)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, scalar_tail)?;
+    emit_aggregate_pair_sve2_fixed16_predicate(assembler)?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(Condition::NotEqual, scalar_block)?;
+    assembler.bind(advance_block)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(scalar_block)?;
+    assembler.add_imm(X7, X5, 15)?;
+    assembler.branch(scalar_scan)?;
+    assembler.bind(scalar_tail)?;
+    assembler.mov_reg(X7, X6)?;
+    assembler.bind(scalar_scan)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::Higher, vector)?;
+    emit_aggregate_pair_scalar_candidate(assembler, candidate_miss, overflow)?;
+    assembler.add_imm(X5, X5, 2)?;
+    assembler.branch(scalar_scan)?;
+    assembler.bind(candidate_miss)?;
+    assembler.add_imm(X5, X5, 1)?;
+    assembler.branch(scalar_scan)
 }
 
 fn emit_aggregate_single_byte(

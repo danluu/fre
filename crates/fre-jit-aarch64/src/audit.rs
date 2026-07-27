@@ -2519,6 +2519,10 @@ struct AuthenticatedAggregateEnvelope {
     output: AggregateOutput,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the sealed aggregate shape matrix and identity rebuild remain in one authentication boundary"
+)]
 fn authenticate_aggregate_envelope(
     image: &NativeImage,
     work: &mut AuditWork,
@@ -2537,6 +2541,7 @@ fn authenticate_aggregate_envelope(
             | BackendVersion::AGGREGATE_HISTORICAL_V2
             | BackendVersion::AGGREGATE_SVE2_FIXED16_COUNT_EXPERIMENTAL_V1
             | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
+            | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
     ) || literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES
         || image.rodata.len() != literal_len
         || image.symbols.len() != 1
@@ -2556,6 +2561,17 @@ fn authenticate_aggregate_envelope(
                 AggregateOutput::SpanSum,
                 1,
             ) => (39_usize, 6_usize, 9_usize, 5_u32),
+            (
+                BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1,
+                AggregateOutput::Count,
+                2,
+            ) => {
+                if image.rodata[0] == image.rodata[1] {
+                    (55, 9, 13, 9)
+                } else {
+                    (55, 6, 12, 9)
+                }
+            }
             (
                 BackendVersion::AGGREGATE_V1 | BackendVersion::AGGREGATE_HISTORICAL_V2,
                 output,
@@ -2767,6 +2783,14 @@ fn validate_aggregate_template(
             | BackendVersion::AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1
     ) {
         return validate_aggregate_sve2_fixed16_count_experimental_template(
+            image,
+            instructions,
+            literal_len,
+            output,
+        );
+    }
+    if image.backend_version == BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1 {
+        return validate_aggregate_sve2_fixed16_pair_count_experimental_template(
             image,
             instructions,
             literal_len,
@@ -3752,6 +3776,378 @@ fn validate_aggregate_sve2_fixed16_count_experimental_template(
     cursor.finish()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the pair backend's complete decoded templates intentionally expose every opcode and operand"
+)]
+fn validate_aggregate_sve2_fixed16_pair_count_experimental_template(
+    image: &NativeImage,
+    instructions: &[DecodedInstruction],
+    literal_len: usize,
+    output: AggregateOutput,
+) -> Result<(), AuditError> {
+    use DecodedInstruction::{
+        AddImmediate64, AddRegister64, Address, Branch, BranchCondition, CompareImmediate64,
+        CompareRegister32, CompareRegister64, LoadByte, LoadByteRegister, MoveRegister64,
+        MoveZero64, Return, Store64, SubtractRegister64, Sve2MatchBytes, SveAndPredicateBytes,
+        SveCountPredicateBytes, SveDuplicateByte, SveLoadBytes, SvePtrueBytesVl16,
+        SveTestPredicateBytes,
+    };
+    const DIRECT_LABELS: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (48, LabelKind::Loop),
+        (124, LabelKind::SlowPath),
+        (192, LabelKind::Internal),
+        (200, LabelKind::ReturnFound),
+        (212, LabelKind::ReturnNone),
+    ];
+    const RECOVERY_LABELS: &[(u32, LabelKind)] = &[
+        (0, LabelKind::Entry),
+        (48, LabelKind::Loop),
+        (104, LabelKind::Internal),
+        (112, LabelKind::SlowPath),
+        (120, LabelKind::SlowPath),
+        (124, LabelKind::Loop),
+        (192, LabelKind::Internal),
+        (200, LabelKind::ReturnFound),
+        (212, LabelKind::ReturnNone),
+    ];
+
+    if image.backend_version != BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
+        || literal_len != 2
+        || output != AggregateOutput::Count
+        || image.rodata.len() != 2
+    {
+        return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+    }
+    let equal_pair = image.rodata[0] == image.rodata[1];
+    let expected_labels = if equal_pair {
+        RECOVERY_LABELS
+    } else {
+        DIRECT_LABELS
+    };
+    if image.labels.len() != expected_labels.len()
+        || image
+            .labels
+            .iter()
+            .zip(expected_labels)
+            .any(|(actual, expected)| (actual.offset, actual.kind) != *expected)
+    {
+        return Err(AuditError::InvalidAggregateTemplate { offset: 0 });
+    }
+
+    let mut cursor = AggregateTemplateCursor::new(instructions);
+    cursor.expect_all([
+        MoveZero64 {
+            destination: 13,
+            immediate: 0,
+            shift: 0,
+        },
+        Address {
+            destination: 8,
+            displacement: 220,
+        },
+        MoveZero64 {
+            destination: 12,
+            immediate: 2,
+            shift: 0,
+        },
+        CompareRegister64 { left: 1, right: 12 },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 184,
+        },
+        SubtractRegister64 {
+            destination: 6,
+            left: 1,
+            right: 12,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        SvePtrueBytesVl16 { destination: 0 },
+        SveDuplicateByte {
+            destination: 1,
+            source: 11,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 1,
+        },
+        SveDuplicateByte {
+            destination: 3,
+            source: 11,
+        },
+        MoveZero64 {
+            destination: 5,
+            immediate: 0,
+            shift: 0,
+        },
+        CompareRegister64 { left: 5, right: 6 },
+        BranchCondition {
+            condition: crate::Condition::Higher,
+            displacement: 148,
+        },
+        SubtractRegister64 {
+            destination: 10,
+            left: 6,
+            right: 5,
+        },
+        CompareImmediate64 {
+            register: 10,
+            immediate: 15,
+        },
+    ])?;
+
+    if equal_pair {
+        cursor.expect_all([
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 56,
+            },
+            AddRegister64 {
+                destination: 15,
+                left: 0,
+                right: 5,
+            },
+            SveLoadBytes {
+                destination: 0,
+                predicate: 0,
+                base: 15,
+            },
+            AddImmediate64 {
+                destination: 10,
+                source: 15,
+                immediate: 1,
+            },
+            SveLoadBytes {
+                destination: 2,
+                predicate: 0,
+                base: 10,
+            },
+            Sve2MatchBytes {
+                destination: 1,
+                predicate: 0,
+                left: 0,
+                right: 1,
+            },
+            Sve2MatchBytes {
+                destination: 2,
+                predicate: 0,
+                left: 2,
+                right: 3,
+            },
+            SveAndPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+            SveTestPredicateBytes {
+                predicate: 0,
+                tested: 1,
+            },
+            BranchCondition {
+                condition: crate::Condition::NotEqual,
+                displacement: 12,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 16,
+            },
+            Branch { displacement: -60 },
+            AddImmediate64 {
+                destination: 7,
+                source: 5,
+                immediate: 15,
+            },
+            Branch { displacement: 8 },
+            MoveRegister64 {
+                destination: 7,
+                source: 6,
+            },
+            CompareRegister64 { left: 5, right: 7 },
+            BranchCondition {
+                condition: crate::Condition::Higher,
+                displacement: -80,
+            },
+        ])?;
+    } else {
+        cursor.expect_all([
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 60,
+            },
+            AddRegister64 {
+                destination: 15,
+                left: 0,
+                right: 5,
+            },
+            SveLoadBytes {
+                destination: 0,
+                predicate: 0,
+                base: 15,
+            },
+            AddImmediate64 {
+                destination: 10,
+                source: 15,
+                immediate: 1,
+            },
+            SveLoadBytes {
+                destination: 2,
+                predicate: 0,
+                base: 10,
+            },
+            Sve2MatchBytes {
+                destination: 1,
+                predicate: 0,
+                left: 0,
+                right: 1,
+            },
+            Sve2MatchBytes {
+                destination: 2,
+                predicate: 0,
+                left: 2,
+                right: 3,
+            },
+            SveAndPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+            SveCountPredicateBytes {
+                destination: 10,
+                predicate: 0,
+                source: 1,
+            },
+            MoveRegister64 {
+                destination: 14,
+                source: 13,
+            },
+            AddRegister64 {
+                destination: 13,
+                left: 13,
+                right: 10,
+            },
+            CompareRegister64 {
+                left: 13,
+                right: 14,
+            },
+            BranchCondition {
+                condition: crate::Condition::CarryClear,
+                displacement: 100,
+            },
+            AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 16,
+            },
+            Branch { displacement: -72 },
+            CompareRegister64 { left: 5, right: 6 },
+            BranchCondition {
+                condition: crate::Condition::Higher,
+                displacement: 72,
+            },
+        ])?;
+    }
+
+    cursor.expect_all([
+        LoadByteRegister {
+            destination: 10,
+            base: 0,
+            index: 5,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 0,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: crate::Condition::NotEqual,
+            displacement: 48,
+        },
+        AddRegister64 {
+            destination: 15,
+            left: 0,
+            right: 5,
+        },
+        LoadByte {
+            destination: 10,
+            base: 15,
+            offset: 1,
+        },
+        LoadByte {
+            destination: 11,
+            base: 8,
+            offset: 1,
+        },
+        CompareRegister32 {
+            left: 10,
+            right: 11,
+        },
+        BranchCondition {
+            condition: crate::Condition::NotEqual,
+            displacement: 28,
+        },
+        MoveRegister64 {
+            destination: 14,
+            source: 13,
+        },
+        AddImmediate64 {
+            destination: 13,
+            source: 13,
+            immediate: 1,
+        },
+        CompareRegister64 {
+            left: 13,
+            right: 14,
+        },
+        BranchCondition {
+            condition: crate::Condition::CarryClear,
+            displacement: 32,
+        },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 2,
+        },
+        Branch { displacement: -64 },
+        AddImmediate64 {
+            destination: 5,
+            source: 5,
+            immediate: 1,
+        },
+        Branch { displacement: -72 },
+        Store64 {
+            source: 13,
+            base: 2,
+            offset: 0,
+        },
+        MoveZero64 {
+            destination: 0,
+            immediate: 0,
+            shift: 0,
+        },
+        Return,
+        MoveZero64 {
+            destination: 0,
+            immediate: 1,
+            shift: 0,
+        },
+        Return,
+    ])?;
+    cursor.finish()
+}
+
 fn instruction_offset(index: usize) -> Result<u32, AuditError> {
     u32::try_from(index)
         .ok()
@@ -3927,7 +4323,21 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             predicate,
             left,
             right,
+        }
+        | DecodedInstruction::SveAndPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
         } => forbidden(&[destination, predicate, left, right]),
+        DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+            forbidden(&[predicate, tested])
+        }
+        DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        } => forbidden(&[destination, predicate, source]),
         DecodedInstruction::UnsignedMinBytes16 {
             destination,
             source,
@@ -4274,11 +4684,17 @@ fn valid_aggregate_x10_write(
         } if Some(immediate) == last
             && matches!(
                 instruction_after(instructions, index, 1),
-                Some(DecodedInstruction::LoadVector128 {
-                    base: 10,
-                    offset: 0,
-                    ..
-                })
+                Some(
+                    DecodedInstruction::LoadVector128 {
+                        base: 10,
+                        offset: 0,
+                        ..
+                    } | DecodedInstruction::SveLoadBytes {
+                        destination: 2,
+                        predicate: 0,
+                        base: 10,
+                    }
+                )
             )
     )
 }
@@ -4340,7 +4756,8 @@ fn valid_aggregate_accumulator_write(
         AggregateOutput::Count => 1,
         AggregateOutput::SpanSum => literal_len,
     };
-    let is_accumulation = (literal_len == 1
+    let is_accumulation = ((literal_len == 1
+        || (literal_len == 2 && output == AggregateOutput::Count))
         && matches!(
             instruction,
             DecodedInstruction::AddRegister64 {
@@ -4436,6 +4853,18 @@ fn valid_aggregate_load(
                 immediate,
             }) if *immediate == last
         ),
+        DecodedInstruction::SveLoadBytes {
+            destination: 2,
+            predicate: 0,
+            base: 10,
+        } => matches!(
+            index.checked_sub(1).and_then(|prior| instructions.get(prior)),
+            Some(DecodedInstruction::AddImmediate64 {
+                destination: 10,
+                source: 15,
+                immediate,
+            }) if *immediate == last
+        ),
         DecodedInstruction::LoadByte { .. }
         | DecodedInstruction::LoadByteRegister { .. }
         | DecodedInstruction::Load64RegisterScaled { .. }
@@ -4445,6 +4874,10 @@ fn valid_aggregate_load(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "literal and scalar filter load witnesses stay adjacent for security review"
+)]
 fn valid_aggregate_last_byte_filter_load(
     instructions: &[DecodedInstruction],
     index: usize,
@@ -4509,6 +4942,35 @@ fn valid_aggregate_last_byte_filter_load(
                     source: 11
                 })
             );
+            let initial_sve_filter = matches!(
+                index
+                    .checked_sub(3)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::LoadByte {
+                    destination: 11,
+                    base: 8,
+                    offset: 0
+                })
+            ) && matches!(
+                index
+                    .checked_sub(2)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::SvePtrueBytesVl16 { destination: 0 })
+            ) && matches!(
+                index
+                    .checked_sub(1)
+                    .and_then(|prior| instructions.get(prior)),
+                Some(DecodedInstruction::SveDuplicateByte {
+                    destination: 1,
+                    source: 11
+                })
+            ) && matches!(
+                instruction_after(instructions, index, 1),
+                Some(DecodedInstruction::SveDuplicateByte {
+                    destination: 3,
+                    source: 11
+                })
+            );
             let scalar_filter = matches!(
                 index.checked_sub(1).and_then(|prior| instructions.get(prior)),
                 Some(DecodedInstruction::LoadByte {
@@ -4523,7 +4985,7 @@ fn valid_aggregate_last_byte_filter_load(
                     right: 11
                 })
             );
-            initial_filter || scalar_filter
+            initial_filter || initial_sve_filter || scalar_filter
         }
         _ => false,
     }
@@ -4669,9 +5131,25 @@ fn valid_aggregate_forward_edge(
                 crate::Condition::CarryClear,
             ) => matches!(
                 target_instruction,
-                Some(DecodedInstruction::MoveRegister64 {
+                Some(
+                    DecodedInstruction::MoveRegister64 {
+                        destination: 7,
+                        source: 6
+                    } | DecodedInstruction::CompareRegister64 { left: 5, right: 6 }
+                )
+            ),
+            (
+                Some(DecodedInstruction::SveTestPredicateBytes {
+                    predicate: 0,
+                    tested: 1,
+                }),
+                crate::Condition::NotEqual,
+            ) => matches!(
+                target_instruction,
+                Some(DecodedInstruction::AddImmediate64 {
                     destination: 7,
-                    source: 6
+                    source: 5,
+                    immediate: 15
                 })
             ),
             (
@@ -4935,7 +5413,19 @@ fn aggregate_predicate_reads(instruction: DecodedInstruction) -> u16 {
     match instruction {
         DecodedInstruction::SveLoadBytes { predicate, .. }
         | DecodedInstruction::Sve2MatchBytes { predicate, .. } => predicate_mask(&[predicate]),
-        DecodedInstruction::SveCountPredicateBytes {
+        DecodedInstruction::SveAndPredicateBytes {
+            predicate,
+            left,
+            right,
+            ..
+        } => predicate_mask(&[predicate, left, right]),
+        DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
+            predicate_mask(&[predicate, tested])
+        }
+        DecodedInstruction::SveBreakBeforeBytes {
+            predicate, source, ..
+        }
+        | DecodedInstruction::SveCountPredicateBytes {
             predicate, source, ..
         } => predicate_mask(&[predicate, source]),
         _ => 0,
@@ -4945,7 +5435,9 @@ fn aggregate_predicate_reads(instruction: DecodedInstruction) -> u16 {
 const fn aggregate_predicate_write(instruction: DecodedInstruction) -> Option<u8> {
     match instruction {
         DecodedInstruction::SvePtrueBytesVl16 { destination }
-        | DecodedInstruction::Sve2MatchBytes { destination, .. } => Some(destination),
+        | DecodedInstruction::Sve2MatchBytes { destination, .. }
+        | DecodedInstruction::SveAndPredicateBytes { destination, .. }
+        | DecodedInstruction::SveBreakBeforeBytes { destination, .. } => Some(destination),
         _ => None,
     }
 }

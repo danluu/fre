@@ -20,6 +20,7 @@ use crate::{
     SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
     emit::emit_search_version_for_test, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
+    emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve16,
     emit_with_backend, image::SearchShape,
 };
@@ -309,6 +310,250 @@ fn experimental_sve2_fixed16_count_is_explicit_audited_and_matches_oracle() {
             "SVE operand mutation at instruction {index} must fail"
         );
     }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the pair backend receipt keeps admission, audit, decoding, identity, overlap, and boundary checks together"
+)]
+fn experimental_sve2_fixed16_pair_count_is_exact_explicit_and_audited() {
+    let direct_program =
+        build_exact_aggregate::<Count>(b"ab", ValidateLimits::default()).expect("pair program");
+    let recovery_program = build_exact_aggregate::<Count>(b"aa", ValidateLimits::default())
+        .expect("self-overlapping pair program");
+    let current =
+        emit_exact_aggregate(&direct_program, EmitLimits::default()).expect("current image");
+    let direct = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+        &direct_program,
+        EmitLimits::default(),
+    )
+    .expect("direct SVE2 pair image");
+    let repeated = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+        &direct_program,
+        EmitLimits::default(),
+    )
+    .expect("deterministic pair image");
+    let recovery = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+        &recovery_program,
+        EmitLimits::default(),
+    )
+    .expect("overlap-safe SVE2 pair image");
+
+    assert_eq!(direct, repeated);
+    assert_eq!(current.backend_version(), BackendVersion::AGGREGATE_CURRENT);
+    assert_eq!(
+        direct.backend_version(),
+        BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
+    );
+    assert_eq!(direct.output(), AggregateOutput::Count);
+    assert_eq!(direct.literal_bytes(), 2);
+    assert_eq!(
+        direct.target().features,
+        CpuFeatures::SVE.union(CpuFeatures::SVE2)
+    );
+    assert_ne!(direct.artifact_identity(), current.artifact_identity());
+    assert_ne!(direct.artifact_identity(), recovery.artifact_identity());
+    let direct_aot = direct
+        .to_aot(AotLimits::default())
+        .expect("pair aggregate AOT");
+    assert_eq!(&direct_aot.as_bytes()[..8], b"FREA64A\x01");
+    assert_eq!(direct_aot.identity(), direct.artifact_identity());
+    assert_ne!(
+        direct_aot,
+        current
+            .to_aot(AotLimits::default())
+            .expect("current aggregate AOT")
+    );
+    assert_eq!(
+        audit_aggregate(&direct)
+            .expect("direct whole-template audit")
+            .stores,
+        1
+    );
+    assert_eq!(
+        audit_aggregate(&recovery)
+            .expect("recovery whole-template audit")
+            .stores,
+        1
+    );
+
+    let direct_instructions = decode(direct.code()).expect("direct pair decode");
+    let recovery_instructions = decode(recovery.code()).expect("recovery pair decode");
+    for (image, instructions) in [
+        (&direct, &direct_instructions),
+        (&recovery, &recovery_instructions),
+    ] {
+        assert_eq!(instructions.len(), 55);
+        assert_eq!(image.stats().vector_instructions, 9);
+        assert!(
+            instructions
+                .iter()
+                .all(|instruction| !instruction.is_asimd())
+        );
+        assert!(instructions.contains(&DecodedInstruction::SvePtrueBytesVl16 { destination: 0 }));
+        assert!(instructions.contains(&DecodedInstruction::SveLoadBytes {
+            destination: 2,
+            predicate: 0,
+            base: 10,
+        }));
+        assert!(instructions.contains(&DecodedInstruction::Sve2MatchBytes {
+            destination: 2,
+            predicate: 0,
+            left: 2,
+            right: 3,
+        }));
+        assert!(
+            instructions.contains(&DecodedInstruction::SveAndPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            })
+        );
+    }
+    assert!(
+        direct_instructions.contains(&DecodedInstruction::SveCountPredicateBytes {
+            destination: 10,
+            predicate: 0,
+            source: 1,
+        })
+    );
+    assert!(!direct_instructions.iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstruction::SveTestPredicateBytes { .. }
+    )));
+    assert!(
+        recovery_instructions.contains(&DecodedInstruction::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        })
+    );
+    assert!(!recovery_instructions.iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstruction::SveCountPredicateBytes { .. }
+    )));
+
+    assert_eq!(
+        decode_one(0xa400_a142, 0),
+        Ok(DecodedInstruction::SveLoadBytes {
+            destination: 2,
+            predicate: 0,
+            base: 10,
+        })
+    );
+    assert_eq!(
+        decode_one(0x4523_8042, 4),
+        Ok(DecodedInstruction::Sve2MatchBytes {
+            destination: 2,
+            predicate: 0,
+            left: 2,
+            right: 3,
+        })
+    );
+    assert_eq!(
+        decode_one(0x2502_4021, 8),
+        Ok(DecodedInstruction::SveAndPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        })
+    );
+
+    for literal in [b"ab".as_slice(), b"aa", b"\0\0", b"\xff\0"] {
+        let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default())
+            .expect("differential pair program");
+        let image = emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+            &program,
+            EmitLimits::default(),
+        )
+        .expect("differential pair image");
+        for length in [0, 1, 2, 3, 15, 16, 17, 18, 31, 32, 33, 34, 63, 64, 65] {
+            for phase in 0..7 {
+                let haystack: Vec<u8> = (0..length)
+                    .map(|index| {
+                        if (index + phase) % 5 < 3 {
+                            literal[(index + phase) % 2]
+                        } else {
+                            u8::try_from((index * 37 + phase * 19) & 0xff).expect("masked byte")
+                        }
+                    })
+                    .collect();
+                let expected = *program
+                    .execute(&haystack, AggregateExecutionLimits::unlimited())
+                    .expect("oracle")
+                    .output();
+                let actual = simulate_aggregate(&image, &haystack).expect("SVE2 pair simulation");
+                assert_eq!(
+                    aggregate_output(actual),
+                    Ok(expected),
+                    "literal={literal:?} length={length} phase={phase}"
+                );
+            }
+        }
+    }
+
+    for run_length in 0..=80 {
+        let haystack = vec![b'a'; run_length];
+        let expected = u64::try_from(run_length / 2).expect("bounded run");
+        let actual = simulate_aggregate(&recovery, &haystack).expect("overlap simulation");
+        assert_eq!(aggregate_output(actual), Ok(expected));
+    }
+
+    for invalid_literal in [b"x".as_slice(), b"xyz".as_slice()] {
+        let invalid = build_exact_aggregate::<Count>(invalid_literal, ValidateLimits::default())
+            .expect("invalid-width pair program");
+        assert_eq!(
+            emit_exact_aggregate_sve2_fixed16_pair_count_experimental(
+                &invalid,
+                EmitLimits::default()
+            ),
+            Err(EmitError::Unsupported {
+                reason: crate::UnsupportedReason::KernelShape,
+            })
+        );
+    }
+
+    for (index, replacement) in [
+        (
+            20,
+            DecodedInstruction::SveLoadBytes {
+                destination: 2,
+                predicate: 0,
+                base: 15,
+            },
+        ),
+        (
+            23,
+            DecodedInstruction::SveAndPredicateBytes {
+                destination: 2,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+        ),
+    ] {
+        let mut mutated = direct.inner().clone();
+        replace_test_decoded_at(&mut mutated, index, replacement);
+        reseal_test_image(&mut mutated);
+        assert!(
+            audit_aggregate(&NativeAggregateImage::new(mutated)).is_err(),
+            "pair operand mutation at instruction {index} must fail"
+        );
+    }
+
+    let mut wrong_output = direct.inner().clone();
+    wrong_output
+        .aggregate
+        .as_mut()
+        .expect("aggregate manifest")
+        .output = AggregateOutput::SpanSum;
+    reseal_test_image(&mut wrong_output);
+    assert_eq!(
+        audit_aggregate(&NativeAggregateImage::new(wrong_output)),
+        Err(AuditError::InvalidAggregateManifest)
+    );
 }
 
 #[test]

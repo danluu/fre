@@ -52,6 +52,12 @@ impl BackendVersion {
     /// backend shares the qualified predicate-counting loop while retaining a
     /// distinct backend and aggregate-output identity.
     pub const AGGREGATE_SVE2_FIXED16_SPAN_SUM_EXPERIMENTAL_V1: Self = Self(4);
+    /// Experimental fixed-16-lane SVE2 backend for two-byte Count programs.
+    ///
+    /// Unequal adjacent bytes cannot produce overlapping matches, so their
+    /// intersected pair predicate can be counted directly. Equal-byte pairs
+    /// retain exact non-overlap semantics through scalar recovery.
+    pub const AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1: Self = Self(5);
     /// Current aggregate tag; its AOT wire remains aggregate v1.
     pub const AGGREGATE_CURRENT: Self = Self::AGGREGATE_V1;
     /// Compatibility alias for callers that only handle search images.
