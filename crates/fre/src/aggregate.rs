@@ -12843,12 +12843,12 @@ impl AggregatePlan {
         clippy::large_types_passed_by_value,
         reason = "the complete Copy attempt is consumed into the allocation-free facade result"
     )]
-    fn exact_literal_count_execution(
+    fn exact_literal_count_success(
         &self,
         haystack_len: usize,
         execution_limits: &AggregateRunLimits,
         attempt: LiteralAggregateCountAttempt,
-    ) -> Result<AggregateCountExecution, AggregateExecutionError> {
+    ) -> Result<(u64, AggregateExactLiteralExecutionDetails), AggregateExecutionError> {
         if !attempt.closes() || attempt.result().count != attempt.receipt().actual.count {
             return Err(self.execution_error(
                 execution_limits,
@@ -12865,6 +12865,21 @@ impl AggregatePlan {
             result.accounting,
             receipt,
         )?;
+        Ok((value, details))
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the complete Copy attempt is consumed into the allocation-free facade result"
+    )]
+    fn exact_literal_count_execution(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        attempt: LiteralAggregateCountAttempt,
+    ) -> Result<AggregateCountExecution, AggregateExecutionError> {
+        let (value, details) =
+            self.exact_literal_count_success(haystack_len, execution_limits, attempt)?;
         Ok(AggregateCountExecution::ExactLiteral { value, details })
     }
 
@@ -12872,12 +12887,12 @@ impl AggregatePlan {
         clippy::large_types_passed_by_value,
         reason = "the complete Copy attempt is consumed into the allocation-free facade result"
     )]
-    fn exact_literal_span_sum_execution(
+    fn exact_literal_span_sum_success(
         &self,
         haystack_len: usize,
         execution_limits: &AggregateRunLimits,
         attempt: LiteralAggregateSpanSumAttempt,
-    ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
+    ) -> Result<(u64, AggregateExactLiteralExecutionDetails), AggregateExecutionError> {
         if !attempt.closes() || attempt.result().span_sum != attempt.receipt().actual.matched_bytes
         {
             return Err(self.execution_error(
@@ -12895,6 +12910,21 @@ impl AggregatePlan {
             result.accounting,
             receipt,
         )?;
+        Ok((value, details))
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        reason = "the complete Copy attempt is consumed into the allocation-free facade result"
+    )]
+    fn exact_literal_span_sum_execution(
+        &self,
+        haystack_len: usize,
+        execution_limits: &AggregateRunLimits,
+        attempt: LiteralAggregateSpanSumAttempt,
+    ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
+        let (value, details) =
+            self.exact_literal_span_sum_success(haystack_len, execution_limits, attempt)?;
         Ok(AggregateSpanSumExecution::ExactLiteral { value, details })
     }
 
@@ -14042,7 +14072,7 @@ impl AggregatePlan {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the value-only fixed/residual path keeps publication and terminal P/A checks in one audit boundary"
+        reason = "the exhaustive scalar dispatch avoids the large audited enum while keeping fixed/residual P/A checks in one audit boundary"
     )]
     fn execute_count_value(
         &self,
@@ -14175,33 +14205,268 @@ impl AggregatePlan {
                 }
             };
         }
-        let AggregateEngine::Continuation(engine) = &self.engine else {
-            return self
-                .execute_count(haystack, limits)
-                .map(|execution| execution.value());
-        };
-        let strategy = self.report.continuation_strategy.ok_or_else(|| {
-            self.execution_error(
+        match &self.engine {
+            AggregateEngine::ExactLiteral(engine) => {
+                match engine.count_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => self
+                        .exact_literal_count_success(haystack.len(), limits, attempt)
+                        .map(|(value, _)| value),
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
+            AggregateEngine::DispatchedExactLiteral(engine) => {
+                match engine.count_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => self
+                        .exact_literal_count_success(haystack.len(), limits, attempt)
+                        .map(|(value, _)| value),
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
+            AggregateEngine::UnicodeScalar(engine) => engine
+                .count(haystack, limits.unicode_scalar)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
+            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
+                .count(haystack, limits.unicode_scalar)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
+            AggregateEngine::WordRun(engine) => engine
+                .aggregate_count(haystack, limits.word_run)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
+            AggregateEngine::AsciiWordRun(engine) => engine
+                .aggregate_count(haystack, limits.word_run)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
+            AggregateEngine::LiteralAssertions(engine) => engine
+                .count(haystack, limits.literal_assertions)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::LiteralAssertions(source),
+                    )
+                }),
+            AggregateEngine::BlockingDelimiter(engine) => engine
+                .count(haystack, limits.blocking_delimiter)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BlockingDelimiter(source),
+                    )
+                }),
+            AggregateEngine::TokenPhrase(engine) => engine
+                .count(haystack, limits.token_phrase)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::TokenPhrase(source),
+                    )
+                }),
+            AggregateEngine::FixedClassSandwich(engine) => engine
+                .count(haystack, limits.fixed_class_sandwich)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
+            AggregateEngine::GraphemeScalarDfa(engine) => engine
+                .count(haystack, limits.grapheme_scalar_dfa)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::GraphemeScalarDfa(source),
+                    )
+                }),
+            AggregateEngine::BoundedClassSequence(engine) => engine
+                .count(haystack, limits.bounded_class_sequence)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedClassSequence(source),
+                    )
+                }),
+            AggregateEngine::BoundedSeparatedFields(engine) => engine
+                .count(haystack, limits.bounded_separated_fields)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedSeparatedFields(source),
+                    )
+                }),
+            AggregateEngine::PrefixClassAlternation(engine) => engine
+                .count(haystack, limits.prefix_class_alternation)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PrefixClassAlternation(source),
+                    )
+                }),
+            AggregateEngine::LiteralClassRunLiteral(engine) => engine
+                .count(haystack, limits.literal_class_run_literal)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::LiteralClassRunLiteral(source),
+                    )
+                }),
+            AggregateEngine::BoundedLiteralPair(engine) => engine
+                .count(haystack, limits.bounded_literal_pair)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedLiteralPair(source),
+                    )
+                }),
+            AggregateEngine::BoundedContext(engine) => engine
+                .count(haystack, limits.bounded_context)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedContext(source),
+                    )
+                }),
+            AggregateEngine::FixedAbsoluteDomain(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
-                    "continuation count plan lacks storage strategy",
+                    "fixed-domain count value route escaped its specialized branch",
                 ),
-            )
-        })?;
-        let attempt = engine
-            .count_value_attempt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        match u64::try_from(attempt.value) {
-            Ok(value) => Ok(value),
-            Err(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
             )),
+            AggregateEngine::FiniteCount(engine) => engine
+                .count(haystack, limits.finite_literal)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::FiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a finite span-sum plan",
+                ),
+            )),
+            AggregateEngine::SparseFiniteCount(engine) => engine
+                .count(haystack, sparse_finite_reduce_limits(limits.finite_literal))
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::SparseFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::SparseFiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a sparse finite span-sum plan",
+                ),
+            )),
+            AggregateEngine::GuardedAsciiWord(engine) => engine
+                .count_auto(
+                    haystack,
+                    guarded_ascii_word_reduce_limits(limits.finite_literal),
+                )
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                    )
+                }),
+            AggregateEngine::FixedPredicateWord64(engine) => engine
+                .count(
+                    haystack,
+                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
+                )
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FixedPredicateWord64(source),
+                    )
+                }),
+            AggregateEngine::Continuation(engine) => {
+                let strategy = self.report.continuation_strategy.ok_or_else(|| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation count plan lacks storage strategy",
+                        ),
+                    )
+                })?;
+                let attempt = engine
+                    .count_value_attempt(
+                        haystack,
+                        Self::full_range(haystack),
+                        strategy,
+                        limits.continuation,
+                    )
+                    .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+                match u64::try_from(attempt.value) {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation count does not fit u64",
+                        ),
+                    )),
+                }
+            }
         }
     }
 
@@ -14257,40 +14522,278 @@ impl AggregatePlan {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive scalar dispatch avoids materializing the much larger audited execution enum"
+    )]
     fn execute_span_sum_value(
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        let AggregateEngine::Continuation(engine) = &self.engine else {
-            return self
-                .execute_span_sum(haystack, limits)
-                .map(|execution| execution.value());
-        };
-        let strategy = self.report.continuation_strategy.ok_or_else(|| {
-            self.execution_error(
+        match &self.engine {
+            AggregateEngine::ExactLiteral(engine) => {
+                match engine.span_sum_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => self
+                        .exact_literal_span_sum_success(haystack.len(), limits, attempt)
+                        .map(|(value, _)| value),
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
+            AggregateEngine::DispatchedExactLiteral(engine) => {
+                match engine.span_sum_attempt(haystack, limits.exact_literal) {
+                    Ok(attempt) => self
+                        .exact_literal_span_sum_success(haystack.len(), limits, attempt)
+                        .map(|(value, _)| value),
+                    Err(attempt) => {
+                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+                    }
+                }
+            }
+            AggregateEngine::UnicodeScalar(engine) => engine
+                .span_sum(haystack, limits.unicode_scalar)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
+            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
+                .span_sum(haystack, limits.unicode_scalar)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::UnicodeScalar(source),
+                    )
+                }),
+            AggregateEngine::WordRun(engine) => engine
+                .aggregate_span_sum(haystack, limits.word_run)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
+            AggregateEngine::AsciiWordRun(engine) => engine
+                .aggregate_span_sum(haystack, limits.word_run)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::WordRun(source),
+                    )
+                }),
+            AggregateEngine::LiteralAssertions(engine) => engine
+                .span_sum(haystack, limits.literal_assertions)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::LiteralAssertions(source),
+                    )
+                }),
+            AggregateEngine::BlockingDelimiter(engine) => engine
+                .span_sum(haystack, limits.blocking_delimiter)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BlockingDelimiter(source),
+                    )
+                }),
+            AggregateEngine::TokenPhrase(engine) => engine
+                .span_sum(haystack, limits.token_phrase)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::TokenPhrase(source),
+                    )
+                }),
+            AggregateEngine::FixedClassSandwich(engine) => engine
+                .span_sum(haystack, limits.fixed_class_sandwich)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FixedClassSandwich(source),
+                    )
+                }),
+            AggregateEngine::GraphemeScalarDfa(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
-                    "continuation span-sum plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .span_sum_value_with_receipt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        match u64::try_from(attempt.value) {
-            Ok(value) => Ok(value),
-            Err(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span sum does not fit u64",
+                    "span-sum operation retained a count-only ordered scalar-grammar plan",
                 ),
             )),
+            AggregateEngine::BoundedClassSequence(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a bounded class-sequence count plan",
+                ),
+            )),
+            AggregateEngine::BoundedSeparatedFields(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a bounded separated-field count plan",
+                ),
+            )),
+            AggregateEngine::PrefixClassAlternation(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a count-only prefix/class plan",
+                ),
+            )),
+            AggregateEngine::LiteralClassRunLiteral(engine) => engine
+                .span_sum(haystack, limits.literal_class_run_literal)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::LiteralClassRunLiteral(source),
+                    )
+                }),
+            AggregateEngine::BoundedLiteralPair(engine) => engine
+                .span_sum(haystack, limits.bounded_literal_pair)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedLiteralPair(source),
+                    )
+                }),
+            AggregateEngine::BoundedContext(engine) => engine
+                .span_sum(
+                    haystack,
+                    BoundedContextSpanSumLimits::from_shared(limits.bounded_context),
+                )
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::BoundedContext(source),
+                    )
+                }),
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                if engine.residual.is_some() {
+                    return Err(self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "span-sum fixed-domain route retained a residual",
+                        ),
+                    ));
+                }
+                engine
+                    .guard
+                    .span_sum(haystack, limits.fixed_absolute)
+                    .map(|result| result.span_sum)
+                    .map_err(|source| {
+                        self.fixed_execution_error(
+                            limits,
+                            AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                        )
+                    })
+            }
+            AggregateEngine::FiniteSpanSum(engine) => engine
+                .span_sum(haystack, limits.finite_literal)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::FiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a finite count plan",
+                ),
+            )),
+            AggregateEngine::SparseFiniteSpanSum(engine) => engine
+                .span_sum(haystack, sparse_finite_reduce_limits(limits.finite_literal))
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::SparseFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::SparseFiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a sparse finite count plan",
+                ),
+            )),
+            AggregateEngine::GuardedAsciiWord(engine) => engine
+                .span_sum_auto(
+                    haystack,
+                    guarded_ascii_word_reduce_limits(limits.finite_literal),
+                )
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::GuardedAsciiWord(Box::new(source)),
+                    )
+                }),
+            AggregateEngine::FixedPredicateWord64(engine) => engine
+                .span_sum(
+                    haystack,
+                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
+                )
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FixedPredicateWord64(source),
+                    )
+                }),
+            AggregateEngine::Continuation(engine) => {
+                let strategy = self.report.continuation_strategy.ok_or_else(|| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation span-sum plan lacks storage strategy",
+                        ),
+                    )
+                })?;
+                let attempt = engine
+                    .span_sum_value_with_receipt(
+                        haystack,
+                        Self::full_range(haystack),
+                        strategy,
+                        limits.continuation,
+                    )
+                    .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+                match u64::try_from(attempt.value) {
+                    Ok(value) => Ok(value),
+                    Err(_) => Err(self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "continuation span sum does not fit u64",
+                        ),
+                    )),
+                }
+            }
         }
     }
 

@@ -417,10 +417,16 @@ fn endpoint_direct_descriptors_match_forced_continuation_and_never_rebase_anchor
             .build_span_sum()
             .unwrap();
         for &haystack in haystacks {
+            let audited = direct
+                .span_sum(haystack, AggregateRunLimits::default())
+                .unwrap()
+                .value();
+            let value = direct
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap();
+            assert_eq!(audited, value, "{pattern} on {haystack:?}");
             assert_eq!(
-                direct
-                    .span_sum_value(haystack, AggregateRunLimits::default())
-                    .unwrap(),
+                value,
                 oracle
                     .span_sum_value(haystack, AggregateRunLimits::default())
                     .unwrap(),
@@ -1803,6 +1809,18 @@ fn endpoint_facade_forwards_exact_and_every_positive_one_below_fixed_run_limits(
             },
         )
         .unwrap();
+    assert_eq!(
+        regex
+            .span_sum_value(
+                haystack,
+                AggregateRunLimits {
+                    fixed_absolute: exact,
+                    ..AggregateRunLimits::default()
+                },
+            )
+            .unwrap(),
+        baseline.value()
+    );
 
     let refusals = [
         (
@@ -1870,15 +1888,13 @@ fn endpoint_facade_forwards_exact_and_every_positive_one_below_fixed_run_limits(
         ),
     ];
     for (resource, fixed_absolute) in refusals {
-        let error = regex
-            .span_sum(
-                haystack,
-                AggregateRunLimits {
-                    fixed_absolute,
-                    ..AggregateRunLimits::default()
-                },
-            )
-            .unwrap_err();
+        let limits = AggregateRunLimits {
+            fixed_absolute,
+            ..AggregateRunLimits::default()
+        };
+        let error = regex.span_sum(haystack, limits).unwrap_err();
+        let value_error = regex.span_sum_value(haystack, limits).unwrap_err();
+        assert_eq!(value_error, error);
         assert!(
             error.identity.as_fixed_absolute_domain().is_some(),
             "direct fixed refusal lost its compact identity"
