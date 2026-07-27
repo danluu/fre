@@ -8,15 +8,28 @@
 //! successful greedy continuation scans disjoint after normal regex
 //! non-overlap. Execution therefore streams one candidate and one continuation
 //! state without a queue, active set, scratch allocation, or input rewind.
+//! A caller-captured dispatch context may retain one fixed-16 SVE/SVE2 scanner
+//! for an all-ASCII tail class. Its reported physical classifications,
+//! including terminating-load recovery, are charged exactly; the prospective
+//! envelope admits the scanner's bounded per-candidate overhead. Non-SVE hosts
+//! and classes containing non-ASCII bytes retain the scalar loop unchanged.
 
 use core::{fmt, mem::size_of};
 
+use fre_simd_kernels::{
+    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
+    Feature, FeatureSet, SimdDispatchContext,
+};
+
 use crate::required_literal::ByteClass;
 
-pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v3";
-pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v3";
+pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v4";
+pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v4";
 pub const MAX_OPTIONAL_STAGES: usize = 4;
 const MAX_ANCHOR_BYTES: usize = 64;
+// One complete ASCII-domain table pass, one paired-direction selection, and
+// one retained receipt. This is independent of the dispatcher's variant count.
+const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OptionalStageSource {
@@ -90,6 +103,7 @@ pub struct BuildAccounting {
     pub border_byte_comparisons: usize,
     pub anchor_storage_initialization_bytes: usize,
     pub anchor_copy_bytes: usize,
+    pub tail_run_scanner_build_work: usize,
     pub allocations: usize,
     pub reserves: usize,
     pub source_copies: usize,
@@ -301,6 +315,7 @@ pub struct RequiredInternalAnchorPlan {
     continuation: ContinuationSource,
     anchor: [u8; MAX_ANCHOR_BYTES],
     anchor_len: u8,
+    tail_run_scanner: Option<AsciiByteSetRunScanner>,
     build: BuildAccounting,
 }
 
@@ -312,7 +327,23 @@ impl RequiredInternalAnchorPlan {
         anchor_bytes: usize,
         optional_count: u8,
     ) -> Result<usize, BuildError> {
-        build_work_upper_bound(anchor_bytes, usize::from(optional_count))
+        build_work_upper_bound(anchor_bytes, usize::from(optional_count), false)
+    }
+
+    /// Derive the build-work envelope for a caller-captured SIMD context.
+    ///
+    /// Only an all-ASCII tail on a host with OS-usable SVE adds the fixed
+    /// scanner-construction charge. No input bytes are read.
+    pub fn build_work_upper_bound_with_dispatch(
+        dispatch: SimdDispatchContext,
+        anchor_bytes: usize,
+        continuation: ContinuationSource,
+    ) -> Result<usize, BuildError> {
+        build_work_upper_bound(
+            anchor_bytes,
+            usize::from(continuation.optional_count),
+            tail_run_policy(dispatch, continuation.tail).is_some(),
+        )
     }
 
     /// Build a descriptor-driven candidate stream after proving its bounds.
@@ -322,9 +353,40 @@ impl RequiredInternalAnchorPlan {
         continuation: ContinuationSource,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
+        Self::build_inner(None, prefix, anchor, &continuation, limits)
+    }
+
+    /// Build with one capability snapshot captured before the accounted
+    /// transaction. Eligible ASCII tails retain an SVE/SVE2 run scanner;
+    /// every other host and tail retains the scalar loop.
+    pub fn build_with_dispatch(
+        dispatch: SimdDispatchContext,
+        prefix: ByteClass,
+        anchor: &[u8],
+        continuation: ContinuationSource,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_inner(Some(dispatch), prefix, anchor, &continuation, limits)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the complete preflight, structural proof, optional SVE scanner construction, and exact receipt remain adjacent"
+    )]
+    fn build_inner(
+        dispatch: Option<SimdDispatchContext>,
+        prefix: ByteClass,
+        anchor: &[u8],
+        continuation: &ContinuationSource,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
         let anchor_bytes = anchor.len();
         let optional_count = usize::from(continuation.optional_count);
-        let work_upper_bound = build_work_upper_bound(anchor_bytes, optional_count)?;
+        let tail_run = dispatch.and_then(|snapshot| {
+            tail_run_policy(snapshot, continuation.tail).map(|policy| (snapshot, policy))
+        });
+        let work_upper_bound =
+            build_work_upper_bound(anchor_bytes, optional_count, tail_run.is_some())?;
         if work_upper_bound > limits.max_build_work {
             return Err(BuildError::WorkLimit {
                 needed: work_upper_bound,
@@ -371,12 +433,22 @@ impl RequiredInternalAnchorPlan {
                 count: continuation.optional_count,
             });
         }
-        validate_optional(&continuation, optional_count, &mut meter)?;
+        validate_optional(continuation, optional_count, &mut meter)?;
 
         if let Some(border) = longest_border(anchor, &mut meter)? {
             return Err(BuildError::OverlappingAnchor { border });
         }
 
+        let tail_run_scanner = if let Some((snapshot, policy)) = tail_run {
+            meter.tail_run_scanner(SIMD_RUN_SCANNER_BUILD_WORK)?;
+            Some(
+                snapshot
+                    .ascii_byte_set_run_scanner(ascii_set(continuation.tail), policy)
+                    .expect("the retained policy was derived from this authentic host snapshot"),
+            )
+        } else {
+            None
+        };
         meter.anchor_storage_initialization(MAX_ANCHOR_BYTES)?;
         let mut owned_anchor = [0_u8; MAX_ANCHOR_BYTES];
         meter.anchor_copy(anchor_bytes)?;
@@ -395,9 +467,10 @@ impl RequiredInternalAnchorPlan {
             u8::try_from(anchor_bytes).map_err(|_| BuildError::Overflow("fixed anchor length"))?;
         Ok(Self {
             prefix,
-            continuation,
+            continuation: *continuation,
             anchor: owned_anchor,
             anchor_len,
+            tail_run_scanner,
             build: BuildAccounting {
                 anchor_bytes,
                 class_words,
@@ -414,6 +487,7 @@ impl RequiredInternalAnchorPlan {
                 border_byte_comparisons: meter.border_byte_comparisons,
                 anchor_storage_initialization_bytes: meter.anchor_storage_initialization_bytes,
                 anchor_copy_bytes: meter.anchor_copy_bytes,
+                tail_run_scanner_build_work: meter.tail_run_scanner_build_work,
                 allocations: 0,
                 reserves: 0,
                 source_copies: 1,
@@ -452,6 +526,15 @@ impl RequiredInternalAnchorPlan {
     #[must_use]
     pub const fn build_accounting(&self) -> BuildAccounting {
         self.build
+    }
+
+    /// Stable selected tail-run implementation, when this plan retained one.
+    #[must_use]
+    pub const fn tail_run_variant_id(&self) -> Option<&'static str> {
+        match self.tail_run_scanner {
+            Some(scanner) => Some(scanner.selection().variant_id),
+            None => None,
+        }
     }
 
     /// Count leftmost-first non-overlapping matches after complete preflight.
@@ -559,8 +642,20 @@ impl RequiredInternalAnchorPlan {
             "per-candidate continuation overhead",
         )?;
         let continuation_steps = add(
-            input_bytes,
-            mul(candidate_visits, per_candidate, "continuation bound")?,
+            add(
+                input_bytes,
+                mul(candidate_visits, per_candidate, "continuation bound")?,
+                "continuation bound",
+            )?,
+            if self.tail_run_scanner.is_some() {
+                mul(
+                    candidate_visits,
+                    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                    "tail run classification overhead bound",
+                )?
+            } else {
+                0
+            },
             "continuation bound",
         )?;
         let source_accesses = add(
@@ -682,16 +777,33 @@ impl RequiredInternalAnchorPlan {
         if !self.continuation.head.contains(first) {
             return Ok(None);
         }
-        let mut cursor = start;
-        let mut tail_bytes = 0_usize;
-        while let Some(&byte) = haystack.get(cursor) {
-            actual.continuation_steps = add(actual.continuation_steps, 1, "continuation steps")?;
-            if !self.continuation.tail.contains(byte) {
-                break;
+        let (mut cursor, tail_bytes) = if let Some(scanner) = &self.tail_run_scanner {
+            let remaining = haystack
+                .get(start..)
+                .ok_or(CountError::Overflow("tail run source window"))?;
+            let result = scanner.scan_forward(remaining);
+            actual.continuation_steps = add(
+                actual.continuation_steps,
+                result.examined_bytes(),
+                "tail run physical classifications",
+            )?;
+            let tail_bytes = result.member_run_len();
+            debug_assert!(tail_bytes > 0, "the proved head is a tail member");
+            (add(start, tail_bytes, "tail scanner cursor")?, tail_bytes)
+        } else {
+            let mut cursor = start;
+            let mut tail_bytes = 0_usize;
+            while let Some(&byte) = haystack.get(cursor) {
+                actual.continuation_steps =
+                    add(actual.continuation_steps, 1, "continuation steps")?;
+                if !self.continuation.tail.contains(byte) {
+                    break;
+                }
+                tail_bytes = add(tail_bytes, 1, "tail bytes")?;
+                cursor = add(cursor, 1, "tail cursor")?;
             }
-            tail_bytes = add(tail_bytes, 1, "tail bytes")?;
-            cursor = add(cursor, 1, "tail cursor")?;
-        }
+            (cursor, tail_bytes)
+        };
         if tail_bytes < 2 {
             return Ok(None);
         }
@@ -732,6 +844,7 @@ struct BuildMeter {
     border_byte_comparisons: usize,
     anchor_storage_initialization_bytes: usize,
     anchor_copy_bytes: usize,
+    tail_run_scanner_build_work: usize,
 }
 
 impl BuildMeter {
@@ -795,6 +908,14 @@ impl BuildMeter {
         )
     }
 
+    fn tail_run_scanner(&mut self, amount: usize) -> Result<(), BuildError> {
+        checked_meter_add(
+            &mut self.tail_run_scanner_build_work,
+            amount,
+            "tail run scanner build work",
+        )
+    }
+
     fn total(&self) -> Result<usize, BuildError> {
         [
             self.admission_checks,
@@ -807,6 +928,7 @@ impl BuildMeter {
             self.border_byte_comparisons,
             self.anchor_storage_initialization_bytes,
             self.anchor_copy_bytes,
+            self.tail_run_scanner_build_work,
         ]
         .into_iter()
         .try_fold(0_usize, |total, amount| {
@@ -903,9 +1025,33 @@ fn is_subset(
     Ok(true)
 }
 
+fn ascii_set(class: ByteClass) -> AsciiByteSet {
+    let words = class.words();
+    debug_assert_eq!(words[2], 0);
+    debug_assert_eq!(words[3], 0);
+    AsciiByteSet::from_words([words[0], words[1]])
+}
+
+fn tail_run_policy(dispatch: SimdDispatchContext, class: ByteClass) -> Option<DispatchPolicy> {
+    let words = class.words();
+    if words[2] != 0 || words[3] != 0 {
+        return None;
+    }
+    let usable = dispatch.capabilities().usable();
+    if !usable.contains(Feature::ArmSve) {
+        return None;
+    }
+    let mut allowed = FeatureSet::of(Feature::ArmSve);
+    if usable.contains(Feature::ArmSve2) {
+        allowed = allowed.with(Feature::ArmSve2);
+    }
+    Some(DispatchPolicy::AllowOnly(allowed))
+}
+
 fn build_work_upper_bound(
     anchor_bytes: usize,
     raw_optional_count: usize,
+    tail_run_scanner: bool,
 ) -> Result<usize, BuildError> {
     let optional_count = raw_optional_count.min(MAX_OPTIONAL_STAGES);
     let admission_checks = 8_usize;
@@ -945,6 +1091,11 @@ fn build_work_upper_bound(
         border_byte_comparisons,
         MAX_ANCHOR_BYTES,
         anchor_bytes,
+        if tail_run_scanner {
+            SIMD_RUN_SCANNER_BUILD_WORK
+        } else {
+            0
+        },
     ]
     .into_iter()
     .try_fold(0_usize, |total, amount| {
@@ -1796,5 +1947,197 @@ mod tests {
             ),
             Err(BuildError::AnchorLimit { .. })
         ));
+    }
+
+    #[test]
+    fn dispatched_ascii_tail_matches_scalar_with_exact_physical_accounting() {
+        let prefix = ByteClass::from_bytes(b"a");
+        let continuation =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"ab"));
+        let scalar =
+            RequiredInternalAnchorPlan::build(prefix, b"X", continuation, BuildLimits::default())
+                .unwrap();
+        let dispatch = SimdDispatchContext::capture();
+        let dispatched = RequiredInternalAnchorPlan::build_with_dispatch(
+            dispatch,
+            prefix,
+            b"X",
+            continuation,
+            BuildLimits::default(),
+        )
+        .unwrap();
+
+        let mut long = b"aaaaX".to_vec();
+        long.extend((0..257).map(|index| if index & 1 == 0 { b'a' } else { b'b' }));
+        long.push(b'!');
+        for haystack in [
+            b"aXaa!".as_slice(),
+            b"aXa!".as_slice(),
+            b"aaXabba!aXaa!".as_slice(),
+            b"aXaa\xffab!".as_slice(),
+            long.as_slice(),
+        ] {
+            let scalar_result = scalar.count(haystack, CountLimits::default()).unwrap();
+            let dispatched_result = dispatched.count(haystack, CountLimits::default()).unwrap();
+            assert_eq!(dispatched_result.count, scalar_result.count);
+            assert!(
+                dispatched_result.accounting.actual.continuation_steps
+                    <= dispatched_result.accounting.upper_bounds.continuation_steps
+            );
+            assert!(
+                dispatched_result.accounting.actual.source_accesses
+                    <= dispatched_result.accounting.upper_bounds.source_accesses
+            );
+            assert!(
+                dispatched_result.accounting.actual.work
+                    <= dispatched_result.accounting.upper_bounds.work
+            );
+        }
+
+        let scalar_long = scalar.count(&long, CountLimits::default()).unwrap();
+        let dispatched_long = dispatched.count(&long, CountLimits::default()).unwrap();
+        if let Some(scanner) = dispatched.tail_run_scanner.as_ref() {
+            assert!(scanner.selection().variant_id.contains(".sve"));
+            assert_eq!(
+                dispatched.build.tail_run_scanner_build_work,
+                SIMD_RUN_SCANNER_BUILD_WORK
+            );
+            let tail_start = 5;
+            let scan = scanner.scan_forward(&long[tail_start..]);
+            assert_eq!(scan.member_run_len(), 257);
+            assert_eq!(
+                dispatched_long.accounting.actual.continuation_steps,
+                scan.examined_bytes() + 1
+            );
+        } else {
+            assert_eq!(dispatched.build.tail_run_scanner_build_work, 0);
+            assert_eq!(
+                dispatched_long.accounting.actual,
+                scalar_long.accounting.actual
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native release benchmark; requires an OS-usable fixed-16 SVE2 host"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the ignored qualification benchmark keeps alternating scalar/SVE2 samples and its authenticated receipt together"
+    )]
+    fn benchmark_required_internal_anchor_ascii_tail_scalar_against_sve2() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure(
+            plan: &RequiredInternalAnchorPlan,
+            haystack: &[u8],
+            iterations: u32,
+        ) -> (f64, u64) {
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                let result = black_box(plan)
+                    .count(black_box(haystack), CountLimits::default())
+                    .unwrap();
+                checksum = checksum.wrapping_add(black_box(result.count));
+            }
+            (
+                started.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(iterations),
+                checksum,
+            )
+        }
+
+        fn median(samples: &[f64]) -> f64 {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        }
+
+        fn serialize(samples: &[f64]) -> String {
+            samples
+                .iter()
+                .map(|sample| format!("{sample:.9}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let dispatch = SimdDispatchContext::capture();
+        let usable = dispatch.capabilities().usable();
+        assert!(
+            usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2),
+            "benchmark requires OS-usable SVE and SVE2"
+        );
+        let prefix = ByteClass::from_bytes(b"a");
+        let continuation =
+            ContinuationSource::new(ByteClass::from_bytes(b"a"), ByteClass::from_bytes(b"ab"));
+        let scalar =
+            RequiredInternalAnchorPlan::build(prefix, b"X", continuation, BuildLimits::default())
+                .unwrap();
+        let sve2 = RequiredInternalAnchorPlan::build_with_dispatch(
+            dispatch,
+            prefix,
+            b"X",
+            continuation,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            sve2.tail_run_variant_id(),
+            Some("ascii-byte-set.run.sve2-match16.v1")
+        );
+
+        let mut haystack = Vec::with_capacity((256 << 10) + 3);
+        haystack.extend_from_slice(b"aX");
+        haystack.extend((0..(256 << 10)).map(|index| if index & 1 == 0 { b'a' } else { b'b' }));
+        haystack.push(b'!');
+        assert_eq!(
+            scalar
+                .count(&haystack, CountLimits::default())
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            sve2.count(&haystack, CountLimits::default()).unwrap().count,
+            1
+        );
+
+        let iterations = std::env::var("FRE_REQUIRED_ANCHOR_RUN_BENCH_ITERS").map_or(128, |raw| {
+            raw.parse::<u32>()
+                .unwrap_or_else(|error| panic!("FRE_REQUIRED_ANCHOR_RUN_BENCH_ITERS: {error}"))
+        });
+        assert!(iterations > 0);
+        let _ = measure(&scalar, &haystack, iterations / 8 + 1);
+        let _ = measure(&sve2, &haystack, iterations / 8 + 1);
+
+        let samples = 16;
+        let mut scalar_samples = Vec::with_capacity(samples);
+        let mut sve2_samples = Vec::with_capacity(samples);
+        let mut orders = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            if sample & 1 == 0 {
+                scalar_samples.push(measure(&scalar, &haystack, iterations).0);
+                sve2_samples.push(measure(&sve2, &haystack, iterations).0);
+                orders.push("scalar>sve2");
+            } else {
+                sve2_samples.push(measure(&sve2, &haystack, iterations).0);
+                scalar_samples.push(measure(&scalar, &haystack, iterations).0);
+                orders.push("sve2>scalar");
+            }
+        }
+        let scalar_median = median(&scalar_samples);
+        let sve2_median = median(&sve2_samples);
+        eprintln!(
+            "REQUIRED_INTERNAL_ANCHOR_RUN_BENCH iterations={iterations} samples={samples} \
+             bytes={} scalar_ns={scalar_median:.9} sve2_ns={sve2_median:.9} \
+             sve2_over_scalar={:.9} orders={} scalar_samples={} sve2_samples={}",
+            haystack.len(),
+            sve2_median / scalar_median,
+            orders.join(","),
+            serialize(&scalar_samples),
+            serialize(&sve2_samples),
+        );
     }
 }

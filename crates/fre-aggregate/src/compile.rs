@@ -7096,13 +7096,23 @@ fn bind_required_internal_anchor_identity(
         2,
         Resource::CompileWork,
     )?;
+    let tail_run_variant = plan.tail_run_variant_id();
+    let tail_run_identity_bytes = add(
+        1,
+        tail_run_variant.map_or(0, str::len),
+        Resource::CompileWork,
+    )?;
     let configuration_identity_bytes = add(
         add(
             class_identity_bytes,
             optional_identity_bytes,
             Resource::CompileWork,
         )?,
-        add(1, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+        add(
+            add(1, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+            tail_run_identity_bytes,
+            Resource::CompileWork,
+        )?,
         Resource::CompileWork,
     )?;
     budget.charge(add(
@@ -7143,6 +7153,12 @@ fn bind_required_internal_anchor_identity(
             } else {
                 hash.byte(0);
             }
+        }
+        if let Some(variant) = tail_run_variant {
+            hash.byte(1);
+            hash.bytes(variant.as_bytes());
+        } else {
+            hash.byte(0);
         }
     }
     let mut bytes = [0_u8; 16];

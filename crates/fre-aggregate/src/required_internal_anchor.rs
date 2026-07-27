@@ -3,7 +3,7 @@ use fre_kernels::{
     RequiredInternalAnchorBuildLimits as BuildLimits, RequiredInternalAnchorByteClass as ByteClass,
     RequiredInternalAnchorContinuationSource as ContinuationSource,
     RequiredInternalAnchorOptionalStageSource as OptionalStageSource,
-    RequiredInternalAnchorPlan as Plan,
+    RequiredInternalAnchorPlan as Plan, SimdDispatchContext,
 };
 use regex_syntax::hir::{Class, Hir, HirKind, Repetition};
 
@@ -49,8 +49,15 @@ pub(crate) fn inspect_attempt(
     max_literal_bytes: usize,
     max_program_bytes: usize,
 ) -> InspectionAttempt {
+    let simd_dispatch = SimdDispatchContext::capture();
     let mut budget = Budget::new(max_work);
-    let result = inspect_with_budget(hir, max_literal_bytes, max_program_bytes, &mut budget);
+    let result = inspect_with_budget(
+        hir,
+        max_literal_bytes,
+        max_program_bytes,
+        simd_dispatch,
+        &mut budget,
+    );
     InspectionAttempt {
         result,
         inspection_work: budget.work,
@@ -61,6 +68,7 @@ fn inspect_with_budget(
     hir: &Hir,
     max_literal_bytes: usize,
     max_program_bytes: usize,
+    simd_dispatch: SimdDispatchContext,
     budget: &mut Budget,
 ) -> Result<Inspection, Error> {
     let root = transparent(hir, budget)?;
@@ -105,14 +113,13 @@ fn inspect_with_budget(
         })?;
 
     let build_work_upper_bound =
-        Plan::build_work_upper_bound(anchor.0.len(), continuation.optional_count).map_err(
-            |error| match error {
+        Plan::build_work_upper_bound_with_dispatch(simd_dispatch, anchor.0.len(), continuation)
+            .map_err(|error| match error {
                 BuildError::Overflow(_) => Error::ArithmeticOverflow {
                     resource: Resource::CompileWork,
                 },
                 _ => Error::InternalInvariant("required internal-anchor work derivation refused"),
-            },
-        )?;
+            })?;
     charge(budget, build_work_upper_bound)?;
     let plan = build_plan(
         prefix,
@@ -121,6 +128,7 @@ fn inspect_with_budget(
         build_work_upper_bound,
         max_literal_bytes,
         max_program_bytes,
+        simd_dispatch,
     )?;
     Ok(Inspection {
         plan,
@@ -135,6 +143,7 @@ fn build_plan(
     max_build_work: usize,
     max_literal_bytes: usize,
     max_program_bytes: usize,
+    simd_dispatch: SimdDispatchContext,
 ) -> Result<Option<Plan>, Error> {
     let limits = BuildLimits {
         max_anchor_bytes: max_literal_bytes,
@@ -146,7 +155,8 @@ fn build_plan(
         max_source_copies: 1,
         max_scratch_bytes: 0,
     };
-    let plan = match Plan::build(prefix, anchor, *continuation, limits) {
+    let plan = match Plan::build_with_dispatch(simd_dispatch, prefix, anchor, *continuation, limits)
+    {
         Ok(plan) => plan,
         Err(BuildError::AllocationFailed { additional }) => {
             return Err(Error::AllocationFailed {
