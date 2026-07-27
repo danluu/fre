@@ -9726,6 +9726,14 @@ fn finite_plan_identity_matches(
     identity.semantics == expected_semantics && representation_matches
 }
 
+fn exact_literal_plan_identity_matches(
+    identity: fre::AggregateExactLiteralIdentity,
+    semantics: AggregateExactLiteralSemantics,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    identity.semantics == semantics && identity.kernel.authenticates_operation(operation)
+}
+
 fn word_run_plan_identity_matches(
     report: &AggregateBuildReport,
     identity: fre::AggregateWordRunIdentity,
@@ -10778,10 +10786,11 @@ fn require_unicode_plan_identity(
     }
     if !unicode {
         if let AggregatePlanIdentity::ExactLiteral(identity) = report.plan_identity {
-            if identity.semantics == AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
-                && identity.kernel
-                    == fre::LiteralAggregateOperationIdentity::for_operation(operation)
-            {
+            if exact_literal_plan_identity_matches(
+                identity,
+                AggregateExactLiteralSemantics::UnicodeOffByteBoundaries,
+                operation,
+            ) {
                 return Ok(());
             }
             return Err(ExecutionError::fault(format!(
@@ -10864,10 +10873,11 @@ fn require_unicode_plan_identity(
     if matches!(
         report.plan_identity,
         AggregatePlanIdentity::ExactLiteral(identity)
-            if identity.semantics
-                == AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
-                && identity.kernel
-                    == fre::LiteralAggregateOperationIdentity::for_operation(operation)
+            if exact_literal_plan_identity_matches(
+                identity,
+                AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal,
+                operation,
+            )
     ) || matches!(
         report.plan_identity,
         AggregatePlanIdentity::FixedClassSandwich(identity)
@@ -19297,6 +19307,74 @@ mod tests {
             unicode.build_report().plan,
             AggregatePlanKind::FixedPredicateWord64
         );
+    }
+
+    #[test]
+    fn current_fre_exact_literal_identity_accepts_only_authenticated_owners() {
+        for semantics in [
+            AggregateExactLiteralSemantics::UnicodeOffByteBoundaries,
+            AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal,
+        ] {
+            for operation in [
+                LiteralAggregateOperation::Count,
+                LiteralAggregateOperation::SpanSum,
+            ] {
+                for kernel in [
+                    fre::LiteralAggregateOperationIdentity::for_operation(operation),
+                    fre::LiteralAggregateOperationIdentity::for_dispatched_operation(operation),
+                ] {
+                    assert!(exact_literal_plan_identity_matches(
+                        fre::AggregateExactLiteralIdentity { semantics, kernel },
+                        semantics,
+                        operation,
+                    ));
+                }
+
+                let mut forged =
+                    fre::LiteralAggregateOperationIdentity::for_dispatched_operation(operation);
+                forged.plan_id = "forged-exact-literal-owner";
+                assert!(!exact_literal_plan_identity_matches(
+                    fre::AggregateExactLiteralIdentity {
+                        semantics,
+                        kernel: forged,
+                    },
+                    semantics,
+                    operation,
+                ));
+                let other_semantics = match semantics {
+                    AggregateExactLiteralSemantics::UnicodeOffByteBoundaries => {
+                        AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal
+                    }
+                    AggregateExactLiteralSemantics::UnicodeOnNonemptyUtf8Literal => {
+                        AggregateExactLiteralSemantics::UnicodeOffByteBoundaries
+                    }
+                };
+                assert!(!exact_literal_plan_identity_matches(
+                    fre::AggregateExactLiteralIdentity {
+                        semantics: other_semantics,
+                        kernel: fre::LiteralAggregateOperationIdentity::for_dispatched_operation(
+                            operation,
+                        ),
+                    },
+                    semantics,
+                    operation,
+                ));
+                let other_operation = match operation {
+                    LiteralAggregateOperation::Count => LiteralAggregateOperation::SpanSum,
+                    LiteralAggregateOperation::SpanSum => LiteralAggregateOperation::Count,
+                };
+                assert!(!exact_literal_plan_identity_matches(
+                    fre::AggregateExactLiteralIdentity {
+                        semantics,
+                        kernel: fre::LiteralAggregateOperationIdentity::for_dispatched_operation(
+                            other_operation,
+                        ),
+                    },
+                    semantics,
+                    operation,
+                ));
+            }
+        }
     }
 
     #[test]
