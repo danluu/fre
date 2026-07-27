@@ -48,8 +48,8 @@ const SIMD_CLASSIFIER_BUILD_WORK: u64 = 128 + 2 + 2;
 // incumbent sparse/no-match path while dense sources amortize one SVE2 block
 // count per 32 bytes. The probe's classifications are reused on the SIMD path.
 const SIMD_MIN_HAYSTACK_BYTES: usize = ASCII_WIDE_BYTES * 8;
-const SIMD_PROBE_BLOCKS: usize = 4;
-const SIMD_MIN_PROBE_MATCHES: u32 = 8;
+const SIMD_PROBE_BLOCKS: usize = 1;
+const SIMD_MIN_PROBE_MATCHES: u32 = 2;
 
 /// Complete reducer selected for one invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

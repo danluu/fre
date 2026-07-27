@@ -2138,26 +2138,30 @@ impl Dictionary {
                 reduce_invariant(actual, "word cursor overflowed admitted haystack")
             })?;
             if let Some(scanner) = word_run_scanner {
-                let probe_end = index
-                    .checked_add(RUN_SCANNER_SCALAR_PROBE_BYTES)
-                    .unwrap_or(haystack.len())
-                    .min(haystack.len());
-                while index < probe_end && is_ascii_word(haystack[index]) {
-                    increment(&mut actual.bytes_classified, "classified haystack bytes")?;
-                    index = index.checked_add(1).ok_or_else(|| {
-                        reduce_invariant(actual, "word cursor overflowed admitted haystack")
-                    })?;
-                }
-                if index == probe_end && index < haystack.len() {
-                    let member_run = scanner.scan_forward(&haystack[index..]).member_run_len();
-                    actual.bytes_classified = add(
-                        actual.bytes_classified,
-                        member_run,
-                        "classified haystack bytes",
-                    )?;
-                    index = index.checked_add(member_run).ok_or_else(|| {
-                        reduce_invariant(actual, "word cursor overflowed admitted haystack")
-                    })?;
+                // Preserve the scalar loop's one-byte-word fast exit before
+                // doing threshold arithmetic or entering the scanner.
+                if index < haystack.len() && is_ascii_word(haystack[index]) {
+                    let probe_end = index
+                        .checked_add(RUN_SCANNER_SCALAR_PROBE_BYTES)
+                        .unwrap_or(haystack.len())
+                        .min(haystack.len());
+                    while index < probe_end && is_ascii_word(haystack[index]) {
+                        increment(&mut actual.bytes_classified, "classified haystack bytes")?;
+                        index = index.checked_add(1).ok_or_else(|| {
+                            reduce_invariant(actual, "word cursor overflowed admitted haystack")
+                        })?;
+                    }
+                    if index == probe_end && index < haystack.len() {
+                        let member_run = scanner.scan_forward(&haystack[index..]).member_run_len();
+                        actual.bytes_classified = add(
+                            actual.bytes_classified,
+                            member_run,
+                            "classified haystack bytes",
+                        )?;
+                        index = index.checked_add(member_run).ok_or_else(|| {
+                            reduce_invariant(actual, "word cursor overflowed admitted haystack")
+                        })?;
+                    }
                 }
             } else {
                 while index < haystack.len() && is_ascii_word(haystack[index]) {
