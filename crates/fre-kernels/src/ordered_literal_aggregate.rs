@@ -2313,6 +2313,91 @@ mod tests {
         BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, ReduceError,
         ReduceLimits, build_allocation_probe, checked_dp_target_slot, previous_dp_ring_slot,
     };
+    use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
+
+    #[test]
+    #[ignore = "native qualification benchmark; requires Linux/AArch64 with OS-usable SVE2"]
+    fn benchmark_one_byte_union_classifier_ceiling() {
+        use std::{hint::black_box, time::Instant};
+
+        const ITERATIONS: usize = 64;
+        const HAYSTACK_BYTES: usize = 1 << 20;
+
+        let dispatch = SimdDispatchContext::capture();
+        assert!(
+            dispatch.capabilities().usable().contains(Feature::ArmSve2),
+            "benchmark requires OS-usable SVE2"
+        );
+        let members = b"abcd";
+        let patterns: Vec<&[u8]> = members
+            .iter()
+            .map(std::slice::from_ref)
+            .map(<[u8]>::as_ref)
+            .collect();
+        let plan =
+            OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).expect("plan");
+        let mut words = [0_u64; 2];
+        for &byte in members {
+            words[usize::from(byte >= 64)] |= 1_u64 << (byte & 63);
+        }
+        let set = AsciiByteSet::from_words(words);
+        let classifier = dispatch
+            .ascii_byte_set_classifier(set, DispatchPolicy::Auto)
+            .expect("automatic classifier retains a fallback");
+        let corpus = b"abXYZcd!-_012";
+        let haystack: Vec<u8> = corpus
+            .iter()
+            .copied()
+            .cycle()
+            .take(HAYSTACK_BYTES)
+            .collect();
+        let expected = plan
+            .count(&haystack, ReduceLimits::unlimited())
+            .expect("ordered aggregate count")
+            .count;
+        let iterations = f64::from(u32::try_from(ITERATIONS).expect("small iteration count"));
+
+        let started = Instant::now();
+        let mut ordered_checksum = 0_u64;
+        for _ in 0..ITERATIONS {
+            ordered_checksum = ordered_checksum.wrapping_add(black_box(
+                plan.count(black_box(&haystack), black_box(ReduceLimits::unlimited()))
+                    .expect("ordered aggregate benchmark")
+                    .count,
+            ));
+        }
+        let ordered_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations;
+
+        let started = Instant::now();
+        let mut classifier_checksum = 0_u64;
+        for _ in 0..ITERATIONS {
+            let mut count = 0_u64;
+            let mut chunks = black_box(haystack.as_slice()).chunks_exact(ASCII_WIDE_BYTES);
+            for chunk in &mut chunks {
+                let block: &[u8; ASCII_WIDE_BYTES] =
+                    chunk.try_into().expect("exact classifier chunk");
+                count = count.wrapping_add(u64::from(classifier.count_32(block)));
+            }
+            for &byte in chunks.remainder() {
+                count = count.wrapping_add(u64::from(set.contains(byte)));
+            }
+            classifier_checksum = classifier_checksum.wrapping_add(black_box(count));
+        }
+        let classifier_ns = started.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations;
+        assert_eq!(ordered_checksum, classifier_checksum);
+        assert_eq!(
+            ordered_checksum,
+            expected.wrapping_mul(u64::try_from(ITERATIONS).expect("small iteration count"))
+        );
+        println!(
+            "ORDERED_LITERAL_ONE_BYTE_CLASSIFIER_BENCH iterations={ITERATIONS} \
+             haystack_bytes={HAYSTACK_BYTES} ordered_ns={ordered_ns:.6} \
+             classifier_ns={classifier_ns:.6} classifier_over_ordered={:.9} \
+             wide_selection={:?}",
+            classifier_ns / ordered_ns,
+            classifier.selection().wide()
+        );
+    }
 
     #[test]
     fn build_attempt_receipts_close_success_and_partial_allocation_failure() {
