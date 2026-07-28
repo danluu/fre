@@ -321,7 +321,7 @@ pub enum OperationPhysicalRoute {
     RequiredInternalAnchor,
     /// Certified URL aggregate executor.
     UrlAggregate,
-    /// Certified allocation-free byte-topology `SpanSum` reducer.
+    /// Certified allocation-free byte-topology Count/`SpanSum` reducer.
     StateByteSpanSum,
     /// Construction-retained byte candidate scheduler.
     Candidate,
@@ -2354,12 +2354,13 @@ impl CompiledRegex {
         clippy::too_many_arguments,
         reason = "the certified route receives the shared publication and accounting state explicitly"
     )]
-    fn execute_state_byte_span_sum<const OBSERVED_WORK: bool>(
+    fn execute_state_byte_reducer<const OBSERVED_WORK: bool>(
         &self,
         plan: &StateByteSpanSumPlan,
         local: &[u8],
         range: Range<usize>,
         strategy: Strategy,
+        kind: OperationKind,
         limits: OperationLimits,
         mut attempt: Option<&mut AttemptPublication<'_>>,
         attempt_accounting: &mut ExecutionAccounting,
@@ -2367,10 +2368,11 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
     ) -> Result<ExecutionResult, Error> {
-        let prospective = state_byte_span_sum_prospective::<OBSERVED_WORK>(
+        let prospective = state_byte_reducer_prospective::<OBSERVED_WORK>(
             &self.program,
             plan,
             local.len(),
+            kind,
             limits,
         )?;
         if let Some(publication) = attempt.as_mut() {
@@ -2412,14 +2414,19 @@ impl CompiledRegex {
         validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
         if !prospective.contains(*attempt_accounting) {
             return Err(Error::InternalInvariant(
-                "state-byte SpanSum actual accounting exceeds its prospective",
+                "state-byte reducer actual accounting exceeds its prospective",
             ));
         }
+        let span_sum = if kind == OperationKind::Sum {
+            span_sum
+        } else {
+            0
+        };
         let certificate = OperationCertificate {
             regex_plan_id: self.plan_id(),
             operation_limits_id: operation_limits_identity(limits),
             strategy,
-            operation: OperationAttemptKind::SpanSum,
+            operation: operation_attempt_kind(kind),
             physical_route: OperationPhysicalRoute::StateByteSpanSum,
             algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
             accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
@@ -2545,15 +2552,16 @@ impl CompiledRegex {
         }
         let local = &haystack[range.clone()];
         if forced_generic_count_route.is_none()
-            && kind == OperationKind::Sum
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.state_byte_span_sum
         {
-            return self.execute_state_byte_span_sum::<OBSERVED_WORK>(
+            return self.execute_state_byte_reducer::<OBSERVED_WORK>(
                 plan,
                 local,
                 range,
                 strategy,
+                kind,
                 limits,
                 attempt.as_mut(),
                 accounting,
@@ -3903,10 +3911,11 @@ const fn fixed_continuation_beats_dense(
     candidate_work_upper < dense_work_floor
 }
 
-fn state_byte_span_sum_prospective<const OBSERVED_WORK: bool>(
+fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     program: &Program,
     plan: &StateByteSpanSumPlan,
     input_bytes: usize,
+    kind: OperationKind,
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
     let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
@@ -3965,7 +3974,11 @@ fn state_byte_span_sum_prospective<const OBSERVED_WORK: bool>(
         match_events: input_bytes,
         output_matches: input_bytes,
         output_bytes: 0,
-        span_sum: input_bytes,
+        span_sum: if kind == OperationKind::Sum {
+            input_bytes
+        } else {
+            0
+        },
         allocations: 0,
         peak_bytes: 0,
         accounting,
@@ -13936,6 +13949,15 @@ mod tests {
             .sum()
     }
 
+    fn upstream_count(pattern: &str, haystack: &[u8]) -> usize {
+        RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(haystack)
+            .count()
+    }
+
     fn exact_state_byte_limits(prospective: &OperationProspective) -> OperationLimits {
         OperationLimits {
             max_boundaries: prospective.boundaries,
@@ -14001,8 +14023,36 @@ mod tests {
             assert_eq!(attempt.receipt.actual.random_access_peak_bytes, 0);
             assert!(attempt.receipt.authenticates_success());
 
-            // The retained theorem is route-specific; other operation and
-            // strategy combinations preserve their established executors.
+            let count = compiled
+                .count_value_attempt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_span_sum: 0,
+                        ..OperationLimits::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("{pattern:?}: {error:?}"));
+            assert_eq!(
+                count.value,
+                upstream_count(pattern, haystack),
+                "{pattern:?}"
+            );
+            assert_eq!(
+                count.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::StateByteSpanSum)
+            );
+            assert_eq!(
+                count.receipt.identity.operation,
+                OperationAttemptKind::Count
+            );
+            assert_eq!(count.receipt.prospective.unwrap().span_sum, 0);
+            assert_eq!(count.receipt.actual_allocations, 0);
+            assert!(count.receipt.authenticates_success());
+
+            // The retained theorem is strategy-specific; full-table
+            // operations preserve their established executor.
             assert_eq!(
                 compiled
                     .span_sum_value(
@@ -14049,6 +14099,22 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(actual, expected, "{pattern:?}, haystack={haystack:?}");
+                let expected_count = oracle.find_iter(&haystack).count();
+                let actual_count = compiled
+                    .count_value(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits {
+                            max_span_sum: 0,
+                            ..OperationLimits::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual_count, expected_count,
+                    "{pattern:?}, count haystack={haystack:?}"
+                );
                 let ranged_expected: usize = oracle
                     .find_iter(&haystack[1..6])
                     .map(|matched| matched.end().checked_sub(matched.start()).unwrap())
@@ -14064,6 +14130,22 @@ mod tests {
                 assert_eq!(
                     ranged_actual, ranged_expected,
                     "{pattern:?}, range haystack={haystack:?}"
+                );
+                let ranged_expected_count = oracle.find_iter(&haystack[1..6]).count();
+                let ranged_actual_count = compiled
+                    .count_value(
+                        &haystack,
+                        1..6,
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits {
+                            max_span_sum: 0,
+                            ..OperationLimits::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    ranged_actual_count, ranged_expected_count,
+                    "{pattern:?}, range count haystack={haystack:?}"
                 );
             }
         }
