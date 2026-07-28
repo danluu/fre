@@ -607,6 +607,7 @@ fn continuation_details(
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. }
         | AggregateExecutionDetails::GuardedAsciiWord(_)
+        | AggregateExecutionDetails::GuardedUnicodeWord(_)
         | AggregateExecutionDetails::FixedPredicateWord64(_) => {
             panic!("expected continuation execution details")
         }

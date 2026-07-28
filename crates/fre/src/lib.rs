@@ -46,6 +46,7 @@ mod fixed_absolute;
 mod forward_anchored;
 mod grapheme_scalar;
 pub mod guarded_ascii_word;
+pub mod guarded_unicode_word;
 mod line_capture;
 mod literal_assertions;
 mod literal_class_run_literal;
@@ -101,11 +102,13 @@ pub use aggregate::{
     AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaIdentity,
     AggregateGraphemeScalarDfaSemantics, AggregateGuardedAsciiWordBuildAccounting,
     AggregateGuardedAsciiWordIdentity, AggregateGuardedAsciiWordSemantics,
-    AggregateLiteralAssertionsIdentity, AggregateLiteralAssertionsSemantics,
-    AggregateLiteralClassRunLiteralIdentity, AggregateLiteralIneligibility, AggregateOperation,
-    AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
-    AggregatePrefixClassAlternationIdentity, AggregateRetainedFullWindowUpperBounds,
-    AggregateReverseInnerIdentity, AggregateRunLimits, AggregateSearchStep,
+    AggregateGuardedUnicodeWordBuildAccounting, AggregateGuardedUnicodeWordIdentity,
+    AggregateGuardedUnicodeWordSemantics, AggregateLiteralAssertionsIdentity,
+    AggregateLiteralAssertionsSemantics, AggregateLiteralClassRunLiteralIdentity,
+    AggregateLiteralIneligibility, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregatePrefixClassAlternationIdentity,
+    AggregateRetainedFullWindowUpperBounds, AggregateReverseInnerIdentity, AggregateRunLimits,
+    AggregateSearchStep,
     AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult,
     AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateTokenPhraseIdentity,
     AggregateTokenPhraseSemantics, AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,

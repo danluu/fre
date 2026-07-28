@@ -210,7 +210,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-ranked-anchor-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -550,10 +550,10 @@ impl CandidateAdapter for CurrentFreAdapter {
         let mut identity = AdapterIdentity {
             adapter: FRE_ADAPTER.to_string(),
             identity: format!(
-                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, allocation-free ASCII fixed-predicate Word64 Shift-And, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
+                "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded ranked-anchor finite ASCII-word set, allocation-free ASCII fixed-predicate Word64 Shift-And, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, an allocation-free Unicode-off fixed-predicate Word64 reducer after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on ranked-anchor scan for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded ranked-anchor route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         };
@@ -2191,6 +2191,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
         }
+        ("compile", AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => {
+            "compile-aggregate-guarded-unicode-word"
+        }
         ("compile", AggregatePlanKind::FixedPredicateWord64, _) => {
             "compile-aggregate-fixed-predicate-word64"
         }
@@ -2219,6 +2222,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v2",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
+        (_, AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => "aggregate-guarded-unicode-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
     }
@@ -9415,7 +9419,7 @@ fn inactive_prefix_class_alternation_operation_limits() -> PrefixClassAlternatio
 fn bounded_literal_pair_operation_limits(
     haystack_len: usize,
     build: fre::BoundedLiteralPairBuildAccounting,
-    identity: AggregatePlanIdentity,
+    identity: &AggregatePlanIdentity,
     operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<fre::BoundedLiteralPairReduceLimits, ExecutionError> {
@@ -10357,7 +10361,7 @@ fn aggregate_run_limits_with_fixed_absolute(
             bounded_literal_pair: bounded_literal_pair_operation_limits(
                 haystack_len,
                 build,
-                report.plan_identity,
+                &report.plan_identity,
                 report.operation,
                 limits,
             )?,
@@ -10572,6 +10576,55 @@ fn aggregate_run_limits_with_fixed_absolute(
                 fixed_absolute: inactive_fixed_absolute_operation_limits(),
                 fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                 finite_literal: guarded_ascii_word_operation_limits(haystack_len, build, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
+        AggregateBuildAccounting::GuardedUnicodeWord(build) => {
+            let AggregatePlanIdentity::GuardedUnicodeWord(identity) = report.plan_identity else {
+                return Err(ExecutionError::fault(
+                    "FRE guarded Unicode-word resource identity is absent",
+                ));
+            };
+            let operation = match report.operation {
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    LiteralAggregateOperation::Count
+                }
+                AggregateOperation::SpanSum => LiteralAggregateOperation::SpanSum,
+                AggregateOperation::Spans => {
+                    return Err(ExecutionError::fault(
+                        "FRE guarded Unicode-word resource operation is invalid",
+                    ));
+                }
+            };
+            if !guarded_unicode_word_plan_identity_matches(
+                report, &identity, &build, true, operation,
+            ) {
+                return Err(ExecutionError::fault(
+                    "FRE guarded Unicode-word resource identity mismatch",
+                ));
+            }
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
                 continuation: continuation_operation_limits(
                     haystack_len,
                     inactive_continuation_shape(),
@@ -11108,6 +11161,94 @@ fn guarded_ascii_word_plan_identity_matches(
         && prospective.dimensions.packed_bytes >= prospective.dimensions.words
         && guarded_ascii_word_build_accounting_is_closed(build)
         && report.retained_capacity_bytes == actual.persistent_bytes
+}
+
+fn guarded_unicode_word_plan_identity_matches(
+    report: &AggregateBuildReport,
+    identity: &fre::AggregateGuardedUnicodeWordIdentity,
+    build: &fre::AggregateGuardedUnicodeWordBuildAccounting,
+    unicode: bool,
+    operation: LiteralAggregateOperation,
+) -> bool {
+    let dictionary = build.dictionary;
+    let dictionary_prospective = dictionary.prospective;
+    let Some(dictionary_actual) = dictionary.actual() else {
+        return false;
+    };
+    let anchor = build.anchor;
+    let (report_operation_matches, expected_operation_id) = match operation {
+        LiteralAggregateOperation::Count => (
+            matches!(
+                report.operation,
+                AggregateOperation::Compile | AggregateOperation::Count
+            ),
+            fre::guarded_unicode_word::COUNT_OPERATION_ID,
+        ),
+        LiteralAggregateOperation::SpanSum => (
+            report.operation == AggregateOperation::SpanSum,
+            fre::guarded_unicode_word::SPAN_SUM_OPERATION_ID,
+        ),
+    };
+    let allocations_close = dictionary_prospective
+        .allocations
+        .checked_add(anchor.prospective.allocations)
+        .is_some_and(|needed| needed <= build.allocations_upper_bound)
+        && dictionary_actual
+            .allocations
+            .checked_add(anchor.actual.allocations)
+            .is_some_and(|needed| needed <= build.allocations_actual)
+        && build.allocations_actual <= build.allocations_upper_bound;
+    let initialized_close = dictionary_prospective
+        .initialized_bytes
+        .checked_add(anchor.prospective.initialized_bytes)
+        .is_some_and(|needed| needed <= build.initialized_bytes_upper_bound)
+        && dictionary_actual
+            .initialized_bytes
+            .checked_add(anchor.actual.initialized_bytes)
+            .is_some_and(|needed| needed <= build.initialized_bytes_actual)
+        && build.initialized_bytes_actual <= build.initialized_bytes_upper_bound;
+    let retained = dictionary_actual
+        .persistent_bytes
+        .checked_add(anchor.actual.live_persistent_bytes);
+    let anchor_closes = anchor.prospective.patterns == dictionary_prospective.dimensions.words
+        && anchor.prospective.pattern_bytes == dictionary_prospective.dimensions.packed_bytes
+        && anchor.prospective.patterns > 0
+        && anchor.prospective.patterns <= fre::guarded_unicode_word::CERTIFIED_MAX_PATTERNS
+        && anchor.prospective.pattern_bytes
+            <= fre::guarded_unicode_word::CERTIFIED_MAX_TOTAL_PATTERN_BYTES
+        && anchor.prospective.min_pattern_bytes > 0
+        && anchor.prospective.min_pattern_bytes <= anchor.prospective.max_pattern_bytes
+        && anchor.prospective.anchor_offset < anchor.prospective.min_pattern_bytes
+        && anchor.actual.work == anchor.prospective.build_work
+        && anchor.actual.allocations == anchor.prospective.allocations
+        && anchor.actual.initialized_bytes == anchor.prospective.initialized_bytes
+        && anchor.actual.live_persistent_bytes == anchor.prospective.persistent_bytes
+        && anchor.actual.peak_bytes == anchor.prospective.peak_bytes
+        && anchor.actual.published;
+
+    unicode
+        && report_operation_matches
+        && report.selection == AggregatePlanSelection::Auto
+        && report.plan == AggregatePlanKind::GuardedUnicodeWordLiteralSet
+        && report.continuation_strategy.is_none()
+        && report.capture_semantics == AggregateCaptureSemantics::ErasedForWholeMatchOnly
+        && identity.semantics
+            == fre::AggregateGuardedUnicodeWordSemantics::UnicodeOnFullWordBoundariesAsciiWords
+        && identity.dictionary == guarded_ascii_word::PLAN_ID
+        && identity.kernel.plan_id == fre::guarded_unicode_word::PLAN_ID
+        && identity.kernel.anchor_algorithm_id == fre::guarded_unicode_word::ANCHOR_ALGORITHM_ID
+        && identity.kernel.operation_id == expected_operation_id
+        && identity.kernel.anchor_offset == anchor.prospective.anchor_offset
+        && identity.kernel.certified_max_patterns
+            == fre::guarded_unicode_word::CERTIFIED_MAX_PATTERNS
+        && identity.kernel.certified_max_total_pattern_bytes
+            == fre::guarded_unicode_word::CERTIFIED_MAX_TOTAL_PATTERN_BYTES
+        && allocations_close
+        && initialized_close
+        && anchor_closes
+        && build.peak_bytes_actual_upper_bound <= build.peak_bytes_upper_bound
+        && report.finite_planner_work > 0
+        && retained == Some(report.retained_capacity_bytes)
 }
 
 fn bounded_separated_fields_plan_identity_matches(
@@ -11835,6 +11976,35 @@ fn require_unicode_plan_identity(
         }
         return Err(ExecutionError::fault(format!(
             "guarded ASCII-word aggregate identity mismatch for {operation:?}: {:?}",
+            report.plan_identity
+        )));
+    }
+    if report.plan == AggregatePlanKind::GuardedUnicodeWordLiteralSet
+        || matches!(
+            report.build,
+            AggregateBuildAccounting::GuardedUnicodeWord(_)
+        )
+        || matches!(
+            report.plan_identity,
+            AggregatePlanIdentity::GuardedUnicodeWord(_)
+        )
+    {
+        let (
+            AggregatePlanIdentity::GuardedUnicodeWord(identity),
+            AggregateBuildAccounting::GuardedUnicodeWord(build),
+        ) = (report.plan_identity, report.build)
+        else {
+            return Err(ExecutionError::fault(format!(
+                "guarded Unicode-word aggregate identity mismatch for {operation:?}: {:?}",
+                report.plan_identity
+            )));
+        };
+        if guarded_unicode_word_plan_identity_matches(report, &identity, &build, unicode, operation)
+        {
+            return Ok(());
+        }
+        return Err(ExecutionError::fault(format!(
+            "guarded Unicode-word aggregate identity mismatch for {operation:?}: {:?}",
             report.plan_identity
         )));
     }
@@ -13110,6 +13280,15 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
             }
             guarded_ascii_word::ReduceErrorKind::ArithmeticOverflow { .. }
             | guarded_ascii_word::ReduceErrorKind::InternalInvariant { .. } => {
+                ExecutionError::fault(message)
+            }
+        },
+        AggregateExecutionSource::GuardedUnicodeWord(source) => match source.kind {
+            fre::guarded_unicode_word::ReduceErrorKind::ResourceLimit { .. } => {
+                ExecutionError::unsupported(message)
+            }
+            fre::guarded_unicode_word::ReduceErrorKind::ArithmeticOverflow { .. }
+            | fre::guarded_unicode_word::ReduceErrorKind::InternalInvariant { .. } => {
                 ExecutionError::fault(message)
             }
         },
@@ -20439,7 +20618,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-ranked-anchor-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -20460,6 +20639,11 @@ mod tests {
                 .identity
                 .contains("guarded finite ASCII-word dictionary")
         );
+        assert!(
+            identity
+                .identity
+                .contains("full-Unicode guarded ranked-anchor")
+        );
         assert!(identity.identity.contains("ASCII fixed-predicate Word64"));
         assert!(identity.identity.contains("positive-Unicode-word"));
         assert!(
@@ -20467,6 +20651,7 @@ mod tests {
                 .availability
                 .contains("finite nonempty ASCII-word bodies")
         );
+        assert!(identity.availability.contains("two full word boundaries"));
         assert!(identity.identity.contains("aggregate-word-run-v1"));
         assert!(identity.identity.contains("anchored-line-capture-v1"));
         assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
@@ -21076,6 +21261,68 @@ mod tests {
                 ),
                 expected,
                 "aggregate-guarded-ascii-word",
+            );
+        }
+    }
+
+    #[test]
+    fn current_fre_guarded_unicode_word_covers_i787_literal_and_optimized_shapes() {
+        const KEYWORDS: &str = "as\nbreak\nconst\ncontinue\ncrate\nelse\nenum\nextern\nfalse\nfn\nfor\nif\nimpl\nin\nlet\nloop\nmatch\nmod\nmove\nmut\npub\nref\nreturn\nself\nSelf\nstatic\nstruct\nsuper\ntrait\ntrue\ntype\nunsafe\nuse\nwhere\nwhile\nabstract\nbecome\nbox\ndo\nfinal\nmacro\noverride\npriv\ntypeof\nunsized\nvirtual\nyield\ntry\ni8\ni16\ni32\ni64\ni128\nisize\nu8\nu16\nu32\nu64\nu128\nusize\nbool\nchar\nstr\nf32\nf64";
+        const OPTIMIZED: &str = r"\b(Self|a(?:bstract|s)|b(?:ecome|o(?:ol|x)|reak)|c(?:har|on(?:st|tinue)|rate)|do|e(?:lse|num|xtern)|f(?:32|64|alse|inal|n|or)|i(?:1(?:28|6)|32|64|mpl|size|[8fn])|l(?:et|oop)|m(?:a(?:cro|tch)|o(?:d|ve)|ut)|override|p(?:riv|ub)|re(?:f|turn)|s(?:elf|t(?:atic|r(?:(?:uct)?))|uper)|t(?:r(?:ait|ue|y)|ype(?:(?:of)?))|u(?:1(?:28|6)|32|64|8|ns(?:afe|ized)|s(?:(?:(?:iz)?)e))|virtual|wh(?:(?:er|il)e)|yield)\b";
+        let literal = format!(r"\b({})\b", KEYWORDS.lines().collect::<Vec<_>>().join("|"));
+        let haystack = "as break Self βas asβ const continue abstract usize x";
+        let limits = RunLimits::default();
+
+        for pattern in [literal.as_str(), OPTIMIZED] {
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(true)
+                .build()
+                .unwrap();
+            let matches = oracle.find_iter(haystack.as_bytes()).collect::<Vec<_>>();
+            let expected_count = u64::try_from(matches.len()).unwrap();
+            let expected_span_sum = matches.iter().fold(0_u64, |sum, matched| {
+                sum + u64::try_from(matched.len()).unwrap()
+            });
+
+            let count = current_fre_rebar_aggregate_builder(pattern, true, false)
+                .build_count()
+                .expect("i787 guarded Unicode-word count plan");
+            assert_eq!(
+                count.build_report().plan,
+                AggregatePlanKind::GuardedUnicodeWordLiteralSet
+            );
+            current_fre_rebar_validate_aggregate_identity(count.build_report(), true, "count")
+                .expect("closed i787 guarded Unicode-word identity");
+            let AggregateBuildAccounting::GuardedUnicodeWord(build) = count.build_report().build
+            else {
+                panic!("i787 route lost guarded Unicode-word accounting");
+            };
+            assert_eq!(build.anchor.prospective.patterns, 65);
+            assert_eq!(build.anchor.prospective.pattern_bytes, 274);
+
+            assert_current_fre_execution(
+                current_fre(
+                    "count",
+                    &[pattern.to_string()],
+                    haystack.as_bytes(),
+                    true,
+                    false,
+                    &limits,
+                ),
+                expected_count,
+                "aggregate-guarded-unicode-word",
+            );
+            assert_current_fre_execution(
+                current_fre(
+                    "count-spans",
+                    &[pattern.to_string()],
+                    haystack.as_bytes(),
+                    true,
+                    false,
+                    &limits,
+                ),
+                expected_span_sum,
+                "aggregate-guarded-unicode-word",
             );
         }
     }

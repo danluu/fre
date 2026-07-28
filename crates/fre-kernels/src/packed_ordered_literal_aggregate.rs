@@ -53,7 +53,12 @@ const BYTE_FREQUENCY_RANK: [u8; 256] = [
     255,
 ];
 
-pub(crate) fn byte_frequency_rank(byte: u8) -> u8 {
+/// Frozen general-purpose byte-frequency rank used by ranked literal anchors.
+///
+/// Lower values are rarer. Other FRE-owned literal reducers may reuse this
+/// policy while retaining their own construction and execution receipts.
+#[must_use]
+pub fn byte_frequency_rank(byte: u8) -> u8 {
     BYTE_FREQUENCY_RANK[usize::from(byte)]
 }
 

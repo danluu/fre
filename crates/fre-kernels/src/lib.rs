@@ -418,6 +418,7 @@ pub use packed_ordered_literal_aggregate::{
     Semantics as PackedOrderedLiteralAggregateSemantics,
     SpanSumBuildAttempt as PackedOrderedLiteralSpanSumBuildAttempt,
     SpanSumResult as PackedOrderedLiteralSpanSumResult,
+    byte_frequency_rank as packed_ordered_literal_byte_frequency_rank,
 };
 pub use prefix_class_alternation::{
     BuildAccounting as PrefixClassAlternationBuildAccounting,

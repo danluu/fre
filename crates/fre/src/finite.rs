@@ -1007,6 +1007,17 @@ pub(crate) struct GuardedFiniteBuildLimits {
     pub max_peak_bytes: usize,
 }
 
+/// Endpoint assertion family accepted by guarded finite extraction.
+///
+/// Keeping this choice explicit prevents a Unicode-enabled profile containing
+/// an inline ASCII boundary (or the converse) from borrowing the wrong
+/// dictionary execution theorem.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GuardedFiniteBoundarySemantics {
+    Ascii,
+    UnicodeFull,
+}
+
 impl GuardedFiniteBuildLimits {
     pub(crate) const fn unlimited() -> Self {
         Self {
@@ -1309,14 +1320,45 @@ pub(crate) fn extract(
     derive_guarded_dictionary: bool,
     guarded_limits: GuardedFiniteBuildLimits,
 ) -> FiniteOutcome {
+    extract_with_guarded_semantics(
+        hir,
+        max_words,
+        max_bytes,
+        initial_work,
+        work_limit,
+        derive_guarded_dictionary.then_some(GuardedFiniteBoundarySemantics::Ascii),
+        guarded_limits,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the iterative task machine keeps every HIR case and early resource refusal visible"
+)]
+pub(crate) fn extract_with_guarded_semantics(
+    hir: &Hir,
+    max_words: usize,
+    max_bytes: usize,
+    initial_work: u64,
+    work_limit: u64,
+    guarded_semantics: Option<GuardedFiniteBoundarySemantics>,
+    guarded_limits: GuardedFiniteBuildLimits,
+) -> FiniteOutcome {
     let context = FiniteExtractionContext::new(initial_work, work_limit);
     match extract_plain(hir, max_words, max_bytes, &context) {
         Ok(Some(words)) => FiniteOutcome::Fits {
             words,
             receipt: context.close(FiniteExtractionTerminal::Fits),
         },
-        Ok(None) if derive_guarded_dictionary => {
-            match extract_guarded_dictionary(hir, max_words, max_bytes, &context, guarded_limits) {
+        Ok(None) if guarded_semantics.is_some() => {
+            match extract_guarded_dictionary(
+                hir,
+                max_words,
+                max_bytes,
+                &context,
+                guarded_semantics.expect("guarded semantics checked above"),
+                guarded_limits,
+            ) {
                 Ok(Ok((dictionary, accounting))) => FiniteOutcome::GuardedFiniteBody {
                     dictionary,
                     accounting,
@@ -1863,16 +1905,23 @@ fn extract_guarded_source<'context>(
     max_words: usize,
     max_bytes: usize,
     context: &'context FiniteExtractionContext,
+    semantics: GuardedFiniteBoundarySemantics,
     guarded_limits: GuardedFiniteBuildLimits,
 ) -> Result<GuardedSourceResult<'context>, GuardedAttemptError> {
-    let materialization =
-        match prove_guarded_materialization(hir, max_words, max_bytes, context, guarded_limits)? {
-            Ok(materialization) => materialization,
-            Err(refusal) => return Ok(Err(refusal)),
-        };
+    let materialization = match prove_guarded_materialization(
+        hir,
+        max_words,
+        max_bytes,
+        context,
+        semantics,
+        guarded_limits,
+    )? {
+        Ok(materialization) => materialization,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     let plan = materialization.plan;
     admit_guarded_source_work(plan, context.work(), context.work_limit)?;
-    publish_guarded_source(materialization, plan, context).map_err(Into::into)
+    publish_guarded_source(materialization, plan, semantics, context).map_err(Into::into)
 }
 
 struct GuardedMaterialization<'context> {
@@ -1889,9 +1938,10 @@ fn prove_guarded_materialization<'context>(
     max_words: usize,
     max_bytes: usize,
     context: &'context FiniteExtractionContext,
+    semantics: GuardedFiniteBoundarySemantics,
     guarded_limits: GuardedFiniteBuildLimits,
 ) -> Result<GuardedMaterializationResult<'context>, GuardedAttemptError> {
-    if !guarded_structure_supported(hir, context)? {
+    if !guarded_structure_supported(hir, semantics, context)? {
         return Ok(Err(GuardedRefusal::Unsupported));
     }
     let Some(shape) = guarded_shape(hir, context)? else {
@@ -2104,6 +2154,7 @@ fn admit_guarded_source_work(
 fn publish_guarded_source<'context>(
     materialization: GuardedMaterialization<'context>,
     plan: GuardedSourcePlan,
+    semantics: GuardedFiniteBoundarySemantics,
     context: &'context FiniteExtractionContext,
 ) -> Result<GuardedSourceResult<'context>, BuildError> {
     let GuardedMaterialization {
@@ -2134,10 +2185,10 @@ fn publish_guarded_source<'context>(
         let GuardedSymbol::Look(right) = last else {
             return Ok(Err(GuardedRefusal::Unsupported));
         };
-        let Some(left) = map_left_guard(*left) else {
+        let Some(left) = map_left_guard(*left, semantics) else {
             return Ok(Err(GuardedRefusal::Unsupported));
         };
-        let Some(right) = map_right_guard(*right) else {
+        let Some(right) = map_right_guard(*right, semantics) else {
             return Ok(Err(GuardedRefusal::Unsupported));
         };
         context.charge(u64::try_from(body.len()).unwrap_or(u64::MAX))?;
@@ -2209,9 +2260,10 @@ const fn map_guarded_source_allocation(
 
 fn guarded_structure_supported(
     hir: &Hir,
+    semantics: GuardedFiniteBoundarySemantics,
     context: &FiniteExtractionContext,
 ) -> Result<bool, BuildError> {
-    let Some(relation) = guarded_relation(hir, context)? else {
+    let Some(relation) = guarded_relation(hir, semantics, context)? else {
         return Ok(false);
     };
     Ok(relation.rows[GUARDED_START_STATE] == GUARDED_ACCEPT_BIT)
@@ -2268,6 +2320,7 @@ impl GuardedRelation {
 
 fn guarded_relation(
     hir: &Hir,
+    semantics: GuardedFiniteBoundarySemantics,
     context: &FiniteExtractionContext,
 ) -> Result<Option<GuardedRelation>, BuildError> {
     context.charge(1)?;
@@ -2313,12 +2366,12 @@ fn guarded_relation(
             }
             Ok(has_member.then_some(guarded_byte_relation()))
         }
-        HirKind::Look(look) => Ok(guarded_look_relation(*look)),
-        HirKind::Capture(capture) => guarded_relation(&capture.sub, context),
+        HirKind::Look(look) => Ok(guarded_look_relation(*look, semantics)),
+        HirKind::Capture(capture) => guarded_relation(&capture.sub, semantics, context),
         HirKind::Concat(children) => {
             let mut relation = GuardedRelation::identity();
             for child in children {
-                let Some(child) = guarded_relation(child, context)? else {
+                let Some(child) = guarded_relation(child, semantics, context)? else {
                     return Ok(None);
                 };
                 relation = relation.then(child);
@@ -2328,7 +2381,7 @@ fn guarded_relation(
         HirKind::Alternation(children) => {
             let mut relation = GuardedRelation::empty_language();
             for child in children {
-                let Some(child) = guarded_relation(child, context)? else {
+                let Some(child) = guarded_relation(child, semantics, context)? else {
                     return Ok(None);
                 };
                 relation = relation.union(child);
@@ -2342,7 +2395,7 @@ fn guarded_relation(
             if maximum < repetition.min {
                 return Ok(None);
             }
-            let Some(sub) = guarded_relation(&repetition.sub, context)? else {
+            let Some(sub) = guarded_relation(&repetition.sub, semantics, context)? else {
                 return Ok(None);
             };
             let mut result = GuardedRelation::empty_language();
@@ -2378,24 +2431,35 @@ const fn guarded_byte_relation() -> GuardedRelation {
     }
 }
 
-const fn guarded_look_relation(look: Look) -> Option<GuardedRelation> {
+const fn guarded_look_relation(
+    look: Look,
+    semantics: GuardedFiniteBoundarySemantics,
+) -> Option<GuardedRelation> {
     let dead = 1 << GUARDED_DEAD_STATE;
-    match look {
-        Look::WordAscii => Some(GuardedRelation {
-            rows: [
-                1 << GUARDED_AFTER_LEFT_STATE,
-                dead,
-                1 << GUARDED_ACCEPT_STATE,
-                dead,
-                dead,
-            ],
-        }),
-        Look::WordStartAscii | Look::WordStartHalfAscii => Some(GuardedRelation {
+    match (look, semantics) {
+        (Look::WordAscii, GuardedFiniteBoundarySemantics::Ascii)
+        | (Look::WordUnicode, GuardedFiniteBoundarySemantics::UnicodeFull) => {
+            Some(GuardedRelation {
+                rows: [
+                    1 << GUARDED_AFTER_LEFT_STATE,
+                    dead,
+                    1 << GUARDED_ACCEPT_STATE,
+                    dead,
+                    dead,
+                ],
+            })
+        }
+        (
+            Look::WordStartAscii | Look::WordStartHalfAscii,
+            GuardedFiniteBoundarySemantics::Ascii,
+        ) => Some(GuardedRelation {
             rows: [1 << GUARDED_AFTER_LEFT_STATE, dead, dead, dead, dead],
         }),
-        Look::WordEndAscii | Look::WordEndHalfAscii => Some(GuardedRelation {
-            rows: [dead, dead, 1 << GUARDED_ACCEPT_STATE, dead, dead],
-        }),
+        (Look::WordEndAscii | Look::WordEndHalfAscii, GuardedFiniteBoundarySemantics::Ascii) => {
+            Some(GuardedRelation {
+                rows: [dead, dead, 1 << GUARDED_ACCEPT_STATE, dead, dead],
+            })
+        }
         _ => None,
     }
 }
@@ -2706,12 +2770,14 @@ fn extract_guarded_dictionary(
     max_words: usize,
     max_bytes: usize,
     context: &FiniteExtractionContext,
+    semantics: GuardedFiniteBoundarySemantics,
     limits: GuardedFiniteBuildLimits,
 ) -> Result<GuardedDictionaryResult, GuardedAttemptError> {
-    let source = match extract_guarded_source(hir, max_words, max_bytes, context, limits)? {
-        Ok(source) => source,
-        Err(refusal) => return Ok(Err(refusal)),
-    };
+    let source =
+        match extract_guarded_source(hir, max_words, max_bytes, context, semantics, limits)? {
+            Ok(source) => source,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
     let dimensions = GuardedBuildDimensions {
         words: source.accounting.words,
         packed_bytes: source.accounting.word_bytes,
@@ -2803,20 +2869,30 @@ fn extract_guarded_dictionary(
     Ok(Ok((dictionary, accounting)))
 }
 
-const fn map_left_guard(look: Look) -> Option<Guard> {
-    match look {
-        Look::WordAscii => Some(Guard::LeftBoundary),
-        Look::WordStartAscii => Some(Guard::LeftStart),
-        Look::WordStartHalfAscii => Some(Guard::LeftStartHalf),
+const fn map_left_guard(look: Look, semantics: GuardedFiniteBoundarySemantics) -> Option<Guard> {
+    match (look, semantics) {
+        (Look::WordAscii, GuardedFiniteBoundarySemantics::Ascii)
+        | (Look::WordUnicode, GuardedFiniteBoundarySemantics::UnicodeFull) => {
+            Some(Guard::LeftBoundary)
+        }
+        (Look::WordStartAscii, GuardedFiniteBoundarySemantics::Ascii) => Some(Guard::LeftStart),
+        (Look::WordStartHalfAscii, GuardedFiniteBoundarySemantics::Ascii) => {
+            Some(Guard::LeftStartHalf)
+        }
         _ => None,
     }
 }
 
-const fn map_right_guard(look: Look) -> Option<Guard> {
-    match look {
-        Look::WordAscii => Some(Guard::RightBoundary),
-        Look::WordEndAscii => Some(Guard::RightEnd),
-        Look::WordEndHalfAscii => Some(Guard::RightEndHalf),
+const fn map_right_guard(look: Look, semantics: GuardedFiniteBoundarySemantics) -> Option<Guard> {
+    match (look, semantics) {
+        (Look::WordAscii, GuardedFiniteBoundarySemantics::Ascii)
+        | (Look::WordUnicode, GuardedFiniteBoundarySemantics::UnicodeFull) => {
+            Some(Guard::RightBoundary)
+        }
+        (Look::WordEndAscii, GuardedFiniteBoundarySemantics::Ascii) => Some(Guard::RightEnd),
+        (Look::WordEndHalfAscii, GuardedFiniteBoundarySemantics::Ascii) => {
+            Some(Guard::RightEndHalf)
+        }
         _ => None,
     }
 }

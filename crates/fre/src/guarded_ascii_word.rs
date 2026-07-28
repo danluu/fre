@@ -630,6 +630,21 @@ impl Dictionary {
         }
     }
 
+    /// Borrow one retained source word by its original alternative index.
+    ///
+    /// This crate-private view lets another already-proved guarded reducer
+    /// reuse the exact dictionary owner without copying or reordering bytes.
+    pub(crate) fn source_word(&self, source_index: usize) -> Option<SourceWord<'_>> {
+        let entry = *self.entries.as_slice().get(source_index)?;
+        let start = usize::try_from(entry.start).ok()?;
+        let end = usize::try_from(entry.end).ok()?;
+        Some(SourceWord {
+            bytes: self.packed.as_slice().get(start..end)?,
+            left: entry.left,
+            right: entry.right,
+        })
+    }
+
     /// Construct an allocation-free execution view from authentic host facts.
     ///
     /// OS-usable SVE admits scanner construction, after which the qualified
