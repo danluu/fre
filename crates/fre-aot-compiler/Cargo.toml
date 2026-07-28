@@ -6,6 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+autoexamples = false
+
+[[example]]
+name = "emit_linux_search_span_source_candidate"
+path = "examples/emit_linux_search_span_source_candidate.rs"
+
+[[example]]
+name = "emit_search_span_source_candidate"
+path = "examples/emit_search_span_source_candidate.rs"
 
 [dependencies]
 fre = { path = "../fre", default-features = false }
