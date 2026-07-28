@@ -16,11 +16,21 @@ write_native_csv() {
     bundle=$3
     backend=$4
     schema=$5
-    binding="fre-qualified-exact-evidence-v2|output=span|backend=$backend|route=native-jit|artifact=$artifact|qualification_state=$state|qualification_bundle=$bundle|minimum_window_bytes=65536|minimum_qualifying_calls=1024"
+    if [ "$schema" = fre-jit-bakeoff-v3 ]; then
+        binding="fre-qualified-exact-evidence-v3|public_output=span|native_output=selected-end|native_abi=selected-end-register-v2|backend=$backend|route=native-jit|artifact=$artifact|qualification_state=$state|qualification_bundle=$bundle|minimum_window_bytes=65536|minimum_qualifying_calls=1024"
+        timing_scope=session_value_search_declared_workload_build_and_session_excluded
+        stores=0
+        artifact_binding=facade-reported-abi2-identity+deterministic-selected-end-register-v2-image
+    else
+        binding="fre-qualified-exact-evidence-v2|output=span|backend=$backend|route=native-jit|artifact=$artifact|qualification_state=$state|qualification_bundle=$bundle|minimum_window_bytes=65536|minimum_qualifying_calls=1024"
+        timing_scope=search_only_declared_workload_build_excluded
+        stores=1
+        artifact_binding=facade-reported-identity+deterministic-native-span-image
+    fi
     evidence=$(printf '%s' "$binding" | shasum -a 256 | awk '{print $1}')
     {
         printf '%s\n' "$header"
-        printf '%s\n' "$schema,rev,1,0,exact-span-64k-absent,exact,span,64k,absent,65536,0,fre-qualified-exact,search,search_only_declared_workload_build_excluded,1024,1,1,0x1,0x1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,synthetic-v1,span,$backend,native-jit,$artifact,$evidence,$state,$bundle,$binding,facade-reported-identity+deterministic-native-span-image,65536,1024,1024,1024"
+        printf '%s\n' "$schema,rev,1,0,exact-span-64k-absent,exact,span,64k,absent,65536,0,fre-qualified-exact,search,$timing_scope,1024,1,1,0x1,0x1,1,1,1,1,1,1,1,1,$stores,1,0,0,0,0,0,synthetic-v1,span,$backend,native-jit,$artifact,$evidence,$state,$bundle,$binding,$artifact_binding,65536,1024,1024,1024"
     } > "$destination"
 }
 
@@ -32,19 +42,28 @@ verify() {
 
 write_native_csv \
     "$temporary/valid-candidate.csv" candidate none \
-    aarch64-search-v7 fre-jit-bakeoff-v2
+    aarch64-search-v8-selected-end-register-v2 fre-jit-bakeoff-v3
 verify "$temporary/valid-candidate.csv"
 
 write_native_csv \
     "$temporary/valid-qualified.csv" qualified "$accepted_bundle" \
-    aarch64-search-v7 fre-jit-bakeoff-v2
+    aarch64-search-v8-selected-end-register-v2 fre-jit-bakeoff-v3
 verify "$temporary/valid-qualified.csv"
+
+write_native_csv \
+    "$temporary/valid-historical-v2.csv" candidate none \
+    aarch64-search-v7 fre-jit-bakeoff-v2
+verify "$temporary/valid-historical-v2.csv"
 
 for field_and_value in \
     "output_kind exists" \
+    "backend aarch64-search-v7" \
     "route portable-literal" \
+    "timing_scope forged-scope" \
     "artifact_identity cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
     "evidence_identity cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" \
+    "stores 1" \
+    "artifact_binding forged-binding" \
     "declared_min_qualifying_calls 2048" \
     "measured_calls 500" \
     "measured_qualifying_calls 500"
@@ -76,23 +95,23 @@ assert_rejected() {
 
 write_native_csv \
     "$temporary/candidate-with-bundle.csv" candidate "$accepted_bundle" \
-    aarch64-search-v7 fre-jit-bakeoff-v2
+    aarch64-search-v8-selected-end-register-v2 fre-jit-bakeoff-v3
 assert_rejected "$temporary/candidate-with-bundle.csv"
 write_native_csv \
     "$temporary/qualified-zero.csv" qualified "$zero_bundle" \
-    aarch64-search-v7 fre-jit-bakeoff-v2
+    aarch64-search-v8-selected-end-register-v2 fre-jit-bakeoff-v3
 assert_rejected "$temporary/qualified-zero.csv"
 write_native_csv \
     "$temporary/qualified-historical.csv" qualified "$historical_bundle" \
-    aarch64-search-v7 fre-jit-bakeoff-v2
+    aarch64-search-v8-selected-end-register-v2 fre-jit-bakeoff-v3
 assert_rejected "$temporary/qualified-historical.csv"
 write_native_csv \
     "$temporary/old-backend.csv" candidate none \
-    aarch64-jit-v2 fre-jit-bakeoff-v2
+    aarch64-search-v7 fre-jit-bakeoff-v3
 assert_rejected "$temporary/old-backend.csv"
 write_native_csv \
     "$temporary/old-schema.csv" candidate none \
     aarch64-search-v7 fre-jit-bakeoff-v1
 assert_rejected "$temporary/old-schema.csv"
 
-echo "verified: V7 backend, typed qualification, binding, and call-count tampering fail closed"
+echo "verified: V8 register ABI2 and historical V7 schemas fail closed under typed qualification, binding, and call-count tampering"

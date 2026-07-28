@@ -5,6 +5,17 @@ narrow V7 native backend. It is not evidence that FRE is the world's fastest
 regex engine and is not qualification authority for the current composed
 source.
 
+The current harness source emits 48-column `fre-jit-bakeoff-v3` rows for the
+explicit V8 `SelectedEnd` register-return ABI2 policy. It establishes one
+current-thread session outside each search-only timer and uses only its
+value-returning call in the hot loop. Full-workload rows include owner and
+session construction once, followed by the declared value-only workload.
+Before serializing a native row, the generator requires the facade-reported
+V8/ABI2 target, backend, image statistics, and artifact identity to match a
+separately emitted deterministic register-return image.
+Historical V2 rows remain V2 and continue to describe only the retired
+sessionless Search-v1/Span-image harness.
+
 At the exact historical Q source below, the V7 exact-literal leaf was qualified
 only through the explicit opt-in `fre::QualifiedExactSearch`; no default
 facade selected it. Its accepted historical envelope was limited to 16-byte
@@ -102,18 +113,20 @@ Every synthetic process validates semantics before entering these timers:
 | Rust regex | `search` | search through an already compiled regex | compilation |
 | `fre-kernels` | `build_first_call` | plan build and first search | nothing in its plan-to-first-result path |
 | `fre-kernels` | `search` | search through an already built plan | plan build |
-| experimental facade | `search` | actual routing check and selected portable/native calls; iterations meet the declared reuse count | construction and publication |
-| experimental facade | `build_full_workload` | owner construction plus exactly the declared workload, reported amortized per search | nothing in the facade-plus-workload path |
-| under-threshold facade | `search`, `build_full_workload` | the same boundaries with a declaration one call below admission | native emission and publication, which must not occur |
+| experimental facade | `search` | value-only calls through one admitted current-thread session; iterations meet the declared reuse count | owner and session construction; route reporting |
+| experimental facade | `build_full_workload` | owner and current-thread session construction once, then exactly the declared value-only workload, reported amortized per search | untimed route reporting after the workload |
+| under-threshold facade | `search`, `build_full_workload` | the same session boundaries with a declaration one call below admission | native emission and publication, which must not occur |
 
 Iterations are fixed by haystack size, not calibrated from performance.
 `raw.csv` retains total nanoseconds, iterations, a rolling checksum, the
 single-call semantic value, image and mapping sizes, decoded instruction mix,
 identity receipt, and cache accounting. `ranges.csv` reports the five-process
 minimum, rounded mean, and maximum without discarding any raw sample.
-Both synthetic and Sherlock serializers exactly match the 48-column V2
+Both synthetic and Sherlock serializers exactly match the 48-column V3
 header. Sherlock rows explicitly report qualification state `not-applicable`
-and bundle `none`.
+and bundle `none`. `verify_evidence_rows.awk` accepts both current V3 rows and
+unaltered historical V2 rows, while applying the schema-specific backend, ABI,
+artifact, and accounting rules.
 
 ## Semantic authentication
 

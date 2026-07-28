@@ -3,12 +3,13 @@ use std::{error::Error, fmt, fs, hint::black_box, path::Path, process, time::Ins
 use fre::{
     QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
     QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
-    QualifiedExactSearch, QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification,
-    QualifiedExactSearchRoute, QualifiedExactSearchWorkload, SearchLimits as FacadeSearchLimits,
+    QualifiedExactSearch, QualifiedExactSearchBackendPolicy, QualifiedExactSearchNativeAbi,
+    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
+    QualifiedExactSearchWorkload, SearchLimits as FacadeSearchLimits,
 };
 use fre_jit_aarch64::{
-    ArtifactIdentityReceipt, BackendVersion, DecodedInstruction, EmitLimits, ImageStats,
-    NativeImage, decode, emit,
+    BackendVersion, DecodedInstruction, EmitLimits, ImageStats, NativeImage,
+    SelectedEndRegisterBackendV2, TargetSpec, decode, emit, emit_selected_end_register_v2,
 };
 use fre_jit_cache::{CacheLimits, KernelCache};
 use fre_jit_runtime::{
@@ -27,7 +28,10 @@ use memchr::arch::all::packedpair::Pair;
 use regex::bytes::{Regex, RegexBuilder};
 use sha2::{Digest, Sha256};
 
-const SCHEMA: &str = "fre-jit-bakeoff-v2";
+// V3 measures the public V8 register-return ABI2 current-thread session. V2
+// used the retired sessionless Search-v1 facade and generic Span-image evidence;
+// those rows remain historical evidence and must never be relabeled.
+const SCHEMA: &str = "fre-jit-bakeoff-v3";
 const CSV_HEADER: &str = "schema,revision,pid,repetition,cell,shape,operation,size,scenario,haystack_bytes,alignment_mod16,engine,stage,timing_scope,iterations,total_ns,ns_per_iter,checksum,semantic_value,code_bytes,data_bytes,payload_used_bytes,total_mapped_bytes,total_pages,instructions,vector_instructions,loads,stores,branches,identity_bytes_hashed,identity_scratch_bytes,identity_heap_allocations,cache_bookkeeping_bytes,cache_hits,fixture,output_kind,backend,route,artifact_identity,evidence_identity,qualification_state,qualification_bundle_sha256,evidence_binding,artifact_binding,declared_min_window_bytes,declared_min_qualifying_calls,measured_calls,measured_qualifying_calls";
 const EXACT_LITERAL: &[u8] = b"0123456789abcdef";
 const LITERAL_1: &[u8] = b"a";
@@ -484,30 +488,28 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     let qualified_workload = cell.size.qualified_workload();
     let under_threshold_workload = cell.size.under_threshold_workload();
     let qualified = if cell.shape == Shape::Exact {
-        Some(QualifiedExactSearch::new(
-            EXACT_LITERAL,
-            qualified_workload,
-        )?)
+        Some(build_qualified_v8(qualified_workload)?)
     } else {
         None
     };
     let under_threshold = if cell.shape == Shape::Exact {
-        Some(QualifiedExactSearch::new(
-            EXACT_LITERAL,
-            under_threshold_workload,
-        )?)
+        Some(build_qualified_v8(under_threshold_workload)?)
     } else {
         None
     };
-    let qualified_span_image = if cell.shape == Shape::Exact {
-        let span_program = build_exact_literal::<Span>(
-            EXACT_LITERAL,
-            AnchorFlags::default(),
-            ValidateLimits::default(),
-        )?;
-        let span_image = emit(&span_program, EmitLimits::default())?;
-        let span_mix = InstructionMix::for_image(&span_image)?;
-        Some((span_image, span_mix))
+    // The sessions borrow their owners and are established before every hot
+    // timer. Even V8 uses this explicit boundary, though its construction is
+    // SVE-syscall-free.
+    let qualified_session = qualified
+        .as_ref()
+        .map(|search| search.begin_current_thread_session())
+        .transpose()?;
+    let under_threshold_session = under_threshold
+        .as_ref()
+        .map(|search| search.begin_current_thread_session())
+        .transpose()?;
+    let qualified_v8_artifact = if cell.shape == Shape::Exact {
+        Some(qualified_v8_artifact_witness()?)
     } else {
         None
     };
@@ -521,8 +523,9 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     let kernels_value = O::encode_span(native_plan.find(haystack)?);
     ensure_equal("regex", oracle, regex_value, cell)?;
     ensure_equal("fre-kernels", oracle, kernels_value, cell)?;
-    let qualified_route = if let Some(qualified) = &qualified {
-        let (matched, execution) = qualified.find(haystack, FacadeSearchLimits::unlimited())?;
+    let qualified_route = if let (Some(qualified), Some(session)) = (&qualified, &qualified_session)
+    {
+        let (matched, execution) = session.find(haystack, FacadeSearchLimits::unlimited())?;
         let qualified_value = O::encode_span(matched.map(|span| (span.start(), span.end())));
         ensure_equal("qualified exact facade", oracle, qualified_value, cell)?;
         let expected_route = if haystack.len()
@@ -544,9 +547,10 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     } else {
         None
     };
-    let under_threshold_route = if let Some(under_threshold) = &under_threshold {
-        let (matched, execution) =
-            under_threshold.find(haystack, FacadeSearchLimits::unlimited())?;
+    let under_threshold_route = if let (Some(under_threshold), Some(session)) =
+        (&under_threshold, &under_threshold_session)
+    {
+        let (matched, execution) = session.find(haystack, FacadeSearchLimits::unlimited())?;
         let qualified_value = O::encode_span(matched.map(|span| (span.start(), span.end())));
         ensure_equal(
             "under-threshold qualified exact facade",
@@ -584,19 +588,11 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
         black_box(O::encode(&published.search(black_box(haystack), window)?));
         black_box(O::regex_search(&regex, black_box(haystack)));
         black_box(O::encode_span(native_plan.find(black_box(haystack))?));
-        if let Some(qualified) = &qualified {
-            black_box(
-                qualified
-                    .find(black_box(haystack), FacadeSearchLimits::unlimited())?
-                    .0,
-            );
+        if let Some(session) = &qualified_session {
+            black_box(session.find_value(black_box(haystack), FacadeSearchLimits::unlimited())?);
         }
-        if let Some(under_threshold) = &under_threshold {
-            black_box(
-                under_threshold
-                    .find(black_box(haystack), FacadeSearchLimits::unlimited())?
-                    .0,
-            );
+        if let Some(session) = &under_threshold_session {
+            black_box(session.find_value(black_box(haystack), FacadeSearchLimits::unlimited())?);
         }
         let lease = cache.get_or_publish(&image)?;
         black_box(O::encode(&lease.search(black_box(haystack), window)?));
@@ -723,38 +719,37 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
     if let (
         Some(qualified),
         Some(under_threshold),
+        Some(qualified_session),
+        Some(under_threshold_session),
         Some(route),
         Some(under_route),
-        Some((span_image, span_mix)),
+        Some(v8_artifact),
     ) = (
         &qualified,
         &under_threshold,
+        &qualified_session,
+        &under_threshold_session,
         qualified_route,
         under_threshold_route,
-        &qualified_span_image,
+        &qualified_v8_artifact,
     ) {
         let search_timed = measure(hot_iterations, || {
-            let (matched, execution) = qualified
-                .find(black_box(haystack), FacadeSearchLimits::unlimited())
-                .expect("qualified facade search remains valid");
-            assert_eq!(
-                execution.route, route,
-                "qualified route changed inside one search-only sample"
-            );
+            let matched = qualified_session
+                .find_value(black_box(haystack), FacadeSearchLimits::unlimited())
+                .expect("qualified V8 ABI2 session search remains valid");
             O::encode_span(matched.map(|span| (span.start(), span.end())))
         });
         samples.push(
             Sample::new(
                 "fre-qualified-exact",
                 "search",
-                "search_only_declared_workload_build_excluded",
+                "session_value_search_declared_workload_build_and_session_excluded",
                 search_timed,
             )
             .with_evidence(qualified_row_evidence(
                 qualified,
                 route,
-                span_image,
-                *span_mix,
+                v8_artifact,
                 haystack.len(),
                 search_timed.iterations,
             )?),
@@ -762,35 +757,23 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
 
         let full_workload_calls = u64::try_from(qualified_workload.minimum_qualifying_searches())
             .expect("bounded declared workload fits u64");
-        let full_workload_timed = measure_full_workload(
+        let full_workload_timed = measure_qualified_full_workload::<O>(
+            qualified_workload,
+            haystack,
             full_workload_calls,
-            || {
-                QualifiedExactSearch::new(EXACT_LITERAL, qualified_workload)
-                    .expect("qualified facade build")
-            },
-            |cold| {
-                let (matched, execution) = cold
-                    .find(black_box(haystack), FacadeSearchLimits::unlimited())
-                    .expect("qualified facade workload search remains valid");
-                assert_eq!(
-                    execution.route, route,
-                    "qualified route changed inside full-workload sample"
-                );
-                O::encode_span(matched.map(|span| (span.start(), span.end())))
-            },
+            route,
         );
         samples.push(
             Sample::new(
                 "fre-qualified-exact",
                 "build_full_workload",
-                "build_plus_declared_workload_amortized_per_search",
+                "build_plus_session_plus_declared_workload_amortized_per_value_search",
                 full_workload_timed,
             )
             .with_evidence(qualified_row_evidence(
                 qualified,
                 route,
-                span_image,
-                *span_mix,
+                v8_artifact,
                 haystack.len(),
                 full_workload_timed.iterations,
             )?),
@@ -801,61 +784,44 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
                 .expect("bounded under-threshold workload fits u64")
                 .max(1);
         let under_search_timed = measure(under_threshold_calls, || {
-            let (matched, execution) = under_threshold
-                .find(black_box(haystack), FacadeSearchLimits::unlimited())
-                .expect("under-threshold facade search remains valid");
-            assert_eq!(
-                execution.route, under_route,
-                "under-threshold route changed inside one search-only sample"
-            );
+            let matched = under_threshold_session
+                .find_value(black_box(haystack), FacadeSearchLimits::unlimited())
+                .expect("under-threshold V8 ABI2 session search remains valid");
             O::encode_span(matched.map(|span| (span.start(), span.end())))
         });
         samples.push(
             Sample::new(
                 "fre-qualified-exact-under-threshold",
                 "search",
-                "search_only_forced_portable_under_threshold",
+                "session_value_search_forced_portable_build_and_session_excluded",
                 under_search_timed,
             )
             .with_evidence(qualified_row_evidence(
                 under_threshold,
                 under_route,
-                span_image,
-                *span_mix,
+                v8_artifact,
                 haystack.len(),
                 under_search_timed.iterations,
             )?),
         );
 
-        let under_full_timed = measure_full_workload(
+        let under_full_timed = measure_qualified_full_workload::<O>(
+            under_threshold_workload,
+            haystack,
             under_threshold_calls,
-            || {
-                QualifiedExactSearch::new(EXACT_LITERAL, under_threshold_workload)
-                    .expect("under-threshold facade build")
-            },
-            |cold| {
-                let (matched, execution) = cold
-                    .find(black_box(haystack), FacadeSearchLimits::unlimited())
-                    .expect("under-threshold facade workload search remains valid");
-                assert_eq!(
-                    execution.route, under_route,
-                    "under-threshold route changed inside full-workload sample"
-                );
-                O::encode_span(matched.map(|span| (span.start(), span.end())))
-            },
+            under_route,
         );
         samples.push(
             Sample::new(
                 "fre-qualified-exact-under-threshold",
                 "build_full_workload",
-                "portable_build_plus_declared_workload_amortized_per_search",
+                "portable_build_plus_session_plus_declared_workload_amortized_per_value_search",
                 under_full_timed,
             )
             .with_evidence(qualified_row_evidence(
                 under_threshold,
                 under_route,
-                span_image,
-                *span_mix,
+                v8_artifact,
                 haystack.len(),
                 under_full_timed.iterations,
             )?),
@@ -893,6 +859,81 @@ fn bench<O: BenchOperation>(cell: Cell, repetition: u32) -> Result<(), Box<dyn E
         print_sample(&metadata, &sample);
     }
     Ok(())
+}
+
+fn build_qualified_v8(
+    workload: QualifiedExactSearchWorkload,
+) -> Result<QualifiedExactSearch, fre::QualifiedExactSearchBuildError> {
+    QualifiedExactSearch::new_with_backend(
+        EXACT_LITERAL,
+        workload,
+        QualifiedExactSearchBackendPolicy::AsimdV8,
+    )
+}
+
+fn qualified_v8_artifact_witness() -> Result<QualifiedV8ArtifactWitness, Box<dyn Error>> {
+    let program = build_exact_literal::<SelectedEnd>(
+        EXACT_LITERAL,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )?;
+    let image = emit_selected_end_register_v2(
+        &program,
+        SelectedEndRegisterBackendV2::AsimdV8,
+        EmitLimits::default(),
+    )?;
+    Ok(QualifiedV8ArtifactWitness {
+        image: image.stats(),
+        target: image.target(),
+        backend: image.backend_version(),
+        artifact_sha256: *image.artifact_identity().as_bytes(),
+        mix: InstructionMix::for_code(image.code())?,
+    })
+}
+
+/// Time the complete qualified lifecycle without creating a self-referential
+/// state object. Construction and session admission are inside the lifecycle
+/// timer; the session itself is established once before the value-only loop.
+fn measure_qualified_full_workload<O: BenchOperation>(
+    workload: QualifiedExactSearchWorkload,
+    haystack: &[u8],
+    calls: u64,
+    expected_route: QualifiedExactSearchRoute,
+) -> Timed {
+    assert!(calls > 0);
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
+    let start = Instant::now();
+    let qualified = build_qualified_v8(workload).expect("qualified V8 ABI2 facade build");
+    let session = qualified
+        .begin_current_thread_session()
+        .expect("qualified V8 ABI2 current-thread session");
+    for iteration in 0..calls {
+        let matched = session
+            .find_value(black_box(haystack), FacadeSearchLimits::unlimited())
+            .expect("qualified V8 ABI2 value search remains valid");
+        let value = black_box(O::encode_span(
+            matched.map(|span| (span.start(), span.end())),
+        ));
+        checksum = checksum.rotate_left(9)
+            ^ value.wrapping_add(iteration.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    }
+    let total_ns = start.elapsed().as_nanos();
+    black_box(checksum);
+
+    // Route reporting remains outside the measured lifecycle. It proves that
+    // every value-only call used the intended native or portable executor.
+    let (_, execution) = session
+        .find(haystack, FacadeSearchLimits::unlimited())
+        .expect("qualified V8 ABI2 reporting search remains valid");
+    assert_eq!(
+        execution.route, expected_route,
+        "qualified route changed inside one full-workload sample"
+    );
+    Timed {
+        iterations: calls,
+        total_ns,
+        checksum,
+    }
 }
 
 fn build_program<O: Operation>(
@@ -1226,28 +1267,6 @@ where
     }
 }
 
-fn measure_full_workload<S, I, F>(iterations: u64, initialize: I, mut measured: F) -> Timed
-where
-    I: FnOnce() -> S,
-    F: FnMut(&S) -> u64,
-{
-    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
-    let start = Instant::now();
-    let state = initialize();
-    for iteration in 0..iterations {
-        let value = black_box(measured(&state));
-        checksum = checksum.rotate_left(9)
-            ^ value.wrapping_add(iteration.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    }
-    let total_ns = start.elapsed().as_nanos();
-    black_box(checksum);
-    Timed {
-        iterations,
-        total_ns,
-        checksum,
-    }
-}
-
 fn identity_word(identity: RuntimeIdentity) -> u64 {
     u64::from_le_bytes(
         identity.as_bytes()[..8]
@@ -1275,7 +1294,11 @@ struct InstructionMix {
 
 impl InstructionMix {
     fn for_image(image: &NativeImage) -> Result<Self, fre_jit_aarch64::DecodeError> {
-        let decoded = decode(image.code())?;
+        Self::for_code(image.code())
+    }
+
+    fn for_code(code: &[u8]) -> Result<Self, fre_jit_aarch64::DecodeError> {
+        let decoded = decode(code)?;
         let mut mix = Self {
             instructions: decoded.len(),
             ..Self::default()
@@ -1311,11 +1334,23 @@ impl InstructionMix {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct QualifiedV8ArtifactWitness {
+    image: ImageStats,
+    target: TargetSpec,
+    backend: BackendVersion,
+    artifact_sha256: [u8; 32],
+    mix: InstructionMix,
+}
+
+#[derive(Clone, Debug)]
 struct NativeArtifactEvidence {
     image: ImageStats,
     publication: PublicationAccounting,
     mix: InstructionMix,
-    identity: ArtifactIdentityReceipt,
+    artifact_identity: String,
+    identity_bytes_hashed: u64,
+    identity_scratch_bytes: u64,
+    identity_heap_allocations: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1347,23 +1382,30 @@ fn qualification_row_fields(
     }
 }
 
-fn qualified_search_backend_label(backend: BackendVersion) -> Result<String, Box<dyn Error>> {
-    if backend != BackendVersion::SEARCH_V7 {
+fn qualified_search_backend_label(
+    backend: BackendVersion,
+    abi: QualifiedExactSearchNativeAbi,
+) -> Result<String, Box<dyn Error>> {
+    if backend != BackendVersion::SEARCH_V8
+        || abi != QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+    {
         return Err(format!(
-            "qualified facade reported search backend {}, expected {}",
+            "qualified facade reported backend {}/ABI {abi:?}, expected {}/SelectedEndRegisterV2",
             backend.0,
-            BackendVersion::SEARCH_V7.0
+            BackendVersion::SEARCH_V8.0
         )
         .into());
     }
-    Ok(format!("aarch64-search-v{}", backend.0))
+    Ok(format!(
+        "aarch64-search-v{}-selected-end-register-v2",
+        backend.0
+    ))
 }
 
 fn qualified_row_evidence(
     qualified: &QualifiedExactSearch,
     route: QualifiedExactSearchRoute,
-    span_image: &NativeImage,
-    span_mix: InstructionMix,
+    witness: &QualifiedV8ArtifactWitness,
     haystack_bytes: usize,
     measured_calls: u64,
 ) -> Result<RowEvidence, Box<dyn Error>> {
@@ -1371,31 +1413,50 @@ fn qualified_row_evidence(
     let workload = report.workload;
     let (qualification_state, qualification_bundle_sha256) =
         qualification_row_fields(report.qualification)?;
-    let (artifact, backend, route_name, artifact_binding, artifact_identity) = match route {
+    let (
+        artifact,
+        backend,
+        route_name,
+        native_abi,
+        native_output,
+        artifact_binding,
+        artifact_identity,
+    ) = match route {
         QualifiedExactSearchRoute::NativeJit => {
             let QualifiedExactSearchNativeStatus::Published {
                 image,
                 mapping,
+                abi,
+                sve_vector_bytes_at_publication,
+                required_thread_sve_vector_bytes,
                 identity,
-            } = &qualified.build_report().native
+                ..
+            } = &report.native
             else {
                 return Err("facade reported a native route without a published image".into());
             };
-            if *image != span_image.stats() {
+            if report.backend_policy != QualifiedExactSearchBackendPolicy::AsimdV8
+                || identity.backend_policy != QualifiedExactSearchBackendPolicy::AsimdV8
+                || identity.backend != BackendVersion::SEARCH_V8
+                || *abi != QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+                || identity.abi != QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+                || identity.sve_vector_bytes_at_publication.is_some()
+                || identity.required_thread_sve_vector_bytes.is_some()
+                || sve_vector_bytes_at_publication.is_some()
+                || required_thread_sve_vector_bytes.is_some()
+            {
                 return Err(
-                    "facade native-span image stats differ from deterministic evidence image"
+                    "qualified V8 route did not retain the syscall-free register ABI2 contract"
                         .into(),
                 );
             }
-            let image_identity = span_image.artifact_identity_receipt();
-            if identity.artifact_sha256 != *span_image.artifact_identity().as_bytes()
-                || identity.backend != span_image.backend_version()
-                || identity.target != span_image.target()
+            if *image != witness.image
+                || identity.artifact_sha256 != witness.artifact_sha256
+                || identity.backend != witness.backend
+                || identity.target != witness.target
             {
-                return Err(
-                    "facade-reported native identity differs from the executed image contract"
-                        .into(),
-                );
+                let message = "facade-reported V8 ABI2 identity differs from the deterministic register-return witness";
+                return Err(message.into());
             }
             if identity.qualification != report.qualification {
                 return Err(
@@ -1403,17 +1464,24 @@ fn qualified_row_evidence(
                         .into(),
                 );
             }
-            let backend = qualified_search_backend_label(identity.backend)?;
+            let backend = qualified_search_backend_label(identity.backend, identity.abi)?;
             (
                 Some(NativeArtifactEvidence {
                     image: *image,
                     publication: *mapping,
-                    mix: span_mix,
-                    identity: image_identity,
+                    mix: witness.mix,
+                    artifact_identity: hex_encode(&identity.artifact_sha256),
+                    // ABI2 exposes the precomputed digest directly. Reading it
+                    // hashes no bytes and uses no scratch or heap allocation.
+                    identity_bytes_hashed: 0,
+                    identity_scratch_bytes: 0,
+                    identity_heap_allocations: 0,
                 }),
                 backend,
                 "native-jit",
-                "facade-reported-identity+deterministic-native-span-image",
+                "selected-end-register-v2",
+                "selected-end",
+                "facade-reported-abi2-identity+deterministic-selected-end-register-v2-image",
                 hex_encode(&identity.artifact_sha256),
             )
         }
@@ -1421,12 +1489,14 @@ fn qualified_row_evidence(
             None,
             "portable-literal".to_owned(),
             "portable-literal",
+            "none",
+            "none",
             "portable-semantic-owner",
             "none".to_owned(),
         ),
     };
     let evidence_binding = format!(
-        "fre-qualified-exact-evidence-v2|output=span|backend={backend}|route={route_name}|artifact={artifact_identity}|qualification_state={qualification_state}|qualification_bundle={qualification_bundle_sha256}|minimum_window_bytes={}|minimum_qualifying_calls={}",
+        "fre-qualified-exact-evidence-v3|public_output=span|native_output={native_output}|native_abi={native_abi}|backend={backend}|route={route_name}|artifact={artifact_identity}|qualification_state={qualification_state}|qualification_bundle={qualification_bundle_sha256}|minimum_window_bytes={}|minimum_qualifying_calls={}",
         workload.minimum_window_bytes(),
         workload.minimum_qualifying_searches(),
     );
@@ -1539,9 +1609,9 @@ fn format_sample(metadata: &Metadata, sample: &Sample) -> String {
             artifact.mix.loads,
             artifact.mix.stores,
             artifact.mix.branches,
-            artifact.identity.canonical_bytes_hashed,
-            artifact.identity.scratch_bytes,
-            artifact.identity.heap_allocations,
+            artifact.identity_bytes_hashed,
+            artifact.identity_scratch_bytes,
+            artifact.identity_heap_allocations,
         ),
         Some(RowEvidence { artifact: None, .. }) => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         None => (
@@ -1564,7 +1634,7 @@ fn format_sample(metadata: &Metadata, sample: &Sample) -> String {
         .evidence
         .as_ref()
         .and_then(|evidence| evidence.artifact.as_ref())
-        .map(|artifact| artifact.identity.identity.to_string());
+        .map(|artifact| artifact.artifact_identity.as_str());
     let (
         output_kind,
         backend,
@@ -1584,7 +1654,7 @@ fn format_sample(metadata: &Metadata, sample: &Sample) -> String {
             evidence.output_kind,
             evidence.backend.as_str(),
             evidence.route,
-            evidence_artifact_identity.as_deref().unwrap_or("none"),
+            evidence_artifact_identity.unwrap_or("none"),
             evidence.evidence_identity.as_str(),
             evidence.qualification_state,
             evidence.qualification_bundle_sha256.as_str(),
@@ -2143,7 +2213,79 @@ mod tests {
     }
 
     #[test]
-    fn normal_and_sherlock_rows_exactly_match_the_v2_csv_schema() {
+    fn qualified_v8_abi2_session_and_evidence_boundaries_are_source_sealed() {
+        fn between<'source>(source: &'source str, start: &str, end: &str) -> &'source str {
+            let start = source
+                .find(start)
+                .unwrap_or_else(|| panic!("missing ABI2 source marker: {start}"));
+            let end = start
+                + source[start..]
+                    .find(end)
+                    .unwrap_or_else(|| panic!("missing ABI2 source marker: {end}"));
+            &source[start..end]
+        }
+
+        let source = include_str!("main.rs");
+        assert!(source.contains("const SCHEMA: &str = \"fre-jit-bakeoff-v3\";"));
+        let builder = between(
+            source,
+            "fn build_qualified_v8(",
+            "\nfn qualified_v8_artifact_witness(",
+        );
+        assert!(builder.contains("QualifiedExactSearch::new_with_backend("));
+        assert!(builder.contains("QualifiedExactSearchBackendPolicy::AsimdV8"));
+
+        let bench = between(
+            source,
+            "fn bench<O: BenchOperation>(",
+            "\nfn build_qualified_v8(",
+        );
+        let session = bench
+            .find("let qualified_session")
+            .expect("qualified session construction");
+        let hot = bench.find("let search_timed").expect("qualified hot timer");
+        assert!(session < hot);
+        assert!(bench[hot..].contains("qualified_session\n                .find_value("));
+        assert!(!bench[hot..].contains("qualified\n                .find("));
+        for scope in [
+            "session_value_search_declared_workload_build_and_session_excluded",
+            "build_plus_session_plus_declared_workload_amortized_per_value_search",
+            "session_value_search_forced_portable_build_and_session_excluded",
+            "portable_build_plus_session_plus_declared_workload_amortized_per_value_search",
+        ] {
+            assert!(bench.contains(scope));
+        }
+
+        let full = between(
+            source,
+            "fn measure_qualified_full_workload<O: BenchOperation>(",
+            "\nfn build_program<O: Operation>(",
+        );
+        let build = full
+            .find("let qualified = build_qualified_v8(workload)")
+            .expect("full-workload facade build");
+        let session = full
+            .find(".begin_current_thread_session()")
+            .expect("full-workload session");
+        let loop_start = full.find("for iteration in 0..calls").expect("value loop");
+        assert!(build < session && session < loop_start);
+        assert!(full[loop_start..].contains(".find_value("));
+        assert!(full.contains("let total_ns = start.elapsed().as_nanos();"));
+
+        let evidence = between(
+            source,
+            "fn qualified_row_evidence(",
+            "\n#[derive(Debug)]\nstruct Sample",
+        );
+        assert!(evidence.contains("QualifiedExactSearchNativeAbi::SelectedEndRegisterV2"));
+        assert!(evidence.contains("BackendVersion::SEARCH_V8"));
+        assert!(evidence.contains("fre-qualified-exact-evidence-v3"));
+        assert!(evidence.contains("deterministic-selected-end-register-v2-image"));
+    }
+
+    #[test]
+    fn normal_and_sherlock_rows_exactly_match_the_v3_csv_schema() {
+        assert_eq!(SCHEMA, "fre-jit-bakeoff-v3");
         let cell = exact_cell(Scenario::Absent);
         let program = build_program::<Span>(cell.shape).expect("test program");
         let image = emit(&program, EmitLimits::default()).expect("test image");
