@@ -7,7 +7,7 @@
 
 use core::convert::Infallible;
 
-use crate::unicode_word_run::{Plan, WordMode};
+use crate::unicode_word_run::{Plan, WordMode, WordRunTopology};
 
 /// Source-independent execution maxima for one exact word plan and source
 /// length.
@@ -292,6 +292,7 @@ pub(crate) const fn supports(plan: Plan) -> bool {
         plan,
         Plan::Word {
             minimum_scalars,
+            topology: WordRunTopology::CompleteWordBoundaries,
             ..
         } if minimum_scalars > 0
     )
@@ -372,6 +373,7 @@ where
     let Plan::Word {
         minimum_scalars,
         mode,
+        topology: WordRunTopology::CompleteWordBoundaries,
     } = plan
     else {
         return Err(Error::UnsupportedPlan.into());
@@ -907,6 +909,7 @@ mod tests {
         Plan::Word {
             minimum_scalars,
             mode: WordMode::Ascii,
+            topology: WordRunTopology::CompleteWordBoundaries,
         }
     }
 
@@ -914,6 +917,7 @@ mod tests {
         Plan::Word {
             minimum_scalars,
             mode: WordMode::Unicode,
+            topology: WordRunTopology::CompleteWordBoundaries,
         }
     }
 
@@ -939,6 +943,11 @@ mod tests {
         assert_eq!(error, Error::UnsupportedPlan);
         assert!(!supports(ascii(0)));
         assert!(!supports(unicode(0)));
+        assert!(!supports(Plan::Word {
+            minimum_scalars: 1,
+            mode: WordMode::Ascii,
+            topology: WordRunTopology::BareGreedyRoot,
+        }));
     }
 
     #[test]
@@ -1178,6 +1187,7 @@ mod tests {
                         let plan = Plan::Word {
                             minimum_scalars,
                             mode,
+                            topology: WordRunTopology::CompleteWordBoundaries,
                         };
                         let admitted = prospective(plan, haystack.len()).expect("prospective");
                         let mut actual_trace = Vec::new();

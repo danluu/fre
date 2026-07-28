@@ -39,11 +39,27 @@ pub(crate) enum WordMode {
     Unicode,
 }
 
+/// Source-derived match topology retained by the direct word-run operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WordRunTopology {
+    /// The canonical HIR proved matching word-boundary assertions at both
+    /// endpoints.
+    CompleteWordBoundaries,
+    /// The canonical HIR proved one bare greedy nonempty unbounded root word
+    /// repetition. Whole-input aggregate iteration therefore emits the same
+    /// maximal runs without asserting either endpoint.
+    BareGreedyRoot,
+    /// One exact-width canonical byte-class repetition emits consecutive
+    /// chunks from each maximal admitted run.
+    FixedClassChunks,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Plan {
     Word {
         minimum_scalars: usize,
         mode: WordMode,
+        topology: WordRunTopology,
     },
     FixedClassChunks {
         chunk_bytes: usize,
@@ -87,6 +103,7 @@ pub struct AggregateOperationIdentity {
     pub canonical_class_words: [u64; 4],
     pub unicode: bool,
     pub greedy: bool,
+    pub topology: WordRunTopology,
     pub complete_word_boundaries: bool,
     pub invalid_bytes_are_non_word: bool,
     pub arbitrary_bytes_are_classified: bool,
@@ -531,6 +548,15 @@ impl Plan {
         Self::Word {
             minimum_scalars,
             mode,
+            topology: WordRunTopology::CompleteWordBoundaries,
+        }
+    }
+
+    const fn bare_greedy(minimum_scalars: usize, mode: WordMode) -> Self {
+        Self::Word {
+            minimum_scalars,
+            mode,
+            topology: WordRunTopology::BareGreedyRoot,
         }
     }
 
@@ -598,6 +624,17 @@ impl Plan {
             Self::Word {
                 minimum_scalars, ..
             } => minimum_scalars,
+            Self::FixedClassChunks { .. } => {
+                unreachable!("fixed-class chunk plans never enter word search")
+            }
+        }
+    }
+
+    fn has_complete_word_boundaries(self) -> bool {
+        match self {
+            Self::Word { topology, .. } => {
+                matches!(topology, WordRunTopology::CompleteWordBoundaries)
+            }
             Self::FixedClassChunks { .. } => {
                 unreachable!("fixed-class chunk plans never enter word search")
             }
@@ -695,6 +732,7 @@ impl Plan {
             fixed_chunk_bytes,
             canonical_class_words,
             unicode,
+            topology,
             complete_word_boundaries,
             invalid_bytes_are_non_word,
             arbitrary_bytes_are_classified,
@@ -702,19 +740,30 @@ impl Plan {
             Self::Word {
                 minimum_scalars,
                 mode,
+                topology,
             } => (
                 minimum_scalars,
                 None,
                 [0; 4],
                 matches!(mode, WordMode::Unicode),
-                true,
+                topology,
+                matches!(topology, WordRunTopology::CompleteWordBoundaries),
                 true,
                 false,
             ),
             Self::FixedClassChunks {
                 chunk_bytes,
                 class_words,
-            } => (0, Some(chunk_bytes), class_words, false, false, false, true),
+            } => (
+                0,
+                Some(chunk_bytes),
+                class_words,
+                false,
+                WordRunTopology::FixedClassChunks,
+                false,
+                false,
+                true,
+            ),
         };
         AggregateOperationIdentity {
             plan_id: self.plan_id(),
@@ -724,6 +773,7 @@ impl Plan {
             canonical_class_words,
             unicode,
             greedy: true,
+            topology,
             complete_word_boundaries,
             invalid_bytes_are_non_word,
             arbitrary_bytes_are_classified,
@@ -1103,6 +1153,7 @@ impl Plan {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, Accounting), Error> {
         let minimum_scalars = self.word_minimum_scalars();
+        let complete_word_boundaries = self.has_complete_word_boundaries();
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -1115,9 +1166,10 @@ impl Plan {
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             if !is_ascii_word(byte)
-                || position
-                    .checked_sub(1)
-                    .is_some_and(|before| is_ascii_word(haystack[before]))
+                || (complete_word_boundaries
+                    && position
+                        .checked_sub(1)
+                        .is_some_and(|before| is_ascii_word(haystack[before])))
             {
                 position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
                     needed: u64::MAX,
@@ -1141,9 +1193,10 @@ impl Plan {
                 })?;
             }
             if position.saturating_sub(start) >= minimum_scalars
-                && !haystack
-                    .get(position)
-                    .is_some_and(|&byte| is_ascii_word(byte))
+                && (!complete_word_boundaries
+                    || !haystack
+                        .get(position)
+                        .is_some_and(|&byte| is_ascii_word(byte)))
             {
                 return Ok((
                     Some(Match {
@@ -1166,6 +1219,7 @@ impl Plan {
     ) -> Result<(Option<Match>, Accounting), Error> {
         debug_assert!(self.is_ascii_word());
         let minimum_scalars = self.word_minimum_scalars();
+        let complete_word_boundaries = self.has_complete_word_boundaries();
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -1178,9 +1232,10 @@ impl Plan {
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(1);
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             if !is_ascii_word(byte)
-                || position
-                    .checked_sub(1)
-                    .is_some_and(|before| is_ascii_word(haystack[before]))
+                || (complete_word_boundaries
+                    && position
+                        .checked_sub(1)
+                        .is_some_and(|before| is_ascii_word(haystack[before])))
             {
                 position = position.checked_add(1).ok_or(Error::WorkLimitExceeded {
                     needed: u64::MAX,
@@ -1209,9 +1264,10 @@ impl Plan {
                     limit: limits.max_work,
                 })?;
             if position.saturating_sub(start) >= minimum_scalars
-                && !haystack
-                    .get(position)
-                    .is_some_and(|&byte| is_ascii_word(byte))
+                && (!complete_word_boundaries
+                    || !haystack
+                        .get(position)
+                        .is_some_and(|&byte| is_ascii_word(byte)))
             {
                 return Ok((
                     Some(Match {
@@ -1232,6 +1288,7 @@ impl Plan {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, Accounting), Error> {
         let minimum_scalars = self.word_minimum_scalars();
+        let complete_word_boundaries = self.has_complete_word_boundaries();
         let mut accounting = Accounting {
             work: 0,
             bytes_examined: 0,
@@ -1250,7 +1307,9 @@ impl Plan {
             };
             accounting.scalars_decoded = accounting.scalars_decoded.saturating_add(1);
             accounting.bytes_examined = accounting.bytes_examined.saturating_add(width);
-            if !is_unicode_word(scalar) || unicode_word_before(haystack, position) {
+            if !is_unicode_word(scalar)
+                || (complete_word_boundaries && unicode_word_before(haystack, position))
+            {
                 position = position
                     .checked_add(width)
                     .ok_or(Error::WorkLimitExceeded {
@@ -1287,7 +1346,9 @@ impl Plan {
                         limit: limits.max_work,
                     })?;
             }
-            if count >= minimum_scalars && !unicode_word_after(haystack, position) {
+            if count >= minimum_scalars
+                && (!complete_word_boundaries || !unicode_word_after(haystack, position))
+            {
                 return Ok((
                     Some(Match {
                         start,
@@ -1421,7 +1482,7 @@ fn inspect_bare_word_repetition(
     };
     let minimum_scalars =
         usize::try_from(repetition.min).map_err(|_| AggregateInspectionError::Overflow)?;
-    Ok(Some(Plan::new(minimum_scalars, mode)))
+    Ok(Some(Plan::bare_greedy(minimum_scalars, mode)))
 }
 
 fn inspect_aggregate_with_accounting(
@@ -1948,7 +2009,8 @@ mod tests {
         ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildAccounting, AggregateBuildLimits,
         AggregateInspectionError, AggregateInspectionOutcome, AggregateOperationIdentity,
         AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, FIXED_BUILD_WORK, Plan, WordMode,
-        aggregate_build_accounting_matches, ascii_word_set, inspect_aggregate_attempt,
+        WordRunTopology, aggregate_build_accounting_matches, ascii_word_set,
+        inspect_aggregate_attempt,
     };
     use crate::{SearchLimits, SearchWindow};
 
@@ -2091,8 +2153,8 @@ mod tests {
     #[test]
     fn bare_ascii_word_runs_exhaust_short_malformed_sources() {
         let cases = [
-            (r"\w+", Plan::new(1, WordMode::Ascii)),
-            (r"\w{2,}", Plan::new(2, WordMode::Ascii)),
+            (r"\w+", Plan::bare_greedy(1, WordMode::Ascii)),
+            (r"\w{2,}", Plan::bare_greedy(2, WordMode::Ascii)),
         ];
         for (pattern, plan) in cases {
             for len in 0_u32..=6 {
@@ -2115,6 +2177,54 @@ mod tests {
     }
 
     #[test]
+    fn bare_search_windows_do_not_invent_boundary_assertions() {
+        let window = SearchWindow::new(1, 3);
+        let bare = Plan::bare_greedy(2, WordMode::Ascii);
+        let complete = Plan::new(2, WordMode::Ascii);
+        assert_eq!(
+            bare.find_window(b"abcd", window, SearchLimits::unlimited())
+                .expect("bare ASCII search")
+                .0,
+            Some(crate::Match { start: 1, end: 3 })
+        );
+        assert_eq!(
+            complete
+                .find_window(b"abcd", window, SearchLimits::unlimited())
+                .expect("complete ASCII search")
+                .0,
+            None
+        );
+        assert_eq!(
+            AsciiPlan::build_auto(bare)
+                .expect("bare ASCII owner")
+                .find_window(b"abcd", window, SearchLimits::unlimited())
+                .expect("dispatched bare ASCII search")
+                .0,
+            Some(crate::Match { start: 1, end: 3 })
+        );
+
+        let unicode_haystack = "αβγ".as_bytes();
+        let unicode_window = SearchWindow::new("α".len(), unicode_haystack.len());
+        assert_eq!(
+            Plan::bare_greedy(2, WordMode::Unicode)
+                .find_window(unicode_haystack, unicode_window, SearchLimits::unlimited())
+                .expect("bare Unicode search")
+                .0,
+            Some(crate::Match {
+                start: "α".len(),
+                end: unicode_haystack.len(),
+            })
+        );
+        assert_eq!(
+            Plan::new(2, WordMode::Unicode)
+                .find_window(unicode_haystack, unicode_window, SearchLimits::unlimited())
+                .expect("complete Unicode search")
+                .0,
+            None
+        );
+    }
+
+    #[test]
     fn bare_greedy_word_inspection_is_exact_and_refuses_nearby_shapes() {
         let ascii = ParserBuilder::new()
             .unicode(false)
@@ -2126,9 +2236,16 @@ mod tests {
         let AggregateInspectionOutcome::Eligible(inspection) = inspected else {
             panic!("bare greedy ASCII word run was not selected");
         };
-        assert_eq!(inspection.plan, Plan::new(1, WordMode::Ascii));
+        assert_eq!(inspection.plan, Plan::bare_greedy(1, WordMode::Ascii));
         assert_eq!(inspection.captures, 1);
         assert_eq!(inspection.hir_nodes, 3);
+        for identity in [
+            inspection.plan.aggregate_count_identity(),
+            inspection.plan.aggregate_span_sum_identity(),
+        ] {
+            assert_eq!(identity.topology, WordRunTopology::BareGreedyRoot);
+            assert!(!identity.complete_word_boundaries);
+        }
         let refusal = inspect_aggregate_attempt(&ascii, inspection.work - 1)
             .expect_err("one-below planner work");
         assert_eq!(
@@ -2151,7 +2268,37 @@ mod tests {
         else {
             panic!("bare greedy Unicode word run was not selected");
         };
-        assert_eq!(inspection.plan, Plan::new(2, WordMode::Unicode));
+        assert_eq!(inspection.plan, Plan::bare_greedy(2, WordMode::Unicode));
+        assert_eq!(
+            inspection.plan.aggregate_count_identity().topology,
+            WordRunTopology::BareGreedyRoot
+        );
+        assert!(
+            !inspection
+                .plan
+                .aggregate_count_identity()
+                .complete_word_boundaries
+        );
+
+        let explicit = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"\b\w{2,}\b")
+            .expect("explicit-boundary ASCII word HIR");
+        let AggregateInspectionOutcome::Eligible(inspection) =
+            inspect_aggregate_attempt(&explicit, usize::MAX).expect("explicit inspection")
+        else {
+            panic!("explicit-boundary ASCII word run was not selected");
+        };
+        assert_eq!(inspection.plan, Plan::new(2, WordMode::Ascii));
+        for identity in [
+            inspection.plan.aggregate_count_identity(),
+            inspection.plan.aggregate_span_sum_identity(),
+        ] {
+            assert_eq!(identity.topology, WordRunTopology::CompleteWordBoundaries);
+            assert!(identity.complete_word_boundaries);
+        }
 
         for pattern in [r"\w*", r"\w+?", r"\w{1,3}", r"[A-Z]+"] {
             let hir = ParserBuilder::new()

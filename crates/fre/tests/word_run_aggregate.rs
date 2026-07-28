@@ -5,6 +5,7 @@ use fre::{
     FIXED_CLASS_CHUNKS_COUNT_OPERATION_ID, FIXED_CLASS_CHUNKS_PLAN_ID,
     FIXED_CLASS_CHUNKS_SPAN_SUM_OPERATION_ID, RustProfile, WORD_RUN_COUNT_OPERATION_ID,
     WORD_RUN_SPAN_SUM_OPERATION_ID, WordRunBuildLimits, WordRunReduceError, WordRunReduceLimits,
+    WordRunTopology,
 };
 use regex::bytes::RegexBuilder;
 
@@ -75,6 +76,11 @@ fn durable_unicode_and_ascii_targets_select_operation_owned_word_runs() {
         };
         assert_eq!(identity.kernel.minimum_scalars, 12);
         assert_eq!(identity.kernel.unicode, expected_unicode);
+        assert_eq!(
+            identity.kernel.topology,
+            WordRunTopology::CompleteWordBoundaries
+        );
+        assert!(identity.kernel.complete_word_boundaries);
         assert_eq!(identity.kernel.operation_id, WORD_RUN_SPAN_SUM_OPERATION_ID);
         assert_eq!(
             identity.semantics,
@@ -334,6 +340,7 @@ fn exact_byte_class_repetitions_emit_every_leftmost_chunk() {
     assert_eq!(identity.kernel.minimum_scalars, 0);
     assert_eq!(identity.kernel.fixed_chunk_bytes, Some(WIDTH));
     assert!(!identity.kernel.unicode);
+    assert_eq!(identity.kernel.topology, WordRunTopology::FixedClassChunks);
     assert!(!identity.kernel.complete_word_boundaries);
     assert!(!identity.kernel.invalid_bytes_are_non_word);
     assert!(identity.kernel.arbitrary_bytes_are_classified);
@@ -384,6 +391,7 @@ fn fixed_class_chunks_erase_captures_and_preserve_incumbent_short_width_routes()
         identity.semantics,
         AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks
     );
+    assert_eq!(identity.kernel.topology, WordRunTopology::FixedClassChunks);
     let mut haystack = vec![0xFF; 130];
     haystack.push(b'x');
     haystack.extend([b'a'; 65]);

@@ -1,4 +1,4 @@
-use fre::AggregatePlanKind;
+use fre::{AggregatePlanIdentity, AggregatePlanKind, WordRunTopology};
 use rebar_compare::{
     CandidateAdapter, CandidateOutcome, CandidateRequest, CurrentFreAdapter, RunLimits,
     current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
@@ -79,6 +79,14 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
             .build_span_sum()
             .unwrap();
         assert_eq!(regex.build_report().plan, AggregatePlanKind::WordRun);
+        let AggregatePlanIdentity::WordRun(identity) = regex.build_report().plan_identity else {
+            panic!("explicit word run retained another identity");
+        };
+        assert_eq!(
+            identity.kernel.topology,
+            WordRunTopology::CompleteWordBoundaries
+        );
+        assert!(identity.kernel.complete_word_boundaries);
         assert_eq!(regex.build_report().schema_version, 43);
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count-spans")
             .unwrap();
@@ -125,6 +133,17 @@ fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
     .unwrap();
     assert_eq!(minimum.plan(), "aggregate-word-run-v1");
     assert_eq!(minimum.execute(b"a bc def").unwrap(), 5);
+
+    let bare = current_fre_rebar_aggregate_builder(r"(\w+)", false, false)
+        .build_span_sum()
+        .unwrap();
+    let AggregatePlanIdentity::WordRun(identity) = bare.build_report().plan_identity else {
+        panic!("bare ASCII word run retained another identity");
+    };
+    assert_eq!(identity.kernel.topology, WordRunTopology::BareGreedyRoot);
+    assert!(!identity.kernel.complete_word_boundaries);
+    current_fre_rebar_validate_aggregate_identity(bare.build_report(), false, "count-spans")
+        .unwrap();
 
     for pattern in [r"\w+?", r"\w{1,3}"] {
         let regex = current_fre_rebar_aggregate_builder(pattern, false, false)
@@ -202,6 +221,8 @@ fn i1095_ascii_search_uses_authenticated_fixed_class_chunks() {
     );
     assert_eq!(identity.kernel.fixed_chunk_bytes, Some(256));
     assert_eq!(identity.kernel.plan_id, fre::FIXED_CLASS_CHUNKS_PLAN_ID);
+    assert_eq!(identity.kernel.topology, WordRunTopology::FixedClassChunks);
+    assert!(!identity.kernel.complete_word_boundaries);
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
         .unwrap();
 

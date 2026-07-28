@@ -269,8 +269,9 @@ pub enum AggregatePlanKind {
     /// Direct Unicode scalar class/run stream over compact canonical ranges.
     /// This is not the continuation state engine.
     UnicodeScalarClass,
-    /// Single-pass maximal run reducer for canonical `\b\w{m,}\b` or a
-    /// Unicode-off exact repetition of one canonical byte class.
+    /// Single-pass maximal run reducer for canonical `\b\w{m,}\b`, bare
+    /// greedy nonempty unbounded root word repetitions, or a Unicode-off exact
+    /// repetition of one canonical byte class.
     WordRun,
     /// One monotone literal-candidate stream for the exact ordered
     /// `(?m:^L)|(?m:L$)` shape.
@@ -3890,7 +3891,13 @@ fn word_run_direct_identity_closes(
                 && kernel.fixed_chunk_bytes.is_none()
                 && kernel.canonical_class_words == [0; 4]
                 && !kernel.unicode
-                && kernel.complete_word_boundaries
+                && matches!(
+                    (kernel.topology, kernel.complete_word_boundaries,),
+                    (
+                        unicode_word_run::WordRunTopology::CompleteWordBoundaries,
+                        true,
+                    ) | (unicode_word_run::WordRunTopology::BareGreedyRoot, false)
+                )
                 && kernel.invalid_bytes_are_non_word
                 && !kernel.arbitrary_bytes_are_classified
         }
@@ -3900,7 +3907,13 @@ fn word_run_direct_identity_closes(
                 && kernel.fixed_chunk_bytes.is_none()
                 && kernel.canonical_class_words == [0; 4]
                 && kernel.unicode
-                && kernel.complete_word_boundaries
+                && matches!(
+                    (kernel.topology, kernel.complete_word_boundaries,),
+                    (
+                        unicode_word_run::WordRunTopology::CompleteWordBoundaries,
+                        true,
+                    ) | (unicode_word_run::WordRunTopology::BareGreedyRoot, false)
+                )
                 && kernel.invalid_bytes_are_non_word
                 && !kernel.arbitrary_bytes_are_classified
         }
@@ -3910,6 +3923,7 @@ fn word_run_direct_identity_closes(
                 && kernel.fixed_chunk_bytes.is_some_and(|width| width > 64)
                 && kernel.canonical_class_words != [0; 4]
                 && !kernel.unicode
+                && kernel.topology == unicode_word_run::WordRunTopology::FixedClassChunks
                 && !kernel.complete_word_boundaries
                 && !kernel.invalid_bytes_are_non_word
                 && kernel.arbitrary_bytes_are_classified

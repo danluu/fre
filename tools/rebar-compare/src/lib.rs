@@ -651,10 +651,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; Unicode-off bounded-affix count/span-sum scans maximal middle-byte runs once, verifies only suffix literals at disjoint right endpoints, and uses zero execution scratch",
         );
         identity.identity.push_str(
-            "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary or bare greedy unbounded canonical word-class repetitions and reduced under independent pre-source prospective limits with checked actual counters",
+            "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary ASCII/Unicode word repetitions or bare greedy unbounded ASCII word repetitions, with the source topology retained in its operation identity and reduction under independent pre-source prospective limits with checked actual counters",
         );
         identity.availability.push_str(
-            "; the direct word-run reduces canonical complete-boundary or bare greedy unbounded ASCII/Unicode runs once with zero execution scratch",
+            "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs and bare greedy unbounded ASCII runs once with zero execution scratch; bare Unicode repetitions retain the earlier Unicode-scalar route",
         );
         identity.identity.push_str(
             "; fixed-class-chunks-v1 authenticates arbitrary canonical Unicode-off byte classes and nonzero exact widths with operation-specific count/span-sum identities",
@@ -11912,7 +11912,14 @@ fn word_run_plan_identity_matches(
                 && identity.kernel.fixed_chunk_bytes.is_none()
                 && identity.kernel.canonical_class_words == [0; 4]
                 && !identity.kernel.unicode
-                && identity.kernel.complete_word_boundaries
+                && matches!(
+                    (
+                        identity.kernel.topology,
+                        identity.kernel.complete_word_boundaries,
+                    ),
+                    (fre::WordRunTopology::CompleteWordBoundaries, true)
+                        | (fre::WordRunTopology::BareGreedyRoot, false)
+                )
                 && identity.kernel.invalid_bytes_are_non_word
                 && !identity.kernel.arbitrary_bytes_are_classified
         }
@@ -11922,7 +11929,14 @@ fn word_run_plan_identity_matches(
                 && identity.kernel.fixed_chunk_bytes.is_none()
                 && identity.kernel.canonical_class_words == [0; 4]
                 && identity.kernel.unicode
-                && identity.kernel.complete_word_boundaries
+                && matches!(
+                    (
+                        identity.kernel.topology,
+                        identity.kernel.complete_word_boundaries,
+                    ),
+                    (fre::WordRunTopology::CompleteWordBoundaries, true)
+                        | (fre::WordRunTopology::BareGreedyRoot, false)
+                )
                 && identity.kernel.invalid_bytes_are_non_word
                 && !identity.kernel.arbitrary_bytes_are_classified
         }
@@ -11935,6 +11949,7 @@ fn word_run_plan_identity_matches(
                     .is_some_and(|width| width > 64)
                 && identity.kernel.canonical_class_words != [0; 4]
                 && !identity.kernel.unicode
+                && identity.kernel.topology == fre::WordRunTopology::FixedClassChunks
                 && !identity.kernel.complete_word_boundaries
                 && !identity.kernel.invalid_bytes_are_non_word
                 && identity.kernel.arbitrary_bytes_are_classified
@@ -22510,21 +22525,34 @@ mod tests {
 
     #[test]
     fn current_fre_word_run_build_accounting_is_plan_owned_and_operation_complete() {
-        for (pattern, unicode, expected_semantics) in [
+        for (pattern, unicode, expected_semantics, expected_topology, complete_word_boundaries) in [
             (
                 r"\b\w{12,}\b",
                 false,
                 fre::AggregateWordRunSemantics::AsciiWordBytes,
+                fre::WordRunTopology::CompleteWordBoundaries,
+                true,
             ),
             (
                 r"\b\w{12,}\b",
                 true,
                 fre::AggregateWordRunSemantics::UnicodeWordScalarsInvalidBytesNonWord,
+                fre::WordRunTopology::CompleteWordBoundaries,
+                true,
+            ),
+            (
+                r"(\w{2,})",
+                false,
+                fre::AggregateWordRunSemantics::AsciiWordBytes,
+                fre::WordRunTopology::BareGreedyRoot,
+                false,
             ),
             (
                 r"[0-9A-Za-z_]{256}",
                 false,
                 fre::AggregateWordRunSemantics::UnicodeOffFixedWidthByteClassChunks,
+                fre::WordRunTopology::FixedClassChunks,
+                false,
             ),
         ] {
             for operation in [
@@ -22558,6 +22586,11 @@ mod tests {
                     panic!("word-run test retained another plan or build receipt");
                 };
                 assert_eq!(identity.semantics, expected_semantics);
+                assert_eq!(identity.kernel.topology, expected_topology);
+                assert_eq!(
+                    identity.kernel.complete_word_boundaries,
+                    complete_word_boundaries
+                );
                 assert!(fre::word_run_build_accounting_matches(
                     identity.kernel,
                     build
@@ -22600,6 +22633,42 @@ mod tests {
                             .is_err()
                     );
                 }
+
+                let mut wrong_topology = report.clone();
+                let AggregatePlanIdentity::WordRun(identity) = &mut wrong_topology.plan_identity
+                else {
+                    unreachable!("word-run identity checked above");
+                };
+                identity.kernel.topology = match identity.kernel.topology {
+                    fre::WordRunTopology::CompleteWordBoundaries => {
+                        fre::WordRunTopology::BareGreedyRoot
+                    }
+                    fre::WordRunTopology::BareGreedyRoot => {
+                        fre::WordRunTopology::CompleteWordBoundaries
+                    }
+                    fre::WordRunTopology::FixedClassChunks => fre::WordRunTopology::BareGreedyRoot,
+                };
+                assert!(
+                    current_fre_rebar_validate_aggregate_identity(&wrong_topology, unicode, model)
+                        .is_err()
+                );
+
+                let mut wrong_boundary_claim = report.clone();
+                let AggregatePlanIdentity::WordRun(identity) =
+                    &mut wrong_boundary_claim.plan_identity
+                else {
+                    unreachable!("word-run identity checked above");
+                };
+                identity.kernel.complete_word_boundaries =
+                    !identity.kernel.complete_word_boundaries;
+                assert!(
+                    current_fre_rebar_validate_aggregate_identity(
+                        &wrong_boundary_claim,
+                        unicode,
+                        model
+                    )
+                    .is_err()
+                );
 
                 let mut wrong_plan = report;
                 let AggregatePlanIdentity::WordRun(identity) = &mut wrong_plan.plan_identity else {
