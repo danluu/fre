@@ -305,7 +305,9 @@ struct Timed {
     checksum: u64,
 }
 
-struct CandidateExecutionGuard;
+struct CandidateExecutionGuard {
+    permit: QualificationCandidateExecutionPermit,
+}
 
 impl CandidateExecutionGuard {
     fn acquire_for(qualification: QualifiedExactSearchQualification) -> Option<Self> {
@@ -319,18 +321,13 @@ impl CandidateExecutionGuard {
             return None;
         }
         assert_eq!(qualification, QualifiedExactSearchQualification::Candidate);
-        TEST_CANDIDATE_EXECUTION.with(|enabled| {
-            assert!(!enabled.replace(true), "nested Candidate execution guard");
-        });
-        Some(Self)
+        Some(Self {
+            permit: QualificationCandidateExecutionPermit::acquire(),
+        })
     }
-}
 
-impl Drop for CandidateExecutionGuard {
-    fn drop(&mut self) {
-        TEST_CANDIDATE_EXECUTION.with(|enabled| {
-            assert!(enabled.replace(false), "Candidate execution guard was lost");
-        });
+    fn permit(&self) -> &QualificationCandidateExecutionPermit {
+        &self.permit
     }
 }
 
@@ -513,7 +510,7 @@ fn portable_value(portable: &PortableRegex, haystack: &[u8]) -> u64 {
 }
 
 fn facade_value_only(
-    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    session: &QualifiedExactSearchFacadeQualificationThreadSession<'_>,
     haystack: &[u8],
 ) -> u64 {
     let matched = session
@@ -523,7 +520,7 @@ fn facade_value_only(
 }
 
 fn assert_facade_reporting_contract(
-    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    session: &QualifiedExactSearchFacadeQualificationThreadSession<'_>,
     haystack: &[u8],
     expected: u64,
 ) {
@@ -600,6 +597,7 @@ fn measure_facade_full(
     size: Size,
     haystack: &[u8],
     calls: usize,
+    candidate_permit: Option<&QualificationCandidateExecutionPermit>,
 ) -> Timed {
     let mut checksum = 0x6a09_e667_f3bc_c909_u64;
     let started = Instant::now();
@@ -607,8 +605,8 @@ fn measure_facade_full(
     let total_ns = {
         let _ = black_box(facade_artifact(subject, &facade));
         let session = facade
-            .begin_current_thread_session()
-            .expect("ABI2 facade current-thread session");
+            .begin_current_thread_session_for_qualification(candidate_permit)
+            .expect("ABI2 qualification facade current-thread session");
         for iteration in 0..calls {
             let value = black_box(facade_value_only(&session, haystack));
             checksum = checksum.rotate_left(9)
@@ -651,7 +649,8 @@ fn run_cell(
     let provenance_suffix =
         affinity_cpu.map_or_else(String::new, |cpu| subject.tag19_provenance_suffix(cpu));
     let qualification = subject_qualification(subject);
-    let _guard = CandidateExecutionGuard::acquire_for(qualification);
+    let guard = CandidateExecutionGuard::acquire_for(qualification);
+    let candidate_permit = guard.as_ref().map(CandidateExecutionGuard::permit);
     let qualification_state = qualification_label(qualification);
     let haystack = make_haystack(case, size, scenario);
     let portable = build_portable(case);
@@ -664,8 +663,8 @@ fn run_cell(
     // cold/full helpers create it after their timers start so lifecycle cost
     // remains represented in those stages.
     let facade_session = facade
-        .begin_current_thread_session()
-        .expect("ABI2 facade current-thread session");
+        .begin_current_thread_session_for_qualification(candidate_permit)
+        .expect("ABI2 qualification facade current-thread session");
     let expected = portable_value(&portable, &haystack);
     let kir = build_exact_literal::<NativeSpan>(
         case.literal,
@@ -722,9 +721,18 @@ fn run_cell(
         })
     };
     let portable_cold = || measure_portable_full(case, &haystack, 1);
-    let facade_cold = || measure_facade_full(subject, case, size, &haystack, 1);
+    let facade_cold = || measure_facade_full(subject, case, size, &haystack, 1, candidate_permit);
     let portable_full = || measure_portable_full(case, &haystack, size.calls());
-    let facade_full = || measure_facade_full(subject, case, size, &haystack, size.calls());
+    let facade_full = || {
+        measure_facade_full(
+            subject,
+            case,
+            size,
+            &haystack,
+            size.calls(),
+            candidate_permit,
+        )
+    };
 
     let (pb, jb, ps, js, pc, jc, pf, jf, order) = if repetition.is_multiple_of(2) {
         (
@@ -1090,7 +1098,7 @@ fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "one source seal keeps the value helper, untimed reporting gate, full loop, and hot closure boundaries auditable together"
+    reason = "one source seal keeps the permit lifetime, value helper, untimed reporting gate, full loop, and hot closure boundaries auditable together"
 )]
 fn current_thread_session_timing_boundaries_are_source_sealed() {
     fn position(source: &str, marker: &str) -> usize {
@@ -1150,6 +1158,13 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     assert!(fresh.contains("&cache,"));
     assert!(fresh.contains("(cache, facade)"));
 
+    let guard_start = position(source, "struct CandidateExecutionGuard {");
+    let guard_end = guard_start + position(&source[guard_start..], "\nfn builder(");
+    let guard = &source[guard_start..guard_end];
+    assert!(guard.contains("permit: QualificationCandidateExecutionPermit"));
+    assert!(guard.contains("QualificationCandidateExecutionPermit::acquire()"));
+    assert!(guard.contains("fn permit(&self) -> &QualificationCandidateExecutionPermit"));
+
     let full_start = position(source, "fn measure_facade_full(");
     let full_end = full_start
         + position(
@@ -1162,7 +1177,10 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
         full,
         "let (cache, facade) = build_fresh_cache_facade(subject, case, size);",
     );
-    let full_session = position(full, ".begin_current_thread_session()");
+    let full_session = position(
+        full,
+        ".begin_current_thread_session_for_qualification(candidate_permit)",
+    );
     let full_loop = position(full, "for iteration in 0..calls");
     let full_elapsed = position(full, "let total_ns = started.elapsed().as_nanos();");
     let full_session_scope_end = position(full, "\n    };\n    // Preserve the pre-cache");
@@ -1178,6 +1196,7 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     let full_loop_body = &full[full_loop..];
     assert!(full_loop_body.contains("facade_value_only(&session, haystack)"));
     assert!(!full_loop_body.contains("begin_current_thread_session"));
+    assert!(!full_loop_body.contains("candidate_permit"));
     assert!(!full.contains("assert_facade_reporting_contract"));
     for reporting_call in [
         ".find(",
@@ -1199,11 +1218,21 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
             "\n#[allow(clippy::too_many_arguments",
         );
     let cell = &source[cell_start..cell_end];
+    let guard = position(
+        cell,
+        "let guard = CandidateExecutionGuard::acquire_for(qualification);",
+    );
+    let permit = position(
+        cell,
+        "let candidate_permit = guard.as_ref().map(CandidateExecutionGuard::permit);",
+    );
     let session = position(cell, "let facade_session = facade");
     let reporting = position(cell, "assert_facade_reporting_contract(");
     let first_timed_closure = position(cell, "let portable_build = ||");
     let hot_start = position(cell, "let facade_search = ||");
     let hot_end = position(cell, "let portable_cold = ||");
+    assert!(guard < permit);
+    assert!(permit < session);
     assert!(session < hot_start);
     assert!(session < reporting);
     assert!(reporting < first_timed_closure);
@@ -1218,6 +1247,7 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     let hot = &cell[hot_start..hot_end];
     assert!(hot.contains("facade_value_only(black_box(&facade_session), black_box(&haystack))"));
     assert!(!hot.contains("begin_current_thread_session"));
+    assert!(!hot.contains("candidate_permit"));
     assert!(!hot.contains("assert_facade_reporting_contract"));
     for reporting_call in [
         ".find(",
@@ -1231,4 +1261,76 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
             "hot timed region contains reporting call {reporting_call}"
         );
     }
+
+    let facade_source = include_str!("qualified_exact_search.rs");
+    let permit_start = position(
+        facade_source,
+        "struct QualificationCandidateExecutionPermit {",
+    );
+    let permit_end = permit_start
+        + position(
+            &facade_source[permit_start..],
+            "\nfn qualification_authorizes_native_execution(",
+        );
+    let permit_source = &facade_source[permit_start..permit_end];
+    assert!(permit_source.contains("PhantomData<std::rc::Rc<()>>"));
+    assert!(permit_source.contains("impl Drop for QualificationCandidateExecutionPermit"));
+    assert!(permit_source.contains("fn assert_active(&self)"));
+
+    let qualification_begin_start = position(
+        facade_source,
+        "fn begin_current_thread_session_for_qualification<'session>(",
+    );
+    let qualification_begin_end = qualification_begin_start
+        + position(
+            &facade_source[qualification_begin_start..],
+            "\n    /// Find the first match in the complete haystack.",
+        );
+    let qualification_begin = &facade_source[qualification_begin_start..qualification_begin_end];
+    let active = position(qualification_begin, "permit.assert_active();");
+    let hoisted_begin = position(
+        qualification_begin,
+        "let session = self.begin_current_thread_session_authorized_by(|_| true)?;",
+    );
+    assert!(active < hoisted_begin);
+    assert!(
+        qualification_begin
+            .contains("QualificationSessionAuthority::Candidate { _permit: permit }")
+    );
+
+    let qualification_call_start = position(
+        facade_source,
+        "impl QualifiedExactSearchFacadeQualificationThreadSession<'_> {",
+    );
+    let qualification_call_end = qualification_call_start
+        + position(
+            &facade_source[qualification_call_start..],
+            "\n#[cfg(test)]\nmod tests {",
+        );
+    let qualification_call = &facade_source[qualification_call_start..qualification_call_end];
+    assert!(qualification_call.contains("find_window_projected_authorized_by("));
+    assert!(qualification_call.contains("|_| true,"));
+    assert!(!qualification_call.contains("retained_native_execution_authorized"));
+    assert!(!qualification_call.contains("TEST_CANDIDATE_EXECUTION"));
+
+    let facade_session_impl_start = position(
+        facade_source,
+        "impl QualifiedExactSearchFacadeThreadSession<'_> {",
+    );
+    let shared_projection_start = facade_session_impl_start
+        + position(
+            &facade_source[facade_session_impl_start..],
+            "fn find_window_projected_authorized_by<R>(",
+        );
+    let shared_projection_end = shared_projection_start
+        + position(
+            &facade_source[shared_projection_start..],
+            "\n    /// Return the first match while retaining the original haystack.",
+        );
+    let shared_projection = &facade_source[shared_projection_start..shared_projection_end];
+    assert!(
+        shared_projection
+            .contains("QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(search)")
+    );
+    assert!(shared_projection.contains(".find_window_projected_authorized_by("));
 }

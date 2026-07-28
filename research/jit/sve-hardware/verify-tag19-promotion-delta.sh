@@ -200,7 +200,7 @@ FACADE_SCENARIOS = ("absent", "late", "homogeneous", "near-miss")
 FACADE_STAGES = ("build", "search", "cold", "full")
 CANDIDATE_ATOM_BLOB = "44609addd5e2ada9bd003614352bda0bdc5c2316"
 ABI2_SOURCE_CLOSURE_SHA256 = (
-    "274c7a6afa4d5db214e65a0211b43176ebcd8906ab0a773cf3fedd242ef02b17"
+    "9097e3ffc23d7d4dd6d55f7bc19f275b436d3d04ae0d0a021f8041f98d1db805"
 )
 MAX_GIT_OUTPUT = 4 * 1024 * 1024
 MAX_ENTRIES = 16_384
@@ -1505,6 +1505,23 @@ def reject_source_marker(
         fail(f"Candidate ABI2 source contract retains a forbidden marker in {path}")
 
 
+def bounded_source_region(
+    raw_by_path: dict[str, bytes],
+    path: str,
+    start_marker: bytes,
+    end_marker: bytes,
+    label: str,
+) -> bytes:
+    raw = raw_by_path[path]
+    start = raw.find(start_marker)
+    if start < 0:
+        fail(f"Candidate ABI2 source contract omits {label} start in {path}")
+    end = raw.find(end_marker, start + len(start_marker))
+    if end < 0:
+        fail(f"Candidate ABI2 source contract omits {label} end in {path}")
+    return raw[start:end]
+
+
 def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     abi = "crates/fre-jit-aarch64/src/abi.rs"
     selected = "crates/fre-jit-aarch64/src/selected_end_v2.rs"
@@ -1664,6 +1681,114 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     ):
         require_source_marker(raw_by_path, facade, marker)
     for marker in (
+        b"#[cfg(test)]\n#[derive(Debug)]\n"
+        b"struct QualificationCandidateExecutionPermit {",
+        b"struct QualificationCandidateExecutionPermit {",
+        b"_thread_bound: core::marker::PhantomData<std::rc::Rc<()>>",
+        b"impl Drop for QualificationCandidateExecutionPermit",
+        b"#[cfg(test)]\n#[derive(Debug)]\n"
+        b"enum QualificationSessionAuthority<'session> {",
+        b"#[cfg(test)]\n#[derive(Debug)]\n"
+        b"struct QualifiedExactSearchFacadeQualificationThreadSession<'session>",
+        b"struct QualifiedExactSearchFacadeQualificationThreadSession<'session>",
+        b"authority: QualificationSessionAuthority<'session>",
+        b"_permit: &'session QualificationCandidateExecutionPermit",
+        b"fn begin_current_thread_session_authorized_by(",
+        b"authorize_native: impl FnOnce() -> bool",
+        b"&& authorize_native()",
+        b"|| self.search.retained_native_execution_authorized(),",
+        b"preflight.searched_bytes() >= self.report.workload.minimum_window_bytes()",
+        b"native.search_preflighted(preflight)?",
+    ):
+        require_source_marker(raw_by_path, facade, marker)
+    qualification_begin = bounded_source_region(
+        raw_by_path,
+        facade,
+        b"fn begin_current_thread_session_for_qualification<'session>(",
+        b"\n    /// Find the first match in the complete haystack.",
+        "qualification session constructor",
+    )
+    for marker in (
+        b"candidate_permit.expect(",
+        b"permit.assert_active();",
+        b"QualificationSessionAuthority::Candidate { _permit: permit }",
+        b"candidate_permit.is_none()",
+        b"let session = self.begin_current_thread_session_authorized_by(|_| true)?;",
+    ):
+        if marker not in qualification_begin:
+            fail("Candidate qualification session constructor lost its sealed authority")
+    if qualification_begin.find(b"permit.assert_active();") >= qualification_begin.find(
+        b"let session = self.begin_current_thread_session_authorized_by(|_| true)?;"
+    ):
+        fail("Candidate qualification permit is not checked before session creation")
+    if (
+        b"TEST_CANDIDATE_EXECUTION" in qualification_begin
+        or b"self.begin_current_thread_session()?" in qualification_begin
+    ):
+        fail("Candidate qualification session repeats dynamic authorization")
+    facade_session = bounded_source_region(
+        raw_by_path,
+        facade,
+        b"impl QualifiedExactSearchFacadeThreadSession<'_> {",
+        (
+            b"\n#[cfg(test)]\n"
+            b"impl QualifiedExactSearchFacadeQualificationThreadSession<'_> {"
+        ),
+        "facade session projection",
+    )
+    for marker in (
+        b"fn find_window_projected_authorized_by<R>(",
+        b"|search| search.search.retained_native_execution_authorized(),",
+        b"QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(search)",
+        b"search\n                .find_window_projected_authorized_by(",
+        b"QualifiedExactSearchFacadeThreadSessionPlan::Portable(portable)",
+    ):
+        if marker not in facade_session:
+            fail("production facade session projection lost its sealed shared body")
+    if facade_session.count(b"fn find_window_projected_authorized_by<R>(") != 1:
+        fail("production facade session projection is ambiguous")
+    qualification_call = bounded_source_region(
+        raw_by_path,
+        facade,
+        b"impl QualifiedExactSearchFacadeQualificationThreadSession<'_> {",
+        b"\n#[cfg(test)]\nmod tests {",
+        "qualification value projection",
+    )
+    for marker in (
+        b"self.session.find(haystack, limits)",
+        b"let _authority = &self.authority;",
+        b"self.session.find_window_projected_authorized_by(",
+        b"\n            |_| true,",
+    ):
+        if marker not in qualification_call:
+            fail("qualification value projection lost its shared production path")
+    if (
+        b"retained_native_execution_authorized" in qualification_call
+        or b"TEST_CANDIDATE_EXECUTION" in qualification_call
+    ):
+        fail("qualification timed projection repeats dynamic authorization")
+    core_search = bounded_source_region(
+        raw_by_path,
+        facade,
+        b"    fn find_window_with_native<R>(",
+        b"\n    /// Whether a selected match exists in the complete haystack.",
+        "exact-search projected body",
+    )
+    for marker in (
+        b"authorize_native: impl FnOnce() -> bool",
+        b"&& authorize_native()",
+        b"NativeCheckedSearchWindow::new(",
+        b".preflight_checked_window(checked_window, literal_limits)?",
+        b"preflight.searched_bytes() >= self.report.workload.minimum_window_bytes()",
+        b"native.search_preflighted(preflight)?",
+        b"let matched = preflight.find()?;",
+        b"self.portable\n                .find_window(",
+    ):
+        if marker not in core_search:
+            fail("exact-search projected body lost a safety or fallback boundary")
+    if b"retained_native_execution_authorized" in core_search:
+        fail("exact-search projected body reacquired dynamic authorization")
+    for marker in (
         PRODUCER_RECEIPT_SCHEMA.encode("ascii"),
         b"const RANDOM_CASES: usize = 4096;",
         b"emit_selected_end_register_v2(",
@@ -1679,8 +1804,14 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     for marker in (
         FACADE_PERFORMANCE_SCHEMA.encode("ascii"),
         ",".join(FACADE_PERFORMANCE_FIELDS).encode("ascii"),
-        b"struct CandidateExecutionGuard;",
+        b"struct CandidateExecutionGuard {",
+        b"permit: QualificationCandidateExecutionPermit",
+        b"QualificationCandidateExecutionPermit::acquire()",
+        b"fn permit(&self) -> &QualificationCandidateExecutionPermit",
         b"CandidateExecutionGuard::acquire_for(qualification)",
+        b"let candidate_permit = guard.as_ref().map(CandidateExecutionGuard::permit);",
+        b".begin_current_thread_session_for_qualification(candidate_permit)",
+        b"QualifiedExactSearchFacadeQualificationThreadSession<'_>",
         b".find_value(black_box(haystack), SearchLimits::unlimited())",
         b"QualifiedExactSearchRoute::NativeJit",
         b'fs::read_to_string("/proc/thread-self/status")',
@@ -1696,12 +1827,17 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
         b"assert!(full_facade_drop < full_cache_drop);",
         b'assert!(build.contains("drop(cold);"));',
         b'assert!(build.contains("drop(cache);"));',
+        b'assert!(!hot.contains("candidate_permit"));',
+        b"assert!(active < hoisted_begin);",
     ):
         require_source_marker(raw_by_path, facade_producer, marker)
     for forbidden in (
         b"fre-jit-tag19-facade-performance-v4",
         b"fre-jit-tag19-facade-performance-v3",
         b"fre-jit-tag19-facade-performance-v2",
+        b"struct CandidateExecutionGuard;",
+        b"impl Drop for CandidateExecutionGuard",
+        b"enabled.replace(true)",
     ):
         reject_source_marker(raw_by_path, facade_producer, forbidden)
     reject_source_marker(

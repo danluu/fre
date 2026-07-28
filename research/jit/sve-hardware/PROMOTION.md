@@ -133,6 +133,21 @@ new default-policy cache created inside that measurement and retained through
 its use; those rows therefore retain compilation rather than measuring a
 prewarmed global-cache hit.
 
+Candidate execution in this V5 harness is bounded by a `cfg(test)`-private,
+thread-bound RAII permit. The cell guard owns the neither-`Send`-nor-`Sync`
+permit, and every qualification session borrows it for its full lifetime.
+Each session validates the already-acquired permit once before opening the
+normal native session; repeated timed value calls do not consult the
+test-only thread-local authority. They pass the hoisted authority through the
+same production projected body, retaining the checked window, work-limit
+preflight, minimum-window fallback, exact-plan binding, native-result
+validation, and portable fallback. The reporting method is exercised untimed
+through the normal dynamically authorized session path. Normal public session
+behavior and guard-loss fallback tests remain unchanged. The receipt value
+`candidate_guard_scope=test-thread-local-only` and the V5 schemas are
+unchanged. The separate bridge qualifier retains its own dynamic test guard
+and is outside this facade-performance repair.
+
 The verifier reconstructs the complete matrix and rejects a cell assembled
 from multiple PIDs or a PID reused for multiple cells. It independently
 recomputes every semantic value and every search/cold/full checksum. For every

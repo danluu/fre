@@ -351,6 +351,50 @@ std::thread_local! {
     static TEST_CANDIDATE_EXECUTION: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Qualification-private proof that Candidate execution remains scoped to the
+/// current thread.
+///
+/// The permit is deliberately neither `Send` nor `Sync`. A qualification
+/// session borrows it for its complete lifetime, so timed calls can use the
+/// same already-authorized projection as a production-qualified release
+/// without repeating the test-only thread-local lookup. Normal test sessions
+/// do not borrow this permit and retain their dynamic guard-loss fallback.
+#[cfg(test)]
+#[derive(Debug)]
+struct QualificationCandidateExecutionPermit {
+    _thread_bound: core::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl QualificationCandidateExecutionPermit {
+    fn acquire() -> Self {
+        TEST_CANDIDATE_EXECUTION.with(|enabled| {
+            assert!(!enabled.replace(true), "nested Candidate execution guard");
+        });
+        Self {
+            _thread_bound: core::marker::PhantomData,
+        }
+    }
+
+    fn assert_active(&self) {
+        TEST_CANDIDATE_EXECUTION.with(|enabled| {
+            assert!(
+                enabled.get(),
+                "Candidate qualification permit lost its thread-local authority"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for QualificationCandidateExecutionPermit {
+    fn drop(&mut self) {
+        TEST_CANDIDATE_EXECUTION.with(|enabled| {
+            assert!(enabled.replace(false), "Candidate execution guard was lost");
+        });
+    }
+}
+
 fn qualification_authorizes_native_execution(
     qualification: QualifiedExactSearchQualification,
 ) -> bool {
@@ -1304,11 +1348,20 @@ impl QualifiedExactSearch {
         &self,
     ) -> Result<QualifiedExactSearchThreadSession<'_>, QualifiedExactSearchThreadContractError>
     {
-        let native = retained_native_if_authorized(self.native.as_ref(), || {
+        self.begin_current_thread_session_authorized_by(|| {
             self.retained_native_execution_authorized()
         })
-        .map(|native| native.begin_current_thread_session(&self.portable))
-        .transpose()?;
+    }
+
+    #[inline]
+    fn begin_current_thread_session_authorized_by(
+        &self,
+        authorize_native: impl FnOnce() -> bool,
+    ) -> Result<QualifiedExactSearchThreadSession<'_>, QualifiedExactSearchThreadContractError>
+    {
+        let native = retained_native_if_authorized(self.native.as_ref(), authorize_native)
+            .map(|native| native.begin_current_thread_session(&self.portable))
+            .transpose()?;
         Ok(QualifiedExactSearchThreadSession {
             search: self,
             native,
@@ -1356,6 +1409,7 @@ impl QualifiedExactSearch {
             window,
             limits,
             None,
+            || false,
             |matched, route, accounting| {
                 (matched, QualifiedExactSearchExecution { route, accounting })
             },
@@ -1369,13 +1423,14 @@ impl QualifiedExactSearch {
         window: SearchWindow,
         limits: SearchLimits,
         native: Option<&QualifiedExactSearchNativeThreadSession<'_>>,
+        authorize_native: impl FnOnce() -> bool,
         project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
     ) -> Result<R, QualifiedExactSearchError> {
         let literal_limits = LiteralSearchLimits {
             max_linear_terms: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
         };
         if let Some(native) = native
-            && self.retained_native_execution_authorized()
+            && authorize_native()
             && let Some(checked_window) = NativeCheckedSearchWindow::new(
                 haystack,
                 NativeSearchWindow::new(window.start(), window.end()),
@@ -1547,8 +1602,32 @@ impl QualifiedExactSearchThreadSession<'_> {
         limits: SearchLimits,
         project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
     ) -> Result<R, QualifiedExactSearchError> {
-        self.search
-            .find_window_with_native(haystack, window, limits, self.native.as_ref(), project)
+        self.find_window_projected_authorized_by(
+            haystack,
+            window,
+            limits,
+            || self.search.retained_native_execution_authorized(),
+            project,
+        )
+    }
+
+    #[inline]
+    fn find_window_projected_authorized_by<R>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        authorize_native: impl FnOnce() -> bool,
+        project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
+    ) -> Result<R, QualifiedExactSearchError> {
+        self.search.find_window_with_native(
+            haystack,
+            window,
+            limits,
+            self.native.as_ref(),
+            authorize_native,
+            project,
+        )
     }
 }
 
@@ -1745,6 +1824,29 @@ enum QualifiedExactSearchFacadeThreadSessionPlan<'session> {
 #[derive(Debug)]
 pub struct QualifiedExactSearchFacadeThreadSession<'session> {
     plan: QualifiedExactSearchFacadeThreadSessionPlan<'session>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum QualificationSessionAuthority<'session> {
+    Candidate {
+        _permit: &'session QualificationCandidateExecutionPermit,
+    },
+    Qualified,
+}
+
+/// Qualification-only facade session whose authority is sealed once.
+///
+/// Candidate sessions borrow their thread-bound RAII permit, preventing guard
+/// retirement while the session exists. Only the test-only authority lookup
+/// is hoisted: every timed call retains the production facade projection,
+/// checked-window and work-limit preflight, minimum-window fallback, plan
+/// identity check, native invocation, and result validation.
+#[cfg(test)]
+#[derive(Debug)]
+struct QualifiedExactSearchFacadeQualificationThreadSession<'session> {
+    session: QualifiedExactSearchFacadeThreadSession<'session>,
+    authority: QualificationSessionAuthority<'session>,
 }
 
 impl PortableBuilder {
@@ -2152,10 +2254,25 @@ impl QualifiedExactSearchFacade {
         &self,
     ) -> Result<QualifiedExactSearchFacadeThreadSession<'_>, QualifiedExactSearchThreadContractError>
     {
+        self.begin_current_thread_session_authorized_by(|search| {
+            search.retained_native_execution_authorized()
+        })
+    }
+
+    #[inline]
+    fn begin_current_thread_session_authorized_by(
+        &self,
+        authorize_exact: impl FnOnce(&QualifiedExactSearch) -> bool,
+    ) -> Result<QualifiedExactSearchFacadeThreadSession<'_>, QualifiedExactSearchThreadContractError>
+    {
         let plan = match &self.plan {
             QualifiedExactSearchFacadePlan::ExactLiteral(exact) => {
                 QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(
-                    exact.search.begin_current_thread_session()?,
+                    exact
+                        .search
+                        .begin_current_thread_session_authorized_by(|| {
+                            authorize_exact(&exact.search)
+                        })?,
                 )
             }
             QualifiedExactSearchFacadePlan::Portable(portable) => {
@@ -2163,6 +2280,38 @@ impl QualifiedExactSearchFacade {
             }
         };
         Ok(QualifiedExactSearchFacadeThreadSession { plan })
+    }
+
+    #[cfg(test)]
+    fn begin_current_thread_session_for_qualification<'session>(
+        &'session self,
+        candidate_permit: Option<&'session QualificationCandidateExecutionPermit>,
+    ) -> Result<
+        QualifiedExactSearchFacadeQualificationThreadSession<'session>,
+        QualifiedExactSearchThreadContractError,
+    > {
+        let qualification = self
+            .qualified_build_report()
+            .expect("qualification session requires an exact-literal facade")
+            .qualification;
+        let authority = match qualification {
+            QualifiedExactSearchQualification::Candidate => {
+                let permit =
+                    candidate_permit.expect("Candidate qualification session requires its permit");
+                permit.assert_active();
+                QualificationSessionAuthority::Candidate { _permit: permit }
+            }
+            qualified if qualified.is_authorized() => {
+                assert!(
+                    candidate_permit.is_none(),
+                    "production-qualified session must not borrow a Candidate permit"
+                );
+                QualificationSessionAuthority::Qualified
+            }
+            _ => panic!("qualification session requires valid source-bound authority"),
+        };
+        let session = self.begin_current_thread_session_authorized_by(|_| true)?;
+        Ok(QualifiedExactSearchFacadeQualificationThreadSession { session, authority })
     }
 
     /// Find the first match in the complete haystack.
@@ -2357,9 +2506,35 @@ impl QualifiedExactSearchFacadeThreadSession<'_> {
         exact_project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
         portable_project: impl FnOnce(Option<Match>, SearchAccounting) -> R,
     ) -> Result<R, QualifiedExactSearchFacadeError> {
+        self.find_window_projected_authorized_by(
+            haystack,
+            window,
+            limits,
+            |search| search.search.retained_native_execution_authorized(),
+            exact_project,
+            portable_project,
+        )
+    }
+
+    #[inline]
+    fn find_window_projected_authorized_by<R>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        authorize_exact: impl FnOnce(&QualifiedExactSearchThreadSession<'_>) -> bool,
+        exact_project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
+        portable_project: impl FnOnce(Option<Match>, SearchAccounting) -> R,
+    ) -> Result<R, QualifiedExactSearchFacadeError> {
         match &self.plan {
             QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(search) => search
-                .find_window_projected(haystack, window, limits, exact_project)
+                .find_window_projected_authorized_by(
+                    haystack,
+                    window,
+                    limits,
+                    || authorize_exact(search),
+                    exact_project,
+                )
                 .map_err(QualifiedExactSearchFacadeError::from),
             QualifiedExactSearchFacadeThreadSessionPlan::Portable(portable) => {
                 let (matched, accounting) = portable.find_window(haystack, window, limits)?;
@@ -2410,6 +2585,38 @@ impl QualifiedExactSearchFacadeThreadSession<'_> {
             limits,
             |matched, _, _| matched.is_some(),
             |matched, _| matched.is_some(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl QualifiedExactSearchFacadeQualificationThreadSession<'_> {
+    /// Exercise the normal reporting path outside qualification timers.
+    fn find(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, QualifiedExactSearchFacadeExecution), QualifiedExactSearchFacadeError>
+    {
+        self.session.find(haystack, limits)
+    }
+
+    /// Return only the semantic match through the authority-hoisted
+    /// qualification boundary.
+    #[inline]
+    fn find_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchFacadeError> {
+        let _authority = &self.authority;
+        self.session.find_window_projected_authorized_by(
+            haystack,
+            SearchWindow::full(haystack),
+            limits,
+            |_| true,
+            |matched, _, _| matched,
+            |matched, _| matched,
         )
     }
 }
@@ -2559,6 +2766,7 @@ mod tests {
         let sessionless = &source[sessionless_start..sessionless_end];
         assert!(sessionless.contains("self.find_window_with_native("));
         assert!(sessionless.contains("\n            None,"));
+        assert!(sessionless.contains("\n            || false,"));
         assert!(!sessionless.contains("self.native"));
 
         let call_start = position(source, "    fn find_window_with_native<R>(");
@@ -2569,8 +2777,11 @@ mod tests {
             );
         let call = &source[call_start..call_end];
         assert_eq!(call.matches(".preflight_checked_window(").count(), 1);
+        assert!(call.contains("authorize_native: impl FnOnce() -> bool"));
+        assert!(call.contains("&& authorize_native()"));
         assert!(call.contains("native.search_preflighted(preflight)?"));
         assert!(!call.contains("preflight_literal_window("));
+        assert!(!call.contains("retained_native_execution_authorized"));
 
         let invocation_start =
             position(source, "impl QualifiedExactSearchNativeThreadSession<'_> {");
@@ -2595,7 +2806,55 @@ mod tests {
                 "\n    #[inline]\n    fn retained_native_execution_authorized",
             );
         let public_session = &source[public_session_start..public_session_end];
+        assert!(public_session.contains("self.begin_current_thread_session_authorized_by(|| {"));
+        assert!(public_session.contains("self.retained_native_execution_authorized()"));
+        assert!(public_session.contains("authorize_native: impl FnOnce() -> bool"));
         assert!(public_session.contains("native.begin_current_thread_session(&self.portable)"));
+
+        let projected_start = position(source, "impl QualifiedExactSearchThreadSession<'_> {");
+        let projected_end = projected_start
+            + position(
+                &source[projected_start..],
+                "\n/// Semantic route selected by",
+            );
+        let projected = &source[projected_start..projected_end];
+        assert!(projected.contains("fn find_window_projected_authorized_by<R>("));
+        assert!(projected.contains("|| self.search.retained_native_execution_authorized(),"));
+        assert_eq!(
+            projected
+                .matches("self.search.find_window_with_native(")
+                .count(),
+            1
+        );
+
+        let permit_start = position(source, "struct QualificationCandidateExecutionPermit {");
+        let permit_end = permit_start
+            + position(
+                &source[permit_start..],
+                "\nfn qualification_authorizes_native_execution(",
+            );
+        let permit = &source[permit_start..permit_end];
+        assert!(permit.contains("PhantomData<std::rc::Rc<()>>"));
+        assert!(permit.contains("impl Drop for QualificationCandidateExecutionPermit"));
+        assert!(permit.contains("TEST_CANDIDATE_EXECUTION.with("));
+
+        let qualification_session_start = position(
+            source,
+            "struct QualifiedExactSearchFacadeQualificationThreadSession<'session>",
+        );
+        let qualification_session_end = qualification_session_start
+            + position(
+                &source[qualification_session_start..],
+                "\nimpl PortableBuilder {",
+            );
+        let qualification_session = &source[qualification_session_start..qualification_session_end];
+        assert!(
+            qualification_session.contains("authority: QualificationSessionAuthority<'session>")
+        );
+        assert!(
+            qualification_session
+                .contains("_permit: &'session QualificationCandidateExecutionPermit")
+        );
     }
 
     #[test]

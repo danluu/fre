@@ -2,9 +2,9 @@
 
 Last updated: 2026-07-28 (America/Vancouver)
 
-This document describes implementation source sealed at
-`abc88e880167b166425c61f6fa37d191aca604f4`, tree
-`7f71ec7f5bffd69012fe86a3cccb69f13c616d4d`. Its immediately relevant
+This document describes a source/static Candidate-permit successor rooted at
+exact source base `cc25577dbebacdf43cc5ce8bd938e41072f65b3c`, tree
+`7ae2373728e58fd6149df5463bab9e15728e7442`. Its immediately relevant
 succession is:
 
 ```text
@@ -16,16 +16,20 @@ db0ae3df  source-bound tag-19 ABI2 verifier baseline
   -> 7bb6fadb  bounded default-policy facade cache adoption
   -> 5c5577ec  fresh-cache facade qualification timing
   -> abc88e88  lexically scoped timed-session retirement
+  -> cc25577d  resealed ABI2 facade qualification source
+  -> [this successor]  authority-hoisted Candidate facade timing
 ```
 
-This verifier/docs child expands the Candidate-rooted executable verifier's
-exact source closure to include the cache crate and the facade's
-gates-before-lookup, lease-owner, and lookup-free-session boundaries. It adds
-no runtime/compiler implementation or dynamic evidence. Git content cannot
-embed the identity of its own containing commit; the verifier therefore
-authenticates the externally supplied exact final Candidate commit and tree at
-run time. Review or evidence from an ancestor does not authorize that composed
-tree.
+This successor adds only a qualification-private RAII Candidate permit and
+shared internal authorization projections; normal public/session behavior and
+production authority remain unchanged. Its Candidate-rooted executable
+verifier reseals the exact source closure and checks the permit lifetime,
+authority-hoisted timing boundary, shared production search body, cache
+ownership, and lifecycle source contracts. It adds no dynamic evidence. Git
+content cannot embed the identity of its own containing commit; the verifier
+therefore authenticates the externally supplied exact final Candidate commit
+and tree at run time. Review or evidence from an ancestor does not authorize
+that composed tree.
 
 ## Compiler boundary
 
@@ -98,7 +102,20 @@ V8 session creation performs no SVE syscall. An atom for one backend cannot
 authorize another.
 
 Private scoped Candidate execution exists for tests and qualification source.
-It does not manufacture a production `Qualified` atom or expose a
+The tag-19 V5 facade harness now owns that authority in a `cfg(test)`-private,
+thread-bound RAII permit and lends it to a qualification-only session for the
+session's complete lifetime. Session construction validates the acquired
+permit once and performs the normal native-session setup, including any VL16
+check. Repeated timed value calls then pass constant proven authority into the
+same production facade and exact-search projection, so they avoid only the
+test TLS lookup while retaining checked-window construction, work preflight,
+minimum-window fallback, exact-plan identity, native invocation, decoded
+result validation, and portable fallback. Untimed reporting still enters the
+normal dynamically authorized session method. Ordinary public sessions and
+dynamic guard-loss tests are unchanged. The separate bridge qualification
+helper retains its independent dynamic guard and is outside this V5 repair.
+
+This permit does not manufacture a production `Qualified` atom or expose a
 caller-controlled production setter. No historical JIT result is a deployment
 or speed claim for this composed tree.
 
@@ -148,7 +165,8 @@ a claim that a V3 run passed or produced performance evidence.
 Tag 19 now has separate source-bound ABI2 evidence producers: a low-level
 correctness executable for the exact four-argument image/session boundary and
 a V5 fresh-process facade campaign that compares public portable and
-Candidate-guarded NativeJit routes. Its Candidate-extracted verifier parses
+RAII-permit-scoped NativeJit routes. Its Candidate-extracted verifier seals the
+authority-hoisted timed call against the shared production search body, parses
 the retained raw rows, reconstructs correctness and performance summaries,
 and permits tag-19 authority only beside an independently verified V8
 fallback. No producer has been run at this checkpoint, so this is not
