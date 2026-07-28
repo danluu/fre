@@ -35,7 +35,7 @@ pub use compile::{BuildReport, Program};
 pub use error::{BuildError, ResourceKind, SearchError};
 pub use history::{
     HistoryRegex, PARTICIPATION_QUOTIENT_ACCOUNTING_VERSION,
-    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION,
+    PARTICIPATION_QUOTIENT_ALGORITHM_VERSION, ParticipationExactSession,
 };
 pub use inline::InlineRegex;
 pub use limits::{AggregateLimits, BuildLimits, SearchLimits};
