@@ -9,9 +9,9 @@ three execution routes on a little-endian Linux/AArch64 Arm `0x41/0xd84` host:
    strict W^X; and
 3. the portable preprocessed exact-literal plan.
 
-It is diagnostic scaffolding, not promotion or deployment authority. Every
-metadata and sample row says `promotion_authority=absent`, and the deterministic
-P2b bundle itself says `runtime_authority=absent`.
+It is diagnostic scaffolding, not promotion or deployment authority. The run
+metadata and every result row say `promotion_authority=absent`, and the
+deterministic P2b bundle itself says `runtime_authority=absent`.
 
 ## Static AOT construction
 
@@ -73,9 +73,17 @@ qualification case.
 
 Hot samples calibrate to a target duration, warm every route, rotate all six
 engine permutations by `repetition % 6`, retain CPU-affinity observations, and
-consume match-dependent checksums. Lifecycle samples use the same six-order
-rotation and emit the individual plan, emit, publish, preflight, session, and
-first-call stage totals.
+consume match-dependent checksums. Warmup, calibration, and measurement all use
+that repetition's order, so the route immediately preceding the first measured
+route is balanced across the six permutations. Lifecycle warmup and samples use
+the same six-order rotation and emit the individual plan, emit, publish,
+preflight, session, and first-call stage totals.
+
+Fixture alignment advances only after a complete six-order block:
+`alignment = (repetition / 6) % 16`. A campaign must use a repetition count that
+is a multiple of six; the canonical 96 repetitions cover the full
+six-order-by-sixteen-alignment grid without correlating engine position with
+alignment.
 
 The runtime refuses unless its freshly emitted JIT artifact identity is exactly
 the build-time AOT artifact identity. Rows bind source commit, source tree,
@@ -90,11 +98,13 @@ does not yet have a generated `Cargo.lock`. It is not correct to claim
 `--locked` build readiness until the following post-GO gates complete:
 
 1. generate and review `Cargo.lock` without updating unrelated dependencies;
-2. build the exact source commit/tree with the four required binding variables;
-3. run `verify_post_link.py` against the final executable and the exact
+2. independently derive the source commit/tree and helper digest from the
+   admitted clean checkout/helper, rather than accepting caller-provided labels;
+3. build that exact source with the four required binding variables;
+4. run `verify_post_link.py` against the final executable and the exact
    `OUT_DIR` implementation/glue/contract paths;
-4. run correctness qualification;
-5. only then run controlled, source-bound hot and lifecycle cells.
+5. run correctness qualification;
+6. only then run controlled, source-bound hot and lifecycle cells.
 
 Required build variables:
 
@@ -118,12 +128,16 @@ python3 -I -B verify_post_link.py \
   --source-tree <exact-tree>
 ```
 
-The verifier parses the original glue relocation and final ELF image. It
-requires exactly one glue `R_AARCH64_CALL26` to the identity-suffixed entry,
-the exact four-instruction wrapper, a resolved direct `bl` with no PLT, and a
-separate direct `bl` from the primary benchmark path. It independently hashes
-the implementation object and the domain-separated glue object, and requires
-the final entry instruction bytes to equal the implementation object's entry
-range. It rejects `blr`, x4 in the wrapper, result-slot contracts, RWX load
-segments, and executable stack. Its successful output is still an observation with
-`runtime_authority=absent` and `promotion_authority=absent`.
+The build roots both the payload and metadata symbols against section garbage
+collection. The verifier parses the original glue relocation and final ELF
+image from sealed in-memory snapshots. It requires exactly one glue
+`R_AARCH64_CALL26` to the identity-suffixed entry, the exact four-instruction
+wrapper, a resolved direct `bl` with no PLT, and a separate direct `bl` from the
+primary benchmark path. It independently hashes the implementation object and
+the domain-separated glue object, and requires the final entry, complete
+code/padding/literal payload, and metadata symbol bytes to equal the input
+implementation object's exact symbol extents. It rejects `blr`, x4 in the
+wrapper, result-slot contracts, RWX load segments, and executable stack, and
+reports the final executable SHA-256. Its successful output is still an
+observation with `runtime_authority=absent` and
+`promotion_authority=absent`.

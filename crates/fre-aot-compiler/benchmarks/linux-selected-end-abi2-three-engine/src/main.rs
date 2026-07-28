@@ -1,5 +1,5 @@
 //! Source-bound, non-authoritative Linux/AArch64 comparison of one exact
-//! SelectedEnd ABI2 image used as linked AOT, strict-W^X JIT, and portable
+//! `SelectedEnd` ABI2 image used as linked AOT, strict-W^X JIT, and portable
 //! exact-literal search.
 
 use std::{
@@ -32,7 +32,7 @@ mod linked {
 type DynError = Box<dyn Error>;
 type SpanValue = Option<(usize, usize)>;
 
-const SCHEMA: &str = "fre-aot-selected-end-abi2-three-engine-v1";
+const SCHEMA: &str = "fre-aot-selected-end-abi2-three-engine-v2";
 const EVIDENCE_CLASS: &str = "diagnostic-nonpromotion";
 const PROMOTION_AUTHORITY: &str = "absent";
 const POST_LINK_OBSERVATION: &str = "pending-external-static-verifier";
@@ -55,8 +55,6 @@ enum Engine {
 }
 
 impl Engine {
-    const ALL: [Self; 3] = [Self::Aot, Self::Jit, Self::Portable];
-
     const fn name(self) -> &'static str {
         match self {
             Self::Aot => "aot-tag21-entry-direct-abi2",
@@ -430,7 +428,15 @@ fn qualification(arguments: &[String]) -> Result<(), DynError> {
         }
     }
     println!(
-        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=exact-entry-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\tpromotion_authority={PROMOTION_AUTHORITY}"
+        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=exact-entry-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        identity.run_id,
+        identity.instance_type,
+        identity.helper_sha256,
+        identity.profile,
+        hex(&linked::AOT_ARTIFACT_IDENTITY),
+        hex(&linked::AOT_BUNDLE_IDENTITY),
+        identity.source_commit,
+        identity.source_tree,
     );
     Ok(())
 }
@@ -444,7 +450,7 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
     let repetition = parse_repetition(&arguments[2])?;
     let identity = require_identity(&arguments[3..])?;
     let affinity_cpu = require_host()?;
-    let fixture = make_fixture(size.bytes(), scenario, repetition % 16)?;
+    let fixture = make_fixture(size.bytes(), scenario, benchmark_alignment(repetition))?;
     let order = ENGINE_ORDERS[repetition % ENGINE_ORDERS.len()];
     print_run_metadata(&identity, affinity_cpu);
     let engines = Engines::build()?;
@@ -452,17 +458,17 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
     let sessions = engines.begin_sessions()?;
     sessions.assert_equal(&fixture, "hot cell")?;
     let preflight = sessions.preflight(&fixture)?;
-    for engine in Engine::ALL {
+    for engine in order {
         for _ in 0..WARMUP_CALLS {
             black_box(sessions.search(engine, black_box(preflight))?);
         }
     }
     let mut iterations = BTreeMap::new();
-    for engine in Engine::ALL {
+    for engine in order {
         iterations.insert(engine, calibrate_hot(&sessions, engine, preflight)?);
     }
     println!(
-        "CELL\t{SCHEMA}\tstage=hot\tstrategy=same-preflight-value-only\tsize={}\tscenario={}\trepetition={repetition}\torder={}\talignment={}\tsearched_bytes={}\twindow={}..{}\texpected={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "CELL\t{SCHEMA}\tstage=hot\tstrategy=same-preflight-value-only\tsize={}\tscenario={}\trepetition={repetition}\torder={}\talignment={}\tsearched_bytes={}\twindow={}..{}\texpected={}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
         size.name(),
         scenario.name(),
         format_order(order),
@@ -471,6 +477,10 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
         fixture.window.start(),
         fixture.window.end(),
         format_span(fixture.expected),
+        identity.run_id,
+        identity.instance_type,
+        identity.helper_sha256,
+        identity.profile,
         hex(&linked::AOT_ARTIFACT_IDENTITY),
         hex(&linked::AOT_BUNDLE_IDENTITY),
         identity.source_commit,
@@ -494,10 +504,14 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
             .into());
         }
         println!(
-            "SAMPLE\t{SCHEMA}\tstage=hot\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={engine_iterations}\telapsed_ns={}\tchecksum={checksum}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+            "SAMPLE\t{SCHEMA}\tstage=hot\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={engine_iterations}\telapsed_ns={}\tchecksum={checksum}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
             engine.name(),
             engine.code_origin(),
             elapsed.as_nanos(),
+            identity.run_id,
+            identity.instance_type,
+            identity.helper_sha256,
+            identity.profile,
             hex(&linked::AOT_ARTIFACT_IDENTITY),
             hex(&linked::AOT_BUNDLE_IDENTITY),
             identity.source_commit,
@@ -507,6 +521,10 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the lifecycle row keeps all three rotated engines and the AOT activation boundary together"
+)]
 fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     if arguments.len() != 9 {
         return Err("lifecycle expects SIZE SCENARIO REPETITION plus six identity fields".into());
@@ -516,7 +534,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     let repetition = parse_repetition(&arguments[2])?;
     let identity = require_identity(&arguments[3..])?;
     let affinity_cpu = require_host()?;
-    let fixture = make_fixture(size.bytes(), scenario, repetition % 16)?;
+    let fixture = make_fixture(size.bytes(), scenario, benchmark_alignment(repetition))?;
     let expected = independent_oracle(&fixture)?;
     if expected != fixture.expected {
         return Err("lifecycle fixture differs from independent oracle".into());
@@ -524,16 +542,20 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     let order = ENGINE_ORDERS[repetition % ENGINE_ORDERS.len()];
     print_run_metadata(&identity, affinity_cpu);
     println!(
-        "LIFECYCLE\t{SCHEMA}\tsize={}\tscenario={}\trepetition={repetition}\torder={}\titerations={LIFECYCLE_ITERATIONS}\taot_compile=offline-excluded\taot_link=offline-excluded\taot_runtime=plan+preflight+vl16-session+call\tjit_runtime=plan+emit+strict-wx-publication+preflight+vl16-session+call\tportable_runtime=plan+preflight+call\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "LIFECYCLE\t{SCHEMA}\tsize={}\tscenario={}\trepetition={repetition}\torder={}\titerations={LIFECYCLE_ITERATIONS}\taot_compile=offline-excluded\taot_link=offline-excluded\taot_runtime=plan+preflight+vl16-session+call\tjit_runtime=plan+emit+strict-wx-publication+preflight+vl16-session+call\tportable_runtime=plan+preflight+call\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
         size.name(),
         scenario.name(),
         format_order(order),
+        identity.run_id,
+        identity.instance_type,
+        identity.helper_sha256,
+        identity.profile,
         hex(&linked::AOT_ARTIFACT_IDENTITY),
         hex(&linked::AOT_BUNDLE_IDENTITY),
         identity.source_commit,
         identity.source_tree,
     );
-    for engine in Engine::ALL {
+    for engine in order {
         for _ in 0..LIFECYCLE_WARMUP_CALLS {
             black_box(measure_lifecycle_once(engine, &fixture, expected)?);
         }
@@ -568,7 +590,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
         require_stable_cpu(affinity_cpu, cpu_before, cpu_after)?;
         black_box(aggregate.checksum);
         println!(
-            "SAMPLE\t{SCHEMA}\tstage=lifecycle\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tplan_ns={}\temit_ns={}\tpublish_ns={}\tpreflight_ns={}\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+            "SAMPLE\t{SCHEMA}\tstage=lifecycle\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tplan_ns={}\temit_ns={}\tpublish_ns={}\tpreflight_ns={}\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
             engine.name(),
             engine.code_origin(),
             aggregate.plan_ns,
@@ -579,6 +601,10 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
             aggregate.first_call_ns,
             aggregate.total_ns,
             aggregate.checksum,
+            identity.run_id,
+            identity.instance_type,
+            identity.helper_sha256,
+            identity.profile,
             hex(&linked::AOT_ARTIFACT_IDENTITY),
             hex(&linked::AOT_BUNDLE_IDENTITY),
             identity.source_commit,
@@ -618,13 +644,17 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     require_stable_cpu(affinity_cpu, activation_cpu_before, activation_cpu_after)?;
     black_box(activation.checksum);
     println!(
-        "SAMPLE\t{SCHEMA}\tstage=aot-activation\tengine={}\tcode_origin={}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tprepared_preflight=outside\tplan_ns=0\temit_ns=0\tpublish_ns=0\tpreflight_ns=0\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={activation_cpu_before}\tcpu_after={activation_cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "SAMPLE\t{SCHEMA}\tstage=aot-activation\tengine={}\tcode_origin={}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tprepared_preflight=outside\tplan_ns=0\temit_ns=0\tpublish_ns=0\tpreflight_ns=0\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={activation_cpu_before}\tcpu_after={activation_cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
         Engine::Aot.name(),
         Engine::Aot.code_origin(),
         activation.session_ns,
         activation.first_call_ns,
         activation.total_ns,
         activation.checksum,
+        identity.run_id,
+        identity.instance_type,
+        identity.helper_sha256,
+        identity.profile,
         hex(&linked::AOT_ARTIFACT_IDENTITY),
         hex(&linked::AOT_BUNDLE_IDENTITY),
         identity.source_commit,
@@ -667,6 +697,10 @@ fn measure_aot_activation_once(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one enclosing timer must visibly contain every lifecycle stage in exact order"
+)]
 fn measure_lifecycle_once(
     engine: Engine,
     fixture: &Fixture,
@@ -685,18 +719,17 @@ fn measure_lifecycle_once(
     };
     let plan_ns = plan_started.elapsed().as_nanos();
 
-    let emit_started = Instant::now();
-    let image = program
-        .as_ref()
-        .map(|program| {
-            emit_selected_end_register_v2(
-                program,
-                SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
-                EmitLimits::default(),
-            )
-        })
-        .transpose()?;
-    let emit_ns = emit_started.elapsed().as_nanos();
+    let (image, emit_ns) = if let Some(program) = program.as_ref() {
+        let emit_started = Instant::now();
+        let image = emit_selected_end_register_v2(
+            program,
+            SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
+            EmitLimits::default(),
+        )?;
+        (Some(image), emit_started.elapsed().as_nanos())
+    } else {
+        (None, 0)
+    };
     if image
         .as_ref()
         .is_some_and(|image| image.artifact_identity().as_bytes() != &linked::AOT_ARTIFACT_IDENTITY)
@@ -704,30 +737,37 @@ fn measure_lifecycle_once(
         return Err("lifecycle JIT image differs from linked AOT artifact".into());
     }
 
-    let publish_started = Instant::now();
-    let jit = image
-        .as_ref()
-        .map(|image| publish_selected_end_register_v2(image, PublicationLimits::default()))
-        .transpose()?;
-    let publish_ns = publish_started.elapsed().as_nanos();
+    let (jit, publish_ns) = if let Some(image) = image.as_ref() {
+        let publish_started = Instant::now();
+        let jit = publish_selected_end_register_v2(image, PublicationLimits::default())?;
+        (Some(jit), publish_started.elapsed().as_nanos())
+    } else {
+        (None, 0)
+    };
 
+    let preflight_started = Instant::now();
     let checked = CheckedSearchWindow::new(fixture.haystack(), fixture.window)
         .ok_or("lifecycle fixture has invalid window")?;
-    let preflight_started = Instant::now();
     let preflight = portable.preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
     let preflight_ns = preflight_started.elapsed().as_nanos();
 
     let aot = AotLinked;
-    let session_started = Instant::now();
-    let aot_session = match engine {
-        Engine::Aot => Some(aot.begin_current_thread_session()?),
-        Engine::Jit | Engine::Portable => None,
+    let (aot_session, jit_session, session_ns) = match engine {
+        Engine::Aot => {
+            let session_started = Instant::now();
+            let session = aot.begin_current_thread_session()?;
+            (Some(session), None, session_started.elapsed().as_nanos())
+        }
+        Engine::Jit => {
+            let session_started = Instant::now();
+            let session = jit
+                .as_ref()
+                .ok_or("JIT lifecycle omitted its publication")?
+                .begin_current_thread_session()?;
+            (None, Some(session), session_started.elapsed().as_nanos())
+        }
+        Engine::Portable => (None, None, 0),
     };
-    let jit_session = jit
-        .as_ref()
-        .map(PublishedSelectedEndRegisterV2::begin_current_thread_session)
-        .transpose()?;
-    let session_ns = session_started.elapsed().as_nanos();
 
     let first_call_started = Instant::now();
     let actual = match engine {
@@ -965,10 +1005,14 @@ fn synthesize_filter_hits(haystack: &mut [u8], filter_offsets: [usize; 5]) -> Re
 
 fn parse_repetition(value: &str) -> Result<usize, DynError> {
     let repetition = value.parse::<usize>()?;
-    if repetition >= 120 {
-        return Err("repetition must be in 0..119".into());
+    if repetition >= 96 {
+        return Err("repetition must be in 0..95".into());
     }
     Ok(repetition)
+}
+
+const fn benchmark_alignment(repetition: usize) -> usize {
+    (repetition / ENGINE_ORDERS.len()) % 16
 }
 
 fn require_identity(arguments: &[String]) -> Result<RunIdentity<'_>, DynError> {

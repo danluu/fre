@@ -42,6 +42,10 @@ fn main() {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the build transaction keeps all emitted artifacts and linker roots visibly ordered"
+)]
 fn run() -> Result<(), DynError> {
     require_target()?;
     let source_commit = required_hex(SOURCE_COMMIT_ENV, 40)?;
@@ -160,6 +164,9 @@ fn run() -> Result<(), DynError> {
     for link_input in [&implementation_path, &glue_path] {
         println!("cargo:rustc-link-arg-bin={BIN}={}", link_input.display());
     }
+    for retained in [symbols.payload().as_str(), symbols.metadata().as_str()] {
+        println!("cargo:rustc-link-arg-bin={BIN}=-Wl,--undefined={retained}");
+    }
     println!("cargo:rustc-link-arg-bin={BIN}=-Wl,-z,separate-code");
     println!("cargo:rustc-link-arg-bin={BIN}=-Wl,-z,noexecstack");
     println!("cargo:rustc-link-arg-bin={BIN}=-Wl,-z,now");
@@ -263,63 +270,75 @@ fn render_rust_bindings(
     let mut output = String::new();
     writeln!(
         output,
-        "pub const BOUND_SOURCE_COMMIT: &str = {source_commit:?};"
+        "pub(super) const BOUND_SOURCE_COMMIT: &str = {source_commit:?};"
     )?;
     writeln!(
         output,
-        "pub const BOUND_SOURCE_TREE: &str = {source_tree:?};"
+        "pub(super) const BOUND_SOURCE_TREE: &str = {source_tree:?};"
     )?;
     writeln!(
         output,
-        "pub const BOUND_HELPER_SHA256: &str = {helper_sha256:?};"
+        "pub(super) const BOUND_HELPER_SHA256: &str = {helper_sha256:?};"
     )?;
-    writeln!(output, "pub const BOUND_PROFILE: &str = {profile:?};")?;
     writeln!(
         output,
-        "pub const POST_LINK_CONTRACT_PATH: &str = {:?};",
+        "pub(super) const BOUND_PROFILE: &str = {profile:?};"
+    )?;
+    writeln!(
+        output,
+        "pub(super) const POST_LINK_CONTRACT_PATH: &str = {:?};",
         contract_path.display().to_string()
     )?;
     writeln!(
         output,
-        "pub const IMPLEMENTATION_OBJECT_PATH: &str = {:?};",
+        "pub(super) const IMPLEMENTATION_OBJECT_PATH: &str = {:?};",
         implementation_path.display().to_string()
     )?;
     writeln!(
         output,
-        "pub const DIRECT_GLUE_OBJECT_PATH: &str = {:?};",
+        "pub(super) const DIRECT_GLUE_OBJECT_PATH: &str = {:?};",
         glue_path.display().to_string()
     )?;
-    writeln!(output, "pub const WRAPPER_SYMBOL: &str = {wrapper:?};")?;
-    writeln!(output, "pub const ENTRY_SYMBOL: &str = {entry:?};")?;
-    writeln!(output, "pub const PAYLOAD_SYMBOL: &str = {payload:?};")?;
-    writeln!(output, "pub const METADATA_SYMBOL: &str = {metadata:?};")?;
     writeln!(
         output,
-        "pub const AOT_ARTIFACT_IDENTITY: [u8; 32] = {artifact_identity:?};"
+        "pub(super) const WRAPPER_SYMBOL: &str = {wrapper:?};"
+    )?;
+    writeln!(output, "pub(super) const ENTRY_SYMBOL: &str = {entry:?};")?;
+    writeln!(
+        output,
+        "pub(super) const PAYLOAD_SYMBOL: &str = {payload:?};"
     )?;
     writeln!(
         output,
-        "pub const AOT_COMPILE_IDENTITY: [u8; 32] = {compile_identity:?};"
+        "pub(super) const METADATA_SYMBOL: &str = {metadata:?};"
     )?;
     writeln!(
         output,
-        "pub const AOT_IMPLEMENTATION_OBJECT_IDENTITY: [u8; 32] = {implementation_object_identity:?};"
+        "pub(super) const AOT_ARTIFACT_IDENTITY: [u8; 32] = {artifact_identity:?};"
     )?;
     writeln!(
         output,
-        "pub const AOT_GLUE_OBJECT_IDENTITY: [u8; 32] = {glue_object_identity:?};"
+        "pub(super) const AOT_COMPILE_IDENTITY: [u8; 32] = {compile_identity:?};"
     )?;
     writeln!(
         output,
-        "pub const AOT_BUNDLE_IDENTITY: [u8; 32] = {bundle_identity:?};"
+        "pub(super) const AOT_IMPLEMENTATION_OBJECT_IDENTITY: [u8; 32] = {implementation_object_identity:?};"
     )?;
     writeln!(
         output,
-        "#[allow(unsafe_code)]\nunsafe extern \"C\" {{\n    #[link_name = {entry:?}]\n    fn exact_linked_aot_selected_end_entry_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n    #[link_name = {wrapper:?}]\n    fn exact_linked_aot_selected_end_qualification_wrapper_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n}}"
+        "pub(super) const AOT_GLUE_OBJECT_IDENTITY: [u8; 32] = {glue_object_identity:?};"
     )?;
     writeln!(
         output,
-        "#[allow(unsafe_code)]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_entry_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: the private generated entry requires the non-transferable\n    // AotThreadSession constructed after one same-thread tag21 VL16 check;\n    // its caller also supplies scalar-preflighted bounds. The exact linked\n    // entry has the sealed four-argument ABI2 contract and no result slot.\n    unsafe {{ exact_linked_aot_selected_end_entry_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}\n\n#[allow(unsafe_code)]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_qualification_wrapper_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: this diagnostic-only route requires the same private checked\n    // thread token and scalar-preflighted inputs as the primary direct route.\n    unsafe {{ exact_linked_aot_selected_end_qualification_wrapper_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}"
+        "pub(super) const AOT_BUNDLE_IDENTITY: [u8; 32] = {bundle_identity:?};"
+    )?;
+    writeln!(
+        output,
+        "#[allow(unsafe_code, reason = \"generated FFI declares only the sealed exact ABI2 symbols\")]\nunsafe extern \"C\" {{\n    #[link_name = {entry:?}]\n    fn exact_linked_aot_selected_end_entry_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n    #[link_name = {wrapper:?}]\n    fn exact_linked_aot_selected_end_qualification_wrapper_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n}}"
+    )?;
+    writeln!(
+        output,
+        "#[allow(unsafe_code, reason = \"the checked AOT session guards this exact ABI2 call\")]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_entry_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: the private generated entry requires the non-transferable\n    // AotThreadSession constructed after one same-thread tag21 VL16 check;\n    // its caller also supplies scalar-preflighted bounds. The exact linked\n    // entry has the sealed four-argument ABI2 contract and no result slot.\n    unsafe {{ exact_linked_aot_selected_end_entry_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}\n\n#[allow(unsafe_code, reason = \"the checked AOT session guards this diagnostic ABI2 call\")]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_qualification_wrapper_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: this diagnostic-only route requires the same private checked\n    // thread token and scalar-preflighted inputs as the primary direct route.\n    unsafe {{ exact_linked_aot_selected_end_qualification_wrapper_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}"
     )?;
     Ok(output)
 }
