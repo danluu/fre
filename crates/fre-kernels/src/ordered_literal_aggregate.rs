@@ -11,8 +11,10 @@
 //! ordered literal starting at each byte position. A bounded dynamic-program
 //! ring then implements the regex iterator's initial/progressed empty-match
 //! states. Search logically charges exactly `N` DFA transitions and `N + 1`
-//! reducer steps, while maximal root-miss runs avoid redundant physical table
-//! lookups and DP stores. Scratch is explicitly bounded by
+//! reducer steps, while root sets backed by `memrchr1`/`memrchr2`/`memrchr3`
+//! skip maximal root-miss runs without redundant physical table lookups and DP
+//! stores. Wider root sets retain the incumbent one-transition-per-byte loop.
+//! Scratch is explicitly bounded by
 //! `O(min(N, longest_literal))`.
 
 use core::{fmt, mem::size_of};
@@ -921,6 +923,11 @@ struct RootInterest<'a> {
 
 impl RootInterest<'_> {
     #[inline]
+    const fn has_accelerated_reverse_search(self) -> bool {
+        matches!(self.count, 1..=3)
+    }
+
+    #[inline]
     fn contains(&self, byte: u8) -> bool {
         self.byte_classes[usize::from(byte)] & ROOT_INTEREST_FLAG != 0
     }
@@ -1004,6 +1011,17 @@ impl DenseReverseDfa {
             ],
             count: u16::try_from(metadata & ROOT_COUNT_MASK).expect("encoded root count fits u16"),
         }
+    }
+
+    #[inline]
+    fn accelerated_root_interest(&self) -> Option<RootInterest<'_>> {
+        if !self.root_has_no_output() {
+            return None;
+        }
+        let interest = self.root_interest();
+        interest
+            .has_accelerated_reverse_search()
+            .then_some(interest)
     }
 }
 
@@ -1159,7 +1177,7 @@ impl OrderedLiteralCountPlan {
         ring.resize(upper.ring_entries, CountState::default());
         let actual = self
             .core
-            .execute_count::<true>(haystack, &mut ring, upper)?;
+            .execute_count_dispatched(haystack, &mut ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1215,7 +1233,7 @@ impl OrderedLiteralCountPlan {
                 })?;
         let actual = self
             .core
-            .execute_count::<true>(haystack, active_ring, upper)?;
+            .execute_count_dispatched(haystack, active_ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1288,7 +1306,9 @@ impl OrderedLiteralSpanSumPlan {
             limits,
         )?;
         ring.resize(upper.ring_entries, SpanState::default());
-        let actual = self.core.execute_span::<true>(haystack, &mut ring, upper)?;
+        let actual = self
+            .core
+            .execute_span_dispatched(haystack, &mut ring, upper)?;
         let span_sum = actual
             .span_sum
             .expect("span plan always publishes a span sum");
@@ -1345,7 +1365,7 @@ impl OrderedLiteralSpanSumPlan {
                 })?;
         let actual = self
             .core
-            .execute_span::<true>(haystack, active_ring, upper)?;
+            .execute_span_dispatched(haystack, active_ring, upper)?;
         let span_sum = actual
             .span_sum
             .expect("span plan always publishes a span sum");
@@ -1385,7 +1405,7 @@ impl PlanCore {
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
             transition_kind: "byte-class-compressed dense u32 reverse AC DFA",
-            traversal_kind: "root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
+            traversal_kind: "memrchr-eligible root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
         }
@@ -1812,6 +1832,32 @@ impl PlanCore {
         Ok(())
     }
 
+    fn execute_count_dispatched(
+        &self,
+        haystack: &[u8],
+        ring: &mut [CountState],
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        if let Some(root_interest) = self.dfa.accelerated_root_interest() {
+            self.execute_count::<true>(haystack, ring, upper, Some(root_interest))
+        } else {
+            self.execute_count::<false>(haystack, ring, upper, None)
+        }
+    }
+
+    fn execute_span_dispatched(
+        &self,
+        haystack: &[u8],
+        ring: &mut [SpanState],
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        if let Some(root_interest) = self.dfa.accelerated_root_interest() {
+            self.execute_span::<true>(haystack, ring, upper, Some(root_interest))
+        } else {
+            self.execute_span::<false>(haystack, ring, upper, None)
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the root-skip proof and count DP recurrence stay adjacent for audit"
@@ -1821,12 +1867,12 @@ impl PlanCore {
         haystack: &[u8],
         ring: &mut [CountState],
         upper: ReduceUpperBounds,
+        root_interest: Option<RootInterest<'_>>,
     ) -> Result<ReduceActualCounters, ReduceError> {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = 0_u64;
-        let can_skip_root_runs = SKIP_ROOT_RUNS && self.dfa.root_has_no_output();
-        let root_interest = self.dfa.root_interest();
+        debug_assert_eq!(SKIP_ROOT_RUNS, root_interest.is_some());
         let mut current_slot =
             haystack
                 .len()
@@ -1837,7 +1883,9 @@ impl PlanCore {
         let mut position = haystack.len();
         loop {
             if position < haystack.len() {
-                if can_skip_root_runs && state == 0 {
+                if SKIP_ROOT_RUNS && state == 0 {
+                    let root_interest =
+                        root_interest.expect("root-skip specialization retains root metadata");
                     let root_miss_run = root_interest.miss_suffix_len(&haystack[..=position]);
                     if root_miss_run != 0 {
                         let consumed_through_start = root_miss_run
@@ -1938,12 +1986,12 @@ impl PlanCore {
         haystack: &[u8],
         ring: &mut [SpanState],
         upper: ReduceUpperBounds,
+        root_interest: Option<RootInterest<'_>>,
     ) -> Result<ReduceActualCounters, ReduceError> {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = SpanState::default();
-        let can_skip_root_runs = SKIP_ROOT_RUNS && self.dfa.root_has_no_output();
-        let root_interest = self.dfa.root_interest();
+        debug_assert_eq!(SKIP_ROOT_RUNS, root_interest.is_some());
         let mut current_slot =
             haystack
                 .len()
@@ -1954,7 +2002,9 @@ impl PlanCore {
         let mut position = haystack.len();
         loop {
             if position < haystack.len() {
-                if can_skip_root_runs && state == 0 {
+                if SKIP_ROOT_RUNS && state == 0 {
+                    let root_interest =
+                        root_interest.expect("root-skip specialization retains root metadata");
                     let root_miss_run = root_interest.miss_suffix_len(&haystack[..=position]);
                     if root_miss_run != 0 {
                         let consumed_through_start = root_miss_run
@@ -2980,10 +3030,11 @@ mod tests {
     }
 
     #[test]
-    fn root_interest_uses_small_reverse_searches_and_full_domain_bitmap_fallback() {
+    fn root_interest_accelerates_only_memrchr_widths() {
         let haystack = b"\xFFa0b1c2d3a\x80";
         let empty =
             OrderedLiteralCountPlan::build(&[b"".as_slice()], BuildLimits::unlimited()).unwrap();
+        assert!(empty.core.dfa.accelerated_root_interest().is_none());
         assert_eq!(
             empty.core.dfa.root_interest().miss_suffix_len(haystack),
             haystack.len()
@@ -2994,6 +3045,7 @@ mod tests {
         let interest = one.core.dfa.root_interest();
         assert_eq!(interest.count, 1);
         assert_eq!(interest.last_in(haystack), Some(9));
+        assert!(one.core.dfa.accelerated_root_interest().is_some());
 
         let three = OrderedLiteralCountPlan::build(
             &[b"xa".as_slice(), b"xb".as_slice(), b"xc".as_slice()],
@@ -3003,6 +3055,7 @@ mod tests {
         let interest = three.core.dfa.root_interest();
         assert_eq!(interest.count, 3);
         assert_eq!(interest.last_in(haystack), Some(9));
+        assert!(three.core.dfa.accelerated_root_interest().is_some());
 
         let six = OrderedLiteralCountPlan::build(
             &[
@@ -3018,6 +3071,7 @@ mod tests {
         .unwrap();
         let interest = six.core.dfa.root_interest();
         assert_eq!(interest.count, 6);
+        assert!(six.core.dfa.accelerated_root_interest().is_none());
         assert_eq!(interest.last_in(haystack), Some(10));
         assert_eq!(interest.miss_suffix_len(haystack), 0);
         assert_eq!(interest.miss_suffix_len(&haystack[..9]), 1);
@@ -3028,6 +3082,7 @@ mod tests {
             .collect::<Vec<_>>();
         let all = OrderedLiteralCountPlan::build(&every_byte, BuildLimits::unlimited()).unwrap();
         let interest = all.core.dfa.root_interest();
+        assert!(all.core.dfa.accelerated_root_interest().is_none());
         for byte in u8::MIN..=u8::MAX {
             assert!(interest.contains(byte));
         }
@@ -3161,7 +3216,7 @@ mod tests {
             .unwrap();
         ring.resize(upper.ring_entries, CountState::default());
         plan.core
-            .execute_count::<false>(haystack, &mut ring, upper)
+            .execute_count::<false>(haystack, &mut ring, upper, None)
             .unwrap()
     }
 
@@ -3181,7 +3236,7 @@ mod tests {
             .unwrap();
         ring.resize(upper.ring_entries, SpanState::default());
         plan.core
-            .execute_span::<false>(haystack, &mut ring, upper)
+            .execute_span::<false>(haystack, &mut ring, upper, None)
             .unwrap()
     }
 
@@ -3358,7 +3413,7 @@ mod tests {
                 b"aaaaabxxxxxxabaaaa",
             ),
             (
-                "four-plus full-byte bitmap fallback",
+                "four-plus root bytes use the incumbent loop",
                 &[b"qa", b"wb", b"ec", b"rd", b"t\xFF", b"y\x80"],
                 b"xxxxxxxxqa--wb--ec--rd--t\xFF--y\x80",
             ),
