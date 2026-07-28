@@ -63,9 +63,11 @@ pub(super) fn sve_vector_bytes() -> Option<u16> {
         return None;
     }
     // SAFETY: `PR_SVE_GET_VL` reads the calling thread's SVE control state
-    // and ignores all remaining variadic arguments. Search tag 19 treats a
-    // denied or malformed query as fail-closed construction/publication
-    // refusal; no generated-code call repeats this syscall.
+    // and ignores all remaining variadic arguments. The retained low-level
+    // Search-v1 tag-19 path treats a denied or malformed query as fail-closed
+    // construction/publication refusal. The qualified ABI2 tag-19 path makes
+    // this query only while opening its current-thread session. Neither path
+    // repeats the syscall inside generated-code calls.
     let raw = unsafe { libc::prctl(PR_SVE_GET_VL, 0, 0, 0, 0) };
     if raw < 0 {
         return None;

@@ -102,7 +102,7 @@ pub(crate) use implementation::{ExecutableMapping, SearchEntry, SelectedEndRegis
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-pub(crate) use implementation::{live_code_mappings, with_guarded_haystack};
+pub(crate) use implementation::live_code_mappings;
 
 #[cfg(all(
     any(test, feature = "sve-hardware-qualification"),
@@ -111,7 +111,10 @@ pub(crate) use implementation::{live_code_mappings, with_guarded_haystack};
     target_pointer_width = "64",
     target_endian = "little"
 ))]
-pub(crate) use implementation::invoke_with_vector_callee_saved_canary;
+pub(crate) use implementation::{
+    invoke_selected_end_register_v2_with_vector_callee_saved_canary,
+    invoke_with_vector_callee_saved_canary, with_guarded_haystack,
+};
 
 pub(crate) fn capabilities() -> Result<NativeHostCapabilities, PublishError> {
     implementation::capabilities()

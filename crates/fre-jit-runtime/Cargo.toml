@@ -8,8 +8,8 @@ license.workspace = true
 publish = false
 
 [features]
-# Exposes only the doc-hidden ABI canary used by source-bound hardware
-# qualification. Production users have no reason to enable it.
+# Exposes doc-hidden ABI canary, guarded-mapping, and VL observation helpers
+# used only by source-bound hardware qualification. It remains default-off.
 sve-hardware-qualification = []
 
 [dependencies]

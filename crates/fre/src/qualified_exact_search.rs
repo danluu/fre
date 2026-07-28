@@ -3705,6 +3705,9 @@ mod tests {
             tag19_execution.route,
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
+        // V5 is deliberately a tag-19-only ABI2 receipt contract. The V4
+        // sibling rows remain byte-stable for their independently versioned
+        // V8/tag-10/tag-21 evidence consumers.
         println!(
             "fre-jit-auto-facade-v5\tcase=tag19_fallback\tpolicy=Sve16V6\tbackend=19\tabi=SelectedEndRegisterV2\tqualification=TestQualified\tpublication_vl=none\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(tag19_identity.artifact_sha256)

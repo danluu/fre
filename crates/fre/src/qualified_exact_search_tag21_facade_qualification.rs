@@ -1,15 +1,168 @@
-use std::{env, hint::black_box, time::Instant};
+use std::{env, fs, hint::black_box, time::Instant};
 
 use fre_kernel_ir::Span as NativeSpan;
 
 use super::*;
 
-// V4 measures the register-return ABI2 facade boundary. Existing V2
-// reporting-path and V3 value-only ABI1 rows remain historical evidence and
-// must never be relabeled.
+// Tag21 V4 and tag19 V5 measure the register-return ABI2 facade boundary.
+// Existing tag21 V2/V3 and every legacy tag19 result-slot row remain
+// historical evidence and must never be relabeled.
 const SCHEMA: &str = "fre-jit-tag21-facade-performance-v4";
+const TAG19_SCHEMA: &str = "fre-jit-tag19-facade-performance-v5";
 const CSV_HEADER: &str = "schema,revision,pid,repetition,literal_class,literal_hex,size,scenario,order,engine,stage,iterations,total_ns,ns_per_iter,checksum,semantic_value,haystack_bytes,route,backend,qualification_state,artifact_sha256,declared_min_window_bytes,declared_min_calls,measured_calls";
+const TAG19_CSV_HEADER: &str = "schema,revision,pid,repetition,literal_class,literal_hex,size,scenario,order,engine,stage,iterations,total_ns,ns_per_iter,checksum,semantic_value,haystack_bytes,route,backend,qualification_state,artifact_sha256,declared_min_window_bytes,declared_min_calls,measured_calls,tree,run_id,instance_id,instance_type,resource_coordinator_sha256,resource_cutover_sha256,profile,affinity_cpu";
 const BUILD_ITERATIONS: usize = 8;
+const TAG19_PROFILE: &str = "linux-aarch64-arm-41-d84-vl16-release-v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QualificationSubject {
+    Tag19,
+    Tag21,
+}
+
+impl QualificationSubject {
+    const fn schema(self) -> &'static str {
+        match self {
+            Self::Tag19 => TAG19_SCHEMA,
+            Self::Tag21 => SCHEMA,
+        }
+    }
+
+    const fn row_prefix(self) -> &'static str {
+        match self {
+            Self::Tag19 => "FRE_JIT_TAG19_FACADE_ROW",
+            Self::Tag21 => "FRE_JIT_TAG21_FACADE_ROW",
+        }
+    }
+
+    const fn csv_header(self) -> &'static str {
+        match self {
+            Self::Tag19 => TAG19_CSV_HEADER,
+            Self::Tag21 => CSV_HEADER,
+        }
+    }
+
+    const fn backend_policy(self) -> QualifiedExactSearchBackendPolicy {
+        match self {
+            Self::Tag19 => QualifiedExactSearchBackendPolicy::Sve16V6,
+            Self::Tag21 => QualifiedExactSearchBackendPolicy::Sve2Fixed16V2,
+        }
+    }
+
+    const fn backend_version(self) -> BackendVersion {
+        match self {
+            Self::Tag19 => BackendVersion::SEARCH_SVE16_V6,
+            Self::Tag21 => BackendVersion::SEARCH_SVE2_FIXED16_V2,
+        }
+    }
+
+    const fn target_feature_bits(self) -> u64 {
+        match self {
+            Self::Tag19 => 3,
+            Self::Tag21 => 7,
+        }
+    }
+
+    const fn backend_label(self) -> &'static str {
+        match self {
+            Self::Tag19 => "aarch64-search-v19",
+            Self::Tag21 => "aarch64-search-v21",
+        }
+    }
+
+    const fn qualification(self) -> QualifiedExactSearchQualification {
+        match self {
+            Self::Tag19 => QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION,
+            Self::Tag21 => QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
+        }
+    }
+
+    fn expected_qualification(self) -> &'static str {
+        match self {
+            Self::Tag19 => option_env!("FRE_JIT_TAG19_FACADE_EXPECTED_QUALIFICATION")
+                .expect("tag19 facade binary must bind its expected qualification"),
+            Self::Tag21 => option_env!("FRE_JIT_TAG21_FACADE_EXPECTED_QUALIFICATION")
+                .expect("tag21 facade binary must bind its expected qualification"),
+        }
+    }
+
+    fn revision(self) -> &'static str {
+        match self {
+            Self::Tag19 => option_env!("FRE_JIT_TAG19_FACADE_SUBJECT_REVISION")
+                .expect("tag19 facade qualification binary must bind its source revision"),
+            Self::Tag21 => option_env!("FRE_JIT_TAG21_FACADE_SUBJECT_REVISION")
+                .expect("tag21 facade qualification binary must bind its source revision"),
+        }
+    }
+
+    fn tag19_provenance_suffix(self, affinity_cpu: u32) -> String {
+        assert_eq!(self, Self::Tag19);
+        let tree = required_hex(
+            option_env!("FRE_JIT_TAG19_FACADE_SUBJECT_TREE"),
+            40,
+            "tag19 facade source tree",
+        );
+        let resource = required_hex(
+            option_env!("FRE_JIT_TAG19_FACADE_RESOURCE_COORDINATOR_SHA256"),
+            64,
+            "tag19 facade resource coordinator",
+        );
+        let cutover = required_hex(
+            option_env!("FRE_JIT_TAG19_FACADE_RESOURCE_CUTOVER_SHA256"),
+            64,
+            "tag19 facade resource cutover",
+        );
+        let profile = option_env!("FRE_JIT_TAG19_FACADE_PROFILE")
+            .expect("tag19 facade profile must be source-bound");
+        assert_eq!(profile, TAG19_PROFILE);
+        let run_id = runtime_token("FRE_JIT_TAG19_FACADE_RUN_ID");
+        let instance_id = runtime_token("FRE_JIT_TAG19_FACADE_INSTANCE_ID");
+        let instance_type = runtime_token("FRE_JIT_TAG19_FACADE_INSTANCE_TYPE");
+        format!(
+            ",{tree},{run_id},{instance_id},{instance_type},{resource},{cutover},{profile},{affinity_cpu}"
+        )
+    }
+}
+
+fn required_hex(value: Option<&'static str>, digits: usize, label: &str) -> &'static str {
+    let value = value.unwrap_or_else(|| panic!("{label} must be source-bound"));
+    assert!(
+        value.len() == digits
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            && value.bytes().any(|byte| byte != b'0'),
+        "{label} must be one nonzero lowercase hexadecimal identity"
+    );
+    value
+}
+
+fn runtime_token(name: &str) -> String {
+    let value = env::var(name).unwrap_or_else(|_| panic!("{name}"));
+    assert!(
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:@+-".contains(&byte)),
+        "{name} must be one bounded safe token"
+    );
+    value
+}
+
+fn sole_thread_affinity_cpu() -> u32 {
+    let affinity = fs::read_to_string("/proc/thread-self/status")
+        .expect("read Linux timing-thread status")
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .map(str::trim)
+        .expect("Cpus_allowed_list");
+    assert!(
+        !affinity.contains(',') && !affinity.contains('-'),
+        "tag19 facade process must be pinned to one CPU"
+    );
+    affinity.parse().expect("numeric sole affinity CPU")
+}
 
 const UNIQUE_LITERAL: [u8; 16] = *b"0123456789abcdef";
 const REPEATED_LITERAL: [u8; 16] = *b"aaaaaaaaaaaaaaaa";
@@ -189,15 +342,13 @@ fn build_portable(case: LiteralCase) -> PortableRegex {
     builder(case).build().expect("portable facade build")
 }
 
-fn subject_qualification() -> QualifiedExactSearchQualification {
-    let qualification = QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION;
+fn subject_qualification(subject: QualificationSubject) -> QualifiedExactSearchQualification {
+    let qualification = subject.qualification();
     let actual = qualification_label(qualification);
-    let Some(expected) = option_env!("FRE_JIT_TAG21_FACADE_EXPECTED_QUALIFICATION") else {
-        panic!("tag21 facade binary must bind its expected qualification");
-    };
+    let expected = subject.expected_qualification();
     assert_eq!(
         actual, expected,
-        "compiled tag21 qualification differs from build authority"
+        "compiled facade qualification differs from build authority"
     );
     qualification
 }
@@ -209,38 +360,36 @@ fn qualification_label(qualification: QualifiedExactSearchQualification) -> Stri
             assert_eq!(
                 qualification.authorized_bundle_sha256(),
                 Some(bundle_sha256),
-                "qualified tag21 bundle must be authorized"
+                "qualified facade bundle must be authorized"
             );
             format!("qualified:{}", hex(&bundle_sha256))
         }
     }
 }
 
-fn build_facade(case: LiteralCase, size: Size) -> QualifiedExactSearchFacade {
-    let qualification = subject_qualification();
+fn build_facade(
+    subject: QualificationSubject,
+    case: LiteralCase,
+    size: Size,
+) -> QualifiedExactSearchFacade {
+    let qualification = subject_qualification(subject);
     if qualification.is_authorized() {
         builder(case)
             .build_qualified_exact_search(size.workload())
-            .expect("production-qualified automatic tag21 facade build")
+            .expect("production-qualified automatic facade build")
     } else {
         builder(case)
-            .build_qualified_exact_search_with_backend(
-                size.workload(),
-                QualifiedExactSearchBackendPolicy::Sve2Fixed16V2,
-            )
-            .expect("Candidate tag21 facade build")
+            .build_qualified_exact_search_with_backend(size.workload(), subject.backend_policy())
+            .expect("Candidate facade build")
     }
 }
 
-fn facade_artifact(facade: &QualifiedExactSearchFacade) -> [u8; 32] {
+fn facade_artifact(subject: QualificationSubject, facade: &QualifiedExactSearchFacade) -> [u8; 32] {
     let report = facade
         .qualified_build_report()
-        .expect("exact tag21 facade report");
-    assert_eq!(
-        report.backend_policy,
-        QualifiedExactSearchBackendPolicy::Sve2Fixed16V2
-    );
-    let expected_qualification = subject_qualification();
+        .expect("exact facade report");
+    assert_eq!(report.backend_policy, subject.backend_policy());
+    let expected_qualification = subject_qualification(subject);
     assert_eq!(report.qualification, expected_qualification);
     let QualifiedExactSearchNativeStatus::Published {
         identity,
@@ -250,18 +399,18 @@ fn facade_artifact(facade: &QualifiedExactSearchFacade) -> [u8; 32] {
         ..
     } = &report.native
     else {
-        panic!(
-            "Candidate tag21 facade did not publish: {:?}",
-            report.native
-        );
+        panic!("Candidate facade did not publish: {:?}", report.native);
     };
-    assert_eq!(identity.backend, BackendVersion::SEARCH_SVE2_FIXED16_V2);
+    assert_eq!(identity.backend, subject.backend_version());
     assert_eq!(
         identity.abi,
         QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
     );
     assert_eq!(*abi, QualifiedExactSearchNativeAbi::SelectedEndRegisterV2);
-    assert_eq!(identity.target.features.bits(), 7);
+    assert_eq!(
+        identity.target.features.bits(),
+        subject.target_feature_bits()
+    );
     assert_eq!(identity.qualification, expected_qualification);
     assert_eq!(identity.sve_vector_bytes_at_publication, None);
     assert_eq!(identity.required_thread_sve_vector_bytes, Some(16));
@@ -346,7 +495,7 @@ fn facade_value_only(
 ) -> u64 {
     let matched = session
         .find_value(black_box(haystack), SearchLimits::unlimited())
-        .expect("tag21 value-only facade search");
+        .expect("ABI2 value-only facade search");
     encode_span(matched)
 }
 
@@ -357,7 +506,7 @@ fn assert_facade_reporting_contract(
 ) {
     let (matched, execution) = session
         .find(haystack, SearchLimits::unlimited())
-        .expect("untimed tag21 reporting facade search");
+        .expect("untimed ABI2 reporting facade search");
     assert_eq!(
         execution.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
@@ -370,7 +519,7 @@ fn assert_facade_reporting_contract(
             linear_terms: haystack
                 .len()
                 .checked_add(QUALIFIED_EXACT_SEARCH_LITERAL_BYTES)
-                .expect("bounded tag21 reporting accounting"),
+                .expect("bounded ABI2 reporting accounting"),
             scratch_bytes: 0,
         })
     );
@@ -422,14 +571,20 @@ fn measure_portable_full(case: LiteralCase, haystack: &[u8], calls: usize) -> Ti
     }
 }
 
-fn measure_facade_full(case: LiteralCase, size: Size, haystack: &[u8], calls: usize) -> Timed {
+fn measure_facade_full(
+    subject: QualificationSubject,
+    case: LiteralCase,
+    size: Size,
+    haystack: &[u8],
+    calls: usize,
+) -> Timed {
     let mut checksum = 0x6a09_e667_f3bc_c909_u64;
     let started = Instant::now();
-    let facade = build_facade(case, size);
-    let _ = black_box(facade_artifact(&facade));
+    let facade = build_facade(subject, case, size);
+    let _ = black_box(facade_artifact(subject, &facade));
     let session = facade
         .begin_current_thread_session()
-        .expect("tag21 facade current-thread session");
+        .expect("ABI2 facade current-thread session");
     for iteration in 0..calls {
         let value = black_box(facade_value_only(&session, haystack));
         checksum = checksum.rotate_left(9)
@@ -452,20 +607,32 @@ fn measure_facade_full(case: LiteralCase, size: Size, haystack: &[u8], calls: us
     clippy::too_many_lines,
     reason = "one closed facade cell keeps construction, route checks, cold cost, and declared-workload timing together"
 )]
-fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) {
-    let qualification = subject_qualification();
+fn run_cell(
+    subject: QualificationSubject,
+    case: LiteralCase,
+    size: Size,
+    scenario: Scenario,
+    repetition: u32,
+) {
+    let affinity_cpu = match subject {
+        QualificationSubject::Tag19 => Some(sole_thread_affinity_cpu()),
+        QualificationSubject::Tag21 => None,
+    };
+    let provenance_suffix =
+        affinity_cpu.map_or_else(String::new, |cpu| subject.tag19_provenance_suffix(cpu));
+    let qualification = subject_qualification(subject);
     let _guard = CandidateExecutionGuard::acquire_for(qualification);
     let qualification_state = qualification_label(qualification);
     let haystack = make_haystack(case, size, scenario);
     let portable = build_portable(case);
-    let facade = build_facade(case, size);
-    let artifact_sha256 = facade_artifact(&facade);
+    let facade = build_facade(subject, case, size);
+    let artifact_sha256 = facade_artifact(subject, &facade);
     // Session creation is deliberately outside the hot-search timer. The
     // cold/full helpers create it after their timers start so lifecycle cost
     // remains represented in those stages.
     let facade_session = facade
         .begin_current_thread_session()
-        .expect("tag21 facade current-thread session");
+        .expect("ABI2 facade current-thread session");
     let expected = portable_value(&portable, &haystack);
     let kir = build_exact_literal::<NativeSpan>(
         case.literal,
@@ -498,9 +665,9 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
     };
     let facade_build = || {
         measure(BUILD_ITERATIONS, || {
-            let cold = build_facade(case, size);
+            let cold = build_facade(subject, case, size);
             u64::from_le_bytes(
-                facade_artifact(&cold)[..8]
+                facade_artifact(subject, &cold)[..8]
                     .try_into()
                     .expect("artifact prefix"),
             )
@@ -517,9 +684,9 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
         })
     };
     let portable_cold = || measure_portable_full(case, &haystack, 1);
-    let facade_cold = || measure_facade_full(case, size, &haystack, 1);
+    let facade_cold = || measure_facade_full(subject, case, size, &haystack, 1);
     let portable_full = || measure_portable_full(case, &haystack, size.calls());
-    let facade_full = || measure_facade_full(case, size, &haystack, size.calls());
+    let facade_full = || measure_facade_full(subject, case, size, &haystack, size.calls());
 
     let (pb, jb, ps, js, pc, jc, pf, jf, order) = if repetition.is_multiple_of(2) {
         (
@@ -548,6 +715,13 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
     assert_eq!(ps.checksum, js.checksum, "search checksums differ");
     assert_eq!(pc.checksum, jc.checksum, "cold checksums differ");
     assert_eq!(pf.checksum, jf.checksum, "full-workload checksums differ");
+    if let Some(cpu) = affinity_cpu {
+        assert_eq!(
+            sole_thread_affinity_cpu(),
+            cpu,
+            "tag19 facade timing-thread affinity changed during measurement"
+        );
+    }
 
     for (engine, stage, timed, route, backend, artifact, measured_calls) in [
         (
@@ -564,7 +738,7 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
             "build",
             jb,
             "native-jit",
-            "aarch64-search-v21",
+            subject.backend_label(),
             Some(artifact_sha256),
             0,
         ),
@@ -582,7 +756,7 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
             "search",
             js,
             "native-jit",
-            "aarch64-search-v21",
+            subject.backend_label(),
             Some(artifact_sha256),
             size.calls(),
         ),
@@ -600,7 +774,7 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
             "cold",
             jc,
             "native-jit",
-            "aarch64-search-v21",
+            subject.backend_label(),
             Some(artifact_sha256),
             1,
         ),
@@ -618,12 +792,13 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
             "full",
             jf,
             "native-jit",
-            "aarch64-search-v21",
+            subject.backend_label(),
             Some(artifact_sha256),
             size.calls(),
         ),
     ] {
         emit(
+            subject,
             case,
             size,
             scenario,
@@ -639,12 +814,14 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
             artifact,
             measured_calls,
             &qualification_state,
+            &provenance_suffix,
         );
     }
 }
 
 #[allow(clippy::too_many_arguments, reason = "closed qualification row schema")]
 fn emit(
+    subject: QualificationSubject,
     case: LiteralCase,
     size: Size,
     scenario: Scenario,
@@ -660,10 +837,9 @@ fn emit(
     artifact_sha256: Option<[u8; 32]>,
     measured_calls: usize,
     qualification_state: &str,
+    provenance_suffix: &str,
 ) {
-    let Some(revision) = option_env!("FRE_JIT_TAG21_FACADE_SUBJECT_REVISION") else {
-        panic!("tag21 facade qualification binary must bind its source revision");
-    };
+    let revision = subject.revision();
     assert!(
         revision.len() == 40
             && revision
@@ -672,8 +848,10 @@ fn emit(
         "qualification revision must be 40 lowercase hexadecimal digits"
     );
     println!(
-        "FRE_JIT_TAG21_FACADE_ROW\t{}",
+        "{}\t{}",
+        subject.row_prefix(),
         row_with_revision(
+            subject,
             revision,
             case,
             size,
@@ -690,12 +868,14 @@ fn emit(
             artifact_sha256,
             measured_calls,
             qualification_state,
+            provenance_suffix,
         )
     );
 }
 
 #[allow(clippy::too_many_arguments, reason = "closed qualification row schema")]
 fn row_with_revision(
+    subject: QualificationSubject,
     revision: &str,
     case: LiteralCase,
     size: Size,
@@ -712,14 +892,16 @@ fn row_with_revision(
     artifact_sha256: Option<[u8; 32]>,
     measured_calls: usize,
     qualification_state: &str,
+    provenance_suffix: &str,
 ) -> String {
     let artifact = artifact_sha256.map_or_else(|| "none".to_owned(), |bytes| hex(&bytes));
     let ns_per_iter = timed
         .total_ns
         .checked_div(u128::try_from(timed.iterations).expect("iterations fit u128"))
         .expect("timed iteration count is nonzero");
-    format!(
-        "{SCHEMA},{revision},{},{repetition},{},{},{},{},{order},{engine},{stage},{},{},{ns_per_iter},0x{:016x},0x{semantic_value:016x},{},{route},{backend},{qualification_state},{artifact},{},{},{}",
+    let row = format!(
+        "{},{revision},{},{repetition},{},{},{},{},{order},{engine},{stage},{},{},{ns_per_iter},0x{:016x},0x{semantic_value:016x},{},{route},{backend},{qualification_state},{artifact},{},{},{}",
+        subject.schema(),
         std::process::id(),
         case.name,
         hex(case.literal),
@@ -732,7 +914,8 @@ fn row_with_revision(
         size.bytes(),
         size.calls(),
         measured_calls,
-    )
+    );
+    format!("{row}{provenance_suffix}")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -744,30 +927,63 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
-#[test]
-#[ignore = "external source-bound tag21 facade qualification driver"]
-fn driver() {
-    match env::var("FRE_JIT_TAG21_FACADE_DRIVER")
-        .expect("FRE_JIT_TAG21_FACADE_DRIVER")
+fn drive(
+    subject: QualificationSubject,
+    driver: &str,
+    literal: &str,
+    size: &str,
+    scenario: &str,
+    repetition: &str,
+) {
+    match env::var(driver)
+        .unwrap_or_else(|_| panic!("{driver}"))
         .as_str()
     {
-        "header" => println!("FRE_JIT_TAG21_FACADE_ROW\t{CSV_HEADER}"),
+        "header" => println!("{}\t{}", subject.row_prefix(), subject.csv_header()),
         "run" => run_cell(
-            LiteralCase::parse(&env::var("FRE_JIT_TAG21_FACADE_LITERAL").expect("literal class")),
-            Size::parse(&env::var("FRE_JIT_TAG21_FACADE_SIZE").expect("size")),
-            Scenario::parse(&env::var("FRE_JIT_TAG21_FACADE_SCENARIO").expect("scenario")),
-            env::var("FRE_JIT_TAG21_FACADE_REPETITION")
-                .expect("repetition")
+            subject,
+            LiteralCase::parse(&env::var(literal).expect("literal class")),
+            Size::parse(&env::var(size).expect("size")),
+            Scenario::parse(&env::var(scenario).expect("scenario")),
+            env::var(repetition)
+                .unwrap_or_else(|_| panic!("{repetition}"))
                 .parse()
                 .expect("numeric repetition"),
         ),
-        command => panic!("invalid tag21 facade qualification command: {command}"),
+        command => panic!("invalid facade qualification command: {command}"),
     }
+}
+
+#[test]
+#[ignore = "external source-bound tag21 facade qualification driver"]
+fn driver() {
+    drive(
+        QualificationSubject::Tag21,
+        "FRE_JIT_TAG21_FACADE_DRIVER",
+        "FRE_JIT_TAG21_FACADE_LITERAL",
+        "FRE_JIT_TAG21_FACADE_SIZE",
+        "FRE_JIT_TAG21_FACADE_SCENARIO",
+        "FRE_JIT_TAG21_FACADE_REPETITION",
+    );
+}
+
+#[test]
+#[ignore = "external source-bound tag19 ABI2 facade qualification driver"]
+fn tag19_driver() {
+    drive(
+        QualificationSubject::Tag19,
+        "FRE_JIT_TAG19_FACADE_DRIVER",
+        "FRE_JIT_TAG19_FACADE_LITERAL",
+        "FRE_JIT_TAG19_FACADE_SIZE",
+        "FRE_JIT_TAG19_FACADE_SCENARIO",
+        "FRE_JIT_TAG19_FACADE_REPETITION",
+    );
 }
 
 #[test]
 fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
     assert_eq!(SCHEMA, "fre-jit-tag21-facade-performance-v4");
+    assert_eq!(TAG19_SCHEMA, "fre-jit-tag19-facade-performance-v5");
     let columns: Vec<_> = CSV_HEADER.split(',').collect();
     assert_eq!(columns.len(), 24);
     let mut deduplicated = columns.clone();
@@ -778,6 +994,7 @@ fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
         assert_eq!(case.literal.len(), QUALIFIED_EXACT_SEARCH_LITERAL_BYTES);
     }
     let row = row_with_revision(
+        QualificationSubject::Tag21,
         "0000000000000000000000000000000000000001",
         LiteralCase::ALL[0],
         Size::K64,
@@ -798,8 +1015,38 @@ fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
         Some([1; 32]),
         1,
         "candidate",
+        "",
     );
     assert_eq!(row.split(',').count(), columns.len());
+    let tag19_row = row_with_revision(
+        QualificationSubject::Tag19,
+        "0000000000000000000000000000000000000001",
+        LiteralCase::ALL[0],
+        Size::K64,
+        Scenario::Absent,
+        0,
+        "portable-first",
+        "facade",
+        "full",
+        Timed {
+            iterations: 1,
+            total_ns: 1,
+            checksum: 1,
+        },
+        0,
+        &[0],
+        "native-jit",
+        "aarch64-search-v19",
+        Some([1; 32]),
+        1,
+        "candidate",
+        ",0000000000000000000000000000000000000002,run,instance,type,0000000000000000000000000000000000000000000000000000000000000003,0000000000000000000000000000000000000000000000000000000000000004,linux-aarch64-arm-41-d84-vl16-release-v1,0",
+    );
+    assert_eq!(
+        tag19_row.split(',').count(),
+        TAG19_CSV_HEADER.split(',').count()
+    );
+    assert!(tag19_row.starts_with("fre-jit-tag19-facade-performance-v5,"));
 }
 
 #[test]
@@ -859,7 +1106,7 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
         );
     let full = &source[full_start..full_end];
     let full_timer = position(full, "let started = Instant::now();");
-    let full_build = position(full, "let facade = build_facade(case, size);");
+    let full_build = position(full, "let facade = build_facade(subject, case, size);");
     let full_session = position(full, ".begin_current_thread_session()");
     let full_loop = position(full, "for iteration in 0..calls");
     assert!(full_timer < full_build);

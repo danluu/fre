@@ -57,10 +57,11 @@ use crate::{limits::PublicationPlan, platform::ExecutableMapping};
 ///
 /// `sve_vector_bytes` is an observation of the calling Linux thread. It is
 /// `None` when SVE is absent or the query is unavailable. Most fixed-lane
-/// images use predication and do not bind to this value. Search-v1 tags 10 and
-/// 21 deliberately require and record exactly 16 bytes at construction and
-/// publication. Register-return ABI2 tags 19 and 21 instead defer their one
-/// VL16 observation to current-thread session construction.
+/// images use predication and do not bind to this value. Legacy Search-v1
+/// fixed16 tags 10, 19, and 21 require and record exactly 16 bytes at
+/// construction and publication. The qualified register-return ABI2
+/// tag-19/tag-21 routes instead use feature-only publication admission and
+/// defer their one VL16 observation to current-thread session construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeHostCapabilities {
     asimd: bool,
@@ -256,10 +257,12 @@ fn search_host_admission(backend: BackendVersion) -> Result<SearchHostAdmission,
 /// Legacy search tag 9 requires OS-usable SVE before emission. Search tag 10
 /// requires ASIMD, SVE, SVE2, calling-thread vector length 16, and the
 /// homogeneous Arm `0x41/0xd84` host class named by its independent
-/// performance-qualification scope. Legacy Search-v1 tag 19 retains no
-/// production route: the typed register-return ABI2 boundary owns tag 19's
-/// ASIMD, SVE, vector-length 16, and same-host-class contract without
-/// requiring SVE2.
+/// performance-qualification scope. The qualified public facade has no legacy
+/// Search-v1 tag-19 route: its typed register-return ABI2 boundary owns tag
+/// 19's ASIMD, SVE, vector-length 16, and same-host-class contract without
+/// requiring SVE2. Versioned low-level legacy emitter and publisher APIs
+/// remain available for research and compatibility, outside facade
+/// qualification and promotion.
 /// Candidate Search-v1 tag 21 restores the tag-10 SVE2 requirements for its
 /// paired-ASIMD and predicate-recovery graph. These construction-time checks
 /// are repeated independently at publication; generated-code calls do not
@@ -307,6 +310,27 @@ pub fn qualification_preserves_vector_callee_saved_lanes<O: RuntimeOperation>(
     );
     operation::decode::<O>(raw, window)?;
     Ok(observed == canaries)
+}
+
+/// Place one qualification haystack directly against an inaccessible guard
+/// page for a single higher-ranked callback.
+///
+/// This helper is feature-gated and doc-hidden because it is evidence
+/// infrastructure, not a production search API.
+#[cfg(all(
+    feature = "sve-hardware-qualification",
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[doc(hidden)]
+pub fn qualification_with_guarded_haystack<T>(
+    bytes: &[u8],
+    at_right_boundary: bool,
+    callback: impl for<'haystack> FnOnce(&'haystack [u8]) -> T,
+) -> Result<T, PublishError> {
+    platform::with_guarded_haystack(bytes, at_right_boundary, callback)
 }
 
 /// An immutable, reference-counted native kernel with a typed output contract.

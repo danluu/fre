@@ -242,9 +242,65 @@ impl PublishedSelectedEndRegisterV2 {
     pub const fn literal_bytes(&self) -> u32 {
         self.literal_bytes.get()
     }
+
+    /// Qualification observation of the SVE vector length recorded by
+    /// publication.
+    ///
+    /// Register-return ABI2 publication is feature-only, so this remains
+    /// `None`; fixed-VL tag19/tag21 observe the calling thread only when a
+    /// callable session opens.
+    #[cfg(all(
+        feature = "sve-hardware-qualification",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn qualification_sve_vector_bytes_at_publication(&self) -> Option<u16> {
+        self.mapping.sve_vector_bytes_at_publication()
+    }
+
+    /// Qualification observation of the fixed SVE bytes required when this
+    /// publication opens a callable current-thread session, or `None` for the
+    /// ASIMD-only V8 backend.
+    #[cfg(all(
+        feature = "sve-hardware-qualification",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn qualification_required_thread_sve_vector_bytes(&self) -> Option<u16> {
+        match self.backend.fixed_active_vector_bytes() {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
 }
 
 impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
+    /// SVE vector length validated while this qualification session opened,
+    /// or `None` for an ASIMD-only session.
+    #[cfg(all(
+        feature = "sve-hardware-qualification",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn qualification_validated_thread_sve_vector_bytes(&self) -> Option<u16> {
+        match self.kernel.backend.fixed_active_vector_bytes() {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
+
     /// Search one half-open byte window after shared scalar preflight.
     ///
     /// Window validation and the literal linear-work limit complete before a
@@ -259,6 +315,45 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
         checked_selected_end_register_call_v2(self.literal_bytes, haystack, window, limits, || {
             self.entry.invoke(haystack, window)
         })
+    }
+
+    /// Exercise this session's exact four-argument ABI2 entry through the
+    /// qualification-only AAPCS64 vector callee-saved-lane canary.
+    ///
+    /// The wrapper forwards only x0 through x3, clears x4 instead of passing a
+    /// result slot, returns the generated entry's x0, and verifies that the
+    /// native result still decodes inside the scalar-preflighted window.
+    #[cfg(all(
+        any(test, feature = "sve-hardware-qualification"),
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    pub fn qualification_preserves_abi2_vector_callee_saved_lanes(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: LiteralSearchLimits,
+        canaries: [u64; 8],
+    ) -> Result<bool, SelectedEndRegisterCallErrorV2> {
+        let mut preserved = false;
+        checked_selected_end_register_call_v2(
+            self.literal_bytes,
+            haystack,
+            window,
+            limits,
+            || {
+                let (end_or_zero, observed) =
+                    platform::invoke_selected_end_register_v2_with_vector_callee_saved_canary(
+                        self.entry, haystack, window, canaries,
+                    );
+                preserved = observed == canaries;
+                end_or_zero
+            },
+        )?;
+        Ok(preserved)
     }
 
     /// Search the complete haystack after shared scalar preflight.

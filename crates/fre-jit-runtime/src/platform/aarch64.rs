@@ -84,11 +84,70 @@ macro_rules! define_vector_callee_saved_canary {
     };
 }
 
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
+macro_rules! define_selected_end_register_v2_vector_callee_saved_canary {
+    ($symbol:literal) => {
+        core::arch::global_asm!(concat!(
+            r#"
+    .text
+    .p2align 2
+    .globl "#,
+            $symbol,
+            "\n",
+            $symbol,
+            r#":
+    sub sp, sp, #80
+    stp x19, x30, [sp, #0]
+    stp d8, d9, [sp, #16]
+    stp d10, d11, [sp, #32]
+    stp d12, d13, [sp, #48]
+    stp d14, d15, [sp, #64]
+    mov x16, x0
+    mov x19, x5
+    mov x5, xzr
+    mov x6, xzr
+    mov x7, xzr
+    ldp d8, d9, [x19, #0]
+    ldp d10, d11, [x19, #16]
+    ldp d12, d13, [x19, #32]
+    ldp d14, d15, [x19, #48]
+    mov x0, x1
+    mov x1, x2
+    mov x2, x3
+    mov x3, x4
+    mov x4, xzr
+    blr x16
+    stp d8, d9, [x19, #64]
+    stp d10, d11, [x19, #80]
+    stp d12, d13, [x19, #96]
+    stp d14, d15, [x19, #112]
+    ldp d8, d9, [sp, #16]
+    ldp d10, d11, [sp, #32]
+    ldp d12, d13, [sp, #48]
+    ldp d14, d15, [sp, #64]
+    ldp x19, x30, [sp, #0]
+    add sp, sp, #80
+    ret
+"#
+        ));
+    };
+}
+
 #[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "macos"))]
 define_vector_callee_saved_canary!("_fre_jit_test_vector_callee_saved_canary");
 
 #[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "linux"))]
 define_vector_callee_saved_canary!("fre_jit_test_vector_callee_saved_canary");
+
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "macos"))]
+define_selected_end_register_v2_vector_callee_saved_canary!(
+    "_fre_jit_test_selected_end_register_v2_vector_callee_saved_canary"
+);
+
+#[cfg(all(any(test, feature = "sve-hardware-qualification"), target_os = "linux"))]
+define_selected_end_register_v2_vector_callee_saved_canary!(
+    "fre_jit_test_selected_end_register_v2_vector_callee_saved_canary"
+);
 
 #[cfg(any(test, feature = "sve-hardware-qualification"))]
 unsafe extern "C" {
@@ -101,6 +160,15 @@ unsafe extern "C" {
         result: *mut NativeResult,
         canaries: *mut u64,
     ) -> u64;
+
+    fn fre_jit_test_selected_end_register_v2_vector_callee_saved_canary(
+        entry: *const c_void,
+        haystack: *const u8,
+        haystack_len: usize,
+        window_start: usize,
+        window_end: usize,
+        canaries: *mut u64,
+    ) -> usize;
 }
 
 #[cfg(test)]
@@ -141,6 +209,34 @@ pub(crate) fn invoke_with_vector_callee_saved_canary(
         },
         observed,
     )
+}
+
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
+pub(crate) fn invoke_selected_end_register_v2_with_vector_callee_saved_canary(
+    entry: SelectedEndRegisterEntryV2,
+    haystack: &[u8],
+    window: SearchWindow,
+    canaries: [u64; 8],
+) -> (usize, [u64; 8]) {
+    let mut slots = [0_u64; 16];
+    slots[..8].copy_from_slice(&canaries);
+    // SAFETY: the session-bound typed entry was decoded only from a P1-audited
+    // immutable ABI2 mapping. The wrapper forwards exactly haystack, length,
+    // start, and end in x0..x3, clears x4 instead of passing a result slot,
+    // returns the generated entry's x0 unchanged, and stores only into the
+    // live canary buffer.
+    let end_or_zero = unsafe {
+        fre_jit_test_selected_end_register_v2_vector_callee_saved_canary(
+            entry.0 as *const () as *const c_void,
+            haystack.as_ptr(),
+            haystack.len(),
+            window.start(),
+            window.end(),
+            slots.as_mut_ptr(),
+        )
+    };
+    let observed = slots[8..].try_into().expect("eight vector canary slots");
+    (end_or_zero, observed)
 }
 
 #[derive(Debug)]
@@ -429,10 +525,10 @@ impl Drop for Reservation {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 struct GuardedTestMapping(NonNull<c_void>, usize);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 impl Drop for GuardedTestMapping {
     fn drop(&mut self) {
         // SAFETY: this helper solely owns the exact test reservation.
@@ -916,7 +1012,7 @@ fn query_protection(pointer: usize) -> Result<i32, PublishError> {
     host::query_protection(pointer)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "sve-hardware-qualification"))]
 pub(crate) fn with_guarded_haystack<T>(
     bytes: &[u8],
     at_right_boundary: bool,

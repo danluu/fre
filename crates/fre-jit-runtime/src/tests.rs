@@ -404,6 +404,60 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE2"));
+    let canary_start = position(
+        platform,
+        "macro_rules! define_selected_end_register_v2_vector_callee_saved_canary",
+    );
+    let canary_end = canary_start
+        + position(
+            &platform[canary_start..],
+            "\n#[cfg(all(any(test, feature = \"sve-hardware-qualification\"), target_os = \"macos\"))]",
+        );
+    let canary = &platform[canary_start..canary_end];
+    for marker in [
+        "mov x16, x0",
+        "mov x19, x5",
+        "mov x0, x1",
+        "mov x1, x2",
+        "mov x2, x3",
+        "mov x3, x4",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "blr x16",
+    ] {
+        assert!(
+            canary.contains(marker),
+            "missing ABI2 canary marker {marker}"
+        );
+    }
+    assert!(!canary.contains("NativeResult"));
+    assert!(platform.contains("fre_jit_test_selected_end_register_v2_vector_callee_saved_canary("));
+    assert!(runtime.contains("pub fn qualification_preserves_abi2_vector_callee_saved_lanes("));
+    assert!(
+        runtime
+            .contains("platform::invoke_selected_end_register_v2_with_vector_callee_saved_canary(")
+    );
+
+    let producer = include_str!("../examples/tag19_selected_end_register_v2_qualification.rs");
+    for marker in [
+        "SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16",
+        "audit_selected_end_register_v2(&image)",
+        "kernel.begin_current_thread_session_for_literal_plan(&portable)",
+        "qualification_with_guarded_haystack(",
+        "qualification_preserves_abi2_vector_callee_saved_lanes(",
+        "portable_oracle=PASS",
+        "kernel_ir_oracle=PASS",
+        "abi2_vector_callee_saved_canary=PASS",
+    ] {
+        assert!(
+            producer.contains(marker),
+            "tag19 ABI2 producer is missing {marker}"
+        );
+    }
+    assert!(!producer.contains("emit_sve16_v6"));
+    assert!(!producer.contains("PublishedKernel<"));
 }
 
 #[test]
