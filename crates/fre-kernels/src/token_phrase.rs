@@ -608,7 +608,20 @@ impl TokenPhrasePlan {
         self.finder.needle()
     }
 
+    #[inline]
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
+        if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+            let upper = self.preflight_short_input(haystack.len(), Operation::Count, limits)?;
+            let actual = self.scan(haystack, Operation::Count, upper)?;
+            return Ok(CountResult {
+                count: actual.count,
+                accounting: ReduceAccounting {
+                    identity: self.count_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
         let upper = self.preflight(haystack.len(), Operation::Count, limits)?;
         let actual = self.scan(haystack, Operation::Count, upper)?;
         Ok(CountResult {
@@ -621,11 +634,24 @@ impl TokenPhrasePlan {
         })
     }
 
+    #[inline]
     pub fn span_sum(
         &self,
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
+        if haystack.len() < CANDIDATE_MIN_INPUT_BYTES {
+            let upper = self.preflight_short_input(haystack.len(), Operation::SpanSum, limits)?;
+            let actual = self.scan(haystack, Operation::SpanSum, upper)?;
+            return Ok(SpanSumResult {
+                span_sum: actual.span_sum,
+                accounting: ReduceAccounting {
+                    identity: self.span_sum_identity(),
+                    upper_bounds: upper,
+                    actual,
+                },
+            });
+        }
         let upper = self.preflight(haystack.len(), Operation::SpanSum, limits)?;
         let actual = self.scan(haystack, Operation::SpanSum, upper)?;
         Ok(SpanSumResult {
@@ -635,6 +661,115 @@ impl TokenPhrasePlan {
                 upper_bounds: upper,
                 actual,
             },
+        })
+    }
+
+    #[inline]
+    fn preflight_short_input(
+        &self,
+        input_bytes: usize,
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        debug_assert!(input_bytes < CANDIDATE_MIN_INPUT_BYTES);
+        let upper = self.derive_short_input_upper_bounds(input_bytes, operation)?;
+        enforce_upper_bounds(upper, limits)?;
+        Ok(upper)
+    }
+
+    fn derive_short_input_upper_bounds(
+        &self,
+        input_bytes: usize,
+        operation: Operation,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let minimum_match_bytes = self
+            .literal()
+            .len()
+            .checked_add(MINIMUM_NON_LITERAL_BYTES)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "minimum token-phrase match width",
+            })?;
+        let route = if input_bytes < minimum_match_bytes {
+            Route::ImpossibleWidth
+        } else {
+            Route::BlockMasks
+        };
+        let match_events = if route == Route::ImpossibleWidth {
+            0
+        } else {
+            input_bytes
+                .checked_div(minimum_match_bytes)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "match-event bound divisor",
+                })?
+        };
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "match-event bound as count",
+        })?;
+        let span_sum = match operation {
+            Operation::Count => 0,
+            Operation::SpanSum if route == Route::ImpossibleWidth => 0,
+            Operation::SpanSum => {
+                u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
+                    computation: "input bytes as span-sum bound",
+                })?
+            }
+        };
+        let (source_reads, work, classifications, literal_comparisons, token_events) =
+            if route == Route::ImpossibleWidth {
+                (0, FIXED_REDUCE_WORK, 0, 0, 0)
+            } else {
+                let classifications = input_bytes;
+                let literal_comparisons = input_bytes;
+                let token_events = input_bytes;
+                let work = classifications
+                    .checked_mul(CLASSIFICATION_WORK)
+                    .and_then(|value| {
+                        literal_comparisons
+                            .checked_mul(LITERAL_COMPARISON_WORK)
+                            .and_then(|comparisons| value.checked_add(comparisons))
+                    })
+                    .and_then(|value| {
+                        token_events
+                            .checked_mul(TOKEN_EVENT_WORK)
+                            .and_then(|tokens| value.checked_add(tokens))
+                    })
+                    .and_then(|value| {
+                        match_events
+                            .checked_mul(MATCH_WORK)
+                            .and_then(|matches| value.checked_add(matches))
+                    })
+                    .and_then(|value| value.checked_add(FIXED_REDUCE_WORK))
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "complete short-input block-mask reduction work bound",
+                    })?;
+                (
+                    input_bytes,
+                    work,
+                    classifications,
+                    literal_comparisons,
+                    token_events,
+                )
+            };
+        let persistent_bytes = self.build.persistent_bytes;
+        Ok(ReduceUpperBounds {
+            route,
+            input_bytes,
+            source_reads,
+            work,
+            classifications,
+            literal_comparisons,
+            token_events,
+            finder_scan_bytes: 0,
+            finder_calls: 0,
+            anchor_candidates: 0,
+            verification_reads: 0,
+            match_events,
+            count,
+            span_sum,
+            scratch_bytes: 0,
+            persistent_bytes,
+            peak_bytes: persistent_bytes,
         })
     }
 
@@ -1889,6 +2024,36 @@ mod tests {
                 assert_eq!(spans.accounting.actual.route, expected_route);
             }
         }
+    }
+
+    #[test]
+    fn short_route_has_no_anchor_admission_dependency() {
+        let plan = plan(b"Holmes", true);
+        let haystack = b"left Holmes right---------------";
+        assert!(haystack.len() < CANDIDATE_MIN_INPUT_BYTES);
+        let limits = ReduceLimits {
+            max_finder_scan_bytes: 0,
+            max_finder_calls: 0,
+            max_anchor_candidates: 0,
+            max_verification_reads: 0,
+            ..ReduceLimits::unlimited()
+        };
+        let count = plan.count(haystack, limits).expect("short count");
+        let span_sum = plan.span_sum(haystack, limits).expect("short span sum");
+        assert_eq!(count.accounting.upper_bounds.route, Route::BlockMasks);
+        assert_eq!(span_sum.accounting.upper_bounds.route, Route::BlockMasks);
+        assert_eq!(count.accounting.actual.route, Route::BlockMasks);
+        assert_eq!(span_sum.accounting.actual.route, Route::BlockMasks);
+        assert_eq!(
+            (
+                count.accounting.upper_bounds.finder_scan_bytes,
+                count.accounting.upper_bounds.finder_calls,
+                count.accounting.upper_bounds.anchor_candidates,
+                count.accounting.upper_bounds.verification_reads,
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!((count.count, span_sum.span_sum), (1, 17));
     }
 
     #[test]
