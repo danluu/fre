@@ -2580,6 +2580,22 @@ fn build_candidate_plan(
     let shared_fixed_work = add(entries.len(), buckets.len(), Resource::CompileWork)?;
     budget.charge(shared_fixed_work)?;
     let shared_fixed = candidate::shared_fixed_anchors(&entries, &buckets)?;
+    let classified_proof = if fixed_continuation_proof.is_none() && shared_fixed.is_none() {
+        let classified_work = add(entries.len(), buckets.len(), Resource::CompileWork)?;
+        budget.charge(classified_work)?;
+        candidate::classified_anchor_proof(&entries, &buckets)?
+    } else {
+        None
+    };
+    let classified = if let Some(proof) = classified_proof {
+        // `AsciiByteSetClassifier` constructs its 16 nibble columns by
+        // examining the complete 128-byte domain exactly once.
+        budget.charge(128)?;
+        let classified = candidate::build_classified_anchors(proof);
+        retain_classified_anchors(&classified, budget)?
+    } else {
+        candidate::inline_no_classified_anchors()?
+    };
     let shape = candidate::packed_shape(max_offset, shared_fixed)?;
     let shape = if let Some(proof) = fixed_continuation_proof {
         let fixed = build_fixed_continuation(hir, proof, shape, budget)?;
@@ -2593,6 +2609,7 @@ fn build_candidate_plan(
         buckets,
         global_buckets,
         shape,
+        classified,
     };
     budget.accounting.candidate_entries = plan.entries.len();
     budget.accounting.candidate_bytes = plan.retained_bytes()?;
@@ -3179,6 +3196,41 @@ fn retain_fixed_continuation(
     }
     budget.record_items::<candidate::FixedContinuation>(1, false)?;
     Ok(fixed)
+}
+
+fn retain_classified_anchors(
+    classified: &candidate::ClassifiedAnchors,
+    budget: &mut CompileBudget,
+) -> Result<fre_exact_alloc::ExactBoxOrUsize<candidate::ClassifiedAnchors>, Error> {
+    let retained_bytes = core::mem::size_of::<candidate::ClassifiedAnchors>();
+    enforce(
+        add(
+            budget.current_construction_bytes,
+            retained_bytes,
+            Resource::ProgramBytes,
+        )?,
+        budget.limits.max_program_bytes,
+        Resource::ProgramBytes,
+    )?;
+    budget.charge(1)?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(retained_bytes)?;
+    } else {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    let classified = compiler_allocation(
+        budget,
+        retained_bytes != 0,
+        Resource::ProgramBytes,
+        1,
+        || candidate::exact_classified_anchors(classified),
+        |_| Ok(retained_bytes),
+    )?;
+    if budget.receipt_scope {
+        budget.acquire_construction_bytes(retained_bytes)?;
+    }
+    budget.record_items::<candidate::ClassifiedAnchors>(1, false)?;
+    Ok(classified)
 }
 
 fn retain_fixed_continuation_tokens(
@@ -7412,7 +7464,9 @@ fn bind_candidate_identity(
     plan: &candidate::Plan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = if plan.fixed_continuation().is_some() {
+    let domain = if plan.classified_anchors().is_some() {
+        b"fre.aggregate.candidate-intervals.v3".as_slice()
+    } else if plan.fixed_continuation().is_some() {
         b"fre.aggregate.candidate-intervals.v2".as_slice()
     } else {
         b"fre.aggregate.candidate-intervals.v1".as_slice()
@@ -7485,6 +7539,15 @@ fn bind_candidate_identity(
     } else {
         0
     };
+    let classified_payload = if plan.classified_anchors().is_some() {
+        add(
+            mul(3, core::mem::size_of::<u64>(), Resource::CompileWork)?,
+            core::mem::size_of::<u128>(),
+            Resource::CompileWork,
+        )?
+    } else {
+        0
+    };
     let payload = add(
         add(program.0.len(), domain.len(), Resource::CompileWork)?,
         add(
@@ -7493,7 +7556,7 @@ fn bind_candidate_identity(
                 core::mem::size_of::<u64>(),
                 Resource::CompileWork,
             )?,
-            fixed_payload,
+            add(fixed_payload, classified_payload, Resource::CompileWork)?,
             Resource::CompileWork,
         )?,
         Resource::CompileWork,
@@ -7549,6 +7612,15 @@ fn bind_candidate_identity(
     for &bucket in &*plan.global_buckets {
         first.bytes(&bucket.to_le_bytes());
         second.bytes(&bucket.to_le_bytes());
+    }
+    if let Some(classified) = plan.classified_anchors() {
+        for hash in [&mut first, &mut second] {
+            hash_usize(hash, classified.offset());
+            hash.bytes(&classified.owners().to_le_bytes());
+            for word in classified.set().words() {
+                hash.bytes(&word.to_le_bytes());
+            }
+        }
     }
     if let Some(fixed) = plan.fixed_continuation() {
         for hash in [&mut first, &mut second] {
@@ -9150,6 +9222,73 @@ mod tests {
         assert_eq!(
             budget.current_construction_bytes,
             plan.retained_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn classified_candidate_allocation_is_exact_and_commits_after_bucket_storage() {
+        let hir = parse_bytes(r"(?i:abx|cdy)");
+        let HirKind::Alternation(branches) = hir.kind() else {
+            panic!("classified candidate fixture must remain a root alternation")
+        };
+        let draft_bytes = branches.len() * core::mem::size_of::<CandidateDraft>();
+        let entry_bytes = branches.len() * core::mem::size_of::<CandidateEntry>();
+        let bucket_bytes = candidate::bucket_count() * core::mem::size_of::<u128>();
+        let base = draft_bytes + entry_bytes + 2 * bucket_bytes;
+        let expected_live = [
+            0,
+            draft_bytes,
+            draft_bytes + entry_bytes,
+            draft_bytes + entry_bytes + bucket_bytes,
+            base,
+        ];
+        for (ordinal, expected_live) in expected_live.into_iter().enumerate() {
+            let mut budget = CompileBudget::new_receipt(
+                CompileLimits::default(),
+                Some(AllocationScope {
+                    limit: 5,
+                    prospective: 5,
+                }),
+            );
+            let fault = compiler_allocation_probe::fail_at(ordinal);
+            let error = build_candidate_plan(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CapturePolicy::Reject,
+                &mut budget,
+            )
+            .unwrap_err();
+            drop(fault);
+            assert!(matches!(error, Error::AllocationFailed { .. }));
+            assert_eq!(budget.actual_allocations, ordinal);
+            assert_eq!(budget.current_construction_bytes, expected_live);
+            assert_eq!(budget.accounting.construction_peak_bytes, expected_live);
+        }
+
+        let mut budget = CompileBudget::new_receipt(
+            CompileLimits::default(),
+            Some(AllocationScope {
+                limit: 5,
+                prospective: 5,
+            }),
+        );
+        let plan = build_candidate_plan(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CapturePolicy::Reject,
+            &mut budget,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(plan.classified_anchors().is_some());
+        assert_eq!(budget.actual_allocations, 5);
+        assert_eq!(
+            budget.current_construction_bytes,
+            plan.retained_bytes().unwrap()
+        );
+        assert_eq!(
+            plan.retained_bytes().unwrap(),
+            entry_bytes + 2 * bucket_bytes + core::mem::size_of::<candidate::ClassifiedAnchors>()
         );
     }
 

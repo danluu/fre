@@ -11,6 +11,7 @@
 use core::{mem::size_of, ops::Range};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
+use fre_kernels::{ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier};
 
 use crate::accounting::ExecutionAccounting;
 use crate::error::{add, enforce, mul};
@@ -22,6 +23,11 @@ pub(crate) const MAX_OFFSET: usize = 4_096;
 const BUCKETS: usize = 256;
 pub(crate) const MAX_FILTER_CHECKS: usize = 7;
 pub(crate) const MAX_FIXED_CONTINUATION_TOKEN_BYTES: usize = 16;
+const MIN_CLASSIFIED_ANCHOR_BYTES: usize = 4;
+const MAX_CLASSIFIED_ANCHOR_BYTES: usize = 16;
+const MIN_CLASSIFIED_FILTER_CHECKS: usize = 2;
+const CLASSIFIED_DENSITY_SAMPLE_BYTES: usize = 256;
+const CLASSIFIED_DENSITY_CUTOVER_DENOMINATOR: usize = 4;
 const SHAPE_OFFSET_RADIX: usize = 8_192;
 #[cfg(target_pointer_width = "64")]
 const SHAPE_LENGTH_RADIX: usize = SHAPE_OFFSET_RADIX;
@@ -151,6 +157,7 @@ pub(crate) struct Plan {
     pub(crate) buckets: ExactVec<u128>,
     pub(crate) global_buckets: ExactVec<u128>,
     pub(crate) shape: ExactBoxOrUsize<FixedContinuation>,
+    pub(crate) classified: ExactBoxOrUsize<ClassifiedAnchors>,
 }
 
 impl Plan {
@@ -241,11 +248,64 @@ impl Plan {
                 Resource::ProgramBytes,
             )
         })?;
-        add(ordinary, fixed, Resource::ProgramBytes)
+        let classified = self
+            .classified_anchors()
+            .map_or(0, |_| size_of::<ClassifiedAnchors>());
+        add(
+            add(ordinary, fixed, Resource::ProgramBytes)?,
+            classified,
+            Resource::ProgramBytes,
+        )
     }
 
     pub(crate) fn fixed_continuation(&self) -> Option<&FixedContinuation> {
         self.shape.boxed()
+    }
+
+    pub(crate) fn classified_anchors(&self) -> Option<&ClassifiedAnchors> {
+        self.classified.boxed()
+    }
+}
+
+/// A construction-selected native classifier for a shared fixed candidate
+/// offset whose ASCII anchor set is wider than `memchr3`.
+///
+/// The original bucket table remains the semantic owner map. This descriptor
+/// only skips bytes absent from the union and is therefore a prefilter, never
+/// an alternate matcher.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClassifiedAnchors {
+    classifier: AsciiByteSetClassifier,
+    offset: usize,
+    owners: u128,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ClassifiedAnchorProof {
+    set: AsciiByteSet,
+    offset: usize,
+    owners: u128,
+}
+
+impl ClassifiedAnchors {
+    pub(crate) const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) const fn owners(&self) -> u128 {
+        self.owners
+    }
+
+    pub(crate) const fn set(&self) -> AsciiByteSet {
+        self.classifier.set()
+    }
+}
+
+pub(crate) fn build_classified_anchors(proof: ClassifiedAnchorProof) -> ClassifiedAnchors {
+    ClassifiedAnchors {
+        classifier: AsciiByteSetClassifier::new(proof.set),
+        offset: proof.offset,
+        owners: proof.owners,
     }
 }
 
@@ -324,6 +384,19 @@ pub(crate) fn exact_fixed_continuation(
 ) -> Result<ExactBoxOrUsize<FixedContinuation>, Error> {
     ExactBoxOrUsize::try_from_boxed(fixed)
         .map_err(|error| allocation_error(error, Resource::ProgramBytes, 1))
+}
+
+pub(crate) fn exact_classified_anchors(
+    classified: &ClassifiedAnchors,
+) -> Result<ExactBoxOrUsize<ClassifiedAnchors>, Error> {
+    ExactBoxOrUsize::try_from_boxed(*classified)
+        .map_err(|error| allocation_error(error, Resource::ProgramBytes, 1))
+}
+
+pub(crate) fn inline_no_classified_anchors() -> Result<ExactBoxOrUsize<ClassifiedAnchors>, Error> {
+    ExactBoxOrUsize::try_from_usize(0).map_err(|_| {
+        Error::InternalInvariant("empty classified candidate marker does not fit tagged word")
+    })
 }
 
 pub(crate) fn inline_candidate_shape(
@@ -882,11 +955,17 @@ pub(crate) fn reduce_attempt(
     let mut candidates = 0_usize;
     let result = (|| {
         let shared_fixed = plan.shared_fixed()?;
+        let classified = plan.classified_anchors();
+        if shared_fixed.is_some() && classified.is_some() {
+            return Err(Error::InternalInvariant(
+                "candidate plan retained two shared-anchor executors",
+            ));
+        }
         // A shared fixed anchor is drained immediately and therefore has only
         // one live start. Retain the offset-sized ring solely for the generic
         // interval scheduler, where starts remain live until its safe
         // frontier advances.
-        let schedule = if shared_fixed.is_some() {
+        let schedule = if shared_fixed.is_some() || classified.is_some() {
             1
         } else {
             add(plan.max_offset(), 1, Resource::ScratchBytes)?
@@ -924,78 +1003,20 @@ pub(crate) fn reduce_attempt(
                 let byte = *local.get(position).ok_or(Error::InternalInvariant(
                     "shared fixed anchor outside source",
                 ))?;
-                let mut owners =
-                    *plan
-                        .buckets
-                        .get(usize::from(byte))
-                        .ok_or(Error::InternalInvariant(
-                            "shared fixed anchor outside bucket table",
-                        ))?
-                        & fixed.owners
-                        & eligible;
-                let mut scheduled_owners = 0_u128;
-                while owners != 0 {
-                    meter.charge_work(1)?; // one owner selection
-                    let ordinal = take_owner(&mut owners)?;
-                    let entry = plan.entries.get(ordinal).ok_or(Error::InternalInvariant(
-                        "shared fixed candidate owner outside entries",
-                    ))?;
-                    if !filter_matches(entry, local, position, &mut meter)?
-                        || position < entry.min_offset
-                    {
-                        continue;
-                    }
-                    meter.charge_work(1)?; // one fixed candidate publication
-                    let start =
-                        position
-                            .checked_sub(entry.min_offset)
-                            .ok_or(Error::InternalInvariant(
-                                "shared fixed candidate offset underflow",
-                            ))?;
-                    if let Some(assertion) = entry.leading_assertion {
-                        meter.charge_assertion()?;
-                        meter
-                            .charge_random(assertions.candidate_source_bytes(assertion, start)?)?;
-                        if !assertions.is_match(assertion, start)? {
-                            continue;
-                        }
-                    }
-                    let required = add(candidates, 1, Resource::MatchEvents)?;
-                    enforce(required, limits.max_match_events, Resource::MatchEvents)?;
-                    candidates = required;
-                    scheduled_owners |= owner_bit(ordinal)?;
-                }
-                if scheduled_owners == 0 {
-                    continue;
-                }
-                let start = position
-                    .checked_sub(fixed.offset)
-                    .ok_or(Error::InternalInvariant(
-                        "shared fixed candidate offset underflow",
-                    ))?;
-                let slot = ring_slot(start, workspace.schedule.len())?;
-                let scheduled =
-                    workspace
-                        .schedule
-                        .get_mut(slot)
-                        .ok_or(Error::InternalInvariant(
-                            "shared fixed candidate schedule slot outside ring",
-                        ))?;
-                if *scheduled != 0 {
-                    return Err(Error::InternalInvariant(
-                        "shared fixed candidate reused a live schedule slot",
-                    ));
-                }
-                *scheduled = scheduled_owners;
-                process_start(
+                process_shared_candidate(
                     plan,
                     program,
                     local,
                     assertions,
-                    start,
+                    fixed.offset,
+                    fixed.owners,
+                    eligible,
+                    position,
+                    byte,
                     &mut cursor,
                     &mut matches,
                     &mut span_sum,
+                    &mut candidates,
                     kind,
                     &mut workspace,
                     &mut meter,
@@ -1004,6 +1025,113 @@ pub(crate) fn reduce_attempt(
             if workspace.bytes != allocations.bytes {
                 return Err(Error::InternalInvariant(
                     "shared fixed candidate workspace diverged from allocation ledger",
+                ));
+            }
+            return Ok(());
+        }
+
+        if let Some(classified) = classified {
+            // Charge the logical source pass before the classifier can touch
+            // the source. Complete SIMD blocks enumerate only set-member
+            // lanes. A dense sample cuts over at a block boundary to the
+            // scalar bucket-equivalent membership walk without replaying any
+            // source byte.
+            let eligible = globally_present_owners(plan, local, &mut meter)?;
+            if eligible == 0 {
+                if workspace.bytes != allocations.bytes {
+                    return Err(Error::InternalInvariant(
+                        "classified candidate workspace diverged from allocation ledger",
+                    ));
+                }
+                return Ok(());
+            }
+            meter.charge_work(local.len())?;
+            meter.charge_sequential(local.len())?;
+            let mut block_start = 0_usize;
+            let mut sampled_candidates = 0_usize;
+            while block_start
+                .checked_add(ASCII_WIDE_BYTES)
+                .is_some_and(|end| end <= local.len())
+            {
+                let block_end = add(block_start, ASCII_WIDE_BYTES, Resource::Boundaries)?;
+                let block: &[u8; ASCII_WIDE_BYTES] =
+                    local[block_start..block_end].try_into().map_err(|_| {
+                        Error::InternalInvariant(
+                            "complete classified candidate block lost its fixed extent",
+                        )
+                    })?;
+                meter.charge_work(1)?; // one native set-classification block
+                let mut lanes = classified.classifier.classify_32(block).member_mask();
+                sampled_candidates = add(
+                    sampled_candidates,
+                    usize::try_from(lanes.count_ones()).map_err(|_| {
+                        Error::InternalInvariant(
+                            "classified candidate lane count does not fit usize",
+                        )
+                    })?,
+                    Resource::ExecutionWork,
+                )?;
+                while lanes != 0 {
+                    let lane = usize::try_from(lanes.trailing_zeros()).map_err(|_| {
+                        Error::InternalInvariant("classified candidate lane does not fit usize")
+                    })?;
+                    lanes &= lanes.wrapping_sub(1);
+                    let position = add(block_start, lane, Resource::Boundaries)?;
+                    let byte = block[lane];
+                    process_shared_candidate(
+                        plan,
+                        program,
+                        local,
+                        assertions,
+                        classified.offset,
+                        classified.owners,
+                        eligible,
+                        position,
+                        byte,
+                        &mut cursor,
+                        &mut matches,
+                        &mut span_sum,
+                        &mut candidates,
+                        kind,
+                        &mut workspace,
+                        &mut meter,
+                    )?;
+                }
+                block_start = block_end;
+                if classified_density_is_dense(block_start, sampled_candidates) {
+                    meter.charge_work(1)?; // one construction-bounded dense cutover
+                    break;
+                }
+            }
+            while block_start < local.len() {
+                let byte = *local.get(block_start).ok_or(Error::InternalInvariant(
+                    "classified candidate scalar tail outside source",
+                ))?;
+                if classified.set().contains(byte) {
+                    process_shared_candidate(
+                        plan,
+                        program,
+                        local,
+                        assertions,
+                        classified.offset,
+                        classified.owners,
+                        eligible,
+                        block_start,
+                        byte,
+                        &mut cursor,
+                        &mut matches,
+                        &mut span_sum,
+                        &mut candidates,
+                        kind,
+                        &mut workspace,
+                        &mut meter,
+                    )?;
+                }
+                block_start = add(block_start, 1, Resource::Boundaries)?;
+            }
+            if workspace.bytes != allocations.bytes {
+                return Err(Error::InternalInvariant(
+                    "classified candidate workspace diverged from allocation ledger",
                 ));
             }
             return Ok(());
@@ -1208,6 +1336,58 @@ pub(crate) fn shared_fixed_anchors(
         bytes,
         len,
         offset: fixed_offset,
+        owners: all,
+    }))
+}
+
+/// Build a single-pass native candidate classifier when every owner uses one
+/// shared fixed offset but the ASCII anchor union is too wide for `memchr3`.
+///
+/// The cardinality and filter-width gates are source-independent. They keep a
+/// broad root class or a one-byte-only proof on the ordinary scalar bucket
+/// walk, where enumerating a dense candidate mask would have no general
+/// advantage.
+pub(crate) fn classified_anchor_proof(
+    entries: &[Entry],
+    buckets: &[u128],
+) -> Result<Option<ClassifiedAnchorProof>, Error> {
+    let Some(first) = entries.first() else {
+        return Ok(None);
+    };
+    if entries.iter().any(|entry| {
+        entry.min_offset != first.min_offset
+            || entry.max_offset != first.min_offset
+            || entry.check_len < MIN_CLASSIFIED_FILTER_CHECKS
+    }) {
+        return Ok(None);
+    }
+    let all = complete_owner_mask(entries.len())?;
+    let mut words = [0_u64; 2];
+    let mut cardinality = 0_usize;
+    let mut observed_owners = 0_u128;
+    for (byte, &owners) in buckets.iter().enumerate() {
+        if owners == 0 {
+            continue;
+        }
+        if owners & !all != 0 || byte >= 128 {
+            return Ok(None);
+        }
+        cardinality = add(cardinality, 1, Resource::ProgramBytes)?;
+        if cardinality > MAX_CLASSIFIED_ANCHOR_BYTES {
+            return Ok(None);
+        }
+        let word = byte / 64;
+        let shift = u32::try_from(byte % 64)
+            .map_err(|_| Error::InternalInvariant("ASCII anchor shift does not fit u32"))?;
+        words[word] |= 1_u64 << shift;
+        observed_owners |= owners;
+    }
+    if observed_owners != all || cardinality < MIN_CLASSIFIED_ANCHOR_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(ClassifiedAnchorProof {
+        set: AsciiByteSet::from_words(words),
+        offset: first.min_offset,
         owners: all,
     }))
 }
@@ -1563,6 +1743,112 @@ fn filter_checks(
         }
     }
     Ok(true)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared candidate publication keeps every semantic and resource ledger explicit"
+)]
+fn process_shared_candidate(
+    plan: &Plan,
+    program: &Program,
+    haystack: &[u8],
+    assertions: AssertionContext<'_>,
+    offset: usize,
+    owner_mask: u128,
+    eligible: u128,
+    position: usize,
+    byte: u8,
+    cursor: &mut usize,
+    matches: &mut usize,
+    span_sum: &mut usize,
+    candidates: &mut usize,
+    kind: ReductionKind,
+    workspace: &mut Workspace,
+    meter: &mut Meter,
+) -> Result<(), Error> {
+    if position >= haystack.len() {
+        return Err(Error::InternalInvariant(
+            "shared candidate anchor outside source",
+        ));
+    }
+    let mut owners = *plan
+        .buckets
+        .get(usize::from(byte))
+        .ok_or(Error::InternalInvariant(
+            "shared candidate anchor outside bucket table",
+        ))?
+        & owner_mask
+        & eligible;
+    let mut scheduled_owners = 0_u128;
+    while owners != 0 {
+        meter.charge_work(1)?; // one owner selection
+        let ordinal = take_owner(&mut owners)?;
+        let entry = plan.entries.get(ordinal).ok_or(Error::InternalInvariant(
+            "shared candidate owner outside entries",
+        ))?;
+        if !filter_matches(entry, haystack, position, meter)? || position < entry.min_offset {
+            continue;
+        }
+        if entry.min_offset != offset || entry.max_offset != offset {
+            return Err(Error::InternalInvariant(
+                "shared candidate owner lost its fixed offset",
+            ));
+        }
+        meter.charge_work(1)?; // one fixed candidate publication
+        let start = position
+            .checked_sub(entry.min_offset)
+            .ok_or(Error::InternalInvariant(
+                "shared candidate offset underflow",
+            ))?;
+        if let Some(assertion) = entry.leading_assertion {
+            meter.charge_assertion()?;
+            meter.charge_random(assertions.candidate_source_bytes(assertion, start)?)?;
+            if !assertions.is_match(assertion, start)? {
+                continue;
+            }
+        }
+        let required = add(*candidates, 1, Resource::MatchEvents)?;
+        enforce(
+            required,
+            meter.limits.max_match_events,
+            Resource::MatchEvents,
+        )?;
+        *candidates = required;
+        scheduled_owners |= owner_bit(ordinal)?;
+    }
+    if scheduled_owners == 0 {
+        return Ok(());
+    }
+    let start = position
+        .checked_sub(offset)
+        .ok_or(Error::InternalInvariant(
+            "shared candidate offset underflow",
+        ))?;
+    let slot = ring_slot(start, workspace.schedule.len())?;
+    let scheduled = workspace
+        .schedule
+        .get_mut(slot)
+        .ok_or(Error::InternalInvariant(
+            "shared candidate schedule slot outside ring",
+        ))?;
+    if *scheduled != 0 {
+        return Err(Error::InternalInvariant(
+            "shared candidate reused a live schedule slot",
+        ));
+    }
+    *scheduled = scheduled_owners;
+    process_start(
+        plan, program, haystack, assertions, start, cursor, matches, span_sum, kind, workspace,
+        meter,
+    )
+}
+
+fn classified_density_is_dense(scanned: usize, candidates: usize) -> bool {
+    let threshold = (scanned / CLASSIFIED_DENSITY_CUTOVER_DENOMINATOR).saturating_add(usize::from(
+        !scanned.is_multiple_of(CLASSIFIED_DENSITY_CUTOVER_DENOMINATOR),
+    ));
+    scanned >= CLASSIFIED_DENSITY_SAMPLE_BYTES && candidates >= threshold
 }
 
 #[allow(
@@ -2081,7 +2367,7 @@ mod tests {
     fn candidate_plan_retains_fixed_continuation_metadata_explicitly() {
         assert_eq!(
             size_of::<Plan>(),
-            size_of::<ExactVec<Entry>>() * 3 + size_of::<usize>()
+            size_of::<ExactVec<Entry>>() * 3 + size_of::<usize>() * 2
         );
     }
 
@@ -2728,6 +3014,178 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn classified_fixed_anchors_match_ordered_byte_oracle_exhaustively() {
+        let pattern = r"(?i:abx|cdy)";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert!(!plan.has_shared_fixed());
+        let classified = plan
+            .classified_anchors()
+            .expect("four folded anchor bytes select the native classifier");
+        assert_eq!(classified.owners(), 0b11);
+        assert_eq!(
+            classified
+                .set()
+                .words()
+                .map(u64::count_ones)
+                .iter()
+                .sum::<u32>(),
+            4
+        );
+
+        let reference = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+        let alphabet = [b'A', b'a', b'C', b'c', b'b', b'd', b'x', b'y', 0xFF];
+        let mut haystack = Vec::new();
+        for encoded in 0_usize..4_000 {
+            haystack.clear();
+            let mut value = encoded;
+            let length = encoded % 8;
+            for _ in 0..length {
+                haystack.push(alphabet[value % alphabet.len()]);
+                value /= alphabet.len();
+            }
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let (expected_count, expected_span_sum) = reference
+                        .find_iter(&haystack[start..end])
+                        .fold((0_usize, 0_usize), |(count, sum), matched| {
+                            (
+                                count.checked_add(1).unwrap(),
+                                sum.checked_add(
+                                    matched.end().checked_sub(matched.start()).unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                        });
+                    let count = reduce_attempt(
+                        ReductionKind::Count,
+                        plan,
+                        &compiled.program,
+                        &haystack,
+                        start..end,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                    let span_sum = reduce_attempt(
+                        ReductionKind::SpanSum,
+                        plan,
+                        &compiled.program,
+                        &haystack,
+                        start..end,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        (count.matches, span_sum.span_sum),
+                        (expected_count, expected_span_sum),
+                        "range={start}..{end} haystack={haystack:?}"
+                    );
+                    assert_eq!(count.matches, span_sum.matches);
+                    assert_eq!(count.candidates, span_sum.candidates);
+                    assert_eq!(count.accounting, span_sum.accounting);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classified_fixed_anchors_preserve_leading_assertions() {
+        let pattern = r"(?m:^[Aa]b[Qq])|\b[Cc]d[Zz]";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert!(
+            plan.classified_anchors().is_some(),
+            "unexpected candidate plan: {plan:#?}"
+        );
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.leading_assertion.is_some())
+        );
+        let haystack = b"ABQ\ncdz\nxabq xCdz\nCDZ";
+        let result = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches, reference(pattern, haystack));
+        assert_eq!(result.span_sum, reference_span_sum(pattern, haystack));
+    }
+
+    #[test]
+    fn classified_density_cutover_is_forward_only_and_exactly_metered() {
+        assert!(!classified_density_is_dense(255, 255));
+        assert!(!classified_density_is_dense(256, 63));
+        assert!(classified_density_is_dense(256, 64));
+        assert!(classified_density_is_dense(257, 65));
+
+        let pattern = r"(?i:abx|cdy)";
+        let compiled = compiled(pattern);
+        let plan = compiled.candidate.as_ref().unwrap();
+        assert!(plan.classified_anchors().is_some());
+        let mut haystack = b"AaCc".repeat(128);
+        haystack.extend_from_slice(b"abx cdy");
+        let result = reduce_attempt(
+            ReductionKind::SpanSum,
+            plan,
+            &compiled.program,
+            &haystack,
+            0..haystack.len(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(result.matches, reference(pattern, &haystack));
+        assert_eq!(result.span_sum, reference_span_sum(pattern, &haystack));
+        assert!(
+            (haystack.len()..=haystack.len().checked_mul(2).unwrap())
+                .contains(&result.accounting.sequential_bytes_read),
+            "the global proof and classified pass may each visit a byte, but the cutover may not replay one"
+        );
+
+        let exact = OperationLimits {
+            max_work: result.accounting.work,
+            ..OperationLimits::default()
+        };
+        assert_eq!(
+            reduce_attempt(
+                ReductionKind::SpanSum,
+                plan,
+                &compiled.program,
+                &haystack,
+                0..haystack.len(),
+                exact,
+            )
+            .unwrap(),
+            result
+        );
+        let one_short = OperationLimits {
+            max_work: result.accounting.work.checked_sub(1).unwrap(),
+            ..OperationLimits::default()
+        };
+        assert!(matches!(
+            reduce_attempt(
+                ReductionKind::SpanSum,
+                plan,
+                &compiled.program,
+                &haystack,
+                0..haystack.len(),
+                one_short,
+            ),
+            Err(ReductionAttemptError {
+                source: Error::ResourceLimit {
+                    resource: Resource::ExecutionWork,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]

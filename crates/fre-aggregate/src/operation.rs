@@ -312,12 +312,12 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 5;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 6;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 7;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 8;
 
-/// Maximum allocation count representable by every route in accounting v7.
+/// Maximum allocation count representable by every route in accounting v8.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -837,7 +837,7 @@ impl OperationCounterValue {
 /// attempt.
 ///
 /// Fields that are not present in the capture-free continuation executor are
-/// explicitly zero rather than omitted. In particular, accounting v7 has no
+/// explicitly zero rather than omitted. In particular, accounting v8 has no
 /// DFA cache, line-domain, persistent-history, or reusable-scratch-clear
 /// facility. This makes a zero an auditable statement about the selected
 /// implementation rather than an absent measurement.
@@ -849,7 +849,7 @@ pub struct OperationStructuralCounters {
     pub verified_bytes: usize,
     /// Exact transition checks performed by the selected continuation route.
     pub state_transitions: usize,
-    /// Cache misses in a DFA cache. Accounting v7 has no DFA cache.
+    /// Cache misses in a DFA cache. Accounting v8 has no DFA cache.
     pub dfa_cache_misses: usize,
     /// One whole-operation selector invocation, published before source use.
     pub selector_invocations: usize,
@@ -909,7 +909,7 @@ impl OperationStructuralCounters {
 /// created only after that receipt has authenticated a successful terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v7.
+    /// Schema for the structural projection, independent from accounting v8.
     pub schema_version: u8,
     /// Sealed route, invocation, prospective bounds, and actual accounting.
     pub attempt: OperationAttemptReceipt,
@@ -998,7 +998,7 @@ fn attempt_counter_components_close(
 /// operation already produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationHotCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v7.
+    /// Schema for the structural projection, independent from accounting v8.
     pub schema_version: u8,
     /// Exact route certificate emitted by the ordinary value-only operation.
     pub certificate: OperationCertificate,
