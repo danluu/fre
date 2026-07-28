@@ -522,7 +522,7 @@ pub use token_phrase::{
     PLAN_ID as TOKEN_PHRASE_PLAN_ID, ReduceAccounting as TokenPhraseReduceAccounting,
     ReduceActualCounters as TokenPhraseActualCounters, ReduceError as TokenPhraseReduceError,
     ReduceLimits as TokenPhraseReduceLimits, ReduceUpperBounds as TokenPhraseUpperBounds,
-    SPAN_SUM_OPERATION_ID as TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    Route as TokenPhraseRoute, SPAN_SUM_OPERATION_ID as TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
     SpanSumResult as TokenPhraseSpanSumResult, TokenPhrasePlan, Topology as TokenPhraseTopology,
 };
 pub use unicode_scalar_aggregate::{

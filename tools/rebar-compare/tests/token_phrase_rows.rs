@@ -13,8 +13,8 @@ const ASSERTED_PATTERN_SHA256: &str =
 const UNASSERTED_PATTERN: &str = r"\w+\s+Holmes\s+\w+";
 const UNASSERTED_PATTERN_SHA256: &str =
     "b529539ea7718c8fdfd31b0505e3722f2284c5cd2cbb04384c267a1b0fefecb0";
-const COMPILE_PLAN: &str = "compile-aggregate-token-phrase-v1";
-const OPERATION_PLAN: &str = "aggregate-token-phrase-v1";
+const COMPILE_PLAN: &str = "compile-aggregate-token-phrase-v2";
+const OPERATION_PLAN: &str = "aggregate-token-phrase-v2";
 
 fn local_fixture() -> Vec<u8> {
     b"Sherlock Holmes wat--A Holmes B; C X Holmes Y; Mycroft  Holmes \t too\xff".to_vec()
@@ -105,9 +105,50 @@ fn exact_rebar_shapes_use_token_phrase() {
 #[test]
 fn adapter_identity_names_the_new_operation_owned_leaf() {
     let identity = CurrentFreAdapter.identity();
-    assert!(identity.adapter.contains("token-phrase-v1"));
-    assert!(identity.identity.contains("token-phrase-v1"));
+    assert!(identity.adapter.contains("token-phrase-v2"));
+    assert!(identity.identity.contains("token-phrase-v2"));
     assert!(identity.availability.contains("token-phrase"));
+}
+
+#[test]
+fn adapter_limits_close_literal_anchor_and_impossible_width_routes() {
+    let mut anchor_haystack = vec![b'-'; 4_096];
+    anchor_haystack.extend_from_slice(b"--left Holmes right--");
+    anchor_haystack.resize(8_192, b'-');
+    let anchor_oracle = RegexBuilder::new(ASSERTED_PATTERN)
+        .unicode(false)
+        .build()
+        .unwrap()
+        .find_iter(&anchor_haystack)
+        .map(|matched| matched.len())
+        .sum::<usize>();
+    let anchor = current_fre_rebar_aggregate_operation_lifecycle(
+        "count-spans",
+        &[ASSERTED_PATTERN.to_owned()],
+        false,
+        false,
+        anchor_haystack.len(),
+    )
+    .expect("literal-anchor lifecycle");
+    assert_eq!(anchor.plan(), OPERATION_PLAN);
+    assert_eq!(
+        anchor.execute(&anchor_haystack).unwrap(),
+        u64::try_from(anchor_oracle).unwrap()
+    );
+
+    let literal = "H".repeat(256);
+    let pattern = format!(r"\b\w+\s+{literal}\s+\w+\b");
+    let impossible_haystack = vec![b'H'; 128];
+    let impossible = current_fre_rebar_aggregate_operation_lifecycle(
+        "count",
+        &[pattern],
+        false,
+        false,
+        impossible_haystack.len(),
+    )
+    .expect("impossible-width lifecycle");
+    assert_eq!(impossible.plan(), OPERATION_PLAN);
+    assert_eq!(impossible.execute(&impossible_haystack).unwrap(), 0);
 }
 
 #[test]

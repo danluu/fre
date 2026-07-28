@@ -3,7 +3,8 @@ use fre::{
     AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateTokenPhraseSemantics, RustProfile,
     TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseBuildLimits,
-    TokenPhraseReduceError, TokenPhraseReduceLimits, TokenPhraseTopology, TokenPhraseUpperBounds,
+    TokenPhraseReduceError, TokenPhraseReduceLimits, TokenPhraseRoute, TokenPhraseTopology,
+    TokenPhraseUpperBounds,
 };
 use regex::bytes::RegexBuilder;
 
@@ -96,7 +97,7 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
 }
 
 #[test]
-fn facade_uses_block_mask_literal_gating_and_enforces_phrase_restart() {
+fn facade_uses_literal_anchor_gating_and_enforces_phrase_restart() {
     let mut haystack = vec![b'x'; 4_096];
     haystack.extend_from_slice(b"--a Holmes b Holmes c--");
     haystack.extend_from_slice(&[b'y'; 4_096]);
@@ -113,9 +114,18 @@ fn facade_uses_block_mask_literal_gating_and_enforces_phrase_restart() {
         let AggregateExecutionDetails::TokenPhrase(accounting) = result.report().details() else {
             panic!("token phrase count executed another family");
         };
-        assert_eq!(accounting.actual.source_reads, haystack.len());
-        assert_eq!(accounting.actual.classifications, haystack.len());
-        assert!(accounting.actual.literal_comparisons < haystack.len());
+        assert_eq!(accounting.actual.route, TokenPhraseRoute::LiteralAnchors);
+        assert_eq!(accounting.actual.finder_scan_bytes, haystack.len());
+        assert_eq!(
+            accounting.actual.finder_calls,
+            accounting.actual.anchor_candidates + 1
+        );
+        assert_eq!(
+            accounting.actual.classifications,
+            accounting.actual.verification_reads
+        );
+        assert_eq!(accounting.actual.literal_comparisons, 0);
+        assert_eq!(accounting.actual.tokens, 0);
         assert_eq!(accounting.actual.matches, 1);
 
         let span_sum = builder(pattern).build_span_sum().unwrap();
@@ -291,6 +301,10 @@ fn exact_run_limits(upper: TokenPhraseUpperBounds) -> TokenPhraseReduceLimits {
         max_classifications: upper.classifications,
         max_literal_comparisons: upper.literal_comparisons,
         max_token_events: upper.token_events,
+        max_finder_scan_bytes: upper.finder_scan_bytes,
+        max_finder_calls: upper.finder_calls,
+        max_anchor_candidates: upper.anchor_candidates,
+        max_verification_reads: upper.verification_reads,
         max_match_events: upper.match_events,
         max_count: upper.count,
         max_span_sum: upper.span_sum,

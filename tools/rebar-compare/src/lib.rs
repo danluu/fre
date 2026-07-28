@@ -207,7 +207,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -618,10 +618,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the direct blocking-delimiter reducer scans one monotone delimiter-pair stream with zero execution scratch",
         );
         identity.identity.push_str(
-            "; token-phrase-v1 authenticates Unicode-off ASCII W+ S+ L S+ W+ count/span-sum with optional redundant outer word boundaries and complete pre-source bounds",
+            "; token-phrase-v2 authenticates Unicode-off ASCII W+ S+ L S+ W+ count/span-sum with optional redundant outer word boundaries, a build-owned exact literal finder, route-specific receipts, and complete pre-source bounds",
         );
         identity.availability.push_str(
-            "; the direct token-phrase reducer scans one monotone maximal-token stream with zero execution scratch",
+            "; the direct token-phrase reducer returns source-free when the phrase cannot fit, uses a fixed-block maximal-token stream below 128 bytes, and otherwise scans one retained monotone literal-anchor stream with explicit candidate and adjacent-run verification accounting and zero execution scratch",
         );
         identity.identity.push_str(
             "; literal-class-run-literal-v2 authenticates count/span-sum for one greedy nonempty byte-class run with one or two fixed byte-literal anchors, or one complete ASCII word run ending in a nonempty fixed word suffix",
@@ -2149,7 +2149,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::BlockingDelimiter, _) => {
             "compile-aggregate-blocking-delimiter-v1"
         }
-        ("compile", AggregatePlanKind::TokenPhrase, _) => "compile-aggregate-token-phrase-v1",
+        ("compile", AggregatePlanKind::TokenPhrase, _) => "compile-aggregate-token-phrase-v2",
         ("compile", AggregatePlanKind::FixedClassSandwich, _) => {
             "compile-aggregate-fixed-class-sandwich"
         }
@@ -2198,7 +2198,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::WordRun, _) => "aggregate-word-run-v1",
         (_, AggregatePlanKind::LiteralAssertions, _) => "aggregate-literal-assertions-v1",
         (_, AggregatePlanKind::BlockingDelimiter, _) => "aggregate-blocking-delimiter-v1",
-        (_, AggregatePlanKind::TokenPhrase, _) => "aggregate-token-phrase-v1",
+        (_, AggregatePlanKind::TokenPhrase, _) => "aggregate-token-phrase-v2",
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::LiteralClassRunLiteral, _) => {
             "aggregate-literal-class-run-literal-v2"
@@ -8273,27 +8273,36 @@ fn inactive_blocking_delimiter_operation_limits() -> BlockingDelimiterReduceLimi
     BlockingDelimiterReduceLimits::default()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the adapter mirrors every impossible-width, block-mask, and literal-anchor prospective counter at one auditable limit boundary"
+)]
 fn token_phrase_operation_limits(
     haystack_len: usize,
     build: TokenPhraseBuildAccounting,
     operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<TokenPhraseReduceLimits, ExecutionError> {
-    let classifications = haystack_len;
-    let source_reads = classifications;
-    let literal_comparisons = haystack_len;
-    let token_events = haystack_len;
     let minimum_match_bytes = build
         .literal_bytes
         .checked_add(4)
         .ok_or_else(|| ExecutionError::fault("token-phrase minimum match width overflow"))?;
-    let match_events = haystack_len
-        .checked_div(minimum_match_bytes)
-        .ok_or_else(|| ExecutionError::fault("token-phrase match-event bound divided by zero"))?;
+    let impossible_width = haystack_len < minimum_match_bytes;
+    let literal_anchor = !impossible_width && haystack_len >= 128;
+    let match_events = if impossible_width {
+        0
+    } else {
+        haystack_len
+            .checked_div(minimum_match_bytes)
+            .ok_or_else(|| {
+                ExecutionError::fault("token-phrase match-event bound divided by zero")
+            })?
+    };
     let count = u64::try_from(match_events)
         .map_err(|_| ExecutionError::fault("token-phrase count bound does not fit u64"))?;
     let span_sum = match operation {
         AggregateOperation::Compile | AggregateOperation::Count => 0,
+        AggregateOperation::SpanSum if impossible_width => 0,
         AggregateOperation::SpanSum => u64::try_from(haystack_len)
             .map_err(|_| ExecutionError::fault("token-phrase span bound does not fit u64"))?,
         AggregateOperation::Spans => {
@@ -8302,17 +8311,90 @@ fn token_phrase_operation_limits(
             ));
         }
     };
-    let work = [
-        checked_aggregate_mul(classifications, 2, "token-phrase classification work")?,
+    let (
+        source_reads,
+        work,
+        classifications,
         literal_comparisons,
-        checked_aggregate_mul(token_events, 3, "token-phrase token-event work")?,
-        checked_aggregate_mul(match_events, 4, "token-phrase match work")?,
-        8,
-    ]
-    .into_iter()
-    .try_fold(0_usize, |total, term| {
-        checked_aggregate_add(total, term, "token-phrase total work")
-    })?;
+        token_events,
+        finder_scan_bytes,
+        finder_calls,
+        anchor_candidates,
+        verification_reads,
+    ) = if impossible_width {
+        (0, 8, 0, 0, 0, 0, 0, 0, 0)
+    } else if literal_anchor {
+        let anchor_candidates = haystack_len
+            .checked_div(build.literal_bytes)
+            .ok_or_else(|| ExecutionError::fault("token-phrase anchor bound divided by zero"))?;
+        let finder_calls =
+            checked_aggregate_add(anchor_candidates, 1, "token-phrase finder-call bound")?;
+        let verification_reads = checked_aggregate_add(
+            checked_aggregate_mul(haystack_len, 4, "token-phrase verifier scan-read bound")?,
+            checked_aggregate_mul(
+                anchor_candidates,
+                8,
+                "token-phrase verifier endpoint-read bound",
+            )?,
+            "token-phrase verification-read bound",
+        )?;
+        let finder_charge =
+            checked_aggregate_mul(haystack_len, 16, "token-phrase finder scan charge")?;
+        let source_reads = checked_aggregate_add(
+            finder_charge,
+            verification_reads,
+            "token-phrase literal-anchor source reads",
+        )?;
+        let work = [
+            finder_charge,
+            checked_aggregate_mul(finder_calls, 2, "token-phrase finder-call work")?,
+            checked_aggregate_mul(anchor_candidates, 4, "token-phrase anchor-candidate work")?,
+            verification_reads,
+            checked_aggregate_mul(match_events, 4, "token-phrase match work")?,
+            8,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, term| {
+            checked_aggregate_add(total, term, "token-phrase literal-anchor total work")
+        })?;
+        (
+            source_reads,
+            work,
+            verification_reads,
+            0,
+            0,
+            haystack_len,
+            finder_calls,
+            anchor_candidates,
+            verification_reads,
+        )
+    } else {
+        let classifications = haystack_len;
+        let literal_comparisons = haystack_len;
+        let token_events = haystack_len;
+        let work = [
+            checked_aggregate_mul(classifications, 2, "token-phrase classification work")?,
+            literal_comparisons,
+            checked_aggregate_mul(token_events, 3, "token-phrase token-event work")?,
+            checked_aggregate_mul(match_events, 4, "token-phrase match work")?,
+            8,
+        ]
+        .into_iter()
+        .try_fold(0_usize, |total, term| {
+            checked_aggregate_add(total, term, "token-phrase block-mask total work")
+        })?;
+        (
+            haystack_len,
+            work,
+            classifications,
+            literal_comparisons,
+            token_events,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
     Ok(TokenPhraseReduceLimits {
@@ -8322,6 +8404,10 @@ fn token_phrase_operation_limits(
         max_classifications: classifications,
         max_literal_comparisons: literal_comparisons,
         max_token_events: token_events.min(reducer_limit),
+        max_finder_scan_bytes: finder_scan_bytes,
+        max_finder_calls: finder_calls,
+        max_anchor_candidates: anchor_candidates,
+        max_verification_reads: verification_reads,
         max_match_events: match_events.min(reducer_limit),
         max_count: count.min(limits.reducer_steps),
         max_span_sum: span_sum,
@@ -12089,6 +12175,10 @@ fn token_phrase_reduce_error(source: &TokenPhraseReduceError, message: String) -
         | TokenPhraseReduceError::ClassificationsLimit { .. }
         | TokenPhraseReduceError::LiteralComparisonsLimit { .. }
         | TokenPhraseReduceError::TokenEventsLimit { .. }
+        | TokenPhraseReduceError::FinderScanBytesLimit { .. }
+        | TokenPhraseReduceError::FinderCallsLimit { .. }
+        | TokenPhraseReduceError::AnchorCandidatesLimit { .. }
+        | TokenPhraseReduceError::VerificationReadsLimit { .. }
         | TokenPhraseReduceError::MatchEventsLimit { .. }
         | TokenPhraseReduceError::CountLimit { .. }
         | TokenPhraseReduceError::SpanSumLimit { .. }
@@ -15566,7 +15656,7 @@ mod tests {
             let candidate = candidate_reducer(&CurrentFreAdapter, job, &input, &limits)
                 .expect("FRE token-phrase result");
             assert_eq!(candidate.actual, rust);
-            assert_eq!(candidate.plan.as_deref(), Some("aggregate-token-phrase-v1"));
+            assert_eq!(candidate.plan.as_deref(), Some("aggregate-token-phrase-v2"));
             println!(
                 "token-phrase-canary manifest_sha256={manifest_hash} job={job_id} rust={rust} fre={} plan={}",
                 candidate.actual,
@@ -19505,7 +19595,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
