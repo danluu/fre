@@ -23,6 +23,7 @@ mod identity;
 mod limits;
 mod operation;
 mod platform;
+mod selected_end_register_v2;
 
 use core::{fmt, marker::PhantomData};
 use std::{rc::Rc, sync::Arc};
@@ -38,9 +39,16 @@ pub use error::{
     PublishError, ResourceKind, WxMode,
 };
 pub use fre_jit_aarch64::{AuditedNativeImage, NativeAggregateImage, NativeImage};
+pub use fre_kernels::{
+    LiteralAccounting, LiteralError, LiteralSearchLimits, LiteralSearchPreflight,
+};
 pub use identity::RuntimeIdentity;
 pub use limits::{PublicationAccounting, PublicationLimits};
 pub use operation::{RuntimeAggregateOperation, RuntimeOperation};
+pub use selected_end_register_v2::{
+    PublishedSelectedEndRegisterThreadSessionV2, PublishedSelectedEndRegisterV2,
+    SelectedEndRegisterCallErrorV2, publish_selected_end_register_v2,
+};
 
 use crate::{limits::PublicationPlan, platform::ExecutableMapping};
 

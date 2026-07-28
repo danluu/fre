@@ -18,8 +18,9 @@ use std::{io, ptr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fre_jit_aarch64::{
-    AuditedNativeImage, BackendVersion, CpuFeatures, NativeAggregateImage, NativeAggregateResult,
-    NativeImage, NativeResult, TargetSpec, audit, audit_aggregate,
+    AuditedNativeImage, AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures,
+    NativeAggregateImage, NativeAggregateResult, NativeImage, NativeResult, TargetSpec, audit,
+    audit_aggregate, audit_selected_end_register_v2,
 };
 use fre_kernel_ir::{AggregateOutput, OutputKind, SearchWindow};
 
@@ -32,6 +33,8 @@ use crate::{
 use super::{FailureInjection, Mapping, host};
 
 type EntryFunction = unsafe extern "C" fn(*const u8, usize, usize, usize, *mut NativeResult) -> u64;
+type SelectedEndRegisterEntryFunctionV2 =
+    unsafe extern "C" fn(*const u8, usize, usize, usize) -> usize;
 type AggregateEntryFunction =
     unsafe extern "C" fn(*const u8, usize, *mut NativeAggregateResult) -> u64;
 
@@ -147,6 +150,7 @@ pub(crate) struct ExecutableMapping {
     identity: RuntimeIdentity,
     output: OutputKind,
     aggregate: Option<AggregateMappingContract>,
+    selected_end_register_literal_bytes_v2: Option<u32>,
     backend_version: BackendVersion,
     target: TargetSpec,
     sve_vector_bytes_at_publication: Option<u16>,
@@ -160,6 +164,10 @@ pub(crate) struct ExecutableMapping {
 /// outside the runtime crate.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SearchEntry(EntryFunction);
+
+/// Exact register-return ABI2 entry retained only with its owning RX mapping.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedEndRegisterEntryV2(SelectedEndRegisterEntryFunctionV2);
 
 impl SearchEntry {
     #[inline]
@@ -204,6 +212,24 @@ impl SearchEntry {
             },
         };
         RawCallResult { status, slot }
+    }
+}
+
+impl SelectedEndRegisterEntryV2 {
+    #[inline]
+    pub(crate) fn invoke(self, haystack: &[u8], window: SearchWindow) -> usize {
+        // SAFETY: construction decoded this exact four-argument callable only
+        // from a P1-audited ABI2 mapping after its final RX transition. The
+        // borrowing session retains the owning mapping for this complete leaf
+        // call, and scalar preflight validated both window bounds first.
+        unsafe {
+            (self.0)(
+                haystack.as_ptr(),
+                haystack.len(),
+                window.start(),
+                window.end(),
+            )
+        }
     }
 }
 
@@ -252,6 +278,7 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::SEARCH_SVE2_FIXED16_V2
             )
             && self.aggregate.is_none()
+            && self.selected_end_register_literal_bytes_v2.is_none()
             && self.output == expected_output
             && self.target.architecture == expected.architecture
             && self.target.little_endian == expected.little_endian
@@ -261,6 +288,32 @@ impl Mapping for ExecutableMapping {
                 self.backend_version,
                 self.sve_vector_bytes_at_publication,
             )
+            && target_features_available(self.target.features)
+    }
+
+    fn selected_end_register_v2_contract_valid(&self, literal_bytes: u32) -> bool {
+        let expected = TargetSpec::AARCH64_AAPCS64;
+        self.reservation.state == MappingState::Executable
+            && matches!(
+                self.backend_version,
+                BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+            )
+            && self.aggregate.is_none()
+            && literal_bytes != 0
+            && self.selected_end_register_literal_bytes_v2 == Some(literal_bytes)
+            && self.output == OutputKind::SelectedEnd
+            && self.sve_vector_bytes_at_publication.is_none()
+            && match self.backend_version {
+                BackendVersion::SEARCH_V8 => self.target.features == CpuFeatures::ASIMD,
+                BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
+                    self.target.features == CpuFeatures::ASIMD_SVE2
+                }
+                _ => false,
+            }
+            && self.target.architecture == expected.architecture
+            && self.target.little_endian == expected.little_endian
+            && self.target.pointer_width == expected.pointer_width
+            && self.target.abi == expected.abi
             && target_features_available(self.target.features)
     }
 
@@ -280,6 +333,7 @@ impl Mapping for ExecutableMapping {
                     | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_COUNT_EXPERIMENTAL_V1
                     | BackendVersion::AGGREGATE_SVE2_FIXED16_PAIR_SPAN_SUM_EXPERIMENTAL_V1
             )
+            && self.selected_end_register_literal_bytes_v2.is_none()
             && self.aggregate
                 == Some(AggregateMappingContract {
                     output: expected_output,
@@ -310,10 +364,27 @@ impl ExecutableMapping {
     /// Decode the already-audited search address once for an owning kernel.
     pub(crate) fn search_entry(&self) -> SearchEntry {
         debug_assert_eq!(self.reservation.state, MappingState::Executable);
+        debug_assert!(self.selected_end_register_literal_bytes_v2.is_none());
         // SAFETY: `entry` was decoded and independently audited before being
         // copied at the exact image-relative offset. It now names an immutable
         // RX AAPCS64-v1 search function for the complete mapping lifetime.
         SearchEntry(unsafe { mem::transmute::<*mut c_void, EntryFunction>(self.entry.as_ptr()) })
+    }
+
+    /// Decode the P1-audited four-argument entry once for an owning ABI2
+    /// publication.
+    pub(crate) fn selected_end_register_entry_v2(&self) -> SelectedEndRegisterEntryV2 {
+        debug_assert_eq!(self.reservation.state, MappingState::Executable);
+        debug_assert!(
+            self.selected_end_register_literal_bytes_v2
+                .is_some_and(|literal_bytes| literal_bytes != 0)
+        );
+        // SAFETY: the distinct P1 audit authenticated the exact ABI2 entry and
+        // prohibited the removed x4 result pointer before these bytes became
+        // immutable RX. The owning publication retains this mapping.
+        SelectedEndRegisterEntryV2(unsafe {
+            mem::transmute::<*mut c_void, SelectedEndRegisterEntryFunctionV2>(self.entry.as_ptr())
+        })
     }
 }
 
@@ -423,6 +494,7 @@ fn target_features_available(features: CpuFeatures) -> bool {
 enum PublicationSource<'a> {
     Search(&'a NativeImage),
     EmitterAttested(&'a AuditedNativeImage),
+    SelectedEndRegisterV2(&'a AuditedSelectedEndRegisterImageV2),
     Aggregate(&'a NativeAggregateImage),
 }
 
@@ -431,6 +503,7 @@ impl<'a> PublicationSource<'a> {
         match self {
             Self::Search(image) => image.code(),
             Self::EmitterAttested(image) => image.as_image().code(),
+            Self::SelectedEndRegisterV2(image) => image.code(),
             Self::Aggregate(image) => image.code(),
         }
     }
@@ -439,6 +512,7 @@ impl<'a> PublicationSource<'a> {
         match self {
             Self::Search(image) => image.rodata(),
             Self::EmitterAttested(image) => image.as_image().rodata(),
+            Self::SelectedEndRegisterV2(image) => image.rodata(),
             Self::Aggregate(image) => image.rodata(),
         }
     }
@@ -447,6 +521,7 @@ impl<'a> PublicationSource<'a> {
         match self {
             Self::Search(image) => image.backend_version(),
             Self::EmitterAttested(image) => image.as_image().backend_version(),
+            Self::SelectedEndRegisterV2(image) => image.backend_version(),
             Self::Aggregate(image) => image.backend_version(),
         }
     }
@@ -455,20 +530,25 @@ impl<'a> PublicationSource<'a> {
         match self {
             Self::Search(image) => image.target(),
             Self::EmitterAttested(image) => image.as_image().target(),
+            Self::SelectedEndRegisterV2(image) => image.target(),
             Self::Aggregate(image) => image.target(),
         }
     }
 
-    const fn contract(self) -> (OutputKind, Option<AggregateMappingContract>) {
+    const fn contract(self) -> (OutputKind, Option<AggregateMappingContract>, Option<u32>) {
         match self {
-            Self::Search(image) => (image.output(), None),
-            Self::EmitterAttested(image) => (image.as_image().output(), None),
+            Self::Search(image) => (image.output(), None, None),
+            Self::EmitterAttested(image) => (image.as_image().output(), None, None),
+            Self::SelectedEndRegisterV2(image) => {
+                (image.output(), None, Some(image.literal_bytes()))
+            }
             Self::Aggregate(image) => (
                 OutputKind::Span,
                 Some(AggregateMappingContract {
                     output: image.output(),
                     literal_bytes: image.literal_bytes(),
                 }),
+                None,
             ),
         }
     }
@@ -477,6 +557,9 @@ impl<'a> PublicationSource<'a> {
         match self {
             Self::Search(image) => audit(image).map(|_| ()).map_err(PublishError::ImageAudit),
             Self::EmitterAttested(_) => Ok(()),
+            Self::SelectedEndRegisterV2(image) => audit_selected_end_register_v2(image)
+                .map(|_| ())
+                .map_err(PublishError::ImageAudit),
             Self::Aggregate(image) => audit_aggregate(image)
                 .map(|_| ())
                 .map_err(PublishError::ImageAudit),
@@ -512,6 +595,25 @@ pub(crate) fn publish_audited(
         plan,
         identity,
         sve_vector_bytes_at_publication,
+        failure,
+    )
+}
+
+pub(crate) fn publish_selected_end_register_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+    plan: PublicationPlan,
+    identity: RuntimeIdentity,
+    literal_bytes: u32,
+    failure: FailureInjection,
+) -> Result<ExecutableMapping, PublishError> {
+    if literal_bytes == 0 || literal_bytes != image.literal_bytes() {
+        return Err(PublishError::PublicationIdentityMismatch);
+    }
+    publish_source(
+        PublicationSource::SelectedEndRegisterV2(image),
+        plan,
+        identity,
+        None,
         failure,
     )
 }
@@ -651,13 +753,14 @@ fn publish_source(
     // decoded instruction. Pointer creation itself does not execute code.
     let entry_ptr = unsafe { reservation.payload.as_ptr().add(plan.entry_offset) };
     let entry = NonNull::new(entry_ptr.cast()).ok_or(PublishError::PublicationIdentityMismatch)?;
-    let (output, aggregate) = image.contract();
+    let (output, aggregate, selected_end_register_literal_bytes_v2) = image.contract();
     Ok(ExecutableMapping {
         reservation,
         entry,
         identity,
         output,
         aggregate,
+        selected_end_register_literal_bytes_v2,
         backend_version: image.backend_version(),
         target: image.target(),
         sve_vector_bytes_at_publication,

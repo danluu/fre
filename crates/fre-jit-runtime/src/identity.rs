@@ -1,6 +1,8 @@
 use core::fmt;
 
-use fre_jit_aarch64::{ArtifactIdentity, NativeAggregateImage, NativeImage};
+use fre_jit_aarch64::{
+    ArtifactIdentity, AuditedSelectedEndRegisterImageV2, NativeAggregateImage, NativeImage,
+};
 
 /// SHA-256 identity of the complete deterministic native image and manifest.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -32,6 +34,12 @@ impl RuntimeIdentity {
 
     pub(crate) const fn from_preflight_aggregate_image(image: &NativeAggregateImage) -> Self {
         Self::from_artifact(image.artifact_identity())
+    }
+
+    pub(crate) fn from_preflight_selected_end_register_v2(
+        image: &AuditedSelectedEndRegisterImageV2,
+    ) -> Self {
+        Self(*image.artifact_identity().as_bytes())
     }
 
     const fn from_artifact(identity: ArtifactIdentity) -> Self {

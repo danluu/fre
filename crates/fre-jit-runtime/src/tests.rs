@@ -1,8 +1,10 @@
+use core::{cell::Cell, num::NonZeroU32};
 use std::sync::{Mutex, MutexGuard};
 
 use fre_jit_aarch64::{
-    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, NativeResult,
-    SearchBackendPolicy, decode, emit, emit_audited_with_backend, emit_exact_aggregate,
+    AuditedSelectedEndRegisterImageV2, BackendVersion, DecodedInstruction, EmitLimits,
+    NativeAggregateResult, NativeResult, SearchBackendPolicy, SelectedEndRegisterBackendV2, decode,
+    emit, emit_audited_with_backend, emit_exact_aggregate, emit_selected_end_register_v2,
     emit_with_backend,
 };
 #[cfg(all(
@@ -22,23 +24,437 @@ use fre_kernel_ir::{
     ExecutionLimits, Exists, SearchWindow, SelectedEnd, Span, SpanSum, ValidateLimits,
     build_class_suffix, build_exact_aggregate, build_exact_literal,
 };
+use fre_kernels::{LiteralBuildLimits, LiteralPlan, LiteralSearchLimits};
 use fre_target_features::{ArmCpuIdentity, TuningClass};
 
 use crate::{
-    CallError, FailureStage, PublicationLimits, PublishError, ResourceKind,
-    RuntimeAggregateOperation, RuntimeIdentity, RuntimeOperation,
+    AuditedNativeImage, CallError, FailureStage, PublicationLimits, PublishError, PublishedKernel,
+    PublishedSelectedEndRegisterV2, ResourceKind, RuntimeAggregateOperation, RuntimeIdentity,
+    RuntimeOperation, SelectedEndRegisterCallErrorV2,
     operation::{
         RawAggregateCallResult, RawCallResult, decode as decode_operation, decode_aggregate,
     },
     platform::{self, FailureInjection},
     publish, publish_aggregate, publish_aggregate_impl, publish_audited, publish_audited_impl,
-    publish_impl,
+    publish_impl, publish_selected_end_register_v2,
+    selected_end_register_v2::{
+        SelectedEndRegisterHostFeaturesV2, checked_selected_end_register_call_v2,
+        decode_selected_end_register_v2, invoke_preflighted_selected_end_register_v2,
+        publish_selected_end_register_v2_impl, validate_selected_end_register_host_features_v2,
+    },
 };
 
 static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn native_test_lock() -> MutexGuard<'static, ()> {
     NATIVE_TEST_LOCK.lock().expect("native test lock")
+}
+
+#[test]
+fn selected_end_register_v1_and_v2_publishers_remain_type_separated() {
+    type V1Publisher = fn(
+        &AuditedNativeImage,
+        PublicationLimits,
+    ) -> Result<PublishedKernel<SelectedEnd>, PublishError>;
+    type V2Publisher = fn(
+        &AuditedSelectedEndRegisterImageV2,
+        PublicationLimits,
+    ) -> Result<PublishedSelectedEndRegisterV2, PublishError>;
+
+    let _v1: V1Publisher = publish_audited::<SelectedEnd>;
+    let _v2: V2Publisher = publish_selected_end_register_v2;
+}
+
+#[test]
+fn selected_end_register_v2_feature_admission_is_backend_exact_and_vl_free() {
+    let features = |asimd, sve, sve2| SelectedEndRegisterHostFeaturesV2 { asimd, sve, sve2 };
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::AsimdV8,
+            features(true, false, false),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::AsimdV8,
+            features(false, true, true),
+        ),
+        Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
+    );
+    for (available, missing) in [
+        (features(false, true, true), "asimd"),
+        (features(true, false, true), "sve"),
+        (features(true, true, false), "sve2"),
+    ] {
+        assert_eq!(
+            validate_selected_end_register_host_features_v2(
+                SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
+                available,
+            ),
+            Err(PublishError::CpuFeatureUnavailable { feature: missing })
+        );
+    }
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
+            features(true, true, true),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn selected_end_register_v2_end_or_zero_decode_is_closed() {
+    let window = SearchWindow::new(4, 32);
+    assert_eq!(decode_selected_end_register_v2(0, window, 6), Ok(None));
+    assert_eq!(
+        decode_selected_end_register_v2(12, window, 6),
+        Ok(Some(fre_kernel_ir::MatchSpan::new(6, 12)))
+    );
+    for (end_or_zero, literal_bytes) in [(5, 6), (8, 6), (33, 6), (usize::MAX, 6), (12, 0)] {
+        assert_eq!(
+            decode_selected_end_register_v2(end_or_zero, window, literal_bytes),
+            Err(SelectedEndRegisterCallErrorV2::InvalidNativeEnd {
+                end_or_zero,
+                literal_bytes,
+                window_start: window.start(),
+                window_end: window.end(),
+            })
+        );
+    }
+}
+
+#[test]
+fn selected_end_register_v2_preflight_refuses_before_entry_and_returns_accounting() {
+    let calls = Cell::new(0_usize);
+    let literal_bytes = NonZeroU32::new(6).expect("nonzero literal");
+    let haystack = b"xxneedlezz";
+    let window = SearchWindow::new(2, 8);
+    let (matched, accounting) = checked_selected_end_register_call_v2(
+        literal_bytes,
+        haystack,
+        window,
+        LiteralSearchLimits::unlimited(),
+        || {
+            calls.set(calls.get() + 1);
+            8
+        },
+    )
+    .expect("checked ABI2 call");
+    assert_eq!(matched, Some(fre_kernel_ir::MatchSpan::new(2, 8)));
+    assert_eq!(accounting.needle_bytes, 6);
+    assert_eq!(accounting.searched_bytes, 6);
+    assert_eq!(accounting.linear_terms, 12);
+    assert_eq!(accounting.scratch_bytes, 0);
+    assert_eq!(calls.get(), 1);
+
+    for (bad_window, limits) in [
+        (SearchWindow::new(9, 8), LiteralSearchLimits::unlimited()),
+        (
+            SearchWindow::new(0, haystack.len() + 1),
+            LiteralSearchLimits::unlimited(),
+        ),
+        (
+            SearchWindow::new(0, haystack.len()),
+            LiteralSearchLimits {
+                max_linear_terms: 1,
+            },
+        ),
+    ] {
+        let before = calls.get();
+        let refused = checked_selected_end_register_call_v2(
+            literal_bytes,
+            haystack,
+            bad_window,
+            limits,
+            || {
+                calls.set(calls.get() + 1);
+                0
+            },
+        );
+        assert!(matches!(
+            refused,
+            Err(SelectedEndRegisterCallErrorV2::Preflight(_))
+        ));
+        assert_eq!(calls.get(), before);
+    }
+}
+
+#[test]
+fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_width() {
+    let haystack = b"xxneedlezz";
+    let checked = CheckedSearchWindow::new(haystack, SearchWindow::new(2, 8))
+        .expect("checked literal window");
+    let plan = LiteralPlan::new(b"needle", LiteralBuildLimits::default()).expect("literal plan");
+    let preflight = plan
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+        .expect("authoritative literal preflight");
+    let expected_accounting = preflight.accounting();
+    let calls = Cell::new(0_usize);
+    let result = invoke_preflighted_selected_end_register_v2(
+        NonZeroU32::new(6).expect("nonzero literal"),
+        preflight,
+        |bound_haystack, bound_window| {
+            calls.set(calls.get() + 1);
+            assert!(core::ptr::eq(bound_haystack, haystack));
+            assert_eq!(bound_window, SearchWindow::new(2, 8));
+            8
+        },
+    )
+    .expect("preflighted ABI2 call");
+    assert_eq!(
+        result,
+        (
+            Some(fre_kernel_ir::MatchSpan::new(2, 8)),
+            expected_accounting
+        )
+    );
+    assert_eq!(calls.get(), 1);
+
+    let wrong_plan =
+        LiteralPlan::new(b"needles", LiteralBuildLimits::default()).expect("wrong-width plan");
+    let wrong = wrong_plan
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+        .expect("wrong-width preflight remains internally valid");
+    let before = calls.get();
+    assert_eq!(
+        invoke_preflighted_selected_end_register_v2(
+            NonZeroU32::new(6).expect("nonzero literal"),
+            wrong,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                0
+            },
+        ),
+        Err(SelectedEndRegisterCallErrorV2::LiteralWidthMismatch {
+            expected_bytes: 6,
+            actual_bytes: 7,
+        })
+    );
+    assert_eq!(calls.get(), before);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one source seal keeps the distinct entry, repeated P1 audit, session-only API, and authoritative preflight boundaries together"
+)]
+fn selected_end_register_v2_source_boundaries_are_sealed() {
+    fn position(source: &str, marker: &str) -> usize {
+        source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing ABI2 source marker: {marker}"))
+    }
+
+    let runtime = include_str!("selected_end_register_v2.rs");
+    let publish_start = position(
+        runtime,
+        "pub(crate) fn publish_selected_end_register_v2_impl(",
+    );
+    let preflight_start = position(runtime, "fn preflight_selected_end_register_v2(");
+    let publish = &runtime[publish_start..preflight_start];
+    assert_eq!(
+        publish
+            .matches("audit_selected_end_register_v2(image)")
+            .count(),
+        1
+    );
+    assert!(publish.contains("platform::publish_selected_end_register_v2("));
+
+    let target_start = position(runtime, "fn validate_selected_end_register_target_v2(");
+    let preflight = &runtime[preflight_start..target_start];
+    assert_eq!(
+        preflight
+            .matches("audit_selected_end_register_v2(image)")
+            .count(),
+        1
+    );
+    assert!(!preflight.contains("current_thread_sve_vector_bytes"));
+
+    let handle_start = position(runtime, "impl PublishedSelectedEndRegisterV2 {");
+    let session_start = position(
+        runtime,
+        "impl PublishedSelectedEndRegisterThreadSessionV2<'_> {",
+    );
+    let handle = &runtime[handle_start..session_start];
+    assert!(handle.contains("pub fn begin_current_thread_session("));
+    assert!(!handle.contains("pub fn search("));
+    assert!(!handle.contains("pub fn find("));
+
+    let token_start = position(
+        runtime,
+        "pub(crate) fn invoke_preflighted_selected_end_register_v2(",
+    );
+    let decode_start = position(runtime, "pub(crate) fn decode_selected_end_register_v2(");
+    let token = &runtime[token_start..decode_start];
+    assert!(token.contains("preflight.literal_bytes()"));
+    assert!(token.contains("preflight.checked_window()"));
+    assert!(!token.contains("preflight_literal_window("));
+
+    let platform = include_str!("platform/aarch64.rs");
+    assert!(platform.contains("unsafe extern \"C\" fn(*const u8, usize, usize, usize) -> usize;"));
+    assert!(platform.contains("Self::SelectedEndRegisterV2(image) =>"));
+    assert!(platform.contains("audit_selected_end_register_v2(image)"));
+    assert!(platform.contains("self.selected_end_register_literal_bytes_v2.is_none()"));
+    assert!(
+        platform.contains("self.selected_end_register_literal_bytes_v2 == Some(literal_bytes)")
+    );
+    assert!(platform.contains("self.sve_vector_bytes_at_publication.is_none()"));
+    assert!(platform.contains("self.target.features == CpuFeatures::ASIMD"));
+    assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE2"));
+}
+
+#[test]
+fn selected_end_register_v2_strict_wx_guards_accounting_and_failures_are_closed() {
+    let _lock = native_test_lock();
+    assert_eq!(platform::live_code_mappings(), 0);
+    let literal = b"needle";
+    let program = build_exact_literal::<SelectedEnd>(
+        literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("nonempty exact SelectedEnd");
+    let image = emit_selected_end_register_v2(
+        &program,
+        SelectedEndRegisterBackendV2::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("sealed register ABI2 image");
+
+    for stage in [
+        FailureStage::Reserve,
+        FailureStage::MakeWritable,
+        FailureStage::Copy,
+        FailureStage::Verify,
+        FailureStage::Reaudit,
+        FailureStage::MakeExecutable,
+        FailureStage::InvalidateInstructionCache,
+        FailureStage::Publish,
+    ] {
+        let error = publish_selected_end_register_v2_impl(
+            &image,
+            PublicationLimits::default(),
+            FailureInjection::At(stage),
+        )
+        .expect_err("injected ABI2 publication stage fails");
+        assert_eq!(error, PublishError::InjectedFailure { stage });
+        assert_eq!(platform::live_code_mappings(), 0, "leak at {stage:?}");
+    }
+    assert_eq!(
+        publish_selected_end_register_v2_impl(
+            &image,
+            PublicationLimits::default(),
+            FailureInjection::CorruptCopy,
+        )
+        .expect_err("corrupt ABI2 copy is rejected"),
+        PublishError::CopyVerificationFailed
+    );
+    assert_eq!(platform::live_code_mappings(), 0);
+
+    let kernel = publish_selected_end_register_v2(&image, PublicationLimits::default())
+        .expect("strict-W^X ABI2 publication");
+    assert_eq!(kernel.artifact_identity(), image.artifact_identity());
+    assert_eq!(kernel.backend(), SelectedEndRegisterBackendV2::AsimdV8);
+    assert_eq!(
+        kernel.literal_bytes(),
+        u32::try_from(literal.len()).expect("small literal")
+    );
+    let accounting = kernel.accounting();
+    assert_eq!(
+        accounting.guard_bytes,
+        accounting
+            .page_bytes
+            .checked_mul(2)
+            .expect("two guard pages")
+    );
+    assert_eq!(
+        accounting.total_mapped_bytes,
+        accounting
+            .payload_mapped_bytes
+            .checked_add(accounting.guard_bytes)
+            .expect("bounded ABI2 mapping")
+    );
+    assert!(
+        kernel
+            .mapping
+            .selected_end_register_v2_contract_valid(kernel.literal_bytes())
+    );
+    assert!(
+        !kernel
+            .mapping
+            .call_contract_valid(fre_kernel_ir::OutputKind::SelectedEnd)
+    );
+    let protections = kernel
+        .mapping
+        .protections()
+        .expect("ABI2 mapping protection query");
+    assert_eq!(protections.left_guard, libc::PROT_NONE);
+    assert_eq!(protections.payload, libc::PROT_READ | libc::PROT_EXEC);
+    assert_eq!(protections.payload & libc::PROT_WRITE, 0);
+    assert_eq!(protections.right_guard, libc::PROT_NONE);
+    assert!(
+        kernel
+            .mapping
+            .post_publication_write_is_blocked()
+            .expect("isolated ABI2 write probe")
+    );
+
+    let session = kernel
+        .begin_current_thread_session()
+        .expect("V8 ABI2 session creation is syscall-free");
+    assert_eq!(
+        session
+            .find(b"zzneedlezz", LiteralSearchLimits::unlimited())
+            .expect("complete ABI2 search")
+            .0,
+        Some(fre_kernel_ir::MatchSpan::new(2, 8))
+    );
+    for right_guard in [false, true] {
+        platform::with_guarded_haystack(b"zzneedle", right_guard, |haystack| {
+            let (matched, call_accounting) = session
+                .find(haystack, LiteralSearchLimits::unlimited())
+                .expect("guarded ABI2 search");
+            assert_eq!(matched, Some(fre_kernel_ir::MatchSpan::new(2, 8)));
+            assert_eq!(call_accounting.needle_bytes, literal.len());
+            assert_eq!(call_accounting.searched_bytes, haystack.len());
+            assert_eq!(
+                call_accounting.linear_terms,
+                literal
+                    .len()
+                    .checked_add(haystack.len())
+                    .expect("bounded literal accounting")
+            );
+            assert_eq!(call_accounting.scratch_bytes, 0);
+        })
+        .expect("guarded ABI2 haystack");
+    }
+
+    for (resource, exact) in [
+        (ResourceKind::CodeBytes, accounting.code_bytes),
+        (ResourceKind::DataBytes, accounting.data_bytes),
+        (ResourceKind::PayloadBytes, accounting.payload_mapped_bytes),
+        (ResourceKind::MappedBytes, accounting.total_mapped_bytes),
+        (ResourceKind::Pages, accounting.total_pages),
+    ] {
+        let exact_limits = limits_with(resource, exact);
+        drop(
+            publish_selected_end_register_v2(&image, exact_limits)
+                .expect("exact ABI2 publication boundary"),
+        );
+        let failing = limits_with(resource, exact.checked_sub(1).expect("nonzero resource"));
+        assert!(matches!(
+            publish_selected_end_register_v2(&image, failing),
+            Err(PublishError::ResourceLimit {
+                resource: actual,
+                ..
+            }) if actual == resource
+        ));
+    }
+    drop(session);
+    drop(kernel);
+    assert_eq!(platform::live_code_mappings(), 0);
 }
 
 #[test]

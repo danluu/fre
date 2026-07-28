@@ -1,6 +1,8 @@
 //! Platform dispatch. Unsafe code is allowed only in a target implementation.
 
-use fre_jit_aarch64::{AuditedNativeImage, NativeAggregateImage, NativeImage};
+use fre_jit_aarch64::{
+    AuditedNativeImage, AuditedSelectedEndRegisterImageV2, NativeAggregateImage, NativeImage,
+};
 use fre_kernel_ir::{AggregateOutput, OutputKind};
 
 use crate::{
@@ -91,7 +93,7 @@ mod unsupported;
 )))]
 use unsupported as implementation;
 
-pub(crate) use implementation::{ExecutableMapping, SearchEntry};
+pub(crate) use implementation::{ExecutableMapping, SearchEntry, SelectedEndRegisterEntryV2};
 
 #[cfg(all(
     test,
@@ -171,6 +173,16 @@ pub(crate) fn publish_audited(
     )
 }
 
+pub(crate) fn publish_selected_end_register_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+    plan: PublicationPlan,
+    identity: RuntimeIdentity,
+    literal_bytes: u32,
+    failure: FailureInjection,
+) -> Result<ExecutableMapping, PublishError> {
+    implementation::publish_selected_end_register_v2(image, plan, identity, literal_bytes, failure)
+}
+
 pub(crate) fn publish_aggregate(
     image: &NativeAggregateImage,
     plan: PublicationPlan,
@@ -185,6 +197,7 @@ pub(crate) trait Mapping {
     fn output(&self) -> OutputKind;
     fn sve_vector_bytes_at_publication(&self) -> Option<u16>;
     fn call_contract_valid(&self, expected_output: OutputKind) -> bool;
+    fn selected_end_register_v2_contract_valid(&self, literal_bytes: u32) -> bool;
     fn aggregate_contract_valid(
         &self,
         expected_output: AggregateOutput,
@@ -208,6 +221,10 @@ impl ExecutableMapping {
 
     pub(crate) fn call_contract_valid(&self, expected_output: OutputKind) -> bool {
         <Self as Mapping>::call_contract_valid(self, expected_output)
+    }
+
+    pub(crate) fn selected_end_register_v2_contract_valid(&self, literal_bytes: u32) -> bool {
+        <Self as Mapping>::selected_end_register_v2_contract_valid(self, literal_bytes)
     }
 
     pub(crate) fn aggregate_contract_valid(

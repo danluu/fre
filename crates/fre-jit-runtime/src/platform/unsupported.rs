@@ -1,4 +1,6 @@
-use fre_jit_aarch64::{AuditedNativeImage, NativeAggregateImage, NativeImage};
+use fre_jit_aarch64::{
+    AuditedNativeImage, AuditedSelectedEndRegisterImageV2, NativeAggregateImage, NativeImage,
+};
 use fre_kernel_ir::{AggregateOutput, OutputKind, SearchWindow};
 
 use crate::{
@@ -15,6 +17,9 @@ pub(crate) struct ExecutableMapping;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SearchEntry;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SelectedEndRegisterEntryV2;
+
 impl SearchEntry {
     pub(crate) fn invoke<O: crate::RuntimeOperation>(
         self,
@@ -26,9 +31,19 @@ impl SearchEntry {
     }
 }
 
+impl SelectedEndRegisterEntryV2 {
+    pub(crate) fn invoke(self, _haystack: &[u8], _window: SearchWindow) -> usize {
+        unreachable!("unsupported hosts cannot construct an ABI2 search entry")
+    }
+}
+
 impl ExecutableMapping {
     pub(crate) fn search_entry(&self) -> SearchEntry {
         unreachable!("unsupported hosts cannot construct a search entry")
+    }
+
+    pub(crate) fn selected_end_register_entry_v2(&self) -> SelectedEndRegisterEntryV2 {
+        unreachable!("unsupported hosts cannot construct an ABI2 search entry")
     }
 }
 
@@ -46,6 +61,10 @@ impl Mapping for ExecutableMapping {
     }
 
     fn call_contract_valid(&self, _expected_output: OutputKind) -> bool {
+        false
+    }
+
+    fn selected_end_register_v2_contract_valid(&self, _literal_bytes: u32) -> bool {
         false
     }
 
@@ -114,6 +133,16 @@ pub(crate) fn publish_audited(
     _plan: PublicationPlan,
     _identity: RuntimeIdentity,
     _sve_vector_bytes_at_publication: Option<u16>,
+    _failure: FailureInjection,
+) -> Result<ExecutableMapping, PublishError> {
+    ensure_host_supported().map(|()| ExecutableMapping)
+}
+
+pub(crate) fn publish_selected_end_register_v2(
+    _image: &AuditedSelectedEndRegisterImageV2,
+    _plan: PublicationPlan,
+    _identity: RuntimeIdentity,
+    _literal_bytes: u32,
     _failure: FailureInjection,
 ) -> Result<ExecutableMapping, PublishError> {
     ensure_host_supported().map(|()| ExecutableMapping)

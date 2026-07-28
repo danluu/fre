@@ -820,6 +820,14 @@ impl<'haystack> LiteralSearchPreflight<'_, 'haystack> {
         self.accounting.searched_bytes
     }
 
+    /// Authenticated literal width owned by the plan that issued this token.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn literal_bytes(self) -> usize {
+        self.accounting.needle_bytes
+    }
+
     /// The non-forgeable window bound to this preflight's haystack.
     #[doc(hidden)]
     #[must_use]

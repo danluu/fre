@@ -15,6 +15,7 @@ sve-hardware-qualification = []
 [dependencies]
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+fre-kernels = { path = "../fre-kernels" }
 fre-target-features = { path = "../fre-target-features" }
 libc = "=0.2.186"
 

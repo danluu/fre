@@ -1,4 +1,6 @@
-use fre_jit_aarch64::{CodeLabel, ImageLayout, NativeAggregateImage, NativeImage};
+use fre_jit_aarch64::{
+    AuditedSelectedEndRegisterImageV2, CodeLabel, ImageLayout, NativeAggregateImage, NativeImage,
+};
 
 use crate::{ArithmeticSite, PublishError, ResourceKind};
 
@@ -63,6 +65,21 @@ impl PublicationPlan {
 
     pub(crate) fn new_aggregate(
         image: &NativeAggregateImage,
+        page_bytes: usize,
+        limits: PublicationLimits,
+    ) -> Result<Self, PublishError> {
+        Self::from_parts(
+            image.code().len(),
+            image.rodata().len(),
+            image.layout(),
+            image.labels(),
+            page_bytes,
+            limits,
+        )
+    }
+
+    pub(crate) fn new_selected_end_register_v2(
+        image: &AuditedSelectedEndRegisterImageV2,
         page_bytes: usize,
         limits: PublicationLimits,
     ) -> Result<Self, PublishError> {
