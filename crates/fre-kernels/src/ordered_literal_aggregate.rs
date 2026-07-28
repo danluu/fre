@@ -11,10 +11,12 @@
 //! ordered literal starting at each byte position. A bounded dynamic-program
 //! ring then implements the regex iterator's initial/progressed empty-match
 //! states. Search logically charges exactly `N` DFA transitions and `N + 1`
-//! reducer steps, while root sets backed by `memrchr1`/`memrchr2`/`memrchr3`
-//! skip maximal root-miss runs without redundant physical table lookups and DP
-//! stores. Wider root sets retain the incumbent one-transition-per-byte loop.
-//! Scratch is explicitly bounded by
+//! reducer steps. A nonempty language containing only one-byte alternatives
+//! reduces directly to byte-set membership, because every matching byte is one
+//! complete non-overlapping match. Other root sets backed by
+//! `memrchr1`/`memrchr2`/`memrchr3` skip maximal root-miss runs without
+//! redundant physical table lookups and DP stores. Wider root sets retain the
+//! incumbent one-transition-per-byte loop. Scratch is explicitly bounded by
 //! `O(min(N, longest_literal))`.
 
 use core::{fmt, mem::size_of};
@@ -1405,7 +1407,7 @@ impl PlanCore {
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
             transition_kind: "byte-class-compressed dense u32 reverse AC DFA",
-            traversal_kind: "memrchr-eligible root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
+            traversal_kind: "one-byte-union membership or memrchr-eligible root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
         }
@@ -1838,6 +1840,9 @@ impl PlanCore {
         ring: &mut [CountState],
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        if self.is_nonempty_unit_union() {
+            return self.execute_unit_union(haystack, ring.len(), upper, Operation::Count);
+        }
         if let Some(root_interest) = self.dfa.accelerated_root_interest() {
             self.execute_count::<true>(haystack, ring, upper, Some(root_interest))
         } else {
@@ -1851,11 +1856,52 @@ impl PlanCore {
         ring: &mut [SpanState],
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        if self.is_nonempty_unit_union() {
+            return self.execute_unit_union(haystack, ring.len(), upper, Operation::SpanSum);
+        }
         if let Some(root_interest) = self.dfa.accelerated_root_interest() {
             self.execute_span::<true>(haystack, ring, upper, Some(root_interest))
         } else {
             self.execute_span::<false>(haystack, ring, upper, None)
         }
+    }
+
+    #[inline]
+    const fn is_nonempty_unit_union(&self) -> bool {
+        !self.build.has_empty_pattern
+            && self.build.max_pattern_bytes == 1
+            && matches!(self.build.min_nonempty_pattern_bytes, Some(1))
+    }
+
+    fn execute_unit_union(
+        &self,
+        haystack: &[u8],
+        ring_len: usize,
+        upper: ReduceUpperBounds,
+        operation: Operation,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        validate_ring(ring_len, upper.ring_entries)?;
+        let members = self.dfa.root_interest();
+        debug_assert_ne!(members.count, 0);
+        let matches = haystack
+            .iter()
+            .map(|&byte| usize::from(members.contains(byte)))
+            .sum::<usize>();
+        let match_events = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "one-byte union match count as u64",
+        })?;
+        debug_assert!(match_events <= upper.count);
+        Ok(ReduceActualCounters {
+            transitions: haystack.len(),
+            reducer_steps: upper.reducer_steps,
+            ring_initializations: upper.ring_initializations,
+            total_work: upper.total_work,
+            match_events,
+            count: Some(match_events),
+            span_sum: (operation == Operation::SpanSum).then_some(match_events),
+            scratch_bytes: upper.scratch_bytes,
+            peak_bytes: upper.peak_bytes,
+        })
     }
 
     #[allow(
@@ -2842,10 +2888,11 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, CountState, OrderedLiteralCountPlan, OrderedLiteralCountWorkspace,
-        OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace, ReduceActualCounters,
-        ReduceError, ReduceLimits, SpanState, build_allocation_probe, checked_dp_target_slot,
-        materialize_constant_reverse_run, previous_dp_ring_slot, reserve_ring,
+        BuildError, BuildLimits, CountState, Operation, OrderedLiteralCountPlan,
+        OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace,
+        ReduceActualCounters, ReduceError, ReduceLimits, SpanState, build_allocation_probe,
+        checked_dp_target_slot, materialize_constant_reverse_run, previous_dp_ring_slot,
+        reserve_ring,
     };
     use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
 
@@ -3088,6 +3135,53 @@ mod tests {
         }
         assert_eq!(interest.count, 256);
         assert_eq!(interest.last_in(haystack), haystack.len().checked_sub(1));
+    }
+
+    #[test]
+    fn nonempty_unit_unions_reduce_directly_for_count_and_span_sum() {
+        let patterns = [
+            b"a".as_slice(),
+            b"\xFF".as_slice(),
+            b"a".as_slice(),
+            b"\0".as_slice(),
+        ];
+        let haystack = b"\0ab\xFF\x80a";
+        let count = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        assert!(count.core.is_nonempty_unit_union());
+        let mut count_workspace = OrderedLiteralCountWorkspace::new();
+        let counted = count
+            .count_with_workspace(haystack, ReduceLimits::unlimited(), &mut count_workspace)
+            .unwrap();
+        assert_eq!(counted.count, 4);
+        assert_eq!(counted.accounting.actual.match_events, 4);
+        assert_eq!(counted.accounting.actual.count, Some(4));
+        assert_eq!(counted.accounting.actual.span_sum, None);
+
+        let span = OrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        assert!(span.core.is_nonempty_unit_union());
+        let mut span_workspace = OrderedLiteralSpanSumWorkspace::new();
+        let summed = span
+            .span_sum_with_workspace(haystack, ReduceLimits::unlimited(), &mut span_workspace)
+            .unwrap();
+        assert_eq!(summed.span_sum, 4);
+        assert_eq!(summed.accounting.actual.match_events, 4);
+        assert_eq!(summed.accounting.actual.count, Some(4));
+        assert_eq!(summed.accounting.actual.span_sum, Some(4));
+
+        let with_empty = OrderedLiteralCountPlan::build(
+            &[b"".as_slice(), b"a".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(!with_empty.core.is_nonempty_unit_union());
+        let wider = OrderedLiteralCountPlan::build(
+            &[b"a".as_slice(), b"ab".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(!wider.core.is_nonempty_unit_union());
+        assert_eq!(count.cache_identity().operation, Operation::Count);
+        assert_eq!(span.cache_identity().operation, Operation::SpanSum);
     }
 
     #[test]
