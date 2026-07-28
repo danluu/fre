@@ -144,6 +144,9 @@ impl std::error::Error for PublishError {
 pub enum KernelThreadContractError {
     /// The host capability query itself could not run.
     HostCapabilities(PublishError),
+    /// A plan-bound fast session was requested for a literal that differs
+    /// from the exact literal sealed into the native artifact.
+    LiteralIdentityMismatch,
     /// A fixed-VL SVE/SVE2 kernel requires a different current-thread vector
     /// length.
     RequiredSveVectorLengthUnavailable {
@@ -162,7 +165,7 @@ impl std::error::Error for KernelThreadContractError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::HostCapabilities(error) => Some(error),
-            Self::RequiredSveVectorLengthUnavailable { .. } => None,
+            Self::LiteralIdentityMismatch | Self::RequiredSveVectorLengthUnavailable { .. } => None,
         }
     }
 }

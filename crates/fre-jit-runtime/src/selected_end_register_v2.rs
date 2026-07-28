@@ -5,14 +5,14 @@ use core::{fmt, marker::PhantomData, num::NonZeroU32};
 use std::{rc::Rc, sync::Arc};
 
 use fre_jit_aarch64::{
-    AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures,
+    AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures, MAX_REPEATED_CONFIRM_BYTES,
     SelectedEndRegisterArtifactIdentityV2, SelectedEndRegisterBackendV2, TargetSpec,
     audit_selected_end_register_v2,
 };
 use fre_kernel_ir::{MatchSpan, OutputKind, SearchWindow};
 use fre_kernels::{
-    LiteralAccounting, LiteralError, LiteralSearchLimits, LiteralSearchPreflight, Window,
-    preflight_literal_window,
+    LiteralAccounting, LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSearchPreflight,
+    Window, preflight_literal_window,
 };
 
 use crate::{
@@ -34,6 +34,8 @@ pub enum SelectedEndRegisterCallErrorV2 {
         expected_bytes: usize,
         actual_bytes: usize,
     },
+    /// A same-width preflight token belongs to a different exact literal.
+    LiteralIdentityMismatch,
     /// Native code returned an end that cannot encode a match inside the
     /// checked window for the authenticated nonzero literal width.
     InvalidNativeEnd {
@@ -59,6 +61,7 @@ impl std::error::Error for SelectedEndRegisterCallErrorV2 {
             Self::Preflight(error) => Some(error),
             Self::LiteralWidthNotRepresentable { .. }
             | Self::LiteralWidthMismatch { .. }
+            | Self::LiteralIdentityMismatch
             | Self::InvalidNativeEnd { .. } => None,
         }
     }
@@ -83,6 +86,7 @@ pub struct PublishedSelectedEndRegisterV2 {
     accounting: PublicationAccounting,
     backend: SelectedEndRegisterBackendV2,
     literal_bytes: NonZeroU32,
+    exact_literal: [u8; MAX_REPEATED_CONFIRM_BYTES],
 }
 
 /// Current-thread invocation token for one register-return ABI2 publication.
@@ -108,6 +112,7 @@ pub struct PublishedSelectedEndRegisterThreadSessionV2<'kernel> {
     entry: SelectedEndRegisterEntryV2,
     literal_bytes: NonZeroU32,
     kernel: &'kernel PublishedSelectedEndRegisterV2,
+    literal_plan: Option<&'kernel LiteralPlan>,
     thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -121,6 +126,7 @@ impl Clone for PublishedSelectedEndRegisterV2 {
             accounting: self.accounting,
             backend: self.backend,
             literal_bytes: self.literal_bytes,
+            exact_literal: self.exact_literal,
         }
     }
 }
@@ -156,6 +162,32 @@ impl PublishedSelectedEndRegisterV2 {
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'_>, KernelThreadContractError> {
+        self.begin_current_thread_session_impl(None)
+    }
+
+    /// Establish a plan-bound session for the qualified exact-literal facade.
+    ///
+    /// This compares the plan's immutable literal with the sealed artifact
+    /// once. Repeated preflighted calls can then prove that their token came
+    /// from this exact plan with a pointer-identity check instead of comparing
+    /// up to 32 literal bytes on every hot call.
+    #[doc(hidden)]
+    pub fn begin_current_thread_session_for_literal_plan<'session>(
+        &'session self,
+        plan: &'session LiteralPlan,
+    ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'session>, KernelThreadContractError>
+    {
+        if plan.needle() != self.exact_literal() {
+            return Err(KernelThreadContractError::LiteralIdentityMismatch);
+        }
+        self.begin_current_thread_session_impl(Some(plan))
+    }
+
+    fn begin_current_thread_session_impl<'session>(
+        &'session self,
+        literal_plan: Option<&'session LiteralPlan>,
+    ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'session>, KernelThreadContractError>
+    {
         let required = self.backend.fixed_active_vector_bytes();
         if required != 0 {
             let actual = platform::current_thread_sve_vector_bytes()
@@ -173,8 +205,16 @@ impl PublishedSelectedEndRegisterV2 {
             entry: self.entry,
             literal_bytes: self.literal_bytes,
             kernel: self,
+            literal_plan,
             thread_bound: PhantomData,
         })
+    }
+
+    #[inline]
+    fn exact_literal(&self) -> &[u8] {
+        let bytes = usize::try_from(self.literal_bytes.get())
+            .expect("u32 literal width fits every supported runtime host");
+        &self.exact_literal[..bytes]
     }
 
     /// Exact page/code/data accounting charged at publication.
@@ -233,8 +273,10 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
     ///
     /// The token's private fields bind its exact plan, haystack, window,
     /// accounting, and successful resource admission. This boundary verifies
-    /// that plan's literal width against the sealed ABI2 image, then invokes
-    /// native code without repeating scalar preflight.
+    /// that plan's exact literal against the sealed ABI2 image, then invokes
+    /// native code without repeating scalar preflight. Qualified facade
+    /// sessions bind their plan once at construction and use a pointer check
+    /// here; general sessions compare the exact bytes.
     #[doc(hidden)]
     #[inline]
     pub fn search_preflighted(
@@ -243,6 +285,8 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
     ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
         invoke_preflighted_selected_end_register_v2(
             self.literal_bytes,
+            self.kernel.exact_literal(),
+            self.literal_plan,
             preflight,
             |haystack, window| self.entry.invoke(haystack, window),
         )
@@ -319,6 +363,7 @@ pub(crate) fn publish_selected_end_register_v2_impl(
     failure: FailureInjection,
 ) -> Result<PublishedSelectedEndRegisterV2, PublishError> {
     let literal_bytes = preflight_selected_end_register_v2(image)?;
+    let exact_literal = copy_selected_end_register_literal_v2(image, literal_bytes)?;
     let page_bytes = platform::page_size()?;
     let plan = PublicationPlan::new_selected_end_register_v2(image, page_bytes, limits)?;
     let runtime_identity = RuntimeIdentity::from_preflight_selected_end_register_v2(image);
@@ -348,7 +393,23 @@ pub(crate) fn publish_selected_end_register_v2_impl(
         accounting: plan.accounting,
         backend: image.backend(),
         literal_bytes,
+        exact_literal,
     })
+}
+
+fn copy_selected_end_register_literal_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+    literal_bytes: NonZeroU32,
+) -> Result<[u8; MAX_REPEATED_CONFIRM_BYTES], PublishError> {
+    let literal_len = usize::try_from(literal_bytes.get())
+        .map_err(|_| PublishError::PublicationIdentityMismatch)?;
+    let source = image.rodata();
+    if literal_len > MAX_REPEATED_CONFIRM_BYTES || source.len() != literal_len {
+        return Err(PublishError::PublicationIdentityMismatch);
+    }
+    let mut exact_literal = [0_u8; MAX_REPEATED_CONFIRM_BYTES];
+    exact_literal[..literal_len].copy_from_slice(source);
+    Ok(exact_literal)
 }
 
 fn preflight_selected_end_register_v2(
@@ -443,6 +504,8 @@ pub(crate) fn checked_selected_end_register_call_v2(
 #[inline]
 pub(crate) fn invoke_preflighted_selected_end_register_v2(
     literal_bytes: NonZeroU32,
+    exact_literal: &[u8],
+    literal_plan: Option<&LiteralPlan>,
     preflight: LiteralSearchPreflight<'_, '_>,
     invoke: impl FnOnce(&[u8], SearchWindow) -> usize,
 ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
@@ -457,6 +520,19 @@ pub(crate) fn invoke_preflighted_selected_end_register_v2(
             expected_bytes,
             actual_bytes,
         });
+    }
+    if exact_literal.len() != expected_bytes {
+        return Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch);
+    }
+    let exact_identity = match literal_plan {
+        Some(plan) => {
+            debug_assert_eq!(plan.needle(), exact_literal);
+            preflight.was_issued_by(plan)
+        }
+        None => preflight.literal() == exact_literal,
+    };
+    if !exact_identity {
+        return Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch);
     }
     let accounting = preflight.accounting();
     let checked = preflight.checked_window();

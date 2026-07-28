@@ -194,6 +194,8 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_widt
     let calls = Cell::new(0_usize);
     let result = invoke_preflighted_selected_end_register_v2(
         NonZeroU32::new(6).expect("nonzero literal"),
+        b"needle",
+        None,
         preflight,
         |bound_haystack, bound_window| {
             calls.set(calls.get() + 1);
@@ -221,6 +223,8 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_widt
     assert_eq!(
         invoke_preflighted_selected_end_register_v2(
             NonZeroU32::new(6).expect("nonzero literal"),
+            b"needle",
+            None,
             wrong,
             |_, _| {
                 calls.set(calls.get() + 1);
@@ -233,6 +237,60 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_widt
         })
     );
     assert_eq!(calls.get(), before);
+
+    let wrong_identity =
+        LiteralPlan::new(b"noodle", LiteralBuildLimits::default()).expect("same-width wrong plan");
+    let wrong_identity_preflight = wrong_identity
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+        .expect("same-width wrong preflight remains internally valid");
+    assert_eq!(
+        invoke_preflighted_selected_end_register_v2(
+            NonZeroU32::new(6).expect("nonzero literal"),
+            b"needle",
+            None,
+            wrong_identity_preflight,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                0
+            },
+        ),
+        Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch)
+    );
+    assert_eq!(calls.get(), before);
+
+    let plan_bound = invoke_preflighted_selected_end_register_v2(
+        NonZeroU32::new(6).expect("nonzero literal"),
+        b"needle",
+        Some(&plan),
+        preflight,
+        |_, _| {
+            calls.set(calls.get() + 1);
+            8
+        },
+    )
+    .expect("exact plan identity takes the allocation-free hot path");
+    assert_eq!(plan_bound.0, Some(fre_kernel_ir::MatchSpan::new(2, 8)));
+    assert_eq!(calls.get(), before + 1);
+
+    let equal_but_distinct =
+        LiteralPlan::new(b"needle", LiteralBuildLimits::default()).expect("distinct equal plan");
+    let equal_but_distinct_preflight = equal_but_distinct
+        .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+        .expect("distinct equal preflight");
+    assert_eq!(
+        invoke_preflighted_selected_end_register_v2(
+            NonZeroU32::new(6).expect("nonzero literal"),
+            b"needle",
+            Some(&plan),
+            equal_but_distinct_preflight,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                0
+            },
+        ),
+        Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch)
+    );
+    assert_eq!(calls.get(), before + 1);
 }
 
 #[test]
@@ -290,6 +348,8 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     );
     let handle = &runtime[handle_start..session_start];
     assert!(handle.contains("pub fn begin_current_thread_session("));
+    assert!(handle.contains("pub fn begin_current_thread_session_for_literal_plan"));
+    assert!(handle.contains("plan.needle() != self.exact_literal()"));
     assert!(handle.contains("let required = self.backend.fixed_active_vector_bytes();"));
     assert!(handle.contains("if required != 0"));
     assert_eq!(
@@ -306,6 +366,8 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     let decode_start = position(runtime, "pub(crate) fn decode_selected_end_register_v2(");
     let token = &runtime[token_start..decode_start];
     assert!(token.contains("preflight.literal_bytes()"));
+    assert!(token.contains("preflight.literal() == exact_literal"));
+    assert!(token.contains("preflight.was_issued_by(plan)"));
     assert!(token.contains("preflight.checked_window()"));
     assert!(!token.contains("preflight_literal_window("));
 

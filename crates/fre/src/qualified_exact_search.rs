@@ -646,16 +646,19 @@ enum QualifiedExactSearchNative {
 
 impl QualifiedExactSearchNative {
     #[inline]
-    fn begin_current_thread_session(
-        &self,
-    ) -> Result<QualifiedExactSearchNativeThreadSession<'_>, QualifiedExactSearchThreadContractError>
-    {
+    fn begin_current_thread_session<'session>(
+        &'session self,
+        literal_plan: &'session LiteralPlan,
+    ) -> Result<
+        QualifiedExactSearchNativeThreadSession<'session>,
+        QualifiedExactSearchThreadContractError,
+    > {
         match self {
             Self::LegacyV1(native) => native
                 .begin_current_thread_session()
                 .map(QualifiedExactSearchNativeThreadSession::LegacyV1),
             Self::RegisterV2(native) => native
-                .begin_current_thread_session()
+                .begin_current_thread_session_for_literal_plan(literal_plan)
                 .map(QualifiedExactSearchNativeThreadSession::RegisterV2),
         }
     }
@@ -1122,7 +1125,7 @@ impl QualifiedExactSearch {
         let native = retained_native_if_authorized(self.native.as_ref(), || {
             self.retained_native_execution_authorized()
         })
-        .map(QualifiedExactSearchNative::begin_current_thread_session)
+        .map(|native| native.begin_current_thread_session(&self.portable))
         .transpose()?;
         Ok(QualifiedExactSearchThreadSession {
             search: self,
@@ -2251,6 +2254,17 @@ mod tests {
         assert!(session.contains("PublishedKernelThreadSession<'kernel, NativeSelectedEnd>"));
         assert!(session.contains("PublishedSelectedEndRegisterThreadSessionV2<'kernel>"));
 
+        let native_session_start = position(source, "\nimpl QualifiedExactSearchNative {");
+        let native_session_end = native_session_start
+            + position(
+                &source[native_session_start..],
+                "\n#[derive(Debug)]\nenum QualifiedExactSearchNativeThreadSession",
+            );
+        let native_session = &source[native_session_start..native_session_end];
+        assert!(
+            native_session.contains(".begin_current_thread_session_for_literal_plan(literal_plan)")
+        );
+
         let construction_start = position(
             source,
             "    fn with_portable_plan_backend_and_qualification(",
@@ -2303,6 +2317,18 @@ mod tests {
         assert!(invocation.contains("native.search_preflighted(preflight)?"));
         assert!(invocation.contains("Self::LegacyV1(native)"));
         assert!(invocation.contains("match_from_legacy_native_selected_end(end, decode_window)"));
+
+        let public_session_start = position(
+            source,
+            "    pub fn begin_current_thread_session(\n        &self,",
+        );
+        let public_session_end = public_session_start
+            + position(
+                &source[public_session_start..],
+                "\n    #[inline]\n    fn retained_native_execution_authorized",
+            );
+        let public_session = &source[public_session_start..public_session_end];
+        assert!(public_session.contains("native.begin_current_thread_session(&self.portable)"));
     }
 
     #[test]

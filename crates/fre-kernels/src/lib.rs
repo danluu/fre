@@ -803,7 +803,7 @@ pub struct LiteralSearchPreflight<'plan, 'haystack> {
     accounting: LiteralAccounting,
 }
 
-impl<'haystack> LiteralSearchPreflight<'_, 'haystack> {
+impl<'plan, 'haystack> LiteralSearchPreflight<'plan, 'haystack> {
     /// Exact accounting produced by the authoritative literal preflight.
     #[doc(hidden)]
     #[must_use]
@@ -826,6 +826,30 @@ impl<'haystack> LiteralSearchPreflight<'_, 'haystack> {
     #[inline]
     pub const fn literal_bytes(self) -> usize {
         self.accounting.needle_bytes
+    }
+
+    /// Exact immutable needle owned by the plan that issued this token.
+    ///
+    /// Native sibling executors use this to bind scalar preflight to one exact
+    /// embedded artifact instead of accepting any plan with the same width.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn literal(self) -> &'plan [u8] {
+        self.plan.needle()
+    }
+
+    /// Whether this token was issued by one exact plan instance.
+    ///
+    /// A native session may first compare that plan's immutable needle with
+    /// its sealed artifact and then use this allocation-free identity check on
+    /// repeated calls. Equal bytes in a different plan remain a distinct
+    /// instance and therefore take the general byte-identity path.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn was_issued_by(self, plan: &LiteralPlan) -> bool {
+        core::ptr::eq(self.plan, plan)
     }
 
     /// The non-forgeable window bound to this preflight's haystack.
@@ -1089,6 +1113,11 @@ mod tests {
             exact.searched_bytes(),
             haystack.len().checked_sub(1).expect("nonempty haystack")
         );
+        assert_eq!(exact.literal(), b"needle");
+        assert!(exact.was_issued_by(&plan));
+        let equal_but_distinct =
+            LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap();
+        assert!(!exact.was_issued_by(&equal_but_distinct));
         assert_eq!(
             exact.checked_window().haystack().as_ptr(),
             haystack.as_ptr()
