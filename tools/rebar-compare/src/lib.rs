@@ -10172,8 +10172,27 @@ fn fixed_predicate_word64_plan_identity_matches(
         &report.syntax_key.profile,
         CompatibilityProfile::RustBytes(profile) if !profile.options.unicode
     );
-    let source_ranges_in_range = build.source_ranges > build.positions
+    let source_ranges_in_range = build.source_ranges >= build.positions
         && build.source_ranges <= build.positions.saturating_mul(2);
+    let member_writes_in_range = build.member_writes >= build.source_ranges
+        && build.member_writes <= build.source_ranges.saturating_mul(128);
+    let anchor_mask_reads_match = build.anchor_mask_reads == build.positions.saturating_mul(128);
+    let reducer_identity_matches = match identity.reducer {
+        fre::FixedPredicateWord64Reducer::OneByteAnchor => {
+            usize::from(identity.anchor_offset) < identity.width
+                && identity.anchor_bytes[0].is_ascii()
+                && identity.anchor_bytes[1] == 0
+        }
+        fre::FixedPredicateWord64Reducer::TwoByteAnchor => {
+            usize::from(identity.anchor_offset) < identity.width
+                && identity.anchor_bytes[0].is_ascii()
+                && identity.anchor_bytes[1].is_ascii()
+                && identity.anchor_bytes[0] < identity.anchor_bytes[1]
+        }
+        fre::FixedPredicateWord64Reducer::ShiftAnd => {
+            identity.anchor_offset == 0 && identity.anchor_bytes == [0, 0]
+        }
+    };
     let capture_erasure_matches = [2_usize, 3_usize].into_iter().any(|passes| {
         report
             .captures_erased
@@ -10199,7 +10218,9 @@ fn fixed_predicate_word64_plan_identity_matches(
         && build.mask_zero_writes == fre::FIXED_PREDICATE_WORD64_MASK_SLOTS
         && build.position_visits == build.positions
         && build.range_inspections == build.source_ranges
-        && build.member_writes == build.source_ranges
+        && member_writes_in_range
+        && anchor_mask_reads_match
+        && reducer_identity_matches
         && build.work_charged <= build.work_upper_bound
         && build.allocations == 0
         && build.reserves == 0
@@ -19610,7 +19631,7 @@ mod tests {
             .build_count()
             .expect("captured Rebar-cap Word64 retry plan");
         assert_eq!(captured.build_report().captures_erased, 2);
-        assert_eq!(captured.build_report().capture_erasure_work, 6);
+        assert_eq!(captured.build_report().capture_erasure_work, 4);
         current_fre_rebar_validate_aggregate_identity(captured.build_report(), false, "count")
             .expect("closed captured post-dense-retry identity");
         let captured_limits =
@@ -19629,6 +19650,95 @@ mod tests {
         assert_ne!(
             unicode.build_report().plan,
             AggregatePlanKind::FixedPredicateWord64
+        );
+    }
+
+    #[test]
+    fn current_fre_fixed_predicate_word64_admits_general_ranges_and_every_reducer() {
+        for (pattern, case_insensitive, expected_reducer) in [
+            (
+                "[a-z]shing",
+                false,
+                fre::FixedPredicateWord64Reducer::OneByteAnchor,
+            ),
+            (
+                "abcdefghijklmno",
+                true,
+                fre::FixedPredicateWord64Reducer::TwoByteAnchor,
+            ),
+            (
+                "[a-z][0-9][A-Z][0-9]",
+                false,
+                fre::FixedPredicateWord64Reducer::ShiftAnd,
+            ),
+        ] {
+            let count = current_fre_rebar_aggregate_builder(pattern, false, case_insensitive)
+                .build_count()
+                .expect("general fixed-predicate count plan");
+            assert_eq!(
+                count.build_report().plan,
+                AggregatePlanKind::FixedPredicateWord64,
+                "{pattern}"
+            );
+            let AggregatePlanIdentity::FixedPredicateWord64(identity) =
+                count.build_report().plan_identity
+            else {
+                panic!("{pattern} must retain a fixed-predicate identity");
+            };
+            assert_eq!(identity.reducer, expected_reducer, "{pattern}");
+            current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
+                .unwrap_or_else(|error| panic!("{pattern} identity must close: {error}"));
+        }
+
+        let limits = RunLimits::default();
+        let pattern = "[a-z]shing";
+        let patterns = vec![pattern.to_string()];
+        let haystack = b"ashing|bshing|zshing|Ashing|xshingx";
+        let count = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_count()
+            .expect("shing fixed-predicate count plan");
+        let AggregateBuildAccounting::FixedPredicateWord64(build) = count.build_report().build
+        else {
+            panic!("expected shing fixed-predicate build accounting");
+        };
+        assert_eq!(build.positions, 6);
+        assert_eq!(build.source_ranges, 6);
+        assert_eq!(build.member_writes, 31);
+        assert_eq!(build.anchor_mask_reads, 6 * 128);
+
+        let count_limits =
+            current_fre_rebar_aggregate_run_limits(haystack.len(), count.build_report())
+                .expect("shing fixed-predicate run limits");
+        let counted = count
+            .count(haystack, count_limits)
+            .expect("shing fixed-predicate count");
+        assert_eq!(counted.value(), 4);
+        let AggregateExecutionDetails::FixedPredicateWord64(accounting) =
+            counted.report().details()
+        else {
+            panic!("expected shing fixed-predicate execution accounting");
+        };
+        assert!(accounting.actual.finder_calls > 0);
+        assert!(accounting.actual.anchor_candidates > 0);
+        assert!(accounting.actual.predicate_checks > 0);
+        assert!(accounting.actual.finder_calls <= accounting.upper_bounds.finder_calls);
+        assert!(accounting.actual.anchor_candidates <= accounting.upper_bounds.anchor_candidates);
+        assert!(accounting.actual.predicate_checks <= accounting.upper_bounds.predicate_checks);
+
+        assert_current_fre_execution(
+            current_fre("count", &patterns, haystack, false, false, &limits),
+            4,
+            "aggregate-fixed-predicate-word64",
+        );
+        assert_current_fre_execution(
+            current_fre("count-spans", &patterns, haystack, false, false, &limits),
+            24,
+            "aggregate-fixed-predicate-word64",
+        );
+        assert_current_fre_execution(
+            current_fre("compile", &patterns, haystack, false, false, &limits),
+            4,
+            "compile-aggregate-fixed-predicate-word64",
         );
     }
 
@@ -20323,7 +20433,7 @@ mod tests {
         assert_current_fre_execution(
             current_fre("count", &folded, b"SHERLOCK sherlock", false, true, &limits),
             2,
-            "aggregate-finite-literal-dfa",
+            "aggregate-fixed-predicate-word64",
         );
 
         // These are canonical leftmost-first results. The pinned Rust meta
