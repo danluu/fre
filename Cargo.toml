@@ -54,9 +54,9 @@ module_name_repetitions = "allow"
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = false
 panic = "abort"
 
 [profile.bench]
 debug = 1
-lto = "thin"
+lto = false
