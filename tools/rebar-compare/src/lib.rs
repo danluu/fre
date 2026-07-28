@@ -19,6 +19,7 @@ use std::{fmt::Write as _, io::Write as _};
 
 use bstr::ByteSlice;
 use fre::{
+    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
     ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION,
     ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION, ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID,
@@ -214,7 +215,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-unicode-folded-literal-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -578,6 +579,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences whose non-ASCII folded root has at most four canonical members and whose Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
+        );
+        identity.identity.push_str(
+            "; aggregate-many-total-byte-cover-v1 proves from canonical HIR alone that every pattern is nonnullable and that the one-byte slices of a look-free subset cover all 256 byte values, making ordered span sum exactly the haystack length without reading source bytes",
+        );
+        identity.availability.push_str(
+            "; Unicode-off ordered build-many span-sum uses the total-cover theorem when its structural witnesses are complete; count, capture-count, nullable sets, incomplete covers, and looked witnesses retain their incumbent plans",
         );
         identity
             .identity
@@ -1474,6 +1481,7 @@ impl CurrentFreAggregateCompileArtifact {
                 )?;
                 Ok(match regex.build_report().plan {
                     AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
+                    AggregateManyPlanKind::TotalByteCoverSpanSum => "compile-many-total-byte-cover",
                     AggregateManyPlanKind::ContinuationProgram => {
                         "compile-many-continuation-program"
                     }
@@ -2518,10 +2526,16 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
 fn aggregate_many_plan_label(model: &str, plan: AggregateManyPlanKind) -> &'static str {
     match (model, plan) {
         ("compile", AggregateManyPlanKind::OrderedLiteral) => "compile-many-ordered-literal",
+        ("compile", AggregateManyPlanKind::TotalByteCoverSpanSum) => {
+            "compile-many-total-byte-cover"
+        }
         ("compile", AggregateManyPlanKind::ContinuationProgram) => {
             "compile-many-continuation-program"
         }
         (_, AggregateManyPlanKind::OrderedLiteral) => "aggregate-many-ordered-literal",
+        (_, AggregateManyPlanKind::TotalByteCoverSpanSum) => {
+            "aggregate-many-total-byte-cover-span-sum"
+        }
         (_, AggregateManyPlanKind::ContinuationProgram) => "aggregate-many-continuation-program",
     }
 }
@@ -14060,6 +14074,50 @@ fn require_aggregate_many_identity(
     )
 }
 
+fn authenticate_aggregate_many_plan_identity(
+    patterns: usize,
+    unicode: bool,
+    report: &AggregateManyBuildReport,
+    operation: AggregateManyOperation,
+) -> Result<Option<AggregateManyLiteralSemantics>, ExecutionError> {
+    match (report.plan, report.plan_identity, report.build) {
+        (
+            AggregateManyPlanKind::OrderedLiteral,
+            AggregateManyPlanIdentity::OrderedLiteral { semantics, .. },
+            AggregateManyBuildAccounting::OrderedLiteral(_),
+        ) if report.strategy.is_none() => Ok(Some(semantics)),
+        (
+            AggregateManyPlanKind::TotalByteCoverSpanSum,
+            AggregateManyPlanIdentity::TotalByteCoverSpanSum(identity),
+            AggregateManyBuildAccounting::TotalByteCoverSpanSum(build),
+        ) if report.strategy.is_none()
+            && operation == AggregateManyOperation::SpanSum
+            && !unicode
+            && identity.algorithm == AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID
+            && identity.patterns == patterns
+            && identity.patterns == build.patterns
+            && identity.nonnullable_patterns == patterns
+            && identity.nonnullable_patterns == build.nonnullable_patterns
+            && identity.look_free_patterns == build.look_free_patterns
+            && identity.contributing_patterns == build.contributing_patterns
+            && identity.covered_bytes == 256
+            && identity.covered_bytes == build.covered_bytes
+            && build.allocations == 0
+            && !identity.unicode =>
+        {
+            Ok(None)
+        }
+        (
+            AggregateManyPlanKind::ContinuationProgram,
+            AggregateManyPlanIdentity::Continuation(_),
+            AggregateManyBuildAccounting::Continuation(_),
+        ) if report.strategy.is_some() => Ok(None),
+        _ => Err(ExecutionError::fault(
+            "FRE ordered build-many plan/accounting/semantic identity mismatch",
+        )),
+    }
+}
+
 fn require_aggregate_many_report_identity(
     patterns: &[String],
     unicode: bool,
@@ -14070,9 +14128,12 @@ fn require_aggregate_many_report_identity(
     let mut expected_profile = rebar_profile();
     expected_profile.options.unicode = unicode;
     expected_profile.options.case_insensitive = case_insensitive;
-    if report.profile != expected_profile || report.operation != operation {
+    if report.schema_version != AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION
+        || report.profile != expected_profile
+        || report.operation != operation
+    {
         return Err(ExecutionError::fault(
-            "FRE ordered build-many profile/operation identity mismatch",
+            "FRE ordered build-many schema/profile/operation identity mismatch",
         ));
     }
     match operation {
@@ -14115,10 +14176,8 @@ fn require_aggregate_many_report_identity(
             )));
         }
     }
-    let literal_semantics = match report.plan_identity {
-        AggregateManyPlanIdentity::OrderedLiteral { semantics, .. } => Some(semantics),
-        AggregateManyPlanIdentity::Continuation(_) => None,
-    };
+    let literal_semantics =
+        authenticate_aggregate_many_plan_identity(patterns.len(), unicode, report, operation)?;
     if unicode
         && literal_semantics != Some(AggregateManyLiteralSemantics::UnicodeOnNonemptyUtf8Literals)
     {
@@ -14136,6 +14195,29 @@ fn require_aggregate_many_report_identity(
         ));
     }
     Ok(())
+}
+
+fn total_byte_cover_operation_limits(
+    haystack_len: usize,
+    boundaries: usize,
+    reducer_limit: usize,
+    build: fre::AggregateManyTotalByteCoverBuildAccounting,
+    limits: &RunLimits,
+) -> AggregateOperationLimits {
+    AggregateOperationLimits {
+        max_boundaries: boundaries,
+        max_table_cells: 0,
+        max_random_access_bytes: 0,
+        max_scratch_bytes: 0,
+        max_log_bytes: 0,
+        max_sequential_bytes: 0,
+        max_match_events: haystack_len.min(reducer_limit),
+        max_output_matches: haystack_len.min(reducer_limit),
+        max_output_bytes: 0,
+        max_span_sum: haystack_len,
+        max_peak_bytes: build.persistent_bytes.min(limits.fre_aggregate_peak_bytes),
+        max_work: 1_usize.min(limits.fre_aggregate_operation_work),
+    }
 }
 
 fn aggregate_many_run_limits(
@@ -14180,27 +14262,43 @@ fn aggregate_many_run_limits(
                 max_peak_bytes: limits.fre_aggregate_peak_bytes,
             }
         }
-        AggregateManyBuildAccounting::Continuation(_) => OrderedLiteralAggregateReduceLimits {
-            max_transitions: haystack_len,
-            max_match_events: boundaries.min(reducer_limit),
-            max_count: limits.reducer_steps,
-            max_span_sum: u64::try_from(haystack_len).map_err(|_| {
-                ExecutionError::fault("FRE inactive ordered span bound does not fit u64")
-            })?,
-            max_reducer_steps: boundaries.min(reducer_limit),
-            max_ring_initializations: boundaries,
-            max_total_work: limits.fre_aggregate_operation_work,
-            max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
-            max_peak_bytes: limits.fre_aggregate_peak_bytes,
-        },
+        AggregateManyBuildAccounting::Continuation(_)
+        | AggregateManyBuildAccounting::TotalByteCoverSpanSum(_) => {
+            OrderedLiteralAggregateReduceLimits {
+                max_transitions: haystack_len,
+                max_match_events: boundaries.min(reducer_limit),
+                max_count: limits.reducer_steps,
+                max_span_sum: u64::try_from(haystack_len).map_err(|_| {
+                    ExecutionError::fault("FRE inactive ordered span bound does not fit u64")
+                })?,
+                max_reducer_steps: boundaries.min(reducer_limit),
+                max_ring_initializations: boundaries,
+                max_total_work: limits.fre_aggregate_operation_work,
+                max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+                max_peak_bytes: limits.fre_aggregate_peak_bytes,
+            }
+        }
     };
-    let continuation_shape = match report.build {
-        AggregateManyBuildAccounting::Continuation(compile) => compile.into(),
-        AggregateManyBuildAccounting::OrderedLiteral(_) => inactive_continuation_shape(),
+    let continuation = match report.build {
+        AggregateManyBuildAccounting::Continuation(compile) => {
+            continuation_operation_limits(haystack_len, compile.into(), limits)?
+        }
+        AggregateManyBuildAccounting::OrderedLiteral(_) => {
+            continuation_operation_limits(haystack_len, inactive_continuation_shape(), limits)?
+        }
+        AggregateManyBuildAccounting::TotalByteCoverSpanSum(build) => {
+            total_byte_cover_operation_limits(
+                haystack_len,
+                boundaries,
+                reducer_limit,
+                build,
+                limits,
+            )
+        }
     };
     Ok(AggregateManyRunLimits {
         ordered_literal,
-        continuation: continuation_operation_limits(haystack_len, continuation_shape, limits)?,
+        continuation,
     })
 }
 
@@ -14263,7 +14361,8 @@ fn aggregate_many_build_error(error: &AggregateManyBuildError) -> ExecutionError
         AggregateManyBuildError::OrderedLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
         }
-        AggregateManyBuildError::ContinuationCompile { source, .. } => {
+        AggregateManyBuildError::TotalByteCoverBuild { source }
+        | AggregateManyBuildError::ContinuationCompile { source, .. } => {
             aggregate_engine_error(source, message)
         }
         _ => ExecutionError::fault(message),
@@ -14278,7 +14377,8 @@ fn aggregate_many_execution_error(
         AggregateManyExecutionSource::OrderedLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
         }
-        AggregateManyExecutionSource::Continuation(source) => {
+        AggregateManyExecutionSource::TotalByteCover(source)
+        | AggregateManyExecutionSource::Continuation(source) => {
             aggregate_engine_error(source, message)
         }
         AggregateManyExecutionSource::CaptureEventsLimit { .. }
@@ -14314,6 +14414,7 @@ fn fre_aggregate_many_count(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
+        AggregateManyPlanKind::TotalByteCoverSpanSum => "aggregate-many-total-byte-cover-span-sum",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction { actual, plan })
@@ -14351,6 +14452,7 @@ fn fre_aggregate_many_capture_count(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "capture-many-ordered-literal",
+        AggregateManyPlanKind::TotalByteCoverSpanSum => "capture-many-total-byte-cover-span-sum",
         AggregateManyPlanKind::ContinuationProgram => "capture-many-continuation-program",
     };
     Ok(FreReduction { actual, plan })
@@ -14383,6 +14485,7 @@ fn fre_aggregate_many_compile(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "compile-many-ordered-literal",
+        AggregateManyPlanKind::TotalByteCoverSpanSum => "compile-many-total-byte-cover",
         AggregateManyPlanKind::ContinuationProgram => "compile-many-continuation-program",
     };
     Ok(FreReduction {
@@ -14419,6 +14522,7 @@ fn fre_aggregate_many_span_sum(
         })?;
     let plan = match regex.build_report().plan {
         AggregateManyPlanKind::OrderedLiteral => "aggregate-many-ordered-literal",
+        AggregateManyPlanKind::TotalByteCoverSpanSum => "aggregate-many-total-byte-cover-span-sum",
         AggregateManyPlanKind::ContinuationProgram => "aggregate-many-continuation-program",
     };
     Ok(FreReduction { actual, plan })
@@ -21063,7 +21167,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-unicode-folded-literal-v1"
+            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -21076,6 +21180,12 @@ mod tests {
                 .availability
                 .contains("canonical terminal-scalar encodings")
         );
+        assert!(
+            identity
+                .identity
+                .contains("aggregate-many-total-byte-cover-v1")
+        );
+        assert!(identity.availability.contains("total-cover theorem"));
         assert!(identity.identity.contains("fixed class-sandwich"));
         assert!(identity.identity.contains("finite-packed-v2"));
         assert!(identity.availability.contains("bounded packed scanner"));
@@ -21965,7 +22075,7 @@ mod tests {
             (
                 "count-spans",
                 150_600,
-                "aggregate-many-continuation-program",
+                "aggregate-many-total-byte-cover-span-sum",
             ),
             (
                 "count-captures",
@@ -21979,6 +22089,31 @@ mod tests {
                 plan,
             );
         }
+    }
+
+    #[test]
+    fn total_byte_cover_span_sum_uses_the_authenticated_value_only_route() {
+        let patterns = [
+            r"(?:ab|a)",
+            r"(?:\r\n|\r|\n)",
+            r"(?-u:[\x00-\x09\x0B-\xFF])",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let haystack = b"\x00aab\r\nb\xFF";
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &patterns,
+                haystack,
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            u64::try_from(haystack.len()).unwrap(),
+            "aggregate-many-total-byte-cover-span-sum",
+        );
     }
 
     #[test]

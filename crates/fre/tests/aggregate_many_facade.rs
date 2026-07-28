@@ -1,16 +1,44 @@
 use fre::{
-    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateEngineError, AggregateManyBuildError,
+    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
+    AggregateEngineError, AggregateManyBuildAccounting, AggregateManyBuildError,
     AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyCaptureIneligibility,
     AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyExecutionDetails,
     AggregateManyExecutionSource, AggregateManyOperation, AggregateManyOutput,
-    AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits, AggregateResource,
-    AggregateStrategy, CompatibilityProfile, RustProfile,
+    AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
+    AggregateResource, AggregateStrategy, CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
 use regex_automata::{Input, meta::Regex as MetaRegex};
 
 fn patterns(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn meta_regex(patterns: &[String]) -> MetaRegex {
+    MetaRegex::builder()
+        .configure(MetaRegex::config().utf8_empty(false))
+        .syntax(
+            regex_automata::util::syntax::Config::new()
+                .utf8(false)
+                .unicode(false)
+                .case_insensitive(false),
+        )
+        .build_many(patterns)
+        .unwrap()
+}
+
+fn meta_count_and_span_sum(regex: &MetaRegex, haystack: &[u8]) -> (u64, u64) {
+    regex
+        .find_iter(haystack)
+        .try_fold((0_u64, 0_u64), |(count, span_sum), matched| {
+            Some((
+                count.checked_add(1)?,
+                span_sum.checked_add(
+                    u64::try_from(matched.end().checked_sub(matched.start())?).ok()?,
+                )?,
+            ))
+        })
+        .unwrap()
 }
 
 fn meta_capture_count(patterns: &[String], haystack: &[u8]) -> u64 {
@@ -602,6 +630,180 @@ fn byte_strings(max_len: usize, alphabet: &[u8]) -> Vec<Vec<u8>> {
     all
 }
 
+fn total_byte_cover_patterns() -> Vec<String> {
+    patterns(&[
+        r"(?:ab|a)",
+        r"(?:\r\n|\r|\n)",
+        r"(?-u:[\x00-\x09\x0B-\xFF])",
+    ])
+}
+
+#[test]
+fn total_byte_cover_span_sum_is_source_independent_and_matches_meta() {
+    let base = total_byte_cover_patterns();
+    let mut reordered = base.clone();
+    reordered.rotate_left(1);
+    let mut with_unrelated_look = base.clone();
+    with_unrelated_look.insert(0, r"\bword\b".to_owned());
+    let haystacks = byte_strings(3, &[0x00, b'\n', b'\r', b'a', b'b', 0xFF]);
+
+    for values in [base, reordered, with_unrelated_look] {
+        let oracle = meta_regex(&values);
+        let span_sum = AggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_span_sum()
+            .unwrap();
+        assert_eq!(
+            AggregateManyPlanKind::TotalByteCoverSpanSum,
+            span_sum.build_report().plan
+        );
+        assert_eq!(None, span_sum.build_report().strategy);
+        let AggregateManyPlanIdentity::TotalByteCoverSpanSum(identity) =
+            span_sum.build_report().plan_identity
+        else {
+            panic!("total byte cover must publish its structural identity");
+        };
+        assert_eq!(
+            AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
+            identity.algorithm
+        );
+        assert_eq!(values.len(), identity.patterns);
+        assert_eq!(values.len(), identity.nonnullable_patterns);
+        assert_eq!(256, identity.covered_bytes);
+        assert!(!identity.unicode);
+
+        let count = AggregateManyBuilder::new(&values)
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        assert_eq!(
+            AggregateManyPlanKind::ContinuationProgram,
+            count.build_report().plan,
+            "the span-sum theorem does not imply a count shortcut"
+        );
+
+        for haystack in &haystacks {
+            let (_, expected_span_sum) = meta_count_and_span_sum(&oracle, haystack);
+            assert_eq!(u64::try_from(haystack.len()).unwrap(), expected_span_sum);
+            let result = span_sum
+                .span_sum(haystack, AggregateManyRunLimits::unlimited())
+                .unwrap();
+            assert_eq!(expected_span_sum, result.value());
+            let AggregateManyExecutionDetails::TotalByteCover {
+                upper_bounds,
+                actual,
+            } = result.details()
+            else {
+                panic!("total byte cover must publish exact execution accounting");
+            };
+            assert_eq!(0, actual.logical_source_bytes);
+            assert_eq!(1, actual.work);
+            assert_eq!(0, actual.match_events);
+            assert_eq!(0, actual.output_matches);
+            assert_eq!(haystack.len(), actual.span_sum);
+            assert_eq!(haystack.len(), upper_bounds.match_events);
+            assert_eq!(haystack.len(), upper_bounds.output_matches);
+        }
+    }
+}
+
+#[test]
+fn total_byte_cover_requires_nonnullable_look_free_complete_witnesses() {
+    let mut missing_lf = patterns(&[r"(?:ab|a)", r"(?:\r\n|\r)", r"(?-u:[\x00-\x09\x0B-\xFF])"]);
+    let span_sum = AggregateManyBuilder::new(&missing_lf)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        span_sum.build_report().plan
+    );
+
+    missing_lf[1] = r"(?-u:\A\n)".to_owned();
+    let span_sum = AggregateManyBuilder::new(&missing_lf)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        span_sum.build_report().plan,
+        "a looked one-byte witness cannot contribute to the cover"
+    );
+
+    let mut nullable = total_byte_cover_patterns();
+    nullable.push(String::new());
+    let span_sum = AggregateManyBuilder::new(&nullable)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        span_sum.build_report().plan,
+        "every pattern must be nonnullable"
+    );
+}
+
+#[test]
+fn total_byte_cover_precedes_the_literal_span_sum_plan_and_enforces_limits() {
+    let literals = (u8::MIN..=u8::MAX)
+        .map(|byte| format!(r"(?-u:\x{byte:02X})"))
+        .collect::<Vec<_>>();
+    let baseline = AggregateManyBuilder::new(&literals)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregateManyPlanKind::TotalByteCoverSpanSum,
+        baseline.build_report().plan
+    );
+    let AggregateManyBuildAccounting::TotalByteCoverSpanSum(build) = baseline.build_report().build
+    else {
+        panic!("total byte cover must publish build accounting");
+    };
+    assert_eq!(256, build.patterns);
+    assert_eq!(256, build.nonnullable_patterns);
+    assert_eq!(256, build.covered_bytes);
+    assert_eq!(0, build.allocations);
+    assert!(build.work > 0);
+    assert!(build.persistent_bytes > 0);
+
+    let mut exact_build = AggregateManyBuildLimits::default();
+    exact_build.continuation.max_work = build.work;
+    exact_build.continuation.max_program_bytes = build.persistent_bytes;
+    AggregateManyBuilder::new(&literals)
+        .unicode(false)
+        .limits(exact_build)
+        .build_span_sum()
+        .unwrap();
+
+    exact_build.continuation.max_work = build.work - 1;
+    assert!(matches!(
+        AggregateManyBuilder::new(&literals)
+            .unicode(false)
+            .limits(exact_build)
+            .build_span_sum()
+            .unwrap_err(),
+        AggregateManyBuildError::TotalByteCoverBuild {
+            source: AggregateEngineError::ResourceLimit {
+                resource: AggregateResource::CompileWork,
+                required,
+                limit,
+            },
+        } if required == build.work && limit == build.work - 1
+    ));
+
+    let mut refused = AggregateManyRunLimits::unlimited();
+    refused.continuation.max_work = 0;
+    assert!(matches!(
+        baseline.span_sum_value(b"x", refused).unwrap_err().source,
+        AggregateManyExecutionSource::TotalByteCover(AggregateEngineError::ResourceLimit {
+            resource: AggregateResource::ExecutionWork,
+            required: 1,
+            limit: 0,
+        })
+    ));
+}
+
 #[test]
 fn continuation_value_paths_match_diagnostic_values_and_refusals() {
     let pattern_sets = [
@@ -725,8 +927,12 @@ fn sealed_veryl_count_span_sum_and_captures_fit_default_execution_work() {
         count.build_report().plan
     );
     assert_eq!(
-        AggregateManyPlanKind::ContinuationProgram,
+        AggregateManyPlanKind::TotalByteCoverSpanSum,
         span_sum.build_report().plan
+    );
+    assert_eq!(
+        AggregateManyPlanKind::ContinuationProgram,
+        captures.build_report().plan
     );
     assert_eq!(
         oracle_count,

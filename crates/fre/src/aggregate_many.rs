@@ -3,7 +3,7 @@ use core::{fmt, mem::size_of};
 use fre_aggregate::{
     AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompileAccounting, CompileLimits, CompiledRegex,
     Error as AggregateEngineError, ExecutionAccounting, OperationCertificate, OperationLimits,
-    PlanId, RustByteProfile, SpanIter, Strategy,
+    PlanId, Resource as AggregateResource, RustByteProfile, SpanIter, Strategy,
 };
 use fre_kernels::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
@@ -17,10 +17,14 @@ use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile, ParseError,
     ParseSummary, RustProfile, SafetyEnvelope,
 };
-use regex_syntax::hir::{Hir, HirKind};
+use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
 pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 3;
+
+/// Stable identity for the source-independent total byte-cover theorem.
+pub const AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID: &str =
+    "aggregate-many.nonnullable-look-free-one-byte-cover-span-sum.v1";
 
 /// Requested output boundary for ordered multi-pattern construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +69,8 @@ pub enum AggregateManyCaptureIneligibility {
 pub enum AggregateManyPlanKind {
     /// Ordered finite literals reduced by one reverse DFA and DP ring.
     OrderedLiteral,
+    /// Nonnullable byte languages with a look-free one-byte total cover.
+    TotalByteCoverSpanSum,
     /// Independently parsed HIRs joined by one ordered alternation program.
     ContinuationProgram,
 }
@@ -84,7 +90,62 @@ pub enum AggregateManyPlanIdentity {
         operation: &'static str,
         semantics: AggregateManyLiteralSemantics,
     },
+    TotalByteCoverSpanSum(AggregateManyTotalByteCoverIdentity),
     Continuation(PlanId),
+}
+
+/// Structural facts that prove every source byte belongs to one selected match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyTotalByteCoverIdentity {
+    pub algorithm: &'static str,
+    pub patterns: usize,
+    pub nonnullable_patterns: usize,
+    pub look_free_patterns: usize,
+    pub contributing_patterns: usize,
+    pub covered_bytes: usize,
+    pub unicode: bool,
+}
+
+/// Exact construction accounting for the source-independent total-cover proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyTotalByteCoverBuildAccounting {
+    pub patterns: usize,
+    pub nonnullable_patterns: usize,
+    pub look_free_patterns: usize,
+    pub contributing_patterns: usize,
+    pub covered_bytes: usize,
+    pub hir_visits: usize,
+    pub class_byte_visits: usize,
+    pub union_word_visits: usize,
+    pub work: usize,
+    pub allocations: usize,
+    pub persistent_bytes: usize,
+}
+
+/// Source-independent execution envelope for one total-cover span sum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyTotalByteCoverUpperBounds {
+    pub input_bytes: usize,
+    pub boundaries: usize,
+    pub logical_source_bytes: usize,
+    pub work: usize,
+    pub match_events: usize,
+    pub output_matches: usize,
+    pub span_sum: usize,
+    pub scratch_bytes: usize,
+    pub persistent_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// Exact counters committed by one total-cover span sum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyTotalByteCoverActual {
+    pub logical_source_bytes: usize,
+    pub work: usize,
+    pub match_events: usize,
+    pub output_matches: usize,
+    pub span_sum: usize,
+    pub scratch_bytes: usize,
 }
 
 /// Complete caller-selected limits for multi-pattern construction.
@@ -155,6 +216,7 @@ pub struct AggregateManyCompositionAccounting {
 )]
 pub enum AggregateManyBuildAccounting {
     OrderedLiteral(OrderedLiteralAggregateBuildAccounting),
+    TotalByteCoverSpanSum(AggregateManyTotalByteCoverBuildAccounting),
     Continuation(CompileAccounting),
 }
 
@@ -227,6 +289,9 @@ pub enum AggregateManyBuildError {
         operation: AggregateManyOperation,
         source: OrderedLiteralAggregateBuildError,
     },
+    TotalByteCoverBuild {
+        source: AggregateEngineError,
+    },
     ContinuationCompile {
         operation: AggregateManyOperation,
         strategy: Strategy,
@@ -293,6 +358,10 @@ impl fmt::Display for AggregateManyBuildError {
                 f,
                 "ordered build-many {operation:?} literal construction failed: {source}"
             ),
+            Self::TotalByteCoverBuild { source } => write!(
+                f,
+                "ordered build-many total-byte-cover construction failed: {source}"
+            ),
             Self::ContinuationCompile {
                 operation,
                 strategy,
@@ -316,7 +385,9 @@ impl std::error::Error for AggregateManyBuildError {
         match self {
             Self::Syntax { source, .. } => Some(source),
             Self::OrderedLiteralBuild { source, .. } => Some(source),
-            Self::ContinuationCompile { source, .. } => Some(source),
+            Self::TotalByteCoverBuild { source } | Self::ContinuationCompile { source, .. } => {
+                Some(source)
+            }
             _ => None,
         }
     }
@@ -388,6 +459,7 @@ impl Default for AggregateManyCaptureRunLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateManyExecutionSource {
     OrderedLiteral(OrderedLiteralAggregateReduceError),
+    TotalByteCover(AggregateEngineError),
     Continuation(AggregateEngineError),
     CaptureEventsLimit { needed: u64, limit: u64 },
     CaptureCountLimit { needed: u64, limit: u64 },
@@ -425,6 +497,10 @@ pub enum AggregateManyExecutionDetails {
     OrderedLiteral {
         upper_bounds: OrderedLiteralAggregateUpperBounds,
         actual: OrderedLiteralAggregateActualCounters,
+    },
+    TotalByteCover {
+        upper_bounds: AggregateManyTotalByteCoverUpperBounds,
+        actual: AggregateManyTotalByteCoverActual,
     },
     Continuation {
         certificate: OperationCertificate,
@@ -877,6 +953,9 @@ impl<'a> AggregateManyBuilder<'a> {
         } else {
             first_nonliteral = Some(0);
         }
+        let total_byte_cover_shape = (!unicode && operation == AggregateManyOperation::SpanSum)
+            .then(|| total_byte_cover_shape(&hirs))
+            .flatten();
         if unicode && !all_literals {
             return Err(AggregateManyBuildError::UnicodeNonLiteral {
                 pattern: first_nonliteral.unwrap_or(0),
@@ -885,9 +964,34 @@ impl<'a> AggregateManyBuilder<'a> {
 
         let mut literal_view_capacity_bytes = 0_usize;
         let ordered_literal_operation = operation != AggregateManyOperation::Spans;
-        let (engine, plan, build, plan_identity, engine_persistent) = if all_literals
-            && ordered_literal_operation
+        let (engine, plan, build, plan_identity, engine_persistent) = if let Some(shape) =
+            total_byte_cover_shape
         {
+            let plan = TotalByteCoverSpanSumPlan::build(
+                shape,
+                self.limits.continuation,
+                engine_persistent_limit,
+            )
+            .map_err(|source| AggregateManyBuildError::TotalByteCoverBuild { source })?;
+            let accounting = plan.build_accounting;
+            (
+                AggregateManyEngine::TotalByteCoverSpanSum(plan),
+                AggregateManyPlanKind::TotalByteCoverSpanSum,
+                AggregateManyBuildAccounting::TotalByteCoverSpanSum(accounting),
+                AggregateManyPlanIdentity::TotalByteCoverSpanSum(
+                    AggregateManyTotalByteCoverIdentity {
+                        algorithm: AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
+                        patterns: accounting.patterns,
+                        nonnullable_patterns: accounting.nonnullable_patterns,
+                        look_free_patterns: accounting.look_free_patterns,
+                        contributing_patterns: accounting.contributing_patterns,
+                        covered_bytes: accounting.covered_bytes,
+                        unicode: false,
+                    },
+                ),
+                accounting.persistent_bytes,
+            )
+        } else if all_literals && ordered_literal_operation {
             let mut literals = Vec::new();
             literals.try_reserve_exact(count).map_err(|_| {
                 AggregateManyBuildError::AllocationFailed {
@@ -1071,6 +1175,7 @@ pub enum AggregateManyRegex {
 enum AggregateManyEngine {
     OrderedLiteralCount(OrderedLiteralCountPlan),
     OrderedLiteralSpanSum(OrderedLiteralSpanSumPlan),
+    TotalByteCoverSpanSum(TotalByteCoverSpanSumPlan),
     Continuation(CompiledRegex),
 }
 
@@ -1121,6 +1226,11 @@ impl AggregateManyPlan {
                     },
                 })
             }
+            AggregateManyEngine::TotalByteCoverSpanSum(_) => Err(self.execution_error(
+                AggregateManyExecutionSource::InternalInvariant(
+                    "count operation retained a total-byte-cover span-sum engine",
+                ),
+            )),
             AggregateManyEngine::OrderedLiteralSpanSum(_) => Err(self.execution_error(
                 AggregateManyExecutionSource::InternalInvariant(
                     "count operation retained a span-sum engine",
@@ -1157,6 +1267,11 @@ impl AggregateManyPlan {
                     ))
                 })
             }
+            AggregateManyEngine::TotalByteCoverSpanSum(_) => Err(self.execution_error(
+                AggregateManyExecutionSource::InternalInvariant(
+                    "count operation retained a total-byte-cover span-sum engine",
+                ),
+            )),
             AggregateManyEngine::OrderedLiteralSpanSum(_) => Err(self.execution_error(
                 AggregateManyExecutionSource::InternalInvariant(
                     "count operation retained a span-sum engine",
@@ -1443,6 +1558,21 @@ impl AggregateManySpanSumRegex {
                     },
                 })
             }
+            AggregateManyEngine::TotalByteCoverSpanSum(plan) => {
+                let (value, upper_bounds, actual) = plan
+                    .span_sum(haystack.len(), limits.continuation)
+                    .map_err(|source| {
+                        self.0
+                            .execution_error(AggregateManyExecutionSource::TotalByteCover(source))
+                    })?;
+                Ok(AggregateManySpanSumResult {
+                    value,
+                    details: AggregateManyExecutionDetails::TotalByteCover {
+                        upper_bounds,
+                        actual,
+                    },
+                })
+            }
             AggregateManyEngine::OrderedLiteralCount(_) => {
                 Err(self
                     .0
@@ -1468,6 +1598,13 @@ impl AggregateManySpanSumRegex {
                 self.0
                     .continuation_span_sum_value(engine, haystack, limits.continuation)
             }
+            AggregateManyEngine::TotalByteCoverSpanSum(plan) => plan
+                .span_sum(haystack.len(), limits.continuation)
+                .map(|(value, _, _)| value)
+                .map_err(|source| {
+                    self.0
+                        .execution_error(AggregateManyExecutionSource::TotalByteCover(source))
+                }),
             AggregateManyEngine::OrderedLiteralCount(_) => {
                 Err(self
                     .0
@@ -1477,6 +1614,353 @@ impl AggregateManySpanSumRegex {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TotalByteCoverShape {
+    patterns: usize,
+    nonnullable_patterns: usize,
+    look_free_patterns: usize,
+    contributing_patterns: usize,
+    covered_bytes: usize,
+    hir_visits: usize,
+    byte_visits: usize,
+    union_word_visits: usize,
+    work: usize,
+}
+
+#[derive(Debug)]
+struct TotalByteCoverSpanSumPlan {
+    build_accounting: AggregateManyTotalByteCoverBuildAccounting,
+}
+
+impl TotalByteCoverSpanSumPlan {
+    fn build(
+        shape: TotalByteCoverShape,
+        limits: CompileLimits,
+        persistent_limit: usize,
+    ) -> Result<Self, AggregateEngineError> {
+        enforce_total_cover_resource(shape.work, limits.max_work, AggregateResource::CompileWork)?;
+        let persistent_bytes = size_of::<Self>();
+        enforce_total_cover_resource(
+            persistent_bytes,
+            limits.max_program_bytes.min(persistent_limit),
+            AggregateResource::ProgramBytes,
+        )?;
+        Ok(Self {
+            build_accounting: AggregateManyTotalByteCoverBuildAccounting {
+                patterns: shape.patterns,
+                nonnullable_patterns: shape.nonnullable_patterns,
+                look_free_patterns: shape.look_free_patterns,
+                contributing_patterns: shape.contributing_patterns,
+                covered_bytes: shape.covered_bytes,
+                hir_visits: shape.hir_visits,
+                class_byte_visits: shape.byte_visits,
+                union_word_visits: shape.union_word_visits,
+                work: shape.work,
+                allocations: 0,
+                persistent_bytes,
+            },
+        })
+    }
+
+    fn span_sum(
+        &self,
+        input_bytes: usize,
+        limits: OperationLimits,
+    ) -> Result<
+        (
+            u64,
+            AggregateManyTotalByteCoverUpperBounds,
+            AggregateManyTotalByteCoverActual,
+        ),
+        AggregateEngineError,
+    > {
+        let boundaries =
+            input_bytes
+                .checked_add(1)
+                .ok_or(AggregateEngineError::ArithmeticOverflow {
+                    resource: AggregateResource::Boundaries,
+                })?;
+        let upper_bounds = AggregateManyTotalByteCoverUpperBounds {
+            input_bytes,
+            boundaries,
+            logical_source_bytes: 0,
+            work: 1,
+            match_events: input_bytes,
+            output_matches: input_bytes,
+            span_sum: input_bytes,
+            scratch_bytes: 0,
+            persistent_bytes: self.build_accounting.persistent_bytes,
+            peak_bytes: self.build_accounting.persistent_bytes,
+        };
+        for (required, limit, resource) in [
+            (
+                upper_bounds.boundaries,
+                limits.max_boundaries,
+                AggregateResource::Boundaries,
+            ),
+            (
+                upper_bounds.logical_source_bytes,
+                limits.max_random_access_bytes,
+                AggregateResource::RandomAccessBytes,
+            ),
+            (
+                upper_bounds.scratch_bytes,
+                limits.max_scratch_bytes,
+                AggregateResource::ScratchBytes,
+            ),
+            (
+                upper_bounds.match_events,
+                limits.max_match_events,
+                AggregateResource::MatchEvents,
+            ),
+            (
+                upper_bounds.output_matches,
+                limits.max_output_matches,
+                AggregateResource::OutputMatches,
+            ),
+            (
+                upper_bounds.span_sum,
+                limits.max_span_sum,
+                AggregateResource::SpanSum,
+            ),
+            (
+                upper_bounds.peak_bytes,
+                limits.max_peak_bytes,
+                AggregateResource::PeakBytes,
+            ),
+            (
+                upper_bounds.work,
+                limits.max_work,
+                AggregateResource::ExecutionWork,
+            ),
+        ] {
+            enforce_total_cover_resource(required, limit, resource)?;
+        }
+        let value =
+            u64::try_from(input_bytes).map_err(|_| AggregateEngineError::ArithmeticOverflow {
+                resource: AggregateResource::SpanSum,
+            })?;
+        let actual = AggregateManyTotalByteCoverActual {
+            logical_source_bytes: 0,
+            work: 1,
+            match_events: 0,
+            output_matches: 0,
+            span_sum: input_bytes,
+            scratch_bytes: 0,
+        };
+        Ok((value, upper_bounds, actual))
+    }
+}
+
+fn enforce_total_cover_resource(
+    required: usize,
+    limit: usize,
+    resource: AggregateResource,
+) -> Result<(), AggregateEngineError> {
+    if required > limit {
+        return Err(AggregateEngineError::ResourceLimit {
+            resource,
+            required,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    fn insert(&mut self, byte: u8) {
+        let index = usize::from(byte);
+        self.0[index / 64] |= 1_u64 << (index % 64);
+    }
+
+    fn union_with(&mut self, other: Self, analysis: &mut TotalByteCoverAnalysis) -> Option<()> {
+        for (left, right) in self.0.iter_mut().zip(other.0) {
+            analysis.union_words = analysis.union_words.checked_add(1)?;
+            *left |= right;
+        }
+        Some(())
+    }
+
+    fn len(self) -> usize {
+        self.0
+            .into_iter()
+            .map(|word| usize::from(u8::try_from(word.count_ones()).unwrap_or(u8::MAX)))
+            .sum()
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == [0; 4]
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ZeroAndOneByteLanguage {
+    empty: bool,
+    one_byte: ByteSet,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TotalByteCoverAnalysis {
+    hir: usize,
+    bytes: usize,
+    union_words: usize,
+}
+
+impl TotalByteCoverAnalysis {
+    fn one_byte_language(&mut self, hir: &Hir) -> Option<ZeroAndOneByteLanguage> {
+        self.hir = self.hir.checked_add(1)?;
+        match hir.kind() {
+            HirKind::Empty => Some(ZeroAndOneByteLanguage {
+                empty: true,
+                one_byte: ByteSet::default(),
+            }),
+            HirKind::Literal(literal) => {
+                let mut one_byte = ByteSet::default();
+                if let [byte] = literal.0.as_ref() {
+                    self.bytes = self.bytes.checked_add(1)?;
+                    one_byte.insert(*byte);
+                }
+                Some(ZeroAndOneByteLanguage {
+                    empty: literal.0.is_empty(),
+                    one_byte,
+                })
+            }
+            HirKind::Class(Class::Bytes(class)) => {
+                let mut one_byte = ByteSet::default();
+                for range in class.iter() {
+                    for byte in range.start()..=range.end() {
+                        self.bytes = self.bytes.checked_add(1)?;
+                        one_byte.insert(byte);
+                    }
+                }
+                Some(ZeroAndOneByteLanguage {
+                    empty: false,
+                    one_byte,
+                })
+            }
+            HirKind::Class(Class::Unicode(class)) => {
+                let mut one_byte = ByteSet::default();
+                for range in class.iter() {
+                    let start = u32::from(range.start());
+                    if start > 0x7F {
+                        continue;
+                    }
+                    let end = u32::from(range.end()).min(0x7F);
+                    for scalar in start..=end {
+                        self.bytes = self.bytes.checked_add(1)?;
+                        one_byte.insert(u8::try_from(scalar).ok()?);
+                    }
+                }
+                Some(ZeroAndOneByteLanguage {
+                    empty: false,
+                    one_byte,
+                })
+            }
+            HirKind::Look(_) => None,
+            HirKind::Repetition(repetition) => {
+                let sub = self.one_byte_language(repetition.sub.as_ref())?;
+                let can_repeat = repetition.max != Some(0);
+                let one_byte = if can_repeat && (repetition.min <= 1 || sub.empty) {
+                    sub.one_byte
+                } else {
+                    ByteSet::default()
+                };
+                Some(ZeroAndOneByteLanguage {
+                    empty: repetition.min == 0 || sub.empty,
+                    one_byte,
+                })
+            }
+            HirKind::Capture(capture) => self.one_byte_language(capture.sub.as_ref()),
+            HirKind::Concat(parts) => {
+                let mut combined = ZeroAndOneByteLanguage {
+                    empty: true,
+                    one_byte: ByteSet::default(),
+                };
+                for part in parts {
+                    let right = self.one_byte_language(part)?;
+                    let mut one_byte = ByteSet::default();
+                    if right.empty {
+                        one_byte.union_with(combined.one_byte, self)?;
+                    }
+                    if combined.empty {
+                        one_byte.union_with(right.one_byte, self)?;
+                    }
+                    combined = ZeroAndOneByteLanguage {
+                        empty: combined.empty && right.empty,
+                        one_byte,
+                    };
+                }
+                Some(combined)
+            }
+            HirKind::Alternation(parts) => {
+                let mut combined = ZeroAndOneByteLanguage {
+                    empty: false,
+                    one_byte: ByteSet::default(),
+                };
+                for part in parts {
+                    let branch = self.one_byte_language(part)?;
+                    combined.empty |= branch.empty;
+                    combined.one_byte.union_with(branch.one_byte, self)?;
+                }
+                Some(combined)
+            }
+        }
+    }
+}
+
+/// Prove a source-independent span-sum identity.
+///
+/// At every byte position, the look-free witnesses collectively accept the
+/// exact one-byte string beginning there. Ordered `find_iter` therefore cannot
+/// skip that position, although an earlier pattern may select a longer match.
+/// Since every pattern is nonnullable, each selected match advances. Induction
+/// from position zero partitions the complete haystack into adjacent nonempty
+/// matches, so the sum of their lengths is exactly the haystack length.
+fn total_byte_cover_shape(hirs: &[Hir]) -> Option<TotalByteCoverShape> {
+    let mut analysis = TotalByteCoverAnalysis::default();
+    let mut coverage = ByteSet::default();
+    let mut nonnullable_patterns = 0_usize;
+    let mut look_free_patterns = 0_usize;
+    let mut contributing_patterns = 0_usize;
+    for hir in hirs {
+        if !matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0) {
+            return None;
+        }
+        nonnullable_patterns = nonnullable_patterns.checked_add(1)?;
+        let Some(language) = analysis.one_byte_language(hir) else {
+            continue;
+        };
+        look_free_patterns = look_free_patterns.checked_add(1)?;
+        if !language.one_byte.is_empty() {
+            contributing_patterns = contributing_patterns.checked_add(1)?;
+        }
+        coverage.union_with(language.one_byte, &mut analysis)?;
+    }
+    let covered_bytes = coverage.len();
+    if covered_bytes != 256 {
+        return None;
+    }
+    let work = hirs
+        .len()
+        .checked_add(analysis.hir)?
+        .checked_add(analysis.bytes)?
+        .checked_add(analysis.union_words)?;
+    Some(TotalByteCoverShape {
+        patterns: hirs.len(),
+        nonnullable_patterns,
+        look_free_patterns,
+        contributing_patterns,
+        covered_bytes,
+        hir_visits: analysis.hir,
+        byte_visits: analysis.bytes,
+        union_word_visits: analysis.union_words,
+        work,
+    })
 }
 
 fn direct_whole_match_literal(hir: &Hir, unicode: bool) -> Option<&[u8]> {
