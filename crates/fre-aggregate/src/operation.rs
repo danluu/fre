@@ -1811,6 +1811,23 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<usize, Error> {
+        if strategy == Strategy::ReverseSequentialRows
+            && let Some(assertion) = self.program.root_assertion()
+        {
+            return self.root_assertion_value(assertion, haystack, &range, limits);
+        }
+        if strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.state_byte_span_sum
+            && let Some((matches, _)) = Self::state_byte_reducer_value(
+                plan,
+                haystack,
+                &range,
+                OperationKind::Count,
+                limits,
+            )?
+        {
+            return Ok(matches);
+        }
         self.execute::<true>(haystack, range, strategy, OperationKind::Count, limits)
             .map(|result| result.summary.matches)
     }
@@ -2250,6 +2267,19 @@ impl CompiledRegex {
         strategy: Strategy,
         limits: OperationLimits,
     ) -> Result<usize, Error> {
+        if strategy == Strategy::ReverseSequentialRows
+            && let Some(assertion) = self.program.root_assertion()
+        {
+            self.root_assertion_value(assertion, haystack, &range, limits)?;
+            return Ok(0);
+        }
+        if strategy == Strategy::ReverseSequentialRows
+            && let Some(plan) = &self.state_byte_span_sum
+            && let Some((_, span_sum)) =
+                Self::state_byte_reducer_value(plan, haystack, &range, OperationKind::Sum, limits)?
+        {
+            return Ok(span_sum);
+        }
         self.execute::<true>(haystack, range, strategy, OperationKind::Sum, limits)
             .map(|result| result.summary.span_sum)
     }
@@ -2473,6 +2503,200 @@ impl CompiledRegex {
             None,
             Some(session),
         )
+    }
+
+    /// Evaluate the compiler-proved root assertion without materializing the
+    /// receipt-only certificate and component accounting carried by
+    /// [`ExecutionResult`]. The admission order and observed-work charges are
+    /// the same as the ordinary non-receipt root-assertion route.
+    fn root_assertion_value(
+        &self,
+        assertion: Assertion,
+        haystack: &[u8],
+        range: &Range<usize>,
+        limits: OperationLimits,
+    ) -> Result<usize, Error> {
+        if range.start > range.end || range.end > haystack.len() {
+            return Err(Error::InvalidRange {
+                start: range.start,
+                end: range.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        let input_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(Error::InternalInvariant(
+                "validated root-assertion range underflow",
+            ))?;
+        let envelope =
+            root_assertion_envelope::<true>(assertion, haystack.len(), input_bytes, limits)?;
+
+        // Keep the ordinary malformed-UTF-8 precedence: validation admission
+        // and the complete validation read precede the remaining prospective
+        // envelope.
+        let preflight = preflight_unicode_word_utf8_bytes(&self.program, haystack.len(), limits)?;
+        if preflight != envelope.utf8_validation {
+            return Err(Error::InternalInvariant(
+                "root-assertion UTF-8 preflight diverged from retained assertion",
+            ));
+        }
+        enforce(
+            envelope.utf8_validation,
+            envelope.work_bound,
+            Resource::ExecutionWork,
+        )?;
+        if envelope.utf8_validation != 0 && core::str::from_utf8(haystack).is_err() {
+            return Err(Error::InvalidUtf8ForUnicodeWordBoundary);
+        }
+
+        // This is `OperationProspective::enforce_limits` in the same field
+        // order, specialized to the zero-allocation root-assertion envelope.
+        enforce(
+            envelope.boundaries,
+            limits.max_boundaries,
+            Resource::Boundaries,
+        )?;
+        enforce(0, limits.max_table_cells, Resource::TableCells)?;
+        enforce(
+            envelope.random_access_bytes,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(0, limits.max_scratch_bytes, Resource::ScratchBytes)?;
+        enforce(0, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            envelope.utf8_validation,
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        enforce(
+            envelope.boundaries,
+            limits.max_match_events,
+            Resource::MatchEvents,
+        )?;
+        enforce(
+            envelope.boundaries,
+            limits.max_output_matches,
+            Resource::OutputMatches,
+        )?;
+        enforce(0, limits.max_output_bytes, Resource::OutputBytes)?;
+        enforce(0, limits.max_span_sum, Resource::SpanSum)?;
+        enforce(0, limits.max_peak_bytes, Resource::PeakBytes)?;
+        enforce(
+            envelope.work_bound,
+            limits.max_work,
+            Resource::ExecutionWork,
+        )?;
+
+        let assertions = AssertionContext::new(haystack, range.start, input_bytes)?;
+        let mut work = envelope.utf8_validation;
+        let mut matches = 0_usize;
+        for position in 0..=input_bytes {
+            try_charge_value_work(&mut work, envelope.work_bound)?;
+            try_charge_value_work(&mut work, envelope.work_bound)?;
+            if assertions.is_match(assertion, position)? {
+                try_charge_value_work(&mut work, envelope.work_bound)?;
+                matches = add(matches, 1, Resource::MatchEvents)?;
+            }
+        }
+        enforce(work, limits.max_work, Resource::ExecutionWork)?;
+        Ok(matches)
+    }
+
+    /// Evaluate a compiler-proved state-byte reduction while retaining only
+    /// the scalar values needed by the ordinary Count/`SpanSum` APIs.
+    fn state_byte_reducer_value(
+        plan: &StateByteSpanSumPlan,
+        haystack: &[u8],
+        range: &Range<usize>,
+        kind: OperationKind,
+        limits: OperationLimits,
+    ) -> Result<Option<(usize, usize)>, Error> {
+        if range.start > range.end || range.end > haystack.len() {
+            return Err(Error::InvalidRange {
+                start: range.start,
+                end: range.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        let local = &haystack[range.clone()];
+        let envelope = state_byte_reducer_envelope::<true>(plan, local.len(), limits)?;
+        enforce(
+            envelope.boundaries,
+            limits.max_boundaries,
+            Resource::Boundaries,
+        )?;
+        enforce(0, limits.max_table_cells, Resource::TableCells)?;
+        enforce(
+            0,
+            limits.max_random_access_bytes,
+            Resource::RandomAccessBytes,
+        )?;
+        enforce(0, limits.max_scratch_bytes, Resource::ScratchBytes)?;
+        enforce(0, limits.max_log_bytes, Resource::LogBytes)?;
+        enforce(
+            local.len(),
+            limits.max_sequential_bytes,
+            Resource::SequentialBytes,
+        )?;
+        enforce(local.len(), limits.max_match_events, Resource::MatchEvents)?;
+        enforce(
+            local.len(),
+            limits.max_output_matches,
+            Resource::OutputMatches,
+        )?;
+        enforce(0, limits.max_output_bytes, Resource::OutputBytes)?;
+        enforce(
+            if kind == OperationKind::Sum {
+                local.len()
+            } else {
+                0
+            },
+            limits.max_span_sum,
+            Resource::SpanSum,
+        )?;
+        enforce(0, limits.max_peak_bytes, Resource::PeakBytes)?;
+        enforce(
+            envelope.work_bound,
+            limits.max_work,
+            Resource::ExecutionWork,
+        )?;
+        if envelope.structural_work_bound > limits.max_work {
+            return Ok(None);
+        }
+
+        // Once the complete structural work envelope fits, no individual
+        // charge can refuse. The value-only route can therefore monomorphize
+        // the shared reducer against a zero-sized meter while receipt and
+        // counter callers retain exact component accounting.
+        let mut accounting = StateByteValueMeter;
+        let (matches, span_sum) = match plan.topology() {
+            StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
+                reduce_greedy_prefix_literal_suffix(
+                    plan,
+                    local,
+                    envelope.work_bound,
+                    &mut accounting,
+                )?
+            }
+            StateByteSpanSumTopology::DisjointRunsLiteral => {
+                reduce_disjoint_runs_literal(plan, local, envelope.work_bound, &mut accounting)?
+            }
+            StateByteSpanSumTopology::DisjointInternalRuns
+            | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
+                reduce_disjoint_internal_runs(plan, local, envelope.work_bound, &mut accounting)?
+            }
+            StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+                reduce_repeated_lazy_delimiter_suffix(
+                    plan,
+                    local,
+                    envelope.work_bound,
+                    &mut accounting,
+                )?
+            }
+        };
+        Ok(Some((matches, span_sum)))
     }
 
     #[allow(
@@ -4277,13 +4501,12 @@ const fn fixed_continuation_beats_dense(
     candidate_work_upper < dense_work_floor
 }
 
-fn root_assertion_prospective<const OBSERVED_WORK: bool>(
-    program: &Program,
+fn root_assertion_envelope<const OBSERVED_WORK: bool>(
     assertion: Assertion,
     haystack_bytes: usize,
     input_bytes: usize,
     limits: OperationLimits,
-) -> Result<OperationProspective, Error> {
+) -> Result<RootAssertionEnvelope, Error> {
     let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
     let utf8_validation = if assertion.is_unicode_word() {
         haystack_bytes
@@ -4319,32 +4542,57 @@ fn root_assertion_prospective<const OBSERVED_WORK: bool>(
         | Assertion::WordEndHalfUnicode => 8,
     };
     let random_access_bytes = mul(boundaries, source_factor, Resource::RandomAccessBytes)?;
+    Ok(RootAssertionEnvelope {
+        boundaries,
+        utf8_validation,
+        work_bound,
+        random_access_bytes,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct RootAssertionEnvelope {
+    boundaries: usize,
+    utf8_validation: usize,
+    work_bound: usize,
+    random_access_bytes: usize,
+}
+
+fn root_assertion_prospective<const OBSERVED_WORK: bool>(
+    program: &Program,
+    assertion: Assertion,
+    haystack_bytes: usize,
+    input_bytes: usize,
+    limits: OperationLimits,
+) -> Result<OperationProspective, Error> {
+    let envelope =
+        root_assertion_envelope::<OBSERVED_WORK>(assertion, haystack_bytes, input_bytes, limits)?;
     let accounting = ExecutionAccounting {
-        transition_checks: boundaries.min(work_bound),
-        assertion_checks: boundaries.min(work_bound),
-        root_probes: boundaries.min(work_bound),
-        successful_paths: boundaries.min(work_bound),
-        emitted_matches: boundaries.min(work_bound),
-        utf8_validation_work: utf8_validation.min(work_bound),
-        sequential_bytes_read: utf8_validation,
-        random_access_bytes_read: random_access_bytes,
-        work: work_bound,
+        transition_checks: envelope.boundaries.min(envelope.work_bound),
+        assertion_checks: envelope.boundaries.min(envelope.work_bound),
+        root_probes: envelope.boundaries.min(envelope.work_bound),
+        successful_paths: envelope.boundaries.min(envelope.work_bound),
+        emitted_matches: envelope.boundaries.min(envelope.work_bound),
+        utf8_validation_work: envelope.utf8_validation.min(envelope.work_bound),
+        sequential_bytes_read: envelope.utf8_validation,
+        random_access_bytes_read: envelope.random_access_bytes,
+        work: envelope.work_bound,
         ..ExecutionAccounting::default()
     };
     Ok(OperationProspective {
         states: program.insts.len(),
-        boundaries,
+        boundaries: envelope.boundaries,
         table_cells: 0,
         row_storage: None,
         row_record_bytes: 0,
         terminal_frontier: false,
-        work_bound,
-        random_access_bytes,
+        work_bound: envelope.work_bound,
+        random_access_bytes: envelope.random_access_bytes,
         scratch_bytes: 0,
         log_bytes: 0,
-        sequential_bytes: utf8_validation,
-        match_events: boundaries,
-        output_matches: boundaries,
+        sequential_bytes: envelope.utf8_validation,
+        match_events: envelope.boundaries,
+        output_matches: envelope.boundaries,
         output_bytes: 0,
         span_sum: 0,
         allocations: 0,
@@ -4357,13 +4605,11 @@ fn root_assertion_prospective<const OBSERVED_WORK: bool>(
     clippy::too_many_lines,
     reason = "the prospective keeps every topology's complete resource envelope adjacent"
 )]
-fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
-    program: &Program,
+fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
     plan: &StateByteSpanSumPlan,
     input_bytes: usize,
-    kind: OperationKind,
     limits: OperationLimits,
-) -> Result<OperationProspective, Error> {
+) -> Result<StateByteReducerEnvelope, Error> {
     let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
     let work_factor = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 6,
@@ -4439,25 +4685,53 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
             mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
         }
     };
+    Ok(StateByteReducerEnvelope {
+        boundaries,
+        structural_work_bound,
+        work_bound,
+        state_transition_bound,
+        root_probe_bound,
+        random_access_bytes_read,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct StateByteReducerEnvelope {
+    boundaries: usize,
+    structural_work_bound: usize,
+    work_bound: usize,
+    state_transition_bound: usize,
+    root_probe_bound: usize,
+    random_access_bytes_read: usize,
+}
+
+fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
+    program: &Program,
+    plan: &StateByteSpanSumPlan,
+    input_bytes: usize,
+    kind: OperationKind,
+    limits: OperationLimits,
+) -> Result<OperationProspective, Error> {
+    let envelope = state_byte_reducer_envelope::<OBSERVED_WORK>(plan, input_bytes, limits)?;
     let accounting = ExecutionAccounting {
-        state_evaluations: state_transition_bound.min(work_bound),
-        transition_checks: state_transition_bound.min(work_bound),
-        root_probes: root_probe_bound.min(work_bound),
-        successful_paths: input_bytes.min(work_bound),
-        emitted_matches: input_bytes.min(work_bound),
-        sequential_bytes_read: input_bytes.min(work_bound),
-        random_access_bytes_read: random_access_bytes_read.min(work_bound),
-        work: work_bound,
+        state_evaluations: envelope.state_transition_bound.min(envelope.work_bound),
+        transition_checks: envelope.state_transition_bound.min(envelope.work_bound),
+        root_probes: envelope.root_probe_bound.min(envelope.work_bound),
+        successful_paths: input_bytes.min(envelope.work_bound),
+        emitted_matches: input_bytes.min(envelope.work_bound),
+        sequential_bytes_read: input_bytes.min(envelope.work_bound),
+        random_access_bytes_read: envelope.random_access_bytes_read.min(envelope.work_bound),
+        work: envelope.work_bound,
         ..ExecutionAccounting::default()
     };
     Ok(OperationProspective {
         states: program.insts.len(),
-        boundaries,
+        boundaries: envelope.boundaries,
         table_cells: 0,
         row_storage: None,
         row_record_bytes: 0,
         terminal_frontier: false,
-        work_bound,
+        work_bound: envelope.work_bound,
         random_access_bytes: 0,
         scratch_bytes: 0,
         log_bytes: 0,
@@ -4476,11 +4750,231 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     })
 }
 
+trait StateByteMeter {
+    fn work(&self) -> usize;
+
+    fn record_scan(
+        &mut self,
+        scanned: usize,
+        work_limit: usize,
+        transactional: bool,
+    ) -> Result<(), Error>;
+
+    fn classify(
+        &mut self,
+        class: crate::program::ByteSet,
+        haystack: &[u8],
+        index: usize,
+        access: StateByteSourceAccess,
+        work_limit: usize,
+    ) -> Result<StateByteClassification, Error>;
+
+    fn compare_source(
+        &mut self,
+        haystack: &[u8],
+        index: usize,
+        expected: u8,
+        work_limit: usize,
+    ) -> Result<bool, Error>;
+
+    fn compare_cached(&mut self, byte: u8, expected: u8, work_limit: usize) -> Result<bool, Error>;
+
+    fn event(&mut self, work_limit: usize) -> Result<(), Error>;
+}
+
+impl StateByteMeter for ExecutionAccounting {
+    fn work(&self) -> usize {
+        self.work
+    }
+
+    fn record_scan(
+        &mut self,
+        scanned: usize,
+        work_limit: usize,
+        transactional: bool,
+    ) -> Result<(), Error> {
+        if transactional {
+            let sequential_bytes_read = add(
+                self.sequential_bytes_read,
+                scanned,
+                Resource::SequentialBytes,
+            )?;
+            let root_probes = add(self.root_probes, scanned, Resource::ExecutionWork)?;
+            let work = add(self.work, scanned, Resource::ExecutionWork)?;
+            enforce(work, work_limit, Resource::ExecutionWork)?;
+            self.sequential_bytes_read = sequential_bytes_read;
+            self.root_probes = root_probes;
+            self.work = work;
+        } else {
+            self.sequential_bytes_read = add(
+                self.sequential_bytes_read,
+                scanned,
+                Resource::SequentialBytes,
+            )?;
+            self.root_probes = add(self.root_probes, scanned, Resource::ExecutionWork)?;
+            self.work = add(self.work, scanned, Resource::ExecutionWork)?;
+            enforce(self.work, work_limit, Resource::ExecutionWork)?;
+        }
+        Ok(())
+    }
+
+    fn classify(
+        &mut self,
+        class: crate::program::ByteSet,
+        haystack: &[u8],
+        index: usize,
+        access: StateByteSourceAccess,
+        work_limit: usize,
+    ) -> Result<StateByteClassification, Error> {
+        let state_evaluations = add(self.state_evaluations, 1, Resource::ExecutionWork)?;
+        let transition_checks = add(self.transition_checks, 1, Resource::ExecutionWork)?;
+        let work = add(self.work, 2, Resource::ExecutionWork)?;
+        enforce(work, work_limit, Resource::ExecutionWork)?;
+        let (sequential_bytes_read, random_access_bytes_read) = match access {
+            StateByteSourceAccess::Sequential => (
+                add(self.sequential_bytes_read, 1, Resource::SequentialBytes)?,
+                self.random_access_bytes_read,
+            ),
+            StateByteSourceAccess::Random => (
+                self.sequential_bytes_read,
+                add(
+                    self.random_access_bytes_read,
+                    1,
+                    Resource::RandomAccessBytes,
+                )?,
+            ),
+        };
+        let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+            "state-byte classification index exceeds admitted source",
+        ))?;
+        self.state_evaluations = state_evaluations;
+        self.transition_checks = transition_checks;
+        self.sequential_bytes_read = sequential_bytes_read;
+        self.random_access_bytes_read = random_access_bytes_read;
+        self.work = work;
+        Ok(StateByteClassification {
+            byte,
+            matches: class.contains(byte),
+        })
+    }
+
+    fn compare_source(
+        &mut self,
+        haystack: &[u8],
+        index: usize,
+        expected: u8,
+        work_limit: usize,
+    ) -> Result<bool, Error> {
+        let root_probes = add(self.root_probes, 1, Resource::ExecutionWork)?;
+        let random_access_bytes_read = add(
+            self.random_access_bytes_read,
+            1,
+            Resource::RandomAccessBytes,
+        )?;
+        let work = add(self.work, 1, Resource::ExecutionWork)?;
+        enforce(work, work_limit, Resource::ExecutionWork)?;
+        let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+            "state-byte literal index exceeds admitted source",
+        ))?;
+        self.root_probes = root_probes;
+        self.random_access_bytes_read = random_access_bytes_read;
+        self.work = work;
+        Ok(byte == expected)
+    }
+
+    fn compare_cached(&mut self, byte: u8, expected: u8, work_limit: usize) -> Result<bool, Error> {
+        let root_probes = add(self.root_probes, 1, Resource::ExecutionWork)?;
+        let work = add(self.work, 1, Resource::ExecutionWork)?;
+        enforce(work, work_limit, Resource::ExecutionWork)?;
+        self.root_probes = root_probes;
+        self.work = work;
+        Ok(byte == expected)
+    }
+
+    fn event(&mut self, work_limit: usize) -> Result<(), Error> {
+        let successful_paths = add(self.successful_paths, 1, Resource::MatchEvents)?;
+        let emitted_matches = add(self.emitted_matches, 1, Resource::OutputMatches)?;
+        let work = add(self.work, 1, Resource::ExecutionWork)?;
+        enforce(work, work_limit, Resource::ExecutionWork)?;
+        self.successful_paths = successful_paths;
+        self.emitted_matches = emitted_matches;
+        self.work = work;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct StateByteValueMeter;
+
+impl StateByteMeter for StateByteValueMeter {
+    #[inline]
+    fn work(&self) -> usize {
+        0
+    }
+
+    #[inline]
+    fn record_scan(
+        &mut self,
+        _scanned: usize,
+        _work_limit: usize,
+        _transactional: bool,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[inline]
+    fn classify(
+        &mut self,
+        class: crate::program::ByteSet,
+        haystack: &[u8],
+        index: usize,
+        _access: StateByteSourceAccess,
+        _work_limit: usize,
+    ) -> Result<StateByteClassification, Error> {
+        let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+            "state-byte classification index exceeds admitted source",
+        ))?;
+        Ok(StateByteClassification {
+            byte,
+            matches: class.contains(byte),
+        })
+    }
+
+    #[inline]
+    fn compare_source(
+        &mut self,
+        haystack: &[u8],
+        index: usize,
+        expected: u8,
+        _work_limit: usize,
+    ) -> Result<bool, Error> {
+        let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+            "state-byte literal index exceeds admitted source",
+        ))?;
+        Ok(byte == expected)
+    }
+
+    #[inline]
+    fn compare_cached(
+        &mut self,
+        byte: u8,
+        expected: u8,
+        _work_limit: usize,
+    ) -> Result<bool, Error> {
+        Ok(byte == expected)
+    }
+
+    #[inline]
+    fn event(&mut self, _work_limit: usize) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 fn reduce_repeated_lazy_delimiter_suffix(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let [delimiter, suffix @ ..] = plan.literal() else {
         return Err(Error::InternalInvariant(
@@ -4551,12 +5045,12 @@ fn state_byte_find_either(
     haystack: &[u8],
     start: usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<Option<(usize, u8)>, Error> {
     let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
         "state-byte memchr2 start exceeds admitted source",
     ))?;
-    let available_work = work_limit.saturating_sub(accounting.work);
+    let available_work = work_limit.saturating_sub(accounting.work());
     let admitted_len = remaining.len().min(available_work);
     let admitted = &remaining[..admitted_len];
     let relative = memchr::memchr2(first, second, admitted);
@@ -4564,14 +5058,7 @@ fn state_byte_find_either(
         Some(offset) => add(offset, 1, Resource::SequentialBytes)?,
         None => admitted_len,
     };
-    accounting.sequential_bytes_read = add(
-        accounting.sequential_bytes_read,
-        scanned,
-        Resource::SequentialBytes,
-    )?;
-    accounting.root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
-    accounting.work = add(accounting.work, scanned, Resource::ExecutionWork)?;
-    enforce(accounting.work, work_limit, Resource::ExecutionWork)?;
+    accounting.record_scan(scanned, work_limit, false)?;
     if let Some(relative) = relative {
         let index = add(start, relative, Resource::Boundaries)?;
         let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
@@ -4580,7 +5067,7 @@ fn state_byte_find_either(
         return Ok(Some((index, byte)));
     }
     if admitted_len < remaining.len() {
-        let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+        let required = add(accounting.work(), 1, Resource::ExecutionWork)?;
         enforce(required, work_limit, Resource::ExecutionWork)?;
         return Err(Error::InternalInvariant(
             "state-byte memchr2 work refusal unexpectedly admitted progress",
@@ -4594,7 +5081,7 @@ fn state_byte_suffix_matches(
     haystack: &[u8],
     start: usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
     if haystack.len().saturating_sub(start) < suffix.len() {
         return Ok(false);
@@ -4612,7 +5099,7 @@ fn reduce_greedy_prefix_literal_suffix(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     // On short inputs the scalar pass avoids constructing a substring
     // searcher. Larger inputs use the mandatory literal as the source
@@ -4632,7 +5119,7 @@ fn reduce_greedy_prefix_literal_suffix_anchored(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
@@ -4701,7 +5188,7 @@ fn reduce_greedy_prefix_literal_suffix_scalar(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
@@ -4800,7 +5287,7 @@ fn reduce_disjoint_runs_literal(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     if plan.literal().len() > 1 {
         reduce_disjoint_runs_literal_anchored(plan, haystack, work_limit, accounting)
@@ -4827,7 +5314,7 @@ fn reduce_disjoint_internal_runs(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
@@ -4959,7 +5446,7 @@ fn reduce_disjoint_runs_literal_anchored(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let first = plan.first();
     let second = plan.second();
@@ -5071,7 +5558,7 @@ fn reduce_disjoint_runs_literal_scalar(
     plan: &StateByteSpanSumPlan,
     haystack: &[u8],
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
     let first = plan.first();
     let second = plan.second();
@@ -5172,12 +5659,12 @@ fn state_byte_find_anchor(
     haystack: &[u8],
     start: usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<Option<usize>, Error> {
     let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
         "state-byte anchor search start exceeds admitted source",
     ))?;
-    let available_work = work_limit.saturating_sub(accounting.work);
+    let available_work = work_limit.saturating_sub(accounting.work());
     let admitted_len = remaining.len().min(available_work);
     let admitted = &remaining[..admitted_len];
     let relative = memchr::memchr(anchor, admitted);
@@ -5185,22 +5672,12 @@ fn state_byte_find_anchor(
         Some(offset) => add(offset, 1, Resource::SequentialBytes)?,
         None => admitted_len,
     };
-    let sequential_bytes_read = add(
-        accounting.sequential_bytes_read,
-        scanned,
-        Resource::SequentialBytes,
-    )?;
-    let root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
-    let work = add(accounting.work, scanned, Resource::ExecutionWork)?;
-    enforce(work, work_limit, Resource::ExecutionWork)?;
-    accounting.sequential_bytes_read = sequential_bytes_read;
-    accounting.root_probes = root_probes;
-    accounting.work = work;
+    accounting.record_scan(scanned, work_limit, true)?;
     if let Some(relative) = relative {
         return Ok(Some(add(start, relative, Resource::Boundaries)?));
     }
     if admitted_len < remaining.len() {
-        let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+        let required = add(accounting.work(), 1, Resource::ExecutionWork)?;
         enforce(required, work_limit, Resource::ExecutionWork)?;
         return Err(Error::InternalInvariant(
             "state-byte anchor work refusal unexpectedly admitted progress",
@@ -5214,13 +5691,13 @@ fn state_byte_find_literal(
     haystack: &[u8],
     start: usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<Option<usize>, Error> {
     let [anchor] = literal else {
         let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
             "state-byte literal search start exceeds admitted source",
         ))?;
-        let available_work = work_limit.saturating_sub(accounting.work);
+        let available_work = work_limit.saturating_sub(accounting.work());
         let admitted_len = remaining.len().min(available_work);
         let admitted = &remaining[..admitted_len];
         let relative = memchr::memmem::find(admitted, literal);
@@ -5228,19 +5705,12 @@ fn state_byte_find_literal(
             Some(offset) => add(offset, literal.len(), Resource::SequentialBytes)?,
             None => admitted_len,
         };
-        accounting.sequential_bytes_read = add(
-            accounting.sequential_bytes_read,
-            scanned,
-            Resource::SequentialBytes,
-        )?;
-        accounting.root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
-        accounting.work = add(accounting.work, scanned, Resource::ExecutionWork)?;
-        enforce(accounting.work, work_limit, Resource::ExecutionWork)?;
+        accounting.record_scan(scanned, work_limit, false)?;
         if let Some(relative) = relative {
             return add(start, relative, Resource::Boundaries).map(Some);
         }
         if admitted_len < remaining.len() {
-            let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+            let required = add(accounting.work(), 1, Resource::ExecutionWork)?;
             enforce(required, work_limit, Resource::ExecutionWork)?;
             return Err(Error::InternalInvariant(
                 "state-byte literal work refusal unexpectedly admitted progress",
@@ -5257,7 +5727,7 @@ fn state_byte_literal_matches_at(
     haystack: &[u8],
     start: usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
     for (offset, &expected) in literal.iter().enumerate() {
         if offset == anchor_offset {
@@ -5282,7 +5752,7 @@ fn state_byte_disjoint_literal_matches(
     start: usize,
     classified_first: Option<u8>,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
     if haystack.len().saturating_sub(start) < literal.len() {
         return Ok(false);
@@ -5308,42 +5778,9 @@ fn state_byte_classify(
     index: usize,
     access: StateByteSourceAccess,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<StateByteClassification, Error> {
-    let state_evaluations = add(accounting.state_evaluations, 1, Resource::ExecutionWork)?;
-    let transition_checks = add(accounting.transition_checks, 1, Resource::ExecutionWork)?;
-    let work = add(accounting.work, 2, Resource::ExecutionWork)?;
-    enforce(work, work_limit, Resource::ExecutionWork)?;
-    let (sequential_bytes_read, random_access_bytes_read) = match access {
-        StateByteSourceAccess::Sequential => (
-            add(
-                accounting.sequential_bytes_read,
-                1,
-                Resource::SequentialBytes,
-            )?,
-            accounting.random_access_bytes_read,
-        ),
-        StateByteSourceAccess::Random => (
-            accounting.sequential_bytes_read,
-            add(
-                accounting.random_access_bytes_read,
-                1,
-                Resource::RandomAccessBytes,
-            )?,
-        ),
-    };
-    let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
-        "state-byte classification index exceeds admitted source",
-    ))?;
-    accounting.state_evaluations = state_evaluations;
-    accounting.transition_checks = transition_checks;
-    accounting.sequential_bytes_read = sequential_bytes_read;
-    accounting.random_access_bytes_read = random_access_bytes_read;
-    accounting.work = work;
-    Ok(StateByteClassification {
-        byte,
-        matches: class.contains(byte),
-    })
+    accounting.classify(class, haystack, index, access, work_limit)
 }
 
 fn state_byte_compare_source(
@@ -5351,37 +5788,18 @@ fn state_byte_compare_source(
     index: usize,
     expected: u8,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
-    let root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
-    let random_access_bytes_read = add(
-        accounting.random_access_bytes_read,
-        1,
-        Resource::RandomAccessBytes,
-    )?;
-    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
-    enforce(work, work_limit, Resource::ExecutionWork)?;
-    let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
-        "state-byte literal index exceeds admitted source",
-    ))?;
-    accounting.root_probes = root_probes;
-    accounting.random_access_bytes_read = random_access_bytes_read;
-    accounting.work = work;
-    Ok(byte == expected)
+    accounting.compare_source(haystack, index, expected, work_limit)
 }
 
 fn state_byte_compare_cached(
     byte: u8,
     expected: u8,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
-    let root_probes = add(accounting.root_probes, 1, Resource::ExecutionWork)?;
-    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
-    enforce(work, work_limit, Resource::ExecutionWork)?;
-    accounting.root_probes = root_probes;
-    accounting.work = work;
-    Ok(byte == expected)
+    accounting.compare_cached(byte, expected, work_limit)
 }
 
 fn state_byte_kmp_feed(
@@ -5390,7 +5808,7 @@ fn state_byte_kmp_feed(
     failure: &[u8],
     matched: &mut usize,
     work_limit: usize,
-    accounting: &mut ExecutionAccounting,
+    accounting: &mut impl StateByteMeter,
 ) -> Result<bool, Error> {
     loop {
         if state_byte_compare_cached(byte, literal[*matched], work_limit, accounting)? {
@@ -5419,15 +5837,8 @@ enum StateByteSourceAccess {
     Random,
 }
 
-fn state_byte_event(work_limit: usize, accounting: &mut ExecutionAccounting) -> Result<(), Error> {
-    let successful_paths = add(accounting.successful_paths, 1, Resource::MatchEvents)?;
-    let emitted_matches = add(accounting.emitted_matches, 1, Resource::OutputMatches)?;
-    let work = add(accounting.work, 1, Resource::ExecutionWork)?;
-    enforce(work, work_limit, Resource::ExecutionWork)?;
-    accounting.successful_paths = successful_paths;
-    accounting.emitted_matches = emitted_matches;
-    accounting.work = work;
-    Ok(())
+fn state_byte_event(work_limit: usize, accounting: &mut impl StateByteMeter) -> Result<(), Error> {
+    accounting.event(work_limit)
 }
 
 fn start_domain_prospective(
@@ -10649,6 +11060,14 @@ fn try_charge_amount(
     let required = add(accounting.work, amount, Resource::ExecutionWork)?;
     enforce(required, admitted_work_bound, Resource::ExecutionWork)?;
     accounting.work = required;
+    Ok(())
+}
+
+#[inline]
+fn try_charge_value_work(work: &mut usize, admitted_work_bound: usize) -> Result<(), Error> {
+    let required = add(*work, 1, Resource::ExecutionWork)?;
+    enforce(required, admitted_work_bound, Resource::ExecutionWork)?;
+    *work = required;
     Ok(())
 }
 
@@ -16073,6 +16492,84 @@ mod tests {
     }
 
     #[test]
+    fn state_byte_scalar_value_path_matches_full_counter_path_and_refusals() {
+        for (pattern, haystack) in [
+            (r"[a-c]*ab[a-z]*", b"ccababzzz\ncabq".as_slice()),
+            (r"\w+\s+Holmes", b"alpha Holmes beta".as_slice()),
+            (r"\w+@\w+", b"good@example bad@".as_slice()),
+            (r"(.*?,){2}z", b"a,b,z\nx,y,no".as_slice()),
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let limits = [
+                OperationLimits::default(),
+                OperationLimits {
+                    max_boundaries: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_sequential_bytes: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_match_events: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_output_matches: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_work: 0,
+                    ..OperationLimits::default()
+                },
+            ];
+            for limits in limits {
+                let compact_count = compiled.count_value(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                );
+                let full_count = compiled
+                    .count_value_with_counters(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        limits,
+                    )
+                    .map(|attempt| attempt.value);
+                assert_eq!(
+                    compact_count, full_count,
+                    "count mismatch for {pattern:?}, limits={limits:?}"
+                );
+
+                let compact_sum = compiled.span_sum_value(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                );
+                let full_sum = compiled
+                    .span_sum_value_with_counters(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        limits,
+                    )
+                    .map(|attempt| attempt.value);
+                assert_eq!(
+                    compact_sum, full_sum,
+                    "span-sum mismatch for {pattern:?}, limits={limits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn state_byte_redundant_stars_and_large_literal_anchor_match_upstream() {
         for pattern in [r".*.*=.*", r"[ -~]*[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*"] {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -17184,6 +17681,106 @@ mod tests {
                 expected,
                 "regex oracle mismatch for {pattern:?}, unicode={unicode}"
             );
+        }
+    }
+
+    #[test]
+    fn root_assertion_scalar_value_path_matches_full_counter_path_and_refusals() {
+        for (pattern, unicode, haystack) in [
+            (r"\A", false, b"a_ z\r\n".as_slice()),
+            (r"(?Rm:$)", false, b"a_ z\r\n".as_slice()),
+            (r"\b", false, b"a_ z\r\n".as_slice()),
+            (r"\b", true, "aé_ β\r\n".as_bytes()),
+        ] {
+            let compiled = root_assertion_fixture(pattern, unicode);
+            let range = 1..haystack.len().saturating_sub(1);
+            let limits = [
+                OperationLimits::default(),
+                OperationLimits {
+                    max_boundaries: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_random_access_bytes: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_sequential_bytes: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_match_events: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_output_matches: 0,
+                    ..OperationLimits::default()
+                },
+                OperationLimits {
+                    max_work: 0,
+                    ..OperationLimits::default()
+                },
+            ];
+            for limits in limits {
+                let compact_count = compiled.count_value(
+                    haystack,
+                    range.clone(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                );
+                let full_count = compiled
+                    .count_value_with_counters(
+                        haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        limits,
+                    )
+                    .map(|attempt| attempt.value);
+                assert_eq!(
+                    compact_count, full_count,
+                    "count mismatch for {pattern:?}, unicode={unicode}, limits={limits:?}"
+                );
+
+                let compact_sum = compiled.span_sum_value(
+                    haystack,
+                    range.clone(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                );
+                let full_sum = compiled
+                    .span_sum_value_with_counters(
+                        haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        limits,
+                    )
+                    .map(|attempt| attempt.value);
+                assert_eq!(
+                    compact_sum, full_sum,
+                    "span-sum mismatch for {pattern:?}, unicode={unicode}, limits={limits:?}"
+                );
+            }
+        }
+
+        let unicode = root_assertion_fixture(r"\b", true);
+        for limits in [
+            OperationLimits::default(),
+            OperationLimits {
+                max_boundaries: 0,
+                ..OperationLimits::default()
+            },
+            OperationLimits {
+                max_sequential_bytes: 0,
+                ..OperationLimits::default()
+            },
+        ] {
+            let haystack = b"\xFFa";
+            let compact =
+                unicode.count_value(haystack, 1..2, Strategy::ReverseSequentialRows, limits);
+            let full = unicode
+                .count_value_with_counters(haystack, 1..2, Strategy::ReverseSequentialRows, limits)
+                .map(|attempt| attempt.value);
+            assert_eq!(compact, full, "malformed UTF-8 precedence diverged");
         }
     }
 
