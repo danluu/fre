@@ -4249,7 +4249,7 @@ mod tests {
 
     #[cfg(all(
         target_arch = "aarch64",
-        target_os = "macos",
+        any(target_os = "macos", target_os = "linux"),
         target_pointer_width = "64",
         target_endian = "little"
     ))]
@@ -4284,7 +4284,7 @@ mod tests {
 
     #[cfg(all(
         target_arch = "aarch64",
-        target_os = "macos",
+        any(target_os = "macos", target_os = "linux"),
         target_pointer_width = "64",
         target_endian = "little"
     ))]
@@ -4331,7 +4331,7 @@ mod tests {
 
     #[cfg(not(all(
         target_arch = "aarch64",
-        target_os = "macos",
+        any(target_os = "macos", target_os = "linux"),
         target_pointer_width = "64",
         target_endian = "little"
     )))]
