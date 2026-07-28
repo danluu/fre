@@ -217,6 +217,9 @@ fn classify_span_sum_candidate(
 ) -> Result<Candidate, ()> {
     meter.charge(1)?;
     if starts {
+        if let Some(candidate) = classify_start_mask_candidate(&parts[1..], meter)? {
+            return Ok(candidate);
+        }
         let [_start, prefix, alternatives] = parts else {
             return Ok(Candidate::Ineligible);
         };
@@ -466,6 +469,91 @@ fn classify_span_sum_candidate(
     Ok(Candidate::ProvenEligible)
 }
 
+fn classify_start_mask_candidate(
+    core: &[Hir],
+    meter: &mut CandidateMeter,
+) -> Result<Option<Candidate>, ()> {
+    if core.is_empty() {
+        return Ok(None);
+    }
+    let mut positions = 0_usize;
+    let mut inspection = 0_usize;
+    for part in core {
+        let before = meter.work;
+        let Some(part) = meter.peel(part)? else {
+            return Ok(Some(Candidate::Possible));
+        };
+        let peel_work = meter.work.checked_sub(before).ok_or(())?;
+        meter.charge(1)?;
+        if !candidate_add_bounded(&mut inspection, peel_work, CANDIDATE_INSPECTION_ENVELOPE) {
+            return Ok(Some(Candidate::Possible));
+        }
+        match part.kind() {
+            HirKind::Literal(literal) if !literal.0.is_empty() => {
+                if !candidate_add_bounded(&mut positions, literal.0.len(), CANDIDATE_PAYLOAD_LIMIT)
+                    || !candidate_add_bounded(
+                        &mut inspection,
+                        literal.0.len(),
+                        CANDIDATE_INSPECTION_ENVELOPE,
+                    )
+                {
+                    return Ok(Some(Candidate::Possible));
+                }
+            }
+            HirKind::Class(Class::Bytes(class)) if !class.ranges().is_empty() => {
+                meter.charge(class.ranges().len())?;
+                if !candidate_add_bounded(&mut positions, 1, CANDIDATE_PAYLOAD_LIMIT)
+                    || !candidate_add_bounded(
+                        &mut inspection,
+                        class.ranges().len(),
+                        CANDIDATE_INSPECTION_ENVELOPE,
+                    )
+                {
+                    return Ok(Some(Candidate::Possible));
+                }
+                for range in class.ranges() {
+                    if !candidate_add_bounded(
+                        &mut inspection,
+                        range.len(),
+                        CANDIDATE_INSPECTION_ENVELOPE,
+                    ) {
+                        return Ok(Some(Candidate::Possible));
+                    }
+                }
+            }
+            HirKind::Class(Class::Unicode(class))
+                if !class.ranges().is_empty()
+                    && class
+                        .ranges()
+                        .last()
+                        .is_some_and(|range| range.end().is_ascii()) =>
+            {
+                meter.charge(class.ranges().len())?;
+                if !candidate_add_bounded(&mut positions, 1, CANDIDATE_PAYLOAD_LIMIT)
+                    || !candidate_add_bounded(
+                        &mut inspection,
+                        class.ranges().len(),
+                        CANDIDATE_INSPECTION_ENVELOPE,
+                    )
+                {
+                    return Ok(Some(Candidate::Possible));
+                }
+                for range in class.ranges() {
+                    if !candidate_add_bounded(
+                        &mut inspection,
+                        range.len(),
+                        CANDIDATE_INSPECTION_ENVELOPE,
+                    ) {
+                        return Ok(Some(Candidate::Possible));
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(Candidate::ProvenEligible))
+}
+
 struct CandidateMeter {
     work: usize,
     limit: usize,
@@ -506,7 +594,7 @@ pub(crate) enum Inspection<'a> {
 }
 
 pub(crate) enum Shape<'a> {
-    EndMaskSequence(MaskSource<'a>),
+    MaskSequence(MaskSource<'a>),
     EndOneByteMask(FixedAbsoluteDomainByteMask),
     EndGreedyClassLiteral {
         class: FixedAbsoluteDomainByteMask,
@@ -537,8 +625,12 @@ impl Shape<'_> {
         &self,
     ) -> Result<FixedAbsoluteDomainBuildProspective, FixedAbsoluteDomainBuildError> {
         match self {
-            Self::EndMaskSequence(source) => {
-                FixedAbsoluteDomainPlan::end_mask_sequence_prospective(source.positions)
+            Self::MaskSequence(source) => {
+                if source.start_anchored {
+                    FixedAbsoluteDomainPlan::start_mask_sequence_prospective(source.positions)
+                } else {
+                    FixedAbsoluteDomainPlan::end_mask_sequence_prospective(source.positions)
+                }
             }
             Self::EndOneByteMask(mask) => {
                 FixedAbsoluteDomainPlan::end_one_byte_mask_prospective(*mask)
@@ -593,8 +685,12 @@ impl Shape<'_> {
         limits: FixedAbsoluteDomainBuildLimits,
     ) -> Result<FixedAbsoluteDomainPlan, FixedAbsoluteDomainBuildError> {
         match self {
-            Self::EndMaskSequence(source) => {
-                FixedAbsoluteDomainPlan::build_end_mask_sequence(source.iter(), limits)
+            Self::MaskSequence(source) => {
+                if source.start_anchored {
+                    FixedAbsoluteDomainPlan::build_start_mask_sequence(source.iter(), limits)
+                } else {
+                    FixedAbsoluteDomainPlan::build_end_mask_sequence(source.iter(), limits)
+                }
             }
             Self::EndOneByteMask(mask) => {
                 FixedAbsoluteDomainPlan::build_end_one_byte_mask(*mask, limits)
@@ -807,6 +903,7 @@ fn charge_census(work: &mut usize, limit: usize, amount: usize) -> Result<(), In
 pub(crate) struct MaskSource<'a> {
     parts: &'a [Hir],
     positions: usize,
+    start_anchored: bool,
 }
 
 impl MaskSource<'_> {
@@ -853,6 +950,22 @@ impl Iterator for MaskIter<'_> {
                     let mut mask = FixedAbsoluteDomainByteMask::default();
                     for range in class.ranges() {
                         mask.insert_inclusive(range.start(), range.end());
+                    }
+                    self.part = self.part.checked_add(1)?;
+                    self.remaining = self.remaining.checked_sub(1)?;
+                    return Some(mask);
+                }
+                HirKind::Class(Class::Unicode(class))
+                    if class
+                        .ranges()
+                        .last()
+                        .is_some_and(|range| range.end().is_ascii()) =>
+                {
+                    let mut mask = FixedAbsoluteDomainByteMask::default();
+                    for range in class.ranges() {
+                        let start = u8::try_from(u32::from(range.start())).ok()?;
+                        let end = u8::try_from(u32::from(range.end())).ok()?;
+                        mask.insert_inclusive(start, end);
                     }
                     self.part = self.part.checked_add(1)?;
                     self.remaining = self.remaining.checked_sub(1)?;
@@ -1117,17 +1230,31 @@ fn inspect_byte_span_sum<'a>(
         let source = MaskSource {
             parts: core,
             positions,
+            start_anchored: false,
         };
         return Ok(Some(if positions == 1 {
             Shape::EndOneByteMask(source.iter().next().ok_or(InspectionError::Overflow)?)
         } else {
-            Shape::EndMaskSequence(source)
+            Shape::MaskSequence(source)
         }));
     }
     if first_start && !last_end {
         visitor.expect_look(&parts[0], Look::Start)?;
         let core = &parts[1..];
-        return inspect_start_prefix(core, visitor);
+        let mut ordered_trial = *visitor;
+        if let Some(shape) = inspect_start_prefix(core, &mut ordered_trial)? {
+            *visitor = ordered_trial;
+            return Ok(Some(shape));
+        }
+        visitor.work = ordered_trial.work;
+        let Some(positions) = visitor.inspect_masks(core)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Shape::MaskSequence(MaskSource {
+            parts: core,
+            positions,
+            start_anchored: true,
+        })));
     }
     Ok(None)
 }
@@ -1462,6 +1589,27 @@ impl Visitor {
                         .ok_or(InspectionError::Overflow)?;
                 }
                 HirKind::Class(Class::Bytes(class)) if !class.ranges().is_empty() => {
+                    self.charge(class.ranges().len())?;
+                    let insertion_work =
+                        class.ranges().iter().try_fold(0_usize, |total, range| {
+                            total
+                                .checked_add(range.len())
+                                .ok_or(InspectionError::Overflow)
+                        })?;
+                    self.charge(
+                        future_peel_work
+                            .checked_add(insertion_work)
+                            .ok_or(InspectionError::Overflow)?,
+                    )?;
+                    positions = positions.checked_add(1).ok_or(InspectionError::Overflow)?;
+                }
+                HirKind::Class(Class::Unicode(class))
+                    if !class.ranges().is_empty()
+                        && class
+                            .ranges()
+                            .last()
+                            .is_some_and(|range| range.end().is_ascii()) =>
+                {
                     self.charge(class.ranges().len())?;
                     let insertion_work =
                         class.ranges().iter().try_fold(0_usize, |total, range| {

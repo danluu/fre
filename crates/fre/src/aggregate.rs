@@ -3265,7 +3265,8 @@ impl AggregateBuildReport {
                         FixedAbsoluteDomainDescriptorKind::EndMaskSequence
                             | FixedAbsoluteDomainDescriptorKind::EndOneByteMask
                             | FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
-                            | FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix,
+                            | FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                            | FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
                     )
                 );
                 let residual_closed = match (

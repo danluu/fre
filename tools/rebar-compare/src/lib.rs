@@ -13026,7 +13026,8 @@ fn fixed_absolute_plan_identity_matches(
             fre::FixedAbsoluteDomainDescriptorKind::EndMaskSequence
                 | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
                 | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
-                | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix,
+                | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
         ) | (
             true,
             LiteralAggregateOperation::Count,
@@ -13832,6 +13833,7 @@ fn fixed_absolute_operation_identity_is_closed(
                         | fre::FixedAbsoluteDomainDescriptorKind::EndOneByteMask
                         | fre::FixedAbsoluteDomainDescriptorKind::EndGreedyClassLiteral
                         | fre::FixedAbsoluteDomainDescriptorKind::StartOrderedPrefix
+                        | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence
                 )
         }
     };

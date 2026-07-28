@@ -231,6 +231,50 @@ fn endpoint_masks_are_positional_and_end_is_never_rebased_to_a_window() {
 }
 
 #[test]
+fn start_masks_are_positional_and_start_is_never_rebased_to_a_window() {
+    let plan = FixedAbsoluteDomainPlan::build_start_mask_sequence(
+        [
+            FixedAbsoluteDomainByteMask::inclusive(0, u8::MAX),
+            singleton(b'b'),
+            singleton(b'c'),
+            FixedAbsoluteDomainByteMask::inclusive(b'd', b'e'),
+        ]
+        .into_iter(),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.descriptor_identity(),
+        FixedAbsoluteDomainDescriptorIdentity::StartMaskSequence { width: 4 }
+    );
+
+    for haystack in [b"abcd-tail".as_slice(), b"\xffbce-tail".as_slice()] {
+        let matched = plan
+            .span_sum(haystack, FixedAbsoluteDomainReduceLimits::default())
+            .unwrap();
+        assert_eq!(matched.span_sum, 4);
+        assert_eq!(matched.accounting.actual.source_accesses, 4);
+    }
+    for window in [Window::new(1, 9), Window::new(0, 3)] {
+        let excluded = plan
+            .span_sum_in(
+                b"abcd-tail",
+                window,
+                FixedAbsoluteDomainReduceLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(excluded.span_sum, 0);
+        assert_eq!(excluded.accounting.actual.source_accesses, 0);
+    }
+    assert_every_run_fence(
+        "start-mask-sequence",
+        &plan,
+        4,
+        FixedAbsoluteDomainOperation::SpanSum,
+    );
+}
+
+#[test]
 fn endpoint_one_byte_mask_covers_all_bytes_without_unicode_conflation() {
     let mut word = FixedAbsoluteDomainByteMask::default();
     for (start, end) in [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')] {

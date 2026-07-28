@@ -23,7 +23,7 @@ pub const SPAN_SUM_OPERATION_ID: &str = "fixed-absolute-domain.span-sum.v1";
 /// A normalized 256-bit positional byte predicate.
 pub type ByteMask = ByteClass;
 
-/// One of the seven closed absolute-domain theorems.
+/// One of the eight closed absolute-domain theorems.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DescriptorKind {
     EndMaskSequence,
@@ -33,6 +33,7 @@ pub enum DescriptorKind {
     WholeOrderedWords,
     StartOrderedPrefix,
     WholeScalarEnvelope,
+    StartMaskSequence,
 }
 
 /// Whole-match reduction selected before construction.
@@ -75,6 +76,7 @@ impl ContentDigestBuilder {
             DescriptorKind::StartOrderedPrefix => 5,
             DescriptorKind::WholeScalarEnvelope => 6,
             DescriptorKind::EndGreedyClassLiteral => 7,
+            DescriptorKind::StartMaskSequence => 8,
         };
         Self {
             lane0: 0xcbf2_9ce4_8422_2325_u64 ^ domain,
@@ -142,6 +144,9 @@ pub enum DescriptorIdentity {
         width: usize,
         alternatives: usize,
     },
+    StartMaskSequence {
+        width: usize,
+    },
     WholeScalarEnvelope {
         scalars: u32,
         minimum_bytes: usize,
@@ -160,6 +165,7 @@ impl DescriptorIdentity {
             Self::WholeOrderedWords { .. } => DescriptorKind::WholeOrderedWords,
             Self::StartOrderedPrefix { .. } => DescriptorKind::StartOrderedPrefix,
             Self::WholeScalarEnvelope { .. } => DescriptorKind::WholeScalarEnvelope,
+            Self::StartMaskSequence { .. } => DescriptorKind::StartMaskSequence,
         }
     }
 }
@@ -608,7 +614,7 @@ struct Word {
 
 #[derive(Debug)]
 enum Descriptor {
-    EndMaskSequence(ExactVec<ByteMask>),
+    MaskSequence(ExactVec<ByteMask>),
     EndOneByteMask(ByteMask),
     EndGreedyClassLiteral {
         class: ByteMask,
@@ -679,7 +685,39 @@ impl FixedAbsoluteDomainPlan {
         masks: impl ExactSizeIterator<Item = ByteMask>,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
-        Self::build_masks(masks, DescriptorKind::EndMaskSequence, limits)
+        Self::build_masks(masks, false, limits)
+    }
+
+    /// Allocation-free construction prospective for a start-mask sequence.
+    #[doc(hidden)]
+    pub fn start_mask_sequence_prospective(count: usize) -> Result<BuildProspective, BuildError> {
+        if count == 0 {
+            return Err(build_error(BuildErrorKind::EmptyDescriptor));
+        }
+        let identity = DescriptorIdentity::StartMaskSequence { width: count };
+        let payload = count.checked_mul(size_of::<ByteMask>()).ok_or_else(|| {
+            build_error(BuildErrorKind::ArithmeticOverflow {
+                computation: "start mask payload bytes",
+            })
+        })?;
+        let work = count
+            .checked_add(1)
+            .and_then(|work| u64::try_from(work).ok())
+            .ok_or_else(|| {
+                build_error(BuildErrorKind::ArithmeticOverflow {
+                    computation: "start mask build work",
+                })
+            })?;
+        prospective(identity, count, payload, payload, payload, 1, payload, work)
+    }
+
+    /// Build a non-empty positional byte predicate anchored to byte zero of
+    /// the original haystack.
+    pub fn build_start_mask_sequence(
+        masks: impl ExactSizeIterator<Item = ByteMask>,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_masks(masks, true, limits)
     }
 
     pub fn build_end_one_byte_mask(
@@ -1758,25 +1796,27 @@ impl FixedAbsoluteDomainPlan {
     )]
     fn build_masks(
         mut masks: impl ExactSizeIterator<Item = ByteMask>,
-        kind: DescriptorKind,
+        start_anchored: bool,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
         let count = masks.len();
         if count == 0 {
             return Err(build_error(BuildErrorKind::EmptyDescriptor));
         }
-        if kind == DescriptorKind::EndMaskSequence && count == 1 {
+        if !start_anchored && count == 1 {
             return Err(build_error(BuildErrorKind::InternalInvariant(
                 "one-byte endpoint must use EndOneByteMask",
             )));
         }
-        let identity = match kind {
-            DescriptorKind::EndMaskSequence => DescriptorIdentity::EndMaskSequence { width: count },
-            _ => {
-                return Err(build_error(BuildErrorKind::InternalInvariant(
-                    "mask builder received non-mask descriptor",
-                )));
-            }
+        let identity = if start_anchored {
+            DescriptorIdentity::StartMaskSequence { width: count }
+        } else {
+            DescriptorIdentity::EndMaskSequence { width: count }
+        };
+        let kind = if start_anchored {
+            DescriptorKind::StartMaskSequence
+        } else {
+            DescriptorKind::EndMaskSequence
         };
         let payload = count.checked_mul(size_of::<ByteMask>()).ok_or_else(|| {
             build_error(BuildErrorKind::ArithmeticOverflow {
@@ -1791,9 +1831,13 @@ impl FixedAbsoluteDomainPlan {
                     computation: "mask build work",
                 })
             })?;
-        let prospective = Self::end_mask_sequence_prospective(count)?;
+        let prospective = if start_anchored {
+            Self::start_mask_sequence_prospective(count)?
+        } else {
+            Self::end_mask_sequence_prospective(count)?
+        };
         enforce_build(prospective, limits)?;
-        let mut digest = ContentDigestBuilder::new(DescriptorKind::EndMaskSequence);
+        let mut digest = ContentDigestBuilder::new(kind);
         digest.write_usize(count);
         let mut actual = BuildActual {
             identity_bytes: FIXED_IDENTITY_BYTES,
@@ -1916,10 +1960,7 @@ impl FixedAbsoluteDomainPlan {
         actual.peak_bytes = prospective.peak_bytes;
         actual.published = true;
         validate_build_actual(prospective, actual)?;
-        let descriptor = match kind {
-            DescriptorKind::EndMaskSequence => Descriptor::EndMaskSequence(retained),
-            _ => unreachable!("validated mask descriptor kind"),
-        };
+        let descriptor = Descriptor::MaskSequence(retained);
         Ok(Self {
             descriptor,
             identity,
@@ -2163,7 +2204,8 @@ impl FixedAbsoluteDomainPlan {
             DescriptorKind::EndMaskSequence
             | DescriptorKind::EndOneByteMask
             | DescriptorKind::EndGreedyClassLiteral
-            | DescriptorKind::StartOrderedPrefix => operation == Operation::SpanSum,
+            | DescriptorKind::StartOrderedPrefix
+            | DescriptorKind::StartMaskSequence => operation == Operation::SpanSum,
             DescriptorKind::WholeByteRepeat
             | DescriptorKind::WholeOrderedWords
             | DescriptorKind::WholeScalarEnvelope => operation == Operation::Count,
@@ -2181,8 +2223,12 @@ impl FixedAbsoluteDomainPlan {
     fn candidate(&self, haystack_len: usize, window: Window) -> Result<Candidate, ReduceErrorKind> {
         let full = window.start() == 0 && window.end() == haystack_len;
         match &self.descriptor {
-            Descriptor::EndMaskSequence(masks) => {
-                endpoint_candidate(haystack_len, window, masks.len())
+            Descriptor::MaskSequence(masks) => {
+                if matches!(self.identity, DescriptorIdentity::StartMaskSequence { .. }) {
+                    start_mask_candidate(haystack_len, window, masks.len())
+                } else {
+                    endpoint_candidate(haystack_len, window, masks.len())
+                }
             }
             Descriptor::EndOneByteMask(_) => endpoint_candidate(haystack_len, window, 1),
             Descriptor::EndGreedyClassLiteral { suffix, .. } => {
@@ -2245,27 +2291,12 @@ impl FixedAbsoluteDomainPlan {
             Descriptor::StartOrderedPrefix {
                 prefix,
                 alternatives,
-            } => {
-                let width =
-                    prefix
-                        .len()
-                        .checked_add(1)
-                        .ok_or(ReduceErrorKind::ArithmeticOverflow {
-                            computation: "ordered prefix width",
-                        })?;
-                let eligible =
-                    window.start() == 0 && width <= window.end() && width <= haystack_len;
-                Ok(if eligible {
-                    let probes = prefix.len().checked_add(alternatives.len()).ok_or(
-                        ReduceErrorKind::ArithmeticOverflow {
-                            computation: "ordered prefix probe bound",
-                        },
-                    )?;
-                    Candidate::verify(probes, 1, alternatives.len(), width)?
-                } else {
-                    Candidate::complete_zero(1)
-                })
-            }
+            } => start_ordered_prefix_candidate(
+                haystack_len,
+                window,
+                prefix.len(),
+                alternatives.len(),
+            ),
             Descriptor::WholeScalarEnvelope {
                 minimum_bytes,
                 maximum_bytes,
@@ -2327,9 +2358,14 @@ impl FixedAbsoluteDomainPlan {
         }
         let verified = if admission.candidate_active {
             match &self.descriptor {
-                Descriptor::EndMaskSequence(masks) => {
-                    verify_endpoint_masks(haystack, admission.window, masks, &mut actual)
-                        .map(|matched| (matched, None))
+                Descriptor::MaskSequence(masks) => {
+                    if matches!(self.identity, DescriptorIdentity::StartMaskSequence { .. }) {
+                        verify_start_masks(haystack, admission.window, masks, &mut actual)
+                            .map(|matched| (matched, None))
+                    } else {
+                        verify_endpoint_masks(haystack, admission.window, masks, &mut actual)
+                            .map(|matched| (matched, None))
+                    }
                 }
                 Descriptor::EndOneByteMask(mask) => {
                     verify_endpoint_one(haystack, admission.window, *mask, &mut actual)
@@ -2537,6 +2573,44 @@ fn endpoint_candidate(
     }
 }
 
+fn start_mask_candidate(
+    haystack_len: usize,
+    window: Window,
+    width: usize,
+) -> Result<Candidate, ReduceErrorKind> {
+    let eligible = window.start() == 0 && width <= window.end() && width <= haystack_len;
+    Ok(if eligible {
+        Candidate::verify(width, 1, 0, width)?
+    } else {
+        Candidate::complete_zero(1)
+    })
+}
+
+fn start_ordered_prefix_candidate(
+    haystack_len: usize,
+    window: Window,
+    prefix_bytes: usize,
+    alternatives: usize,
+) -> Result<Candidate, ReduceErrorKind> {
+    let width = prefix_bytes
+        .checked_add(1)
+        .ok_or(ReduceErrorKind::ArithmeticOverflow {
+            computation: "ordered prefix width",
+        })?;
+    let eligible = window.start() == 0 && width <= window.end() && width <= haystack_len;
+    Ok(if eligible {
+        let probes =
+            prefix_bytes
+                .checked_add(alternatives)
+                .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                    computation: "ordered prefix probe bound",
+                })?;
+        Candidate::verify(probes, 1, alternatives, width)?
+    } else {
+        Candidate::complete_zero(1)
+    })
+}
+
 fn verify_endpoint_masks(
     haystack: &[u8],
     window: Window,
@@ -2559,6 +2633,29 @@ fn verify_endpoint_masks(
             .get(index)
             .ok_or(ReduceErrorKind::ArithmeticOverflow {
                 computation: "endpoint source access",
+            })?;
+        record_probe(actual)?;
+        if !mask.contains(byte) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verify_start_masks(
+    haystack: &[u8],
+    window: Window,
+    masks: &[ByteMask],
+    actual: &mut ReduceActual,
+) -> Result<bool, ReduceErrorKind> {
+    if window.start() != 0 || masks.len() > window.end() || masks.len() > haystack.len() {
+        return Ok(false);
+    }
+    for (index, mask) in masks.iter().enumerate() {
+        let byte = *haystack
+            .get(index)
+            .ok_or(ReduceErrorKind::ArithmeticOverflow {
+                computation: "start mask source access",
             })?;
         record_probe(actual)?;
         if !mask.contains(byte) {
@@ -3823,6 +3920,18 @@ mod tests {
             FixedAbsoluteDomainPlan::build_start_ordered_prefix(
                 b"zbc",
                 [b'd', b'e'].into_iter(),
+                limits,
+            )
+        });
+        assert_every_build_fence("start-mask-sequence", |limits| {
+            FixedAbsoluteDomainPlan::build_start_mask_sequence(
+                [
+                    ByteMask::inclusive(0, u8::MAX),
+                    singleton(b'b'),
+                    singleton(b'c'),
+                    ByteMask::inclusive(b'd', b'e'),
+                ]
+                .into_iter(),
                 limits,
             )
         });
