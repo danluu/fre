@@ -35,6 +35,7 @@ type SpanValue = Option<(usize, usize)>;
 const SCHEMA: &str = "fre-aot-selected-end-abi2-three-engine-v2";
 const EVIDENCE_CLASS: &str = "diagnostic-nonpromotion";
 const PROMOTION_AUTHORITY: &str = "absent";
+const RUNTIME_AUTHORITY: &str = "absent";
 const POST_LINK_OBSERVATION: &str = "pending-external-static-verifier";
 const LITERAL: &[u8; 16] = b"0123456789abcdef";
 const TAG21_FILTER_OFFSETS: [usize; 5] = [7, 6, 8, 5, 15];
@@ -428,7 +429,7 @@ fn qualification(arguments: &[String]) -> Result<(), DynError> {
         }
     }
     println!(
-        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=exact-entry-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=exact-entry-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
         identity.run_id,
         identity.instance_type,
         identity.helper_sha256,
@@ -468,7 +469,7 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
         iterations.insert(engine, calibrate_hot(&sessions, engine, preflight)?);
     }
     println!(
-        "CELL\t{SCHEMA}\tstage=hot\tstrategy=same-preflight-value-only\tsize={}\tscenario={}\trepetition={repetition}\torder={}\talignment={}\tsearched_bytes={}\twindow={}..{}\texpected={}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "CELL\t{SCHEMA}\tstage=hot\tstrategy=same-preflight-value-only\tsize={}\tscenario={}\trepetition={repetition}\torder={}\talignment={}\tsearched_bytes={}\twindow={}..{}\texpected={}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
         size.name(),
         scenario.name(),
         format_order(order),
@@ -504,7 +505,7 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
             .into());
         }
         println!(
-            "SAMPLE\t{SCHEMA}\tstage=hot\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={engine_iterations}\telapsed_ns={}\tchecksum={checksum}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+            "SAMPLE\t{SCHEMA}\tstage=hot\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={engine_iterations}\telapsed_ns={}\tchecksum={checksum}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
             engine.name(),
             engine.code_origin(),
             elapsed.as_nanos(),
@@ -542,7 +543,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     let order = ENGINE_ORDERS[repetition % ENGINE_ORDERS.len()];
     print_run_metadata(&identity, affinity_cpu);
     println!(
-        "LIFECYCLE\t{SCHEMA}\tsize={}\tscenario={}\trepetition={repetition}\torder={}\titerations={LIFECYCLE_ITERATIONS}\taot_compile=offline-excluded\taot_link=offline-excluded\taot_runtime=plan+preflight+vl16-session+call\tjit_runtime=plan+emit+strict-wx-publication+preflight+vl16-session+call\tportable_runtime=plan+preflight+call\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "LIFECYCLE\t{SCHEMA}\tsize={}\tscenario={}\trepetition={repetition}\torder={}\titerations={LIFECYCLE_ITERATIONS}\taot_compile=offline-excluded\taot_link=offline-excluded\taot_runtime=plan+preflight+vl16-session+call\tjit_runtime=plan+emit+strict-wx-publication+preflight+vl16-session+call\tportable_runtime=plan+preflight+call\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
         size.name(),
         scenario.name(),
         format_order(order),
@@ -590,7 +591,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
         require_stable_cpu(affinity_cpu, cpu_before, cpu_after)?;
         black_box(aggregate.checksum);
         println!(
-            "SAMPLE\t{SCHEMA}\tstage=lifecycle\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tplan_ns={}\temit_ns={}\tpublish_ns={}\tpreflight_ns={}\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+            "SAMPLE\t{SCHEMA}\tstage=lifecycle\tengine={}\tcode_origin={}\tposition={position}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tplan_ns={}\temit_ns={}\tpublish_ns={}\tpreflight_ns={}\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={cpu_before}\tcpu_after={cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
             engine.name(),
             engine.code_origin(),
             aggregate.plan_ns,
@@ -644,7 +645,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     require_stable_cpu(affinity_cpu, activation_cpu_before, activation_cpu_after)?;
     black_box(activation.checksum);
     println!(
-        "SAMPLE\t{SCHEMA}\tstage=aot-activation\tengine={}\tcode_origin={}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tprepared_preflight=outside\tplan_ns=0\temit_ns=0\tpublish_ns=0\tpreflight_ns=0\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={activation_cpu_before}\tcpu_after={activation_cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "SAMPLE\t{SCHEMA}\tstage=aot-activation\tengine={}\tcode_origin={}\trepetition={repetition}\titerations={LIFECYCLE_ITERATIONS}\tprepared_preflight=outside\tplan_ns=0\temit_ns=0\tpublish_ns=0\tpreflight_ns=0\tsession_ns={}\tfirst_call_ns={}\ttotal_ns={}\tchecksum={}\tcpu_before={activation_cpu_before}\tcpu_after={activation_cpu_after}\taot_compiler_cost_scope=offline-excluded\taot_linker_cost_scope=offline-excluded\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
         Engine::Aot.name(),
         Engine::Aot.code_origin(),
         activation.session_ns,
@@ -1220,7 +1221,7 @@ fn print_static_metadata() {
     print_meta("schema", SCHEMA);
     print_meta("evidence_class", EVIDENCE_CLASS);
     print_meta("promotion_authority", PROMOTION_AUTHORITY);
-    print_meta("runtime_authority", "absent");
+    print_meta("runtime_authority", RUNTIME_AUTHORITY);
     print_meta("post_link_observation", POST_LINK_OBSERVATION);
     print_meta("source_commit", linked::BOUND_SOURCE_COMMIT);
     print_meta("source_tree", linked::BOUND_SOURCE_TREE);
