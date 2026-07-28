@@ -96,7 +96,7 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
 }
 
 #[test]
-fn facade_uses_one_pass_literal_gating_and_enforces_phrase_restart() {
+fn facade_uses_block_mask_literal_gating_and_enforces_phrase_restart() {
     let mut haystack = vec![b'x'; 4_096];
     haystack.extend_from_slice(b"--a Holmes b Holmes c--");
     haystack.extend_from_slice(&[b'y'; 4_096]);

@@ -1,11 +1,12 @@
-//! One-pass whole-operation reduction for `W+ S+ L S+ W+`.
+//! Block-mask whole-operation reduction for `W+ S+ L S+ W+`.
 //!
 //! Admission proves byte-mode complete ASCII word and whitespace classes,
 //! greedy nonempty repetitions, and one nonempty all-word literal. The reducer
-//! classifies each source byte exactly once and drives a maximal-token DFA.
-//! Literal equality work is gated by the DFA: word bytes are compared only
-//! while the middle literal token is expected, and the byte already loaded for
-//! classification is reused for that comparison.
+//! loads each source block exactly once, classifies its bytes into disjoint
+//! word/space masks through one retained immutable classifier, and drives a
+//! maximal-token DFA from contiguous mask runs. Literal equality work is gated
+//! by the DFA: local block bytes are compared only while the middle literal
+//! token is expected.
 //!
 //! A completed right word resets the DFA instead of reusing that word as the
 //! next left token. This preserves non-overlapping restart semantics for
@@ -19,15 +20,19 @@
 use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
+use fre_simd_kernels::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiWordSpaceClassifier, DispatchPolicy,
+};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
-pub const PLAN_ID: &str = "token-phrase.literal-gated-maximal-ascii-stream.v3";
-pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v3";
-pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v3";
+pub const PLAN_ID: &str = "token-phrase.block-mask-maximal-ascii-stream.v4";
+pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v4";
+pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v4";
 
 const FIXED_BUILD_WORK: usize = 8;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 2;
+const SIMD_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 const FIXED_REDUCE_WORK: usize = 8;
 const CLASSIFICATION_WORK: usize = 2;
 const LITERAL_COMPARISON_WORK: usize = 1;
@@ -305,6 +310,7 @@ impl std::error::Error for ReduceError {}
 #[derive(Debug)]
 pub struct TokenPhrasePlan {
     literal: Box<[u8]>,
+    classifier: AsciiWordSpaceClassifier,
     outer_word_assertions: bool,
     build: BuildAccounting,
 }
@@ -321,6 +327,10 @@ impl TokenPhrasePlan {
     }
 
     /// Build while retaining exact successful or partial terminal effects.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the construction transaction keeps literal validation, exact allocation, classifier construction, and partial effects in one auditable boundary"
+    )]
     pub fn build_attempt(
         literal: &[u8],
         outer_word_assertions: bool,
@@ -340,6 +350,7 @@ impl TokenPhrasePlan {
                 .len()
                 .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
                 .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
+                .and_then(|work| work.checked_add(SIMD_CLASSIFIER_BUILD_WORK))
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "complete literal build work",
                 })?;
@@ -393,6 +404,18 @@ impl TokenPhrasePlan {
                         bytes: literal.len(),
                     },
                 })?;
+            let classifier = AsciiWordSpaceClassifier::with_policy(DispatchPolicy::Auto)
+                .expect("automatic word/space classification always has a scalar fallback");
+            actual.work = actual
+                .work
+                .checked_add(u64::try_from(SIMD_CLASSIFIER_BUILD_WORK).map_err(|_| {
+                    BuildError::ArithmeticOverflow {
+                        computation: "classifier build work conversion",
+                    }
+                })?)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "complete actual build work",
+                })?;
             debug_assert_eq!(usize::try_from(actual.work), Ok(work_upper_bound));
             actual.allocations = 1;
             actual.allocated_bytes = literal.len();
@@ -402,6 +425,7 @@ impl TokenPhrasePlan {
             actual.peak_bytes = persistent_bytes;
             Ok(Self {
                 literal,
+                classifier,
                 outer_word_assertions,
                 build: BuildAccounting {
                     literal_bytes: persistent_bytes - size_of::<Self>(),
@@ -563,6 +587,10 @@ impl TokenPhrasePlan {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-pass fixed 32/16/tail schedule and exact final accounting remain together for source-read review"
+    )]
     fn scan(
         &self,
         haystack: &[u8],
@@ -580,67 +608,81 @@ impl TokenPhrasePlan {
             span_sum: 0,
             scratch_bytes: 0,
         };
-        let mut state = PhraseState::SeekingWord;
-        let mut token_kind = None;
-        let mut token_start = 0_usize;
-        let mut literal_offset = 0_usize;
-        let mut literal_equal = false;
-        let mut compare_literal = false;
+        let mut stream = TokenStreamState::new();
+        let mut position = 0_usize;
 
-        for (position, &byte) in haystack.iter().enumerate() {
-            let kind = classify(byte);
-            if token_kind.is_some_and(|current| current != kind) {
-                let current = token_kind.ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "current token kind",
-                })?;
-                self.consume_token(
-                    Token {
-                        kind: current,
-                        start: token_start,
-                        end: position,
-                        literal_equal,
-                    },
-                    operation,
-                    &mut state,
-                    &mut actual,
-                )?;
-                token_start = position;
-                literal_offset = 0;
-                compare_literal =
-                    kind == TokenKind::Word && matches!(state, PhraseState::NeedLiteral { .. });
-                literal_equal = compare_literal;
-            } else if token_kind.is_none() {
-                compare_literal =
-                    kind == TokenKind::Word && matches!(state, PhraseState::NeedLiteral { .. });
-                literal_equal = compare_literal;
-            }
-            token_kind = Some(kind);
-
-            if compare_literal {
-                if literal_equal {
-                    let Some(&expected) = self.literal.get(literal_offset) else {
-                        literal_equal = false;
-                        literal_offset += 1;
-                        continue;
-                    };
-                    literal_equal &= expected == byte;
-                    // At most one comparison is charged for each source byte.
-                    actual.literal_comparisons += 1;
-                }
-                // This offset is bounded by the current source position.
-                literal_offset += 1;
-            }
+        while haystack.len() - position >= ASCII_WIDE_BYTES {
+            let end = position + ASCII_WIDE_BYTES;
+            let block: [u8; ASCII_WIDE_BYTES] = haystack[position..end]
+                .try_into()
+                .expect("the exact wide source extent was checked");
+            let masks = self.classifier.classify_32(&block);
+            self.consume_classified_block(
+                &block,
+                position,
+                masks.word_mask(),
+                masks.space_mask(),
+                operation,
+                &mut stream,
+                &mut actual,
+            )?;
+            position = end;
         }
-        if let Some(kind) = token_kind {
+
+        if haystack.len() - position >= ASCII_NARROW_BYTES {
+            let end = position + ASCII_NARROW_BYTES;
+            let block: [u8; ASCII_NARROW_BYTES] = haystack[position..end]
+                .try_into()
+                .expect("the exact narrow source extent was checked");
+            let masks = self.classifier.classify_16(&block);
+            self.consume_classified_block(
+                &block,
+                position,
+                u32::from(masks.word_mask()),
+                u32::from(masks.space_mask()),
+                operation,
+                &mut stream,
+                &mut actual,
+            )?;
+            position = end;
+        }
+
+        if position < haystack.len() {
+            let tail_len = haystack.len() - position;
+            let mut tail = [0_u8; ASCII_NARROW_BYTES];
+            let mut words = 0_u32;
+            let mut spaces = 0_u32;
+            for lane in 0..tail_len {
+                let byte = haystack[position + lane];
+                tail[lane] = byte;
+                let bit = 1_u32 << lane;
+                if is_ascii_word(byte) {
+                    words |= bit;
+                } else if is_ascii_space(byte) {
+                    spaces |= bit;
+                }
+            }
+            self.consume_classified_block(
+                &tail[..tail_len],
+                position,
+                words,
+                spaces,
+                operation,
+                &mut stream,
+                &mut actual,
+            )?;
+        }
+
+        if let Some(kind) = stream.token_kind {
             self.consume_token(
                 Token {
                     kind,
-                    start: token_start,
+                    start: stream.token_start,
                     end: haystack.len(),
-                    literal_equal,
+                    literal_equal: stream.literal_equal,
                 },
                 operation,
-                &mut state,
+                &mut stream.phrase,
                 &mut actual,
             )?;
         }
@@ -672,6 +714,107 @@ impl TokenPhrasePlan {
             })?;
         verify_actual(actual, upper)?;
         Ok(actual)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fixed-block boundary keeps its local bytes, disjoint masks, absolute offset, DFA, and accounting visibly coupled"
+    )]
+    fn consume_classified_block(
+        &self,
+        bytes: &[u8],
+        block_start: usize,
+        words: u32,
+        spaces: u32,
+        operation: Operation,
+        stream: &mut TokenStreamState,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<(), ReduceError> {
+        debug_assert!(bytes.len() <= ASCII_WIDE_BYTES);
+        let valid = low_mask(bytes.len());
+        if words & spaces != 0 || (words | spaces) & !valid != 0 {
+            return Err(ReduceError::AccountingInvariant {
+                resource: "block class masks",
+                actual: u64::from((words | spaces) & !valid),
+                upper: 0,
+            });
+        }
+
+        let others = valid & !(words | spaces);
+        let mut lane = 0_usize;
+        while lane < bytes.len() {
+            let bit = 1_u32 << lane;
+            let (kind, mask) = if words & bit != 0 {
+                (TokenKind::Word, words)
+            } else if spaces & bit != 0 {
+                (TokenKind::Space, spaces)
+            } else {
+                (TokenKind::Other, others)
+            };
+            let run_len = usize::try_from((mask >> lane).trailing_ones())
+                .expect("a u32 mask run length fits usize")
+                .min(bytes.len() - lane);
+            debug_assert_ne!(run_len, 0);
+            let token_position = block_start + lane;
+
+            if stream.token_kind.is_some_and(|current| current != kind) {
+                let current = stream.token_kind.ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "current token kind",
+                })?;
+                self.consume_token(
+                    Token {
+                        kind: current,
+                        start: stream.token_start,
+                        end: token_position,
+                        literal_equal: stream.literal_equal,
+                    },
+                    operation,
+                    &mut stream.phrase,
+                    actual,
+                )?;
+                stream.begin_token(kind, token_position);
+            } else if stream.token_kind.is_none() {
+                stream.begin_token(kind, token_position);
+            }
+
+            if kind == TokenKind::Word && stream.compare_literal {
+                let run_end = lane + run_len;
+                self.compare_literal_segment(&bytes[lane..run_end], stream, actual)?;
+            }
+            lane += run_len;
+        }
+        Ok(())
+    }
+
+    fn compare_literal_segment(
+        &self,
+        bytes: &[u8],
+        stream: &mut TokenStreamState,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<(), ReduceError> {
+        let segment_start = stream.literal_offset;
+        stream.literal_offset = stream.literal_offset.checked_add(bytes.len()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "literal candidate token width",
+            },
+        )?;
+        if !stream.literal_equal {
+            return Ok(());
+        }
+
+        let available = self.literal.len().saturating_sub(segment_start);
+        let comparison_bytes = bytes.len().min(available);
+        for (relative, &byte) in bytes[..comparison_bytes].iter().enumerate() {
+            actual.literal_comparisons += 1;
+            if self.literal[segment_start + relative] != byte {
+                stream.literal_equal = false;
+                return Ok(());
+            }
+        }
+        if comparison_bytes != bytes.len() {
+            stream.literal_equal = false;
+        }
+        Ok(())
     }
 
     fn consume_token(
@@ -741,13 +884,35 @@ enum PhraseState {
     NeedFinalWord { start: usize },
 }
 
-const fn classify(byte: u8) -> TokenKind {
-    if is_ascii_word(byte) {
-        TokenKind::Word
-    } else if is_ascii_space(byte) {
-        TokenKind::Space
-    } else {
-        TokenKind::Other
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TokenStreamState {
+    phrase: PhraseState,
+    token_kind: Option<TokenKind>,
+    token_start: usize,
+    literal_offset: usize,
+    literal_equal: bool,
+    compare_literal: bool,
+}
+
+impl TokenStreamState {
+    const fn new() -> Self {
+        Self {
+            phrase: PhraseState::SeekingWord,
+            token_kind: None,
+            token_start: 0,
+            literal_offset: 0,
+            literal_equal: false,
+            compare_literal: false,
+        }
+    }
+
+    fn begin_token(&mut self, kind: TokenKind, start: usize) {
+        self.token_kind = Some(kind);
+        self.token_start = start;
+        self.literal_offset = 0;
+        self.compare_literal =
+            kind == TokenKind::Word && matches!(self.phrase, PhraseState::NeedLiteral { .. });
+        self.literal_equal = self.compare_literal;
     }
 }
 
@@ -757,6 +922,14 @@ const fn is_ascii_word(byte: u8) -> bool {
 
 const fn is_ascii_space(byte: u8) -> bool {
     matches!(byte, b'\t'..=b'\r' | b' ')
+}
+
+const fn low_mask(bits: usize) -> u32 {
+    if bits == ASCII_WIDE_BYTES {
+        u32::MAX
+    } else {
+        (1_u32 << bits) - 1
+    }
 }
 
 fn record_match(
@@ -1080,6 +1253,39 @@ mod tests {
     }
 
     #[test]
+    fn block_boundaries_preserve_maximal_runs_literal_gating_and_restart() {
+        for asserted in [false, true] {
+            let plan = plan(b"Holmes", asserted);
+            for alignment in 0..ASCII_WIDE_BYTES * 2 {
+                for run_len in [1, 15, 16, 17, 31, 32, 33] {
+                    let mut haystack = vec![b'-'; alignment];
+                    haystack.extend(core::iter::repeat_n(b'a', run_len));
+                    haystack.extend(core::iter::repeat_n(b' ', run_len));
+                    haystack.extend_from_slice(b"Holmes");
+                    haystack.extend(core::iter::repeat_n(b'\t', run_len));
+                    haystack.extend(core::iter::repeat_n(b'b', run_len));
+                    haystack.extend_from_slice(b"--a Holmes b Holmes c--");
+
+                    let expected = oracle("Holmes", asserted, &haystack);
+                    let count = plan
+                        .count(&haystack, ReduceLimits::unlimited())
+                        .expect("block-boundary count");
+                    let spans = plan
+                        .span_sum(&haystack, ReduceLimits::unlimited())
+                        .expect("block-boundary span sum");
+                    assert_eq!(
+                        (count.count, spans.span_sum),
+                        expected,
+                        "asserted={asserted}, alignment={alignment}, run_len={run_len}"
+                    );
+                    assert_eq!(count.accounting.actual.source_reads, haystack.len());
+                    assert_eq!(count.accounting.actual.classifications, haystack.len());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exhaustive_small_byte_semantics_match_pinned_regex() {
         for (literal, maximum) in [("h", 6), ("aa", 6)] {
             for asserted in [false, true] {
@@ -1122,17 +1328,27 @@ mod tests {
     }
 
     #[test]
-    fn one_pass_literal_gating_and_accounting_are_exact_and_conservative() {
+    fn block_mask_literal_gating_and_accounting_are_exact_and_conservative() {
         let plan = plan(b"Holmes", true);
         assert_eq!(&*plan.literal, b"Holmes");
+        assert_eq!(
+            plan.build.work_upper_bound,
+            FIXED_BUILD_WORK
+                + b"Holmes".len() * LITERAL_BUILD_WORK_PER_BYTE
+                + SIMD_CLASSIFIER_BUILD_WORK
+        );
+        assert_eq!(
+            plan.classifier.selection().policy,
+            fre_simd_kernels::DispatchPolicy::Auto
+        );
 
         let haystack = b"noise noise--Sherlock  Holmes \t watson--a Holmes b Holmes c--notHolmes";
         let count = plan
             .count(haystack, ReduceLimits::unlimited())
-            .expect("one-pass count");
+            .expect("block-mask count");
         let spans = plan
             .span_sum(haystack, ReduceLimits::unlimited())
-            .expect("one-pass span sum");
+            .expect("block-mask span sum");
         let actual = count.accounting.actual;
         assert_eq!(actual.source_reads, haystack.len());
         assert_eq!(actual.classifications, haystack.len());
@@ -1225,7 +1441,7 @@ mod tests {
             .upper_bounds;
         let exact = exact_limits(upper);
         plan.span_sum(haystack, exact)
-            .expect("every exact one-pass limit succeeds");
+            .expect("every exact block-mask limit succeeds");
         let cases = [
             ReduceLimits {
                 max_input_bytes: upper.input_bytes - 1,
