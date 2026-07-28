@@ -648,6 +648,8 @@ pub(crate) struct StateByteSpanSumPlan {
     literal_failure: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
     literal_len: usize,
     literal_anchor_offset: u8,
+    repeat_count: u8,
+    barrier: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -661,6 +663,9 @@ pub(crate) enum StateByteSpanSumTopology {
     /// Exact greedy `P+ A S+ D S+`, with identical `S`, singleton
     /// `A ∉ P ∪ S`, and singleton `D ∈ S`.
     DisjointInternalRunsCheckpoint,
+    /// Exact `(C*? D){N} L`, where `C` excludes exactly one barrier byte,
+    /// `D ∈ C`, `N > 0`, and `L` is nonempty.
+    RepeatedLazyDelimiterSuffix,
 }
 
 impl StateByteSpanSumPlan {
@@ -688,6 +693,14 @@ impl StateByteSpanSumPlan {
         usize::from(self.literal_anchor_offset)
     }
 
+    pub(crate) fn repeat_count(&self) -> usize {
+        usize::from(self.repeat_count)
+    }
+
+    pub(crate) const fn barrier(&self) -> u8 {
+        self.barrier
+    }
+
     const fn materialized_bytes() -> usize {
         core::mem::size_of::<Self>()
     }
@@ -705,6 +718,7 @@ impl StateByteSpanSumPlan {
             StateByteSpanSumTopology::DisjointRunsLiteral => 2,
             StateByteSpanSumTopology::DisjointInternalRuns => 3,
             StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
+            StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 5,
         }
     }
 }
@@ -1559,6 +1573,8 @@ fn build_state_byte_span_sum_plan(
                 first,
                 second,
                 literal.len(),
+                0,
+                0,
             ));
         }
     }
@@ -1586,6 +1602,8 @@ fn build_state_byte_span_sum_plan(
                 first,
                 second,
                 literal.len(),
+                0,
+                0,
             ));
         }
     }
@@ -1608,6 +1626,8 @@ fn build_state_byte_span_sum_plan(
                 first,
                 second,
                 1,
+                0,
+                0,
             ));
         }
     }
@@ -1637,10 +1657,31 @@ fn build_state_byte_span_sum_plan(
                 first,
                 second,
                 2,
+                0,
+                0,
             ));
         }
     }
-    let Some((topology, first, second, literal_len)) = proof else {
+    if proof.is_none()
+        && let Some((class, barrier, delimiter, repeat_count, suffix)) =
+            state_byte_repeated_lazy_delimiter_suffix(parts, budget)?
+        && suffix.len() < MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
+    {
+        let literal_len = add(suffix.len(), 1, Resource::CompileWork)?;
+        retained_literal[0] = delimiter;
+        retained_literal[1..literal_len].copy_from_slice(suffix);
+        let mut barrier_class = ByteSet::empty();
+        barrier_class.insert(barrier);
+        proof = Some((
+            StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix,
+            class,
+            barrier_class,
+            literal_len,
+            repeat_count,
+            barrier,
+        ));
+    }
+    let Some((topology, first, second, literal_len, repeat_count, barrier)) = proof else {
         return Ok(None);
     };
     let literal = &retained_literal[..literal_len];
@@ -1662,6 +1703,8 @@ fn build_state_byte_span_sum_plan(
         literal_failure,
         literal_len: literal.len(),
         literal_anchor_offset,
+        repeat_count,
+        barrier,
     };
     budget.accounting.state_byte_span_sum_plans = 1;
     budget.accounting.state_byte_span_sum_literal_bytes = literal.len();
@@ -1719,6 +1762,110 @@ fn state_byte_greedy_prefix_literal_suffix<'a>(
         }
     }
     Ok(prefix.map(|prefix| (prefix, literal, suffix)))
+}
+
+type StateByteRepeatedLazyDelimiterSuffix<'a> = (ByteSet, u8, u8, u8, &'a [u8]);
+
+/// Recognize exact `(C*? D){N} L` with one byte outside `C`.
+///
+/// The missing byte partitions the source into maximal `C` runs. Within one
+/// run, a complete match exists exactly when the `N`th-or-later `D` is
+/// immediately followed by `L`; lazy repetition selects the earliest such
+/// endpoint for the current leftmost run start.
+fn state_byte_repeated_lazy_delimiter_suffix<'a>(
+    parts: &'a [Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteRepeatedLazyDelimiterSuffix<'a>>, Error> {
+    let [repeated, suffix] = parts else {
+        return Ok(None);
+    };
+    let suffix = match state_byte_literal(suffix, budget)? {
+        Some(suffix) if !suffix.is_empty() => suffix,
+        Some(_) | None => return Ok(None),
+    };
+
+    let mut repeated = repeated;
+    loop {
+        budget.charge(1)?;
+        match repeated.kind() {
+            HirKind::Capture(capture) => repeated = &capture.sub,
+            HirKind::Repetition(repetition)
+                if repetition.greedy
+                    && repetition.min > 0
+                    && repetition.max == Some(repetition.min) =>
+            {
+                let Ok(repeat_count) = u8::try_from(repetition.min) else {
+                    return Ok(None);
+                };
+                let Some(body) = state_byte_concat_parts(&repetition.sub, budget)? else {
+                    return Ok(None);
+                };
+                let [lazy_class, delimiter] = body else {
+                    return Ok(None);
+                };
+                let Some(class) = state_byte_lazy_zero_or_more_class(lazy_class, budget)? else {
+                    return Ok(None);
+                };
+                let Some(delimiter) = state_byte_literal(delimiter, budget)? else {
+                    return Ok(None);
+                };
+                let [delimiter] = delimiter else {
+                    return Ok(None);
+                };
+                if !class.contains(*delimiter) {
+                    return Ok(None);
+                }
+                let mut barrier = None;
+                for value in 0_u16..=u16::from(u8::MAX) {
+                    budget.charge(1)?;
+                    let byte = u8::try_from(value).map_err(|_| {
+                        Error::InternalInvariant("state-byte barrier byte exceeds u8")
+                    })?;
+                    if !class.contains(byte) && barrier.replace(byte).is_some() {
+                        return Ok(None);
+                    }
+                }
+                return Ok(
+                    barrier.map(|barrier| (class, barrier, *delimiter, repeat_count, suffix))
+                );
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn state_byte_lazy_zero_or_more_class(
+    mut hir: &Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<ByteSet>, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            HirKind::Repetition(repetition)
+                if !repetition.greedy && repetition.min == 0 && repetition.max.is_none() =>
+            {
+                let mut sub = &*repetition.sub;
+                loop {
+                    budget.charge(1)?;
+                    match sub.kind() {
+                        HirKind::Capture(capture) => sub = &capture.sub,
+                        HirKind::Class(Class::Bytes(class)) => {
+                            let mut bytes = ByteSet::empty();
+                            for range in class.ranges() {
+                                let width = inclusive_byte_width(range.start(), range.end())?;
+                                budget.charge(add(width, 1, Resource::CompileWork)?)?;
+                                bytes.insert_range(range.start(), range.end());
+                            }
+                            return Ok(Some(bytes));
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 fn state_byte_literal_anchor_offset(
@@ -7365,8 +7512,8 @@ fn bind_state_byte_span_sum_identity(
     plan: &StateByteSpanSumPlan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = b"fre.aggregate.state-byte-span-sum-plan.v4";
-    let operation = b"fre.aggregate.state-byte-span-sum-operation.v4";
+    let domain = b"fre.aggregate.state-byte-span-sum-plan.v5";
+    let operation = b"fre.aggregate.state-byte-span-sum-operation.v5";
     let class_bytes = mul(8, core::mem::size_of::<u64>(), Resource::CompileWork)?;
     let payload = add(
         add(
@@ -7384,7 +7531,7 @@ fn bind_state_byte_span_sum_identity(
                 )?,
                 Resource::CompileWork,
             )?,
-            add(1, core::mem::size_of::<usize>(), Resource::CompileWork)?,
+            add(3, core::mem::size_of::<usize>(), Resource::CompileWork)?,
             Resource::CompileWork,
         )?,
         Resource::CompileWork,
@@ -7405,6 +7552,8 @@ fn bind_state_byte_span_sum_identity(
         }
         hash_usize(hash, plan.literal().len());
         hash.byte(plan.literal_anchor_offset);
+        hash.byte(plan.repeat_count);
+        hash.byte(plan.barrier);
         hash.bytes(plan.literal());
         hash.bytes(plan.literal_failure());
     }

@@ -278,7 +278,7 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 2;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 3;
 
 /// Version of the continuation prospective/actual accounting schema.
 pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 6;
@@ -2352,6 +2352,7 @@ impl CompiledRegex {
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "the certified route receives the shared publication and accounting state explicitly"
     )]
     fn execute_state_byte_reducer<const OBSERVED_WORK: bool>(
@@ -2413,6 +2414,14 @@ impl CompiledRegex {
             StateByteSpanSumTopology::DisjointInternalRuns
             | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
                 reduce_disjoint_internal_runs(
+                    plan,
+                    local,
+                    prospective.work_bound,
+                    attempt_accounting,
+                )?
+            }
+            StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+                reduce_repeated_lazy_delimiter_suffix(
                     plan,
                     local,
                     prospective.work_bound,
@@ -3947,6 +3956,9 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         }
         StateByteSpanSumTopology::DisjointInternalRuns
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 12,
+        StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+            add(plan.literal().len(), 4, Resource::ExecutionWork)?
+        }
     };
     let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
     let work_bound = if OBSERVED_WORK {
@@ -3958,6 +3970,7 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::DisjointRunsLiteral if plan.literal().len() > 1 => 4,
         StateByteSpanSumTopology::DisjointInternalRuns
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
+        StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 0,
         _ => 2,
     };
     let state_transition_bound = mul(
@@ -3979,6 +3992,10 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+            let factor = add(plan.literal().len(), 1, Resource::ExecutionWork)?;
+            mul(input_bytes, factor, Resource::ExecutionWork)?
+        }
     };
     let random_access_bytes_read = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => input_bytes,
@@ -3993,6 +4010,9 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::DisjointInternalRuns
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
             mul(input_bytes, 4, Resource::ExecutionWork)?
+        }
+        StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+            mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
         }
     };
     let accounting = ExecutionAccounting {
@@ -4030,6 +4050,138 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         peak_bytes: 0,
         accounting,
     })
+}
+
+fn reduce_repeated_lazy_delimiter_suffix(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let [delimiter, suffix @ ..] = plan.literal() else {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its literal suffix",
+        ));
+    };
+    if suffix.is_empty() || plan.repeat_count() == 0 {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter plan lost its nonempty proof",
+        ));
+    }
+    let barrier = plan.barrier();
+    if !plan.second().contains(barrier) {
+        return Err(Error::InternalInvariant(
+            "state-byte repeated delimiter lost its barrier",
+        ));
+    }
+
+    let mut run_start = 0_usize;
+    let mut search = 0_usize;
+    let mut delimiters = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while search < haystack.len() {
+        let Some((index, byte)) = state_byte_find_either(
+            *delimiter, barrier, haystack, search, work_limit, accounting,
+        )?
+        else {
+            break;
+        };
+        search = add(index, 1, Resource::Boundaries)?;
+        if !state_byte_compare_cached(byte, *delimiter, work_limit, accounting)? {
+            if byte != barrier {
+                return Err(Error::InternalInvariant(
+                    "state-byte memchr2 returned an unrequested byte",
+                ));
+            }
+            run_start = search;
+            delimiters = 0;
+            continue;
+        }
+        delimiters = add(delimiters, 1, Resource::Boundaries)?;
+        if delimiters < plan.repeat_count()
+            || !state_byte_suffix_matches(suffix, haystack, search, work_limit, accounting)?
+        {
+            continue;
+        }
+        let end = add(search, suffix.len(), Resource::Boundaries)?;
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            end.checked_sub(run_start).ok_or(Error::InternalInvariant(
+                "state-byte repeated delimiter selected a reversed span",
+            ))?,
+            Resource::SpanSum,
+        )?;
+        search = end;
+        run_start = end;
+        delimiters = 0;
+    }
+    Ok((matches, span_sum))
+}
+
+fn state_byte_find_either(
+    first: u8,
+    second: u8,
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<Option<(usize, u8)>, Error> {
+    let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
+        "state-byte memchr2 start exceeds admitted source",
+    ))?;
+    let available_work = work_limit.saturating_sub(accounting.work);
+    let admitted_len = remaining.len().min(available_work);
+    let admitted = &remaining[..admitted_len];
+    let relative = memchr::memchr2(first, second, admitted);
+    let scanned = match relative {
+        Some(offset) => add(offset, 1, Resource::SequentialBytes)?,
+        None => admitted_len,
+    };
+    accounting.sequential_bytes_read = add(
+        accounting.sequential_bytes_read,
+        scanned,
+        Resource::SequentialBytes,
+    )?;
+    accounting.root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
+    accounting.work = add(accounting.work, scanned, Resource::ExecutionWork)?;
+    enforce(accounting.work, work_limit, Resource::ExecutionWork)?;
+    if let Some(relative) = relative {
+        let index = add(start, relative, Resource::Boundaries)?;
+        let byte = *haystack.get(index).ok_or(Error::InternalInvariant(
+            "state-byte memchr2 result exceeds admitted source",
+        ))?;
+        return Ok(Some((index, byte)));
+    }
+    if admitted_len < remaining.len() {
+        let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+        enforce(required, work_limit, Resource::ExecutionWork)?;
+        return Err(Error::InternalInvariant(
+            "state-byte memchr2 work refusal unexpectedly admitted progress",
+        ));
+    }
+    Ok(None)
+}
+
+fn state_byte_suffix_matches(
+    suffix: &[u8],
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    if haystack.len().saturating_sub(start) < suffix.len() {
+        return Ok(false);
+    }
+    for (offset, &expected) in suffix.iter().enumerate() {
+        let index = add(start, offset, Resource::Boundaries)?;
+        if !state_byte_compare_source(haystack, index, expected, work_limit, accounting)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn reduce_greedy_prefix_literal_suffix(
@@ -10550,7 +10702,9 @@ mod tests {
 
     #[test]
     fn small_required_literal_sets_use_bounded_native_services() {
-        let pattern = r"(.*?,){13}z";
+        // The trailing repetition keeps this fixture on the required-literal
+        // rejection route instead of the exact repeated-delimiter reducer.
+        let pattern = r"(.*?,){13}z+";
         let compiled = required_literal_regex(pattern);
         assert_eq!(compiled.required_literals.len(), 2);
         assert!(compiled.required_literals.iter().all(u128::is_power_of_two));
@@ -14695,7 +14849,7 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_structural_variants_match_upstream() {
-        let cases: [(&str, &[u8]); 8] = [
+        let cases: [(&str, &[u8]); 9] = [
             (
                 r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*",
                 b"\xffno\npre ABCDEFGHIJKLMNOPQRSTUVWXYZ tail\n\
@@ -14723,6 +14877,10 @@ mod tests {
                 r"[\w.+-]+@[\w.-]+\.[\w.-]+",
                 b"a@b.c bad@.x bad@x. bad@.x. fail@x. good@a.b \
                   a+b-c@sub.example.org x@@y.z",
+            ),
+            (
+                r"(.*?,){2}z",
+                b"none\n,a,z a,b,z a,b,c,z\nx,y,z\n,,,,z\nx,y,zz",
             ),
         ];
         for (pattern, haystack) in cases {
@@ -14864,13 +15022,14 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_exhaustive_small_differential() {
-        let cases: [(&str, &[u8]); 6] = [
+        let cases: [(&str, &[u8]); 7] = [
             (r"[ab]*ab[abc]*", b"abc\n"),
             (r"[ab]*abab[abc]*", b"abc\n"),
             (r"[ab]+[ ]+a", b"ab \n"),
             (r"[a]+[b]+aba", b"abx\n"),
             (r"[ab]+@[ab]+", b"ab@\n"),
             (r"[a]+@[a.]+\.[a.]+", b"a@.!"),
+            (r"(?:.*?,){2}z", b",z\nx"),
         ];
         for (pattern, alphabet) in cases {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -14949,6 +15108,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one audit keeps compile and operation exact-limit checks adjacent for every topology"
+    )]
     fn state_byte_internal_runs_retain_exact_routes_and_close_one_below() {
         for (pattern, topology, haystack) in [
             (
@@ -14960,6 +15123,11 @@ mod tests {
                 r"[\w.+-]+@[\w.-]+\.[\w.-]+",
                 StateByteSpanSumTopology::DisjointInternalRunsCheckpoint,
                 b"a@b.c bad@.x bad@x. a+b-c@sub.example.org".as_slice(),
+            ),
+            (
+                r"(?:.*?,){2}z",
+                StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix,
+                b"none\n,a,z a,b,z a,b,c,z\nx,y,z\n,,,,z\nx,y,zz".as_slice(),
             ),
         ] {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -15327,6 +15495,10 @@ mod tests {
             r"[ab]+@[ab]+?",
             r"[ab]+@[ab.]+\.[ac.]+",
             r"[ab]+@[ab]+\.[ab]+",
+            r"(?:.*,){2}z",
+            r"(?:.*?,){2,3}z",
+            r"(?:[^,\n]*?,){2}z",
+            r"(?:.*?,){2}",
         ] {
             let compiled = state_byte_span_sum_fixture(pattern);
             assert_eq!(
