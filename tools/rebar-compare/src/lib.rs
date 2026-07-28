@@ -2274,6 +2274,18 @@ struct CurrentFreRequiredLiteralScan {
     searched_bytes: usize,
 }
 
+// A consolidated literal scan has fixed iterator/dispatch cost in addition to
+// touching the source a second time. Below one KiB, even eliminating every K0
+// line search cannot reliably amortize that fixed cost. This construction-time
+// gate depends only on authenticated source length.
+const CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES: usize = 1_024;
+
+// Once at least this many observed line domains have supplied candidates and
+// at least three quarters of them survive, continuing the prefilter can save
+// at most one quarter of the remaining K0 calls under the observed prefix.
+// Retiring it bounds dense-input regret while retaining sparse-input wins.
+const CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES: usize = 16;
+
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -2298,7 +2310,9 @@ enum CurrentFreGrepRoute<'r> {
 /// [`Self::execute`]. Each operation then performs either one admitted
 /// whole-input literal scan plus K0 searches for surviving LF/CRLF domains, or
 /// the unchanged per-line semantic search. Route selection never observes
-/// source bytes.
+/// source bytes. Execution may retire an admitted literal scan after a bounded
+/// dense candidate prefix; the semantic K0 matcher then admits every remaining
+/// line.
 #[derive(Debug)]
 pub struct CurrentFreGrepSession<'r> {
     route: CurrentFreGrepRoute<'r>,
@@ -2330,7 +2344,8 @@ impl CurrentFreGrepSession<'_> {
     }
 
     /// Whether this haystack length admitted the consolidated whole-input
-    /// required-literal scan.
+    /// required-literal scan. Dense-prefix execution may retire that scan
+    /// after a bounded number of line domains.
     #[must_use]
     pub const fn uses_required_literal_prefilter(&self) -> bool {
         matches!(
@@ -2553,6 +2568,9 @@ fn prepare_current_fre_grep_prefilter(
     let Some(prefilter) = prefilter else {
         return Ok((None, None, line_scan));
     };
+    if haystack_len < CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES {
+        return Ok((Some(prefilter), None, line_scan));
+    }
     let Some(prospective) =
         prefilter
             .line_partition_prospective(haystack_len)
@@ -2659,10 +2677,19 @@ struct CurrentFreSearchGrepReport {
     candidate_domains: usize,
     search_executions: usize,
     consolidated_prefilter: bool,
+    prefilter_cutover: bool,
     prefilter_transitions: usize,
     prefilter_match_events: usize,
     prefilter_match_events_upper_bound: usize,
     prefilter_sequential_bytes: usize,
+}
+
+fn current_fre_grep_should_cut_over_prefilter(
+    line_domains: usize,
+    candidate_domains: usize,
+) -> bool {
+    line_domains >= CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES
+        && candidate_domains >= line_domains.saturating_sub(line_domains / 4)
 }
 
 #[allow(
@@ -2749,6 +2776,7 @@ fn execute_current_fre_search_grep(
             limits.reducer_steps,
             "FRE plain-grep line events",
         )?;
+        let mut cut_over_after_candidate = false;
         let candidate = if let Some(matches) = line_matches.as_mut() {
             let mut candidate = false;
             while matches.peek().is_some_and(|&(start, _)| start < raw_cursor) {
@@ -2765,7 +2793,21 @@ fn execute_current_fre_search_grep(
                         "FRE plain-grep required-literal match escaped its semantic line",
                     ));
                 }
+                let first_candidate_match = !candidate;
                 candidate = true;
+                if first_candidate_match
+                    && current_fre_grep_should_cut_over_prefilter(
+                        report.line_domains,
+                        report.candidate_domains.saturating_add(1),
+                    )
+                {
+                    // Stop after the first proving match on the cutover line.
+                    // In particular, do not `peek` for another match: that
+                    // lookahead could traverse the entire remaining source
+                    // before the dense-prefix decision retires the iterator.
+                    cut_over_after_candidate = true;
+                    break;
+                }
             }
             candidate
         } else {
@@ -2776,6 +2818,15 @@ fn execute_current_fre_search_grep(
         }
         report.candidate_domains =
             checked_aggregate_add(report.candidate_domains, 1, "plain-grep candidate domains")?;
+        if cut_over_after_candidate {
+            // The semantic K0 matcher remains authoritative. Dropping the
+            // borrowed literal iterator merely admits all remaining line
+            // domains, avoiding a redundant full second traversal on dense
+            // inputs. The whole-input prospective was charged before source
+            // access and remains a conservative terminal envelope.
+            line_matches = None;
+            report.prefilter_cutover = true;
+        }
         report.search_executions =
             checked_aggregate_add(report.search_executions, 1, "plain-grep search executions")?;
         if search
@@ -2797,6 +2848,10 @@ fn execute_current_fre_search_grep(
             "FRE plain-grep line iterator did not consume the complete source",
         ));
     }
+    // A dense-prefix cutover intentionally discarded the remaining iterator:
+    // its unassigned matches are no longer needed because K0 searched every
+    // subsequent line. Without a cutover, retain the complete-stream drain
+    // invariant.
     if let Some(matches) = line_matches.as_mut()
         && matches.next().is_some()
     {
@@ -2814,6 +2869,7 @@ fn execute_current_fre_search_grep(
     }
     if report.search_executions != report.candidate_domains
         || report.candidate_domains > report.line_domains
+        || (report.prefilter_cutover && !report.consolidated_prefilter)
     {
         return Err(ExecutionError::fault(
             "FRE plain-grep search/domain cardinality invariant failed",
@@ -21411,16 +21467,43 @@ mod tests {
                 .expect("required-literal grep session");
             assert!(session.has_reusable_k0_workspace());
             assert!(session.has_required_literal_prefilter());
-            assert!(session.uses_required_literal_prefilter());
+            assert!(!session.uses_required_literal_prefilter());
             assert_eq!(session.execute(haystack).expect("first"), expected);
             assert_eq!(session.execute(haystack).expect("steady"), expected);
+        }
+
+        let mut sparse =
+            b"miss\n".repeat(CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES.div_ceil(b"miss\n".len()));
+        sparse.extend_from_slice(b"ABCZ\nXYxQ\r\n");
+        let mut sparse_session = current_fre_rebar_grep_session(&regex, sparse.len())
+            .expect("large sparse required-literal grep session");
+        assert!(sparse_session.has_reusable_k0_workspace());
+        assert!(sparse_session.has_required_literal_prefilter());
+        assert!(sparse_session.uses_required_literal_prefilter());
+        assert_eq!(sparse_session.execute(&sparse).expect("sparse first"), 2);
+        assert_eq!(sparse_session.execute(&sparse).expect("sparse steady"), 2);
+
+        for (length, expected_prefilter) in [
+            (CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES - 1, false),
+            (CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES, true),
+        ] {
+            let boundary = vec![b'x'; length];
+            let mut boundary_session = current_fre_rebar_grep_session(&regex, boundary.len())
+                .expect("boundary required-literal grep session");
+            assert_eq!(
+                boundary_session.uses_required_literal_prefilter(),
+                expected_prefilter
+            );
+            assert_eq!(boundary_session.execute(&boundary).expect("boundary"), 0);
         }
     }
 
     #[test]
     fn plain_grep_required_literal_admission_is_exact_and_delimiters_fall_back() {
         const SAFE: &str = r"(?:ABC.*Z|XY.+Q)";
-        let haystack = b"miss\nABCZ\r\nXYxQ\n";
+        let mut haystack =
+            b"miss\n".repeat(CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES.div_ceil(b"miss\n".len()));
+        haystack.extend_from_slice(b"ABCZ\r\nXYxQ\n");
         let defaults = RunLimits::default();
         let regex = current_fre_rebar_portable_builder(SAFE, false, false)
             .expect("portable builder")
@@ -21460,7 +21543,10 @@ mod tests {
             current_fre_rebar_grep_session_with_limits(&regex, haystack.len(), &exact)
                 .expect("exact session");
         assert!(exact_session.uses_required_literal_prefilter());
-        assert_eq!(exact_session.execute(haystack).expect("exact operation"), 2);
+        assert_eq!(
+            exact_session.execute(&haystack).expect("exact operation"),
+            2
+        );
 
         let one_below = RunLimits {
             fre_aggregate_operation_work: exact_work - 1,
@@ -21471,7 +21557,7 @@ mod tests {
                 .expect("one-below construction");
         assert!(refused.has_required_literal_prefilter());
         assert!(!refused.uses_required_literal_prefilter());
-        assert_eq!(refused.execute(haystack).expect("one-below fallback"), 2);
+        assert_eq!(refused.execute(&haystack).expect("one-below fallback"), 2);
 
         const DELIMITER: &str = r"(?:AB\r.*Z|XY.+Q)";
         let delimiter_regex = current_fre_rebar_portable_builder(DELIMITER, false, false)
@@ -21499,6 +21585,90 @@ mod tests {
                 .execute(delimiter_source)
                 .expect("delimiter fallback"),
             u64::try_from(expected).expect("delimiter line count")
+        );
+    }
+
+    #[test]
+    fn plain_grep_required_literal_dense_prefix_cuts_over_to_k0() {
+        const PATTERN: &str = r"(?:ABC.*Z|XY.+Q)";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .expect("portable builder")
+            .build()
+            .expect("portable K0");
+        let lines = CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES * 16;
+        let haystack = b"ABCZ\n".repeat(lines);
+        assert!(haystack.len() >= CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES);
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
+            .expect("dense required-literal grep session");
+        assert!(session.uses_required_literal_prefilter());
+        assert_eq!(
+            session.execute(&haystack).expect("dense first"),
+            u64::try_from(lines).expect("dense line count")
+        );
+        assert_eq!(
+            session.execute(&haystack).expect("dense steady"),
+            u64::try_from(lines).expect("dense line count")
+        );
+
+        let minimum = CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES;
+        assert!(!current_fre_grep_should_cut_over_prefilter(
+            minimum - 1,
+            minimum - 1
+        ));
+        assert!(!current_fre_grep_should_cut_over_prefilter(
+            minimum,
+            minimum * 3 / 4 - 1
+        ));
+        assert!(current_fre_grep_should_cut_over_prefilter(
+            minimum,
+            minimum * 3 / 4
+        ));
+        assert!(!current_fre_grep_should_cut_over_prefilter(17, 12));
+        assert!(current_fre_grep_should_cut_over_prefilter(17, 13));
+    }
+
+    #[test]
+    fn plain_grep_required_literal_cutover_preserves_mixed_tail() {
+        const PATTERN: &str = r"(?:ABC.*Z|XY.+Q)";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .expect("portable builder")
+            .build()
+            .expect("portable K0");
+        let mut haystack = Vec::new();
+        for line in 0..CURRENT_FRE_GREP_PREFILTER_DENSITY_MIN_LINES {
+            if line % 2 == 0 {
+                haystack.extend_from_slice(b"ABCZ\r\n");
+            } else {
+                haystack.extend_from_slice(b"XYxQ\n");
+            }
+        }
+        for _ in 0..64 {
+            haystack.extend_from_slice(b"miss\r\n");
+            haystack.extend_from_slice(b"ABC-but-no-uppercase-z\n");
+            haystack.extend_from_slice(b"XYxQ\n");
+            haystack.extend_from_slice(b"ABC-and-Z\n");
+        }
+        assert!(haystack.len() >= CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES);
+        let expected = haystack
+            .lines()
+            .map(|line| {
+                regex
+                    .is_match_value(line, current_fre_rebar_search_limits())
+                    .expect("line reference")
+            })
+            .filter(|matched| *matched)
+            .count();
+        let expected = u64::try_from(expected).expect("mixed-tail line count");
+        let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
+            .expect("mixed-tail required-literal grep session");
+        assert!(session.uses_required_literal_prefilter());
+        assert_eq!(
+            session.execute(&haystack).expect("mixed-tail first"),
+            expected
+        );
+        assert_eq!(
+            session.execute(&haystack).expect("mixed-tail steady"),
+            expected
         );
     }
 
