@@ -26,9 +26,11 @@ name = "fre-aot-linux-selected-end-abi2-three-engine"
 path = "src/main.rs"
 
 [profile.release]
+opt-level = 3
 codegen-units = 1
 lto = "thin"
 panic = "abort"
+strip = "none"
 
 [lints.rust]
 unsafe_code = "warn"

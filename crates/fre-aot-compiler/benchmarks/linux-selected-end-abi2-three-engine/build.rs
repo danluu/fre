@@ -22,7 +22,10 @@ const SOURCE_COMMIT_ENV: &str = "FRE_ABI2_THREE_ENGINE_SOURCE_COMMIT";
 const SOURCE_TREE_ENV: &str = "FRE_ABI2_THREE_ENGINE_SOURCE_TREE";
 const HELPER_SHA256_ENV: &str = "FRE_ABI2_THREE_ENGINE_HELPER_SHA256";
 const PROFILE_ENV: &str = "FRE_ABI2_THREE_ENGINE_PROFILE";
+const NATIVE_TARGET_FEATURES_ENV: &str = "FRE_ABI2_THREE_ENGINE_NATIVE_TARGET_FEATURES";
 const REQUIRED_PROFILE: &str = "linux-target-cpu-local-v1";
+const REQUIRED_TARGET: &str = "aarch64-unknown-linux-gnu";
+const REQUIRED_ENCODED_RUSTFLAGS: &str = "-Ctarget-cpu=native\x1f-Cstrip=none";
 
 type DynError = Box<dyn Error>;
 
@@ -32,6 +35,23 @@ fn main() {
         SOURCE_TREE_ENV,
         HELPER_SHA256_ENV,
         PROFILE_ENV,
+        NATIVE_TARGET_FEATURES_ENV,
+        "CARGO_CFG_PANIC",
+        "CARGO_CFG_TARGET_ENV",
+        "CARGO_CFG_TARGET_FEATURE",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_INCREMENTAL",
+        "CARGO_NET_OFFLINE",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+        "CARGO_PROFILE_RELEASE_INCREMENTAL",
+        "CARGO_PROFILE_RELEASE_LTO",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        "CARGO_PROFILE_RELEASE_PANIC",
+        "CARGO_PROFILE_RELEASE_STRIP",
+        "HOST",
+        "OPT_LEVEL",
+        "PROFILE",
+        "TARGET",
     ] {
         println!("cargo:rerun-if-env-changed={name}");
     }
@@ -388,8 +408,55 @@ fn require_target() -> Result<(), DynError> {
         env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
             && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
             && env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64")
-            && env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little"),
-        "requires little-endian Linux/AArch64 LP64",
+            && env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little")
+            && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu")
+            && env::var("TARGET").as_deref() == Ok(REQUIRED_TARGET)
+            && env::var("HOST").as_deref() == Ok(REQUIRED_TARGET),
+        "requires a native little-endian aarch64-unknown-linux-gnu build",
+    )?;
+    require(
+        env::var("PROFILE").as_deref() == Ok("release")
+            && env::var("OPT_LEVEL").as_deref() == Ok("3")
+            && env::var("CARGO_CFG_PANIC").as_deref() == Ok("abort"),
+        "requires the release opt-level=3 panic=abort profile",
+    )?;
+    require(
+        env::var("CARGO_INCREMENTAL").as_deref() == Ok("0"),
+        "requires CARGO_INCREMENTAL=0",
+    )?;
+    require(
+        env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true"),
+        "requires Cargo offline mode",
+    )?;
+    require(
+        env::var("CARGO_PROFILE_RELEASE_CODEGEN_UNITS").as_deref() == Ok("1")
+            && env::var("CARGO_PROFILE_RELEASE_INCREMENTAL").as_deref() == Ok("false")
+            && env::var("CARGO_PROFILE_RELEASE_LTO").as_deref() == Ok("thin")
+            && env::var("CARGO_PROFILE_RELEASE_OPT_LEVEL").as_deref() == Ok("3")
+            && env::var("CARGO_PROFILE_RELEASE_PANIC").as_deref() == Ok("abort")
+            && env::var("CARGO_PROFILE_RELEASE_STRIP").as_deref() == Ok("none"),
+        "requires the exact checked release-profile overrides",
+    )?;
+    require(
+        env::var("CARGO_ENCODED_RUSTFLAGS").as_deref()
+            == Ok(REQUIRED_ENCODED_RUSTFLAGS),
+        "requires exact native non-stripping CARGO_ENCODED_RUSTFLAGS",
+    )?;
+    let target_features = env::var("CARGO_CFG_TARGET_FEATURE")?;
+    let expected_target_features = env::var(NATIVE_TARGET_FEATURES_ENV)?;
+    let mut actual_features: Vec<&str> = target_features.split(',').collect();
+    let mut expected_features: Vec<&str> = expected_target_features.split(',').collect();
+    actual_features.sort_unstable();
+    expected_features.sort_unstable();
+    require(
+        !actual_features.is_empty()
+            && actual_features.iter().all(|feature| !feature.is_empty())
+            && actual_features.windows(2).all(|pair| pair[0] != pair[1])
+            && expected_features == actual_features
+            && ["neon", "sve", "sve2"]
+                .iter()
+                .all(|feature| actual_features.binary_search(feature).is_ok()),
+        "Cargo target features differ from the checked native rustc probe",
     )
 }
 

@@ -124,38 +124,100 @@ does not yet have a generated `Cargo.lock`. It is not correct to claim
 `--locked` build readiness until the following post-GO gates complete:
 
 1. generate and review `Cargo.lock` without updating unrelated dependencies;
-2. independently derive the source commit/tree and helper digest from the
-   admitted clean checkout/helper, rather than accepting caller-provided labels;
-3. build that exact source with the four required binding variables;
-4. run `verify_post_link.py` against the final executable and the exact
-   `OUT_DIR` implementation, glue, contract, generated binding, and deployment
-   receipt paths;
+2. commit that lock so it is part of the exact clean source tree;
+3. run the checked builder below only after the controller's explicit GO;
+4. retain and review the checked builder's read-only receipt and post-link
+   observation;
 5. run correctness qualification;
 6. only then run controlled, source-bound hot and lifecycle cells.
 
-Required build variables:
+`build_checked_aot.py` is the checked build and post-link-verification entry
+point. It refuses an absent or untracked nested `Cargo.lock`, a dirty checkout,
+a caller commit/tree that differs from `HEAD`, symlinked caller-supplied
+inputs, ambient Cargo configuration, a reused output directory, or any
+tool/input mutation observed during inspection or at a transaction boundary.
+The exact confirmation string below does not obtain or mint GO: supplying it
+is an operator assertion that the external controller has already published
+the applicable live-cutover GO.
 
-```text
-FRE_ABI2_THREE_ENGINE_SOURCE_COMMIT=<40 lowercase hex>
-FRE_ABI2_THREE_ENGINE_SOURCE_TREE=<40 lowercase hex>
-FRE_ABI2_THREE_ENGINE_HELPER_SHA256=<64 lowercase hex>
-FRE_ABI2_THREE_ENGINE_PROFILE=linux-target-cpu-local-v1
+```sh
+python3 -I -B \
+  /absolute/clean/fre/crates/fre-aot-compiler/benchmarks/linux-selected-end-abi2-three-engine/build_checked_aot.py \
+  --source-root /absolute/clean/fre \
+  --source-commit <exact-clean-HEAD-commit> \
+  --source-tree <exact-clean-HEAD-tree> \
+  --helper /absolute/canonical/path/to/reviewed-live-helper \
+  --cargo /absolute/canonical/path/to/toolchain/bin/cargo \
+  --rustc /absolute/canonical/path/to/toolchain/bin/rustc \
+  --linker /absolute/canonical/path/to/native-gnu-gcc-or-clang-driver \
+  --git /usr/bin/git \
+  --cargo-home /absolute/canonical/populated-offline-cargo-home \
+  --output-directory /absolute/new/checked-build-directory \
+  --explicit-post-fence-go I_HAVE_EXPLICIT_LIVE_CUTOVER_GO
 ```
 
-The binary's `metadata` command prints the exact object and contract paths for
-the verifier. Invoke the verifier with isolated Python:
+The Cargo home must already contain every locked registry source required by
+the build and must contain neither `config` nor `config.toml`; the source
+checkout may contain only the exact tracked root `.cargo/config.toml` whose
+bytes define the repository's three aliases and are hashed into the receipt.
+Every other checkout-ancestor `.cargo/config*` is refused. Pass the real
+canonical Cargo and rustc binaries, not a symlink or unresolved rustup proxy.
+The linker must be a canonical native GCC or Clang compiler driver, not direct
+`ld`, because the retained link arguments use compiler-driver `-Wl,...`
+spelling. The wrapper constructs a minimal environment and fixes
+`CARGO_INCREMENTAL=0`,
+`CARGO_ENCODED_RUSTFLAGS=-Ctarget-cpu=native<US>-Cstrip=none`, release
+`opt-level=3`/thin-LTO/one-codegen-unit/panic-abort/non-strip settings,
+`--locked --offline --release --target aarch64-unknown-linux-gnu`, and the four
+source/helper/profile binding variables. `build.rs` independently refuses any
+different target, host, profile, panic strategy, optimization level,
+incremental/offline setting, checked release-profile override,
+encoded-rustflags contract, or native target-feature set. The complete
+`CARGO_CFG_TARGET_FEATURE` set must equal the set produced by the separately
+recorded exact-rustc native probe and must include NEON/SVE/SVE2.
 
-```text
-python3 -I -B verify_post_link.py \
-  --binary <exact-final-executable> \
-  --implementation <metadata-implementation-object-path> \
-  --glue <metadata-direct-glue-object-path> \
-  --contract <metadata-post-link-contract-path> \
-  --binding <metadata-deployment-binding-path> \
-  --deployment-receipt <metadata-deployment-receipt-path> \
-  --source-commit <exact-commit> \
-  --source-tree <exact-tree>
-```
+Because `target-cpu=native` is host-relative, the wrapper also refuses unless
+all `/proc/cpuinfo` processor sections describe the same Arm `0x41/0xd84`
+ASIMD+SVE+SVE2 CPU and the current thread reports `PR_SVE_GET_VL=16`. It runs
+the exact bound rustc with `--print cfg`,
+`--target aarch64-unknown-linux-gnu`, and `-Ctarget-cpu=native`; requires
+NEON/SVE/SVE2 in that output; and binds the command, sanitized environment,
+output digest, complete CPU-info digest, parsed homogeneous CPU identity,
+vector length, and kernel identity into the receipt. CPU info and VL are
+rechecked after build and post-link verification.
+
+Git status is not the source-content authority. At each boundary the wrapper
+also streams every tracked regular file or symlink, compares its raw bytes and
+executable mode directly with the exact `HEAD` tree's blob/mode without Git
+filters, and binds a SHA-256 closure plus the local/worktree Git configuration
+inventory. Submodules, unsupported modes, missing paths, and symlinked
+ancestors are refused.
+
+The wrapper does not glob `target`. It consumes Cargo's JSON message stream,
+requires one exact non-fresh benchmark `compiler-artifact`, and takes the
+matching package's `OUT_DIR` from its sole `build-script-executed` message. It
+then invokes `verify_post_link.py` with isolated Python and those exact paths.
+The verifier's sole canonical `OBSERVATION` line is captured directly into
+`post-link-observation.txt` with exclusive creation, `fsync`, and mode `0444`.
+`build-receipt-v1.json` is canonical JSON, also exclusively created, fsynced,
+and mode `0444`; it binds the complete command and sanitized environment,
+source commit/tree and selected source digests, nested lock and helper digests,
+Cargo/rustc/linker/Git/Python plus fixed `/usr/bin/readelf` and
+`/usr/bin/objdump` identities and versions, Cargo logs, final executable,
+every generated `OUT_DIR` artifact, verifier command/stderr, and observation.
+The two fixed binutils paths may be regular executables or the single-hop
+multiarch symlinks used by Ubuntu; a symlink's identity/link text and its
+canonical target identity/digest are both bound and rechecked. Any refusal
+leaves no PASS receipt; retrying requires a new output directory.
+
+This is a source-bound checked transaction, not a hostile-same-UID sandbox.
+Another process with the same account can race pathname opens by atomically
+swapping and restoring files between boundary checks; that threat requires an
+external read-only mount or equivalent isolation. Likewise, the receipt binds
+the named Cargo/rustc/compiler-driver/binutils entrypoints and their bytes, not
+the compiler sysroot, dynamic-loader closure, or every program a compiler
+driver may launch. Promotion evidence must separately pin those external
+closures; this receipt does not claim to.
 
 The build roots both the payload and metadata symbols against section garbage
 collection and explicitly retains the compiler proof and benchmark consumer
