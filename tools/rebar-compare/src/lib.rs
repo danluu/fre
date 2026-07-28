@@ -12640,8 +12640,14 @@ fn fixed_predicate_word64_plan_identity_matches(
     let source_ranges_in_range = build.source_ranges >= build.positions
         && build.source_ranges <= build.positions.saturating_mul(4);
     let member_writes_in_range = build.member_writes >= build.source_ranges
-        && build.member_writes <= build.source_ranges.saturating_mul(128);
-    let anchor_mask_reads_match = build.anchor_mask_reads == build.positions.saturating_mul(128);
+        && build.member_writes
+            <= build
+                .source_ranges
+                .saturating_mul(fre::FIXED_PREDICATE_WORD64_MASK_SLOTS);
+    let anchor_mask_reads_match = build.anchor_mask_reads
+        == build
+            .positions
+            .saturating_mul(fre::FIXED_PREDICATE_WORD64_MASK_SLOTS);
     let reducer_identity_matches = match identity.reducer {
         fre::FixedPredicateWord64Reducer::OneByteAnchor => {
             usize::from(identity.anchor_offset) < identity.width
@@ -23224,7 +23230,10 @@ mod tests {
         assert_eq!(build.positions, 6);
         assert_eq!(build.source_ranges, 6);
         assert_eq!(build.member_writes, 31);
-        assert_eq!(build.anchor_mask_reads, 6 * 128);
+        assert_eq!(
+            build.anchor_mask_reads,
+            6 * fre::FIXED_PREDICATE_WORD64_MASK_SLOTS
+        );
 
         let count_limits =
             current_fre_rebar_aggregate_run_limits(haystack.len(), count.build_report())
