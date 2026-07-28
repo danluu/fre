@@ -95,8 +95,10 @@ The generated binding also emits an identity-suffixed primary proof callsite
 and marks it hidden. The final link must retain it (for GNU-compatible linkers,
 pass `--undefined=<primary_callsite_symbol>`). Its retained copy makes the
 entry `bl` independently inspectable, but it is deliberately not the safe hot
-API. The checker validates the generated hot-route source names the exact
-entry directly; it does not claim that route survived final optimization.
+API. The safe source first binds the exact portable literal plan once, then
+uses allocation-free plan identity to authenticate repeated preflight tokens
+before naming the exact entry directly. The checker validates that generated
+hot-route source; it does not claim that route survived final optimization.
 Every real consumer must separately expose and externally pin a stable symbol
 covering its actual hot callsite, then inspect that exact symbol in its final
 image. Until that consumer-specific proof exists,

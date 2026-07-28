@@ -5,9 +5,10 @@
 //! AOT boundary. This module does not add an address adopter. Instead it emits
 //! an exact identity-suffixed `extern` declaration whose four-argument call is
 //! visible to the static linker, and requires the default-off static-runtime
-//! same-thread session token. A companion signer-free receipt binds the
-//! generated source to the complete compiler, expectation, full-payload, and
-//! direct-glue tuple.
+//! same-thread session token. The generated safe boundary binds the exact
+//! portable literal plan once and uses plan identity on repeated preflighted
+//! calls. A companion signer-free receipt binds the generated source to the
+//! complete compiler, expectation, full-payload, and direct-glue tuple.
 //!
 //! Success remains diagnostic-only. The generated source, deployment value,
 //! and receipt carry no production or runtime authority. A final linked image
@@ -625,6 +626,11 @@ fn render_rust_binding(
         format!(".hidden {primary_callsite}"),
     )
     .map_err(|_| LinuxSelectedEndQualificationDeploymentErrorV2::Render)?;
+    writeln!(
+        output,
+        "\n#[inline]\npub(super) fn bind_exact_linked_aot_selected_end_plan_v2<'session, 'owner, 'plan>(\n    session: &'session fre_aot_static_runtime::StaticSearchSelectedEndThreadSessionV2<'owner>,\n    plan: &'plan fre_kernels::LiteralPlan,\n) -> Result<\n    fre_aot_static_runtime::StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>,\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    session.bind_literal_plan(plan, &EXACT_LITERAL)\n}}"
+    )
+    .map_err(|_| LinuxSelectedEndQualificationDeploymentErrorV2::Render)?;
     write_call(
         &mut output,
         "search_exact_linked_aot_selected_end_v2",
@@ -677,7 +683,7 @@ fn write_call(
 ) -> Result<(), LinuxSelectedEndQualificationDeploymentErrorV2> {
     writeln!(
         output,
-        "\n#[allow(unsafe_code, reason = \"the checked same-thread session guards this {reason}\")]\n#[inline(always)]\npub(super) fn {public_name}<'plan, 'haystack>(\n    session: &fre_aot_static_runtime::StaticSearchSelectedEndThreadSessionV2<'_>,\n    preflight: fre_kernels::LiteralSearchPreflight<'plan, 'haystack>,\n) -> Result<\n    (Option<fre_kernel_ir::MatchSpan>, fre_kernels::LiteralAccounting),\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    let prepared = session.prepare(preflight, &EXACT_LITERAL)?;\n    let haystack = prepared.haystack();\n    let window = prepared.window();\n    // SAFETY: the generated declaration names the exact hidden P2b symbol;\n    // `prepared` proves the same-thread VL16 session, exact embedded literal,\n    // scalar window bounds, and haystack ownership. Post-link qualification\n    // must still prove this remains a direct non-PLT `bl` in the final image.\n    let end_or_zero = unsafe {{\n        {exact_local}(\n            haystack.as_ptr(),\n            haystack.len(),\n            window.start(),\n            window.end(),\n        )\n    }};\n    prepared.decode(end_or_zero)\n}}"
+        "\n#[allow(unsafe_code, reason = \"the checked same-thread plan session guards this {reason}\")]\n#[inline(always)]\npub(super) fn {public_name}<'preflight, 'haystack>(\n    plan_session: &fre_aot_static_runtime::StaticSearchSelectedEndPlanSessionV2<'_, '_, '_>,\n    preflight: fre_kernels::LiteralSearchPreflight<'preflight, 'haystack>,\n) -> Result<\n    (Option<fre_kernel_ir::MatchSpan>, fre_kernels::LiteralAccounting),\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    let prepared = plan_session.prepare(preflight)?;\n    let haystack = prepared.haystack();\n    let window = prepared.window();\n    // SAFETY: the generated declaration names the exact hidden P2b symbol;\n    // `prepared` proves the same-thread VL16 session, once-bound exact literal\n    // plan, scalar window bounds, and haystack ownership. Post-link\n    // qualification must still prove this remains a direct non-PLT `bl` in\n    // the final image.\n    let end_or_zero = unsafe {{\n        {exact_local}(\n            haystack.as_ptr(),\n            haystack.len(),\n            window.start(),\n            window.end(),\n        )\n    }};\n    prepared.decode(end_or_zero)\n}}"
     )
     .map_err(|_| LinuxSelectedEndQualificationDeploymentErrorV2::Render)
 }
@@ -873,7 +879,15 @@ mod tests {
         let symbols = bundle.glue().symbols().unwrap();
         assert!(source.contains(&format!("#[link_name = {:?}]", symbols.entry().as_str())));
         assert!(source.contains(&format!("#[link_name = {:?}]", symbols.wrapper().as_str())));
-        assert!(source.contains("session.prepare(preflight, &EXACT_LITERAL)?"));
+        assert!(source.contains("session.bind_literal_plan(plan, &EXACT_LITERAL)"));
+        assert!(source.contains("StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>"));
+        assert_eq!(
+            source
+                .matches("let prepared = plan_session.prepare(preflight)?;")
+                .count(),
+            2
+        );
+        assert!(!source.contains("session.prepare(preflight, &EXACT_LITERAL)?"));
         let callsite = format!(
             "{PRIMARY_CALLSITE_SYMBOL_PREFIX_V2}{}",
             hex(symbols.compile_identity())

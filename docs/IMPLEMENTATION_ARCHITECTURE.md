@@ -162,7 +162,10 @@ Its receipts require the final image to retain that exact hidden direct call
 and reject a PLT target, `blr`, any `x4` argument, and any result slot. Those
 receipt bits are requirements, not observations: `observation_complete` is
 false, `RuntimeAuthority` is `Absent`, and this source has no ABI2 adopter or
-callable AOT path. The retained Count-v2 and Search V1 static-adoption
+callable AOT path. Its qualification-private generated safe binding performs
+the 16-byte literal comparison once when binding a portable plan to the
+current-thread session; hot preflighted calls use plan identity. The retained
+Count-v2 and Search V1 static-adoption
 architectures remain separate; their existence cannot authorize ABI2.
 
 ## Qualification status language

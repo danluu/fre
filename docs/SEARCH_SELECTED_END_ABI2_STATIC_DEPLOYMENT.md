@@ -22,13 +22,14 @@ The reusable qualification-private source candidate is split deliberately:
   pointer, registry, or generic adopter. Its default-off
   `selected-end-qualification-private-v2` feature provides only a
   neither-`Send`-nor-`Sync` current-thread token, exact-literal scalar
-  preflight, and strict `x0` end-or-zero decoding. Successful session creation
-  admits Arm `0x41/0xd84` with ASIMD+SVE+SVE2 and observes the calling thread's
-  SVE vector length once, requiring 16 bytes. Calls inside the session perform
-  no VL query. This correctness-first candidate still compares the exact
-  16-byte literal during each call preflight; replacing that comparison with a
-  plan-identity fast path is a post-admission optimization, not part of this
-  source-only candidate.
+  preflight, and strict `x0` end-or-zero decoding. The generated binding
+  compares its embedded 16-byte literal with the portable `LiteralPlan` once
+  while creating a plan-bound session; repeated hot calls then authenticate
+  the private preflight token with plan identity. Equal bytes owned by another
+  plan are still rejected. Successful session creation admits Arm
+  `0x41/0xd84` with ASIMD+SVE+SVE2 and observes the calling thread's SVE vector
+  length once, requiring 16 bytes. Calls inside the session perform no VL
+  query and no literal-byte comparison.
 
 The retained Search V1 Span adopter is intentionally not reused. Its ABI has a
 fifth `x4` output-slot argument and its final verification step converts a

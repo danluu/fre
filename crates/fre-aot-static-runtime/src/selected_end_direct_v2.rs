@@ -10,7 +10,7 @@ use core::{fmt, marker::PhantomData};
 use std::rc::Rc;
 
 use fre_kernel_ir::{CheckedSearchWindow, MatchSpan, SearchWindow};
-use fre_kernels::{LiteralAccounting, LiteralSearchPreflight};
+use fre_kernels::{LiteralAccounting, LiteralPlan, LiteralSearchPreflight};
 
 const SELECTED_END_LITERAL_BYTES_V2: usize = 16;
 const SELECTED_END_FIXED_VECTOR_BYTES_V2: u16 = 16;
@@ -207,10 +207,44 @@ pub struct StaticSearchSelectedEndThreadSessionV2<'owner> {
 }
 
 impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
+    /// Bind one exact portable plan to this already-admitted thread session.
+    ///
+    /// The linked artifact's literal is compared once here. Calls prepared
+    /// through the returned token can then authenticate their private-field
+    /// preflight certificate by plan identity instead of comparing sixteen
+    /// literal bytes on every hot call.
+    pub fn bind_literal_plan<'session, 'plan>(
+        &'session self,
+        plan: &'plan LiteralPlan,
+        exact_literal: &[u8; SELECTED_END_LITERAL_BYTES_V2],
+    ) -> Result<
+        StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        let literal = plan.needle();
+        let actual_bytes = literal.len();
+        if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
+            return Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+                expected_bytes: SELECTED_END_LITERAL_BYTES_V2,
+                actual_bytes,
+            });
+        }
+        if literal != exact_literal {
+            return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
+        }
+        Ok(StaticSearchSelectedEndPlanSessionV2 {
+            session: self,
+            plan,
+        })
+    }
+
     /// Bind one already completed shared scalar preflight to this session.
     ///
     /// The exact linked artifact embeds a 16-byte literal. A token issued by a
     /// different literal plan is rejected before generated code is invoked.
+    /// This general one-off boundary compares bytes on every call; generated
+    /// reusable bindings use [`Self::bind_literal_plan`] and the plan-bound
+    /// identity path instead.
     pub fn prepare<'session, 'haystack>(
         &'session self,
         preflight: LiteralSearchPreflight<'_, 'haystack>,
@@ -231,6 +265,62 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
         }
         Ok(StaticSearchSelectedEndPreparedCallV2 {
             _session: self,
+            checked: preflight.checked_window(),
+            accounting: preflight.accounting(),
+        })
+    }
+}
+
+/// Same-thread AOT session bound once to the exact portable literal plan.
+///
+/// The token borrows the non-transferable thread session and is therefore
+/// neither [`Send`] nor [`Sync`]. It contains no callable address or function
+/// pointer.
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndPlanSessionV2;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<StaticSearchSelectedEndPlanSessionV2<'static, 'static, 'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndPlanSessionV2;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<StaticSearchSelectedEndPlanSessionV2<'static, 'static, 'static>>();
+/// ```
+#[derive(Debug)]
+pub struct StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan> {
+    session: &'session StaticSearchSelectedEndThreadSessionV2<'owner>,
+    plan: &'plan LiteralPlan,
+}
+
+impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan> {
+    /// Consume one authoritative preflight from the plan bound at session
+    /// construction.
+    ///
+    /// The successful hot path is one allocation-free plan-identity check.
+    /// A token from another plan is rejected before any generated code can be
+    /// invoked, even when that plan owns equal literal bytes.
+    #[inline]
+    pub fn prepare<'haystack>(
+        &self,
+        preflight: LiteralSearchPreflight<'_, 'haystack>,
+    ) -> Result<
+        StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        if !preflight.was_issued_by(self.plan) {
+            let actual_bytes = preflight.literal_bytes();
+            if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
+                return Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+                    expected_bytes: SELECTED_END_LITERAL_BYTES_V2,
+                    actual_bytes,
+                });
+            }
+            return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
+        }
+        Ok(StaticSearchSelectedEndPreparedCallV2 {
+            _session: self.session,
             checked: preflight.checked_window(),
             accounting: preflight.accounting(),
         })
@@ -530,13 +620,80 @@ mod tests {
     }
 
     #[test]
+    fn plan_bound_session_checks_bytes_once_and_plan_identity_per_call() {
+        let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
+        let session = StaticSearchSelectedEndThreadSessionV2 {
+            _owner: &owner,
+            _thread_bound: PhantomData,
+        };
+        let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
+        let bound = session
+            .bind_literal_plan(&exact, b"0123456789abcdef")
+            .expect("exact plan binds once");
+        let haystack = b"before-0123456789abcdef-after";
+        let window = CheckedSearchWindow::new(haystack, SearchWindow::new(0, haystack.len()))
+            .expect("checked test window");
+        let exact_preflight = exact
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        let prepared = bound
+            .prepare(exact_preflight)
+            .expect("the bound plan's preflight");
+        assert_eq!(prepared.decode(23).unwrap().0, Some(MatchSpan::new(7, 23)));
+
+        let equal_bytes =
+            LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
+        let equal_preflight = equal_bytes
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            bound.prepare(equal_preflight),
+            Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch)
+        ));
+
+        let wrong_width = LiteralPlan::new(b"short", LiteralBuildLimits::default()).unwrap();
+        let wrong_width_preflight = wrong_width
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            bound.prepare(wrong_width_preflight),
+            Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+                expected_bytes: 16,
+                actual_bytes: 5,
+            })
+        ));
+
+        assert!(matches!(
+            session.bind_literal_plan(&equal_bytes, b"fedcba9876543210"),
+            Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch)
+        ));
+        assert!(matches!(
+            session.bind_literal_plan(&wrong_width, b"0123456789abcdef"),
+            Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+                expected_bytes: 16,
+                actual_bytes: 5,
+            })
+        ));
+    }
+
+    #[test]
     fn source_has_one_session_only_vl_query_and_no_callable_storage() {
         let source = include_str!("selected_end_direct_v2.rs");
-        let prepare = source.find("    pub fn prepare<").unwrap();
+        let bind = source.find("    pub fn bind_literal_plan<").unwrap();
+        let plan_prepare = source
+            .find("impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2")
+            .unwrap();
         let decode = source.find("fn decode_selected_end_v2(").unwrap();
         let tests = source.find("#[cfg(test)]").unwrap();
         let implementation = &source[..tests];
-        assert!(!implementation[prepare..decode].contains("prctl("));
+        assert!(!implementation[bind..decode].contains("prctl("));
+        let plan_prepare = &implementation[plan_prepare..decode];
+        let pointer_check = plan_prepare
+            .find("preflight.was_issued_by(self.plan)")
+            .unwrap();
+        let literal_width = plan_prepare.find("preflight.literal_bytes()").unwrap();
+        assert!(pointer_check < literal_width);
+        assert!(!plan_prepare.contains("preflight.literal()"));
         assert_eq!(implementation.matches("libc::prctl(").count(), 1);
         assert!(!implementation.contains("transmute::<"));
         assert!(!implementation.contains("extern \"C\" fn("));

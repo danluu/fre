@@ -736,6 +736,9 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
     callsite_local = (
         f"exact_linked_aot_selected_end_primary_callsite_v2_{compile_identity}"
     )
+    bind_start = source.find(
+        "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+    )
     primary_start = source.find(
         "pub(super) fn search_exact_linked_aot_selected_end_v2"
     )
@@ -743,10 +746,18 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "pub(super) fn search_exact_linked_aot_selected_end_qualification_wrapper_v2"
     )
     require(
-        0 <= primary_start < diagnostic_start,
-        "binding primary/diagnostic call functions are missing or reordered",
+        0 <= bind_start < primary_start < diagnostic_start,
+        "binding plan/primary/diagnostic functions are missing or reordered",
     )
+    bind_source = source[bind_start:primary_start]
     primary_source = source[primary_start:diagnostic_start]
+    require(
+        "StaticSearchSelectedEndThreadSessionV2<'owner>" in bind_source
+        and "StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        in bind_source
+        and "session.bind_literal_plan(plan, &EXACT_LITERAL)" in bind_source,
+        "binding omits one-time exact-literal plan binding",
+    )
     require(
         f"{entry_local}(" in primary_source
         and f"{callsite_local}(" not in primary_source,
@@ -758,8 +769,9 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "binding exact literal differs from contract",
     )
     require(
-        "session.prepare(preflight, &EXACT_LITERAL)?" in source,
-        "binding omits exact-literal/session preflight",
+        source.count("let prepared = plan_session.prepare(preflight)?;") == 2
+        and "session.prepare(preflight, &EXACT_LITERAL)?" not in source,
+        "binding omits plan-identity preflight or retains per-call literal comparison",
     )
     for forbidden in ("transmute", "extern \"C\" fn(", "*mut", "result_slot", " x4", "blr"):
         require(forbidden not in source, f"binding contains forbidden form {forbidden!r}")
