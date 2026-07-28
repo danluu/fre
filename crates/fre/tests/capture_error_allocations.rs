@@ -5,7 +5,7 @@ use std::alloc::System;
 
 use fre::{
     CaptureBuildLimits, CaptureBuilder, CaptureExecutionError, CaptureExecutionSource,
-    CaptureRunLimits, PrefixClassUniformParticipationError,
+    CaptureRunLimits, CaptureStreamDomains, PrefixClassUniformParticipationError,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
@@ -175,5 +175,48 @@ fn direct_terminal_packaging_has_a_zero_allocation_census() {
             .expect("injected direct receipt")
             .actual,
         success_receipt.actual
+    );
+}
+
+#[test]
+fn prepared_capture_count_values_have_a_zero_allocation_census() {
+    let regex = CaptureBuilder::new(r"(?:(a())|(a))")
+        .unicode(false)
+        .build()
+        .expect("fused capture build");
+    let mut session = regex
+        .prepare_capture_stream_session(2, CaptureRunLimits::default(), CaptureStreamDomains::Whole)
+        .expect("fused capture preparation")
+        .expect("fused capture session");
+
+    for (haystack, expected) in [
+        (b"aa".as_slice(), 6),
+        (b"bb".as_slice(), 0),
+        (b"ab".as_slice(), 3),
+        (b"ba".as_slice(), 3),
+    ] {
+        let count = without_allocations(|| {
+            session
+                .count_value(haystack)
+                .expect("prepared capture count")
+        });
+        assert_eq!(count, expected);
+    }
+
+    let error = without_allocations(|| {
+        session
+            .count_value(b"a")
+            .expect_err("mismatched source must replay without allocation")
+    });
+    assert_eq!(
+        error.source,
+        CaptureExecutionSource::Stream(fre::CaptureStreamError::SourceLength {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        without_allocations(|| session.count_value(b"aa").expect("reuse after refusal")),
+        6
     );
 }

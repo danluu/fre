@@ -3467,14 +3467,14 @@ impl CurrentFreCaptureLifecycle {
             }
             (CurrentFreCaptureRegex::General(_), CurrentFreCapturePreparation::Stream(session)) => {
                 session
-                    .execute(haystack)
+                    .count_value(haystack)
                     .map_err(|error| {
                         ExecutionError::fault(format!(
                             "FRE prepared capture-stream session refused execution: {error}"
                         ))
                     })
-                    .and_then(|result| {
-                        u64::try_from(result.accounting.count).map_err(|_| {
+                    .and_then(|count| {
+                        u64::try_from(count).map_err(|_| {
                             ExecutionError::fault("FRE stream capture count does not fit u64")
                         })
                     })
@@ -3602,6 +3602,26 @@ pub fn current_fre_rebar_capture_lifecycle(
     )
 }
 
+fn current_fre_capture_count_preparation(
+    regex: &CaptureRegex,
+    haystack_len: usize,
+    run_limits: &CaptureRunLimits,
+) -> Result<CurrentFreCapturePreparation, CompareError> {
+    regex
+        .prepare_capture_stream_session(haystack_len, *run_limits, CaptureStreamDomains::Whole)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE capture-stream Count session preflight refused construction: {error}"
+            ))
+        })
+        .map(|session| {
+            session.map_or_else(
+                || CurrentFreCapturePreparation::Count(Box::new(*run_limits)),
+                CurrentFreCapturePreparation::Stream,
+            )
+        })
+}
+
 fn current_fre_rebar_capture_lifecycle_with_limits(
     model: &str,
     pattern: &str,
@@ -3638,9 +3658,11 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                     .map_err(|error| CompareError::new(error.message))?;
                 let run_limits = capture_count_run_limits(&regex, haystack_len, &limits)
                     .map_err(|error| CompareError::new(error.message))?;
+                let preparation =
+                    current_fre_capture_count_preparation(&regex, haystack_len, &run_limits)?;
                 (
                     CurrentFreCaptureRegex::General(Box::new(regex)),
-                    CurrentFreCapturePreparation::Count(Box::new(run_limits)),
+                    preparation,
                 )
             }
         }
@@ -20397,10 +20419,7 @@ mod tests {
             current_fre_rebar_capture_lifecycle("count-captures", r"(a)(b)?", false, false, 4)
                 .expect("count-captures lifecycle");
         assert_eq!(count.model(), "count-captures");
-        assert_eq!(
-            count.plan(),
-            CURRENT_FRE_CAPTURE_PARTICIPATION_QUOTIENT_PLAN
-        );
+        assert_eq!(count.plan(), CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN);
         assert_eq!(count.execute(b"a ab").expect("first count operation"), 5);
         assert_eq!(count.execute(b"a ab").expect("steady count operation"), 5);
         assert!(count.execute(b"a").is_err());
@@ -21186,6 +21205,63 @@ mod tests {
         assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN);
         assert_eq!(grep.execute(haystack).expect("first stream operation"), 6);
         assert_eq!(grep.execute(haystack).expect("steady stream operation"), 6);
+    }
+
+    #[test]
+    fn count_capture_lifecycle_reuses_fused_value_workspace_across_sources() {
+        let pattern = r"(?:(a())|(a))";
+        let reference = rust_compile_options(&[pattern.to_string()], false, false)
+            .expect("pinned capture reference");
+        let mut lifecycle =
+            current_fre_rebar_capture_lifecycle("count-captures", pattern, false, false, 2)
+                .expect("fused Count lifecycle");
+        assert_eq!(
+            lifecycle.plan(),
+            CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
+        );
+        for haystack in [
+            b"aa".as_slice(),
+            b"bb".as_slice(),
+            b"ab".as_slice(),
+            b"ba".as_slice(),
+            b"aa".as_slice(),
+        ] {
+            assert_eq!(
+                lifecycle.execute(haystack).expect("fused Count value"),
+                count_captures(&reference, haystack, u64::MAX).expect("Rust capture count")
+            );
+        }
+
+        let required_pattern = r"(?:(ABC)|(AB)(C)|(XY))";
+        let required_reference =
+            rust_compile_options(&[required_pattern.to_string()], false, false)
+                .expect("required-literal capture reference");
+        let mut required = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            required_pattern,
+            false,
+            false,
+            6,
+        )
+        .expect("required-literal fused Count lifecycle");
+        assert_eq!(
+            required.plan(),
+            CURRENT_FRE_CAPTURE_STREAM_PARTICIPATION_PLAN
+        );
+        for haystack in [
+            b"ABCABC".as_slice(),
+            b"miss!!".as_slice(),
+            b"XYABXY".as_slice(),
+            b"ABCABC".as_slice(),
+        ] {
+            assert_eq!(
+                required
+                    .execute(haystack)
+                    .expect("required-literal fused Count value"),
+                count_captures(&required_reference, haystack, u64::MAX)
+                    .expect("Rust required capture count")
+            );
+        }
     }
 
     #[test]

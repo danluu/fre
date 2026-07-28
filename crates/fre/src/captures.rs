@@ -2444,6 +2444,34 @@ impl CaptureStreamSession {
         self.stream.operation_report()
     }
 
+    /// Execute the prepared operation and return only the capture count.
+    ///
+    /// Successful steady calls retain the complete checked runtime ledger but
+    /// do not construct or authenticate the much larger public receipt. If
+    /// the compact path refuses, a cold receipt-bearing replay is
+    /// authoritative, preserving the established typed terminal and proving
+    /// that a failed attempt did not poison the reusable workspace.
+    #[allow(
+        clippy::result_large_err,
+        reason = "cold replay preserves the established complete capture execution error"
+    )]
+    pub fn count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureExecutionError> {
+        match self.stream.count_value(haystack) {
+            Ok(value) => Ok(value),
+            Err(_) => self.replay_count_value(haystack),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "cold replay preserves the established complete capture execution error"
+    )]
+    fn replay_count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureExecutionError> {
+        self.execute(haystack).map(|report| report.accounting.count)
+    }
+
     /// Execute one complete operation using the already admitted workspace.
     ///
     /// This path never reconstructs a stream and never takes a fallback after

@@ -3360,6 +3360,84 @@ fn caller_owned_capture_stream_sessions_reuse_without_source_cache_and_are_concu
 }
 
 #[test]
+fn capture_stream_count_values_alternate_sources_and_recover_from_poisoned_attempts() {
+    let participation = CaptureBuilder::new(r"(?:(a())|(a))")
+        .unicode(false)
+        .build()
+        .expect("participation stream");
+    let mut participation_session = participation
+        .prepare_capture_stream_session(2, CaptureRunLimits::default(), CaptureStreamDomains::Whole)
+        .expect("participation preparation")
+        .expect("participation session");
+    for (haystack, expected) in [
+        (b"aa".as_slice(), 6),
+        (b"bb".as_slice(), 0),
+        (b"ab".as_slice(), 3),
+        (b"ba".as_slice(), 3),
+        (b"aa".as_slice(), 6),
+    ] {
+        assert_eq!(
+            participation_session
+                .count_value(haystack)
+                .expect("alternating participation value"),
+            expected
+        );
+    }
+    assert_eq!(
+        participation_session
+            .count_value(b"a")
+            .expect_err("mismatched source length must replay its receipt")
+            .source,
+        CaptureExecutionSource::Stream(fre::CaptureStreamError::SourceLength {
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        participation_session
+            .count_value(b"aa")
+            .expect("participation workspace after poison"),
+        6
+    );
+    assert!(
+        participation_session
+            .execute(b"bb")
+            .expect("receipt after compact values")
+            .capture_stream
+            .is_some_and(|stream| stream.closes(stream.limits))
+    );
+
+    let mut history_pattern = "(a)?".repeat(fre::PARTICIPATION_QUOTIENT_CAPTURE_BITS + 1);
+    history_pattern.push('z');
+    let history = CaptureBuilder::new(&history_pattern)
+        .unicode(false)
+        .build()
+        .expect("persistent-history stream");
+    assert_eq!(
+        history.build_report().plan_identity.plan,
+        fre::CapturePlanKind::FusedCaptureStreamPersistentHistoryV1
+    );
+    let mut history_session = history
+        .prepare_capture_stream_session(1, CaptureRunLimits::default(), CaptureStreamDomains::Whole)
+        .expect("history preparation")
+        .expect("history session");
+    for (haystack, expected) in [
+        (b"z".as_slice(), 1),
+        (b"a".as_slice(), 0),
+        (b"z".as_slice(), 1),
+        (b"x".as_slice(), 0),
+        (b"z".as_slice(), 1),
+    ] {
+        assert_eq!(
+            history_session
+                .count_value(haystack)
+                .expect("alternating history value"),
+            expected
+        );
+    }
+}
+
+#[test]
 fn participation_quotient_preserves_interleaved_resource_terminal_priority() {
     let regex = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)

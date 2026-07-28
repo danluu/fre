@@ -1042,6 +1042,15 @@ pub struct CaptureStream {
     exact_only: bool,
 }
 
+#[derive(Debug)]
+struct CaptureStreamRun {
+    accounting: CaptureStreamAccounting,
+    count: usize,
+    matches: usize,
+    first_match: Option<Span>,
+    last_match: Option<Span>,
+}
+
 impl CaptureStream {
     /// Derive a complete source-independent envelope without allocating.
     pub fn prospective(
@@ -1446,12 +1455,30 @@ impl CaptureStream {
         self.operation
     }
 
-    /// Execute one complete fused operation without allocating.
+    /// Execute one complete fused operation and return only its capture count.
+    ///
+    /// This keeps the same checked resource ledger as [`Self::execute`] but
+    /// avoids constructing and closing the full public receipt on an ordinary
+    /// successful value-only call. Callers that must publish an error should
+    /// replay with [`Self::execute`] so the authoritative terminal retains the
+    /// complete P/A evidence.
+    pub fn count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureStreamError> {
+        let run = self.execute_run::<false>(haystack)?;
+        if run.count <= self.operation.capture_count {
+            Ok(run.count)
+        } else {
+            Err(CaptureStreamError::InvalidProgram)
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
-        reason = "domain iteration and the terminal receipt are one allocation-free operation transaction"
+        reason = "domain iteration and the checked hot-path ledger remain one allocation-free operation transaction"
     )]
-    pub fn execute(&mut self, haystack: &[u8]) -> Result<CaptureStreamReport, CaptureStreamError> {
+    fn execute_run<const RETAIN_SPANS: bool>(
+        &mut self,
+        haystack: &[u8],
+    ) -> Result<CaptureStreamRun, CaptureStreamError> {
         if self.exact_only {
             return Err(CaptureStreamError::InvalidProgram);
         }
@@ -1468,7 +1495,7 @@ impl CaptureStream {
         let mut last_match = None;
         match self.domains {
             CaptureStreamDomains::Whole => {
-                self.execute_domain(
+                self.execute_domain::<RETAIN_SPANS>(
                     haystack,
                     Window::all(haystack),
                     false,
@@ -1501,7 +1528,7 @@ impl CaptureStream {
                         } else {
                             index
                         };
-                        self.execute_domain(
+                        self.execute_domain::<RETAIN_SPANS>(
                             haystack,
                             Window {
                                 start,
@@ -1526,7 +1553,7 @@ impl CaptureStream {
                     ))?;
                 }
                 if start < haystack.len() {
-                    self.execute_domain(
+                    self.execute_domain::<RETAIN_SPANS>(
                         haystack,
                         Window {
                             start,
@@ -1565,9 +1592,26 @@ impl CaptureStream {
         if expected_work != accounting.work {
             return Err(CaptureStreamError::InvalidProgram);
         }
-        let captures = CaptureCountOutcome {
+        Ok(CaptureStreamRun {
+            accounting,
             count,
             matches,
+            first_match,
+            last_match,
+        })
+    }
+
+    /// Execute one complete fused operation without allocating.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "domain iteration and the terminal receipt are one allocation-free operation transaction"
+    )]
+    pub fn execute(&mut self, haystack: &[u8]) -> Result<CaptureStreamReport, CaptureStreamError> {
+        let run = self.execute_run::<true>(haystack)?;
+        let accounting = run.accounting;
+        let captures = CaptureCountOutcome {
+            count: run.count,
+            matches: run.matches,
             searches: accounting.searches,
             total_state_visits: accounting.state_visits,
             total_history_nodes: accounting.history_nodes,
@@ -1583,8 +1627,8 @@ impl CaptureStream {
             operation: self.operation,
             accounting,
             captures,
-            first_match,
-            last_match,
+            first_match: run.first_match,
+            last_match: run.last_match,
             capture_events: accounting.capture_events,
             combined_peak_bytes: self.prospective.combined_peak_bytes,
         };
@@ -1772,7 +1816,7 @@ impl CaptureStream {
         clippy::too_many_lines,
         reason = "one domain carries explicit counters and boundaries into a single receipt-bearing transaction"
     )]
-    fn execute_domain(
+    fn execute_domain<const RETAIN_SPANS: bool>(
         &mut self,
         haystack: &[u8],
         window: Window,
@@ -1887,10 +1931,12 @@ impl CaptureStream {
                 self.limits.max_work,
             )?;
             accumulate_tag_accounting(&self.tags.accounting(), accounting, self.limits)?;
-            if first_match.is_none() {
-                *first_match = Some(overall);
+            if RETAIN_SPANS {
+                if first_match.is_none() {
+                    *first_match = Some(overall);
+                }
+                *last_match = Some(overall);
             }
-            *last_match = Some(overall);
             cursor = overall.end;
         }
         Ok(())
