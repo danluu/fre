@@ -84,10 +84,17 @@ use fre_kernels::{
     ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
     OrderedLiteralAggregateBuildAttemptActual, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
-    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PrefixClassAlternationBuildAccounting,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateOperation,
+    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
+    PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
+    PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
+    PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
+    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
+    PackedOrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
     PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
@@ -192,7 +199,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 38;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 39;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
@@ -292,6 +299,9 @@ pub enum AggregatePlanKind {
     /// Ordered finite HIR lowered to one reversed shared dense or sparse
     /// automaton and a bounded initial/progressed reducer ring.
     FiniteLiteralDfa,
+    /// Small ordered finite HIR lowered to one bounded packed literal scanner
+    /// before the dense finite-language route is considered.
+    PackedFiniteLiteral,
     /// Finite nonempty ASCII-word bodies guarded on both endpoints, lowered
     /// to an eager exact dictionary and allocation-free maximal-word scan.
     GuardedAsciiWordDictionary,
@@ -304,6 +314,10 @@ pub enum AggregatePlanKind {
 
 /// Stable identity for the selected operation-specific implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the packed route retains its complete Copy native classifier identity inline so construction and execution authentication add no allocation"
+)]
 pub enum AggregatePlanIdentity {
     /// Exact-literal plan plus count/span-sum operation identity.
     ExactLiteral(AggregateExactLiteralIdentity),
@@ -374,6 +388,9 @@ pub struct AggregateFiniteLiteralIdentity {
     pub semantics: AggregateFiniteLiteralSemantics,
     pub algorithm: &'static str,
     pub operation: &'static str,
+    /// Native packed operation/classifier identity. Dense and sparse finite
+    /// representations always retain `None`.
+    pub packed_operation_identity: Option<PackedOrderedLiteralAggregateOperationIdentity>,
 }
 
 /// Profile proof attached to the shared finite-language reducer.
@@ -1135,6 +1152,8 @@ pub enum AggregateBuildAccounting {
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainBuildSummary),
     /// Shared reversed DFA construction certificate.
     FiniteLiteral(OrderedLiteralAggregateBuildAccounting),
+    /// Bounded packed literal-scanner construction certificate.
+    PackedFiniteLiteral(PackedOrderedLiteralAggregateBuildAccounting),
     /// Sparse shared reversed automaton construction certificate. This is the
     /// same finite-language semantic family with a different transition
     /// representation selected only after the dense cell cap is exceeded.
@@ -1455,6 +1474,7 @@ fn aggregate_construction_prospective(
 ) -> Result<AggregateConstructionProspective, &'static str> {
     let syntax = request.attempt_prospective();
     let sparse = sparse_finite_build_limits(limits.finite_literal);
+    let packed = packed_finite_build_limits(limits.finite_literal);
     let guarded = guarded_finite_build_limits(limits.finite_literal);
     let fixed_predicate = fixed_predicate_word64_build_limits(limits.finite_literal);
 
@@ -1518,6 +1538,8 @@ fn aggregate_construction_prospective(
             .map_err(|_| "bounded-context construction work does not fit u64")?,
         limits.fixed_absolute.max_build_work,
         limits.fixed_absolute_residual.max_work,
+        u64::try_from(packed.max_build_work)
+            .map_err(|_| "packed finite construction work does not fit u64")?,
         limits.finite_literal.max_build_work,
         sparse.max_build_work,
         guarded.dictionary.max_build_work,
@@ -1630,6 +1652,7 @@ fn aggregate_construction_prospective(
             limits.fixed_absolute_residual.max_peak_bytes,
             limits.fixed_absolute_residual.max_persistent_bytes,
         ),
+        (packed.max_build_peak_bytes, packed.max_persistent_bytes),
         (
             limits.finite_literal.max_peak_bytes,
             limits.finite_literal.max_persistent_bytes,
@@ -2135,6 +2158,42 @@ const fn ordered_finite_build_effect(
     }
 }
 
+const fn packed_finite_build_effect(
+    actual: PackedOrderedLiteralAggregateBuildAttemptActual,
+) -> AggregateConstructionEffect {
+    AggregateConstructionEffect {
+        work: actual.work,
+        allocations: actual.allocations,
+        allocated_bytes: actual.allocated_bytes,
+        copied_bytes: actual.copied_bytes,
+        initialized_bytes: actual.initialized_bytes,
+        retained_persistent_bytes: actual.live_persistent_bytes,
+        released_persistent_bytes: 0,
+        co_live_bytes: actual.peak_bytes,
+    }
+}
+
+const fn packed_finite_abandonment(
+    effect: AggregateConstructionEffect,
+) -> AggregateConstructionAbandonment {
+    AggregateConstructionAbandonment {
+        work: effect.work,
+        allocations: effect.allocations,
+        bytes: effect.allocated_bytes,
+        released_persistent_bytes: effect.retained_persistent_bytes,
+    }
+}
+
+fn packed_finite_terminal_effect(
+    actual: PackedOrderedLiteralAggregateBuildAttemptActual,
+    boundary_work: usize,
+    prior: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    let mut effect = include_construction_work(packed_finite_build_effect(actual), boundary_work)?;
+    effect.released_persistent_bytes = prior.retained_persistent_bytes;
+    Some(effect)
+}
+
 fn fixed_predicate_build_effect(
     actual: FixedPredicateWord64BuildAttemptActual,
     inspection: AggregateConstructionEffect,
@@ -2241,6 +2300,7 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
             AggregateConstructionStage::SparseFiniteRoot
         }
         AggregatePlanKind::FiniteLiteralDfa => AggregateConstructionStage::DenseFinite,
+        AggregatePlanKind::PackedFiniteLiteral => AggregateConstructionStage::PackedFinite,
         AggregatePlanKind::GuardedAsciiWordDictionary => {
             AggregateConstructionStage::GeneralFiniteExtraction
         }
@@ -2249,11 +2309,39 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
     }
 }
 
-const fn construction_stage_closes_plan(
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the complete Copy plan identity is matched by value throughout the construction closure protocol"
+)]
+fn construction_stage_closes_plan(
     stage: AggregateConstructionStage,
     plan: AggregatePlanKind,
     identity: AggregatePlanIdentity,
 ) -> bool {
+    match (stage, plan, identity) {
+        (
+            AggregateConstructionStage::PackedFinite,
+            AggregatePlanKind::PackedFiniteLiteral,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => return packed_finite_identity_closes_native(&identity),
+        (
+            AggregateConstructionStage::DenseFinite,
+            AggregatePlanKind::FiniteLiteralDfa,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => {
+            return identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none();
+        }
+        (
+            AggregateConstructionStage::SparseFiniteRoot,
+            AggregatePlanKind::FiniteLiteralDfa,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => {
+            return identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none();
+        }
+        _ => {}
+    }
     matches!(
         (stage, plan, identity),
         (
@@ -2317,10 +2405,6 @@ const fn construction_stage_closes_plan(
             AggregatePlanKind::FixedAbsoluteDomain,
             AggregatePlanIdentity::FixedAbsoluteDomain(_),
         ) | (
-            AggregateConstructionStage::SparseFiniteRoot | AggregateConstructionStage::DenseFinite,
-            AggregatePlanKind::FiniteLiteralDfa,
-            AggregatePlanIdentity::FiniteLiteral(_),
-        ) | (
             AggregateConstructionStage::GeneralFiniteExtraction,
             AggregatePlanKind::GuardedAsciiWordDictionary,
             AggregatePlanIdentity::GuardedAsciiWord(_),
@@ -2336,6 +2420,10 @@ const fn construction_stage_closes_plan(
     )
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "the complete Copy plan identity is matched by value throughout the construction closure protocol"
+)]
 fn construction_strategy_closes_plan(
     requested: AggregateStrategy,
     continuation: Option<AggregateStrategy>,
@@ -3414,8 +3502,7 @@ impl AggregateCacheIdentity {
 }
 
 /// Physical direct reducer selected before an aggregate invocation can inspect
-/// source. Dense and sparse finite reducers remain distinct even though they
-/// intentionally share the public `FiniteLiteralDfa` plan kind.
+/// source. Packed, dense, and sparse finite reducers remain distinct.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateDirectRoute {
     ExactLiteral,
@@ -3432,6 +3519,7 @@ pub enum AggregateDirectRoute {
     LiteralClassRunLiteral,
     BoundedLiteralPair,
     BoundedContext,
+    PackedFiniteLiteral,
     DenseFiniteLiteral,
     SparseFiniteLiteral,
     GuardedAsciiWord,
@@ -3488,6 +3576,11 @@ impl AggregateDirectRouteIdentity {
     }
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    reason = "one exhaustive Copy identity match keeps every physical direct route at one authentication boundary"
+)]
 fn direct_route_matches_plan(
     route: AggregateDirectRoute,
     plan: AggregatePlanKind,
@@ -3575,15 +3668,26 @@ fn direct_route_matches_plan(
             AggregatePlanIdentity::FixedPredicateWord64(_),
         ) => true,
         (
+            AggregateDirectRoute::PackedFiniteLiteral,
+            AggregatePlanKind::PackedFiniteLiteral,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) => packed_finite_identity_closes_native(&identity),
+        (
             AggregateDirectRoute::DenseFiniteLiteral,
             AggregatePlanKind::FiniteLiteralDfa,
             AggregatePlanIdentity::FiniteLiteral(identity),
-        ) => identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+        ) => {
+            identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none()
+        }
         (
             AggregateDirectRoute::SparseFiniteLiteral,
             AggregatePlanKind::FiniteLiteralDfa,
             AggregatePlanIdentity::FiniteLiteral(identity),
-        ) => identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+        ) => {
+            identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none()
+        }
         _ => false,
     }
 }
@@ -3599,6 +3703,26 @@ fn direct_operation_id_closes(
         AggregateOperation::SpanSum => span_sum_id == Some(operation_id),
         AggregateOperation::Spans => false,
     }
+}
+
+fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentity) -> bool {
+    let (expected_operation, expected_plan_id) = match identity.operation {
+        PACKED_ORDERED_LITERAL_COUNT_PLAN_ID => (
+            OrderedLiteralAggregateOperation::Count,
+            PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+        ),
+        PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID => (
+            OrderedLiteralAggregateOperation::SpanSum,
+            PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+        ),
+        _ => return false,
+    };
+    identity.algorithm == PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+        && identity.packed_operation_identity.is_some_and(|native| {
+            native.algorithm_id == PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && native.plan_id == expected_plan_id
+                && native.operation == expected_operation
+        })
 }
 
 fn word_run_direct_identity_closes(
@@ -3782,18 +3906,33 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             Some(BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID),
         ),
         AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
-            ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => direct_operation_id_closes(
-                cache.operation,
-                identity.operation,
-                ORDERED_LITERAL_COUNT_PLAN_ID,
-                Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-            ),
-            SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => direct_operation_id_closes(
-                cache.operation,
-                identity.operation,
-                SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-                Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-            ),
+            PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
+                packed_finite_identity_closes_native(&identity)
+                    && direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+                        Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                    )
+            }
+            ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        ORDERED_LITERAL_COUNT_PLAN_ID,
+                        Some(ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                    )
+            }
+            SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
+                identity.packed_operation_identity.is_none()
+                    && direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+                        Some(SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                    )
+            }
             _ => false,
         },
         AggregatePlanIdentity::GuardedAsciiWord(identity) => direct_operation_id_closes(
@@ -4027,9 +4166,25 @@ fn direct_details_close_cache(
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
+            AggregateExecutionDetails::PackedFiniteLiteral {
+                operation_identity, ..
+            },
+        ) => {
+            packed_finite_identity_closes_native(identity)
+                && identity.packed_operation_identity == Some(*operation_identity)
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.operation,
+                    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+                    Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::FiniteLiteral(identity),
             AggregateExecutionDetails::FiniteLiteral { .. },
         ) => {
             identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none()
                 && direct_operation_id_closes(
                     cache.operation,
                     identity.operation,
@@ -4042,6 +4197,7 @@ fn direct_details_close_cache(
             AggregateExecutionDetails::SparseFiniteLiteral { .. },
         ) => {
             identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                && identity.packed_operation_identity.is_none()
                 && direct_operation_id_closes(
                     cache.operation,
                     identity.operation,
@@ -5064,6 +5220,14 @@ pub enum AggregateBuildError {
         /// construction failure.
         composite: AggregateFixedAbsoluteDomainResidualBuildAttemptReceipt,
     },
+    /// Bounded packed finite-literal construction failed after selection.
+    /// Only caller-selected resource ceilings may fall through to the dense
+    /// finite representation.
+    PackedFiniteLiteralBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: PackedOrderedLiteralAggregateBuildError,
+    },
     /// Reversed finite-language DFA construction failed after selection.
     FiniteLiteralBuild {
         operation: AggregateOperation,
@@ -5310,6 +5474,11 @@ impl AggregateBuildError {
                 selection,
                 ..
             }
+            | Self::PackedFiniteLiteralBuild {
+                operation,
+                selection,
+                ..
+            }
             | Self::SparseFiniteLiteralBuild {
                 operation,
                 selection,
@@ -5417,9 +5586,13 @@ impl AggregateBuildError {
                     stage,
                     AggregateConstructionStage::SparseFiniteRoot
                         | AggregateConstructionStage::GeneralFiniteExtraction
+                        | AggregateConstructionStage::PackedFinite
                         | AggregateConstructionStage::DenseFinite
                         | AggregateConstructionStage::FixedPredicateWord64
                 )
+            }
+            Self::PackedFiniteLiteralBuild { .. } => {
+                stage == AggregateConstructionStage::PackedFinite
             }
             Self::FiniteLiteralBuild { .. } => stage == AggregateConstructionStage::DenseFinite,
             Self::SparseFiniteLiteralBuild { .. } => {
@@ -5914,6 +6087,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?}/{strategy:?} fixed absolute-domain residual compilation failed: {source}"
             ),
+            Self::PackedFiniteLiteralBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} packed finite-language construction failed: {source}"
+            ),
             Self::FiniteLiteralBuild {
                 operation,
                 selection,
@@ -5988,6 +6169,7 @@ impl std::error::Error for AggregateBuildError {
             Self::FixedAbsoluteDomainBuild { source, .. }
             | Self::FixedAbsoluteDomainResidualGuardBuild { source, .. } => Some(source),
             Self::FixedAbsoluteDomainResidualCompile { source, .. } => Some(source),
+            Self::PackedFiniteLiteralBuild { source, .. } => Some(source),
             Self::FiniteLiteralBuild { source, .. } => Some(source),
             Self::SparseFiniteLiteralBuild { source, .. } => Some(source),
             Self::GuardedAsciiWordBuild { source, .. } => Some(source),
@@ -6180,6 +6362,8 @@ pub enum AggregateExecutionSource {
     /// Unit tag for a scalar residual refusal. The enclosing execution
     /// identity owns its construction provenance and complete receipt.
     FixedAbsoluteDomainResidual,
+    /// Bounded packed finite-literal whole-operation refusal.
+    PackedFiniteLiteral(PackedOrderedLiteralAggregateReduceError),
     /// Shared finite-language DFA whole-operation refusal.
     FiniteLiteral(OrderedLiteralAggregateReduceError),
     /// Sparse shared finite-language automaton whole-operation refusal.
@@ -6217,6 +6401,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::FixedAbsoluteDomainResidual => {
                 f.write_str("fixed absolute-domain residual attempt failed")
             }
+            Self::PackedFiniteLiteral(source) => source.fmt(f),
             Self::FiniteLiteral(source) => source.fmt(f),
             Self::SparseFiniteLiteral(source) => source.fmt(f),
             Self::GuardedAsciiWord(source) => source.fmt(f),
@@ -6249,6 +6434,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::FixedAbsoluteDomain
             | Self::FixedAbsoluteDomainResidual
             | Self::InternalInvariant(_) => None,
+            Self::PackedFiniteLiteral(source) => Some(source),
             Self::FiniteLiteral(source) => Some(source),
             Self::SparseFiniteLiteral(source) => Some(source),
             Self::GuardedAsciiWord(source) => Some(source.as_ref()),
@@ -6275,6 +6461,7 @@ impl AggregateExecutionSource {
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
             Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
             Self::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            Self::PackedFiniteLiteral(_) => Some(AggregateDirectRoute::PackedFiniteLiteral),
             Self::FiniteLiteral(_) => Some(AggregateDirectRoute::DenseFiniteLiteral),
             Self::SparseFiniteLiteral(_) => Some(AggregateDirectRoute::SparseFiniteLiteral),
             Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
@@ -6490,6 +6677,12 @@ pub enum AggregateExecutionDetails {
     /// Fixed absolute-domain guard proof and, when the scalar envelope admits
     /// its residual, the nested continuation certificate/accounting.
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainExecutionDetails),
+    /// Packed finite-language upper bounds and exact operation counters.
+    PackedFiniteLiteral {
+        operation_identity: PackedOrderedLiteralAggregateOperationIdentity,
+        upper_bounds: PackedOrderedLiteralAggregateUpperBounds,
+        actual: PackedOrderedLiteralAggregateActualCounters,
+    },
     /// Finite-language structural upper bounds and exact counters. The build
     /// report and syntax key retain the immutable DFA and language identity.
     FiniteLiteral {
@@ -6531,6 +6724,7 @@ impl AggregateExecutionDetails {
             Self::BoundedContext(_) | Self::BoundedContextSpanSum(_) => {
                 Some(AggregateDirectRoute::BoundedContext)
             }
+            Self::PackedFiniteLiteral { .. } => Some(AggregateDirectRoute::PackedFiniteLiteral),
             Self::FiniteLiteral { .. } => Some(AggregateDirectRoute::DenseFiniteLiteral),
             Self::SparseFiniteLiteral { .. } => Some(AggregateDirectRoute::SparseFiniteLiteral),
             Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
@@ -6913,6 +7107,50 @@ fn finite_build_limit_allows_continuation(source: &OrderedLiteralAggregateBuildE
     )
 }
 
+/// The packed scanner is an optional representation inside the caller's
+/// existing finite-language quota. Its absolute theorem caps remain enforced
+/// independently by the kernel.
+fn packed_finite_build_limits(
+    limits: OrderedLiteralAggregateBuildLimits,
+) -> PackedOrderedLiteralAggregateBuildLimits {
+    PackedOrderedLiteralAggregateBuildLimits {
+        max_patterns: limits.max_patterns,
+        max_pattern_bytes: limits.max_pattern_bytes,
+        max_total_pattern_bytes: limits.max_pattern_bytes,
+        max_identity_bytes: limits.max_identity_bytes,
+        max_build_work: usize::try_from(limits.max_build_work).unwrap_or(usize::MAX),
+        max_build_peak_bytes: limits.max_peak_bytes,
+        max_persistent_bytes: limits.max_persistent_bytes,
+    }
+}
+
+fn packed_finite_build_is_semantic_refusal(
+    source: &PackedOrderedLiteralAggregateBuildError,
+) -> bool {
+    matches!(
+        source,
+        PackedOrderedLiteralAggregateBuildError::EmptyPatternSet
+            | PackedOrderedLiteralAggregateBuildError::EmptyPattern { .. }
+            | PackedOrderedLiteralAggregateBuildError::ProofRefused { .. }
+            | PackedOrderedLiteralAggregateBuildError::UnsupportedTargetOrShape
+    )
+}
+
+fn packed_finite_build_limit_allows_dense(
+    source: &PackedOrderedLiteralAggregateBuildError,
+) -> bool {
+    matches!(
+        source,
+        PackedOrderedLiteralAggregateBuildError::PatternLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::TotalPatternBytesLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::IdentityLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::WorkLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::BuildPeakLimit { .. }
+            | PackedOrderedLiteralAggregateBuildError::PersistentLimit { .. }
+    )
+}
+
 /// Sparse construction reuses the existing finite-language quota envelope.
 /// A sparse edge is one packed `u32` cell, so the frozen dense-cell ceiling is
 /// also a conservative sparse-edge ceiling; no quota is introduced or raised.
@@ -7044,6 +7282,20 @@ fn sparse_finite_reduce_limits(
         max_reducer_steps: limits.max_reducer_steps,
         max_ring_initializations: limits.max_ring_initializations,
         max_total_work: total_work,
+        max_scratch_bytes: limits.max_scratch_bytes,
+        max_peak_bytes: limits.max_peak_bytes,
+    }
+}
+
+fn packed_finite_reduce_limits(
+    limits: OrderedLiteralAggregateReduceLimits,
+) -> PackedOrderedLiteralAggregateReduceLimits {
+    PackedOrderedLiteralAggregateReduceLimits {
+        max_work: u64::try_from(limits.max_total_work).unwrap_or(u64::MAX),
+        max_match_events: limits.max_match_events,
+        max_count: limits.max_count,
+        max_span_sum: limits.max_span_sum,
+        max_reducer_steps: limits.max_reducer_steps,
         max_scratch_bytes: limits.max_scratch_bytes,
         max_peak_bytes: limits.max_peak_bytes,
     }
@@ -11424,6 +11676,7 @@ impl AggregateBuilder {
                                     },
                                     algorithm: SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
                                     operation: operation_id,
+                                    packed_operation_identity: None,
                                 },
                             ),
                             sealed_bounded_separated_fields_identity: None,
@@ -11870,7 +12123,7 @@ impl AggregateBuilder {
                 None
             }
         };
-        let finite_words = match finite_words_candidate {
+        let (finite_words, finite_boundary_work) = match finite_words_candidate {
             Some(words) if unicode => {
                 let boundary_work = unicode_finite_boundary_prospective(&words).ok_or(
                     AggregateBuildError::InternalInvariant {
@@ -11904,34 +12157,244 @@ impl AggregateBuilder {
                 }
                 finite_planner_work = needed;
                 if unicode_finite_words_preserve_scalar_boundaries(&words) {
-                    Some(words)
+                    (Some(words), boundary_work)
                 } else {
                     record_construction_ineligible(
                         construction,
-                        AggregateConstructionStage::DenseFinite,
+                        AggregateConstructionStage::PackedFinite,
                         boundary_work,
                     );
-                    None
+                    record_construction_policy_skip(
+                        construction,
+                        AggregateConstructionStage::DenseFinite,
+                    );
+                    (None, 0)
                 }
             }
-            words => words,
+            words => (words, 0),
         };
+        if finite_words.is_none()
+            && construction.transaction.expected_stage()
+                == Some(AggregateConstructionStage::PackedFinite)
+        {
+            record_construction_policy_skip(construction, AggregateConstructionStage::PackedFinite);
+        }
         if let Some(words) = finite_words {
-            let boundary_work = if unicode {
-                unicode_finite_boundary_prospective(&words).ok_or(
-                    AggregateBuildError::InternalInvariant {
+            let packed_limits = packed_finite_build_limits(limits.finite_literal);
+            let packed_build = match operation {
+                AggregateOperation::Compile | AggregateOperation::Count => {
+                    PackedOrderedLiteralCountPlan::build_attempt_with_dispatch(
+                        simd_dispatch,
+                        &words,
+                        packed_limits,
+                    )
+                    .map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let packed_operation_identity =
+                            engine.cache_identity().operation_identity();
+                        (
+                            AggregateEngine::PackedFiniteCount(engine),
+                            build,
+                            PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+                            packed_operation_identity,
+                            receipt.actual(),
+                        )
+                    })
+                }
+                AggregateOperation::SpanSum => {
+                    PackedOrderedLiteralSpanSumPlan::build_attempt_with_dispatch(
+                        simd_dispatch,
+                        &words,
+                        packed_limits,
+                    )
+                    .map(|attempt| {
+                        debug_assert!(attempt.closes());
+                        let (engine, receipt) = attempt.into_parts();
+                        let build = engine.build_accounting();
+                        let packed_operation_identity =
+                            engine.cache_identity().operation_identity();
+                        (
+                            AggregateEngine::PackedFiniteSpanSum(engine),
+                            build,
+                            PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+                            packed_operation_identity,
+                            receipt.actual(),
+                        )
+                    })
+                }
+                AggregateOperation::Spans => {
+                    return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        detail: "Unicode finite boundary work overflow",
-                    },
-                )?
-            } else {
-                0
+                        detail: "span materialization selected packed finite reducer",
+                    });
+                }
             };
+            match packed_build {
+                Ok((engine, build, operation_id, packed_operation_identity, build_actual)) => {
+                    let mut build_effect = include_construction_work(
+                        packed_finite_build_effect(build_actual),
+                        finite_boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "packed finite boundary/build effect overflow",
+                    })?;
+                    select_construction_stage(
+                        construction,
+                        AggregateConstructionStage::PackedFinite,
+                        build_effect,
+                    );
+                    build_effect.released_persistent_bytes = general_finite_completed_effect
+                        .unwrap_or_default()
+                        .retained_persistent_bytes;
+                    construction.pending_terminal_effect = build_effect;
+                    let effect = include_selected_plan_owner_effect(build_effect).ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "packed finite publication effect overflow",
+                        },
+                    )?;
+                    construction.selected_success_effect = Some(effect);
+                    let capture_erasure_work = expected_captures.checked_mul(2).ok_or(
+                        AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "packed finite capture-erasure accounting overflow",
+                        },
+                    )?;
+                    let report = AggregateBuildReport {
+                        schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                        construction_attempt: AggregateClosureEvidence::empty(),
+                        published_artifact_owner: AggregateClosureEvidence::empty(),
+                        syntax_attempt: AggregateClosureEvidence::empty(),
+                        syntax_key,
+                        admission,
+                        syntax,
+                        operation,
+                        selection,
+                        requested_strategy: strategy,
+                        build_limits: limits,
+                        plan: AggregatePlanKind::PackedFiniteLiteral,
+                        continuation_strategy: None,
+                        capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                        planner_work,
+                        unicode_scalar_planner_work,
+                        word_run_planner_work,
+                        literal_assertions_planner_work,
+                        blocking_delimiter_planner_work,
+                        token_phrase_planner_work,
+                        fixed_class_sandwich_planner_work,
+                        bounded_affix_planner_work,
+                        grapheme_scalar_dfa_planner_work,
+                        bounded_class_sequence_planner_work,
+                        bounded_separated_fields_planner_work,
+                        prefix_class_alternation_planner_work,
+                        literal_class_run_literal_planner_work,
+                        bounded_literal_pair_planner_work,
+                        bounded_context_planner_work,
+                        fixed_absolute_planner_work,
+                        finite_planner_work,
+                        capture_erasure_work,
+                        captures_erased: expected_captures,
+                        build: AggregateBuildAccounting::PackedFiniteLiteral(build),
+                        plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                            AggregateFiniteLiteralIdentity {
+                                semantics: if unicode {
+                                    AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+                                } else {
+                                    AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+                                },
+                                algorithm: PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                                operation: operation_id,
+                                packed_operation_identity: Some(packed_operation_identity),
+                            },
+                        ),
+                        sealed_bounded_separated_fields_identity: None,
+                        sealed_required_internal_anchor_identity: None,
+                        sealed_url_aggregate_identity: None,
+                        retained_capacity_bytes: build.persistent_bytes,
+                    };
+                    return Ok(AggregatePlan {
+                        engine,
+                        minimum_match_bytes,
+                        limits,
+                        report,
+                    });
+                }
+                Err(error) if packed_finite_build_is_semantic_refusal(error.source()) => {
+                    let effect = include_construction_work(
+                        packed_finite_build_effect(error.receipt().actual()),
+                        finite_boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "packed finite semantic-refusal effect overflow",
+                    })?;
+                    if let Err(error) = construction.transaction.record_semantic_ineligible(
+                        AggregateConstructionStage::PackedFinite,
+                        effect,
+                    ) {
+                        unreachable!(
+                            "packed finite semantic refusal violated construction order: {error:?}"
+                        );
+                    }
+                }
+                Err(error) if packed_finite_build_limit_allows_dense(error.source()) => {
+                    let effect = include_construction_work(
+                        packed_finite_build_effect(error.receipt().actual()),
+                        finite_boundary_work,
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "packed finite resource-refusal effect overflow",
+                    })?;
+                    select_construction_stage(
+                        construction,
+                        AggregateConstructionStage::PackedFinite,
+                        effect,
+                    );
+                    resolve_construction_soft_refusal_with_abandonment(
+                        construction,
+                        effect,
+                        packed_finite_abandonment(effect),
+                        AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite,
+                    );
+                }
+                Err(error) => {
+                    let effect = packed_finite_terminal_effect(
+                        error.receipt().actual(),
+                        finite_boundary_work,
+                        general_finite_completed_effect.unwrap_or_default(),
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "packed finite terminal effect overflow",
+                    })?;
+                    select_construction_stage(
+                        construction,
+                        AggregateConstructionStage::PackedFinite,
+                        effect,
+                    );
+                    construction.pending_terminal_effect = effect;
+                    return Err(AggregateBuildError::PackedFiniteLiteralBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    });
+                }
+            }
             select_construction_stage(
                 construction,
                 AggregateConstructionStage::DenseFinite,
-                construction_work_effect(boundary_work),
+                AggregateConstructionEffect::default(),
             );
             let capture_erasure_work =
                 expected_captures
@@ -11982,15 +12445,13 @@ impl AggregateBuilder {
             };
             match finite_build {
                 Ok((engine, build, operation_id, build_actual)) => {
-                    let mut build_effect = include_construction_work(
-                        ordered_finite_build_effect(build_actual),
-                        boundary_work,
-                    )
-                    .ok_or(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "dense finite boundary/build effect overflow",
-                    })?;
+                    let mut build_effect =
+                        include_construction_work(ordered_finite_build_effect(build_actual), 0)
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "dense finite boundary/build effect overflow",
+                            })?;
                     build_effect.released_persistent_bytes = general_finite_completed_effect
                         .unwrap_or_default()
                         .retained_persistent_bytes;
@@ -12047,6 +12508,7 @@ impl AggregateBuilder {
                                 },
                                 algorithm: ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
                                 operation: operation_id,
+                                packed_operation_identity: None,
                             },
                         ),
                         sealed_bounded_separated_fields_identity: None,
@@ -12064,15 +12526,13 @@ impl AggregateBuilder {
                 Err(error) if finite_build_limit_allows_continuation(error.source()) => {
                     let prior = general_finite_completed_effect.unwrap_or_default();
                     let build_actual = error.receipt().actual();
-                    let mut effect = include_construction_work(
-                        ordered_finite_build_effect(build_actual),
-                        boundary_work,
-                    )
-                    .ok_or(AggregateBuildError::InternalInvariant {
-                        operation,
-                        selection,
-                        detail: "dense finite refusal boundary/build effect overflow",
-                    })?;
+                    let mut effect =
+                        include_construction_work(ordered_finite_build_effect(build_actual), 0)
+                            .ok_or(AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "dense finite refusal boundary/build effect overflow",
+                            })?;
                     effect.released_persistent_bytes = prior.retained_persistent_bytes;
                     let abandonment = dense_finite_abandonment(prior, effect).ok_or(
                         AggregateBuildError::InternalInvariant {
@@ -12097,7 +12557,7 @@ impl AggregateBuilder {
                 Err(error) => {
                     let mut effect = include_construction_work(
                         ordered_finite_build_effect(error.receipt().actual()),
-                        boundary_work,
+                        0,
                     )
                     .ok_or(AggregateBuildError::InternalInvariant {
                         operation,
@@ -12598,6 +13058,8 @@ enum AggregateEngine {
     BoundedLiteralPair(BoundedLiteralPairPlan),
     BoundedContext(BoundedContextPlan),
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainEngine),
+    PackedFiniteCount(PackedOrderedLiteralCountPlan),
+    PackedFiniteSpanSum(PackedOrderedLiteralSpanSumPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
@@ -12731,6 +13193,9 @@ impl AggregatePlan {
                 Some(AggregateDirectRoute::BoundedLiteralPair)
             }
             AggregateEngine::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
+            AggregateEngine::PackedFiniteCount(_) | AggregateEngine::PackedFiniteSpanSum(_) => {
+                Some(AggregateDirectRoute::PackedFiniteLiteral)
+            }
             AggregateEngine::FiniteCount(_) | AggregateEngine::FiniteSpanSum(_) => {
                 Some(AggregateDirectRoute::DenseFiniteLiteral)
             }
@@ -13942,6 +14407,27 @@ impl AggregatePlan {
                     }
                 }
             }
+            AggregateEngine::PackedFiniteCount(engine) => engine
+                .count(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| AggregateCountExecution::PackedFiniteLiteral {
+                    value: result.count,
+                    operation_identity: result.accounting.identity.operation_identity(),
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::PackedFiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a packed finite span-sum plan",
+                ),
+            )),
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| AggregateCountExecution::FiniteLiteral {
@@ -14225,6 +14711,27 @@ impl AggregatePlan {
                         )
                     })
             }
+            AggregateEngine::PackedFiniteSpanSum(engine) => engine
+                .span_sum(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| AggregateSpanSumExecution::PackedFiniteLiteral {
+                    value: result.span_sum,
+                    operation_identity: result.accounting.identity.operation_identity(),
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::PackedFiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a packed finite count plan",
+                ),
+            )),
             AggregateEngine::FiniteSpanSum(engine) => engine
                 .span_sum(haystack, limits.finite_literal)
                 .map(|result| AggregateSpanSumExecution::FiniteLiteral {
@@ -14642,6 +15149,22 @@ impl AggregatePlan {
                     "fixed-domain count value route escaped its specialized branch",
                 ),
             )),
+            AggregateEngine::PackedFiniteCount(engine) => engine
+                .count(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::PackedFiniteSpanSum(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "count operation retained a packed finite span-sum plan",
+                ),
+            )),
             AggregateEngine::FiniteCount(engine) => engine
                 .count(haystack, limits.finite_literal)
                 .map(|result| result.count)
@@ -14969,6 +15492,22 @@ impl AggregatePlan {
                         )
                     })
             }
+            AggregateEngine::PackedFiniteSpanSum(engine) => engine
+                .span_sum(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
+            AggregateEngine::PackedFiniteCount(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum operation retained a packed finite count plan",
+                ),
+            )),
             AggregateEngine::FiniteSpanSum(engine) => engine
                 .span_sum(haystack, limits.finite_literal)
                 .map(|result| result.span_sum)
@@ -15143,6 +15682,12 @@ enum AggregateCountExecution {
         admitted: AdmittedCountAttempt,
         composite: AggregateFixedAbsoluteDomainResidualReceipt,
     },
+    PackedFiniteLiteral {
+        value: u64,
+        operation_identity: PackedOrderedLiteralAggregateOperationIdentity,
+        upper_bounds: PackedOrderedLiteralAggregateUpperBounds,
+        actual: PackedOrderedLiteralAggregateActualCounters,
+    },
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -15181,6 +15726,7 @@ impl AggregateCountExecution {
                 *value
             }
             Self::ExactLiteral { value, .. }
+            | Self::PackedFiniteLiteral { value, .. }
             | Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -15246,6 +15792,16 @@ impl AggregateCountExecution {
                     },
                 },
             ),
+            Self::PackedFiniteLiteral {
+                operation_identity,
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::PackedFiniteLiteral {
+                operation_identity,
+                upper_bounds,
+                actual,
+            },
             Self::FiniteLiteral {
                 upper_bounds,
                 actual,
@@ -15299,6 +15855,12 @@ enum AggregateSpanSumExecution {
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
     BoundedLiteralPair(BoundedLiteralPairSpanSumResult),
     BoundedContext(BoundedContextSpanSumResult),
+    PackedFiniteLiteral {
+        value: u64,
+        operation_identity: PackedOrderedLiteralAggregateOperationIdentity,
+        upper_bounds: PackedOrderedLiteralAggregateUpperBounds,
+        actual: PackedOrderedLiteralAggregateActualCounters,
+    },
     FiniteLiteral {
         value: u64,
         upper_bounds: OrderedLiteralAggregateUpperBounds,
@@ -15333,6 +15895,7 @@ impl AggregateSpanSumExecution {
             Self::GuardedAsciiWord(result) => result.span_sum,
             Self::FixedPredicateWord64(result) => result.span_sum,
             Self::ExactLiteral { value, .. }
+            | Self::PackedFiniteLiteral { value, .. }
             | Self::FiniteLiteral { value, .. }
             | Self::SparseFiniteLiteral { value, .. }
             | Self::Continuation { value, .. } => *value,
@@ -15370,6 +15933,16 @@ impl AggregateSpanSumExecution {
             Self::BoundedContext(result) => {
                 AggregateExecutionDetails::BoundedContextSpanSum(result.accounting)
             }
+            Self::PackedFiniteLiteral {
+                operation_identity,
+                upper_bounds,
+                actual,
+                ..
+            } => AggregateExecutionDetails::PackedFiniteLiteral {
+                operation_identity,
+                upper_bounds,
+                actual,
+            },
             Self::FiniteLiteral {
                 upper_bounds,
                 actual,
@@ -17936,9 +18509,9 @@ mod tests {
     fn bounded_context_span_sum_keeps_private_execution_envelopes_fixed() {
         assert_eq!(
             core::mem::size_of::<super::AggregateSpanSumExecution>(),
-            2_392
+            2_400
         );
-        assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 728);
+        assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 736);
         assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
     }
 
@@ -18595,6 +19168,41 @@ mod tests {
     }
 
     #[test]
+    fn packed_hard_terminal_releases_finite_extraction_owner() {
+        let prior = AggregateConstructionEffect {
+            work: 11,
+            allocations: 2,
+            allocated_bytes: 100,
+            copied_bytes: 40,
+            initialized_bytes: 60,
+            retained_persistent_bytes: 47,
+            released_persistent_bytes: 0,
+            co_live_bytes: 60,
+        };
+        let effect = super::packed_finite_terminal_effect(
+            super::PackedOrderedLiteralAggregateBuildAttemptActual {
+                work: 7,
+                allocations: 1,
+                allocated_bytes: 80,
+                copied_bytes: 30,
+                initialized_bytes: 50,
+                live_persistent_bytes: 13,
+                live_scratch_bytes: 0,
+                peak_bytes: 80,
+            },
+            3,
+            prior,
+        )
+        .unwrap();
+        assert_eq!(effect.work, 10);
+        assert_eq!(effect.retained_persistent_bytes, 13);
+        assert_eq!(effect.released_persistent_bytes, 47);
+        let terminal = super::hard_terminal_effect(effect);
+        assert_eq!(terminal.retained_persistent_bytes, 0);
+        assert_eq!(terminal.released_persistent_bytes, 47);
+    }
+
+    #[test]
     fn unicode_scalar_inspection_overflow_leaves_counter_unchanged() {
         let mut work = usize::MAX;
         assert!(matches!(
@@ -18667,11 +19275,214 @@ mod tests {
     }
 
     #[test]
+    fn packed_finite_classifies_shape_resource_and_hard_failures() {
+        for semantic in [
+            super::PackedOrderedLiteralAggregateBuildError::EmptyPatternSet,
+            super::PackedOrderedLiteralAggregateBuildError::EmptyPattern { index: 0 },
+            super::PackedOrderedLiteralAggregateBuildError::ProofRefused {
+                fact: "test",
+                needed: 17,
+                certified_limit: 16,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::UnsupportedTargetOrShape,
+        ] {
+            assert!(super::packed_finite_build_is_semantic_refusal(&semantic));
+            assert!(!super::packed_finite_build_limit_allows_dense(&semantic));
+        }
+
+        for resource in [
+            super::PackedOrderedLiteralAggregateBuildError::PatternLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::PatternBytesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::TotalPatternBytesLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::IdentityLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::WorkLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::BuildPeakLimit {
+                needed: 2,
+                limit: 1,
+            },
+            super::PackedOrderedLiteralAggregateBuildError::PersistentLimit {
+                needed: 2,
+                limit: 1,
+            },
+        ] {
+            assert!(super::packed_finite_build_limit_allows_dense(&resource));
+            assert!(!super::packed_finite_build_is_semantic_refusal(&resource));
+        }
+
+        for hard in [
+            super::PackedOrderedLiteralAggregateBuildError::AllocationFailed { additional: 1 },
+            super::PackedOrderedLiteralAggregateBuildError::ArithmeticOverflow {
+                computation: "test",
+            },
+        ] {
+            assert!(!super::packed_finite_build_is_semantic_refusal(&hard));
+            assert!(!super::packed_finite_build_limit_allows_dense(&hard));
+        }
+    }
+
+    #[test]
+    fn small_finite_languages_publish_packed_count_and_span_routes() {
+        std::thread::Builder::new()
+            .name("aggregate-packed-finite-route-matrix".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(small_finite_languages_publish_packed_count_and_span_routes_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn small_finite_languages_publish_packed_count_and_span_routes_body() {
+        let count = AggregateBuilder::new("Sherlock|Street")
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        let span = AggregateBuilder::new("Sherlock|Street")
+            .unicode(false)
+            .build_span_sum()
+            .unwrap();
+        for report in [count.build_report(), span.build_report()] {
+            assert!(report.has_closed_construction_attempt());
+            assert_eq!(report.plan, super::AggregatePlanKind::PackedFiniteLiteral);
+            assert!(matches!(
+                report.build,
+                super::AggregateBuildAccounting::PackedFiniteLiteral(_)
+            ));
+            let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity else {
+                panic!("expected packed finite identity");
+            };
+            assert_eq!(
+                identity.algorithm,
+                super::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+            );
+            let native = identity
+                .packed_operation_identity
+                .expect("packed plan must retain its native classifier identity");
+            assert_eq!(native.algorithm_id, identity.algorithm);
+            assert_eq!(native.plan_id, identity.operation);
+            assert_eq!(
+                identity.semantics,
+                super::AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
+            );
+        }
+        let haystack = b"Sherlock Street SherlockStreet";
+        let count_result = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        let span_result = span
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(count_result.value(), 4);
+        assert_eq!(span_result.value(), 28);
+        assert!(count_result.report().has_closed_direct_attempt());
+        assert!(span_result.report().has_closed_direct_attempt());
+        assert!(matches!(
+            count_result.report().details(),
+            AggregateExecutionDetails::PackedFiniteLiteral { .. }
+        ));
+        assert!(matches!(
+            span_result.report().details(),
+            AggregateExecutionDetails::PackedFiniteLiteral { .. }
+        ));
+        let span_operation_identity = match span_result.report().details() {
+            AggregateExecutionDetails::PackedFiniteLiteral {
+                operation_identity, ..
+            } => *operation_identity,
+            _ => unreachable!("packed span report changed detail family"),
+        };
+        let mut identity_splice = count_result.report().clone();
+        let AggregateExecutionDetails::PackedFiniteLiteral {
+            operation_identity, ..
+        } = &mut identity_splice.details
+        else {
+            unreachable!("packed count report changed detail family");
+        };
+        *operation_identity = span_operation_identity;
+        assert!(!identity_splice.has_closed_direct_attempt());
+
+        let unicode = AggregateBuilder::new("∞|✓").build_count().unwrap();
+        assert!(unicode.build_report().has_closed_construction_attempt());
+        assert_eq!(
+            unicode.build_report().plan,
+            super::AggregatePlanKind::PackedFiniteLiteral
+        );
+        let AggregatePlanIdentity::FiniteLiteral(identity) = unicode.build_report().plan_identity
+        else {
+            panic!("expected Unicode packed finite identity");
+        };
+        assert_eq!(
+            identity.semantics,
+            super::AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+        );
+        assert!(identity.packed_operation_identity.is_some());
+        assert_eq!(
+            unicode
+                .count_value("∞x✓∞".as_bytes(), AggregateRunLimits::default())
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn packed_absolute_width_refusal_falls_through_to_closed_dense_route() {
+        let count = AggregateBuilder::new("a|bc")
+            .unicode(false)
+            .build_count()
+            .unwrap();
+        let report = count.build_report();
+        assert!(report.has_closed_construction_attempt());
+        assert_eq!(report.plan, super::AggregatePlanKind::FiniteLiteralDfa);
+        assert!(matches!(
+            report.build,
+            super::AggregateBuildAccounting::FiniteLiteral(_)
+        ));
+        let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity else {
+            panic!("expected dense finite identity");
+        };
+        assert!(identity.packed_operation_identity.is_none());
+        assert!(matches!(
+            count.0.engine,
+            super::AggregateEngine::FiniteCount(_)
+        ));
+        assert_eq!(
+            count
+                .count_value(b"abcaba", AggregateRunLimits::default())
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn exact_success_receipts_reject_same_length_splices_and_all_build_mutations() {
+        std::thread::Builder::new()
+            .name("aggregate-exact-success-mutation-matrix".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(exact_success_receipts_reject_same_length_splices_and_all_build_mutations_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[allow(
+        clippy::arithmetic_side_effects,
         clippy::too_many_lines,
         reason = "one mutation matrix keeps receipt-only splices and every sealed construction field adjacent"
     )]
-    fn exact_success_receipts_reject_same_length_splices_and_all_build_mutations() {
+    fn exact_success_receipts_reject_same_length_splices_and_all_build_mutations_body() {
         let limits = AggregateRunLimits::default();
         let haystack = b"zzzzzzzzzzzz";
         let first_regex = AggregateBuilder::new("needle")
@@ -18805,11 +19616,22 @@ mod tests {
     }
 
     #[test]
+    fn exact_terminal_receipts_reject_splices_and_every_construction_mutation() {
+        std::thread::Builder::new()
+            .name("aggregate-exact-terminal-mutation-matrix".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(exact_terminal_receipts_reject_splices_and_every_construction_mutation_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[allow(
+        clippy::arithmetic_side_effects,
         clippy::too_many_lines,
         reason = "one mutation matrix keeps terminal source/receipt/provenance forgeries adjacent"
     )]
-    fn exact_terminal_receipts_reject_splices_and_every_construction_mutation() {
+    fn exact_terminal_receipts_reject_splices_and_every_construction_mutation_body() {
         let mut limits = AggregateRunLimits::default();
         limits.exact_literal.max_linear_terms = 0;
         let haystack = b"zzzzzzzzzzzz";
