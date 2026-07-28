@@ -84,8 +84,8 @@ every P2b value reports runtime authority `Absent`, and this source contains
 no ABI2 runtime adopter, authority row, mapped callable, or completed
 post-link observation. The qualification-private safe binding compares its
 embedded literal with one portable plan when the plan-bound session is
-created; repeated preflighted calls use plan identity rather than re-comparing
-the 16 literal bytes.
+created; repeated preflighted calls use the private compile-identity key and
+plan identity rather than re-comparing the 16 literal bytes.
 
 The retained Count-v2 and Search V1 Span adoption paths are separate
 contracts. Their features, registries, or linked symbols cannot authorize the

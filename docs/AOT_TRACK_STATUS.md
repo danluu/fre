@@ -110,7 +110,8 @@ This is the AOT half of the same native-image architecture as JIT, not a second
 optimizer: JIT publishes the sealed image under strict W^X, while P2b stops
 after deterministic packaging and diagnostic receipts. The generated
 qualification-private binding compares its embedded literal with the portable
-plan once, then uses plan identity for repeated scalar-preflighted hot calls.
+plan once, then uses its private compile-identity key and plan identity for
+repeated scalar-preflighted hot calls.
 
 ## Retained inert Search V1 slice
 

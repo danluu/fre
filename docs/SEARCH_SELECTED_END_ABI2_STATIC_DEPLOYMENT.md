@@ -25,8 +25,10 @@ The reusable qualification-private source candidate is split deliberately:
   preflight, and strict `x0` end-or-zero decoding. The generated binding
   compares its embedded 16-byte literal with the portable `LiteralPlan` once
   while creating a plan-bound session; repeated hot calls then authenticate
-  the private preflight token with plan identity. Equal bytes owned by another
-  plan are still rejected. Successful session creation admits Arm
+  the private preflight token with both a private compile-identity key and plan
+  identity. Equal bytes owned by another plan, or a plan session bound by
+  another generated module, are still rejected. Successful session creation
+  admits Arm
   `0x41/0xd84` with ASIMD+SVE+SVE2 and observes the calling thread's SVE vector
   length once, requiring 16 bytes. Calls inside the session perform no VL
   query and no literal-byte comparison.

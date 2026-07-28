@@ -81,8 +81,8 @@ pub use search_linked::{
 #[cfg(feature = "selected-end-qualification-private-v2")]
 #[doc(hidden)]
 pub use selected_end_direct_v2::{
-    StaticSearchSelectedEndCallErrorV2, StaticSearchSelectedEndPlanSessionV2,
-    StaticSearchSelectedEndPreparedCallV2, StaticSearchSelectedEndProductionAuthorityV2,
-    StaticSearchSelectedEndQualificationV2, StaticSearchSelectedEndThreadContractErrorV2,
-    StaticSearchSelectedEndThreadSessionV2,
+    StaticSearchSelectedEndBindingKeyV2, StaticSearchSelectedEndCallErrorV2,
+    StaticSearchSelectedEndPlanSessionV2, StaticSearchSelectedEndPreparedCallV2,
+    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndQualificationV2,
+    StaticSearchSelectedEndThreadContractErrorV2, StaticSearchSelectedEndThreadSessionV2,
 };
