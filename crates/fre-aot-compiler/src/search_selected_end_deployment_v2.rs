@@ -653,7 +653,7 @@ fn render_rust_binding(
     .map_err(|_| LinuxSelectedEndQualificationDeploymentErrorV2::Render)?;
     writeln!(
         output,
-        "\n#[inline]\npub(super) fn bind_exact_linked_aot_selected_end_plan_v2<'owner, 'plan>(\n    session: fre_aot_static_runtime::StaticSearchSelectedEndThreadSessionV2<'owner>,\n    plan: &'plan fre_kernels::LiteralPlan,\n) -> Result<\n    ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>,\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    Ok(ExactLinkedAotSelectedEndPlanSessionV2 {{\n        inner: session.bind_literal_plan_owned(plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?,\n    }})\n}}"
+        "\n#[inline]\nfn bind_exact_linked_aot_selected_end_production_plan_v2<'owner, 'plan>(\n    session: fre_aot_static_runtime::StaticSearchSelectedEndProductionThreadSessionV2<'owner>,\n    plan: &'plan fre_kernels::LiteralPlan,\n) -> Result<\n    ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>,\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    Ok(ExactLinkedAotSelectedEndPlanSessionV2 {{\n        inner: session.bind_compiler_generated_literal_plan_owned(\n            plan,\n            &EXACT_LITERAL,\n            &EXACT_PLAN_BINDING_KEY,\n            &COMPILE_IDENTITY,\n        )?,\n    }})\n}}\n\n/// Qualification-private bind kept separate from production authority.\n/// Safe construction of its input token requires the static runtime's\n/// default-off qualification feature.\n#[inline]\npub(super) fn bind_exact_linked_aot_selected_end_qualification_plan_v2<'owner, 'plan>(\n    session: fre_aot_static_runtime::StaticSearchSelectedEndQualificationThreadSessionV2<'owner>,\n    plan: &'plan fre_kernels::LiteralPlan,\n) -> Result<\n    ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>,\n    fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2,\n> {{\n    Ok(ExactLinkedAotSelectedEndPlanSessionV2 {{\n        inner: session.bind_literal_plan_owned(plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?,\n    }})\n}}"
     )
     .map_err(|_| LinuxSelectedEndQualificationDeploymentErrorV2::Render)?;
     write_call(
@@ -869,7 +869,7 @@ impl<'plan> ExactLinkedAotSelectedEndFacadeV2<'plan> {
         ExactLinkedAotSelectedEndSessionErrorV2,
     > {
         let thread = self.production.begin_current_thread_session()?;
-        bind_exact_linked_aot_selected_end_plan_v2(thread, self.plan)
+        bind_exact_linked_aot_selected_end_production_plan_v2(thread, self.plan)
             .map_err(ExactLinkedAotSelectedEndSessionErrorV2::Binding)
     }
 }
@@ -1168,6 +1168,26 @@ mod tests {
         assert!(source.contains(
             "inner: session.bind_literal_plan_owned(plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
         ));
+        assert!(source.contains(
+            "\nfn bind_exact_linked_aot_selected_end_production_plan_v2<'owner, 'plan>("
+        ));
+        assert!(
+            !source.contains("pub(super) fn bind_exact_linked_aot_selected_end_production_plan_v2")
+        );
+        assert!(!source.contains("pub fn bind_exact_linked_aot_selected_end_production_plan_v2"));
+        assert!(source.contains(
+            "session: fre_aot_static_runtime::StaticSearchSelectedEndProductionThreadSessionV2<'owner>"
+        ));
+        assert!(source.contains("inner: session.bind_compiler_generated_literal_plan_owned("));
+        assert!(source.contains("&EXACT_PLAN_BINDING_KEY,\n            &COMPILE_IDENTITY,"));
+        assert!(source.contains(
+            "pub(super) fn bind_exact_linked_aot_selected_end_qualification_plan_v2<'owner, 'plan>("
+        ));
+        assert!(source.contains(
+            "session: fre_aot_static_runtime::StaticSearchSelectedEndQualificationThreadSessionV2<'owner>"
+        ));
+        assert!(!source.contains("pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"));
+        assert!(!source.contains("StaticSearchSelectedEndThreadSessionV2"));
         assert!(
             source.contains("pub struct ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>")
         );
@@ -1226,6 +1246,14 @@ mod tests {
         assert!(source.contains("StaticSearchSelectedEndAdoptionV2::Fallback(status)"));
         assert!(source.contains("ExactLinkedAotSelectedEndAdoptionV2::PortableFallback("));
         assert!(source.contains("let thread = self.production.begin_current_thread_session()?;"));
+        assert!(
+            source.contains(
+                "bind_exact_linked_aot_selected_end_production_plan_v2(thread, self.plan)"
+            )
+        );
+        assert!(!source.contains(
+            "bind_exact_linked_aot_selected_end_qualification_plan_v2(thread, self.plan)"
+        ));
         assert!(!source.contains("from_address"));
         assert!(!source.contains("from_symbol"));
         assert!(!source.contains("set_authority"));

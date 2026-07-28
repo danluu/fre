@@ -26,6 +26,10 @@ deliberately:
   and the embedded literal. The sole production authority atom is a private
   child module containing a literal, source-reviewed table. That table is
   empty and compile-time constrained to remain empty in this source revision.
+  Its const canonicality gate rejects every zero identity, a zero payload
+  extent, unsorted or duplicate compile identities, and over-capacity tables
+  before any future reviewed row can grant authority. The exact 16-byte literal
+  remains unrestricted binary data and is matched byte-for-byte.
   Empty authority returns typed `ProductionAuthorityAbsent` plus
   `Candidate`; a nonmatching artifact in a future nonempty table returns typed
   `ArtifactUnqualified`. The generated seam turns either status into an
@@ -35,14 +39,19 @@ deliberately:
 - The generated module owns the safe public facade. Its adopter accepts only
   the exact `LiteralPlan`; it accepts no address, function pointer, symbol,
   selector, callback, or authority setter. A production match yields only an
-  opaque owner. That owner must admit the current thread and then pass through
-  the generated module's private exact-plan bind to construct its public but
-  field-private nominal session. Thus a future row cannot bypass the
-  identity-suffixed direct-symbol declaration or mint a nominal session for a
-  different generated artifact.
+  opaque owner. That owner admits the current thread into a distinct production
+  token carrying the matched row's private source-qualified compile identity.
+  The generated module's private production bind compares that identity with
+  both its hardcoded `COMPILE_IDENTITY` and private binding key before literal
+  validation or nominal-session construction. Authority for artifact A
+  therefore cannot enter sibling artifact B, even for equal literal bytes.
+  The qualification owner returns a separate token accepted only by the
+  separately named qualification-private bind. Thus a future row cannot bypass
+  the identity-suffixed direct-symbol declaration or mint a nominal session for
+  a different generated artifact.
 - The shared runtime boundary supplies a neither-`Send`-nor-`Sync`
-  current-thread token, exact-literal scalar preflight, and strict `x0`
-  end-or-zero decoding. The generated binding
+  production and qualification current-thread tokens, exact-literal scalar
+  preflight, and strict `x0` end-or-zero decoding. The generated binding
   compares its embedded 16-byte literal with the portable `LiteralPlan` once,
   records its hardcoded private compile-identity key, and consumes the
   current-thread token into an owning plan-bound session. The generated module

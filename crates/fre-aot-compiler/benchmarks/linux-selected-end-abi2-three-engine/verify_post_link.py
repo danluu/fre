@@ -519,8 +519,12 @@ def validate_deployment(
     nominal_start = source.find(
         "pub struct ExactLinkedAotSelectedEndPlanSessionV2"
     )
-    bind_start = source.find(
-        "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+    production_bind_start = source.find(
+        "fn bind_exact_linked_aot_selected_end_production_plan_v2"
+    )
+    qualification_bind_start = source.find(
+        "pub(super) fn "
+        "bind_exact_linked_aot_selected_end_qualification_plan_v2"
     )
     primary_start = source.find(
         "pub fn search_exact_linked_aot_selected_end_v2"
@@ -533,15 +537,21 @@ def validate_deployment(
         <= key_start
         < claims_start
         < nominal_start
-        < bind_start
+        < production_bind_start
+        < qualification_bind_start
         < primary_start
         < diagnostic_start,
-        "deployment binding key/claims/nominal/bind/primary/diagnostic order changed",
+        "deployment binding key/claims/nominal/production/qualification/primary/diagnostic order changed",
     )
     key_source = source[key_start:claims_start]
     claims_source = source[claims_start:nominal_start]
-    nominal_source = source[nominal_start:bind_start]
-    bind_source = source[bind_start:primary_start]
+    nominal_source = source[nominal_start:production_bind_start]
+    production_bind_source = source[
+        production_bind_start:qualification_bind_start
+    ]
+    qualification_bind_source = source[
+        qualification_bind_start:primary_start
+    ]
     primary_source = source[primary_start:diagnostic_start]
     entry_local = (
         f"exact_linked_aot_selected_end_entry_v2_{compile_identity}"
@@ -624,6 +634,11 @@ def validate_deployment(
         in source
         and "let thread = self.production.begin_current_thread_session()?;"
         in source
+        and (
+            "bind_exact_linked_aot_selected_end_production_plan_v2("
+            "thread, self.plan)"
+        )
+        in source
         and "from_address" not in source
         and "from_symbol" not in source
         and "set_authority" not in source,
@@ -631,26 +646,69 @@ def validate_deployment(
     )
     require(
         (
-            "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+            "fn bind_exact_linked_aot_selected_end_production_plan_v2"
             "<'owner, 'plan>"
         )
-        in bind_source
+        in production_bind_source
         and (
             "session: fre_aot_static_runtime::"
-            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+            "StaticSearchSelectedEndProductionThreadSessionV2<'owner>"
         )
-        in bind_source
+        in production_bind_source
         and (
-            "session: &'session fre_aot_static_runtime::"
-            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+            "inner: session.bind_compiler_generated_literal_plan_owned("
         )
-        not in bind_source
+        in production_bind_source
+        and (
+            "plan,\n"
+            "            &EXACT_LITERAL,\n"
+            "            &EXACT_PLAN_BINDING_KEY,\n"
+            "            &COMPILE_IDENTITY,"
+        )
+        in production_bind_source
+        and "StaticSearchSelectedEndQualificationThreadSessionV2"
+        not in production_bind_source,
+        "deployment production bind is not compile-identity-bound",
+    )
+    require(
+        (
+            "\nfn bind_exact_linked_aot_selected_end_production_plan_v2"
+            "<'owner, 'plan>"
+        )
+        in source
+        and (
+            "pub(super) fn "
+            "bind_exact_linked_aot_selected_end_production_plan_v2"
+        )
+        not in source
+        and (
+            "pub fn bind_exact_linked_aot_selected_end_production_plan_v2"
+        )
+        not in source,
+        "deployment production bind is not module-private",
+    )
+    require(
+        (
+            "pub(super) fn "
+            "bind_exact_linked_aot_selected_end_qualification_plan_v2"
+            "<'owner, 'plan>"
+        )
+        in qualification_bind_source
+        and (
+            "session: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndQualificationThreadSessionV2<'owner>"
+        )
+        in qualification_bind_source
         and (
             "inner: session.bind_literal_plan_owned("
             "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
         )
-        in bind_source,
-        "deployment binding omits its exact consuming plan bind",
+        in qualification_bind_source
+        and "StaticSearchSelectedEndProductionThreadSessionV2"
+        not in qualification_bind_source
+        and "bind_exact_linked_aot_selected_end_plan_v2" not in source
+        and "StaticSearchSelectedEndThreadSessionV2" not in source,
+        "deployment qualification bind is not type-separated from production",
     )
     require(
         f"{entry_local}(" in primary_source
@@ -666,7 +724,7 @@ def validate_deployment(
             "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_>"
         )
         == 2
-        and source.count("&EXACT_PLAN_BINDING_KEY") == 1
+        and source.count("&EXACT_PLAN_BINDING_KEY") == 2
         and "session.prepare(preflight, &EXACT_LITERAL)?" not in source
         and "plan_session.prepare(preflight)?" not in source
         and (

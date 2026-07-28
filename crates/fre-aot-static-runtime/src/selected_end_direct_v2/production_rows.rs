@@ -72,7 +72,11 @@ impl SourceQualifiedStaticSearchSelectedEndRowV2 {
 /// production review required for ordinary runtime use. This authority atom
 /// therefore begins as, and is compile-time constrained to remain, an empty
 /// canonical table. A promotion is a separate source transaction that must
-/// replace the empty-table assertion with the reviewed exact row.
+/// replace the empty-table assertion with the reviewed exact row. Canonical
+/// validation rejects every zero identity, a zero payload extent, duplicate or
+/// unsorted compile identities, and over-capacity tables before any future row
+/// can grant authority. The exact literal remains an unrestricted 16-byte
+/// binary value and is matched byte-for-byte during adoption.
 pub(super) const PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2:
     &[SourceQualifiedStaticSearchSelectedEndRowV2] = &[];
 

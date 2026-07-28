@@ -66,12 +66,14 @@ calling thread's vector length.
 
 The AOT route uses
 `StaticSearchSelectedEndQualificationV2::begin_current_thread_session`; the
-returned static-runtime token is neither `Send` nor `Sync`, checks
+returned qualification-only static-runtime token is nominally distinct from a
+source-qualified production token, is neither `Send` nor `Sync`, checks
 features/tuning, and observes `PR_SVE_GET_VL == 16` once on the calling thread.
-The compiler-generated bind function consumes that token, validates the exact
-literal once, and records the generated module's hardcoded private
-compile-identity key in a field-private nominal session that borrows only the
-external portable plan and qualification owner. Nominal construction
+The separately named compiler-generated qualification bind consumes that
+token, validates the exact literal once, and records the generated module's
+hardcoded private compile-identity key in a field-private nominal session that
+borrows only the external portable plan and qualification owner. There is no
+safe conversion between production and qualification tokens. Nominal construction
 discharges artifact identity; there is no runtime key comparison in the hot
 path. This owning shape is storable without a self-reference. Repeated calls
 check only issuing-plan identity before the exact direct symbol call. The JIT

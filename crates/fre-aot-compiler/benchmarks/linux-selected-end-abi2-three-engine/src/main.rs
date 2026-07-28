@@ -245,8 +245,10 @@ impl Engines {
 
     fn begin_sessions(&self) -> Result<EngineSessions<'_>, DynError> {
         let aot_thread = self.aot.begin_current_thread_session()?;
-        let aot =
-            aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(aot_thread, &self.portable)?;
+        let aot = aot_deployment::bind_exact_linked_aot_selected_end_qualification_plan_v2(
+            aot_thread,
+            &self.portable,
+        )?;
         Ok(EngineSessions {
             engines: self,
             aot,
@@ -638,7 +640,10 @@ fn measure_aot_activation_once(
     let aot = StaticSearchSelectedEndQualificationV2::qualification_private();
     let session_started = Instant::now();
     let thread_session = aot.begin_current_thread_session()?;
-    let session = aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(thread_session, plan)?;
+    let session = aot_deployment::bind_exact_linked_aot_selected_end_qualification_plan_v2(
+        thread_session,
+        plan,
+    )?;
     let session_ns = session_started.elapsed().as_nanos();
     let first_call_started = Instant::now();
     let expected_accounting = preflight.accounting();
@@ -729,7 +734,7 @@ fn measure_lifecycle_once(
         Engine::Aot => {
             let session_started = Instant::now();
             let thread_session = aot.begin_current_thread_session()?;
-            let session = aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(
+            let session = aot_deployment::bind_exact_linked_aot_selected_end_qualification_plan_v2(
                 thread_session,
                 &portable,
             )?;

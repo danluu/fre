@@ -202,9 +202,44 @@ impl SourceQualifiedStaticSearchSelectedEndRowV2 {
             && self.literal == claims.literal
     }
 
-    const fn compile_identity(&self) -> [u8; 32] {
-        self.compile_identity.0
+    const fn compile_identity(&self) -> SourceQualifiedCompileIdentityV2 {
+        self.compile_identity
     }
+}
+
+const fn bytes_are_nonzero_v2(bytes: &[u8]) -> bool {
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        if bytes[index] != 0 {
+            return true;
+        }
+        let Some(next) = index.checked_add(1) else {
+            return false;
+        };
+        index = next;
+    }
+    false
+}
+
+const fn production_row_is_valid_v2(row: &SourceQualifiedStaticSearchSelectedEndRowV2) -> bool {
+    bytes_are_nonzero_v2(row.manifest_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.source_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.semantic_binding_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.literal_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.kir_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.artifact_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.binding_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.compile_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.implementation_object_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.compiler_receipt_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.expectation_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.full_payload_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.glue_source_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.direct_header_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.glue_code_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.glue_object_identity.as_bytes())
+        && bytes_are_nonzero_v2(row.bundle_identity.as_bytes())
+        && row.full_payload_bytes != 0
 }
 
 const fn identity_is_strictly_less_v2(left: &[u8; 32], right: &[u8; 32]) -> bool {
@@ -230,16 +265,21 @@ const fn production_rows_are_canonical_v2(
     if rows.len() > HARD_MAX_STATIC_SEARCH_SELECTED_END_PRODUCTION_ROWS_V2 {
         return false;
     }
-    let mut index = 1_usize;
+    let mut index = 0_usize;
     while index < rows.len() {
-        let Some(previous) = index.checked_sub(1) else {
+        if !production_row_is_valid_v2(&rows[index]) {
             return false;
-        };
-        if !identity_is_strictly_less_v2(
-            rows[previous].compile_identity.as_bytes(),
-            rows[index].compile_identity.as_bytes(),
-        ) {
-            return false;
+        }
+        if index != 0 {
+            let Some(previous) = index.checked_sub(1) else {
+                return false;
+            };
+            if !identity_is_strictly_less_v2(
+                rows[previous].compile_identity.as_bytes(),
+                rows[index].compile_identity.as_bytes(),
+            ) {
+                return false;
+            }
         }
         let Some(next) = index.checked_add(1) else {
             return false;
@@ -298,21 +338,21 @@ impl StaticSearchSelectedEndFallbackStatusV2 {
 /// It contains no address, symbol, callback, or callable pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StaticSearchSelectedEndProductionV2 {
-    compile_identity: [u8; 32],
+    compile_identity: SourceQualifiedCompileIdentityV2,
 }
 
 impl StaticSearchSelectedEndProductionV2 {
     #[must_use]
     pub const fn production_authority(&self) -> StaticSearchSelectedEndProductionAuthorityV2 {
         StaticSearchSelectedEndProductionAuthorityV2::SourceQualified {
-            compile_identity: self.compile_identity,
+            compile_identity: self.compile_identity.0,
         }
     }
 
     #[must_use]
     pub const fn qualification(&self) -> StaticSearchSelectedEndSourceQualificationV2 {
         StaticSearchSelectedEndSourceQualificationV2::SourceQualified {
-            compile_identity: self.compile_identity,
+            compile_identity: self.compile_identity.0,
         }
     }
 
@@ -321,10 +361,14 @@ impl StaticSearchSelectedEndProductionV2 {
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<
-        StaticSearchSelectedEndThreadSessionV2<'_>,
+        StaticSearchSelectedEndProductionThreadSessionV2<'_>,
         StaticSearchSelectedEndThreadContractErrorV2,
     > {
-        begin_current_thread_session_for_owner_v2(self)
+        let core = begin_current_thread_session_for_owner_v2(self)?;
+        Ok(StaticSearchSelectedEndProductionThreadSessionV2 {
+            core,
+            compile_identity: self.compile_identity,
+        })
     }
 }
 
@@ -464,6 +508,14 @@ fn validate_thread_facts_v2(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StaticSearchSelectedEndCallErrorV2 {
+    /// A source-qualified production session was offered to a different
+    /// compiler-generated artifact, or that artifact's private key does not
+    /// carry its declared compile identity.
+    ProductionCompileIdentityMismatch {
+        authorized_compile_identity: [u8; 32],
+        generated_compile_identity: [u8; 32],
+        binding_compile_identity: [u8; 32],
+    },
     LiteralWidthMismatch {
         expected_bytes: usize,
         actual_bytes: usize,
@@ -554,50 +606,124 @@ impl StaticSearchSelectedEndQualificationV2 {
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<
-        StaticSearchSelectedEndThreadSessionV2<'_>,
+        StaticSearchSelectedEndQualificationThreadSessionV2<'_>,
         StaticSearchSelectedEndThreadContractErrorV2,
     > {
         begin_current_thread_session_for_owner_v2(self)
+            .map(|core| StaticSearchSelectedEndQualificationThreadSessionV2 { core })
     }
 }
 
 fn begin_current_thread_session_for_owner_v2<'owner, Owner>(
     _owner: &'owner Owner,
 ) -> Result<
-    StaticSearchSelectedEndThreadSessionV2<'owner>,
+    StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
     StaticSearchSelectedEndThreadContractErrorV2,
 > {
     platform::admit_current_thread_v2()?;
-    Ok(StaticSearchSelectedEndThreadSessionV2 {
+    Ok(StaticSearchSelectedEndThreadSessionCoreV2 {
         _owner: PhantomData,
         _thread_bound: PhantomData,
     })
 }
 
-/// Same-thread invocation capability for a generated exact ABI2 binding.
-///
-/// Construction performs all host/tuning checks and the sole
-/// `PR_SVE_GET_VL` observation. Preparing and decoding calls below are pure
-/// scalar operations and issue no syscall.
-///
-/// ```compile_fail,E0277
-/// use fre_aot_static_runtime::StaticSearchSelectedEndThreadSessionV2;
-/// fn assert_send<T: Send>() {}
-/// assert_send::<StaticSearchSelectedEndThreadSessionV2<'static>>();
-/// ```
-///
-/// ```compile_fail,E0277
-/// use fre_aot_static_runtime::StaticSearchSelectedEndThreadSessionV2;
-/// fn assert_sync<T: Sync>() {}
-/// assert_sync::<StaticSearchSelectedEndThreadSessionV2<'static>>();
-/// ```
 #[derive(Debug)]
-pub struct StaticSearchSelectedEndThreadSessionV2<'owner> {
+struct StaticSearchSelectedEndThreadSessionCoreV2<'owner> {
     _owner: PhantomData<&'owner ()>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
+/// Source-qualified same-thread capability for exactly one compiler-generated
+/// production artifact.
+///
+/// The private compile identity comes from the matched source-reviewed row and
+/// is carried across host/VL admission. Generated code must compare it with
+/// both its hardcoded `COMPILE_IDENTITY` and its private binding key before it
+/// can create an artifact-nominal plan session.
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndProductionThreadSessionV2;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<StaticSearchSelectedEndProductionThreadSessionV2<'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndProductionThreadSessionV2;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<StaticSearchSelectedEndProductionThreadSessionV2<'static>>();
+/// ```
+#[derive(Debug)]
+pub struct StaticSearchSelectedEndProductionThreadSessionV2<'owner> {
+    core: StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
+    compile_identity: SourceQualifiedCompileIdentityV2,
+}
+
+impl<'owner> StaticSearchSelectedEndProductionThreadSessionV2<'owner> {
+    /// Consume this production capability only for its exact generated
+    /// artifact, then bind that artifact's exact portable literal plan.
+    ///
+    /// Both compile-identity comparisons precede literal-plan validation and
+    /// plan-session creation. A token authorized for artifact A therefore
+    /// cannot enter sibling artifact B's generated bind, even when their
+    /// literals are byte-identical.
+    #[doc(hidden)]
+    pub fn bind_compiler_generated_literal_plan_owned<'plan>(
+        self,
+        plan: &'plan LiteralPlan,
+        exact_literal: &[u8; SELECTED_END_LITERAL_BYTES_V2],
+        binding: &'static StaticSearchSelectedEndBindingKeyV2,
+        generated_compile_identity: &[u8; 32],
+    ) -> Result<
+        StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        if self.compile_identity.as_bytes() != generated_compile_identity
+            || binding.identity() != generated_compile_identity
+        {
+            return Err(
+                StaticSearchSelectedEndCallErrorV2::ProductionCompileIdentityMismatch {
+                    authorized_compile_identity: self.compile_identity.0,
+                    generated_compile_identity: *generated_compile_identity,
+                    binding_compile_identity: *binding.identity(),
+                },
+            );
+        }
+        validate_literal_plan_v2(plan, exact_literal)?;
+        Ok(StaticSearchSelectedEndOwnedPlanSessionV2 {
+            session: self.core,
+            plan,
+            binding,
+        })
+    }
+}
+
+/// Qualification-private same-thread invocation capability for a generated
+/// exact ABI2 binding.
+///
+/// Construction performs all host/tuning checks and the sole
+/// `PR_SVE_GET_VL` observation. Preparing and decoding calls below are pure
+/// scalar operations and issue no syscall. Safe construction exists only
+/// behind `selected-end-qualification-private-v2`; production adoption returns
+/// the distinct compile-identity-bound token above.
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndQualificationThreadSessionV2;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<StaticSearchSelectedEndQualificationThreadSessionV2<'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndQualificationThreadSessionV2;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<StaticSearchSelectedEndQualificationThreadSessionV2<'static>>();
+/// ```
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct StaticSearchSelectedEndQualificationThreadSessionV2<'owner> {
+    core: StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
+}
+
+impl<'owner> StaticSearchSelectedEndQualificationThreadSessionV2<'owner> {
     /// Bind one exact portable plan to this already-admitted thread session.
     ///
     /// The linked artifact's literal is compared once here. Calls prepared
@@ -616,7 +742,7 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
     > {
         validate_literal_plan_v2(plan, exact_literal)?;
         Ok(StaticSearchSelectedEndPlanSessionV2 {
-            session: self,
+            session: &self.core,
             plan,
             binding,
         })
@@ -641,7 +767,7 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
     > {
         validate_literal_plan_v2(plan, exact_literal)?;
         Ok(StaticSearchSelectedEndOwnedPlanSessionV2 {
-            session: self,
+            session: self.core,
             plan,
             binding,
         })
@@ -673,7 +799,7 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
             return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
         }
         Ok(StaticSearchSelectedEndPreparedCallV2 {
-            _session: self,
+            _session: &self.core,
             checked: preflight.checked_window(),
             accounting: preflight.accounting(),
         })
@@ -718,7 +844,7 @@ fn validate_literal_plan_v2(
 /// ```
 #[derive(Debug)]
 pub struct StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan> {
-    session: &'session StaticSearchSelectedEndThreadSessionV2<'owner>,
+    session: &'session StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
     plan: &'plan LiteralPlan,
     binding: &'static StaticSearchSelectedEndBindingKeyV2,
 }
@@ -807,7 +933,7 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
 /// ```
 #[derive(Debug)]
 pub struct StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan> {
-    session: StaticSearchSelectedEndThreadSessionV2<'owner>,
+    session: StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
     plan: &'plan LiteralPlan,
     binding: &'static StaticSearchSelectedEndBindingKeyV2,
 }
@@ -869,7 +995,7 @@ impl<'owner, 'plan> StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan> {
 /// decoding. It contains no callable address or function pointer.
 #[derive(Debug)]
 pub struct StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack> {
-    _session: &'session StaticSearchSelectedEndThreadSessionV2<'owner>,
+    _session: &'session StaticSearchSelectedEndThreadSessionCoreV2<'owner>,
     checked: CheckedSearchWindow<'haystack>,
     accounting: LiteralAccounting,
 }
@@ -1038,6 +1164,125 @@ mod tests {
         )
     }
 
+    fn valid_source_row(compile_identity: [u8; 32]) -> SourceQualifiedStaticSearchSelectedEndRowV2 {
+        SourceQualifiedStaticSearchSelectedEndRowV2 {
+            manifest_identity: SourceQualifiedManifestIdentityV2([1; 32]),
+            source_identity: SourceQualifiedSourceIdentityV2([2; 32]),
+            semantic_binding_identity: SourceQualifiedSemanticBindingIdentityV2([3; 32]),
+            literal_identity: SourceQualifiedLiteralIdentityV2([4; 32]),
+            kir_identity: SourceQualifiedKirIdentityV2([5; 32]),
+            artifact_identity: SourceQualifiedArtifactIdentityV2([6; 32]),
+            binding_identity: SourceQualifiedBindingIdentityV2([7; 32]),
+            compile_identity: SourceQualifiedCompileIdentityV2(compile_identity),
+            implementation_object_identity: SourceQualifiedImplementationObjectIdentityV2([9; 32]),
+            compiler_receipt_identity: SourceQualifiedCompilerReceiptIdentityV2([10; 32]),
+            expectation_identity: SourceQualifiedExpectationIdentityV2([11; 32]),
+            full_payload_identity: SourceQualifiedFullPayloadIdentityV2([12; 32]),
+            glue_source_identity: SourceQualifiedGlueSourceIdentityV2([13; 32]),
+            direct_header_identity: SourceQualifiedDirectHeaderIdentityV2([14; 32]),
+            glue_code_identity: SourceQualifiedGlueCodeIdentityV2([15; 32]),
+            glue_object_identity: SourceQualifiedGlueObjectIdentityV2([16; 32]),
+            bundle_identity: SourceQualifiedBundleIdentityV2([17; 32]),
+            full_payload_bytes: 1,
+            literal: *b"0123456789abcdef",
+        }
+    }
+
+    #[test]
+    fn future_production_rows_reject_every_zero_identity_and_invalid_extent() {
+        let valid = valid_source_row([8; 32]);
+        assert!(production_rows_are_canonical_v2(&[valid]));
+        for invalid in [
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                manifest_identity: SourceQualifiedManifestIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                source_identity: SourceQualifiedSourceIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                semantic_binding_identity: SourceQualifiedSemanticBindingIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                literal_identity: SourceQualifiedLiteralIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                kir_identity: SourceQualifiedKirIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                artifact_identity: SourceQualifiedArtifactIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                binding_identity: SourceQualifiedBindingIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                compile_identity: SourceQualifiedCompileIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                implementation_object_identity: SourceQualifiedImplementationObjectIdentityV2(
+                    [0; 32],
+                ),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                compiler_receipt_identity: SourceQualifiedCompilerReceiptIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                expectation_identity: SourceQualifiedExpectationIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                full_payload_identity: SourceQualifiedFullPayloadIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                glue_source_identity: SourceQualifiedGlueSourceIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                direct_header_identity: SourceQualifiedDirectHeaderIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                glue_code_identity: SourceQualifiedGlueCodeIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                glue_object_identity: SourceQualifiedGlueObjectIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                bundle_identity: SourceQualifiedBundleIdentityV2([0; 32]),
+                ..valid
+            },
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                full_payload_bytes: 0,
+                ..valid
+            },
+        ] {
+            assert!(!production_rows_are_canonical_v2(&[invalid]));
+        }
+        assert!(production_rows_are_canonical_v2(&[
+            SourceQualifiedStaticSearchSelectedEndRowV2 {
+                literal: [0; SELECTED_END_LITERAL_BYTES_V2],
+                ..valid
+            },
+        ]));
+        assert!(!production_rows_are_canonical_v2(&[
+            valid_source_row([9; 32]),
+            valid_source_row([8; 32]),
+        ]));
+        assert!(!production_rows_are_canonical_v2(&[valid, valid]));
+    }
+
     #[test]
     fn public_adoption_is_absent_candidate_without_a_production_row() {
         assert!(PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2.is_empty());
@@ -1160,11 +1405,77 @@ mod tests {
         assert_eq!(validate_thread_facts_v2(valid_thread_facts()), Ok(()));
     }
 
+    fn production_thread_for_test(
+        compile_identity: [u8; 32],
+    ) -> StaticSearchSelectedEndProductionThreadSessionV2<'static> {
+        StaticSearchSelectedEndProductionThreadSessionV2 {
+            core: StaticSearchSelectedEndThreadSessionCoreV2 {
+                _owner: PhantomData,
+                _thread_bound: PhantomData,
+            },
+            compile_identity: SourceQualifiedCompileIdentityV2(compile_identity),
+        }
+    }
+
+    #[test]
+    fn production_session_refuses_sibling_artifact_before_plan_binding() {
+        static BINDING_A: StaticSearchSelectedEndBindingKeyV2 =
+            StaticSearchSelectedEndBindingKeyV2::compiler_generated([0xa1; 32]);
+        static BINDING_B: StaticSearchSelectedEndBindingKeyV2 =
+            StaticSearchSelectedEndBindingKeyV2::compiler_generated([0xb2; 32]);
+        let invalid_plan = LiteralPlan::new(b"short", LiteralBuildLimits::default()).unwrap();
+        let error = production_thread_for_test([0xa1; 32])
+            .bind_compiler_generated_literal_plan_owned(
+                &invalid_plan,
+                b"0123456789abcdef",
+                &BINDING_B,
+                &[0xb2; 32],
+            )
+            .expect_err("artifact A authority must not enter artifact B");
+        assert_eq!(
+            error,
+            StaticSearchSelectedEndCallErrorV2::ProductionCompileIdentityMismatch {
+                authorized_compile_identity: [0xa1; 32],
+                generated_compile_identity: [0xb2; 32],
+                binding_compile_identity: [0xb2; 32],
+            }
+        );
+
+        let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
+        let error = production_thread_for_test([0xa1; 32])
+            .bind_compiler_generated_literal_plan_owned(
+                &exact,
+                b"0123456789abcdef",
+                &BINDING_B,
+                &[0xa1; 32],
+            )
+            .expect_err("a generated key must carry its declared compile identity");
+        assert_eq!(
+            error,
+            StaticSearchSelectedEndCallErrorV2::ProductionCompileIdentityMismatch {
+                authorized_compile_identity: [0xa1; 32],
+                generated_compile_identity: [0xa1; 32],
+                binding_compile_identity: [0xb2; 32],
+            }
+        );
+
+        production_thread_for_test([0xa1; 32])
+            .bind_compiler_generated_literal_plan_owned(
+                &exact,
+                b"0123456789abcdef",
+                &BINDING_A,
+                &[0xa1; 32],
+            )
+            .expect("exact source-qualified production identity binds");
+    }
+
     #[test]
     fn preflight_is_bound_to_the_exact_literal_not_only_its_width() {
-        let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: PhantomData,
-            _thread_bound: PhantomData,
+        let session = StaticSearchSelectedEndQualificationThreadSessionV2 {
+            core: StaticSearchSelectedEndThreadSessionCoreV2 {
+                _owner: PhantomData,
+                _thread_bound: PhantomData,
+            },
         };
         let haystack = b"before-0123456789abcdef-after";
         let window = CheckedSearchWindow::new(haystack, SearchWindow::new(0, haystack.len()))
@@ -1193,9 +1504,11 @@ mod tests {
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x19; 32]);
         static OTHER_BINDING: StaticSearchSelectedEndBindingKeyV2 =
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x21; 32]);
-        let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: PhantomData,
-            _thread_bound: PhantomData,
+        let session = StaticSearchSelectedEndQualificationThreadSessionV2 {
+            core: StaticSearchSelectedEndThreadSessionCoreV2 {
+                _owner: PhantomData,
+                _thread_bound: PhantomData,
+            },
         };
         let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
         let bound = session
@@ -1261,9 +1574,11 @@ mod tests {
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x19; 32]);
         static OTHER_BINDING: StaticSearchSelectedEndBindingKeyV2 =
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x21; 32]);
-        let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: PhantomData,
-            _thread_bound: PhantomData,
+        let session = StaticSearchSelectedEndQualificationThreadSessionV2 {
+            core: StaticSearchSelectedEndThreadSessionCoreV2 {
+                _owner: PhantomData,
+                _thread_bound: PhantomData,
+            },
         };
         let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
         let bound = session
@@ -1313,6 +1628,43 @@ mod tests {
         let tests = source.find("#[cfg(test)]").unwrap();
         let implementation = &source[..tests];
         assert!(!implementation[bind..decode].contains("prctl("));
+        assert!(!implementation.contains("StaticSearchSelectedEndThreadSessionV2"));
+        assert!(implementation.contains("StaticSearchSelectedEndProductionThreadSessionV2<'_>,"));
+        assert!(
+            implementation.contains("StaticSearchSelectedEndQualificationThreadSessionV2<'_>,")
+        );
+        assert!(!implementation.contains("From<StaticSearchSelectedEndProductionThreadSessionV2"));
+        assert!(
+            !implementation.contains("From<StaticSearchSelectedEndQualificationThreadSessionV2")
+        );
+        assert!(!implementation.contains("Into<StaticSearchSelectedEndProductionThreadSessionV2"));
+        assert!(
+            !implementation.contains("Into<StaticSearchSelectedEndQualificationThreadSessionV2")
+        );
+        let production_session = implementation
+            .find("impl<'owner> StaticSearchSelectedEndProductionThreadSessionV2<'owner>")
+            .unwrap();
+        let qualification_session = implementation
+            .find("impl<'owner> StaticSearchSelectedEndQualificationThreadSessionV2<'owner>")
+            .unwrap();
+        let production_session = &implementation[production_session..qualification_session];
+        let production_identity_check = production_session
+            .find("self.compile_identity.as_bytes() != generated_compile_identity")
+            .unwrap();
+        let binding_identity_check = production_session
+            .find("binding.identity() != generated_compile_identity")
+            .unwrap();
+        let literal_validation = production_session
+            .find("validate_literal_plan_v2(plan, exact_literal)?;")
+            .unwrap();
+        let session_creation = production_session
+            .find("Ok(StaticSearchSelectedEndOwnedPlanSessionV2")
+            .unwrap();
+        assert!(production_identity_check < literal_validation);
+        assert!(binding_identity_check < literal_validation);
+        assert!(literal_validation < session_creation);
+        assert!(!production_session.contains("pub fn prepare<"));
+        assert!(!production_session.contains("pub fn bind_literal_plan<"));
         let plan_prepare = &implementation[plan_prepare..owned_prepare];
         let binding_check = plan_prepare
             .find("core::ptr::eq(self.binding, binding)")
@@ -1356,5 +1708,17 @@ mod tests {
         assert_eq!(implementation.matches("libc::prctl(").count(), 1);
         assert!(!implementation.contains("transmute::<"));
         assert!(!implementation.contains("extern \"C\" fn("));
+        let row_validation = &implementation[implementation
+            .find("const fn production_row_is_valid_v2(")
+            .unwrap()
+            ..implementation
+                .find("const fn identity_is_strictly_less_v2(")
+                .unwrap()];
+        assert_eq!(row_validation.matches("bytes_are_nonzero_v2(").count(), 17);
+        assert!(row_validation.contains("row.full_payload_bytes != 0"));
+        let production_rows = include_str!("selected_end_direct_v2/production_rows.rs");
+        assert!(production_rows.contains(
+            "PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2:\n    &[SourceQualifiedStaticSearchSelectedEndRowV2] = &[];"
+        ));
     }
 }

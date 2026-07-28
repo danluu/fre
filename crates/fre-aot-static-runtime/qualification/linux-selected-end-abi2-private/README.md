@@ -95,9 +95,13 @@ The generated binding also emits an identity-suffixed primary proof callsite
 and marks it hidden. The final link must retain it (for GNU-compatible linkers,
 pass `--undefined=<primary_callsite_symbol>`). Its retained copy makes the
 entry `bl` independently inspectable, but it is deliberately not the safe hot
-API. The safe source first consumes a non-transferable current-thread token
-while binding the exact portable literal plan and one private compile-identity
-key, then encloses the owning session in a module-private nominal type. That
+API. The safe qualification source first consumes a non-transferable,
+qualification-only current-thread token through the separately named private
+bind while binding the exact portable literal plan and one private
+compile-identity key, then encloses the owning session in a module-private
+nominal type. The source-qualified production token is nominally distinct,
+carries its matched compile identity, and cannot enter this qualification
+bind. That
 value borrows only the external qualification owner and plan, so consumers can
 store it without a self-reference. Repeated calls use only allocation-free plan
 pointer identity before naming the exact entry directly. The checker validates

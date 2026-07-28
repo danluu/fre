@@ -90,7 +90,8 @@ pub use selected_end_direct_v2::{
     StaticSearchSelectedEndBindingKeyV2, StaticSearchSelectedEndCallErrorV2,
     StaticSearchSelectedEndFallbackStatusV2, StaticSearchSelectedEndOwnedPlanSessionV2,
     StaticSearchSelectedEndPlanSessionV2, StaticSearchSelectedEndPreparedCallV2,
-    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndProductionV2,
+    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndProductionThreadSessionV2,
+    StaticSearchSelectedEndProductionV2, StaticSearchSelectedEndQualificationThreadSessionV2,
     StaticSearchSelectedEndSourceQualificationV2, StaticSearchSelectedEndThreadContractErrorV2,
-    StaticSearchSelectedEndThreadSessionV2, adopt_compiler_generated_static_search_selected_end_v2,
+    adopt_compiler_generated_static_search_selected_end_v2,
 };

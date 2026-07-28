@@ -740,37 +740,57 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "static EXACT_PLAN_BINDING_KEY: "
         "fre_aot_static_runtime::StaticSearchSelectedEndBindingKeyV2"
     )
-    nominal_start = source.find(
-        "pub(super) struct ExactLinkedAotSelectedEndPlanSessionV2"
+    claims_start = source.find(
+        "static EXACT_PRODUCTION_CLAIMS: "
+        "fre_aot_static_runtime::StaticSearchSelectedEndArtifactClaimsV2"
     )
-    bind_start = source.find(
-        "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+    nominal_start = source.find(
+        "pub struct ExactLinkedAotSelectedEndPlanSessionV2"
+    )
+    production_bind_start = source.find(
+        "fn bind_exact_linked_aot_selected_end_production_plan_v2"
+    )
+    qualification_bind_start = source.find(
+        "pub(super) fn "
+        "bind_exact_linked_aot_selected_end_qualification_plan_v2"
     )
     primary_start = source.find(
-        "pub(super) fn search_exact_linked_aot_selected_end_v2"
+        "pub fn search_exact_linked_aot_selected_end_v2"
     )
     diagnostic_start = source.find(
         "pub(super) fn search_exact_linked_aot_selected_end_qualification_wrapper_v2"
     )
     require(
-        0 <= key_start < nominal_start < bind_start < primary_start < diagnostic_start,
-        "binding key/nominal session/plan/primary/diagnostic functions are missing or reordered",
+        0
+        <= key_start
+        < claims_start
+        < nominal_start
+        < production_bind_start
+        < qualification_bind_start
+        < primary_start
+        < diagnostic_start,
+        "binding key/claims/nominal/production/qualification/primary/diagnostic functions are missing or reordered",
     )
-    key_source = source[key_start:nominal_start]
-    nominal_source = source[nominal_start:bind_start]
-    bind_source = source[bind_start:primary_start]
+    key_source = source[key_start:claims_start]
+    nominal_source = source[nominal_start:production_bind_start]
+    production_bind_source = source[
+        production_bind_start:qualification_bind_start
+    ]
+    qualification_bind_source = source[
+        qualification_bind_start:primary_start
+    ]
     primary_source = source[primary_start:diagnostic_start]
     require(
         (
             "StaticSearchSelectedEndBindingKeyV2::"
-            "qualification_private(COMPILE_IDENTITY)"
+            "compiler_generated(COMPILE_IDENTITY)"
         )
         in key_source,
         "binding key is not tied to the exact compile identity",
     )
     require(
         (
-            "pub(super) struct "
+            "pub struct "
             "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
         )
         in nominal_source
@@ -787,24 +807,55 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
     require(
         (
             "session: fre_aot_static_runtime::"
-            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+            "StaticSearchSelectedEndProductionThreadSessionV2<'owner>"
         )
-        in bind_source
+        in production_bind_source
         and (
-            "session: &'session fre_aot_static_runtime::"
-            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+            "inner: session.bind_compiler_generated_literal_plan_owned("
         )
-        not in bind_source
+        in production_bind_source
         and (
-            "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
+            "plan,\n"
+            "            &EXACT_LITERAL,\n"
+            "            &EXACT_PLAN_BINDING_KEY,\n"
+            "            &COMPILE_IDENTITY,"
         )
-        in bind_source
+        in production_bind_source,
+        "binding production path is not compile-identity-bound",
+    )
+    require(
+        (
+            "\nfn bind_exact_linked_aot_selected_end_production_plan_v2"
+            "<'owner, 'plan>"
+        )
+        in source
+        and (
+            "pub(super) fn "
+            "bind_exact_linked_aot_selected_end_production_plan_v2"
+        )
+        not in source
+        and (
+            "pub fn bind_exact_linked_aot_selected_end_production_plan_v2"
+        )
+        not in source,
+        "binding production path is not module-private",
+    )
+    require(
+        (
+            "session: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndQualificationThreadSessionV2<'owner>"
+        )
+        in qualification_bind_source
         and (
             "inner: session.bind_literal_plan_owned("
             "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
         )
-        in bind_source,
-        "binding omits its consuming one-time exact-literal/artifact plan binding",
+        in qualification_bind_source
+        and "StaticSearchSelectedEndProductionThreadSessionV2"
+        not in qualification_bind_source
+        and "bind_exact_linked_aot_selected_end_plan_v2" not in source
+        and "StaticSearchSelectedEndThreadSessionV2" not in source,
+        "binding qualification path is not separate from production",
     )
     require(
         f"{entry_local}(" in primary_source
@@ -825,7 +876,7 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
             "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_>"
         )
         == 2
-        and source.count("&EXACT_PLAN_BINDING_KEY") == 1
+        and source.count("&EXACT_PLAN_BINDING_KEY") == 2
         and "session.prepare(preflight, &EXACT_LITERAL)?" not in source
         and "plan_session.prepare(preflight)?" not in source
         and (
