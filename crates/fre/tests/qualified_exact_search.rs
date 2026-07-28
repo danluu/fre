@@ -1,10 +1,11 @@
 use fre::{
-    QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
-    QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
-    QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
+    PortableBuilder, QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
     QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
     QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION, QualifiedExactSearch,
-    QualifiedExactSearchBackendPolicy, QualifiedExactSearchError, QualifiedExactSearchNativeStatus,
+    QualifiedExactSearchBackendPolicy, QualifiedExactSearchError, QualifiedExactSearchFacadeError,
+    QualifiedExactSearchFacadeRoute, QualifiedExactSearchNativeStatus,
     QualifiedExactSearchQualification, QualifiedExactSearchRoute, QualifiedExactSearchWorkload,
     SearchLimits, SearchWindow,
 };
@@ -181,6 +182,9 @@ fn qualified_router_preserves_windows_results_and_portable_refusals() {
     let literal = b"0123456789abcdef";
     let search =
         QualifiedExactSearch::new(literal, QUALIFIED_WORKLOAD).expect("qualified exact matcher");
+    let session = search
+        .begin_current_thread_session()
+        .expect("Candidate portable session needs no host contract");
     for (prefix, tail, present) in [
         (0_usize, 0_usize, true),
         (31, 0, true),
@@ -206,6 +210,17 @@ fn qualified_router_preserves_windows_results_and_portable_refusals() {
             "prefix={prefix} tail={tail} present={present}"
         );
         assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
+        let (session_match, session_execution) = session
+            .find_window(&haystack, window, SearchLimits::unlimited())
+            .expect("reported session window search");
+        assert_eq!(session_match, matched);
+        assert_eq!(session_execution, execution);
+        assert_eq!(
+            session
+                .find_window_value(&haystack, window, SearchLimits::unlimited())
+                .expect("value-only session window search"),
+            matched
+        );
     }
 
     let haystack = vec![b'x'; QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES];
@@ -213,19 +228,140 @@ fn qualified_router_preserves_windows_results_and_portable_refusals() {
         .len()
         .checked_add(literal.len())
         .expect("bounded linear terms");
-    let error = search
-        .find(
-            &haystack,
-            SearchLimits {
-                max_work: u64::try_from(needed - 1).expect("u64 work"),
-                max_scratch_bytes: usize::MAX,
-            },
-        )
+    let limits = SearchLimits {
+        max_work: u64::try_from(needed - 1).expect("u64 work"),
+        max_scratch_bytes: usize::MAX,
+    };
+    let error = session
+        .find(&haystack, limits)
         .expect_err("portable preflight remains authoritative");
+    let value_error = session
+        .find_value(&haystack, limits)
+        .expect_err("value-only portable preflight remains authoritative");
+    assert_eq!(value_error, error);
     assert!(matches!(
         error,
         fre::QualifiedExactSearchError::Portable(fre_kernels::LiteralError::LinearTermLimit { .. })
     ));
+}
+
+#[test]
+fn qualified_facade_session_value_projection_preserves_public_contracts() {
+    let literal = b"0123456789abcdef";
+    let facade = PortableBuilder::new("0123456789abcdef")
+        .build_qualified_exact_search(QUALIFIED_WORKLOAD)
+        .expect("Candidate facade retains its exact portable owner");
+    let session = facade
+        .begin_current_thread_session()
+        .expect("Candidate facade session needs no host contract");
+    let prefix = 19;
+    let tail = 11;
+    let mut haystack = vec![b'x'; prefix + QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES + tail];
+    let expected_start = prefix + 37;
+    let expected_end = expected_start + literal.len();
+    haystack[expected_start..expected_end].copy_from_slice(literal);
+    let window = SearchWindow::new(prefix, haystack.len() - tail);
+
+    let (reported, execution) = session
+        .find_window(&haystack, window, SearchLimits::unlimited())
+        .expect("reported facade window search");
+    assert_eq!(
+        execution.route,
+        QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::PortableLiteral)
+    );
+    assert_eq!(
+        reported.map(|matched| (matched.start(), matched.end())),
+        Some((expected_start, expected_end))
+    );
+    assert_eq!(
+        session
+            .find_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("value-only facade window search"),
+        reported
+    );
+    assert_eq!(
+        session
+            .find_at_value(&haystack, prefix, SearchLimits::unlimited())
+            .expect("value-only facade start-offset search"),
+        reported
+    );
+    assert_eq!(
+        session
+            .find_value(&haystack, SearchLimits::unlimited())
+            .expect("value-only facade full search"),
+        reported
+    );
+    assert_eq!(
+        session
+            .is_match_value(&haystack, SearchLimits::unlimited())
+            .expect("value-only facade existence search"),
+        reported.is_some()
+    );
+
+    let needed = haystack
+        .len()
+        .checked_add(literal.len())
+        .expect("bounded facade linear terms");
+    let refused_limits = SearchLimits {
+        max_work: u64::try_from(needed - 1).expect("facade work fits u64"),
+        max_scratch_bytes: usize::MAX,
+    };
+    let reporting_refusal = session
+        .find(&haystack, refused_limits)
+        .expect_err("reported facade call must preserve resource refusal");
+    let value_refusal = session
+        .find_value(&haystack, refused_limits)
+        .expect_err("value-only facade call must preserve resource refusal");
+    assert_eq!(value_refusal, reporting_refusal);
+
+    let invalid = SearchWindow::new(haystack.len(), haystack.len() - 1);
+    let reporting_invalid = session
+        .find_window(&haystack, invalid, SearchLimits::unlimited())
+        .expect_err("reported facade call must reject an invalid window");
+    let value_invalid = session
+        .find_window_value(&haystack, invalid, SearchLimits::unlimited())
+        .expect_err("value-only facade call must reject an invalid window");
+    assert_eq!(value_invalid, reporting_invalid);
+}
+
+#[test]
+fn qualified_facade_value_projection_preserves_non_exact_portable_plan() {
+    let facade = PortableBuilder::new("a+")
+        .unicode(false)
+        .build_qualified_exact_search(QUALIFIED_WORKLOAD)
+        .expect("non-exact facade retains its selected portable plan");
+    let session = facade
+        .begin_current_thread_session()
+        .expect("portable facade plan needs no host contract");
+    let haystack = b"xxaaax";
+    let (reported, execution) = session
+        .find(haystack, SearchLimits::unlimited())
+        .expect("reported non-exact facade search");
+    assert!(matches!(
+        execution.route,
+        QualifiedExactSearchFacadeRoute::PortablePlan(_)
+    ));
+    assert_eq!(
+        session
+            .find_value(haystack, SearchLimits::unlimited())
+            .expect("value-only non-exact facade search"),
+        reported
+    );
+    assert_eq!(
+        session
+            .is_match_value(haystack, SearchLimits::unlimited())
+            .expect("value-only non-exact facade existence search"),
+        reported.is_some()
+    );
+
+    let invalid = SearchWindow::new(haystack.len(), haystack.len() - 1);
+    let reporting_invalid = session
+        .find_window(haystack, invalid, SearchLimits::unlimited())
+        .expect_err("reported non-exact facade call must reject an invalid window");
+    let value_invalid = session
+        .find_window_value(haystack, invalid, SearchLimits::unlimited())
+        .expect_err("value-only non-exact facade call must reject an invalid window");
+    assert_eq!(value_invalid, reporting_invalid);
 }
 
 #[test]
@@ -350,6 +486,14 @@ fn candidate_refusal_precedes_unsupported_host_and_aarch64_emission() {
 #[test]
 fn native_call_errors_remain_typed_at_the_facade_boundary() {
     let source = CallError::BackendFault { status: 0x55 };
-    let error = QualifiedExactSearchError::from(source.clone());
-    assert_eq!(error, QualifiedExactSearchError::Native(source));
+    let exact_error = QualifiedExactSearchError::from(source.clone());
+    assert_eq!(
+        exact_error,
+        QualifiedExactSearchError::Native(source.clone())
+    );
+    let facade_error = QualifiedExactSearchFacadeError::from(exact_error.clone());
+    assert_eq!(
+        facade_error,
+        QualifiedExactSearchFacadeError::ExactLiteral(exact_error)
+    );
 }

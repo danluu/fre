@@ -1009,17 +1009,21 @@ impl QualifiedExactSearch {
                     sessionless_native_route_allowed(native.requires_current_thread_session())
                 })
                 .map(QualifiedExactSearchNativeCall::Direct),
+            |matched, route, accounting| {
+                (matched, QualifiedExactSearchExecution { route, accounting })
+            },
         )
     }
 
     #[inline]
-    fn find_window_with_native(
+    fn find_window_with_native<R>(
         &self,
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
         native: Option<QualifiedExactSearchNativeCall<'_, '_>>,
-    ) -> Result<(Option<Match>, QualifiedExactSearchExecution), QualifiedExactSearchError> {
+        project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
+    ) -> Result<R, QualifiedExactSearchError> {
         let literal_limits = LiteralSearchLimits {
             max_linear_terms: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
         };
@@ -1042,34 +1046,28 @@ impl QualifiedExactSearch {
                     .search_checked(preflight.checked_window())?
                     .map(|end| match_from_native_selected_end(end, window))
                     .transpose()?;
-                return Ok((
+                return Ok(project(
                     matched,
-                    QualifiedExactSearchExecution {
-                        route: QualifiedExactSearchRoute::NativeJit,
-                        accounting,
-                    },
+                    QualifiedExactSearchRoute::NativeJit,
+                    accounting,
                 ));
             }
             let accounting = preflight.accounting();
             let matched = preflight.find()?;
-            return Ok((
+            return Ok(project(
                 matched.map(|(start, end)| Match { start, end }),
-                QualifiedExactSearchExecution {
-                    route: QualifiedExactSearchRoute::PortableLiteral,
-                    accounting,
-                },
+                QualifiedExactSearchRoute::PortableLiteral,
+                accounting,
             ));
         }
         let literal_window = LiteralWindow::new(window.start(), window.end());
         let (matched, portable_accounting) =
             self.portable
                 .find_window(haystack, literal_window, literal_limits)?;
-        Ok((
+        Ok(project(
             matched.map(|(start, end)| Match { start, end }),
-            QualifiedExactSearchExecution {
-                route: QualifiedExactSearchRoute::PortableLiteral,
-                accounting: portable_accounting,
-            },
+            QualifiedExactSearchRoute::PortableLiteral,
+            portable_accounting,
         ))
     }
 
@@ -1132,14 +1130,40 @@ impl QualifiedExactSearchThreadSession<'_> {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<(Option<Match>, QualifiedExactSearchExecution), QualifiedExactSearchError> {
-        self.search.find_window_with_native(
-            haystack,
-            window,
-            limits,
-            self.native
-                .as_ref()
-                .map(QualifiedExactSearchNativeCall::ThreadSession),
-        )
+        self.find_window_projected(haystack, window, limits, |matched, route, accounting| {
+            (matched, QualifiedExactSearchExecution { route, accounting })
+        })
+    }
+
+    /// Find the first match in the complete haystack without returning the
+    /// per-search execution report.
+    ///
+    /// This is the value-only counterpart to [`Self::find`]. It uses the same
+    /// authority gate, checked window, single resource preflight, minimum-window
+    /// fallback, typed errors, and native-result validation. Only the final
+    /// diagnostic projection is omitted.
+    #[inline]
+    pub fn find_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchError> {
+        self.find_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Find the first match wholly inside a checked byte window without
+    /// returning the per-search execution report.
+    ///
+    /// This follows the same semantic and refusal path as
+    /// [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchError> {
+        self.find_window_projected(haystack, window, limits, |matched, _, _| matched)
     }
 
     /// Whether a selected match exists in the complete haystack.
@@ -1151,6 +1175,44 @@ impl QualifiedExactSearchThreadSession<'_> {
     ) -> Result<(bool, QualifiedExactSearchExecution), QualifiedExactSearchError> {
         self.find(haystack, limits)
             .map(|(matched, execution)| (matched.is_some(), execution))
+    }
+
+    /// Whether a selected match exists without returning the per-search
+    /// execution report.
+    ///
+    /// This is the value-only counterpart to [`Self::is_match`] and preserves
+    /// its semantic, authority, resource, fallback, and error contracts.
+    #[inline]
+    pub fn is_match_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<bool, QualifiedExactSearchError> {
+        self.find_window_projected(
+            haystack,
+            SearchWindow::full(haystack),
+            limits,
+            |matched, _, _| matched.is_some(),
+        )
+    }
+
+    #[inline]
+    fn find_window_projected<R>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
+    ) -> Result<R, QualifiedExactSearchError> {
+        self.search.find_window_with_native(
+            haystack,
+            window,
+            limits,
+            self.native
+                .as_ref()
+                .map(QualifiedExactSearchNativeCall::ThreadSession),
+            project,
+        )
     }
 }
 
@@ -1820,26 +1882,95 @@ impl QualifiedExactSearchFacadeThreadSession<'_> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, QualifiedExactSearchFacadeExecution), QualifiedExactSearchFacadeError>
     {
-        match &self.plan {
-            QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(search) => {
-                let (matched, execution) = search.find_window(haystack, window, limits)?;
-                Ok((
+        self.find_window_projected(
+            haystack,
+            window,
+            limits,
+            |matched, route, accounting| {
+                (
                     matched,
                     QualifiedExactSearchFacadeExecution {
-                        route: QualifiedExactSearchFacadeRoute::ExactLiteral(execution.route),
-                        accounting: SearchAccounting::ExactLiteral(execution.accounting),
+                        route: QualifiedExactSearchFacadeRoute::ExactLiteral(route),
+                        accounting: SearchAccounting::ExactLiteral(accounting),
                     },
-                ))
-            }
-            QualifiedExactSearchFacadeThreadSessionPlan::Portable(portable) => {
-                let (matched, accounting) = portable.find_window(haystack, window, limits)?;
-                Ok((
+                )
+            },
+            |matched, accounting| {
+                (
                     matched,
                     QualifiedExactSearchFacadeExecution {
                         route: QualifiedExactSearchFacadeRoute::PortablePlan(accounting.plan()),
                         accounting,
                     },
-                ))
+                )
+            },
+        )
+    }
+
+    /// Find the first match in the complete haystack without returning the
+    /// per-search facade execution report.
+    ///
+    /// This is the value-only counterpart to [`Self::find`]. It preserves the
+    /// selected facade plan and the exact leaf's authority, single-preflight,
+    /// fallback, validation, and typed-error contracts.
+    #[inline]
+    pub fn find_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchFacadeError> {
+        self.find_window_value(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Find the first match at or after a checked start offset without
+    /// returning the per-search facade execution report.
+    #[inline]
+    pub fn find_at_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchFacadeError> {
+        self.find_window_value(haystack, SearchWindow::new(start, haystack.len()), limits)
+    }
+
+    /// Find the first match wholly inside a checked byte window without
+    /// returning the per-search facade execution report.
+    ///
+    /// This follows the same semantic and refusal path as
+    /// [`Self::find_window`].
+    #[inline]
+    pub fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, QualifiedExactSearchFacadeError> {
+        self.find_window_projected(
+            haystack,
+            window,
+            limits,
+            |matched, _, _| matched,
+            |matched, _| matched,
+        )
+    }
+
+    #[inline]
+    fn find_window_projected<R>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        exact_project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
+        portable_project: impl FnOnce(Option<Match>, SearchAccounting) -> R,
+    ) -> Result<R, QualifiedExactSearchFacadeError> {
+        match &self.plan {
+            QualifiedExactSearchFacadeThreadSessionPlan::ExactLiteral(search) => search
+                .find_window_projected(haystack, window, limits, exact_project)
+                .map_err(QualifiedExactSearchFacadeError::from),
+            QualifiedExactSearchFacadeThreadSessionPlan::Portable(portable) => {
+                let (matched, accounting) = portable.find_window(haystack, window, limits)?;
+                Ok(portable_project(matched, accounting))
             }
         }
     }
@@ -1867,6 +1998,26 @@ impl QualifiedExactSearchFacadeThreadSession<'_> {
     ) -> Result<(bool, QualifiedExactSearchFacadeExecution), QualifiedExactSearchFacadeError> {
         self.find(haystack, limits)
             .map(|(matched, execution)| (matched.is_some(), execution))
+    }
+
+    /// Whether a selected match exists without returning the per-search facade
+    /// execution report.
+    ///
+    /// This is the value-only counterpart to [`Self::is_match`] and preserves
+    /// its semantic, authority, resource, fallback, and error contracts.
+    #[inline]
+    pub fn is_match_value(
+        &self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<bool, QualifiedExactSearchFacadeError> {
+        self.find_window_projected(
+            haystack,
+            SearchWindow::full(haystack),
+            limits,
+            |matched, _, _| matched.is_some(),
+            |matched, _| matched.is_some(),
+        )
     }
 }
 
@@ -3369,7 +3520,7 @@ mod tests {
         let session = facade
             .begin_current_thread_session()
             .expect("Candidate portable session needs no host contract");
-        let (_, execution) = session
+        let (matched, execution) = session
             .find(&haystack, SearchLimits::unlimited())
             .expect("Candidate public facade session searches portably");
         assert_eq!(
@@ -3377,6 +3528,28 @@ mod tests {
             QualifiedExactSearchFacadeRoute::ExactLiteral(
                 QualifiedExactSearchRoute::PortableLiteral
             )
+        );
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .expect("Candidate value-only facade session searches portably"),
+            matched
+        );
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .expect("Candidate value-only window search remains portable"),
+            matched
+        );
+        assert_eq!(
+            session
+                .is_match_value(&haystack, SearchLimits::unlimited())
+                .expect("Candidate value-only existence search remains portable"),
+            matched.is_some()
         );
     }
 
@@ -3446,19 +3619,37 @@ mod tests {
             let session = search
                 .begin_current_thread_session()
                 .expect("guarded V8 current-thread session");
-            let (_, execution) = session
+            let (matched, execution) = session
                 .find(&haystack, SearchLimits::unlimited())
                 .expect("guarded Candidate native session search");
             assert_eq!(execution.route, QualifiedExactSearchRoute::NativeJit);
+            assert_eq!(
+                session
+                    .find_value(&haystack, SearchLimits::unlimited())
+                    .expect("guarded Candidate value-only native session search"),
+                matched
+            );
+            assert_eq!(
+                session
+                    .is_match_value(&haystack, SearchLimits::unlimited())
+                    .expect("guarded Candidate value-only native existence search"),
+                matched.is_some()
+            );
 
             // Losing the scoped test-only guard independently refuses a
             // retained native mapping even through an already-created session
             // while the qualification stays Candidate.
             drop(guard);
-            let (_, execution) = session
+            let (fallback_match, execution) = session
                 .find(&haystack, SearchLimits::unlimited())
                 .expect("session guard loss falls back portably");
             assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
+            assert_eq!(
+                session
+                    .find_value(&haystack, SearchLimits::unlimited())
+                    .expect("value-only session guard loss falls back portably"),
+                fallback_match
+            );
         }
     }
 
@@ -3541,15 +3732,48 @@ mod tests {
             .expect("V8 session shares the exact native preflight");
         assert_eq!(session_matched, matched);
         assert_eq!(session_execution, execution);
+        assert_eq!(
+            session
+                .find_value(&haystack, exact_limits)
+                .expect("V8 value-only session shares the exact native preflight"),
+            session_matched
+        );
+        assert_eq!(
+            session
+                .find_window_value(&haystack, SearchWindow::full(&haystack), exact_limits)
+                .expect("V8 value-only window shares the exact native preflight"),
+            session_matched
+        );
+        assert_eq!(
+            session
+                .is_match_value(&haystack, exact_limits)
+                .expect("V8 value-only existence search shares the native path"),
+            session_matched.is_some()
+        );
 
         let one_below = exact_terms.checked_sub(1).expect("positive exact work");
+        let refused_limits = SearchLimits {
+            max_work: u64::try_from(one_below).expect("one-below work fits u64"),
+            max_scratch_bytes: 0,
+        };
+        let reporting_refusal = session
+            .find(&haystack, refused_limits)
+            .expect_err("one-below reporting session call must refuse");
+        let value_refusal = session
+            .find_value(&haystack, refused_limits)
+            .expect_err("one-below value-only session call must refuse");
+        assert_eq!(value_refusal, reporting_refusal);
+        assert!(matches!(
+            reporting_refusal,
+            QualifiedExactSearchError::Portable(LiteralError::LinearTermLimit {
+                needed,
+                limit
+            }) if needed == exact_terms && limit == one_below
+        ));
         assert!(matches!(
             search.find(
                 &haystack,
-                SearchLimits {
-                    max_work: u64::try_from(one_below).expect("one-below work fits u64"),
-                    max_scratch_bytes: 0,
-                },
+                refused_limits,
             ),
             Err(QualifiedExactSearchError::Portable(
                 LiteralError::LinearTermLimit { needed, limit }
@@ -3578,6 +3802,19 @@ mod tests {
         );
         assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
         assert_eq!(execution.accounting.linear_terms, small_terms);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    small_window,
+                    SearchLimits {
+                        max_work: u64::try_from(small_terms).expect("small work fits u64"),
+                        max_scratch_bytes: 0,
+                    },
+                )
+                .expect("value-only below-threshold call remains portable"),
+            matched
+        );
 
         let before_end = haystack.len().checked_sub(1).expect("nonempty haystack");
         let past_end = haystack.len().checked_add(1).expect("bounded haystack");
@@ -3597,6 +3834,13 @@ mod tests {
                     && end == invalid.end()
                     && haystack_len == haystack.len()
             ));
+            let reporting_error = session
+                .find_window(&haystack, invalid, SearchLimits::unlimited())
+                .expect_err("invalid reporting window must refuse");
+            let value_error = session
+                .find_window_value(&haystack, invalid, SearchLimits::unlimited())
+                .expect_err("invalid value-only window must refuse");
+            assert_eq!(value_error, reporting_error);
         }
     }
 
@@ -3631,7 +3875,7 @@ mod tests {
         let session = facade
             .begin_current_thread_session()
             .expect("guarded V8 facade current-thread session");
-        let (_, execution) = session
+        let (matched, execution) = session
             .find(&haystack, SearchLimits::unlimited())
             .expect("guarded Candidate facade session search");
         assert_eq!(
@@ -3642,10 +3886,22 @@ mod tests {
                 QualifiedExactSearchRoute::PortableLiteral
             })
         );
+        assert_eq!(
+            session
+                .find_value(&haystack, SearchLimits::unlimited())
+                .expect("guarded Candidate value-only facade session search"),
+            matched
+        );
+        assert_eq!(
+            session
+                .is_match_value(&haystack, SearchLimits::unlimited())
+                .expect("guarded Candidate value-only facade existence search"),
+            matched.is_some()
+        );
 
         if published {
             drop(guard);
-            let (_, execution) = session
+            let (fallback_match, execution) = session
                 .find(&haystack, SearchLimits::unlimited())
                 .expect("facade session guard loss falls back portably");
             assert_eq!(
@@ -3653,6 +3909,12 @@ mod tests {
                 QualifiedExactSearchFacadeRoute::ExactLiteral(
                     QualifiedExactSearchRoute::PortableLiteral
                 )
+            );
+            assert_eq!(
+                session
+                    .find_value(&haystack, SearchLimits::unlimited())
+                    .expect("value-only facade session guard loss falls back portably"),
+                fallback_match
             );
         }
     }
