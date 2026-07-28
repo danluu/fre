@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Stable identity of the canonical folded-scalar trie primitive.
-pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v2";
+pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v3";
 
 const NONE: usize = usize::MAX;
 const CANDIDATE_WORK: usize = 2;
@@ -203,6 +203,8 @@ pub struct BuildAccounting {
     pub root_prefilter_work: usize,
     pub root_prefilter_needles: usize,
     pub root_prefilter_offset: Option<usize>,
+    pub root_prefilter_guard_needles: usize,
+    pub root_prefilter_guard_offset: Option<usize>,
     pub work: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
@@ -431,9 +433,20 @@ struct RootPrefilter {
     needles: [u8; MAX_ROOT_PREFILTER_NEEDLES],
     needle_count: u8,
     offset: u8,
+    guard_needles: [u8; MAX_ROOT_PREFILTER_NEEDLES],
+    guard_needle_count: u8,
+    guard_offset: u8,
 }
 
 impl RootPrefilter {
+    const fn has_guard(self) -> bool {
+        self.guard_needle_count != 0
+    }
+
+    fn guard_matches(self, byte: u8) -> bool {
+        self.guard_needles[..usize::from(self.guard_needle_count)].contains(&byte)
+    }
+
     fn scan<F>(
         self,
         source: &[u8],
@@ -443,6 +456,14 @@ impl RootPrefilter {
     where
         F: FnMut(usize) -> Result<(), ScanAttemptError>,
     {
+        if usize::from(self.guard_needle_count) > MAX_ROOT_PREFILTER_NEEDLES {
+            return Err(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root prefilter retained an invalid guard needle count",
+                },
+                actual: invalid_actual,
+            });
+        }
         match self.needle_count {
             1 => {
                 for position in memchr_iter(self.needles[0], source) {
@@ -566,7 +587,8 @@ impl FoldedLiteralTriePlan {
         build.persistent_bytes =
             exact_retained_bytes(nodes.capacity(), edges.capacity(), outputs.capacity())?;
         build.peak_bytes = build.persistent_bytes;
-        let (root_prefilter, root_prefilter_work) = select_root_prefilter(&nodes, &edges)?;
+        let (root_prefilter, root_prefilter_work) =
+            select_root_prefilter(&nodes, &edges, patterns.len())?;
         work = checked_build_add(
             work,
             root_prefilter_work,
@@ -576,6 +598,11 @@ impl FoldedLiteralTriePlan {
         build.root_prefilter_needles =
             root_prefilter.map_or(0, |prefilter| usize::from(prefilter.needle_count));
         build.root_prefilter_offset = root_prefilter.map(|prefilter| usize::from(prefilter.offset));
+        build.root_prefilter_guard_needles =
+            root_prefilter.map_or(0, |prefilter| usize::from(prefilter.guard_needle_count));
+        build.root_prefilter_guard_offset = root_prefilter
+            .filter(|prefilter| prefilter.has_guard())
+            .map(|prefilter| usize::from(prefilter.guard_offset));
         build.work = work;
         if !build_actual_within(build) {
             return Err(BuildError::Invariant {
@@ -623,11 +650,23 @@ impl FoldedLiteralTriePlan {
             "folded scalar source byte reads",
         )?;
         let source_byte_reads = if self.root_prefilter.is_some() {
-            scalar_source_byte_reads.checked_add(input_bytes).ok_or(
-                ScanError::ArithmeticOverflow {
-                    computation: "folded root-prefilter source byte reads",
-                },
-            )?
+            let prefilter_passes =
+                usize::from(self.root_prefilter.is_some_and(RootPrefilter::has_guard))
+                    .checked_add(1)
+                    .ok_or(ScanError::ArithmeticOverflow {
+                        computation: "folded root-prefilter pass count",
+                    })?;
+            let prefilter_reads =
+                input_bytes
+                    .checked_mul(prefilter_passes)
+                    .ok_or(ScanError::ArithmeticOverflow {
+                        computation: "folded root-prefilter source byte reads",
+                    })?;
+            scalar_source_byte_reads
+                .checked_add(prefilter_reads)
+                .ok_or(ScanError::ArithmeticOverflow {
+                    computation: "folded root-prefilter and scalar source byte reads",
+                })?
         } else {
             scalar_source_byte_reads
         };
@@ -809,6 +848,26 @@ where
             let Some(relative_start) = hit.checked_sub(offset) else {
                 return Ok(());
             };
+            if prefilter.has_guard() {
+                let Some(guard_position) =
+                    relative_start.checked_add(usize::from(prefilter.guard_offset))
+                else {
+                    return Ok(());
+                };
+                let Some(&guard_byte) = source.get(guard_position) else {
+                    return Ok(());
+                };
+                actual.source_byte_reads = checked_actual_add(
+                    actual.source_byte_reads,
+                    1,
+                    upper,
+                    actual,
+                    "folded root-prefilter guard reads",
+                )?;
+                if !prefilter.guard_matches(guard_byte) {
+                    return Ok(());
+                }
+            }
             actual.candidate_starts = checked_actual_add(
                 actual.candidate_starts,
                 1,
@@ -854,103 +913,213 @@ where
     Ok(actual)
 }
 
+#[derive(Clone, Copy)]
+struct PrefilterColumn {
+    needles: [u8; MAX_ROOT_PREFILTER_NEEDLES],
+    needle_count: u8,
+    offset: u8,
+    structural_leads: usize,
+    frequency_score: u64,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one allocation-free traversal keeps fixed-column derivation, ranking and exact work accounting visibly coupled"
+)]
 fn select_root_prefilter(
     nodes: &[Node],
     edges: &[Edge],
+    pattern_count: usize,
 ) -> Result<(Option<RootPrefilter>, usize), BuildError> {
     let Some(root) = nodes.first() else {
         return Err(BuildError::Invariant {
             detail: "folded trie root is missing",
         });
     };
-    let mut selected = None::<(usize, u64, usize, RootPrefilter)>;
+    if root.first_edge == NONE {
+        return Ok((None, 0));
+    }
+    let mut selected = [None::<PrefilterColumn>; 2];
     let mut work = 0_usize;
-    for offset in 0..MAX_UTF8_WIDTH {
-        work = checked_build_add(
-            work,
-            ROOT_PREFILTER_OFFSET_WORK,
-            "folded root prefilter offset work",
-        )?;
-        let mut needles = [0_u8; MAX_ROOT_PREFILTER_NEEDLES];
-        let mut needle_count = 0_usize;
-        let mut eligible = true;
-        let mut edge = root.first_edge;
-        while edge != NONE {
+    let mut state = 0_usize;
+    let mut absolute_offset = 0_usize;
+    let mut traversed_states = 0_usize;
+    loop {
+        let node = *nodes.get(state).ok_or(BuildError::Invariant {
+            detail: "folded prefilter state is missing",
+        })?;
+        if node.first_edge == NONE {
+            break;
+        }
+        let mut next_state = None;
+        let mut fixed_width = None;
+        for local_offset in 0..MAX_UTF8_WIDTH {
             work = checked_build_add(
                 work,
-                ROOT_PREFILTER_EDGE_WORK,
-                "folded root prefilter edge work",
+                ROOT_PREFILTER_OFFSET_WORK,
+                "folded root prefilter offset work",
             )?;
-            let transition = edges[edge];
-            let mut encoded = [0_u8; MAX_UTF8_WIDTH];
-            let bytes = transition.scalar.encode_utf8(&mut encoded).as_bytes();
-            let Some(&needle) = bytes.get(offset) else {
-                eligible = false;
-                break;
-            };
-            if !needles[..needle_count].contains(&needle) {
-                if needle_count == MAX_ROOT_PREFILTER_NEEDLES {
-                    eligible = false;
-                    break;
+            let mut needles = [0_u8; MAX_ROOT_PREFILTER_NEEDLES];
+            let mut needle_count = 0_usize;
+            let mut eligible = true;
+            let mut edge = node.first_edge;
+            while edge != NONE {
+                work = checked_build_add(
+                    work,
+                    ROOT_PREFILTER_EDGE_WORK,
+                    "folded root prefilter edge work",
+                )?;
+                let transition = edges[edge];
+                let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+                let bytes = transition.scalar.encode_utf8(&mut encoded).as_bytes();
+                if local_offset == 0 {
+                    if next_state.is_some_and(|target| target != transition.target) {
+                        next_state = Some(NONE);
+                    } else if next_state.is_none() {
+                        next_state = Some(transition.target);
+                    }
+                    if fixed_width.is_some_and(|width| width != bytes.len()) {
+                        fixed_width = Some(0);
+                    } else if fixed_width.is_none() {
+                        fixed_width = Some(bytes.len());
+                    }
                 }
-                needles[needle_count] = needle;
-                needle_count =
-                    needle_count
-                        .checked_add(1)
-                        .ok_or(BuildError::ArithmeticOverflow {
-                            computation: "folded root prefilter needle count",
-                        })?;
+                let Some(&needle) = bytes.get(local_offset) else {
+                    eligible = false;
+                    edge = transition.next;
+                    continue;
+                };
+                if !needles[..needle_count].contains(&needle) {
+                    if needle_count == MAX_ROOT_PREFILTER_NEEDLES {
+                        eligible = false;
+                    } else {
+                        needles[needle_count] = needle;
+                        needle_count =
+                            needle_count
+                                .checked_add(1)
+                                .ok_or(BuildError::ArithmeticOverflow {
+                                    computation: "folded root prefilter needle count",
+                                })?;
+                    }
+                }
+                edge = transition.next;
             }
-            edge = transition.next;
-        }
-        if !eligible || needle_count == 0 {
-            continue;
-        }
-        let mut structural_leads = 0_usize;
-        let mut frequency_score = 0_u64;
-        for &needle in &needles[..needle_count] {
-            work = checked_build_add(
-                work,
-                ROOT_PREFILTER_NEEDLE_WORK,
-                "folded root prefilter needle work",
-            )?;
-            structural_leads = structural_leads
-                .checked_add(usize::from(matches!(needle, 0xC2..=0xF4)))
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "folded root prefilter structural leads",
-                })?;
-            frequency_score = frequency_score
-                .checked_add(u64::from(byte_frequency_rank(needle)).saturating_add(1))
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "folded root prefilter frequency score",
-                })?;
-        }
-        let prefilter = RootPrefilter {
-            needles,
-            needle_count: u8::try_from(needle_count).map_err(|_| BuildError::Invariant {
-                detail: "folded root prefilter needle count does not fit u8",
-            })?,
-            offset: u8::try_from(offset).map_err(|_| BuildError::Invariant {
-                detail: "folded root prefilter offset does not fit u8",
-            })?,
-        };
-        let replace = selected
-            .as_ref()
-            .is_none_or(|&(best_leads, best_score, best_offset, _)| {
-                (
+            if !eligible || needle_count == 0 {
+                continue;
+            }
+            let Some(offset) = absolute_offset.checked_add(local_offset) else {
+                return Err(BuildError::ArithmeticOverflow {
+                    computation: "folded root prefilter absolute offset",
+                });
+            };
+            let Ok(offset) = u8::try_from(offset) else {
+                continue;
+            };
+            let mut structural_leads = 0_usize;
+            let mut frequency_score = 0_u64;
+            for &needle in &needles[..needle_count] {
+                work = checked_build_add(
+                    work,
+                    ROOT_PREFILTER_NEEDLE_WORK,
+                    "folded root prefilter needle work",
+                )?;
+                structural_leads = structural_leads
+                    .checked_add(usize::from(matches!(needle, 0xC2..=0xF4)))
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "folded root prefilter structural leads",
+                    })?;
+                frequency_score = frequency_score
+                    .checked_add(u64::from(byte_frequency_rank(needle)).saturating_add(1))
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "folded root prefilter frequency score",
+                    })?;
+            }
+            if structural_leads == needle_count {
+                continue;
+            }
+            record_prefilter_column(
+                &mut selected,
+                PrefilterColumn {
+                    needles,
+                    needle_count: u8::try_from(needle_count).map_err(|_| {
+                        BuildError::Invariant {
+                            detail: "folded root prefilter needle count does not fit u8",
+                        }
+                    })?,
+                    offset,
                     structural_leads,
                     frequency_score,
-                    core::cmp::Reverse(offset),
-                ) < (best_leads, best_score, core::cmp::Reverse(best_offset))
+                },
+            );
+        }
+        if pattern_count != 1 || fixed_width == Some(0) || next_state == Some(NONE) {
+            break;
+        }
+        let Some(width) = fixed_width else {
+            return Err(BuildError::Invariant {
+                detail: "folded root prefilter class has no width",
             });
-        if replace {
-            selected = Some((structural_leads, frequency_score, offset, prefilter));
+        };
+        let Some(target) = next_state else {
+            return Err(BuildError::Invariant {
+                detail: "folded root prefilter class has no target",
+            });
+        };
+        absolute_offset =
+            absolute_offset
+                .checked_add(width)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded root prefilter prefix width",
+                })?;
+        state = target;
+        traversed_states =
+            traversed_states
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded root prefilter traversed states",
+                })?;
+        if traversed_states >= nodes.len() {
+            return Err(BuildError::Invariant {
+                detail: "folded root prefilter path contains a cycle",
+            });
         }
     }
-    let selected = selected.and_then(|(structural_leads, _, _, prefilter)| {
-        (structural_leads < usize::from(prefilter.needle_count)).then_some(prefilter)
+    let selected = selected[0].map(|primary| {
+        let guard = selected[1];
+        RootPrefilter {
+            needles: primary.needles,
+            needle_count: primary.needle_count,
+            offset: primary.offset,
+            guard_needles: guard.map_or([0; MAX_ROOT_PREFILTER_NEEDLES], |guard| guard.needles),
+            guard_needle_count: guard.map_or(0, |guard| guard.needle_count),
+            guard_offset: guard.map_or(0, |guard| guard.offset),
+        }
     });
     Ok((selected, work))
+}
+
+fn record_prefilter_column(
+    selected: &mut [Option<PrefilterColumn>; 2],
+    candidate: PrefilterColumn,
+) {
+    if selected[0].is_none_or(|best| prefilter_column_is_better(candidate, best)) {
+        selected[1] = selected[0];
+        selected[0] = Some(candidate);
+    } else if selected[1].is_none_or(|best| prefilter_column_is_better(candidate, best)) {
+        selected[1] = Some(candidate);
+    }
+}
+
+fn prefilter_column_is_better(candidate: PrefilterColumn, incumbent: PrefilterColumn) -> bool {
+    (
+        candidate.structural_leads,
+        candidate.frequency_score,
+        core::cmp::Reverse(candidate.offset),
+    ) < (
+        incumbent.structural_leads,
+        incumbent.frequency_score,
+        core::cmp::Reverse(incumbent.offset),
+    )
 }
 
 fn scan_folded_start<F>(
@@ -1168,7 +1337,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         })?;
     let insertion_probes_upper_bound = pairwise_comparisons;
     let root_prefilter_work_upper_bound =
-        preflight_root_prefilter_work_upper_bound(equivalent_scalars)?;
+        preflight_root_prefilter_work_upper_bound(scalar_positions, equivalent_scalars)?;
     let insertion_work =
         insertion_probes_upper_bound
             .checked_add(equivalent_scalars.checked_mul(3).ok_or(
@@ -1208,6 +1377,8 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         root_prefilter_work: 0,
         root_prefilter_needles: 0,
         root_prefilter_offset: None,
+        root_prefilter_guard_needles: 0,
+        root_prefilter_guard_offset: None,
         work: 0,
         persistent_bytes: 0,
         peak_bytes: 0,
@@ -1219,28 +1390,44 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
 }
 
 fn preflight_root_prefilter_work_upper_bound(
+    scalar_positions: usize,
     equivalent_scalars: usize,
 ) -> Result<usize, BuildError> {
-    let needle_work = checked_build_mul(
+    let columns = checked_build_mul(
+        scalar_positions,
+        MAX_UTF8_WIDTH,
+        "folded root prefilter column upper bound",
+    )?;
+    let needle_work_per_column = checked_build_mul(
         MAX_ROOT_PREFILTER_NEEDLES,
         ROOT_PREFILTER_NEEDLE_WORK,
         "folded root prefilter needle upper work",
     )?;
-    let per_offset_work = checked_build_mul(
+    let needle_work = checked_build_mul(
+        columns,
+        needle_work_per_column,
+        "folded root prefilter all-needle upper work",
+    )?;
+    let offset_work = checked_build_mul(
+        columns,
+        ROOT_PREFILTER_OFFSET_WORK,
+        "folded root prefilter offset upper work",
+    )?;
+    let edge_work = checked_build_mul(
         equivalent_scalars,
         ROOT_PREFILTER_EDGE_WORK,
         "folded root prefilter edge upper work",
     )?
-    .checked_add(ROOT_PREFILTER_OFFSET_WORK)
-    .and_then(|value| value.checked_add(needle_work))
+    .checked_mul(MAX_UTF8_WIDTH)
     .ok_or(BuildError::ArithmeticOverflow {
-        computation: "folded root prefilter per-offset upper work",
+        computation: "folded root prefilter all-edge upper work",
     })?;
-    checked_build_mul(
-        MAX_UTF8_WIDTH,
-        per_offset_work,
-        "folded root prefilter upper work",
-    )
+    offset_work
+        .checked_add(edge_work)
+        .and_then(|work| work.checked_add(needle_work))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root prefilter upper work",
+        })
 }
 
 fn enforce_build_limits(
@@ -2075,6 +2262,14 @@ mod tests {
         assert_eq!(needles, [0x88, 0xA8]);
         assert_eq!(plan.build.root_prefilter_offset, Some(1));
         assert_eq!(plan.build.root_prefilter_needles, 2);
+        assert_eq!(prefilter.guard_offset, 3);
+        assert_eq!(prefilter.guard_needle_count, 2);
+        let mut guard_needles =
+            prefilter.guard_needles[..usize::from(prefilter.guard_needle_count)].to_vec();
+        guard_needles.sort_unstable();
+        assert_eq!(guard_needles, [0x95, 0xB5]);
+        assert_eq!(plan.build.root_prefilter_guard_offset, Some(3));
+        assert_eq!(plan.build.root_prefilter_guard_needles, 2);
     }
 
     #[test]

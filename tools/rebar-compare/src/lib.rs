@@ -574,7 +574,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; Unicode-on continuation count may use compact canonical terminal-scalar encodings to seed prospectively bounded required-suffix reverse rows, with wide domains retaining the incumbent route",
         );
         identity.identity.push_str(
-            "; unicode-folded-literal-v1 construction-selects a bounded finite canonical case-fold trie from one eligible nonempty literal/class sequence, then count and span-sum reuse one allocation-free common-offset byte prefilter plus exact scalar-trie validation under explicit build and run receipts",
+            "; unicode-folded-literal-v2 construction-selects a bounded finite canonical case-fold trie from one eligible nonempty literal/class sequence, then count and span-sum reuse one allocation-free ranked fixed-column byte prefilter, a second source-independent fixed-column guard when available, and exact scalar-trie validation under explicit build and run receipts",
         );
         identity.availability.push_str(
             "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences whose non-ASCII folded root has at most four canonical members and whose Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
@@ -1985,7 +1985,7 @@ pub fn current_fre_rebar_aggregate_operation_lifecycle(
     }
 }
 
-const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v1";
+const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v2";
 
 fn unicode_folded_literal_build_limits(
     limits: &RunLimits,
