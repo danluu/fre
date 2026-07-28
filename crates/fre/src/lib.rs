@@ -53,6 +53,7 @@ pub mod operation_session;
 mod qualified_exact_search;
 mod replacement;
 mod required_literal;
+mod reverse_inner;
 mod set;
 mod split;
 #[cfg(all(
@@ -104,16 +105,16 @@ pub use aggregate::{
     AggregateLiteralClassRunLiteralIdentity, AggregateLiteralIneligibility, AggregateOperation,
     AggregatePlanIdentity, AggregatePlanKind, AggregatePlanSelection,
     AggregatePrefixClassAlternationIdentity, AggregateRetainedFullWindowUpperBounds,
-    AggregateRunLimits, AggregateSearchStep, AggregateSearchStepIter, AggregateSpanIter,
-    AggregateSpanSumRegex, AggregateSpanSumResult, AggregateSpans, AggregateSpansRegex,
-    AggregateStrategy, AggregateTokenPhraseIdentity, AggregateTokenPhraseSemantics,
-    AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics, AggregateValueCounterResult,
-    AggregateWordRunIdentity, AggregateWordRunSemantics, LITERAL_ANCHOR_AGGREGATE_ACCOUNTING_ID,
-    LITERAL_ANCHOR_AGGREGATE_SCHEMA_VERSION, LiteralAnchorAggregateBuildError,
-    LiteralAnchorAggregateBuildLimits, LiteralAnchorAggregateBuildReport,
-    LiteralAnchorAggregateBuilder, LiteralAnchorAggregateCountRegex,
-    LiteralAnchorAggregateExecutionReceipt, LiteralAnchorAggregateRoute,
-    LiteralAnchorAggregateRunError, LiteralAnchorAggregateRunLimits,
+    AggregateReverseInnerIdentity, AggregateRunLimits, AggregateSearchStep,
+    AggregateSearchStepIter, AggregateSpanIter, AggregateSpanSumRegex, AggregateSpanSumResult,
+    AggregateSpans, AggregateSpansRegex, AggregateStrategy, AggregateTokenPhraseIdentity,
+    AggregateTokenPhraseSemantics, AggregateUnicodeScalarIdentity, AggregateUnicodeScalarSemantics,
+    AggregateValueCounterResult, AggregateWordRunIdentity, AggregateWordRunSemantics,
+    LITERAL_ANCHOR_AGGREGATE_ACCOUNTING_ID, LITERAL_ANCHOR_AGGREGATE_SCHEMA_VERSION,
+    LiteralAnchorAggregateBuildError, LiteralAnchorAggregateBuildLimits,
+    LiteralAnchorAggregateBuildReport, LiteralAnchorAggregateBuilder,
+    LiteralAnchorAggregateCountRegex, LiteralAnchorAggregateExecutionReceipt,
+    LiteralAnchorAggregateRoute, LiteralAnchorAggregateRunError, LiteralAnchorAggregateRunLimits,
     LiteralAnchorAggregateSpanSumRegex, LiteralAnchorCandidateBuildReport,
     LiteralAnchorCandidateExecutionReceipt, LiteralAnchorFallbackReason,
     PORTABLE_GREP_ACCOUNTING_ID, PORTABLE_GREP_ACCOUNTING_VERSION, PORTABLE_GREP_ALGORITHM_VERSION,
@@ -396,6 +397,11 @@ pub use fre_kernels::{
     PrefixClassUniformParticipationIdentity, PrefixClassUniformParticipationInvocation,
     PrefixClassUniformParticipationLimits, PrefixClassUniformParticipationProspective,
     PrefixClassUniformParticipationResult, PrefixClassUniformParticipationSchema,
+    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_MAX_LITERALS, REVERSE_INNER_PLAN_ID,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerActualCounters, ReverseInnerBuildAccounting,
+    ReverseInnerBuildError, ReverseInnerBuildLimits, ReverseInnerOperation,
+    ReverseInnerOperationIdentity, ReverseInnerReduceAccounting, ReverseInnerReduceError,
+    ReverseInnerReduceLimits, ReverseInnerSemantics, ReverseInnerUpperBounds,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SparseOrderedLiteralAggregateActualCounters,
     SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildError,
@@ -405,8 +411,7 @@ pub use fre_kernels::{
     TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseActualCounters, TokenPhraseBuildAccounting,
     TokenPhraseBuildError, TokenPhraseBuildLimits, TokenPhraseOperationIdentity,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits, TokenPhraseRoute,
-    TokenPhraseTopology,
-    TokenPhraseUpperBounds, UnicodeScalarAggregateBuildAccounting,
+    TokenPhraseTopology, TokenPhraseUpperBounds, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,

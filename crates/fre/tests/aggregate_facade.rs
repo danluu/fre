@@ -598,6 +598,7 @@ fn continuation_details(
         | AggregateExecutionDetails::BoundedSeparatedFields(_)
         | AggregateExecutionDetails::PrefixClassAlternation(_)
         | AggregateExecutionDetails::LiteralClassRunLiteral(_)
+        | AggregateExecutionDetails::ReverseInner(_)
         | AggregateExecutionDetails::BoundedLiteralPair(_)
         | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::BoundedContextSpanSum(_)

@@ -46,6 +46,7 @@ mod packed_ordered_literal_aggregate;
 mod prefix_class_alternation;
 mod required_internal_anchor;
 mod required_literal;
+mod reverse_inner;
 mod sparse_ordered_literal_aggregate;
 mod token_phrase;
 mod unicode_scalar_aggregate;
@@ -484,6 +485,17 @@ pub use required_literal::{
     PLAN_ID as REQUIRED_LITERAL_PLAN_ID, RequiredLiteralPlan,
     SearchAccounting as RequiredLiteralSearchAccounting, SearchError as RequiredLiteralSearchError,
     SearchLimits as RequiredLiteralSearchLimits,
+};
+pub use reverse_inner::{
+    BuildAccounting as ReverseInnerBuildAccounting, BuildError as ReverseInnerBuildError,
+    BuildLimits as ReverseInnerBuildLimits, COUNT_OPERATION_ID as REVERSE_INNER_COUNT_OPERATION_ID,
+    CountResult as ReverseInnerCountResult, MAX_LITERALS as REVERSE_INNER_MAX_LITERALS,
+    Operation as ReverseInnerOperation, OperationIdentity as ReverseInnerOperationIdentity,
+    PLAN_ID as REVERSE_INNER_PLAN_ID, ReduceAccounting as ReverseInnerReduceAccounting,
+    ReduceActualCounters as ReverseInnerActualCounters, ReduceError as ReverseInnerReduceError,
+    ReduceLimits as ReverseInnerReduceLimits, ReduceUpperBounds as ReverseInnerUpperBounds,
+    ReverseInnerPlan, SPAN_SUM_OPERATION_ID as REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    Semantics as ReverseInnerSemantics, SpanSumResult as ReverseInnerSpanSumResult,
 };
 pub use sparse_ordered_literal_aggregate::{
     ALGORITHM_ID as SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,

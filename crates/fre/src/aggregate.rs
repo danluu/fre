@@ -91,27 +91,32 @@ use fre_kernels::{
     PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
     PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
-    PackedOrderedLiteralAggregateActualCounters,
-    PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
-    PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
-    PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
-    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateUpperBounds,
-    PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
-    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
-    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
-    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, PrefixClassAlternationSpanSumResult,
-    PrefixClassAlternationUpperBounds, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    SimdDispatchContext, SparseOrderedLiteralAggregateActualCounters,
-    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildAttemptActual,
-    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
-    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
-    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
-    SparseOrderedLiteralSpanSumPlan, TOKEN_PHRASE_COUNT_OPERATION_ID,
-    TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseBuildAccounting, TokenPhraseBuildError,
-    TokenPhraseBuildLimits, TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
+    PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
+    PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
+    PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
+    PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
+    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
+    PackedOrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
+    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
+    PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
+    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
+    PrefixClassAlternationSpanSumResult, PrefixClassAlternationUpperBounds,
+    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    ReverseInnerBuildAccounting, ReverseInnerBuildError, ReverseInnerBuildLimits,
+    ReverseInnerCountResult, ReverseInnerOperationIdentity, ReverseInnerPlan,
+    ReverseInnerReduceAccounting, ReverseInnerReduceError, ReverseInnerReduceLimits,
+    ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
+    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
+    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
+    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
+    SparseOrderedLiteralAggregateBuildAttemptActual, SparseOrderedLiteralAggregateBuildError,
+    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
+    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
+    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
+    TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
+    TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
+    TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
     TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
@@ -140,7 +145,7 @@ use crate::{
     AggregateOperationCertificate, AggregateOperationLimits, AggregatePlanId, AggregateResource,
     BuildError, Match, aggregate_construction::AggregateInspectionAttemptError, blocking_delimiter,
     bounded_literal_pair, finite, finite_root, fixed_absolute, grapheme_scalar, guarded_ascii_word,
-    literal_assertions, literal_class_run_literal, token_phrase, unicode_word_run,
+    literal_assertions, literal_class_run_literal, reverse_inner, token_phrase, unicode_word_run,
 };
 
 mod forced_priority;
@@ -202,7 +207,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 42;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 43;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -234,6 +239,8 @@ pub enum AggregateRetainedFullWindowUpperBounds {
     PrefixClassAlternation(PrefixClassAlternationUpperBounds),
     /// Literal/class-run/literal count or span-sum reducer.
     LiteralClassRunLiteral(LiteralClassRunLiteralUpperBounds),
+    /// Required-inner-literal Unicode maximal-run reducer.
+    ReverseInner(ReverseInnerUpperBounds),
     /// Bounded-context count reducer.
     BoundedContextCount(BoundedContextUpperBounds),
     /// Bounded-context span-sum reducer.
@@ -291,6 +298,9 @@ pub enum AggregatePlanKind {
     /// Fixed literals bracketing one maximal nonempty Unicode-off byte-class
     /// run, reduced by one monotone run stream.
     LiteralClassRunLiteral,
+    /// Required ASCII literals inside the strict interior of one maximal
+    /// Unicode scalar-class run.
+    ReverseInner,
     /// Two swapped literal endpoints separated by one common finite greedy
     /// byte-class gap and reduced by bounded start/endpoint arbitration.
     BoundedLiteralPair,
@@ -347,6 +357,8 @@ pub enum AggregatePlanIdentity {
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Unicode-off literal/class-run/literal proof and operation identity.
     LiteralClassRunLiteral(AggregateLiteralClassRunLiteralIdentity),
+    /// Unicode scalar-class reverse-inner proof and operation identity.
+    ReverseInner(AggregateReverseInnerIdentity),
     /// Unicode-off swapped bounded literal-pair proof and native operation
     /// identity.
     BoundedLiteralPair(AggregateBoundedLiteralPairIdentity),
@@ -577,6 +589,12 @@ pub struct AggregatePrefixClassAlternationIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateLiteralClassRunLiteralIdentity {
     pub kernel: LiteralClassRunLiteralOperationIdentity,
+}
+
+/// Facade identity for the Unicode reverse-inner reducer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateReverseInnerIdentity {
+    pub kernel: ReverseInnerOperationIdentity,
 }
 
 /// Facade identity for the Unicode-off swapped bounded literal-pair reducer.
@@ -1147,6 +1165,8 @@ pub enum AggregateBuildAccounting {
     PrefixClassAlternation(PrefixClassAlternationBuildAccounting),
     /// Literal/class-run/literal construction certificate.
     LiteralClassRunLiteral(LiteralClassRunLiteralBuildAccounting),
+    /// Unicode reverse-inner construction certificate.
+    ReverseInner(ReverseInnerBuildAccounting),
     /// Swapped bounded literal-pair construction certificate.
     BoundedLiteralPair(BoundedLiteralPairBuildAccounting),
     /// Bounded-context construction certificate.
@@ -1254,6 +1274,8 @@ pub struct AggregateBuildLimits {
     pub prefix_class_alternation: PrefixClassAlternationBuildLimits,
     /// Complete literal/class-run/literal construction limits.
     pub literal_class_run_literal: LiteralClassRunLiteralBuildLimits,
+    /// Complete Unicode reverse-inner construction limits.
+    pub reverse_inner: ReverseInnerBuildLimits,
     /// Complete swapped bounded literal-pair construction limits.
     pub bounded_literal_pair: BoundedLiteralPairBuildLimits,
     /// Complete bounded-context construction limits.
@@ -1303,6 +1325,7 @@ impl Default for AggregateBuildLimits {
             bounded_separated_fields: BoundedSeparatedFieldsBuildLimits::default(),
             prefix_class_alternation: PrefixClassAlternationBuildLimits::default(),
             literal_class_run_literal: LiteralClassRunLiteralBuildLimits::default(),
+            reverse_inner: ReverseInnerBuildLimits::default(),
             bounded_literal_pair: BoundedLiteralPairBuildLimits::default(),
             bounded_context: BoundedContextBuildLimits::default(),
             fixed_absolute: FixedAbsoluteDomainBuildLimits::default(),
@@ -1411,6 +1434,8 @@ pub struct AggregateRunLimits {
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Direct literal/class-run/literal reduction limits.
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
+    /// Direct Unicode reverse-inner reduction limits.
+    pub reverse_inner: ReverseInnerReduceLimits,
     /// Direct swapped bounded literal-pair count/span-sum limits.
     pub bounded_literal_pair: BoundedLiteralPairReduceLimits,
     /// Direct bounded-context limits. The selected operation interprets the
@@ -1537,6 +1562,8 @@ fn aggregate_construction_prospective(
             .map_err(|_| "bounded-pair construction work does not fit u64")?,
         u64::try_from(limits.literal_class_run_literal.max_build_work)
             .map_err(|_| "literal-class construction work does not fit u64")?,
+        u64::try_from(limits.reverse_inner.max_build_work)
+            .map_err(|_| "reverse-inner construction work does not fit u64")?,
         u64::try_from(limits.bounded_context.max_build_work)
             .map_err(|_| "bounded-context construction work does not fit u64")?,
         limits.fixed_absolute.max_build_work,
@@ -1642,6 +1669,10 @@ fn aggregate_construction_prospective(
         (
             limits.literal_class_run_literal.max_peak_bytes,
             limits.literal_class_run_literal.max_persistent_bytes,
+        ),
+        (
+            limits.reverse_inner.max_peak_bytes,
+            limits.reverse_inner.max_persistent_bytes,
         ),
         (
             limits.bounded_context.max_peak_bytes,
@@ -2303,6 +2334,7 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
         AggregatePlanKind::LiteralClassRunLiteral => {
             AggregateConstructionStage::LiteralClassRunLiteral
         }
+        AggregatePlanKind::ReverseInner => AggregateConstructionStage::LiteralClassRunLiteral,
         AggregatePlanKind::BoundedContext
             if matches!(
                 report.plan_identity,
@@ -2334,6 +2366,7 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
 
 #[allow(
     clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
     reason = "the complete Copy plan identity is matched by value throughout the construction closure protocol"
 )]
 fn construction_stage_closes_plan(
@@ -2419,6 +2452,10 @@ fn construction_stage_closes_plan(
             AggregateConstructionStage::LiteralClassRunLiteral,
             AggregatePlanKind::LiteralClassRunLiteral,
             AggregatePlanIdentity::LiteralClassRunLiteral(_),
+        ) | (
+            AggregateConstructionStage::LiteralClassRunLiteral,
+            AggregatePlanKind::ReverseInner,
+            AggregatePlanIdentity::ReverseInner(_),
         ) | (
             AggregateConstructionStage::BoundedAffix | AggregateConstructionStage::BoundedContext,
             AggregatePlanKind::BoundedContext,
@@ -3540,6 +3577,7 @@ pub enum AggregateDirectRoute {
     BoundedSeparatedFields,
     PrefixClassAlternation,
     LiteralClassRunLiteral,
+    ReverseInner,
     BoundedLiteralPair,
     BoundedContext,
     PackedFiniteLiteral,
@@ -3669,6 +3707,11 @@ fn direct_route_matches_plan(
             AggregateDirectRoute::LiteralClassRunLiteral,
             AggregatePlanKind::LiteralClassRunLiteral,
             AggregatePlanIdentity::LiteralClassRunLiteral(_),
+        )
+        | (
+            AggregateDirectRoute::ReverseInner,
+            AggregatePlanKind::ReverseInner,
+            AggregatePlanIdentity::ReverseInner(_),
         )
         | (
             AggregateDirectRoute::BoundedLiteralPair,
@@ -3916,6 +3959,12 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
             Some(LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID),
         ),
+        AggregatePlanIdentity::ReverseInner(identity) => direct_operation_id_closes(
+            cache.operation,
+            identity.kernel.operation_id,
+            REVERSE_INNER_COUNT_OPERATION_ID,
+            Some(REVERSE_INNER_SPAN_SUM_OPERATION_ID),
+        ),
         AggregatePlanIdentity::BoundedLiteralPair(identity) => direct_operation_id_closes(
             cache.operation,
             identity.kernel.operation_id,
@@ -4153,6 +4202,18 @@ fn direct_details_close_cache(
                     identity.kernel.operation_id,
                     LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID,
                     Some(LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID),
+                )
+        }
+        (
+            AggregatePlanIdentity::ReverseInner(identity),
+            AggregateExecutionDetails::ReverseInner(accounting),
+        ) => {
+            identity.kernel == accounting.identity
+                && direct_operation_id_closes(
+                    cache.operation,
+                    identity.kernel.operation_id,
+                    REVERSE_INNER_COUNT_OPERATION_ID,
+                    Some(REVERSE_INNER_SPAN_SUM_OPERATION_ID),
                 )
         }
         (
@@ -5180,6 +5241,12 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: LiteralClassRunLiteralBuildError,
     },
+    /// Unicode reverse-inner construction failed after selection.
+    ReverseInnerBuild {
+        operation: AggregateOperation,
+        selection: AggregatePlanSelection,
+        source: ReverseInnerBuildError,
+    },
     /// Swapped bounded literal-pair construction failed after selection.
     BoundedLiteralPairBuild {
         operation: AggregateOperation,
@@ -5462,6 +5529,11 @@ impl AggregateBuildError {
                 selection,
                 ..
             }
+            | Self::ReverseInnerBuild {
+                operation,
+                selection,
+                ..
+            }
             | Self::BoundedLiteralPairBuild {
                 operation,
                 selection,
@@ -5582,7 +5654,8 @@ impl AggregateBuildError {
                 stage == AggregateConstructionStage::PrefixClassAlternation
             }
             Self::LiteralClassRunLiteralPlannerWorkLimit { .. }
-            | Self::LiteralClassRunLiteralBuild { .. } => {
+            | Self::LiteralClassRunLiteralBuild { .. }
+            | Self::ReverseInnerBuild { .. } => {
                 stage == AggregateConstructionStage::LiteralClassRunLiteral
             }
             Self::BoundedLiteralPairPlannerWorkLimit { .. }
@@ -6055,6 +6128,14 @@ impl fmt::Display for AggregateBuildError {
                 f,
                 "aggregate {operation:?}/{selection:?} literal/class-run/literal construction failed: {source}"
             ),
+            Self::ReverseInnerBuild {
+                operation,
+                selection,
+                source,
+            } => write!(
+                f,
+                "aggregate {operation:?}/{selection:?} Unicode reverse-inner construction failed: {source}"
+            ),
             Self::BoundedLiteralPairBuild {
                 operation,
                 selection,
@@ -6187,6 +6268,7 @@ impl std::error::Error for AggregateBuildError {
             Self::BoundedSeparatedFieldsBuild { source, .. } => Some(source),
             Self::PrefixClassAlternationBuild { source, .. } => Some(source),
             Self::LiteralClassRunLiteralBuild { source, .. } => Some(source),
+            Self::ReverseInnerBuild { source, .. } => Some(source),
             Self::BoundedLiteralPairBuild { source, .. } => Some(source),
             Self::BoundedContextBuild { source, .. } => Some(source),
             Self::FixedAbsoluteDomainBuild { source, .. }
@@ -6375,6 +6457,8 @@ pub enum AggregateExecutionSource {
     PrefixClassAlternation(PrefixClassAlternationReduceError),
     /// Direct literal/class-run/literal refusal.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceError),
+    /// Direct Unicode reverse-inner refusal.
+    ReverseInner(ReverseInnerReduceError),
     /// Direct swapped bounded literal-pair refusal.
     BoundedLiteralPair(BoundedLiteralPairReduceError),
     /// Direct bounded-context refusal.
@@ -6418,6 +6502,7 @@ impl fmt::Display for AggregateExecutionSource {
             Self::BoundedSeparatedFields(source) => source.fmt(f),
             Self::PrefixClassAlternation(source) => source.fmt(f),
             Self::LiteralClassRunLiteral(source) => source.fmt(f),
+            Self::ReverseInner(source) => source.fmt(f),
             Self::BoundedLiteralPair(source) => source.fmt(f),
             Self::BoundedContext(source) => source.fmt(f),
             Self::FixedAbsoluteDomain => f.write_str("fixed absolute-domain guard attempt failed"),
@@ -6452,6 +6537,7 @@ impl std::error::Error for AggregateExecutionSource {
             Self::BoundedSeparatedFields(source) => Some(source),
             Self::PrefixClassAlternation(source) => Some(source),
             Self::LiteralClassRunLiteral(source) => Some(source),
+            Self::ReverseInner(source) => Some(source),
             Self::BoundedLiteralPair(source) => Some(source),
             Self::BoundedContext(source) => Some(source),
             Self::FixedAbsoluteDomain
@@ -6482,6 +6568,7 @@ impl AggregateExecutionSource {
             Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
             Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
+            Self::ReverseInner(_) => Some(AggregateDirectRoute::ReverseInner),
             Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
             Self::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
             Self::PackedFiniteLiteral(_) => Some(AggregateDirectRoute::PackedFiniteLiteral),
@@ -6691,6 +6778,8 @@ pub enum AggregateExecutionDetails {
     PrefixClassAlternation(PrefixClassAlternationReduceAccounting),
     /// Literal/class-run/literal bounds, counters, and identity.
     LiteralClassRunLiteral(LiteralClassRunLiteralReduceAccounting),
+    /// Unicode reverse-inner bounds, counters, and identity.
+    ReverseInner(ReverseInnerReduceAccounting),
     /// Swapped bounded literal-pair bounds, counters, and identity.
     BoundedLiteralPair(BoundedLiteralPairReduceAccounting),
     /// Bounded-context bounds, counters, and operation identity.
@@ -6743,6 +6832,7 @@ impl AggregateExecutionDetails {
             Self::BoundedSeparatedFields(_) => Some(AggregateDirectRoute::BoundedSeparatedFields),
             Self::PrefixClassAlternation(_) => Some(AggregateDirectRoute::PrefixClassAlternation),
             Self::LiteralClassRunLiteral(_) => Some(AggregateDirectRoute::LiteralClassRunLiteral),
+            Self::ReverseInner(_) => Some(AggregateDirectRoute::ReverseInner),
             Self::BoundedLiteralPair(_) => Some(AggregateDirectRoute::BoundedLiteralPair),
             Self::BoundedContext(_) | Self::BoundedContextSpanSum(_) => {
                 Some(AggregateDirectRoute::BoundedContext)
@@ -10073,6 +10163,162 @@ impl AggregateBuilder {
                 0
             }
         };
+        let reverse_inner_inspection = if unicode
+            && !case_insensitive
+            && selection == AggregatePlanSelection::Auto
+            && operation != AggregateOperation::Spans
+        {
+            Some(
+                reverse_inner::inspect_attempt(
+                    &rust.hir,
+                    limits.max_literal_class_run_literal_planner_work,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = construction_work_effect(error.work());
+                    match error.into_source() {
+                        reverse_inner::InspectionError::WorkLimit { needed, limit } => {
+                            AggregateBuildError::LiteralClassRunLiteralPlannerWorkLimit {
+                                operation,
+                                selection,
+                                needed,
+                                limit,
+                            }
+                        }
+                        reverse_inner::InspectionError::Overflow => {
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "reverse-inner inspection accounting overflow",
+                            }
+                        }
+                    }
+                })?,
+            )
+        } else {
+            None
+        };
+        let reverse_inner_planner_work = match reverse_inner_inspection {
+            Some(reverse_inner::Inspection::Eligible {
+                class,
+                literals,
+                literal_count,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                    construction_work_effect(work),
+                );
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from reverse-inner inspection",
+                    });
+                }
+                let attempt = ReverseInnerPlan::build_attempt(
+                    class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end())),
+                    &literals[..literal_count],
+                    limits.reverse_inner,
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect =
+                        direct_build_stage_effect(work, error.actual());
+                    AggregateBuildError::ReverseInnerBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
+                })?;
+                let (engine, build_actual) = attempt.into_parts();
+                retain_direct_build_success(construction, work, build_actual);
+                let build = engine.build_accounting();
+                let kernel = match operation {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "span iteration selected reverse-inner reducer",
+                        });
+                    }
+                };
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
+                    plan: AggregatePlanKind::ReverseInner,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    literal_assertions_planner_work,
+                    blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work,
+                    literal_class_run_literal_planner_work: work,
+                    bounded_literal_pair_planner_work,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work: captures,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::ReverseInner(build),
+                    plan_identity: AggregatePlanIdentity::ReverseInner(
+                        AggregateReverseInnerIdentity { kernel },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::ReverseInner(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
+            Some(reverse_inner::Inspection::Ineligible { work }) => {
+                record_construction_ineligible(
+                    construction,
+                    AggregateConstructionStage::LiteralClassRunLiteral,
+                    work,
+                );
+                work
+            }
+            None => {
+                if unicode {
+                    record_construction_policy_skip(
+                        construction,
+                        AggregateConstructionStage::LiteralClassRunLiteral,
+                    );
+                }
+                0
+            }
+        };
         let literal_class_run_literal_inspection = if !unicode
             && !case_insensitive
             && selection == AggregatePlanSelection::Auto
@@ -10236,11 +10482,15 @@ impl AggregateBuilder {
                 work
             }
             None => {
-                record_construction_policy_skip(
-                    construction,
-                    AggregateConstructionStage::LiteralClassRunLiteral,
-                );
-                0
+                if unicode {
+                    reverse_inner_planner_work
+                } else {
+                    record_construction_policy_skip(
+                        construction,
+                        AggregateConstructionStage::LiteralClassRunLiteral,
+                    );
+                    0
+                }
             }
         };
         let bounded_affix_planner_work;
@@ -13255,6 +13505,7 @@ enum AggregateEngine {
     BoundedSeparatedFields(BoundedSeparatedFieldsPlan),
     PrefixClassAlternation(AggregatePrefixClassAlternationEngine),
     LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
+    ReverseInner(ReverseInnerPlan),
     BoundedLiteralPair(BoundedLiteralPairPlan),
     BoundedContext(BoundedContextPlan),
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainEngine),
@@ -13389,6 +13640,7 @@ impl AggregatePlan {
             AggregateEngine::LiteralClassRunLiteral(_) => {
                 Some(AggregateDirectRoute::LiteralClassRunLiteral)
             }
+            AggregateEngine::ReverseInner(_) => Some(AggregateDirectRoute::ReverseInner),
             AggregateEngine::BoundedLiteralPair(_) => {
                 Some(AggregateDirectRoute::BoundedLiteralPair)
             }
@@ -13814,6 +14066,41 @@ impl AggregatePlan {
                     .map(AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral)
                     .map(Some)
                     .map_err(AggregateExecutionSource::LiteralClassRunLiteral)
+            }
+            AggregateEngine::ReverseInner(engine) => {
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained reverse-inner owner has an unsupported operation",
+                        ));
+                    }
+                };
+                let (
+                    AggregatePlanIdentity::ReverseInner(identity),
+                    AggregateBuildAccounting::ReverseInner(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained reverse-inner owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::ReverseInner)
+                    || identity.kernel != expected_identity
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained reverse-inner owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .full_window_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::ReverseInner)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::ReverseInner)
             }
             AggregateEngine::BoundedContext(engine) => {
                 let expected_identity = match self.operation() {
@@ -14462,6 +14749,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
                     )
                 }),
+            AggregateEngine::ReverseInner(engine) => engine
+                .count(haystack, limits.reverse_inner)
+                .map(AggregateCountExecution::ReverseInner)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ReverseInner(source),
+                    )
+                }),
             AggregateEngine::BoundedLiteralPair(engine) => engine
                 .count(haystack, limits.bounded_literal_pair)
                 .map(AggregateCountExecution::BoundedLiteralPair)
@@ -14881,6 +15178,16 @@ impl AggregatePlan {
                         haystack.len(),
                         limits,
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
+                    )
+                }),
+            AggregateEngine::ReverseInner(engine) => engine
+                .span_sum(haystack, limits.reverse_inner)
+                .map(AggregateSpanSumExecution::ReverseInner)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ReverseInner(source),
                     )
                 }),
             AggregateEngine::BoundedLiteralPair(engine) => engine
@@ -15338,6 +15645,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
                     )
                 }),
+            AggregateEngine::ReverseInner(engine) => engine
+                .count(haystack, limits.reverse_inner)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ReverseInner(source),
+                    )
+                }),
             AggregateEngine::BoundedLiteralPair(engine) => engine
                 .count(haystack, limits.bounded_literal_pair)
                 .map(|result| result.count)
@@ -15668,6 +15985,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::LiteralClassRunLiteral(source),
                     )
                 }),
+            AggregateEngine::ReverseInner(engine) => engine
+                .span_sum(haystack, limits.reverse_inner)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::ReverseInner(source),
+                    )
+                }),
             AggregateEngine::BoundedLiteralPair(engine) => engine
                 .span_sum(haystack, limits.bounded_literal_pair)
                 .map(|result| result.span_sum)
@@ -15890,6 +16217,7 @@ enum AggregateCountExecution {
     BoundedSeparatedFields(BoundedSeparatedFieldsCountResult),
     PrefixClassAlternation(PrefixClassAlternationCountResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralCountResult),
+    ReverseInner(ReverseInnerCountResult),
     BoundedLiteralPair(BoundedLiteralPairCountResult),
     BoundedContext(BoundedContextCountResult),
     FixedAbsoluteDirect {
@@ -15939,6 +16267,7 @@ impl AggregateCountExecution {
             Self::BoundedSeparatedFields(result) => result.count,
             Self::PrefixClassAlternation(result) => result.count,
             Self::LiteralClassRunLiteral(result) => result.count,
+            Self::ReverseInner(result) => result.count,
             Self::BoundedLiteralPair(result) => result.count,
             Self::BoundedContext(result) => result.count,
             Self::FixedAbsoluteDirect { value, .. } | Self::FixedAbsoluteResidual { value, .. } => {
@@ -15985,6 +16314,9 @@ impl AggregateCountExecution {
             }
             Self::LiteralClassRunLiteral(result) => {
                 AggregateExecutionDetails::LiteralClassRunLiteral(result.accounting)
+            }
+            Self::ReverseInner(result) => {
+                AggregateExecutionDetails::ReverseInner(result.accounting)
             }
             Self::BoundedLiteralPair(result) => {
                 AggregateExecutionDetails::BoundedLiteralPair(result.accounting)
@@ -16073,6 +16405,7 @@ enum AggregateSpanSumExecution {
     PrefixClassAlternation(PrefixClassAlternationSpanSumResult),
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
+    ReverseInner(ReverseInnerSpanSumResult),
     BoundedLiteralPair(BoundedLiteralPairSpanSumResult),
     BoundedContext(BoundedContextSpanSumResult),
     PackedFiniteLiteral {
@@ -16111,6 +16444,7 @@ impl AggregateSpanSumExecution {
             Self::PrefixClassAlternation(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::LiteralClassRunLiteral(result) => result.span_sum,
+            Self::ReverseInner(result) => result.span_sum,
             Self::BoundedLiteralPair(result) => result.span_sum,
             Self::BoundedContext(result) => result.span_sum,
             Self::GuardedAsciiWord(result) => result.span_sum,
@@ -16150,6 +16484,9 @@ impl AggregateSpanSumExecution {
             ),
             Self::LiteralClassRunLiteral(result) => {
                 AggregateExecutionDetails::LiteralClassRunLiteral(result.accounting)
+            }
+            Self::ReverseInner(result) => {
+                AggregateExecutionDetails::ReverseInner(result.accounting)
             }
             Self::BoundedLiteralPair(result) => {
                 AggregateExecutionDetails::BoundedLiteralPair(result.accounting)
@@ -18736,7 +19073,7 @@ mod tests {
             2_400
         );
         assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 736);
-        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_360);
+        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_496);
     }
 
     #[test]

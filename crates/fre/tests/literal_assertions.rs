@@ -53,7 +53,7 @@ fn exact_sherlock_shape_selects_operation_owned_leaf_in_both_profiles() {
             count.build_report().plan,
             AggregatePlanKind::LiteralAssertions
         );
-        assert_eq!(count.build_report().schema_version, 42);
+        assert_eq!(count.build_report().schema_version, 43);
         let AggregatePlanIdentity::LiteralAssertions(count_identity) =
             count.build_report().plan_identity
         else {
