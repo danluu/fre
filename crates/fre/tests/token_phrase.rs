@@ -96,6 +96,45 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
 }
 
 #[test]
+fn facade_uses_sparse_literal_candidates_and_enforces_phrase_restart() {
+    let mut haystack = vec![b'x'; 4_096];
+    haystack.extend_from_slice(b"--a Holmes b Holmes c--");
+    haystack.extend_from_slice(&[b'y'; 4_096]);
+
+    for pattern in [ASSERTED, UNASSERTED] {
+        let expected = oracle(pattern, &haystack);
+        let count = builder(pattern).build_count().unwrap();
+        assert_eq!(count.build_report().plan, AggregatePlanKind::TokenPhrase);
+        let result = count
+            .count(&haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(result.value(), expected.0);
+        assert_eq!(expected.0, 1, "the second phrase overlaps through `b`");
+        let AggregateExecutionDetails::TokenPhrase(accounting) = result.report().details() else {
+            panic!("token phrase count executed another family");
+        };
+        assert_eq!(
+            accounting.actual.literal_comparisons,
+            haystack.len() + b"Holmes".len()
+        );
+        assert_eq!(accounting.actual.tokens, 2);
+        assert_eq!(accounting.actual.matches, 1);
+        assert_eq!(
+            accounting.actual.source_reads,
+            accounting.actual.literal_comparisons + accounting.actual.classifications
+        );
+
+        let span_sum = builder(pattern).build_span_sum().unwrap();
+        assert_eq!(
+            span_sum
+                .span_sum_value(&haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.1
+        );
+    }
+}
+
+#[test]
 fn captures_are_transparent_and_nearby_profiles_do_not_claim_the_leaf() {
     let captured = builder(r"(\b)((\w+))(\s+)(Holmes)(\s+)((\w+))(\b)")
         .build_span_sum()
