@@ -384,6 +384,29 @@ fn build_facade(
     }
 }
 
+fn build_fresh_cache_facade(
+    subject: QualificationSubject,
+    case: LiteralCase,
+    size: Size,
+) -> (SelectedEndRegisterCacheV2, QualifiedExactSearchFacade) {
+    let qualification = subject_qualification(subject);
+    let cache =
+        SelectedEndRegisterCacheV2::new(CacheLimits::default(), PublicationLimits::default())
+            .expect("fresh bounded ABI2 qualification cache");
+    let facade = QualifiedExactSearchFacade::from_builder_with_fresh_cache_for_qualification(
+        builder(case),
+        size.workload(),
+        subject.backend_policy(),
+        ValidateLimits::default(),
+        EmitLimits::default(),
+        PublicationLimits::default(),
+        qualification,
+        &cache,
+    )
+    .expect("fresh-cache facade build");
+    (cache, facade)
+}
+
 fn facade_artifact(subject: QualificationSubject, facade: &QualifiedExactSearchFacade) -> [u8; 32] {
     let report = facade
         .qualified_build_report()
@@ -580,7 +603,7 @@ fn measure_facade_full(
 ) -> Timed {
     let mut checksum = 0x6a09_e667_f3bc_c909_u64;
     let started = Instant::now();
-    let facade = build_facade(subject, case, size);
+    let (cache, facade) = build_fresh_cache_facade(subject, case, size);
     let _ = black_box(facade_artifact(subject, &facade));
     let session = facade
         .begin_current_thread_session()
@@ -596,6 +619,11 @@ fn measure_facade_full(
     }
     let total_ns = started.elapsed().as_nanos();
     black_box(checksum);
+    // Preserve the pre-cache full-workload boundary: construction and session
+    // creation are timed, while facade/cache retirement remains outside it.
+    drop(session);
+    drop(facade);
+    drop(cache);
     Timed {
         iterations: calls,
         total_ns,
@@ -625,6 +653,9 @@ fn run_cell(
     let qualification_state = qualification_label(qualification);
     let haystack = make_haystack(case, size, scenario);
     let portable = build_portable(case);
+    // The hot-search subject intentionally exercises the process-wide cache.
+    // Build/cold/full measurements below use a fresh default-policy cache per
+    // operation so compilation remains represented rather than prewarmed.
     let facade = build_facade(subject, case, size);
     let artifact_sha256 = facade_artifact(subject, &facade);
     // Session creation is deliberately outside the hot-search timer. The
@@ -665,12 +696,17 @@ fn run_cell(
     };
     let facade_build = || {
         measure(BUILD_ITERATIONS, || {
-            let cold = build_facade(subject, case, size);
-            u64::from_le_bytes(
+            let (cache, cold) = build_fresh_cache_facade(subject, case, size);
+            let artifact_prefix = u64::from_le_bytes(
                 facade_artifact(subject, &cold)[..8]
                     .try_into()
                     .expect("artifact prefix"),
-            )
+            );
+            // `measure` times the whole closure, including facade/cache
+            // retirement, matching the original construction-stage boundary.
+            drop(cold);
+            drop(cache);
+            artifact_prefix
         })
     };
     let portable_search = || {
@@ -1098,6 +1134,20 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     assert!(reporting.contains("facade_value_only(session, haystack)"));
     assert!(!reporting.contains("Instant::now"));
 
+    let fresh_start = position(source, "fn build_fresh_cache_facade(");
+    let fresh_end = fresh_start + position(&source[fresh_start..], "\nfn facade_artifact(");
+    let fresh = &source[fresh_start..fresh_end];
+    assert!(fresh.contains(
+        "SelectedEndRegisterCacheV2::new(CacheLimits::default(), PublicationLimits::default())"
+    ));
+    assert!(
+        fresh.contains(
+            "QualifiedExactSearchFacade::from_builder_with_fresh_cache_for_qualification("
+        )
+    );
+    assert!(fresh.contains("&cache,"));
+    assert!(fresh.contains("(cache, facade)"));
+
     let full_start = position(source, "fn measure_facade_full(");
     let full_end = full_start
         + position(
@@ -1106,12 +1156,23 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
         );
     let full = &source[full_start..full_end];
     let full_timer = position(full, "let started = Instant::now();");
-    let full_build = position(full, "let facade = build_facade(subject, case, size);");
+    let full_build = position(
+        full,
+        "let (cache, facade) = build_fresh_cache_facade(subject, case, size);",
+    );
     let full_session = position(full, ".begin_current_thread_session()");
     let full_loop = position(full, "for iteration in 0..calls");
+    let full_elapsed = position(full, "let total_ns = started.elapsed().as_nanos();");
+    let full_session_drop = position(full, "drop(session);");
+    let full_facade_drop = position(full, "drop(facade);");
+    let full_cache_drop = position(full, "drop(cache);");
     assert!(full_timer < full_build);
     assert!(full_build < full_session);
     assert!(full_session < full_loop);
+    assert!(full_loop < full_elapsed);
+    assert!(full_elapsed < full_session_drop);
+    assert!(full_session_drop < full_facade_drop);
+    assert!(full_facade_drop < full_cache_drop);
     let full_loop_body = &full[full_loop..];
     assert!(full_loop_body.contains("facade_value_only(&session, haystack)"));
     assert!(!full_loop_body.contains("begin_current_thread_session"));
@@ -1145,6 +1206,13 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     assert!(session < reporting);
     assert!(reporting < first_timed_closure);
     assert_eq!(cell.matches("assert_facade_reporting_contract(").count(), 1);
+    let build_start = position(cell, "let facade_build = ||");
+    let build_end = position(cell, "let portable_search = ||");
+    let build = &cell[build_start..build_end];
+    assert!(build.contains("let (cache, cold) = build_fresh_cache_facade(subject, case, size);"));
+    assert!(build.contains("drop(cold);"));
+    assert!(build.contains("drop(cache);"));
+    assert!(!build.contains("let cold = build_facade(subject, case, size);"));
     let hot = &cell[hot_start..hot_end];
     assert!(hot.contains("facade_value_only(black_box(&facade_session), black_box(&haystack))"));
     assert!(!hot.contains("begin_current_thread_session"));

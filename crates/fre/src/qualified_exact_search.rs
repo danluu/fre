@@ -1084,6 +1084,34 @@ impl QualifiedExactSearch {
         qualification: QualifiedExactSearchQualification,
         prechecked_host_support: Option<Result<(), PublishError>>,
     ) -> Result<Self, QualifiedExactSearchBuildError> {
+        Self::with_portable_plan_backend_qualification_and_cache(
+            portable,
+            workload,
+            backend_policy,
+            validation_limits,
+            emission_limits,
+            publication_limits,
+            qualification,
+            prechecked_host_support,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the qualification-only cache-injection atom keeps backend identity, bounded policies, source-final qualification, optional host proof, and the exact cache owner explicit"
+    )]
+    fn with_portable_plan_backend_qualification_and_cache(
+        portable: LiteralPlan,
+        workload: QualifiedExactSearchWorkload,
+        backend_policy: QualifiedExactSearchBackendPolicy,
+        validation_limits: ValidateLimits,
+        emission_limits: EmitLimits,
+        publication_limits: PublicationLimits,
+        qualification: QualifiedExactSearchQualification,
+        prechecked_host_support: Option<Result<(), PublishError>>,
+        selected_end_register_cache: Option<&SelectedEndRegisterCacheV2>,
+    ) -> Result<Self, QualifiedExactSearchBuildError> {
         let literal_bytes = portable.needle().len();
         let (native, native_status) = if literal_bytes != QUALIFIED_EXACT_SEARCH_LITERAL_BYTES {
             (
@@ -1120,7 +1148,11 @@ impl QualifiedExactSearch {
             (None, QualifiedExactSearchNativeStatus::Unavailable(error))
         } else if let Some(register_backend) = selected_end_register_backend_v2(backend_policy) {
             if publication_limits == PublicationLimits::default() {
-                match default_selected_end_register_cache_v2() {
+                let cache = match selected_end_register_cache {
+                    Some(cache) => Ok(cache),
+                    None => default_selected_end_register_cache_v2(),
+                };
+                match cache {
                     Ok(cache) => match cache.get_or_compile_exact_literal(
                         portable.needle(),
                         AnchorFlags::default(),
@@ -1942,6 +1974,59 @@ impl QualifiedExactSearchFacade {
         publication_limits: PublicationLimits,
         qualification: QualifiedExactSearchQualification,
     ) -> Result<Self, QualifiedExactSearchFacadeBuildError> {
+        Self::from_builder_with_backend_qualification_and_cache(
+            builder,
+            workload,
+            backend_policy,
+            validation_limits,
+            emission_limits,
+            publication_limits,
+            qualification,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the qualification harness must bind one fresh cache to the exact backend, bounded policies, and qualification subject"
+    )]
+    fn from_builder_with_fresh_cache_for_qualification(
+        builder: PortableBuilder,
+        workload: QualifiedExactSearchWorkload,
+        backend_policy: QualifiedExactSearchBackendPolicy,
+        validation_limits: ValidateLimits,
+        emission_limits: EmitLimits,
+        publication_limits: PublicationLimits,
+        qualification: QualifiedExactSearchQualification,
+        cache: &SelectedEndRegisterCacheV2,
+    ) -> Result<Self, QualifiedExactSearchFacadeBuildError> {
+        Self::from_builder_with_backend_qualification_and_cache(
+            builder,
+            workload,
+            backend_policy,
+            validation_limits,
+            emission_limits,
+            publication_limits,
+            qualification,
+            Some(cache),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the internal facade handoff keeps backend identity, bounded policies, source-final qualification, and the optional construction-only cache explicit"
+    )]
+    fn from_builder_with_backend_qualification_and_cache(
+        builder: PortableBuilder,
+        workload: QualifiedExactSearchWorkload,
+        backend_policy: QualifiedExactSearchBackendPolicy,
+        validation_limits: ValidateLimits,
+        emission_limits: EmitLimits,
+        publication_limits: PublicationLimits,
+        qualification: QualifiedExactSearchQualification,
+        cache: Option<&SelectedEndRegisterCacheV2>,
+    ) -> Result<Self, QualifiedExactSearchFacadeBuildError> {
         let portable = builder.build()?;
         let PortableRegex {
             source,
@@ -1954,16 +2039,18 @@ impl QualifiedExactSearchFacade {
         } = portable;
         let plan = match plan {
             PortablePlan::ExactLiteral(literal) => {
-                let search = QualifiedExactSearch::with_portable_plan_backend_and_qualification(
-                    literal,
-                    workload,
-                    backend_policy,
-                    validation_limits,
-                    emission_limits,
-                    publication_limits,
-                    qualification,
-                    None,
-                )?;
+                let search =
+                    QualifiedExactSearch::with_portable_plan_backend_qualification_and_cache(
+                        literal,
+                        workload,
+                        backend_policy,
+                        validation_limits,
+                        emission_limits,
+                        publication_limits,
+                        qualification,
+                        None,
+                        cache,
+                    )?;
                 QualifiedExactSearchFacadePlan::ExactLiteral(ExactFacadePlan {
                     source,
                     capture_names,
