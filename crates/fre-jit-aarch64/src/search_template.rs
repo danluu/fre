@@ -618,6 +618,43 @@ pub(crate) fn validate_search_whole_template(
     literal: &[u8],
     instructions: &[DecodedInstruction],
 ) -> Result<(), AuditError> {
+    validate_search_whole_template_with_returns(
+        image,
+        manifest,
+        literal,
+        instructions,
+        ReturnTemplate::OutSlotV1,
+    )
+}
+
+pub(crate) fn validate_selected_end_register_whole_template_v2(
+    image: &NativeImage,
+    manifest: SearchManifest,
+    literal: &[u8],
+    instructions: &[DecodedInstruction],
+) -> Result<(), AuditError> {
+    validate_search_whole_template_with_returns(
+        image,
+        manifest,
+        literal,
+        instructions,
+        ReturnTemplate::SelectedEndRegisterV2,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReturnTemplate {
+    OutSlotV1,
+    SelectedEndRegisterV2,
+}
+
+fn validate_search_whole_template_with_returns(
+    image: &NativeImage,
+    manifest: SearchManifest,
+    literal: &[u8],
+    instructions: &[DecodedInstruction],
+    returns: ReturnTemplate,
+) -> Result<(), AuditError> {
     let mut template = Template::new();
     let entry = template.new_label(LabelKind::Entry);
     let found = template.new_label(LabelKind::ReturnFound);
@@ -666,7 +703,14 @@ pub(crate) fn validate_search_whole_template(
             }
         }
     }
-    emit_returns(&mut template, manifest.output, found, none)?;
+    match returns {
+        ReturnTemplate::OutSlotV1 => {
+            emit_returns(&mut template, manifest.output, found, none)?;
+        }
+        ReturnTemplate::SelectedEndRegisterV2 => {
+            emit_selected_end_register_returns_v2(&mut template, found, none)?;
+        }
+    }
     template.validate(image, instructions)
 }
 
@@ -809,6 +853,20 @@ fn emit_returns(
         }
     }
     template.mov_imm64(0, 1);
+    template.ret();
+    template.bind(none)?;
+    template.mov_imm64(0, 0);
+    template.ret();
+    Ok(())
+}
+
+fn emit_selected_end_register_returns_v2(
+    template: &mut Template,
+    found: Label,
+    none: Label,
+) -> Result<(), AuditError> {
+    template.bind(found)?;
+    template.mov_reg(0, 14);
     template.ret();
     template.bind(none)?;
     template.mov_imm64(0, 0);

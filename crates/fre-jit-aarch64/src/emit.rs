@@ -1,7 +1,7 @@
 use fre_kernel_ir::{
     AbiVersion, AggregateOperation, AggregateOutput, AnchorFlags, BlockOp, ByteClass, Count,
     DataBlob, ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES, Operation, OutputKind,
-    SemanticsVersion, SpanSum, ValidatedProgram,
+    SelectedEnd, SemanticsVersion, SpanSum, ValidatedProgram,
 };
 use memchr::arch::all::packedpair::Pair;
 
@@ -9,8 +9,13 @@ use crate::{
     ArithmeticSite, AuditedNativeImage, BackendVersion, BranchKind, CodeLabel, Condition,
     ConfirmationKind, CpuFeatures, DataSymbol, EmitError, ImageLayout, ImageStats, LabelKind,
     NativeAggregateImage, NativeImage, Relocation, RelocationKind, RelocationTarget, ResourceKind,
-    TargetSpec, UnsupportedReason,
-    image::{AggregateManifest, DataSymbolKind, SearchManifest, SearchShape, aot_size},
+    SelectedEndRegisterBackendV2, TargetSpec, UnsupportedReason,
+    image::{
+        AggregateManifest, DataSymbolKind, SearchCallAbi, SearchManifest, SearchShape, aot_size,
+    },
+    selected_end_v2::{
+        AuditedSelectedEndRegisterImageV2, SELECTED_END_REGISTER_ARTIFACT_IDENTITY_DOMAIN_V2,
+    },
 };
 
 const CODE_ALIGNMENT: usize = 16;
@@ -177,6 +182,25 @@ pub fn emit_audited_with_backend<O: Operation>(
     emit_search_version_audited(program, limits, backend.backend_version())
 }
 
+/// Emit a sealed non-empty exact-literal `SelectedEnd` image for the
+/// windowed register-return ABI2.
+///
+/// This is a distinct publication type. Search-v1 publishers accept neither
+/// its wrapper nor its ABI-tagged underlying image.
+pub fn emit_selected_end_register_v2(
+    program: &ValidatedProgram<SelectedEnd>,
+    backend: SelectedEndRegisterBackendV2,
+    limits: EmitLimits,
+) -> Result<AuditedSelectedEndRegisterImageV2, EmitError> {
+    let image = emit_search_image(
+        program,
+        limits,
+        backend.backend_version(),
+        SearchCallAbi::SelectedEndRegisterV2,
+    )?;
+    finalize_selected_end_register_image_v2(image, limits)
+}
+
 /// Emit the opt-in SVE search backend with exactly sixteen active byte lanes.
 ///
 /// The physical architectural vector length may be larger; emitted code uses
@@ -254,6 +278,20 @@ fn emit_search_version_audited<O: Operation>(
     limits: EmitLimits,
     backend_version: BackendVersion,
 ) -> Result<AuditedNativeImage, EmitError> {
+    let image = emit_search_image(program, limits, backend_version, SearchCallAbi::OutSlotV1)?;
+    finalize_image(image, limits)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned search construction keeps one transaction from validation through immutable image construction"
+)]
+fn emit_search_image<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+    backend_version: BackendVersion,
+    search_call_abi: SearchCallAbi,
+) -> Result<NativeImage, EmitError> {
     if !matches!(
         backend_version,
         BackendVersion::SEARCH_V1
@@ -286,7 +324,21 @@ fn emit_search_version_audited<O: Operation>(
             reason: UnsupportedReason::OutputContract,
         });
     }
+    if search_call_abi == SearchCallAbi::SelectedEndRegisterV2
+        && program.raw().output != OutputKind::SelectedEnd
+    {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::OutputContract,
+        });
+    }
     let plan = Plan::recognize(program)?;
+    if search_call_abi == SearchCallAbi::SelectedEndRegisterV2
+        && !matches!(plan, Plan::Exact { literal, .. } if !literal.is_empty())
+    {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
     if matches!(
         backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
@@ -355,7 +407,14 @@ fn emit_search_version_audited<O: Operation>(
         found,
         none,
     )?;
-    emit_returns(&mut assembler, program.raw().output, found, none)?;
+    match search_call_abi {
+        SearchCallAbi::OutSlotV1 => {
+            emit_returns(&mut assembler, program.raw().output, found, none)?;
+        }
+        SearchCallAbi::SelectedEndRegisterV2 => {
+            emit_selected_end_register_returns_v2(&mut assembler, found, none)?;
+        }
+    }
     let finalized = assembler.finalize(data.bytes.len())?;
     let code_len = finalized.code.len();
     let rodata_offset = align_up(code_len, DATA_ALIGNMENT, ArithmeticSite::ImageLayout)?;
@@ -409,6 +468,7 @@ fn emit_search_version_audited<O: Operation>(
         relocations: finalized.relocations,
         stats,
         artifact_identity: crate::ArtifactIdentity::ZERO,
+        search_call_abi,
         search: matches!(
             backend_version,
             BackendVersion::SEARCH_V3
@@ -425,7 +485,7 @@ fn emit_search_version_audited<O: Operation>(
         .then_some(search_manifest),
         aggregate: None,
     };
-    finalize_image(image, limits)
+    Ok(image)
 }
 
 /// Emit one whole-haystack non-overlapping exact-literal aggregate entry.
@@ -671,6 +731,7 @@ fn build_aggregate_image<A: AggregateOperation>(
         relocations: finalized.relocations,
         stats,
         artifact_identity: crate::ArtifactIdentity::ZERO,
+        search_call_abi: SearchCallAbi::OutSlotV1,
         search: None,
         aggregate: Some(AggregateManifest {
             output: A::OUTPUT,
@@ -1169,6 +1230,16 @@ fn finalize_image(
     Ok(AuditedNativeImage::from_emitter_audit(image))
 }
 
+fn finalize_selected_end_register_image_v2(
+    mut image: NativeImage,
+    limits: EmitLimits,
+) -> Result<AuditedSelectedEndRegisterImageV2, EmitError> {
+    charge_image_identity(&mut image, limits)?;
+    let image = AuditedSelectedEndRegisterImageV2::from_emitter_candidate(image)?;
+    crate::audit_selected_end_register_v2(&image).map_err(|_| EmitError::InternalInvariant)?;
+    Ok(image)
+}
+
 fn finalize_aggregate_image(
     mut image: NativeImage,
     limits: EmitLimits,
@@ -1180,8 +1251,19 @@ fn finalize_aggregate_image(
 }
 
 fn charge_image_identity(image: &mut NativeImage, limits: EmitLimits) -> Result<(), EmitError> {
+    let identity_domain_bytes = match image.search_call_abi() {
+        SearchCallAbi::OutSlotV1 => 0,
+        SearchCallAbi::SelectedEndRegisterV2 => {
+            SELECTED_END_REGISTER_ARTIFACT_IDENTITY_DOMAIN_V2.len()
+        }
+    };
+    let identity_bytes = aot_size(image)?.checked_add(identity_domain_bytes).ok_or(
+        EmitError::ArithmeticOverflow {
+            site: ArithmeticSite::AotSize,
+        },
+    )?;
     let identity_work =
-        u64::try_from(aot_size(image)?).map_err(|_| EmitError::ArithmeticOverflow {
+        u64::try_from(identity_bytes).map_err(|_| EmitError::ArithmeticOverflow {
             site: ArithmeticSite::AotSize,
         })?;
     image.stats.emission_work = image.stats.emission_work.checked_add(identity_work).ok_or(
@@ -4243,6 +4325,19 @@ fn emit_returns(
         }
     }
     assembler.mov_imm64(X0, 1)?;
+    assembler.ret()?;
+    assembler.bind(none)?;
+    assembler.mov_imm64(X0, 0)?;
+    assembler.ret()
+}
+
+fn emit_selected_end_register_returns_v2(
+    assembler: &mut Assembler,
+    found: Label,
+    none: Label,
+) -> Result<(), EmitError> {
+    assembler.bind(found)?;
+    assembler.mov_reg(X0, X14)?;
     assembler.ret()?;
     assembler.bind(none)?;
     assembler.mov_imm64(X0, 0)?;

@@ -434,6 +434,142 @@ impl DecodedInstruction {
             | Self::Return => None,
         }
     }
+
+    /// Whether this instruction explicitly names one general-purpose
+    /// register.
+    ///
+    /// Implicit architectural operands such as `RET`'s link register and all
+    /// vector or predicate register numbers are excluded. The register-return
+    /// Search-v2 auditor uses this complete operand projection to prove that
+    /// the removed Search-v1 result-pointer register `x4` is neither read nor
+    /// written.
+    #[allow(
+        clippy::match_same_arms,
+        clippy::too_many_lines,
+        reason = "operand arities remain grouped by decoded ISA form for security review"
+    )]
+    pub(crate) fn uses_gpr(self, register: u8) -> bool {
+        match self {
+            Self::MoveRegister64 {
+                destination,
+                source,
+            } => [destination, source].contains(&register),
+            Self::MoveZero64 { destination, .. }
+            | Self::MoveKeep64 { destination, .. }
+            | Self::CompareImmediate64 {
+                register: destination,
+                ..
+            }
+            | Self::CompareImmediate32 {
+                register: destination,
+                ..
+            }
+            | Self::MoveVectorByteTo32 { destination, .. }
+            | Self::MoveVectorDoubleTo64 { destination, .. }
+            | Self::SveCountPredicateBytes { destination, .. }
+            | Self::Address { destination, .. }
+            | Self::CompareBranchZero64 {
+                register: destination,
+                ..
+            } => destination == register,
+            Self::CompareRegister64 { left, right } | Self::CompareRegister32 { left, right } => {
+                [left, right].contains(&register)
+            }
+            Self::AddRegister64 {
+                destination,
+                left,
+                right,
+            }
+            | Self::SubtractRegister64 {
+                destination,
+                left,
+                right,
+            }
+            | Self::AndRegister64 {
+                destination,
+                left,
+                right,
+            } => [destination, left, right].contains(&register),
+            Self::AddImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::SubtractImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::AndLowBits64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::LogicalShiftRightImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::LogicalShiftLeftImmediate64 {
+                destination,
+                source,
+                ..
+            }
+            | Self::ReverseBits64 {
+                destination,
+                source,
+            }
+            | Self::CountLeadingZeros64 {
+                destination,
+                source,
+            } => [destination, source].contains(&register),
+            Self::LoadByte {
+                destination, base, ..
+            } => [destination, base].contains(&register),
+            Self::LoadVector128 { base, .. }
+            | Self::LoadVectorPair128 { base, .. }
+            | Self::SveLoadBytes { base, .. } => base == register,
+            Self::LoadByteRegister {
+                destination,
+                base,
+                index,
+            }
+            | Self::Load64RegisterScaled {
+                destination,
+                base,
+                index,
+            } => [destination, base, index].contains(&register),
+            Self::Store64 { source, base, .. } => [source, base].contains(&register),
+            Self::DuplicateByte16 { source, .. } | Self::SveDuplicateByte { source, .. } => {
+                source == register
+            }
+            Self::LogicalShiftRightVariable64 {
+                destination,
+                source,
+                shift,
+            } => [destination, source, shift].contains(&register),
+            Self::CompareEqualBytes16 { .. }
+            | Self::AndBytes16 { .. }
+            | Self::ShiftRightNarrowHalfwordsToBytes8 { .. }
+            | Self::UnsignedMinBytes16 { .. }
+            | Self::UnsignedMaxBytes16 { .. }
+            | Self::UnsignedMaxPairwiseBytes16 { .. }
+            | Self::AddAcrossBytes16 { .. }
+            | Self::SvePtrueBytesVl16 { .. }
+            | Self::SveCompareEqualBytes { .. }
+            | Self::Sve2MatchBytes { .. }
+            | Self::SveAndPredicateBytes { .. }
+            | Self::SveAndPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytes { .. }
+            | Self::SveTestPredicateBytes { .. }
+            | Self::SveBreakBeforeBytes { .. }
+            | Self::SveBreakAfterBytes { .. }
+            | Self::Branch { .. }
+            | Self::BranchCondition { .. }
+            | Self::Return => false,
+        }
+    }
 }
 
 /// Failure from the small policy decoder.

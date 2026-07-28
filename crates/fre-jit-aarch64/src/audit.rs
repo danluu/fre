@@ -1,10 +1,11 @@
 use core::fmt;
 
 use crate::{
-    BackendVersion, Condition, CpuFeatures, DataSymbolKind, DecodeError, DecodedInstruction,
-    LabelKind, NativeAggregateImage, NativeImage, RelocationKind, RelocationTarget,
+    AuditedSelectedEndRegisterImageV2, BackendVersion, Condition, CpuFeatures, DataSymbolKind,
+    DecodeError, DecodedInstruction, LabelKind, NativeAggregateImage, NativeImage, RelocationKind,
+    RelocationTarget,
     decode::{canonical_word, decode},
-    image::{SearchManifest, SearchShape},
+    image::{SearchCallAbi, SearchManifest, SearchShape},
 };
 use fre_kernel_ir::{
     AggregateOutput, AnchorFlags, ByteClass, CacheIdentity, Count, Exists,
@@ -63,6 +64,10 @@ pub enum AuditError {
         displacement: u16,
     },
     ResultPointerClobber {
+        offset: u32,
+        register: u8,
+    },
+    ForbiddenSelectedEndRegisterUse {
         offset: u32,
         register: u8,
     },
@@ -171,7 +176,7 @@ impl AuditWork {
     reason = "keeping the independent linear audit in one pass makes relocation completeness auditable"
 )]
 pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
-    if image.aggregate_manifest().is_some() {
+    if image.aggregate_manifest().is_some() || image.search_call_abi() != SearchCallAbi::OutSlotV1 {
         return Err(AuditError::InvalidImageContract);
     }
     // Version and sealed-container checks intentionally precede instruction
@@ -200,8 +205,68 @@ pub fn audit(image: &NativeImage) -> Result<AuditReport, AuditError> {
     Ok(report)
 }
 
+/// Independently authenticate one sealed register-return `SelectedEnd` image.
+///
+/// This is a separate entry point from [`audit`]. It admits no result stores
+/// and rejects every explicit use of the removed Search-v1 `x4` result
+/// pointer, in addition to matching the complete backend-specific template.
+pub fn audit_selected_end_register_v2(
+    image: &AuditedSelectedEndRegisterImageV2,
+) -> Result<AuditReport, AuditError> {
+    audit_selected_end_register_image_v2(image.inner())
+}
+
+#[cfg(test)]
+pub(crate) fn audit_selected_end_register_image_for_test_v2(
+    image: &NativeImage,
+) -> Result<AuditReport, AuditError> {
+    audit_selected_end_register_image_v2(image)
+}
+
+fn audit_selected_end_register_image_v2(image: &NativeImage) -> Result<AuditReport, AuditError> {
+    if image.aggregate_manifest().is_some()
+        || image.search_call_abi() != SearchCallAbi::SelectedEndRegisterV2
+        || image.output() != OutputKind::SelectedEnd
+        || !matches!(
+            image.backend_version(),
+            BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+        )
+    {
+        return Err(AuditError::InvalidImageContract);
+    }
+    let mut work = AuditWork::default();
+    let envelope = authenticate_search_envelope(image, &mut work)?;
+    if envelope.manifest.shape != SearchShape::ExactLiteral
+        || envelope.manifest.output != OutputKind::SelectedEnd
+        || envelope.literal.is_empty()
+    {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let instructions = work.decode(image.code())?;
+    let report = audit_impl(
+        image,
+        StoreContract::SelectedEndRegisterV2,
+        &instructions,
+        &work,
+    )?;
+    crate::search_template::validate_selected_end_register_whole_template_v2(
+        image,
+        envelope.manifest,
+        envelope.literal,
+        &instructions,
+    )?;
+    if report.stores != 0 {
+        return Err(AuditError::InvalidImageContract);
+    }
+    validate_artifact_identity(image)?;
+    Ok(report)
+}
+
 /// Independently re-decode a whole-haystack aggregate image.
 pub fn audit_aggregate(image: &NativeAggregateImage) -> Result<AuditReport, AuditError> {
+    if image.inner().search_call_abi() != SearchCallAbi::OutSlotV1 {
+        return Err(AuditError::InvalidImageContract);
+    }
     let mut work = AuditWork::default();
     let envelope = authenticate_aggregate_envelope(image.inner(), &mut work)?;
     let instructions = work.decode(image.code())?;
@@ -2277,9 +2342,10 @@ fn invalid_search_instruction(index: usize) -> AuditError {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum StoreContract {
     Search,
+    SelectedEndRegisterV2,
     Aggregate,
 }
 
@@ -2324,11 +2390,19 @@ fn audit_impl(
         if let Some(register) = first_forbidden_explicit_gpr(instruction) {
             return Err(AuditError::ForbiddenAggregateRegister { offset, register });
         }
-        if matches!(store_contract, StoreContract::Search)
-            && let Some(register) =
-                first_forbidden_search_vector_register(instruction, image.backend_version)
+        if matches!(
+            store_contract,
+            StoreContract::Search | StoreContract::SelectedEndRegisterV2
+        ) && let Some(register) =
+            first_forbidden_search_vector_register(instruction, image.backend_version)
         {
             return Err(AuditError::ForbiddenSearchVectorRegister { offset, register });
+        }
+        if store_contract == StoreContract::SelectedEndRegisterV2 && instruction.uses_gpr(4) {
+            return Err(AuditError::ForbiddenSelectedEndRegisterUse {
+                offset,
+                register: 4,
+            });
         }
         report.instructions = report
             .instructions
@@ -2350,13 +2424,16 @@ fn audit_impl(
             required_features = required_features.union(CpuFeatures::SVE2);
         }
         let result_pointer = match store_contract {
-            StoreContract::Search => 4,
-            StoreContract::Aggregate => 2,
+            StoreContract::Search => Some(4),
+            StoreContract::Aggregate => Some(2),
+            StoreContract::SelectedEndRegisterV2 => None,
         };
-        if instruction.written_gpr() == Some(result_pointer) {
+        if result_pointer
+            .is_some_and(|result_pointer| instruction.written_gpr() == Some(result_pointer))
+        {
             return Err(AuditError::ResultPointerClobber {
                 offset,
-                register: result_pointer,
+                register: result_pointer.expect("checked as some"),
             });
         }
         let relocation = image
@@ -2453,6 +2530,7 @@ fn audit_impl(
                 let permitted = match store_contract {
                     StoreContract::Search => base == 4 && matches!(store_offset, 0 | 8),
                     StoreContract::Aggregate => base == 2 && store_offset == 0,
+                    StoreContract::SelectedEndRegisterV2 => false,
                 };
                 if !permitted {
                     return Err(AuditError::ForbiddenStore {

@@ -35,6 +35,28 @@ impl Aapcs64V1 {
     pub const STATUS: Register = Register::new(0);
 }
 
+/// Stable v2 register-return ABI for non-empty exact-literal `SelectedEnd`.
+///
+/// The four inputs retain the Search-v1 window registers, but there is no
+/// result pointer. The returned `x0` is zero for no match and otherwise the
+/// absolute exclusive match end. Since this ABI admits only non-empty
+/// literals, zero cannot encode a successful match.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SelectedEndAapcs64V2;
+
+impl SelectedEndAapcs64V2 {
+    /// `x0`: base of the readable haystack.
+    pub const HAYSTACK_BASE: Register = Register::new(0);
+    /// `x1`: total haystack byte length.
+    pub const HAYSTACK_LEN: Register = Register::new(1);
+    /// `x2`: inclusive start of the checked search window.
+    pub const WINDOW_START: Register = Register::new(2);
+    /// `x3`: exclusive end of the checked search window.
+    pub const WINDOW_END: Register = Register::new(3);
+    /// `x0`: zero for no match or the absolute exclusive match end.
+    pub const END_OR_ZERO: Register = Register::new(0);
+}
+
 /// Result memory shared by all v1 output contracts.
 ///
 /// Existence-only kernels do not touch it. Selected-end kernels initialize

@@ -241,8 +241,26 @@ pub struct NativeImage {
     pub(crate) relocations: Box<[Relocation]>,
     pub(crate) stats: ImageStats,
     pub(crate) artifact_identity: ArtifactIdentity,
+    pub(crate) search_call_abi: SearchCallAbi,
     pub(crate) search: Option<SearchManifest>,
     pub(crate) aggregate: Option<AggregateManifest>,
+}
+
+/// Internal discriminator that prevents a register-return image from entering
+/// a Search-v1 publisher or auditor through the generic image representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchCallAbi {
+    OutSlotV1,
+    SelectedEndRegisterV2,
+}
+
+impl SearchCallAbi {
+    pub(crate) const fn aot_tag(self) -> u8 {
+        match self {
+            Self::OutSlotV1 => 0,
+            Self::SelectedEndRegisterV2 => 2,
+        }
+    }
 }
 
 /// Immutable search image carrying the emitter's successful whole-image audit.
@@ -399,8 +417,16 @@ impl NativeImage {
         self.search
     }
 
+    pub(crate) const fn search_call_abi(&self) -> SearchCallAbi {
+        self.search_call_abi
+    }
+
     pub(crate) fn compute_artifact_identity(&self) -> Result<ArtifactIdentity, EmitError> {
         let mut hasher = Sha256::new();
+        if self.search_call_abi == SearchCallAbi::SelectedEndRegisterV2 {
+            hasher
+                .update(crate::selected_end_v2::SELECTED_END_REGISTER_ARTIFACT_IDENTITY_DOMAIN_V2);
+        }
         encode_aot(self, &mut |bytes| hasher.update(bytes))?;
         let digest = hasher.finalize();
         let mut bytes = [0_u8; 32];
@@ -444,7 +470,10 @@ impl AuditedNativeImage {
 
 impl NativeAggregateImage {
     pub(crate) fn try_new(inner: NativeImage) -> Result<Self, EmitError> {
-        if inner.search.is_some() || inner.aggregate.is_none() {
+        if inner.search.is_some()
+            || inner.aggregate.is_none()
+            || inner.search_call_abi != SearchCallAbi::OutSlotV1
+        {
             return Err(EmitError::InternalInvariant);
         }
         Ok(Self(inner))
@@ -679,6 +708,9 @@ fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
     if image.aggregate.is_some() {
         return Ok(b"FREA64A\x01");
     }
+    if image.search_call_abi == SearchCallAbi::SelectedEndRegisterV2 {
+        return Ok(&crate::selected_end_v2::SELECTED_END_REGISTER_AOT_MAGIC_V2);
+    }
     if image.search.is_none() {
         return Ok(b"FREA64\0\x01");
     }
@@ -764,7 +796,7 @@ fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), 
             || output_tag(image.output),
             |value| aggregate_tag(value.output),
         ),
-        0,
+        image.search_call_abi.aot_tag(),
     ]);
     write(&image.target.features.bits().to_le_bytes());
     encode_aot_manifest(image, write);

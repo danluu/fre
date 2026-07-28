@@ -7961,6 +7961,20 @@ fn every_explicit_gpr_role(register: u8) -> Vec<DecodedInstruction> {
             destination: 0,
             source: register,
         },
+        DecodedInstruction::SveDuplicateByte {
+            destination: 0,
+            source: register,
+        },
+        DecodedInstruction::SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: register,
+        },
+        DecodedInstruction::SveCountPredicateBytes {
+            destination: register,
+            predicate: 0,
+            source: 0,
+        },
         DecodedInstruction::LogicalShiftRightVariable64 {
             destination: register,
             source: 1,
@@ -8017,6 +8031,23 @@ fn explicit_gpr_visitor_covers_x18_x30_and_register_31_in_every_role() {
         None,
         "RET's implicit x30 is permitted"
     );
+}
+
+#[test]
+fn explicit_gpr_visitor_covers_removed_selected_end_x4_in_every_role() {
+    for instruction in every_explicit_gpr_role(4) {
+        assert!(
+            instruction.uses_gpr(4),
+            "missed explicit x4 role in {instruction:?}"
+        );
+    }
+    for instruction in every_explicit_gpr_role(17) {
+        assert!(
+            !instruction.uses_gpr(4),
+            "reported x4 in unrelated {instruction:?}"
+        );
+    }
+    assert!(!DecodedInstruction::Return.uses_gpr(4));
 }
 
 fn with_limit(mut limits: EmitLimits, resource: ResourceKind, value: u64) -> EmitLimits {
