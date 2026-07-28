@@ -1388,11 +1388,10 @@ fn execute_grep_session(
             let mut count = 0_u64;
             for line in haystack.lines() {
                 if session
-                    .is_match(line, limits)
+                    .is_match_value(line, limits)
                     .map_err(|error| {
                         CompareError::new(format!("FRE grep fallback lifecycle search: {error}"))
                     })?
-                    .0
                 {
                     count = count.checked_add(1).ok_or_else(|| {
                         CompareError::new("FRE grep fallback lifecycle count overflow")
