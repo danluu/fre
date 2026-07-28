@@ -1,80 +1,62 @@
 # FRE JIT/AOT architecture and AOT production track
 
-Last updated: 2026-07-27 (America/Vancouver)
+Last updated: 2026-07-28 (America/Vancouver)
 
 ## Current composition and temporary admission fence
 
-This document describes the AOT core composed as a path-scoped child of the
-current JIT/VL16 source: `96b1465e4da959f2954e1b333619d43ff169d3df`
-followed by `1b6d25636fd7b2509e19459e99a868ae8aa59f1e`. Source review of an
-ancestor or imported path does not qualify the composed tree or transfer its
-dynamic evidence.
+This document describes implementation Candidate
+`ec6651f767561d65524d1190b6afd52157bad545`, tree
+`fd89927138f0a64f934a01debf3d78a87d07f904`. That exact source contains the
+V8/tag-21 register-return JIT, Linux tag-21 `SelectedEnd` P2b AOT bundle,
+public bakeoff V3 migration/evidence repair, and hardened hidden AOT
+declarations. Source review or evidence from an ancestor does not qualify this
+composed tree.
 
 An absolute temporary admission fence is still in force. No new
-resource-coordinator or headroom-coordinator build or timing command may start
-until the controller publishes explicit live-cutover GO for the reviewed
-candidate helper whose SHA-256 begins `85c1ce3a`. A source checkpoint, an
-installed helper, or an earlier deployment record is not that GO. This docs
-composition therefore uses source/static checks only and makes no new dynamic
-correctness or performance claim.
-
-Future Linux c9g/m9g work remains bound to the disjoint same-host
-`linux-target-cpu-local-v1` source at commit
-`ed6e50ee3f04d5c446779d3abb42ad9b803b883c`, tree
-`1aa73701fbd944d1a278dde717080683fe5f2f56`, helper SHA-256
-`d28346610e8060c16dec861bd37f1169992905c7659e89242ef6658734d3f4cf`,
-and registered-child SHA-256
-`2d7c67d20d57e46ce1e30f46404ce4460d8c54a78ac12545a3d0250dc0f54b56`.
-Those pins are retained inputs, not permission to run while the fence is
-active. After explicit GO, a single-threaded benchmark may coexist with other
-CPU work when a bounded headroom sample admits the selected CPU; it must not
-wait indefinitely for global idleness or stop unrelated work.
+build, test, timing, or coordinator command may start without explicit
+live-cutover GO. This documentation checkpoint therefore uses source/static
+inspection only and makes no build, test, dynamic-correctness, or performance
+claim.
 
 ## Architecture: LLVM is not the regex compiler
 
-The original direct-machine-code design has not been replaced by an
-LLVM-based regex compiler. Search JIT and Search AOT share the typed Kernel IR
-and FRE's custom AArch64 emitter in `fre-jit-aarch64`. The Count-v2 AOT slice
-uses the separate custom direct-Count emitter in `fre-aot-aarch64`. Both
-emitters produce immutable pattern-specialized instruction bytes, data,
-relocations, ABI/target contracts, resource statistics, and identities. Their
-generated entries are ordinary AAPCS64 machine code, not regex bytecode and
-not interpreter dispatch loops.
+The regex compiler has no LLVM code-generation path. Search JIT and Search AOT
+share FRE's typed Kernel IR and custom direct AArch64 machine-code emitter in
+`fre-jit-aarch64`. The Count-v2 AOT slice uses the separate custom direct-Count
+emitter in `fre-aot-aarch64`. Both produce immutable pattern-specialized
+instruction bytes, data, relocations, ABI/target contracts, resource
+statistics, and identities. Their generated entries are ordinary AAPCS64
+machine code, not regex bytecode or interpreter dispatch loops.
 
 The paths diverge only after emission:
 
-- the fresh-emission JIT route gives a private `AuditedNativeImage` capability
-  to `fre-jit-runtime`. That path retains the emitter's completed independent
-  audit instead of repeating its three full-image decode passes, while still
-  checking the backend/host/output contract, copying and byte-comparing the
-  complete writable payload, performing the strict-W^X transition and
-  instruction-cache maintenance, and publishing a typed callable whose
-  mappings remain owned by the runtime. Generic publication from a plain
-  `NativeImage` continues to run the independent runtime audits;
-- the Search AOT route revalidates the same Search image, while Count-v2 uses
-  its independently typed direct-Count image. Both routes write deterministic
-  Mach-O or ELF object bytes. A system linker packages those already-generated
-  bytes in a final executable, and a source-qualified static adopter must
-  authenticate the retained payload, metadata, immutable mappings, and an
-  exact registry row before exposing a safe callable.
+- the JIT route gives the sealed image to `fre-jit-runtime`, which checks the
+  backend/host/output/ABI contract, copies and byte-compares the complete
+  writable payload, performs the strict-W^X transition and instruction-cache
+  maintenance, and owns the resulting mapping;
+- the Search AOT route revalidates the same sealed image and writes
+  deterministic ELF bytes. Count-v2 uses its independently typed direct-Count
+  image and deterministic Mach-O layers. A linker can only package those
+  already-generated payloads.
 
-`rustc` may use LLVM to compile FRE's Rust host code and build tooling. Apple
-clang/ld or the Linux system linker may package an object into an executable.
-Those tools do not select, optimize, or generate the regex payload: FRE's
-custom emitters have already generated it. Accordingly, an LLVM reference in a
-host toolchain record is not evidence that the regex compiler architecture
-changed.
+LLVM may be used only underneath `rustc` or another host/toolchain component
+that compiles FRE's host and tool code. Apple clang/ld or the Linux system
+linker may package an object into an executable. Neither LLVM nor the linker
+selects, optimizes, or generates the regex payload; FRE's custom emitters have
+already generated it. An LLVM reference in a host toolchain record therefore
+does not describe FRE's regex-codegen architecture.
 
-## Exact production scope
+## Retained Count-v2 production-track scope
 
-The current production-track AOT Candidate is deliberately narrow:
+The retained Count-v2 production-track AOT Candidate is deliberately narrow
+and separate from the Linux `SelectedEnd` ABI2 work:
 
 | Dimension | Current Candidate | Not implemented or qualified here |
 | --- | --- | --- |
 | Operation | Whole-haystack, non-overlapping `Count-v2` | Generic search/find, captures, replace, split, or arbitrary aggregates |
 | Pattern | Private qualification Candidate row: exact byte literal `needle`, selector 11. The production table is empty while its promotion atom is all-zero. The focused compiler itself accepts exact byte literals from 0 through 32 bytes. | Other literals are not production-qualified; general regex syntax such as alternation, repetition, classes, or Unicode semantics is not lowered by this compiler. |
 | Code generator | FRE's direct custom AArch64 Count emitter | LLVM, Inkwell, Cranelift, x86-64, or other native backends |
-| Production object and host | arm64 Mach-O on macOS | Linux AArch64 ELF has separately source-gated Search qualification and production-atom slices described below; neither compiler output nor a private row creates production authority. COFF/Windows, other operating systems, and cross-host deployment are not implemented here. |
+| Production object and host | arm64 Mach-O on macOS | Linux retains a separate Search V1 qualification architecture, while the current `SelectedEnd` ABI2 P2b ELF bundle has no adopter or authority row. COFF/Windows, other operating systems, and cross-host deployment are not implemented here. |
 | Deployment | Statically linked implementation and final-image glue, immutable mapped-image verification, authenticated process-static handle | General artifact discovery, cache/distribution, dynamic loading, or runtime code generation |
 | Promotion | One reviewed manifest digest in the C5 `support.rs` atom | Automatic qualification or registration of arbitrary compiler output |
 
@@ -92,11 +74,47 @@ backends, additional hosts, and production artifact lifecycle integration.
 The Search and Count AOT slices described in this document are exact-literal
 slices, not a general-regex AOT compiler.
 
-## Inert Search compiler slice
+## Current Linux `SelectedEnd` ABI2 P2b slice
 
-The workspace now also contains a source-first nonempty exact-literal Search V1
-compiler candidate. This is compiler groundwork, not an expansion of the
-production scope above:
+The current Linux AArch64 P2b slice is an inert exact-literal
+`SelectedEnd` compiler/bundle path:
+
+- source-first planning rebuilds typed `SelectedEnd` KIR and asks
+  `fre-jit-aarch64` for the sealed
+  `SEARCH_SVE2_FIXED16_V2`/tag-21 register-return image under the exact
+  ASIMD+SVE+SVE2, 16-byte-literal, VL16 contract;
+- the compiler retains that same sealed image and wraps it in a deterministic
+  ELF64LE relocatable with hidden, identity-suffixed entry, payload, and
+  metadata symbols;
+- the ABI has exactly four arguments: `x0` through `x3` carry the haystack and
+  half-open search window, and `x0` returns zero or the absolute exclusive
+  selected end. There is no fifth argument, `x4` result pointer, caller-owned
+  result slot, or generic callable alias;
+- a neutral expectation and compiler receipt bind source, semantic plan, KIR,
+  sealed native artifact, payload, metadata, object, resources, and identities;
+  and
+- the qualification bundle adds deterministic assembly/C declarations and a
+  canonical four-instruction hidden wrapper. Its sole relocation is
+  `R_AARCH64_CALL26` on a direct `bl` to the exact identity-suffixed entry.
+
+The glue receipt carries mandatory future final-image checks: the call must
+remain a direct `bl`, may not resolve through a PLT, and the linked wrapper
+must contain no `blr`, `x4` argument, or result slot; all implementation and
+wrapper bindings must remain hidden and identity-suffixed. The checked-in
+receipt is not that observation. Its `observation_complete` field is false,
+every exposed P2b value reports `SelectedEndAotRuntimeAuthorityV2::Absent`,
+and this Candidate contains no ABI2 static adopter, authority row, mapped
+callable, linked-image inspection receipt, or deployment path.
+
+This is the AOT half of the same native-image architecture as JIT, not a second
+optimizer: JIT publishes the sealed image under strict W^X, while P2b stops
+after deterministic packaging and diagnostic receipts.
+
+## Retained inert Search V1 slice
+
+The workspace also retains the older source-first nonempty exact-literal
+Search V1 compiler candidate. This remains compiler groundwork, not an
+expansion of the production scope above and not an adopter for ABI2:
 
 - it starts from the normal portable facade's live exact-literal plan rather
   than accepting an unauthenticated literal-only bypass;
@@ -144,69 +162,56 @@ adopters, for the same implementation intentionally creates duplicate strong
 definitions and must be rejected by the linker. That duplicate-link refusal
 still needs post-fence validation.
 
-The standalone Search bakeoff source compares the same V8 image
-through three honestly named routes: raw statically linked AOT with
-benchmark-local ABI decoding, strict-W^X JIT publication, and the portable
-exact-literal plan. Its results are not qualification evidence until the
-temporary admission fence is lifted and the sealed correctness, linked-image,
-tamper, and timing checks run.
+The retained standalone Search V8 bakeoff source and checked-in Linux
+three-engine harness exercise the Search V1 Span contracts: raw or privately
+adopted static AOT, raw strict-W^X Span JIT, and the portable plan. They do not
+exercise the new `SelectedEnd` ABI2 P2b bundle and cannot serve as its
+qualification evidence.
 
-### Linux AArch64 ELF Search qualification slice
+### Public bakeoff V3 and deferred ABI2 three-engine work
 
-The composed source also contains a deliberately inert Linux AArch64 ELF
-slice for exact-literal Search `Span`. It can:
+The current public JIT bakeoff source emits 48-column
+`fre-jit-bakeoff-v3` rows for explicit V8 `SelectedEnd` ABI2. It establishes
+one current-thread session before each search-only timer and calls only the
+value-returning session method in the hot loop. Full-workload rows include
+owner/session construction once and then the declared value-only workload.
 
-- emit the direct-machine-code `SEARCH_SVE2_FIXED16_V2` image (tag 21) under
-  the exact ASIMD+SVE+SVE2, VL=16 contract;
-- wrap that `NativeImage` in a deterministic ELF relocatable object and
-  identity-derived final-image glue;
-- independently inspect the linked ELF image; and
-- route a successfully authenticated row through the disjoint
-  qualification-private static adopter.
+The evidence repair makes the measured native identity externally
+checkable. The exact-Span inspection sidecar retains its legacy `identity=`
+field for historical V2 rows and adds a distinct `abi2_identity=` witness for
+the ASIMD V8 target, backend, register ABI2, and no-VL contract. V3 verification
+requires that external witness, binds backend policy, target, ABI and VL facts
+into the evidence identity, and rejects a row whose artifact, canonical
+binding, and evidence hash were rewritten together. This Candidate contains
+that source repair; this checkpoint did not run it and records no V3
+correctness or performance result.
 
-This is an implemented qualification path, so “ELF/Linux is unimplemented” is
-no longer an accurate description. It is not by itself a Linux production
-activation. At the source-preparation checkpoint described here, the
-production Search table and qualification-private Search table both begin
-literal-empty. The first reviewed transaction may replace only the private
-atom; a later, separately reviewed transaction may replace only the production
-atom. A compiler receipt, feature flag, linked symbol, proposal, or private row
-cannot manufacture production authority.
+The new P2b three-engine benchmark must compare the exact same sealed tag-21
+artifact through authenticated static AOT, strict-W^X session-only JIT, and
+the portable semantic owner. That benchmark is still in progress and deferred
+at this Candidate. The checked-in Linux three-engine harness is for Search V1
+Span, not the register-return ABI2 path. P2b currently has neither a completed
+post-link observation nor a runtime adopter, so there is no honest callable
+AOT engine to time and no sealed ABI2 three-engine result bundle.
 
-The path-scoped AOT core import includes the reopened-object payload-binding
-repair: the source-reconstructed `NativeImage` is authoritative over complete
-ELF code, padding, rodata, layout, statistics, metadata, and identities. That
-source property closes the internally self-consistent substituted-payload gap,
-but it still needs validation on one frozen composed Candidate after the
-admission fence. Its presence is not a claim of a completed build or test.
+The remaining ABI2 closure order is therefore:
 
-The remaining Linux closure work is explicit:
+1. independently review and freeze one exact source/tree and P2b artifact
+   tuple;
+2. after explicit admission, build/link it and issue the missing post-link
+   observation only after all direct-call, hidden-binding, no-PLT, no-`blr`,
+   no-`x4`, and no-result-slot checks pass;
+3. add and review a qualification-private adopter without changing the empty
+   production authority state;
+4. complete separately bound tag-21 public-facade evidence for the same sealed
+   artifact; and
+5. seal and run the replacement ABI2 AOT/JIT/portable benchmark before making
+   any runtime, lifecycle, or performance claim.
 
-1. independently review the composed successor, including executable forged
-   build-holder refusal and wrong registered-child refusal, then freeze its
-   canonical source lock together with the full-image binding repair;
-2. only after both that source re-audit GO and the live deployment GO, build
-   and validate one exact
-   commit/tree/source/dependency/toolchain/binary tuple;
-3. complete the full 3,317-task tag-21 hardware qualification: 2,160 direct
-   five-engine timing cells, 1,152 process-bound public-facade cells, and the
-   five closed setup/verification/sealing tasks. Its sealed
-   `tag21_artifact_sha256` must equal the AOT Candidate's native artifact
-   identity; tag-10, tag-19, V8, partial, or losing evidence cannot substitute;
-4. only then export, independently review, and pin the exact
-   qualification-private row; that private transaction must leave the
-   production table byte-exact empty;
-5. use that safe private adopter for the closed three-engine
-   AOT/JIT/portable timing matrix and its correctness, lifecycle, and
-   performance gates; and
-6. consider production promotion only from the complete reviewed evidence
-   chain.
+No benchmark source, result, private-row proposal, compiler receipt, or linked
+symbol is production authority by itself.
 
-No benchmark result, private-row proposal, or source-complete implementation
-is promotion authority by itself. No production Search row may be added
-before that evidence.
-
-## Current Candidate architecture
+## Retained Count-v2 Candidate architecture
 
 ```text
 exact literal + untrusted planning claims
@@ -256,8 +261,8 @@ Fresh final evidence is pending after authenticated build admission:
 
 Until those complete against one exact frozen commit/tree/source/binary tuple,
 no fresh result should be described as final qualification or promotion
-evidence. The Linux Search lane has its separate, still-unrun closure sequence
-above; neither lane's evidence can authorize the other.
+evidence. The Linux `SelectedEnd` ABI2 lane has the distinct, still-unrun
+closure sequence above; neither lane's evidence can authorize the other.
 
 ## Next actions after live-cutover GO
 
@@ -277,8 +282,8 @@ For the macOS Count lane:
 7. Treat broader search/aggregate/full-regex AOT as separate future
    qualification work, not as an inference from C5.
 
-For Linux Search, follow the source/build closure, full 3,317-task tag-21
-prerequisite (including both the 2,160 direct cells and 1,152 facade cells),
-reviewed qualification-private row, and three-engine timing sequence above.
-The two lanes may proceed independently once each job has authenticated
-admission, but neither may bypass its own evidence chain.
+For Linux `SelectedEnd` ABI2, follow the frozen-source, post-link observation,
+qualification-private adopter, same-artifact public-facade, and replacement
+three-engine sequence above. The two lanes may proceed independently once
+each job has authenticated admission, but neither may bypass its own evidence
+chain.

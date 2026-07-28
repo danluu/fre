@@ -76,10 +76,11 @@ an open P0 row.
   execution remains explicitly open.
 - [x] `fre-aot-compiler`: source-authenticated custom direct-machine-code
   emission into deterministic Mach-O or ELF objects, with typed
-  source/KIR/native/object receipts and no LLVM regex-codegen dependency.
-  Compiler output remains inert: the Search production and
-  qualification-private authority tables are empty, so no current Search AOT
-  deployment is authorized.
+  source/KIR/native/object receipts and no LLVM regex-codegen dependency. The
+  Linux `SelectedEnd` P2b slice packages the same sealed tag-21 ABI2 image as
+  JIT, adds exact hidden direct-call glue/declarations/receipts, and has no
+  function-pointer API, `x4` result pointer, or result slot. Compiler output
+  remains inert: runtime authority and post-link observation are absent.
 - [x] `fre-aggregate`: production capture-free zero/progress compilation for
   arbitrary nested finite/open repetition, forced full-table and reverse-row
   whole-operation strategies, exact resource accounting, and 242,910 complete
@@ -91,9 +92,11 @@ an open P0 row.
   greediness in executable identity, charge at most `N+1` run transitions,
   use zero dynamic scratch, and preserve forced continuation and neighboring
   routes.
-- [x] `fre-jit-runtime`: audited macOS/AArch64 strict-W^X publication with
-  inaccessible guards, copy verification, rollback and concurrent-lifetime
-  tests, plus 663,084 retained actual-hardware/oracle comparisons. The explicit
+- [x] `fre-jit-runtime`: strict-W^X AArch64 publication now has a separate
+  `SelectedEnd` register-return ABI2 type for V8 and tag 21. Publication
+  exposes no direct call; invocation is session-only. V8 opens a session
+  without an SVE syscall, while Linux tag 21 observes the calling thread's SVE
+  vector length once at session creation and requires VL16. The explicit
   16-byte `QualifiedExactSearch` large-window/reuse leaf remains a Candidate:
   all four current qualification atoms are `Candidate`, legacy V7 is hard
   `Candidate`, and no current Search JIT leaf is performance-qualified.
@@ -141,15 +144,16 @@ exposes typed exists, selected-end, span, and windowed operations. The standalon
 reducers without repeated suffix searches; count and span-sum are exposed by
 operation-typed facade plans and the exact Rebar semantic adapter. General
 match-sequence exposure remains separate. Pattern-specialized AArch64 code can
-be published and executed under a strict audited W^X lifecycle, but is not yet
-a facade planner choice. There is still no capture API, general Unicode
-execution, qualified Search AOT authority row, or compatibility-qualified
-embedding surface. The source-first AOT compiler, deterministic static
-objects, authenticated adopter, and default-off explicit facade binding are
-implemented, but they create no runtime authority and have not received fresh
-dynamic validation or performance qualification on this composed tree. A small
-implemented C11/C++17 surface exists for the current portable subset and
-reports `UPSTREAM_ORACLE_PENDING` in every plan record.
+be published under a strict audited W^X lifecycle through the explicit
+qualified-search API, but every V8/tag-21 ABI2 call requires a same-thread
+session and no default portable facade selects it. There is still no capture
+API, general Unicode execution, qualified `SelectedEnd` AOT authority, or
+compatibility-qualified embedding surface. The P2b source-first AOT compiler
+and deterministic object/glue/receipt bundle are implemented as inert source;
+they provide neither a post-link observation nor a runtime adopter. The
+retained Search V1 adopter/default-off binding is a different ABI and cannot
+authorize P2b. A small implemented C11/C++17 surface exists for the current
+portable subset and reports `UPSTREAM_ORACLE_PENDING` in every plan record.
 
 Seven-process diagnostic medians put exact literals and packed literal
 alternation at parity within noise; the retained literal-set DFA cross-check is
@@ -265,16 +269,24 @@ Those results and that historical atom are non-authoritative for this composed
 tree: legacy V7 is hard `Candidate`, all four current qualification atoms are
 `Candidate`, and no Search JIT execution or speed promotion is current.
 
-The separate AOT track is direct machine code, not LLVM regex compilation.
-FRE's custom AArch64 emitters produce the regex payloads; the AOT compiler
-wraps those already-emitted bytes in deterministic objects and the system
-linker only packages them. Historical macOS Count measurements remain
-development evidence for their exact source and artifacts. The composed
-Search AOT route still has empty production and qualification-private row
-tables, and no fresh
-correctness, linked-image, adoption-lifecycle, or AOT/JIT/portable benchmark
-result has been generated for this tree. No AOT promotion or speed claim is
-therefore current.
+The current native tracks remain direct machine code, not LLVM regex
+compilation. FRE's typed KIR and custom AArch64 emitters produce the regex
+payloads; LLVM may only support `rustc`/host tooling, and the system linker can
+only package already-emitted bytes. V8 and tag 21 now share the `SelectedEnd`
+register-return ABI2 in JIT; tag-21 P2b AOT retains the same sealed image in a
+deterministic ELF/direct-hidden-glue bundle. P2b still has
+`RuntimeAuthority::Absent`, no completed post-link observation, and no
+callable adopter.
+
+The public JIT bakeoff source has moved to 48-column V3 session/value-call
+rows. Its evidence verifier now requires an external ABI2 artifact witness and
+binds the V8 policy, target, ABI, and no-VL facts instead of trusting a
+self-consistent row rewrite. No V3 execution result is claimed here. The
+checked-in three-engine harness still targets Search V1 Span; a replacement
+P2b AOT/JIT/portable benchmark is in progress and deferred until its direct
+call is observed after link and a private adopter exists. No current
+correctness, lifecycle, benchmark, AOT promotion, or speed claim follows from
+this source checkpoint.
 
 ## Non-negotiable gates
 

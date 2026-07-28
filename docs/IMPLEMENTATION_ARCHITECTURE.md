@@ -40,14 +40,15 @@ planning, or native code. Production executors must not turn oracle evaluation
 into a fallback. Conformance adapters may depend on both sides, but no
 production crate may depend on `fre-conformance` or `fre-reference`.
 
-Search JIT and Search AOT share FRE's typed Kernel IR and custom
-`fre-jit-aarch64` direct machine-code emitter. Count-v2 AOT uses the separate
-custom direct-Count emitter in `fre-aot-aarch64`. The JIT publishes an audited
-Search native image through `fre-jit-runtime`; AOT packages already-emitted
-Search or Count bytes in a deterministic object for static linking and
-authenticated adoption. `rustc` may use LLVM for Rust host or tool code, and a
-system linker may place the payload in a final executable, but LLVM does not
-select, optimize, or generate the regex payload.
+There is no LLVM regex-codegen path. Search JIT and Search AOT lower through
+FRE's typed Kernel IR and use the custom `fre-jit-aarch64` direct machine-code
+emitter. Count-v2 AOT uses the separate custom direct-Count emitter in
+`fre-aot-aarch64`. JIT publishes an already-emitted Search image through
+`fre-jit-runtime`; AOT packages already-emitted Search or Count bytes in a
+deterministic object. LLVM may appear only underneath `rustc` or another
+host/toolchain component that compiles FRE's host and tool code. A system
+linker may package the already-emitted payload in a final executable. Neither
+LLVM nor the linker selects, optimizes, or generates the regex machine code.
 
 `fre` keeps its qualified exact-search JIT API behind the default-on
 `qualified-exact-search-jit` feature. The separate
@@ -79,11 +80,11 @@ emitter.
 | `fre-kernel-ir` | proven fast-plan shape | validated structured kernel plus portable oracle result | deterministic identity, CFG/bounds validation, 728,420 differential/malformed cases, and normative ISA contract |
 | `fre-jit-aarch64` | validated Kernel IR plus AAPCS64 target stamp | immutable code/rodata/relocation image and address-free AOT artifact | 455,916 decoded-machine differentials, independent authenticity audit, exact limits; executable publication remains separate |
 | `fre-jit-x86_64` | validated Kernel IR plus SysV target stamp | immutable code/data/relocation image and address-free AOT artifact | 276,309 scalar/SSE external instruction executions, independent audit, exact limits; AVX2 and production publication remain open |
-| `fre-jit-runtime` | audited AArch64 native image plus typed output contract | immutable reference-counted callable mapping | strict `PROT_NONE` to RW to RX lifecycle with guards, exact accounting, rollback and concurrency tests, and 663,084 actual-hardware/oracle comparisons; planner integration remains open |
+| `fre-jit-runtime` | audited AArch64 native image plus typed output/ABI contract | immutable reference-counted publication plus same-thread callable session | strict `PROT_NONE` to RW to RX lifecycle with guards and exact accounting; V8 and tag 21 use the four-argument `SelectedEnd` register-return ABI2, expose no direct call on the publication handle, and invoke only through a current-thread session; tag 21 checks VL16 once when that session opens |
 | `fre-jit-cache` | immutable AArch64 image, typed output contract, fixed publication/cache limits | callable lease plus exact current/peak/event snapshot | same-key single-flight, different-key concurrency, deterministic LRU, unique-token retirement, outstanding-lease accounting, O(1) precomputed full-AOT identity, forced races/failures, and 14 cache tests; process-local only and no speed claim |
-| `fre-aot-macho` / `fre-aot-elf` | audited AArch64 native image plus an external planner binding | deterministic relocatable object, metadata, identity-derived symbols, and object receipts | independently reparse and validate emitted bytes; object creation is inert and grants no linker or runtime authority |
-| `fre-aot-compiler` | authenticated facade source/plan plus sealed Count or Search manifest | deterministic machine-code object plus source/KIR/native/object receipt; Search Span can also emit deterministic final-image glue and an unsigned source-bound receipt | Count-v2 has a narrow static Candidate; nonempty exact-literal Search V1 keeps runtime authority unconditionally absent and cannot populate a qualification row |
-| `fre-aot-static-runtime` | linked Count-v2 or Search Span symbols plus pinned source-qualified expectations, or an already-completed raw Search V1 call | registry-owned authenticated Count/Search Span handle, or typed inert raw Search result | mapped-image adoption verifies immutable code and metadata; production and qualification-private authority come only from isolated source atoms, both current Search tables are empty, and missing or mismatched qualification fails closed |
+| `fre-aot-macho` / `fre-aot-elf` | audited AArch64 native image plus an external planner binding | deterministic relocatable object, metadata, identity-derived symbols, and object receipts | independently reparse and validate emitted bytes; the Linux tag-21 V2 object preserves the sealed `SelectedEnd` ABI2 image and declares only hidden identity-suffixed four-argument symbols; object creation is inert |
+| `fre-aot-compiler` | authenticated facade source/plan plus sealed Count or Search manifest | deterministic machine-code object plus source/KIR/native/object receipts and inert glue material | the Linux `SelectedEnd` P2b slice retains the same sealed tag-21 image used by JIT, emits deterministic ELF plus exact hidden direct-`bl` glue/declarations/receipts, and explicitly grants no runtime authority or completed post-link observation |
+| `fre-aot-static-runtime` | linked Count-v2 or retained Search V1 Span symbols plus pinned source-qualified expectations, or an already-completed raw Search V1 call | registry-owned authenticated Count/Search V1 Span handle, or typed inert raw Search V1 result | mapped-image adoption verifies immutable code and metadata for those retained contracts; the new `SelectedEnd` ABI2 P2b bundle has no runtime adopter or callable authority in this source |
 | `fre-capi` | caller-owned versioned C records and byte views | opaque retained matcher plus plan/exists/end/span results | ten ABI/lifetime/failure/plan-tag tests and debug/release exact-symbol C11/C++17 smokes; only the current Rust-bytes portable subset is advertised and admission remains upstream-oracle-pending |
 | `fre-holdout` | authenticated frozen visible suite/schema/digests | deterministic correctness receipts plus separate diagnostic timing | 1,014 hot/one-shot operation comparisons, canonical cross-architecture framing, tamper/resource/fault gates, and byte-identical 1,014-pass/zero-unsupported/zero-failure reruns; not blind or performance qualification |
 | `rebar-manifest` | retained canonical Rebar inventory | deterministic qualification manifest and summary | runner provenance/configuration; semantic and performance results are separate gates |
@@ -139,19 +140,29 @@ K0. A native loop over regex bytecode is not accepted as JIT specialization.
 The current default AArch64 exact-search emitter contract is `SEARCH_V8`
 (`SearchBackendPolicy::AsimdV8`). It uses lazy 64-candidate screening with the
 V7 staged-recovery fallback, while the historical backend encodings remain
-versioned and byte-stable. This emitter default is not facade authorization:
-the V8, tag-10, tag-19, and tag-21 qualification atoms are all `Candidate`,
-and legacy V7 remains hard `Candidate`.
+versioned and byte-stable. V8 and Linux SVE2 tag 21 now use the sealed
+`SelectedEnd` register-return ABI2: `x0` through `x3` carry the haystack and
+half-open window, and `x0` returns zero for no match or the absolute exclusive
+match end. There is no `x4` result pointer or caller-owned result slot.
+Strict-W^X publication does not expose a direct call method; generated code is
+reachable only through a same-thread invocation session. V8 session creation
+does not query SVE state. Tag 21 admits the process-wide ASIMD+SVE+SVE2/tuning
+contract separately and observes the calling thread's SVE vector length once,
+requiring VL16 when the invocation session opens. Search calls perform no VL
+query. This emitter support is not facade authorization: the V8, tag-10,
+tag-19, and tag-21 qualification atoms are all `Candidate`, and legacy V7
+remains hard `Candidate`.
 
-AOT adds no LLVM or other second regex optimizer. Search packages the same
-audited native-image contract used by its JIT, while Count-v2 packages its
-independently typed direct-Count image. Both write deterministic Mach-O or ELF
-object bytes and leave linking and deployment inert. A safe static callable is
-exposed only after the source-qualified runtime adopter verifies the exact
-row, metadata, payload, mapped protections, and target contract. Compiler
-output, a linked symbol, or a Cargo feature cannot manufacture that authority.
-The current Search production and qualification-private row tables are empty,
-so Search dynamic validation and performance qualification remain pending.
+AOT adds no LLVM or other second regex optimizer. The Linux `SelectedEnd`
+P2b path packages the same sealed tag-21 ABI2 image as deterministic ELF,
+then emits exact hidden identity-suffixed declarations and a four-instruction
+wrapper whose only call relocation is `R_AARCH64_CALL26` for a direct `bl`.
+Its receipts require the final image to retain that exact hidden direct call
+and reject a PLT target, `blr`, any `x4` argument, and any result slot. Those
+receipt bits are requirements, not observations: `observation_complete` is
+false, `RuntimeAuthority` is `Absent`, and this source has no ABI2 adopter or
+callable AOT path. The retained Count-v2 and Search V1 static-adoption
+architectures remain separate; their existence cannot authorize ABI2.
 
 ## Qualification status language
 
