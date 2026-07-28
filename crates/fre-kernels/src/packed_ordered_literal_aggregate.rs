@@ -16,7 +16,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, try_box_preserve};
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy, SimdDispatchContext,
+    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy, FeatureSet,
+    SimdDispatchContext,
 };
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
@@ -95,25 +96,22 @@ pub struct CacheIdentity<'a> {
     pub encoded_patterns: &'a [u8],
 }
 
-/// Copyable operation and native-classifier identity. Pattern bytes remain in
-/// [`CacheIdentity`] and may be authenticated separately by an owning facade.
+/// Copyable operation and exact wide-classifier identity. Pattern bytes remain
+/// in [`CacheIdentity`] and may be authenticated separately by an owning
+/// facade. The wide receipt names its delegated narrow leaf when applicable,
+/// so retaining the separate narrow receipt would be redundant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
     pub algorithm_id: &'static str,
     pub plan_id: &'static str,
     pub operation: Operation,
     pub cache_format_version: u32,
-    pub implementation_kind: &'static str,
-    pub identity_scope: &'static str,
-    pub target_arch: &'static str,
-    pub runtime_minimum_haystack_bytes: usize,
-    pub semantics: Semantics,
-    pub classifier_selection: AsciiSelection,
-    pub certified_min_patterns: usize,
-    pub certified_max_patterns: usize,
-    pub certified_min_pattern_bytes: usize,
-    pub certified_max_pattern_bytes: usize,
-    pub certified_max_total_pattern_bytes: usize,
+    pub wide_policy_version: u16,
+    pub wide_variant_id: &'static str,
+    pub wide_delegate_variant_id: Option<&'static str>,
+    pub wide_policy_usable: FeatureSet,
+    pub wide_required: FeatureSet,
+    pub wide_minimum_input_bytes: usize,
 }
 
 impl CacheIdentity<'_> {
@@ -121,22 +119,18 @@ impl CacheIdentity<'_> {
     /// operation and native-classifier identity.
     #[must_use]
     pub const fn operation_identity(self) -> OperationIdentity {
+        let wide = self.classifier_selection.wide();
         OperationIdentity {
             algorithm_id: self.algorithm_id,
             plan_id: self.plan_id,
             operation: self.operation,
             cache_format_version: self.cache_format_version,
-            implementation_kind: self.implementation_kind,
-            identity_scope: self.identity_scope,
-            target_arch: self.target_arch,
-            runtime_minimum_haystack_bytes: self.runtime_minimum_haystack_bytes,
-            semantics: self.semantics,
-            classifier_selection: self.classifier_selection,
-            certified_min_patterns: self.certified_min_patterns,
-            certified_max_patterns: self.certified_max_patterns,
-            certified_min_pattern_bytes: self.certified_min_pattern_bytes,
-            certified_max_pattern_bytes: self.certified_max_pattern_bytes,
-            certified_max_total_pattern_bytes: self.certified_max_total_pattern_bytes,
+            wide_policy_version: wide.policy_version,
+            wide_variant_id: wide.variant_id,
+            wide_delegate_variant_id: wide.delegate_variant_id,
+            wide_policy_usable: wide.policy_usable,
+            wide_required: wide.required,
+            wide_minimum_input_bytes: wide.minimum_input_bytes,
         }
     }
 }

@@ -68,7 +68,7 @@ fn name_whitespace_compile_and_span_sum_labels_bind_the_typed_plan() {
         regex.build_report().plan,
         AggregatePlanKind::LiteralClassRunLiteral
     );
-    assert_eq!(regex.build_report().schema_version, 38);
+    assert_eq!(regex.build_report().schema_version, 39);
     current_fre_rebar_validate_aggregate_identity(regex.build_report(), false, "count-spans")
         .expect("typed route identity");
 }

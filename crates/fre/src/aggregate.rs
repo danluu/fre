@@ -202,7 +202,7 @@ pub use fre_aggregate::Strategy as AggregateStrategy;
 pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 39;
 
 /// Version of the construction-owned direct-route protocol.
-pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 1;
+pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
 
 /// Version of the lossless direct terminal-attempt envelope.
 pub const AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION: u32 = 1;
