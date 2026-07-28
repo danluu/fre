@@ -1,16 +1,47 @@
 use std::sync::Mutex;
 
+use fre_jit_aarch64::SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2;
 use fre_jit_runtime::PublicationLimits;
 use fre_kernel_ir::Span;
 
 use crate::{
-    CacheCreateError, CacheLimits, CacheResource, KernelCache,
-    cache::bookkeeping_structural_sizes_for_test,
+    CacheCreateError, CacheLimits, CacheResource, KernelCache, SelectedEndRegisterCacheV2,
+    cache::{
+        bookkeeping_structural_sizes_for_test, selected_end_bookkeeping_structural_sizes_for_test,
+    },
     policy::{
         BASE_BOOKKEEPING_BYTES, ENTRY_BOOKKEEPING_BYTES, FLIGHT_BOOKKEEPING_BYTES,
-        LIVE_MAPPING_BOOKKEEPING_BYTES,
+        LIVE_MAPPING_BOOKKEEPING_BYTES, SELECTED_END_REGISTER_LIVE_MAPPING_BOOKKEEPING_BYTES_V2,
     },
 };
+
+#[test]
+fn tracked_drop_unmaps_before_releasing_accounting_or_waiters() {
+    let source = include_str!("cache.rs");
+    let start = source
+        .find("impl<C: CacheContract> Drop for TrackedKernel<C> {")
+        .expect("tracked drop implementation");
+    let length = source[start..]
+        .find("\n#[derive(Clone, Copy)]\nenum Failure")
+        .expect("tracked drop implementation end");
+    let end = start.checked_add(length).expect("bounded source position");
+    let drop_impl = &source[start..end];
+    let take = drop_impl
+        .find(".publication\n            .take()")
+        .expect("linear publication take");
+    let unmap = drop_impl
+        .find("drop(publication);")
+        .expect("synchronous publication drop");
+    let release = drop_impl
+        .find("state.remove_live(identity, self.token, accounting);")
+        .expect("live accounting release");
+    let wake = drop_impl
+        .find("owner.wake.notify_all();")
+        .expect("retirement wake");
+    assert!(take < unmap);
+    assert!(unmap < release);
+    assert!(release < wake);
+}
 
 #[test]
 fn bookkeeping_reservation_accepts_exact_and_rejects_one_below() {
@@ -37,6 +68,52 @@ fn bookkeeping_reservation_accepts_exact_and_rejects_one_below() {
     limits.max_bookkeeping_bytes = exact.checked_sub(1).expect("nonzero bookkeeping");
     assert_eq!(
         KernelCache::<Span>::new(limits, PublicationLimits::default()).expect_err("one below"),
+        CacheCreateError::ResourceLimit {
+            resource: CacheResource::BookkeepingBytes,
+            limit: exact.checked_sub(1).expect("nonzero bookkeeping"),
+            required: exact,
+        }
+    );
+}
+
+#[test]
+fn selected_end_abi2_cache_has_distinct_policy_and_bounded_bookkeeping() {
+    let (base, entry, flight, live) = selected_end_bookkeeping_structural_sizes_for_test();
+    assert!(u64::try_from(base).expect("u64") <= BASE_BOOKKEEPING_BYTES);
+    assert!(u64::try_from(entry).expect("u64") <= ENTRY_BOOKKEEPING_BYTES);
+    assert!(u64::try_from(flight).expect("u64") <= FLIGHT_BOOKKEEPING_BYTES);
+    assert!(
+        u64::try_from(live).expect("u64")
+            <= SELECTED_END_REGISTER_LIVE_MAPPING_BOOKKEEPING_BYTES_V2
+    );
+
+    let mut limits = CacheLimits {
+        max_entries: 7,
+        max_in_flight_builds: 3,
+        max_live_mappings: 11,
+        ..CacheLimits::default()
+    };
+    let exact = limits
+        .required_selected_end_register_bookkeeping_bytes_v2()
+        .expect("bounded bookkeeping");
+    limits.max_bookkeeping_bytes = exact;
+    let publication_limits = PublicationLimits::default();
+    let cache = SelectedEndRegisterCacheV2::new(limits, publication_limits)
+        .expect("exact ABI2 cache boundary");
+    let policy = cache.policy_identity();
+    assert_eq!(
+        policy.call_abi_schema,
+        SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2
+    );
+    assert_eq!(policy.compile_key_schema, 1);
+    assert_eq!(policy.cache_limits, limits);
+    assert_eq!(policy.publication_limits, publication_limits);
+    assert_eq!(cache.snapshot().current.bookkeeping_bytes, exact);
+
+    limits.max_bookkeeping_bytes = exact.checked_sub(1).expect("nonzero bookkeeping");
+    assert_eq!(
+        SelectedEndRegisterCacheV2::new(limits, publication_limits)
+            .expect_err("one below must refuse"),
         CacheCreateError::ResourceLimit {
             resource: CacheResource::BookkeepingBytes,
             limit: exact - 1,
@@ -88,6 +165,109 @@ fn backend_policy_is_part_of_the_complete_cache_key() {
     assert_ne!(keys[0], keys[1]);
     assert_ne!(keys[0], keys[2]);
     assert_ne!(keys[1], keys[2]);
+}
+
+#[test]
+fn selected_end_abi2_cache_key_covers_backend_and_exact_literal() {
+    use fre_jit_aarch64::{EmitLimits, SelectedEndRegisterBackendV2};
+    use fre_kernel_ir::{AnchorFlags, ValidateLimits};
+
+    let validation = ValidateLimits::default();
+    let emission = EmitLimits::default();
+    let backends = [
+        SelectedEndRegisterBackendV2::AsimdV8,
+        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+        SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
+    ];
+    let identities = backends.map(|backend| {
+        SelectedEndRegisterCacheV2::compile_identity(
+            b"0123456789abcdef",
+            AnchorFlags::default(),
+            backend,
+            validation,
+            emission,
+        )
+        .expect("backend-specific ABI2 compile identity")
+    });
+    assert_ne!(identities[0], identities[1]);
+    assert_ne!(identities[0], identities[2]);
+    assert_ne!(identities[1], identities[2]);
+
+    let different_literal = SelectedEndRegisterCacheV2::compile_identity(
+        b"fedcba9876543210",
+        AnchorFlags::default(),
+        SelectedEndRegisterBackendV2::AsimdV8,
+        validation,
+        emission,
+    )
+    .expect("different-literal ABI2 compile identity");
+    assert_ne!(identities[0], different_literal);
+
+    let mut strict_validation = validation;
+    strict_validation.max_validation_work = strict_validation
+        .max_validation_work
+        .checked_sub(1)
+        .expect("nonzero default validation work");
+    let different_validation = SelectedEndRegisterCacheV2::compile_identity(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        SelectedEndRegisterBackendV2::AsimdV8,
+        strict_validation,
+        emission,
+    )
+    .expect("different-validation ABI2 compile identity");
+    assert_ne!(identities[0], different_validation);
+
+    let mut strict_emission = emission;
+    strict_emission.max_emission_work = strict_emission
+        .max_emission_work
+        .checked_sub(1)
+        .expect("nonzero default emission work");
+    let different_emission = SelectedEndRegisterCacheV2::compile_identity(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        SelectedEndRegisterBackendV2::AsimdV8,
+        validation,
+        strict_emission,
+    )
+    .expect("different-emission ABI2 compile identity");
+    assert_ne!(identities[0], different_emission);
+
+    let anchored = SelectedEndRegisterCacheV2::compile_identity(
+        b"0123456789abcdef",
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        SelectedEndRegisterBackendV2::AsimdV8,
+        validation,
+        emission,
+    )
+    .expect("anchored ABI2 compile identity");
+    assert_ne!(identities[0], anchored);
+}
+
+#[test]
+fn selected_end_abi2_compile_identity_schema_one_has_a_golden_vector() {
+    use fre_jit_aarch64::{EmitLimits, SelectedEndRegisterBackendV2};
+    use fre_kernel_ir::{AnchorFlags, ValidateLimits};
+
+    let identity = SelectedEndRegisterCacheV2::compile_identity(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        SelectedEndRegisterBackendV2::AsimdV8,
+        ValidateLimits::default(),
+        EmitLimits::default(),
+    )
+    .expect("golden ABI2 compile identity");
+    assert_eq!(
+        identity.as_bytes(),
+        &[
+            0xf1, 0xb4, 0xa8, 0xfb, 0xb8, 0x78, 0x5f, 0xf4, 0x4a, 0xcb, 0xf8, 0x7d, 0x7b, 0x17,
+            0xf3, 0x73, 0x0b, 0x67, 0xbd, 0x4e, 0x81, 0x15, 0x5d, 0x2b, 0xb9, 0x3b, 0x64, 0x3f,
+            0x8d, 0x89, 0x04, 0x8d,
+        ]
+    );
 }
 
 #[cfg(all(
@@ -654,5 +834,209 @@ mod native {
         let identity = RuntimeIdentity::for_image(&image);
         let kernel = publish::<Span>(&image, PublicationLimits::default()).expect("publish");
         assert_eq!(identity, kernel.identity());
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+mod selected_end_native {
+    use std::sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use fre_jit_aarch64::{CpuFeatures, EmitLimits, SelectedEndRegisterBackendV2};
+    use fre_jit_runtime::PublicationLimits;
+    use fre_kernel_ir::{AnchorFlags, SearchWindow, ValidateLimits};
+
+    use super::*;
+    use crate::{CacheError, SelectedEndRegisterCacheV2};
+
+    static SELECTED_END_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn repeated_abi2_construction_reuses_one_mapping_and_calls_without_cache_state() {
+        let _native = native_lock();
+        let cache = cache();
+        let first = cache
+            .get_or_compile_exact_literal(
+                b"needle",
+                AnchorFlags::default(),
+                SelectedEndRegisterBackendV2::AsimdV8,
+                ValidateLimits::default(),
+                EmitLimits::default(),
+            )
+            .expect("first ABI2 compile");
+        let second = cache
+            .get_or_compile_exact_literal(
+                b"needle",
+                AnchorFlags::default(),
+                SelectedEndRegisterBackendV2::AsimdV8,
+                ValidateLimits::default(),
+                EmitLimits::default(),
+            )
+            .expect("ABI2 compile cache hit");
+        assert_eq!(first.artifact_identity(), second.artifact_identity());
+        assert_eq!(first.compile_identity(), second.compile_identity());
+        assert_eq!(first.source_identity(), second.source_identity());
+        assert_eq!(first.target().features, CpuFeatures::ASIMD);
+        let snapshot_before_search = cache.snapshot();
+        assert_eq!(snapshot_before_search.totals.builds_started, 1);
+        assert_eq!(snapshot_before_search.totals.builds_succeeded, 1);
+        assert_eq!(snapshot_before_search.totals.hits, 1);
+        assert_eq!(snapshot_before_search.current.live_mappings, 1);
+
+        let session = first
+            .kernel()
+            .begin_current_thread_session()
+            .expect("ASIMD ABI2 session");
+        let haystack = b"xxneedlexx";
+        let (found, _) = session
+            .search(
+                haystack,
+                SearchWindow::new(0, haystack.len()),
+                fre_jit_runtime::LiteralSearchLimits::default(),
+            )
+            .expect("ABI2 cached publication call");
+        assert_eq!(found.map(|span| (span.start(), span.end())), Some((2, 8)));
+        assert_eq!(cache.snapshot(), snapshot_before_search);
+
+        let anchored = cache
+            .get_or_compile_exact_literal(
+                b"needle",
+                AnchorFlags {
+                    start: true,
+                    end: false,
+                },
+                SelectedEndRegisterBackendV2::AsimdV8,
+                ValidateLimits::default(),
+                EmitLimits::default(),
+            )
+            .expect("short anchored ABI2 compile");
+        assert_eq!(anchored.target().features, CpuFeatures::NONE);
+    }
+
+    #[test]
+    fn abi2_builder_must_return_the_exact_requested_artifact() {
+        let _native = native_lock();
+        let expected_identity = SelectedEndRegisterCacheV2::compile_identity(
+            b"expected",
+            AnchorFlags::default(),
+            SelectedEndRegisterBackendV2::AsimdV8,
+            ValidateLimits::default(),
+            EmitLimits::default(),
+        )
+        .expect("expected compile identity");
+        let actual_identity = SelectedEndRegisterCacheV2::compile_identity(
+            b"different",
+            AnchorFlags::default(),
+            SelectedEndRegisterBackendV2::AsimdV8,
+            ValidateLimits::default(),
+            EmitLimits::default(),
+        )
+        .expect("actual compile identity");
+        assert_eq!(
+            cache()
+                .get_or_compile_substitute_for_test(
+                    b"expected",
+                    b"different",
+                    SelectedEndRegisterBackendV2::AsimdV8,
+                    ValidateLimits::default(),
+                    EmitLimits::default(),
+                )
+                .expect_err("wrong ABI2 compile product must be rejected"),
+            CacheError::BuilderIdentityMismatch {
+                expected: expected_identity,
+                actual: actual_identity,
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_same_compile_request_runs_the_compiler_once() {
+        let _native = native_lock();
+        let cache = Arc::new(cache());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let builds = Arc::clone(&builds);
+            let released = Arc::clone(&released);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                cache.get_or_compile_with_hook_for_test(
+                    b"single-flight",
+                    SelectedEndRegisterBackendV2::AsimdV8,
+                    move || {
+                        builds.fetch_add(1, Ordering::SeqCst);
+                        let (lock, wake) = &*released;
+                        let mut allowed = lock.lock().expect("compile gate");
+                        while !*allowed {
+                            allowed = wake.wait(allowed).expect("compile gate wait");
+                        }
+                    },
+                )
+            }));
+        }
+        start.wait();
+        wait_until(|| cache.snapshot().current.waiters == 7);
+        {
+            let (lock, wake) = &*released;
+            *lock.lock().expect("compile release") = true;
+            wake.notify_all();
+        }
+        for worker in workers {
+            drop(
+                worker
+                    .join()
+                    .expect("compile worker")
+                    .expect("single-flight ABI2 compile"),
+            );
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.totals.builds_started, 1);
+        assert_eq!(snapshot.totals.builds_succeeded, 1);
+        assert_eq!(snapshot.totals.misses, 8);
+        assert_eq!(snapshot.totals.wait_events, 7);
+    }
+
+    fn cache() -> SelectedEndRegisterCacheV2 {
+        SelectedEndRegisterCacheV2::new(
+            CacheLimits {
+                max_entries: 8,
+                max_in_flight_builds: 4,
+                max_live_mappings: 16,
+                max_mapped_bytes: 64 << 20,
+                max_code_bytes: 16 << 20,
+                max_data_bytes: 16 << 20,
+                max_bookkeeping_bytes: 1 << 20,
+            },
+            PublicationLimits::default(),
+        )
+        .expect("ABI2 cache")
+    }
+
+    fn native_lock() -> MutexGuard<'static, ()> {
+        SELECTED_END_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..1_000_000 {
+            if condition() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("condition did not become true");
     }
 }

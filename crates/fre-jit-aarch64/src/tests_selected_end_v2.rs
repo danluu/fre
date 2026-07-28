@@ -9,7 +9,7 @@ use crate::{
     SearchBackendPolicy, SelectedEndAapcs64V2, SelectedEndRegisterBackendV2, UnsupportedReason,
     audit, audit::audit_selected_end_register_image_for_test_v2, audit_selected_end_register_v2,
     decode, emit_selected_end_register_v2, emit_with_backend, image::SearchCallAbi,
-    selected_end_v2::AuditedSelectedEndRegisterImageV2,
+    selected_end_register_target_v2, selected_end_v2::AuditedSelectedEndRegisterImageV2,
 };
 
 #[test]
@@ -177,6 +177,19 @@ fn selected_end_register_v2_v8_authenticates_every_exact_anchor_shape() {
             EmitLimits::default(),
         )
         .expect("anchored ABI2 V8 image");
+        assert_eq!(image.anchors(), anchors);
+        assert_eq!(
+            image.target(),
+            selected_end_register_target_v2(SelectedEndRegisterBackendV2::AsimdV8, anchors, 6)
+        );
+        assert_eq!(
+            image.target().features,
+            if anchors.start || anchors.end {
+                CpuFeatures::NONE
+            } else {
+                CpuFeatures::ASIMD
+            }
+        );
         assert_eq!(
             audit_selected_end_register_v2(&image)
                 .expect("anchored independent template")

@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use fre_kernel_ir::{CacheIdentity, OutputKind};
+use fre_kernel_ir::{AnchorFlags, CacheIdentity, OutputKind};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -59,6 +59,32 @@ impl SelectedEndRegisterBackendV2 {
             Self::AsimdV8 => 0,
             Self::Sve16V6Tag19Vl16 | Self::Sve2Fixed16Tag21Vl16 => 16,
         }
+    }
+}
+
+/// Exact architectural target required by one register-return ABI2 request.
+///
+/// V8's unanchored candidate scan uses ASIMD. An anchored short literal
+/// bypasses that scan and uses scalar equality until its width reaches one
+/// vector, while tag19 and tag21 retain their fixed feature envelopes.
+#[must_use]
+pub const fn selected_end_register_target_v2(
+    backend: SelectedEndRegisterBackendV2,
+    anchors: AnchorFlags,
+    literal_bytes: u32,
+) -> TargetSpec {
+    match backend {
+        SelectedEndRegisterBackendV2::AsimdV8
+            if (anchors.start || anchors.end) && literal_bytes < 16 =>
+        {
+            TargetSpec {
+                features: CpuFeatures::NONE,
+                ..TargetSpec::AARCH64_AAPCS64
+            }
+        }
+        SelectedEndRegisterBackendV2::AsimdV8 => TargetSpec::AARCH64_AAPCS64,
+        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16 => TargetSpec::AARCH64_AAPCS64_SVE16,
+        SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 => TargetSpec::AARCH64_AAPCS64_SVE2_16,
     }
 }
 
@@ -127,18 +153,26 @@ impl AuditedSelectedEndRegisterImageV2 {
         let manifest = inner
             .search_manifest()
             .ok_or(EmitError::InternalInvariant)?;
+        let backend = match inner.backend_version() {
+            BackendVersion::SEARCH_V8 => SelectedEndRegisterBackendV2::AsimdV8,
+            BackendVersion::SEARCH_SVE16_V6 => SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
+                SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
+            }
+            _ => return Err(EmitError::InternalInvariant),
+        };
         if inner.search_call_abi() != SearchCallAbi::SelectedEndRegisterV2
             || inner.aggregate_manifest().is_some()
             || inner.output() != OutputKind::SelectedEnd
             || manifest.output != OutputKind::SelectedEnd
             || manifest.shape != SearchShape::ExactLiteral
             || manifest.literal_bytes == 0
-            || !matches!(
-                inner.backend_version(),
-                BackendVersion::SEARCH_V8
-                    | BackendVersion::SEARCH_SVE16_V6
-                    | BackendVersion::SEARCH_SVE2_FIXED16_V2
-            )
+            || inner.target()
+                != selected_end_register_target_v2(
+                    backend,
+                    manifest.anchors,
+                    manifest.literal_bytes,
+                )
         {
             return Err(EmitError::InternalInvariant);
         }
@@ -189,6 +223,15 @@ impl AuditedSelectedEndRegisterImageV2 {
     #[must_use]
     pub const fn source_identity(&self) -> CacheIdentity {
         self.inner.source_identity()
+    }
+
+    /// Exact anchor policy authenticated by the sealed manifest.
+    #[must_use]
+    pub const fn anchors(&self) -> AnchorFlags {
+        match self.inner.search_manifest() {
+            Some(manifest) => manifest.anchors,
+            None => unreachable!(),
+        }
     }
 
     /// Non-zero exact-literal width authenticated by the sealed manifest.

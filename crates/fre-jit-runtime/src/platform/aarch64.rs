@@ -402,7 +402,10 @@ impl Mapping for ExecutableMapping {
             && self.output == OutputKind::SelectedEnd
             && self.sve_vector_bytes_at_publication.is_none()
             && match self.backend_version {
-                BackendVersion::SEARCH_V8 => self.target.features == CpuFeatures::ASIMD,
+                BackendVersion::SEARCH_V8 => {
+                    self.target.features == CpuFeatures::NONE
+                        || self.target.features == CpuFeatures::ASIMD
+                }
                 BackendVersion::SEARCH_SVE16_V6 => self.target.features == CpuFeatures::ASIMD_SVE,
                 BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
                     self.target.features == CpuFeatures::ASIMD_SVE2

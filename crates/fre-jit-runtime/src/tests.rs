@@ -2,7 +2,7 @@ use core::{cell::Cell, num::NonZeroU32};
 use std::sync::{Mutex, MutexGuard};
 
 use fre_jit_aarch64::{
-    AuditedSelectedEndRegisterImageV2, BackendVersion, DecodedInstruction, EmitLimits,
+    AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures, DecodedInstruction, EmitLimits,
     NativeAggregateResult, NativeResult, SearchBackendPolicy, SelectedEndRegisterBackendV2, decode,
     emit, emit_audited_with_backend, emit_exact_aggregate, emit_selected_end_register_v2,
     emit_with_backend,
@@ -365,6 +365,13 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
         1
     );
     assert!(!preflight.contains("current_thread_sve_vector_bytes"));
+    let host_features_start = position(
+        runtime,
+        "pub(crate) struct SelectedEndRegisterHostFeaturesV2",
+    );
+    let target_validation = &runtime[target_start..host_features_start];
+    assert!(target_validation.contains("selected_end_register_target_v2("));
+    assert!(target_validation.contains("image.anchors()"));
 
     let handle_start = position(runtime, "impl PublishedSelectedEndRegisterV2 {");
     let general_session_start = position(
@@ -391,6 +398,7 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     );
     assert!(!handle.contains("pub fn search("));
     assert!(!handle.contains("pub fn find("));
+    assert!(!runtime.contains("impl Clone for PublishedSelectedEndRegisterV2"));
 
     let general_struct_start = position(
         runtime,
@@ -465,6 +473,7 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
         platform.contains("self.selected_end_register_literal_bytes_v2 == Some(literal_bytes)")
     );
     assert!(platform.contains("self.sve_vector_bytes_at_publication.is_none()"));
+    assert!(platform.contains("self.target.features == CpuFeatures::NONE"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE2"));
@@ -673,6 +682,39 @@ fn selected_end_register_v2_strict_wx_guards_accounting_and_failures_are_closed(
     }
     drop(session);
     drop(kernel);
+    assert_eq!(platform::live_code_mappings(), 0);
+
+    let anchored_program = build_exact_literal::<SelectedEnd>(
+        literal,
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        ValidateLimits::default(),
+    )
+    .expect("short anchored exact SelectedEnd");
+    let anchored_image = emit_selected_end_register_v2(
+        &anchored_program,
+        SelectedEndRegisterBackendV2::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("scalar-only anchored ABI2 image");
+    assert_eq!(anchored_image.target().features, CpuFeatures::NONE);
+    let anchored_kernel =
+        publish_selected_end_register_v2(&anchored_image, PublicationLimits::default())
+            .expect("scalar-only anchored ABI2 publication");
+    let anchored_session = anchored_kernel
+        .begin_current_thread_session()
+        .expect("anchored V8 ABI2 session");
+    assert_eq!(
+        anchored_session
+            .find(literal, LiteralSearchLimits::unlimited())
+            .expect("anchored ABI2 exact search")
+            .0,
+        Some(fre_kernel_ir::MatchSpan::new(0, literal.len()))
+    );
+    drop(anchored_session);
+    drop(anchored_kernel);
     assert_eq!(platform::live_code_mappings(), 0);
 }
 

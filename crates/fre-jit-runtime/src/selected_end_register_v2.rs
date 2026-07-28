@@ -7,7 +7,7 @@ use std::{rc::Rc, sync::Arc};
 use fre_jit_aarch64::{
     AuditedSelectedEndRegisterImageV2, BackendVersion, CpuFeatures, MAX_REPEATED_CONFIRM_BYTES,
     SelectedEndRegisterArtifactIdentityV2, SelectedEndRegisterBackendV2, TargetSpec,
-    audit_selected_end_register_v2,
+    audit_selected_end_register_v2, selected_end_register_target_v2,
 };
 use fre_kernel_ir::{MatchSpan, OutputKind, SearchWindow};
 use fre_kernels::{
@@ -79,10 +79,21 @@ impl From<LiteralError> for SelectedEndRegisterCallErrorV2 {
 /// through [`PublishedSelectedEndRegisterThreadSessionV2`] or
 /// [`PublishedSelectedEndRegisterPlanThreadSessionV2`], so tag19 and tag21
 /// cannot inherit Search-v1's backward-compatible unchecked-thread assumption.
+///
+/// Mapping ownership is linear. Share a direct publication through an
+/// `Arc<PublishedSelectedEndRegisterV2>` when needed; the handle itself is not
+/// clonable, so a bounded cache can expose borrowed sessions without letting
+/// safe code retain an unaccounted executable mapping.
+///
+/// ```compile_fail,E0277
+/// use fre_jit_runtime::PublishedSelectedEndRegisterV2;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<PublishedSelectedEndRegisterV2>();
+/// ```
 pub struct PublishedSelectedEndRegisterV2 {
     pub(crate) mapping: Arc<ExecutableMapping>,
     entry: SelectedEndRegisterEntryV2,
-    runtime_identity: RuntimeIdentity,
     artifact_identity: SelectedEndRegisterArtifactIdentityV2,
     accounting: PublicationAccounting,
     backend: SelectedEndRegisterBackendV2,
@@ -142,22 +153,6 @@ pub struct PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel> {
     literal_plan: &'kernel LiteralPlan,
     literal_bytes: usize,
 }
-
-impl Clone for PublishedSelectedEndRegisterV2 {
-    fn clone(&self) -> Self {
-        Self {
-            mapping: Arc::clone(&self.mapping),
-            entry: self.entry,
-            runtime_identity: self.runtime_identity,
-            artifact_identity: self.artifact_identity,
-            accounting: self.accounting,
-            backend: self.backend,
-            literal_bytes: self.literal_bytes,
-            exact_literal: self.exact_literal,
-        }
-    }
-}
-
 impl fmt::Debug for PublishedSelectedEndRegisterV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -281,6 +276,17 @@ impl PublishedSelectedEndRegisterV2 {
     #[must_use]
     pub const fn literal_bytes(&self) -> u32 {
         self.literal_bytes.get()
+    }
+
+    /// Whether this handle uniquely owns its executable mapping.
+    ///
+    /// The bounded ABI2 cache uses this only while transferring a freshly
+    /// published mapping into cache accounting. Search sessions never consult
+    /// the cache or this reference count.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_unique_mapping_ownership(&self) -> bool {
+        Arc::strong_count(&self.mapping) == 1
     }
 
     /// Qualification observation of the SVE vector length recorded by
@@ -617,7 +623,6 @@ pub(crate) fn publish_selected_end_register_v2_impl(
     Ok(PublishedSelectedEndRegisterV2 {
         mapping: Arc::new(mapping),
         entry,
-        runtime_identity,
         artifact_identity,
         accounting: plan.accounting,
         backend: image.backend(),
@@ -668,12 +673,9 @@ fn validate_selected_end_register_target_v2(
             bits: target.features.bits(),
         });
     }
-    let expected_features = match image.backend() {
-        SelectedEndRegisterBackendV2::AsimdV8 => CpuFeatures::ASIMD,
-        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16 => CpuFeatures::ASIMD_SVE,
-        SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
-    };
-    if target.features != expected_features
+    let expected_target =
+        selected_end_register_target_v2(image.backend(), image.anchors(), image.literal_bytes());
+    if target != expected_target
         || image.output() != OutputKind::SelectedEnd
         || !matches!(
             image.backend_version(),

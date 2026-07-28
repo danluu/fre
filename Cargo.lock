@@ -303,6 +303,7 @@ dependencies = [
  "fre-jit-aarch64",
  "fre-jit-runtime",
  "fre-kernel-ir",
+ "sha2",
 ]
 
 [[package]]

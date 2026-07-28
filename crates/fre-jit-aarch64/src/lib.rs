@@ -54,6 +54,7 @@ pub use selected_end_v2::{
     AuditedSelectedEndRegisterImageV2, SELECTED_END_REGISTER_CALL_ABI_SCHEMA_V2,
     SELECTED_END_REGISTER_RETURN_ENCODING_V2, SelectedEndRegisterAotArtifactV2,
     SelectedEndRegisterArtifactIdentityV2, SelectedEndRegisterBackendV2,
+    selected_end_register_target_v2,
 };
 
 #[cfg(test)]
