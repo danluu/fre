@@ -2410,6 +2410,15 @@ impl CompiledRegex {
                 prospective.work_bound,
                 attempt_accounting,
             )?,
+            StateByteSpanSumTopology::DisjointInternalRuns
+            | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
+                reduce_disjoint_internal_runs(
+                    plan,
+                    local,
+                    prospective.work_bound,
+                    attempt_accounting,
+                )?
+            }
         };
         validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
         if !prospective.contains(*attempt_accounting) {
@@ -3911,6 +3920,10 @@ const fn fixed_continuation_beats_dense(
     candidate_work_upper < dense_work_floor
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the prospective keeps every topology's complete resource envelope adjacent"
+)]
 fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     program: &Program,
     plan: &StateByteSpanSumPlan,
@@ -3932,6 +3945,8 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
                 add(plan.literal().len(), 7, Resource::ExecutionWork)?
             }
         }
+        StateByteSpanSumTopology::DisjointInternalRuns
+        | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 12,
     };
     let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
     let work_bound = if OBSERVED_WORK {
@@ -3941,6 +3956,8 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     };
     let state_transition_factor = match plan.topology() {
         StateByteSpanSumTopology::DisjointRunsLiteral if plan.literal().len() > 1 => 4,
+        StateByteSpanSumTopology::DisjointInternalRuns
+        | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
         _ => 2,
     };
     let state_transition_bound = mul(
@@ -3949,9 +3966,6 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         Resource::ExecutionWork,
     )?;
     let root_probe_bound = match plan.topology() {
-        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
-            mul(input_bytes, 2, Resource::ExecutionWork)?
-        }
         StateByteSpanSumTopology::DisjointRunsLiteral => {
             let factor = if plan.literal().len() > 1 {
                 add(plan.literal().len(), 1, Resource::ExecutionWork)?
@@ -3959,6 +3973,11 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
                 plan.literal().len()
             };
             mul(input_bytes, factor, Resource::ExecutionWork)?
+        }
+        StateByteSpanSumTopology::GreedyPrefixLiteralSuffix
+        | StateByteSpanSumTopology::DisjointInternalRuns
+        | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
+            mul(input_bytes, 2, Resource::ExecutionWork)?
         }
     };
     let random_access_bytes_read = match plan.topology() {
@@ -3970,6 +3989,10 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
                 add(plan.literal().len(), 1, Resource::ExecutionWork)?
             };
             mul(input_bytes, factor, Resource::ExecutionWork)?
+        }
+        StateByteSpanSumTopology::DisjointInternalRuns
+        | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
+            mul(input_bytes, 4, Resource::ExecutionWork)?
         }
     };
     let accounting = ExecutionAccounting {
@@ -4119,6 +4142,135 @@ fn reduce_disjoint_runs_literal(
     } else {
         reduce_disjoint_runs_literal_scalar(plan, haystack, work_limit, accounting)
     }
+}
+
+// The singleton internal anchor is excluded from both adjacent classes.
+// Consequently, monotone anchor searches partition every reverse prefix run
+// and every forward suffix run. The checkpoint form retains one marker that
+// belongs to the suffix class: `S+ D S+` exists exactly when the maximal
+// suffix run contains `D` somewhere other than its first or last byte.
+//
+// The executor therefore preserves leftmost-first, greedy, non-overlapping
+// whole-match semantics without replay or scratch storage. A failed
+// checkpoint can skip to the end of its suffix run because that run is proved
+// not to contain another anchor.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete anchor, prefix, suffix, checkpoint, publication, and accounting transaction stays visible"
+)]
+fn reduce_disjoint_internal_runs(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let prefix = plan.first();
+    let suffix = plan.second();
+    let anchor = *plan.literal().first().ok_or(Error::InternalInvariant(
+        "state-byte internal-run plan lost its anchor",
+    ))?;
+    let checkpoint = match plan.topology() {
+        StateByteSpanSumTopology::DisjointInternalRuns => None,
+        StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => {
+            Some(*plan.literal().get(1).ok_or(Error::InternalInvariant(
+                "state-byte checkpoint plan lost its marker",
+            ))?)
+        }
+        _ => {
+            return Err(Error::InternalInvariant(
+                "non-internal state-byte topology reached internal reducer",
+            ));
+        }
+    };
+
+    let mut match_floor = 0_usize;
+    let mut search = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while search < haystack.len() {
+        let Some(anchor_index) =
+            state_byte_find_anchor(anchor, haystack, search, work_limit, accounting)?
+        else {
+            break;
+        };
+        search = add(anchor_index, 1, Resource::Boundaries)?;
+        if anchor_index <= match_floor {
+            continue;
+        }
+
+        let mut prefix_start = anchor_index;
+        while prefix_start > match_floor {
+            let previous = prefix_start.checked_sub(1).ok_or(Error::InternalInvariant(
+                "positive state-byte internal prefix lost its predecessor",
+            ))?;
+            if !state_byte_classify(
+                prefix,
+                haystack,
+                previous,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+            {
+                break;
+            }
+            prefix_start = previous;
+        }
+        if prefix_start == anchor_index {
+            continue;
+        }
+
+        let suffix_start = add(anchor_index, 1, Resource::Boundaries)?;
+        let mut suffix_end = suffix_start;
+        let mut suffix_bytes = 0_usize;
+        let mut previous_was_checkpoint = false;
+        let mut interior_checkpoint = false;
+        while suffix_end < haystack.len() {
+            let classified = state_byte_classify(
+                suffix,
+                haystack,
+                suffix_end,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?;
+            if !classified.matches {
+                break;
+            }
+            if previous_was_checkpoint && suffix_bytes > 1 {
+                interior_checkpoint = true;
+            }
+            previous_was_checkpoint = if let Some(marker) = checkpoint {
+                state_byte_compare_cached(classified.byte, marker, work_limit, accounting)?
+            } else {
+                false
+            };
+            suffix_bytes = add(suffix_bytes, 1, Resource::Boundaries)?;
+            suffix_end = add(suffix_end, 1, Resource::Boundaries)?;
+        }
+        if suffix_bytes == 0 {
+            continue;
+        }
+        search = suffix_end;
+        if checkpoint.is_some() && !interior_checkpoint {
+            continue;
+        }
+
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            suffix_end
+                .checked_sub(prefix_start)
+                .ok_or(Error::InternalInvariant(
+                    "state-byte internal reducer selected a reversed span",
+                ))?,
+            Resource::SpanSum,
+        )?;
+        match_floor = suffix_end;
+    }
+    Ok((matches, span_sum))
 }
 
 // The compile-selected byte offset is a necessary literal witness, so a
@@ -9579,8 +9731,8 @@ mod tests {
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
         OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
-        Requirements, RowReader, RowStorage, RowStore, UNCACHED_FRONTIER, allocation_fault,
-        cached_boundary_symbol, cached_compute_row, cached_frontier_words,
+        Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumTopology, UNCACHED_FRONTIER,
+        allocation_fault, cached_boundary_symbol, cached_compute_row, cached_frontier_words,
         cached_program_assertion_mask, compact_operation_allocation_count, decode,
         dense_reduction_work_floor, encoded_width, exact_filled, fixed_continuation_beats_dense,
         operation_identity, read_encoded, write_encoded,
@@ -14210,7 +14362,7 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_structural_variants_match_upstream() {
-        let cases: [(&str, &[u8]); 6] = [
+        let cases: [(&str, &[u8]); 8] = [
             (
                 r"[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*",
                 b"\xffno\npre ABCDEFGHIJKLMNOPQRSTUVWXYZ tail\n\
@@ -14230,6 +14382,15 @@ mod tests {
                 b"a1\tHolmes -- Z_\r\nHolmes\nHolmes 0 Holmes",
             ),
             (r"[ab]+[ ]+a", b"abba  a b a aba   a\nba a"),
+            (
+                r"\w+@\w+",
+                b"none @bad good@example next@site x@@y left@right_tail",
+            ),
+            (
+                r"[\w.+-]+@[\w.-]+\.[\w.-]+",
+                b"a@b.c bad@.x bad@x. bad@.x. fail@x. good@a.b \
+                  a+b-c@sub.example.org x@@y.z",
+            ),
         ];
         for (pattern, haystack) in cases {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -14303,11 +14464,13 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_exhaustive_small_differential() {
-        let cases: [(&str, &[u8]); 4] = [
+        let cases: [(&str, &[u8]); 6] = [
             (r"[ab]*ab[abc]*", b"abc\n"),
             (r"[ab]*abab[abc]*", b"abc\n"),
             (r"[ab]+[ ]+a", b"ab \n"),
             (r"[a]+[b]+aba", b"abx\n"),
+            (r"[ab]+@[ab]+", b"ab@\n"),
+            (r"[a]+@[a.]+\.[a.]+", b"a@.!"),
         ];
         for (pattern, alphabet) in cases {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -14382,6 +14545,111 @@ mod tests {
                     "{pattern:?}, range count haystack={haystack:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn state_byte_internal_runs_retain_exact_routes_and_close_one_below() {
+        for (pattern, topology, haystack) in [
+            (
+                r"\w+@\w+",
+                StateByteSpanSumTopology::DisjointInternalRuns,
+                b"none @bad good@example next@site x@@y".as_slice(),
+            ),
+            (
+                r"[\w.+-]+@[\w.-]+\.[\w.-]+",
+                StateByteSpanSumTopology::DisjointInternalRunsCheckpoint,
+                b"a@b.c bad@.x bad@x. a+b-c@sub.example.org".as_slice(),
+            ),
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled.state_byte_span_sum.as_ref().unwrap().topology(),
+                topology
+            );
+            let compile = compiled.compile_accounting();
+            let exact_compile_limits = CompileLimits {
+                max_program_bytes: compile.program_bytes,
+                max_work: compile.work,
+                ..CompileLimits::default()
+            };
+            assert_eq!(
+                state_byte_span_sum_fixture_with_limits(pattern, exact_compile_limits)
+                    .unwrap()
+                    .state_byte_span_sum
+                    .as_ref()
+                    .unwrap()
+                    .topology(),
+                topology
+            );
+            assert!(matches!(
+                state_byte_span_sum_fixture_with_limits(
+                    pattern,
+                    CompileLimits {
+                        max_work: compile.work - 1,
+                        ..exact_compile_limits
+                    },
+                ),
+                Err(Error::ResourceLimit {
+                    resource: Resource::CompileWork,
+                    ..
+                })
+            ));
+            let baseline = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(baseline.value, upstream_span_sum(pattern, haystack));
+            assert_eq!(baseline.receipt.actual_allocations, 0);
+            let prospective = baseline.receipt.prospective.unwrap();
+            assert!(prospective.contains(baseline.receipt.actual));
+            let exact_limits = OperationLimits {
+                max_work: baseline.receipt.actual.work,
+                ..exact_state_byte_limits(&prospective)
+            };
+            let exact = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    exact_limits,
+                )
+                .unwrap();
+            assert_eq!(exact.value, baseline.value);
+            assert_eq!(exact.receipt.actual, baseline.receipt.actual);
+            assert!(exact.receipt.authenticates_success());
+
+            let one_below = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits {
+                        max_work: baseline.receipt.actual.work - 1,
+                        ..exact_limits
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                one_below.source,
+                Error::ResourceLimit {
+                    resource: Resource::ExecutionWork,
+                    ..
+                }
+            ));
+            assert_eq!(one_below.receipt.actual_allocations, 0);
+            assert!(
+                one_below
+                    .receipt
+                    .prospective
+                    .unwrap()
+                    .contains(one_below.receipt.actual)
+            );
+            assert!(one_below.closes());
         }
     }
 
@@ -14654,6 +14922,11 @@ mod tests {
             r"\A[a-c]+[ ]+a",
             r"(?:[a-c]*ab[a-z]*)|x",
             r"[a-c]{1,3}[ ]+a",
+            r"[a@]+@[ab]+",
+            r"[ab]+@@[ab]+",
+            r"[ab]+@[ab]+?",
+            r"[ab]+@[ab.]+\.[ac.]+",
+            r"[ab]+@[ab]+\.[ab]+",
         ] {
             let compiled = state_byte_span_sum_fixture(pattern);
             assert_eq!(

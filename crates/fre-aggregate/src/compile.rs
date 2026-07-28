@@ -656,6 +656,11 @@ pub(crate) enum StateByteSpanSumTopology {
     GreedyPrefixLiteralSuffix,
     /// Exact greedy `W+ S+ L`, with disjoint `W`/`S`, `L[0] ∈ W`.
     DisjointRunsLiteral,
+    /// Exact greedy `P+ A S+`, with singleton `A ∉ P ∪ S`.
+    DisjointInternalRuns,
+    /// Exact greedy `P+ A S+ D S+`, with identical `S`, singleton
+    /// `A ∉ P ∪ S`, and singleton `D ∈ S`.
+    DisjointInternalRunsCheckpoint,
 }
 
 impl StateByteSpanSumPlan {
@@ -698,6 +703,8 @@ impl StateByteSpanSumPlan {
         match self.topology {
             StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 1,
             StateByteSpanSumTopology::DisjointRunsLiteral => 2,
+            StateByteSpanSumTopology::DisjointInternalRuns => 3,
+            StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
         }
     }
 }
@@ -1513,6 +1520,10 @@ impl fre_kernels::UrlAggregateBuildAuthority for UrlBuildAuthority<'_> {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all exact topology proofs and their single retained descriptor stay in one auditable construction transaction"
+)]
 fn build_state_byte_span_sum_plan(
     hir: &Hir,
     profile: RustByteProfile,
@@ -1528,11 +1539,10 @@ fn build_state_byte_span_sum_plan(
         return Ok(None);
     };
     budget.charge(1)?;
-    if parts.len() != 3 {
-        return Ok(None);
-    }
     let mut proof = None;
-    if let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
+    let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
+    if parts.len() == 3
+        && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
         && let Some(literal) = state_byte_literal(&parts[1], budget)?
         && !literal.is_empty()
         && literal.len() <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
@@ -1548,15 +1558,17 @@ fn build_state_byte_span_sum_plan(
                 .zip(second.0)
                 .all(|(&left, right)| left & !right == 0)
         {
+            retained_literal[..literal.len()].copy_from_slice(literal);
             proof = Some((
                 StateByteSpanSumTopology::GreedyPrefixLiteralSuffix,
                 first,
                 second,
-                literal,
+                literal.len(),
             ));
         }
     }
     if proof.is_none()
+        && parts.len() == 3
         && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
         && let Some((second_min, second)) = state_byte_unbounded_class(&parts[1], budget)?
         && let Some(literal) = state_byte_literal(&parts[2], budget)?
@@ -1573,17 +1585,70 @@ fn build_state_byte_span_sum_plan(
                 .all(|(&left, right)| left & right == 0)
             && first.contains(literal[0])
         {
+            retained_literal[..literal.len()].copy_from_slice(literal);
             proof = Some((
                 StateByteSpanSumTopology::DisjointRunsLiteral,
                 first,
                 second,
-                literal,
+                literal.len(),
             ));
         }
     }
-    let Some((topology, first, second, literal)) = proof else {
+    if proof.is_none()
+        && parts.len() == 3
+        && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
+        && let Some(anchor) = state_byte_literal(&parts[1], budget)?
+        && let [anchor] = anchor
+        && let Some((second_min, second)) = state_byte_unbounded_class(&parts[2], budget)?
+    {
+        budget.charge(6)?;
+        if first_min == 1
+            && second_min == 1
+            && !first.contains(*anchor)
+            && !second.contains(*anchor)
+        {
+            retained_literal[0] = *anchor;
+            proof = Some((
+                StateByteSpanSumTopology::DisjointInternalRuns,
+                first,
+                second,
+                1,
+            ));
+        }
+    }
+    if proof.is_none()
+        && parts.len() == 5
+        && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
+        && let Some(anchor) = state_byte_literal(&parts[1], budget)?
+        && let [anchor] = anchor
+        && let Some((second_min, second)) = state_byte_unbounded_class(&parts[2], budget)?
+        && let Some(checkpoint) = state_byte_literal(&parts[3], budget)?
+        && let [checkpoint] = checkpoint
+        && let Some((trailing_min, trailing)) = state_byte_unbounded_class(&parts[4], budget)?
+    {
+        budget.charge(10)?;
+        if first_min == 1
+            && second_min == 1
+            && trailing_min == 1
+            && second == trailing
+            && !first.contains(*anchor)
+            && !second.contains(*anchor)
+            && second.contains(*checkpoint)
+        {
+            retained_literal[0] = *anchor;
+            retained_literal[1] = *checkpoint;
+            proof = Some((
+                StateByteSpanSumTopology::DisjointInternalRunsCheckpoint,
+                first,
+                second,
+                2,
+            ));
+        }
+    }
+    let Some((topology, first, second, literal_len)) = proof else {
         return Ok(None);
     };
+    let literal = &retained_literal[..literal_len];
 
     let retained_bytes = StateByteSpanSumPlan::materialized_bytes();
     budget.charge(add(retained_bytes, literal.len(), Resource::CompileWork)?)?;
@@ -1594,8 +1659,6 @@ fn build_state_byte_span_sum_plan(
         } else {
             0
         };
-    let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
-    retained_literal[..literal.len()].copy_from_slice(literal);
     let plan = StateByteSpanSumPlan {
         topology,
         first,
@@ -7261,8 +7324,8 @@ fn bind_state_byte_span_sum_identity(
     plan: &StateByteSpanSumPlan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = b"fre.aggregate.state-byte-span-sum-plan.v3";
-    let operation = b"fre.aggregate.state-byte-span-sum-operation.v3";
+    let domain = b"fre.aggregate.state-byte-span-sum-plan.v4";
+    let operation = b"fre.aggregate.state-byte-span-sum-operation.v4";
     let class_bytes = mul(8, core::mem::size_of::<u64>(), Resource::CompileWork)?;
     let payload = add(
         add(
