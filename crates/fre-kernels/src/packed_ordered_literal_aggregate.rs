@@ -1,87 +1,103 @@
-//! Theorem-bounded SIMD packed reducers for small ordered literal sets.
+//! Receipt-correct packed reducers for small ordered literal sets.
 //!
-//! The pinned packed searcher is not used as a general fallback: arbitrary
-//! literal width or count would make its candidate verification bound depend
-//! without limit on the compiled language. This plan admits only the absolute
-//! constants below. Empty alternatives are refused because the pinned packed
-//! iterator does not support them and because nonempty matches are the progress
-//! proof: every restarted suffix begins strictly after the previous start.
+//! The retained owner is entirely FRE controlled. It contains one
+//! length-prefixed copy of the ordered patterns, fixed metadata, a fixed
+//! first-byte-to-pattern map and one already-dispatched ASCII classifier.
+//! Construction publishes that owner through one exact fallible allocation.
+//! The operation walks candidate starts monotonically, verifies pattern IDs in
+//! source order and never allocates.
 //!
-//! This module is research-only. Its operation path is source-audited as
-//! allocation-free, but `Searcher` construction contains dependency-internal
-//! infallible `Vec`, `Box`, `BTreeMap` and `Arc` allocations. Consequently the
-//! build peak below is a conservative admission envelope, not production-grade
-//! resource certification. The general reverse plan has fallible reservations
-//! and remains the correctness/resource floor.
+//! This kernel intentionally knows nothing about Unicode boundaries. It
+//! implements ordered, nonempty byte strings. A facade may bind either
+//! Unicode-off byte semantics or a separately proved set of complete UTF-8
+//! words to that byte-string contract.
 
 use core::{fmt, mem::size_of};
 
-use aho_corasick::packed::Searcher;
-
-use crate::ordered_literal_aggregate::{
-    BoundarySemantics, IterationSemantics, MatchSemantics, Operation, Semantics,
+use fre_exact_alloc::{CopyError, try_box_preserve};
+use fre_simd_kernels::{
+    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy, SimdDispatchContext,
 };
 
-const CACHE_FORMAT_VERSION: u32 = 1;
-const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
-const BUILD_FACTOR: usize = 4_096;
-const FIXED_BUILD_WORK: usize = 1024 * 1024;
-const PATTERN_BYTE_ENVELOPE: usize = 4_096;
-const PATTERN_ENTRY_ENVELOPE: usize = 64 * 1024;
-const FIXED_BUILD_ENVELOPE: usize = 4 * 1024 * 1024;
-// The pinned Teddy implementations use at most one 256-bit (32-byte) vector
-// plus three bytes of mask history. A terminal vector can be revisited once in
-// every iterator call, including the final no-match call. The extra one is an
-// inclusive boundary charge: 32 + 3 + 1 = 36.
-const MAX_TEDDY_TAIL_REVISIT_POSITIONS_PER_CALL: usize = 36;
-const FIXED_WORK_PER_EXAMINED_POSITION: usize = 64;
-const FIXED_WORK_PER_ITERATOR_CALL: usize = 64;
+use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
+const CACHE_FORMAT_VERSION: u32 = 2;
+const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
+const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
+    + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
+    + CERTIFIED_MAX_TOTAL_PATTERN_BYTES;
+const CLASSIFIER_BUILD_WORK: usize = 128;
+const FIXED_WORK_PER_POSITION: usize = 64;
+const FIXED_FINAL_WORK: usize = 64;
+const SIMD_BLOCK_BYTES: usize = 32;
+
+/// Smallest admitted ordered set. Singletons already have a stronger direct
+/// literal implementation.
+pub const CERTIFIED_MIN_PATTERNS: usize = 2;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_PATTERNS: usize = 16;
+/// Smallest admitted literal. One-byte sets are deliberately left to the
+/// existing byte-class reducers until separately qualified.
+pub const CERTIFIED_MIN_PATTERN_BYTES: usize = 2;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_PATTERN_BYTES: usize = 32;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
-/// Pinned dependency identity.
-pub const AHO_CORASICK_VERSION: &str = "1.1.4";
-/// crates.io checksum from the pinned lockfile.
-pub const AHO_CORASICK_PACKAGE_CHECKSUM: &str =
-    "ddd31a130427c27518df266943a5308ed92d4b226cc639f5a8f1002816174301";
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-bounded-find-iter.v1";
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-bounded-find-iter.v1";
-pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.packed-bounded-find-iter.v1";
+/// Stable FRE-owned strategy identity.
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-first-byte-stream.v2";
+/// Stable count-plan identity.
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-first-byte-stream.v2";
+/// Stable span-sum-plan identity.
+pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.packed-first-byte-stream.v2";
+/// Version of the success-or-failure construction protocol.
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+/// Version of the partial-actual construction ledger.
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
+
+/// Boundary contract owned by this byte-string kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundarySemantics {
+    /// Every alternative is nonempty. Character-boundary validity, when
+    /// required, is proved and bound by the caller.
+    NonemptyByteStrings,
+}
+
+/// Exact matching semantics represented by the cache identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Semantics {
+    pub match_semantics: MatchSemantics,
+    pub iteration_semantics: IterationSemantics,
+    pub boundary_semantics: BoundarySemantics,
+}
+
+const SEMANTICS: Semantics = Semantics {
+    match_semantics: MatchSemantics::LeftmostFirst,
+    iteration_semantics: IterationSemantics::NonOverlapping,
+    boundary_semantics: BoundarySemantics::NonemptyByteStrings,
+};
 
 /// Collision-free process-local semantic identity for one packed plan.
-///
-/// The pinned builder runtime-selects a Teddy variant and uses its Rabin-Karp
-/// member for short suffixes. This is not a portable serialized-code cache
-/// key. Limits are excluded and must be revalidated on reuse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CacheIdentity<'a> {
     pub algorithm_id: &'static str,
     pub plan_id: &'static str,
     pub operation: Operation,
     pub cache_format_version: u32,
-    pub dependency_version: &'static str,
-    pub dependency_checksum: &'static str,
     pub implementation_kind: &'static str,
     pub identity_scope: &'static str,
     pub target_arch: &'static str,
     pub runtime_minimum_haystack_bytes: usize,
     pub semantics: Semantics,
+    pub classifier_selection: AsciiSelection,
+    pub certified_min_patterns: usize,
     pub certified_max_patterns: usize,
+    pub certified_min_pattern_bytes: usize,
     pub certified_max_pattern_bytes: usize,
     pub certified_max_total_pattern_bytes: usize,
     pub encoded_patterns: &'a [u8],
 }
 
-/// Research admission limits.
-///
-/// Pattern and identity checks are exact; persistent bytes include the
-/// dependency's documented approximate `memory_usage`. Build work and peak
-/// checks use deliberately oversized source-derived envelopes, but cannot make
-/// the pinned dependency's infallible internal allocations fallible.
+/// Caller limits for one packed construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildLimits {
     pub max_patterns: usize,
@@ -122,6 +138,7 @@ impl Default for BuildLimits {
     }
 }
 
+/// Prospective and published accounting for one packed plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildAccounting {
     pub patterns: usize,
@@ -130,12 +147,107 @@ pub struct BuildAccounting {
     pub min_pattern_bytes: usize,
     pub identity_bytes: usize,
     pub identity_capacity_bytes: usize,
-    pub build_work_upper_bound: usize,
+    pub build_work_upper_bound: u64,
     pub build_peak_upper_bound: usize,
     pub persistent_bytes: usize,
     pub simd_minimum_haystack_bytes: usize,
 }
 
+/// Immutable identity and caller envelope for one construction attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptIdentity {
+    pub algorithm_id: &'static str,
+    pub plan_id: &'static str,
+    pub operation: Operation,
+    pub limits: BuildLimits,
+    pub algorithm_version: u32,
+    pub accounting_version: u32,
+}
+
+/// Exact effects committed through the last completed construction step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BuildAttemptActual {
+    pub work: u64,
+    pub allocations: usize,
+    pub allocated_bytes: usize,
+    pub copied_bytes: usize,
+    pub initialized_bytes: usize,
+    pub live_persistent_bytes: usize,
+    pub live_scratch_bytes: usize,
+    pub peak_bytes: usize,
+}
+
+/// One closed successful or failed construction receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuildAttemptReceipt {
+    identity: BuildAttemptIdentity,
+    actual: BuildAttemptActual,
+    accounting: Option<BuildAccounting>,
+    published: bool,
+}
+
+impl BuildAttemptReceipt {
+    #[must_use]
+    pub const fn identity(&self) -> BuildAttemptIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn actual(&self) -> BuildAttemptActual {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn accounting(&self) -> Option<BuildAccounting> {
+        self.accounting
+    }
+
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    #[must_use]
+    pub fn contains_actual(&self) -> bool {
+        let work_fits = u64::try_from(self.identity.limits.max_build_work)
+            .map_or(true, |limit| self.actual.work <= limit);
+        self.identity.algorithm_id == ALGORITHM_ID
+            && self.identity.algorithm_version == BUILD_ATTEMPT_ALGORITHM_VERSION
+            && self.identity.accounting_version == BUILD_ATTEMPT_ACCOUNTING_VERSION
+            && work_fits
+            && self.actual.live_persistent_bytes <= self.identity.limits.max_persistent_bytes
+            && self.actual.peak_bytes <= self.identity.limits.max_build_peak_bytes
+            && self.actual.live_scratch_bytes == 0
+            && self.actual.copied_bytes <= self.actual.initialized_bytes
+            && self.actual.peak_bytes
+                >= self
+                    .actual
+                    .live_persistent_bytes
+                    .saturating_add(self.actual.live_scratch_bytes)
+    }
+
+    fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
+        self.published
+            && self.identity.operation == operation
+            && self.identity.plan_id
+                == match operation {
+                    Operation::Count => COUNT_PLAN_ID,
+                    Operation::SpanSum => SPAN_SUM_PLAN_ID,
+                }
+            && self.accounting == Some(accounting)
+            && self.contains_actual()
+            && self.actual.work <= accounting.build_work_upper_bound
+            && self.actual.allocations == 1
+            && self.actual.live_persistent_bytes == accounting.persistent_bytes
+            && self.actual.peak_bytes <= accounting.build_peak_upper_bound
+    }
+
+    fn closes_failure(&self) -> bool {
+        !self.published && self.accounting.is_none() && self.contains_actual()
+    }
+}
+
+/// Limits checked before touching one operation's source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceLimits {
     pub max_work: u64,
@@ -176,14 +288,20 @@ impl Default for ReduceLimits {
     }
 }
 
+/// Complete source-independent envelope for one reduction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceUpperBounds {
     pub haystack_bytes: usize,
     pub candidate_positions: usize,
+    /// Retained for compatibility with the former restarted iterator theorem.
+    /// The monotone FRE-owned stream never revisits a suffix.
     pub restart_tail_positions: usize,
     pub examined_positions: usize,
     pub work_per_position: usize,
+    /// Retained for compatibility. The monotone stream has no iterator setup.
     pub iterator_setup_work: usize,
+    pub source_byte_reads: usize,
+    pub pattern_checks: usize,
     pub work: u64,
     pub match_events: usize,
     pub count: u64,
@@ -194,14 +312,28 @@ pub struct ReduceUpperBounds {
     pub peak_bytes: usize,
 }
 
+/// Successful operation counters.
+///
+/// Prefix equality is intentionally left optimized. As with the existing
+/// dependency-owned Two-Way primitive, its opaque early exits are charged at
+/// the prospective source-read envelope in the successful actual receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub match_events: u64,
+    /// Candidate events plus the final exhausted-stream observation.
     pub iterator_next_calls: usize,
     pub count: Option<u64>,
     pub span_sum: Option<u64>,
+    pub classified_positions: usize,
+    pub candidate_events: usize,
+    pub pattern_checks: usize,
+    pub source_byte_reads: usize,
+    pub work: u64,
+    pub scratch_bytes: usize,
+    pub peak_bytes: usize,
 }
 
+/// Successful reduction certificate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceAccounting<'a> {
     pub identity: CacheIdentity<'a>,
@@ -271,12 +403,105 @@ pub enum BuildError {
 }
 
 impl fmt::Display for BuildError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "packed ordered-literal build refusal: {self:?}")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "packed ordered-literal build refusal: {self:?}")
     }
 }
 
 impl std::error::Error for BuildError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildFailureKind {
+    EmptyPatternSet,
+    EmptyPattern,
+    ProofRefused,
+    PatternLimit,
+    PatternBytesLimit,
+    TotalPatternBytesLimit,
+    IdentityLimit,
+    WorkLimit,
+    BuildPeakLimit,
+    PersistentLimit,
+    UnsupportedTargetOrShape,
+    AllocationFailed,
+    ArithmeticOverflow,
+}
+
+impl BuildFailureKind {
+    const fn from_error(error: &BuildError) -> Self {
+        match error {
+            BuildError::EmptyPatternSet => Self::EmptyPatternSet,
+            BuildError::EmptyPattern { .. } => Self::EmptyPattern,
+            BuildError::ProofRefused { .. } => Self::ProofRefused,
+            BuildError::PatternLimit { .. } => Self::PatternLimit,
+            BuildError::PatternBytesLimit { .. } => Self::PatternBytesLimit,
+            BuildError::TotalPatternBytesLimit { .. } => Self::TotalPatternBytesLimit,
+            BuildError::IdentityLimit { .. } => Self::IdentityLimit,
+            BuildError::WorkLimit { .. } => Self::WorkLimit,
+            BuildError::BuildPeakLimit { .. } => Self::BuildPeakLimit,
+            BuildError::PersistentLimit { .. } => Self::PersistentLimit,
+            BuildError::UnsupportedTargetOrShape => Self::UnsupportedTargetOrShape,
+            BuildError::AllocationFailed { .. } => Self::AllocationFailed,
+            BuildError::ArithmeticOverflow { .. } => Self::ArithmeticOverflow,
+        }
+    }
+}
+
+/// Terminal construction failure with its immutable partial actuals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildAttemptError {
+    source: BuildError,
+    receipt: BuildAttemptReceipt,
+    seal: BuildFailureKind,
+}
+
+impl BuildAttemptError {
+    fn new(source: BuildError, identity: BuildAttemptIdentity, actual: BuildAttemptActual) -> Self {
+        let seal = BuildFailureKind::from_error(&source);
+        Self {
+            source,
+            receipt: BuildAttemptReceipt {
+                identity,
+                actual,
+                accounting: None,
+                published: false,
+            },
+            seal,
+        }
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &BuildError {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.seal == BuildFailureKind::from_error(&self.source) && self.receipt.closes_failure()
+    }
+
+    #[must_use]
+    pub fn into_source(self) -> BuildError {
+        self.source
+    }
+}
+
+impl fmt::Display for BuildAttemptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for BuildAttemptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -289,20 +514,59 @@ pub enum ReduceError {
     ScratchLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
     ArithmeticOverflow { computation: &'static str },
+    InternalInvariant { detail: &'static str },
 }
 
 impl fmt::Display for ReduceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "packed ordered-literal reduce refusal: {self:?}")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "packed ordered-literal reduce refusal: {self:?}")
     }
 }
 
 impl std::error::Error for ReduceError {}
 
+#[derive(Clone, Copy, Debug)]
+struct PatternMeta {
+    offset: u16,
+    length: u8,
+}
+
+impl PatternMeta {
+    const EMPTY: Self = Self {
+        offset: 0,
+        length: 0,
+    };
+}
+
+#[derive(Debug)]
+struct PackedOwner {
+    classifier: AsciiByteSetClassifier,
+    has_non_ascii_first_byte: bool,
+    first_byte_patterns: [u16; 256],
+    patterns: [PatternMeta; CERTIFIED_MAX_PATTERNS],
+    encoded_patterns: [u8; IDENTITY_CAPACITY_BYTES],
+    encoded_len: u16,
+}
+
+impl PackedOwner {
+    fn encoded_patterns(&self) -> &[u8] {
+        let len = usize::from(self.encoded_len);
+        &self.encoded_patterns[..len]
+    }
+
+    fn pattern(&self, id: usize) -> &[u8] {
+        let meta = self.patterns[id];
+        let start = usize::from(meta.offset);
+        let end = start
+            .checked_add(usize::from(meta.length))
+            .expect("certified pattern extent fits the fixed identity");
+        &self.encoded_patterns[start..end]
+    }
+}
+
 #[derive(Debug)]
 struct PlanCore {
-    searcher: Searcher,
-    encoded_patterns: Vec<u8>,
+    owner: Box<PackedOwner>,
     build: BuildAccounting,
 }
 
@@ -318,9 +582,99 @@ pub struct PackedOrderedLiteralSpanSumPlan {
     core: PlanCore,
 }
 
+/// Successful count-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct CountBuildAttempt {
+    plan: PackedOrderedLiteralCountPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl CountBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &PackedOrderedLiteralCountPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::Count, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PackedOrderedLiteralCountPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> PackedOrderedLiteralCountPlan {
+        self.plan
+    }
+}
+
+/// Successful span-sum-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct SpanSumBuildAttempt {
+    plan: PackedOrderedLiteralSpanSumPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl SpanSumBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &PackedOrderedLiteralSpanSumPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt
+            .closes_success(Operation::SpanSum, self.plan.build_accounting())
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PackedOrderedLiteralSpanSumPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> PackedOrderedLiteralSpanSumPlan {
+        self.plan
+    }
+}
+
 impl PackedOrderedLiteralCountPlan {
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(CountBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        let identity = build_attempt_identity(Operation::Count, limits);
+        let dispatch = SimdDispatchContext::capture();
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
+            |(core, receipt)| CountBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -339,37 +693,13 @@ impl PackedOrderedLiteralCountPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<CountResult<'a>, ReduceError> {
-        let upper = self.core.preflight(haystack.len(), false, limits)?;
-        let mut events = 0_u64;
-        let mut calls = 0_usize;
-        let mut iterator = self.core.searcher.find_iter(haystack);
-        loop {
-            calls = calls
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual iterator calls",
-                })?;
-            if iterator.next().is_none() {
-                break;
-            }
-            events = events
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual count",
-                })?;
-        }
-        debug_assert!(events <= upper.count);
+        let outcome = self.core.reduce(haystack, false, limits)?;
         Ok(CountResult {
-            count: events,
+            count: outcome.count,
             accounting: ReduceAccounting {
                 identity: self.cache_identity(),
-                upper_bounds: upper,
-                actual: ReduceActualCounters {
-                    match_events: events,
-                    iterator_next_calls: calls,
-                    count: Some(events),
-                    span_sum: None,
-                },
+                upper_bounds: outcome.upper,
+                actual: outcome.actual,
             },
         })
     }
@@ -377,7 +707,27 @@ impl PackedOrderedLiteralCountPlan {
 
 impl PackedOrderedLiteralSpanSumPlan {
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        PlanCore::build(patterns, limits, size_of::<Self>()).map(|core| Self { core })
+        Self::build_attempt(patterns, limits)
+            .map(SpanSumBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
+        let identity = build_attempt_identity(Operation::SpanSum, limits);
+        let dispatch = SimdDispatchContext::capture();
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
+            |(core, receipt)| SpanSumBuildAttempt {
+                plan: Self { core },
+                receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -396,55 +746,29 @@ impl PackedOrderedLiteralSpanSumPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult<'a>, ReduceError> {
-        let upper = self.core.preflight(haystack.len(), true, limits)?;
-        let mut events = 0_u64;
-        let mut span_sum = 0_u64;
-        let mut calls = 0_usize;
-        let mut iterator = self.core.searcher.find_iter(haystack);
-        loop {
-            calls = calls
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual iterator calls",
-                })?;
-            let Some(matched) = iterator.next() else {
-                break;
-            };
-            events = events
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual span events",
-                })?;
-            let length_usize = matched.end().checked_sub(matched.start()).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "actual matched length",
-                },
-            )?;
-            let length =
-                u64::try_from(length_usize).map_err(|_| ReduceError::ArithmeticOverflow {
-                    computation: "actual matched length as u64",
-                })?;
-            span_sum = span_sum
-                .checked_add(length)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual span sum",
-                })?;
-        }
-        debug_assert!(events <= upper.count);
-        debug_assert!(span_sum <= upper.span_sum);
+        let outcome = self.core.reduce(haystack, true, limits)?;
         Ok(SpanSumResult {
-            span_sum,
+            span_sum: outcome.span_sum,
             accounting: ReduceAccounting {
                 identity: self.cache_identity(),
-                upper_bounds: upper,
-                actual: ReduceActualCounters {
-                    match_events: events,
-                    iterator_next_calls: calls,
-                    count: Some(events),
-                    span_sum: Some(span_sum),
-                },
+                upper_bounds: outcome.upper,
+                actual: outcome.actual,
             },
         })
+    }
+}
+
+const fn build_attempt_identity(operation: Operation, limits: BuildLimits) -> BuildAttemptIdentity {
+    BuildAttemptIdentity {
+        algorithm_id: ALGORITHM_ID,
+        plan_id: match operation {
+            Operation::Count => COUNT_PLAN_ID,
+            Operation::SpanSum => SPAN_SUM_PLAN_ID,
+        },
+        operation,
+        limits,
+        algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
+        accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
     }
 }
 
@@ -458,139 +782,295 @@ impl PlanCore {
             },
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            dependency_version: AHO_CORASICK_VERSION,
-            dependency_checksum: AHO_CORASICK_PACKAGE_CHECKSUM,
-            implementation_kind: "aho-corasick packed Searcher LeftmostFirst find_iter",
-            identity_scope: "process-local semantic identity; runtime Teddy variant is not serialized",
+            implementation_kind: "FRE-owned monotone first-byte SIMD candidate stream with ordered verification",
+            identity_scope: "process-local semantic identity with authenticated classifier receipt",
             target_arch: std::env::consts::ARCH,
-            runtime_minimum_haystack_bytes: self.build.simd_minimum_haystack_bytes,
-            semantics: Semantics {
-                match_semantics: MatchSemantics::LeftmostFirst,
-                iteration_semantics: IterationSemantics::NonOverlapping,
-                boundary_semantics: BoundarySemantics::NonemptyOnlyUnicodeOff,
-            },
+            runtime_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
+            semantics: SEMANTICS,
+            classifier_selection: self.owner.classifier.selection(),
+            certified_min_patterns: CERTIFIED_MIN_PATTERNS,
             certified_max_patterns: CERTIFIED_MAX_PATTERNS,
+            certified_min_pattern_bytes: CERTIFIED_MIN_PATTERN_BYTES,
             certified_max_pattern_bytes: CERTIFIED_MAX_PATTERN_BYTES,
             certified_max_total_pattern_bytes: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
-            encoded_patterns: &self.encoded_patterns,
+            encoded_patterns: self.owner.encoded_patterns(),
         }
     }
 
-    fn build<P: AsRef<[u8]>>(
+    #[allow(
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "the failed attempt carries the exact inline receipt, and the source-to-fixed-owner transaction remains adjacent for accounting audit"
+    )]
+    fn build_attempt<P: AsRef<[u8]>>(
         patterns: &[P],
         limits: BuildLimits,
         inline_bytes: usize,
-    ) -> Result<Self, BuildError> {
-        let preflight = preflight(patterns, limits, inline_bytes)?;
-        let mut encoded_patterns = Vec::new();
-        encoded_patterns
-            .try_reserve_exact(preflight.identity_bytes)
-            .map_err(|_| BuildError::AllocationFailed {
-                additional: preflight.identity_bytes,
+        identity: BuildAttemptIdentity,
+        dispatch: SimdDispatchContext,
+    ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
+        let (preflight, mut actual) = preflight(patterns, limits, inline_bytes)
+            .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
+
+        let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
+        let mut pattern_meta = [PatternMeta::EMPTY; CERTIFIED_MAX_PATTERNS];
+        let mut first_byte_patterns = [0_u16; 256];
+        let mut has_non_ascii_first_byte = false;
+        let count = u64::try_from(patterns.len()).map_err(|_| {
+            attempt_error(
+                BuildError::ArithmeticOverflow {
+                    computation: "identity pattern count",
+                },
+                identity,
+                actual,
+            )
+        })?;
+        encoded_patterns[..LENGTH_PREFIX_BYTES].copy_from_slice(&count.to_le_bytes());
+        let mut cursor = LENGTH_PREFIX_BYTES;
+        let mut ascii_words = [0_u64; 2];
+        for (index, pattern) in patterns.iter().enumerate() {
+            let bytes = pattern.as_ref();
+            let length = u64::try_from(bytes.len()).map_err(|_| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "identity pattern length",
+                    },
+                    identity,
+                    actual,
+                )
             })?;
-        encode(patterns, preflight.identity_bytes, &mut encoded_patterns)?;
-        let searcher = Searcher::new(patterns.iter().map(AsRef::as_ref))
-            .ok_or(BuildError::UnsupportedTargetOrShape)?;
-        let persistent_bytes = inline_bytes
-            .checked_add(encoded_patterns.capacity())
-            .and_then(|bytes| bytes.checked_add(searcher.memory_usage()))
-            .ok_or(BuildError::ArithmeticOverflow {
-                computation: "actual persistent bytes",
+            let prefix_end = cursor.checked_add(LENGTH_PREFIX_BYTES).ok_or_else(|| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "identity length-prefix end",
+                    },
+                    identity,
+                    actual,
+                )
             })?;
-        if persistent_bytes > limits.max_persistent_bytes {
-            return Err(BuildError::PersistentLimit {
-                needed: persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
+            encoded_patterns[cursor..prefix_end].copy_from_slice(&length.to_le_bytes());
+            let bytes_end = prefix_end.checked_add(bytes.len()).ok_or_else(|| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "identity pattern end",
+                    },
+                    identity,
+                    actual,
+                )
+            })?;
+            encoded_patterns[prefix_end..bytes_end].copy_from_slice(bytes);
+            pattern_meta[index] = PatternMeta {
+                offset: u16::try_from(prefix_end).map_err(|_| {
+                    attempt_error(
+                        BuildError::ArithmeticOverflow {
+                            computation: "pattern identity offset",
+                        },
+                        identity,
+                        actual,
+                    )
+                })?,
+                length: u8::try_from(bytes.len()).map_err(|_| {
+                    attempt_error(
+                        BuildError::ArithmeticOverflow {
+                            computation: "pattern length metadata",
+                        },
+                        identity,
+                        actual,
+                    )
+                })?,
+            };
+            let first = bytes[0];
+            let bit = 1_u16
+                .checked_shl(u32::try_from(index).map_err(|_| {
+                    attempt_error(
+                        BuildError::ArithmeticOverflow {
+                            computation: "pattern map bit",
+                        },
+                        identity,
+                        actual,
+                    )
+                })?)
+                .ok_or_else(|| {
+                    attempt_error(
+                        BuildError::ArithmeticOverflow {
+                            computation: "pattern map bit",
+                        },
+                        identity,
+                        actual,
+                    )
+                })?;
+            first_byte_patterns[usize::from(first)] |= bit;
+            if first < 128 {
+                let word = usize::from(first / 64);
+                let shift = u32::from(first % 64);
+                ascii_words[word] |= 1_u64 << shift;
+            } else {
+                has_non_ascii_first_byte = true;
+            }
+            cursor = bytes_end;
         }
-        Ok(Self {
-            build: BuildAccounting {
-                patterns: patterns.len(),
-                pattern_bytes: preflight.pattern_bytes,
-                max_pattern_bytes: preflight.max_pattern_bytes,
-                min_pattern_bytes: preflight.min_pattern_bytes,
-                identity_bytes: preflight.identity_bytes,
-                identity_capacity_bytes: encoded_patterns.capacity(),
-                build_work_upper_bound: preflight.build_work_upper_bound,
-                build_peak_upper_bound: preflight.build_peak_upper_bound,
-                persistent_bytes,
-                simd_minimum_haystack_bytes: searcher.minimum_len(),
-            },
-            searcher,
+        if cursor != preflight.identity_bytes {
+            return Err(attempt_error(
+                BuildError::ArithmeticOverflow {
+                    computation: "identity encoded length invariant",
+                },
+                identity,
+                actual,
+            ));
+        }
+        actual.work = preflight.build_work;
+        actual.copied_bytes = preflight.pattern_bytes;
+        actual.initialized_bytes = size_of::<PackedOwner>();
+        let classifier = dispatch
+            .ascii_byte_set_classifier(AsciiByteSet::from_words(ascii_words), DispatchPolicy::Auto)
+            .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
+        let owner = PackedOwner {
+            classifier,
+            has_non_ascii_first_byte,
+            first_byte_patterns,
+            patterns: pattern_meta,
             encoded_patterns,
-        })
+            encoded_len: u16::try_from(cursor).map_err(|_| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "identity encoded length metadata",
+                    },
+                    identity,
+                    actual,
+                )
+            })?,
+        };
+        let owner = allocate_owner(owner).map_err(|(_, _owner)| {
+            attempt_error(
+                BuildError::AllocationFailed {
+                    additional: size_of::<PackedOwner>(),
+                },
+                identity,
+                actual,
+            )
+        })?;
+        actual.allocations = 1;
+        actual.allocated_bytes = size_of::<PackedOwner>();
+        actual.initialized_bytes = actual
+            .initialized_bytes
+            .checked_add(inline_bytes)
+            .ok_or_else(|| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "published initialized bytes",
+                    },
+                    identity,
+                    actual,
+                )
+            })?;
+        actual.live_persistent_bytes = preflight.persistent_bytes;
+        actual.peak_bytes = preflight.peak_bytes;
+        let build = BuildAccounting {
+            patterns: patterns.len(),
+            pattern_bytes: preflight.pattern_bytes,
+            max_pattern_bytes: preflight.max_pattern_bytes,
+            min_pattern_bytes: preflight.min_pattern_bytes,
+            identity_bytes: preflight.identity_bytes,
+            identity_capacity_bytes: IDENTITY_CAPACITY_BYTES,
+            build_work_upper_bound: preflight.build_work,
+            build_peak_upper_bound: preflight.peak_bytes,
+            persistent_bytes: preflight.persistent_bytes,
+            simd_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
+        };
+        let receipt = BuildAttemptReceipt {
+            identity,
+            actual,
+            accounting: Some(build),
+            published: true,
+        };
+        let core = Self { owner, build };
+        if !receipt.closes_success(identity.operation, core.build) {
+            return Err(attempt_error(
+                BuildError::ArithmeticOverflow {
+                    computation: "successful construction receipt closure",
+                },
+                identity,
+                actual,
+            ));
+        }
+        Ok((core, receipt))
     }
 
-    fn preflight(
+    fn preflight_reduce(
         &self,
         haystack_len: usize,
         check_span: bool,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let candidate_positions =
+        let candidate_positions = if haystack_len < self.build.min_pattern_bytes {
+            0
+        } else {
             haystack_len
-                .checked_add(1)
+                .checked_sub(self.build.min_pattern_bytes)
+                .and_then(|remaining| remaining.checked_add(1))
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "candidate positions",
-                })?;
+                })?
+        };
+        let pattern_checks = candidate_positions.checked_mul(self.build.patterns).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "pattern checks",
+            },
+        )?;
+        let verification_reads = candidate_positions
+            .checked_mul(self.build.pattern_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "verification source reads",
+            })?;
+        let source_byte_reads = candidate_positions.checked_add(verification_reads).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "source byte reads",
+            },
+        )?;
+        let work_per_position = self
+            .build
+            .pattern_bytes
+            .checked_add(self.build.patterns)
+            .and_then(|work| work.checked_add(FIXED_WORK_PER_POSITION))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "work per position",
+            })?;
+        let work_usize = candidate_positions
+            .checked_mul(work_per_position)
+            .and_then(|work| work.checked_add(FIXED_FINAL_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "packed operation work",
+            })?;
+        let work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "packed operation work as u64",
+        })?;
         let match_events = haystack_len
             .checked_div(self.build.min_pattern_bytes)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "event quotient",
             })?;
-        let iterator_calls =
-            match_events
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "iterator calls",
-                })?;
-        let restart_tail_positions = iterator_calls
-            .checked_mul(MAX_TEDDY_TAIL_REVISIT_POSITIONS_PER_CALL)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "restarted Teddy tail positions",
-            })?;
-        let examined_positions = candidate_positions
-            .checked_add(restart_tail_positions)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "total packed examined positions",
-            })?;
-        let work_per_position = self
-            .build
-            .pattern_bytes
-            .checked_add(self.build.patterns)
-            .and_then(|work| work.checked_add(FIXED_WORK_PER_EXAMINED_POSITION))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "work per position",
-            })?;
-        let reducer_steps = iterator_calls;
-        let iterator_setup_work = reducer_steps
-            .checked_mul(FIXED_WORK_PER_ITERATOR_CALL)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "iterator setup work",
-            })?;
-        let work_usize = examined_positions
-            .checked_mul(work_per_position)
-            .and_then(|work| work.checked_add(iterator_setup_work))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "packed operation work",
-            })?;
-        let work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "packed work as u64",
-        })?;
         let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
             computation: "count upper bound",
         })?;
         let span_sum =
             u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
-                computation: "span upper bound",
+                computation: "span-sum upper bound",
             })?;
+        let reducer_steps =
+            candidate_positions
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "reducer steps",
+                })?;
         let upper = ReduceUpperBounds {
             haystack_bytes: haystack_len,
             candidate_positions,
-            restart_tail_positions,
-            examined_positions,
+            restart_tail_positions: 0,
+            examined_positions: candidate_positions,
             work_per_position,
-            iterator_setup_work,
+            iterator_setup_work: 0,
+            source_byte_reads,
+            pattern_checks,
             work,
             match_events,
             count,
@@ -603,6 +1083,223 @@ impl PlanCore {
         check_reduce(upper, check_span, limits)?;
         Ok(upper)
     }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotone block/tail traversal and its exact counters remain in one auditable operation"
+    )]
+    fn reduce(
+        &self,
+        haystack: &[u8],
+        check_span: bool,
+        limits: ReduceLimits,
+    ) -> Result<ReduceOutcome, ReduceError> {
+        let upper = self.preflight_reduce(haystack.len(), check_span, limits)?;
+        let candidate_positions = upper.candidate_positions;
+        let mut block_start = 0_usize;
+        let mut consumed_through = 0_usize;
+        let mut candidate_events = 0_usize;
+        let mut pattern_checks = 0_usize;
+        let mut match_events = 0_u64;
+        let mut span_sum = 0_u64;
+
+        while block_start
+            .checked_add(SIMD_BLOCK_BYTES)
+            .is_some_and(|end| end <= candidate_positions)
+        {
+            let block_end = block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "SIMD block end",
+                },
+            )?;
+            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[block_start..block_end]
+                .try_into()
+                .map_err(|_| ReduceError::InternalInvariant {
+                    detail: "complete candidate block lost its fixed extent",
+                })?;
+            let classified = self.owner.classifier.classify_32(block);
+            let mut candidates = classified.member_mask();
+            if self.owner.has_non_ascii_first_byte {
+                let mut non_ascii = !classified.ascii_mask();
+                while non_ascii != 0 {
+                    let lane = non_ascii.trailing_zeros();
+                    non_ascii &= non_ascii.wrapping_sub(1);
+                    let lane_usize =
+                        usize::try_from(lane).map_err(|_| ReduceError::ArithmeticOverflow {
+                            computation: "non-ASCII candidate lane",
+                        })?;
+                    if self.owner.first_byte_patterns[usize::from(block[lane_usize])] != 0 {
+                        candidates |= 1_u32 << lane;
+                    }
+                }
+            }
+            self.consume_candidate_mask(
+                haystack,
+                block_start,
+                candidates,
+                &mut consumed_through,
+                &mut candidate_events,
+                &mut pattern_checks,
+                &mut match_events,
+                &mut span_sum,
+            )?;
+            block_start = block_end;
+        }
+        while block_start < candidate_positions {
+            let byte = haystack[block_start];
+            if self.owner.first_byte_patterns[usize::from(byte)] != 0 {
+                candidate_events =
+                    candidate_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual candidate events",
+                        })?;
+                self.consume_candidate(
+                    haystack,
+                    block_start,
+                    &mut consumed_through,
+                    &mut pattern_checks,
+                    &mut match_events,
+                    &mut span_sum,
+                )?;
+            }
+            block_start = block_start
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "scalar candidate cursor",
+                })?;
+        }
+
+        let iterator_next_calls =
+            candidate_events
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "candidate stream calls",
+                })?;
+        let count = match_events;
+        let actual = ReduceActualCounters {
+            match_events,
+            iterator_next_calls,
+            count: Some(count),
+            span_sum: check_span.then_some(span_sum),
+            classified_positions: candidate_positions,
+            candidate_events,
+            pattern_checks,
+            source_byte_reads: upper.source_byte_reads,
+            work: upper.work,
+            scratch_bytes: 0,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        debug_assert!(match_events <= upper.count);
+        debug_assert!(span_sum <= upper.span_sum);
+        debug_assert!(candidate_events <= upper.candidate_positions);
+        debug_assert!(pattern_checks <= upper.pattern_checks);
+        Ok(ReduceOutcome {
+            count,
+            span_sum,
+            upper,
+            actual,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
+    )]
+    fn consume_candidate_mask(
+        &self,
+        haystack: &[u8],
+        block_start: usize,
+        mut candidates: u32,
+        consumed_through: &mut usize,
+        candidate_events: &mut usize,
+        pattern_checks: &mut usize,
+        match_events: &mut u64,
+        span_sum: &mut u64,
+    ) -> Result<(), ReduceError> {
+        while candidates != 0 {
+            let lane = candidates.trailing_zeros();
+            candidates &= candidates.wrapping_sub(1);
+            let start = block_start
+                .checked_add(usize::try_from(lane).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "candidate lane",
+                    }
+                })?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "candidate start",
+                })?;
+            *candidate_events =
+                candidate_events
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual candidate events",
+                    })?;
+            self.consume_candidate(
+                haystack,
+                start,
+                consumed_through,
+                pattern_checks,
+                match_events,
+                span_sum,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn consume_candidate(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        consumed_through: &mut usize,
+        pattern_checks: &mut usize,
+        match_events: &mut u64,
+        span_sum: &mut u64,
+    ) -> Result<(), ReduceError> {
+        if start < *consumed_through {
+            return Ok(());
+        }
+        let mut pattern_bits = self.owner.first_byte_patterns[usize::from(haystack[start])];
+        while pattern_bits != 0 {
+            let id = pattern_bits.trailing_zeros();
+            pattern_bits &= pattern_bits.wrapping_sub(1);
+            *pattern_checks =
+                pattern_checks
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual pattern checks",
+                    })?;
+            let id = usize::try_from(id).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "pattern ID",
+            })?;
+            let pattern = self.owner.pattern(id);
+            let end = start
+                .checked_add(pattern.len())
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "matched end",
+                })?;
+            if end <= haystack.len() && haystack[start..end] == *pattern {
+                *match_events =
+                    match_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual match events",
+                        })?;
+                *span_sum = span_sum
+                    .checked_add(u64::try_from(pattern.len()).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "matched width as u64",
+                        }
+                    })?)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual span sum",
+                    })?;
+                *consumed_through = end;
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -611,130 +1308,248 @@ struct BuildPreflight {
     max_pattern_bytes: usize,
     min_pattern_bytes: usize,
     identity_bytes: usize,
-    build_work_upper_bound: usize,
-    build_peak_upper_bound: usize,
+    build_work: u64,
+    persistent_bytes: usize,
+    peak_bytes: usize,
+}
+
+struct PreflightFailure {
+    source: BuildError,
+    actual: BuildAttemptActual,
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "eligibility proof and every caller/build envelope are intentionally ordered in one preflight"
+    reason = "proof caps, caller limits and exact prospective construction accounting are deliberately ordered in one source-free preflight"
 )]
 fn preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: BuildLimits,
     inline_bytes: usize,
-) -> Result<BuildPreflight, BuildError> {
+) -> Result<(BuildPreflight, BuildAttemptActual), PreflightFailure> {
+    let mut actual = BuildAttemptActual::default();
     if patterns.is_empty() {
-        return Err(BuildError::EmptyPatternSet);
+        return Err(PreflightFailure {
+            source: BuildError::EmptyPatternSet,
+            actual,
+        });
+    }
+    if patterns.len() < CERTIFIED_MIN_PATTERNS {
+        return Err(PreflightFailure {
+            source: BuildError::ProofRefused {
+                fact: "pattern count minimum",
+                needed: patterns.len(),
+                certified_limit: CERTIFIED_MIN_PATTERNS,
+            },
+            actual,
+        });
     }
     if patterns.len() > CERTIFIED_MAX_PATTERNS {
-        return Err(BuildError::ProofRefused {
-            fact: "pattern count",
-            needed: patterns.len(),
-            certified_limit: CERTIFIED_MAX_PATTERNS,
+        return Err(PreflightFailure {
+            source: BuildError::ProofRefused {
+                fact: "pattern count",
+                needed: patterns.len(),
+                certified_limit: CERTIFIED_MAX_PATTERNS,
+            },
+            actual,
         });
     }
     if patterns.len() > limits.max_patterns {
-        return Err(BuildError::PatternLimit {
-            needed: patterns.len(),
-            limit: limits.max_patterns,
+        return Err(PreflightFailure {
+            source: BuildError::PatternLimit {
+                needed: patterns.len(),
+                limit: limits.max_patterns,
+            },
+            actual,
         });
     }
+    if patterns.len() > limits.max_build_work {
+        return Err(PreflightFailure {
+            source: BuildError::WorkLimit {
+                needed: patterns.len(),
+                limit: limits.max_build_work,
+            },
+            actual,
+        });
+    }
+
     let mut pattern_bytes = 0_usize;
     let mut max_pattern_bytes = 0_usize;
     let mut min_pattern_bytes = usize::MAX;
     for (index, pattern) in patterns.iter().enumerate() {
+        actual.work = actual.work.checked_add(1).ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "pattern length census work",
+            },
+            actual,
+        })?;
         let bytes = pattern.as_ref();
         if bytes.is_empty() {
-            return Err(BuildError::EmptyPattern { index });
+            return Err(PreflightFailure {
+                source: BuildError::EmptyPattern { index },
+                actual,
+            });
+        }
+        if bytes.len() < CERTIFIED_MIN_PATTERN_BYTES {
+            return Err(PreflightFailure {
+                source: BuildError::ProofRefused {
+                    fact: "literal width minimum",
+                    needed: bytes.len(),
+                    certified_limit: CERTIFIED_MIN_PATTERN_BYTES,
+                },
+                actual,
+            });
         }
         if bytes.len() > CERTIFIED_MAX_PATTERN_BYTES {
-            return Err(BuildError::ProofRefused {
-                fact: "literal width",
-                needed: bytes.len(),
-                certified_limit: CERTIFIED_MAX_PATTERN_BYTES,
+            return Err(PreflightFailure {
+                source: BuildError::ProofRefused {
+                    fact: "literal width",
+                    needed: bytes.len(),
+                    certified_limit: CERTIFIED_MAX_PATTERN_BYTES,
+                },
+                actual,
             });
         }
         if bytes.len() > limits.max_pattern_bytes {
-            return Err(BuildError::PatternBytesLimit {
-                needed: bytes.len(),
-                limit: limits.max_pattern_bytes,
+            return Err(PreflightFailure {
+                source: BuildError::PatternBytesLimit {
+                    needed: bytes.len(),
+                    limit: limits.max_pattern_bytes,
+                },
+                actual,
             });
         }
-        pattern_bytes =
-            pattern_bytes
-                .checked_add(bytes.len())
-                .ok_or(BuildError::ArithmeticOverflow {
+        pattern_bytes = pattern_bytes
+            .checked_add(bytes.len())
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
                     computation: "total pattern bytes",
-                })?;
+                },
+                actual,
+            })?;
         max_pattern_bytes = max_pattern_bytes.max(bytes.len());
         min_pattern_bytes = min_pattern_bytes.min(bytes.len());
     }
     if pattern_bytes > CERTIFIED_MAX_TOTAL_PATTERN_BYTES {
-        return Err(BuildError::ProofRefused {
-            fact: "total literal bytes",
-            needed: pattern_bytes,
-            certified_limit: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
+        return Err(PreflightFailure {
+            source: BuildError::ProofRefused {
+                fact: "total literal bytes",
+                needed: pattern_bytes,
+                certified_limit: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
+            },
+            actual,
         });
     }
     if pattern_bytes > limits.max_total_pattern_bytes {
-        return Err(BuildError::TotalPatternBytesLimit {
-            needed: pattern_bytes,
-            limit: limits.max_total_pattern_bytes,
-        });
-    }
-    let identity_bytes = LENGTH_PREFIX_BYTES
-        .checked_add(patterns.len().checked_mul(LENGTH_PREFIX_BYTES).ok_or(
-            BuildError::ArithmeticOverflow {
-                computation: "identity prefixes",
+        return Err(PreflightFailure {
+            source: BuildError::TotalPatternBytesLimit {
+                needed: pattern_bytes,
+                limit: limits.max_total_pattern_bytes,
             },
-        )?)
-        .and_then(|bytes| bytes.checked_add(pattern_bytes))
-        .ok_or(BuildError::ArithmeticOverflow {
-            computation: "identity bytes",
-        })?;
+            actual,
+        });
+    }
+    let identity_bytes =
+        LENGTH_PREFIX_BYTES
+            .checked_add(patterns.len().checked_mul(LENGTH_PREFIX_BYTES).ok_or(
+                PreflightFailure {
+                    source: BuildError::ArithmeticOverflow {
+                        computation: "identity prefixes",
+                    },
+                    actual,
+                },
+            )?)
+            .and_then(|bytes| bytes.checked_add(pattern_bytes))
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "identity bytes",
+                },
+                actual,
+            })?;
     if identity_bytes > limits.max_identity_bytes {
-        return Err(BuildError::IdentityLimit {
-            needed: identity_bytes,
-            limit: limits.max_identity_bytes,
+        return Err(PreflightFailure {
+            source: BuildError::IdentityLimit {
+                needed: identity_bytes,
+                limit: limits.max_identity_bytes,
+            },
+            actual,
         });
     }
-    let build_work_upper_bound = pattern_bytes
-        .checked_add(patterns.len())
-        .and_then(|work| work.checked_mul(BUILD_FACTOR))
-        .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-        .ok_or(BuildError::ArithmeticOverflow {
-            computation: "build work",
+    let build_work_usize = patterns
+        .len()
+        .checked_add(size_of::<PackedOwner>())
+        .and_then(|work| work.checked_add(pattern_bytes))
+        .and_then(|work| work.checked_add(patterns.len()))
+        .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "build work",
+            },
+            actual,
         })?;
-    if build_work_upper_bound > limits.max_build_work {
-        return Err(BuildError::WorkLimit {
-            needed: build_work_upper_bound,
-            limit: limits.max_build_work,
+    if build_work_usize > limits.max_build_work {
+        return Err(PreflightFailure {
+            source: BuildError::WorkLimit {
+                needed: build_work_usize,
+                limit: limits.max_build_work,
+            },
+            actual,
         });
     }
-    let build_peak_upper_bound = pattern_bytes
-        .checked_mul(PATTERN_BYTE_ENVELOPE)
-        .and_then(|bytes| bytes.checked_add(patterns.len().checked_mul(PATTERN_ENTRY_ENVELOPE)?))
-        .and_then(|bytes| bytes.checked_add(FIXED_BUILD_ENVELOPE))
-        .and_then(|bytes| bytes.checked_add(identity_bytes))
-        .and_then(|bytes| bytes.checked_add(inline_bytes))
-        .ok_or(BuildError::ArithmeticOverflow {
-            computation: "build peak",
-        })?;
-    if build_peak_upper_bound > limits.max_build_peak_bytes {
-        return Err(BuildError::BuildPeakLimit {
-            needed: build_peak_upper_bound,
-            limit: limits.max_build_peak_bytes,
+    let persistent_bytes =
+        inline_bytes
+            .checked_add(size_of::<PackedOwner>())
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "persistent bytes",
+                },
+                actual,
+            })?;
+    if persistent_bytes > limits.max_persistent_bytes {
+        return Err(PreflightFailure {
+            source: BuildError::PersistentLimit {
+                needed: persistent_bytes,
+                limit: limits.max_persistent_bytes,
+            },
+            actual,
         });
     }
-    Ok(BuildPreflight {
-        pattern_bytes,
-        max_pattern_bytes,
-        min_pattern_bytes,
-        identity_bytes,
-        build_work_upper_bound,
-        build_peak_upper_bound,
-    })
+    let peak_bytes = persistent_bytes;
+    if peak_bytes > limits.max_build_peak_bytes {
+        return Err(PreflightFailure {
+            source: BuildError::BuildPeakLimit {
+                needed: peak_bytes,
+                limit: limits.max_build_peak_bytes,
+            },
+            actual,
+        });
+    }
+    let build_work = u64::try_from(build_work_usize).map_err(|_| PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "build work as u64",
+        },
+        actual,
+    })?;
+    Ok((
+        BuildPreflight {
+            pattern_bytes,
+            max_pattern_bytes,
+            min_pattern_bytes,
+            identity_bytes,
+            build_work,
+            persistent_bytes,
+            peak_bytes,
+        },
+        actual,
+    ))
+}
+
+fn attempt_error(
+    source: BuildError,
+    identity: BuildAttemptIdentity,
+    actual: BuildAttemptActual,
+) -> BuildAttemptError {
+    BuildAttemptError::new(source, identity, actual)
 }
 
 fn check_reduce(
@@ -787,34 +1602,50 @@ fn check_reduce(
     Ok(())
 }
 
-fn encode<P: AsRef<[u8]>>(
-    patterns: &[P],
-    expected_bytes: usize,
-    encoded: &mut Vec<u8>,
-) -> Result<(), BuildError> {
-    if encoded.capacity() < expected_bytes {
-        return Err(BuildError::ArithmeticOverflow {
-            computation: "identity reservation invariant",
-        });
+#[derive(Clone, Copy)]
+struct ReduceOutcome {
+    count: u64,
+    span_sum: u64,
+    upper: ReduceUpperBounds,
+    actual: ReduceActualCounters,
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "fallible exact publication must preserve the fixed owner without allocating an error"
+)]
+fn allocate_owner(owner: PackedOwner) -> Result<Box<PackedOwner>, (CopyError, PackedOwner)> {
+    #[cfg(test)]
+    if build_allocation_probe::take_failure() {
+        return Err((CopyError::AllocationFailed, owner));
     }
-    let count = u64::try_from(patterns.len()).map_err(|_| BuildError::ArithmeticOverflow {
-        computation: "identity count",
-    })?;
-    encoded.extend_from_slice(&count.to_le_bytes());
-    for pattern in patterns {
-        let bytes = pattern.as_ref();
-        let length = u64::try_from(bytes.len()).map_err(|_| BuildError::ArithmeticOverflow {
-            computation: "identity length",
-        })?;
-        encoded.extend_from_slice(&length.to_le_bytes());
-        encoded.extend_from_slice(bytes);
+    try_box_preserve(owner)
+}
+
+#[cfg(test)]
+mod build_allocation_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
     }
-    if encoded.len() != expected_bytes {
-        return Err(BuildError::ArithmeticOverflow {
-            computation: "identity encoded length invariant",
-        });
+
+    pub(super) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FAIL_NEXT.with(|fail| fail.set(false));
+        }
     }
-    Ok(())
+
+    pub(super) fn fail_next() -> Guard {
+        FAIL_NEXT.with(|fail| fail.set(true));
+        Guard
+    }
+
+    pub(super) fn take_failure() -> bool {
+        FAIL_NEXT.with(|fail| fail.replace(false))
+    }
 }
 
 #[cfg(test)]
@@ -825,11 +1656,7 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
-        ReduceError, ReduceLimits,
-    };
-    use crate::{
-        OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceLimits,
-        OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+        ReduceError, ReduceLimits, build_allocation_probe,
     };
 
     fn source(patterns: &[Vec<u8>]) -> String {
@@ -885,12 +1712,12 @@ mod tests {
     #[test]
     fn ordered_prefix_duplicate_and_arbitrary_bytes_match_regex() {
         let languages = [
-            vec![b"a".to_vec(), b"ab".to_vec()],
-            vec![b"ab".to_vec(), b"a".to_vec()],
-            vec![b"a".to_vec(), b"a".to_vec()],
-            vec![b"\xFF\x00".to_vec(), b"\xFF".to_vec()],
+            vec![b"aa".to_vec(), b"aab".to_vec()],
+            vec![b"aab".to_vec(), b"aa".to_vec()],
+            vec![b"aa".to_vec(), b"aa".to_vec()],
+            vec![b"\xFF\x00".to_vec(), b"\xFF\x00\x80".to_vec()],
         ];
-        let haystacks: &[&[u8]] = &[b"", b"a", b"ababa", b"\xFF\x00\xFF\x80"];
+        let haystacks: &[&[u8]] = &[b"", b"a", b"aaa", b"aaaaab", b"\xFF\x00\xFF\x00\x80"];
         for patterns in languages {
             let regex = RegexBuilder::new(&source(&patterns))
                 .unicode(false)
@@ -921,35 +1748,20 @@ mod tests {
                 );
             }
         }
-
-        let duplicate = PackedOrderedLiteralCountPlan::build(
-            &[b"a".as_slice(), b"a".as_slice()],
-            BuildLimits::unlimited(),
-        )
-        .unwrap();
-        assert_eq!(
-            duplicate
-                .core
-                .searcher
-                .find_iter(b"a")
-                .next()
-                .unwrap()
-                .pattern()
-                .as_usize(),
-            0
-        );
     }
 
     #[test]
-    fn exhaustive_nonempty_languages_match_upstream_and_general_plan() {
+    fn exhaustive_nonempty_languages_match_upstream() {
         let universe = vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"\xFF".to_vec(),
             b"aa".to_vec(),
             b"ab".to_vec(),
+            b"\xFFa".to_vec(),
+            b"aaa".to_vec(),
+            b"aab".to_vec(),
         ];
-        let languages = pattern_lists(&universe, 3);
+        let languages = pattern_lists(&universe, 3)
+            .into_iter()
+            .filter(|patterns| patterns.len() >= super::CERTIFIED_MIN_PATTERNS);
         let haystacks = words(b"\x00a\xFF", 4);
         for patterns in languages {
             let regex = RegexBuilder::new(&source(&patterns))
@@ -961,112 +1773,124 @@ mod tests {
             let packed_span =
                 PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited())
                     .unwrap();
-            let general_count = OrderedLiteralCountPlan::build(
-                &patterns,
-                OrderedLiteralAggregateBuildLimits::unlimited(),
-            )
-            .unwrap();
-            let general_span = OrderedLiteralSpanSumPlan::build(
-                &patterns,
-                OrderedLiteralAggregateBuildLimits::unlimited(),
-            )
-            .unwrap();
             for haystack in &haystacks {
-                let expected = regex
+                let expected_count = u64::try_from(regex.find_iter(haystack).count()).unwrap();
+                let expected_span = regex
                     .find_iter(haystack)
-                    .map(|matched| (matched.start(), matched.end()))
-                    .collect::<Vec<_>>();
-                let actual = packed_count
-                    .core
-                    .searcher
-                    .find_iter(haystack)
-                    .map(|matched| (matched.start(), matched.end()))
-                    .collect::<Vec<_>>();
+                    .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+                    .sum::<u64>();
                 assert_eq!(
-                    actual, expected,
+                    packed_count
+                        .count(haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .count,
+                    expected_count,
                     "patterns={patterns:?}, haystack={haystack:?}"
                 );
-                let count = packed_count
-                    .count(haystack, ReduceLimits::unlimited())
-                    .unwrap()
-                    .count;
-                let span = packed_span
-                    .span_sum(haystack, ReduceLimits::unlimited())
-                    .unwrap()
-                    .span_sum;
                 assert_eq!(
-                    count,
-                    general_count
-                        .count(haystack, OrderedLiteralAggregateReduceLimits::unlimited())
+                    packed_span
+                        .span_sum(haystack, ReduceLimits::unlimited())
                         .unwrap()
-                        .count
-                );
-                assert_eq!(
-                    span,
-                    general_span
-                        .span_sum(haystack, OrderedLiteralAggregateReduceLimits::unlimited())
-                        .unwrap()
-                        .span_sum
+                        .span_sum,
+                    expected_span,
+                    "patterns={patterns:?}, haystack={haystack:?}"
                 );
             }
         }
     }
 
     #[test]
+    fn nonempty_utf8_words_are_profile_neutral_bytes() {
+        let patterns = ["∞".as_bytes(), "✓".as_bytes()];
+        let haystack = "--∞--✓--∞--".as_bytes();
+        let count =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span =
+            PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            count
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            3
+        );
+        assert_eq!(
+            span.span_sum(haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .span_sum,
+            9
+        );
+        assert_eq!(
+            count.cache_identity().semantics.boundary_semantics,
+            super::BoundarySemantics::NonemptyByteStrings
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "table-like exact/one-below assertions keep every packed limit visible"
+        reason = "the exact/one-below matrix keeps every packed limit and receipt visible"
     )]
     fn every_nonzero_limit_has_exact_and_one_below_behavior() {
-        let patterns = [b"ab".as_slice(), b"a".as_slice(), b"\xFF\x00".as_slice()];
+        let patterns = [b"ab".as_slice(), b"abc".as_slice(), b"\xFF\x00".as_slice()];
         let baseline =
-            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                .unwrap();
+        assert!(baseline.closes());
+        let (baseline, receipt) = baseline.into_parts();
+        assert!(receipt.contains_actual());
         let build = baseline.build_accounting();
         let exact = BuildLimits {
             max_patterns: build.patterns,
             max_pattern_bytes: build.max_pattern_bytes,
             max_total_pattern_bytes: build.pattern_bytes,
             max_identity_bytes: build.identity_bytes,
-            max_build_work: build.build_work_upper_bound,
+            max_build_work: usize::try_from(build.build_work_upper_bound).unwrap(),
             max_build_peak_bytes: build.build_peak_upper_bound,
             max_persistent_bytes: build.persistent_bytes,
         };
-        PackedOrderedLiteralCountPlan::build(&patterns, exact).unwrap();
+        assert!(
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, exact)
+                .unwrap()
+                .closes()
+        );
         let build_cases = [
             BuildLimits {
-                max_patterns: exact.max_patterns.checked_sub(1).unwrap(),
+                max_patterns: exact.max_patterns - 1,
                 ..exact
             },
             BuildLimits {
-                max_pattern_bytes: exact.max_pattern_bytes.checked_sub(1).unwrap(),
+                max_pattern_bytes: exact.max_pattern_bytes - 1,
                 ..exact
             },
             BuildLimits {
-                max_total_pattern_bytes: exact.max_total_pattern_bytes.checked_sub(1).unwrap(),
+                max_total_pattern_bytes: exact.max_total_pattern_bytes - 1,
                 ..exact
             },
             BuildLimits {
-                max_identity_bytes: exact.max_identity_bytes.checked_sub(1).unwrap(),
+                max_identity_bytes: exact.max_identity_bytes - 1,
                 ..exact
             },
             BuildLimits {
-                max_build_work: exact.max_build_work.checked_sub(1).unwrap(),
+                max_build_work: exact.max_build_work - 1,
                 ..exact
             },
             BuildLimits {
-                max_build_peak_bytes: exact.max_build_peak_bytes.checked_sub(1).unwrap(),
+                max_build_peak_bytes: exact.max_build_peak_bytes - 1,
                 ..exact
             },
             BuildLimits {
-                max_persistent_bytes: exact.max_persistent_bytes.checked_sub(1).unwrap(),
+                max_persistent_bytes: exact.max_persistent_bytes - 1,
                 ..exact
             },
         ];
         for limits in build_cases {
-            assert!(PackedOrderedLiteralCountPlan::build(&patterns, limits).is_err());
+            let failure = PackedOrderedLiteralCountPlan::build_attempt(&patterns, limits)
+                .expect_err("one-below build limit must refuse");
+            assert!(failure.closes(), "{failure:?}");
         }
 
-        let haystack = b"ababa\xFF\x00";
+        let haystack = b"abcab\xFF\x00";
         let result = baseline.count(haystack, ReduceLimits::unlimited()).unwrap();
         let upper = result.accounting.upper_bounds;
         let reduce_exact = ReduceLimits {
@@ -1083,7 +1907,7 @@ mod tests {
             baseline.count(
                 haystack,
                 ReduceLimits {
-                    max_work: reduce_exact.max_work.checked_sub(1).unwrap(),
+                    max_work: reduce_exact.max_work - 1,
                     ..reduce_exact
                 }
             ),
@@ -1093,7 +1917,7 @@ mod tests {
             baseline.count(
                 haystack,
                 ReduceLimits {
-                    max_match_events: reduce_exact.max_match_events.checked_sub(1).unwrap(),
+                    max_match_events: reduce_exact.max_match_events - 1,
                     ..reduce_exact
                 }
             ),
@@ -1103,7 +1927,7 @@ mod tests {
             baseline.count(
                 haystack,
                 ReduceLimits {
-                    max_count: reduce_exact.max_count.checked_sub(1).unwrap(),
+                    max_count: reduce_exact.max_count - 1,
                     ..reduce_exact
                 }
             ),
@@ -1113,7 +1937,7 @@ mod tests {
             baseline.count(
                 haystack,
                 ReduceLimits {
-                    max_reducer_steps: reduce_exact.max_reducer_steps.checked_sub(1).unwrap(),
+                    max_reducer_steps: reduce_exact.max_reducer_steps - 1,
                     ..reduce_exact
                 }
             ),
@@ -1123,7 +1947,7 @@ mod tests {
             baseline.count(
                 haystack,
                 ReduceLimits {
-                    max_peak_bytes: reduce_exact.max_peak_bytes.checked_sub(1).unwrap(),
+                    max_peak_bytes: reduce_exact.max_peak_bytes - 1,
                     ..reduce_exact
                 }
             ),
@@ -1135,12 +1959,11 @@ mod tests {
         let span = span_plan
             .span_sum(haystack, ReduceLimits::unlimited())
             .unwrap();
-        let span_upper = span.accounting.upper_bounds;
         assert!(matches!(
             span_plan.span_sum(
                 haystack,
                 ReduceLimits {
-                    max_span_sum: span_upper.span_sum.checked_sub(1).unwrap(),
+                    max_span_sum: span.accounting.upper_bounds.span_sum - 1,
                     ..ReduceLimits::unlimited()
                 }
             ),
@@ -1149,16 +1972,50 @@ mod tests {
     }
 
     #[test]
-    fn theorem_refuses_empty_count_width_and_total_outside_absolute_bounds() {
+    fn failed_owner_allocation_has_a_closed_partial_receipt() {
+        let patterns = [b"ab".as_slice(), b"cd".as_slice()];
+        let _guard = build_allocation_probe::fail_next();
+        let failure =
+            PackedOrderedLiteralCountPlan::build_attempt(&patterns, BuildLimits::unlimited())
+                .unwrap_err();
+        assert!(matches!(
+            failure.source(),
+            BuildError::AllocationFailed { additional }
+                if *additional == size_of::<super::PackedOwner>()
+        ));
+        assert!(failure.closes());
+        let actual = failure.receipt().actual();
+        assert_eq!(actual.allocations, 0);
+        assert_eq!(actual.allocated_bytes, 0);
+        assert_eq!(actual.copied_bytes, 4);
+        assert_eq!(actual.live_persistent_bytes, 0);
+        assert_eq!(actual.peak_bytes, 0);
+    }
+
+    #[test]
+    fn theorem_refuses_count_width_and_total_outside_absolute_bounds() {
         assert!(matches!(
             PackedOrderedLiteralCountPlan::build::<&[u8]>(&[], BuildLimits::unlimited()),
             Err(BuildError::EmptyPatternSet)
         ));
         assert!(matches!(
-            PackedOrderedLiteralCountPlan::build(&[b"".as_slice()], BuildLimits::unlimited()),
-            Err(BuildError::EmptyPattern { index: 0 })
+            PackedOrderedLiteralCountPlan::build(&[b"ab".as_slice()], BuildLimits::unlimited()),
+            Err(BuildError::ProofRefused {
+                fact: "pattern count minimum",
+                ..
+            })
         ));
-        let too_many = vec![b"a".as_slice(); super::CERTIFIED_MAX_PATTERNS + 1];
+        assert!(matches!(
+            PackedOrderedLiteralCountPlan::build(
+                &[b"a".as_slice(), b"bc".as_slice()],
+                BuildLimits::unlimited()
+            ),
+            Err(BuildError::ProofRefused {
+                fact: "literal width minimum",
+                ..
+            })
+        ));
+        let too_many = vec![b"aa".as_slice(); super::CERTIFIED_MAX_PATTERNS + 1];
         assert!(matches!(
             PackedOrderedLiteralCountPlan::build(&too_many, BuildLimits::unlimited()),
             Err(BuildError::ProofRefused {
@@ -1168,11 +2025,42 @@ mod tests {
         ));
         let too_wide = vec![b'a'; super::CERTIFIED_MAX_PATTERN_BYTES + 1];
         assert!(matches!(
-            PackedOrderedLiteralCountPlan::build(&[too_wide], BuildLimits::unlimited()),
+            PackedOrderedLiteralCountPlan::build(
+                &[too_wide.as_slice(), b"bc".as_slice()],
+                BuildLimits::unlimited()
+            ),
             Err(BuildError::ProofRefused {
                 fact: "literal width",
                 ..
             })
         ));
+        let wide = vec![b'a'; super::CERTIFIED_MAX_PATTERN_BYTES];
+        let too_large = vec![wide.as_slice(); super::CERTIFIED_MAX_PATTERNS];
+        PackedOrderedLiteralCountPlan::build(&too_large, BuildLimits::unlimited()).unwrap();
+    }
+
+    #[test]
+    fn operation_receipt_is_bounded_and_allocation_free() {
+        let patterns = [b"Sherlock".as_slice(), b"Holmes".as_slice()];
+        let plan =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let result = plan
+            .count(
+                b"Sherlock and Holmes and Sherlock",
+                ReduceLimits::unlimited(),
+            )
+            .unwrap();
+        let upper = result.accounting.upper_bounds;
+        let actual = result.accounting.actual;
+        assert_eq!(result.count, 3);
+        assert_eq!(actual.scratch_bytes, 0);
+        assert_eq!(upper.scratch_bytes, 0);
+        assert_eq!(actual.classified_positions, upper.candidate_positions);
+        assert!(actual.candidate_events <= upper.candidate_positions);
+        assert!(actual.pattern_checks <= upper.pattern_checks);
+        assert_eq!(actual.source_byte_reads, upper.source_byte_reads);
+        assert_eq!(actual.work, upper.work);
+        assert_eq!(upper.restart_tail_positions, 0);
+        assert_eq!(upper.iterator_setup_work, 0);
     }
 }
