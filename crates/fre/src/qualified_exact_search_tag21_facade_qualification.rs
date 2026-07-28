@@ -4,7 +4,9 @@ use fre_kernel_ir::Span as NativeSpan;
 
 use super::*;
 
-const SCHEMA: &str = "fre-jit-tag21-facade-performance-v2";
+// V3 is a new value-only timing boundary. Existing V2 reporting-path rows
+// remain historical evidence and must never be relabeled.
+const SCHEMA: &str = "fre-jit-tag21-facade-performance-v3";
 const CSV_HEADER: &str = "schema,revision,pid,repetition,literal_class,literal_hex,size,scenario,order,engine,stage,iterations,total_ns,ns_per_iter,checksum,semantic_value,haystack_bytes,route,backend,qualification_state,artifact_sha256,declared_min_window_bytes,declared_min_calls,measured_calls";
 const BUILD_ITERATIONS: usize = 8;
 
@@ -328,15 +330,42 @@ fn portable_value(portable: &PortableRegex, haystack: &[u8]) -> u64 {
     encode_span(matched)
 }
 
-fn facade_value(session: &QualifiedExactSearchFacadeThreadSession<'_>, haystack: &[u8]) -> u64 {
+fn facade_value_only(
+    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    haystack: &[u8],
+) -> u64 {
+    let matched = session
+        .find_value(black_box(haystack), SearchLimits::unlimited())
+        .expect("tag21 value-only facade search");
+    encode_span(matched)
+}
+
+fn assert_facade_reporting_contract(
+    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    haystack: &[u8],
+    expected: u64,
+) {
     let (matched, execution) = session
-        .find(black_box(haystack), SearchLimits::unlimited())
-        .expect("tag21 facade search");
+        .find(haystack, SearchLimits::unlimited())
+        .expect("untimed tag21 reporting facade search");
     assert_eq!(
         execution.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
     );
-    encode_span(matched)
+    assert_eq!(
+        execution.accounting,
+        SearchAccounting::ExactLiteral(LiteralAccounting {
+            needle_bytes: QUALIFIED_EXACT_SEARCH_LITERAL_BYTES,
+            searched_bytes: haystack.len(),
+            linear_terms: haystack
+                .len()
+                .checked_add(QUALIFIED_EXACT_SEARCH_LITERAL_BYTES)
+                .expect("bounded tag21 reporting accounting"),
+            scratch_bytes: 0,
+        })
+    );
+    assert_eq!(encode_span(matched), expected);
+    assert_eq!(facade_value_only(session, haystack), expected);
 }
 
 fn measure(iterations: usize, mut operation: impl FnMut() -> u64) -> Timed {
@@ -392,7 +421,7 @@ fn measure_facade_full(case: LiteralCase, size: Size, haystack: &[u8], calls: us
         .begin_current_thread_session()
         .expect("tag21 facade current-thread session");
     for iteration in 0..calls {
-        let value = black_box(facade_value(&session, haystack));
+        let value = black_box(facade_value_only(&session, haystack));
         checksum = checksum.rotate_left(9)
             ^ value.wrapping_add(
                 u64::try_from(iteration)
@@ -447,7 +476,9 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
         encode_offsets(kir_expected.map(|span| (span.start(), span.end()))),
         "portable facade differs from the independent Kernel IR oracle"
     );
-    assert_eq!(facade_value(&facade_session, &haystack), expected);
+    // The reporting boundary is exercised once outside every timer. Timed
+    // search/full-workload calls consume only the semantic value projection.
+    assert_facade_reporting_contract(&facade_session, &haystack, expected);
 
     let portable_build = || {
         measure(BUILD_ITERATIONS, || {
@@ -472,7 +503,7 @@ fn run_cell(case: LiteralCase, size: Size, scenario: Scenario, repetition: u32) 
     };
     let facade_search = || {
         measure(size.calls(), || {
-            facade_value(black_box(&facade_session), black_box(&haystack))
+            facade_value_only(black_box(&facade_session), black_box(&haystack))
         })
     };
     let portable_cold = || measure_portable_full(case, &haystack, 1);
@@ -726,6 +757,7 @@ fn driver() {
 
 #[test]
 fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
+    assert_eq!(SCHEMA, "fre-jit-tag21-facade-performance-v3");
     let columns: Vec<_> = CSV_HEADER.split(',').collect();
     assert_eq!(columns.len(), 24);
     let mut deduplicated = columns.clone();
@@ -761,6 +793,10 @@ fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one source seal keeps the value helper, untimed reporting gate, full loop, and hot closure boundaries auditable together"
+)]
 fn current_thread_session_timing_boundaries_are_source_sealed() {
     fn position(source: &str, marker: &str) -> usize {
         source
@@ -772,6 +808,39 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/qualified_exact_search_tag21_facade_qualification.rs"
     ));
+
+    let value_start = position(source, "fn facade_value_only(");
+    let value_end = value_start
+        + position(
+            &source[value_start..],
+            "\nfn assert_facade_reporting_contract(",
+        );
+    let value = &source[value_start..value_end];
+    assert!(value.contains(".find_value("));
+    assert!(!value.contains("execution"));
+    assert!(!value.contains("begin_current_thread_session"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !value.contains(reporting_call),
+            "value-only timed helper contains reporting call {reporting_call}"
+        );
+    }
+
+    let reporting_start = position(source, "fn assert_facade_reporting_contract(");
+    let reporting_end = reporting_start + position(&source[reporting_start..], "\nfn measure(");
+    let reporting = &source[reporting_start..reporting_end];
+    assert!(reporting.contains(".find(haystack, SearchLimits::unlimited())"));
+    assert!(reporting.contains("execution.route"));
+    assert!(reporting.contains("execution.accounting"));
+    assert!(reporting.contains("facade_value_only(session, haystack)"));
+    assert!(!reporting.contains("Instant::now"));
+
     let full_start = position(source, "fn measure_facade_full(");
     let full_end = full_start
         + position(
@@ -786,6 +855,22 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     assert!(full_timer < full_build);
     assert!(full_build < full_session);
     assert!(full_session < full_loop);
+    let full_loop_body = &full[full_loop..];
+    assert!(full_loop_body.contains("facade_value_only(&session, haystack)"));
+    assert!(!full_loop_body.contains("begin_current_thread_session"));
+    assert!(!full.contains("assert_facade_reporting_contract"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !full_loop_body.contains(reporting_call),
+            "full-workload loop contains reporting call {reporting_call}"
+        );
+    }
 
     let cell_start = position(source, "fn run_cell(");
     let cell_end = cell_start
@@ -795,10 +880,28 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
         );
     let cell = &source[cell_start..cell_end];
     let session = position(cell, "let facade_session = facade");
+    let reporting = position(cell, "assert_facade_reporting_contract(");
+    let first_timed_closure = position(cell, "let portable_build = ||");
     let hot_start = position(cell, "let facade_search = ||");
     let hot_end = position(cell, "let portable_cold = ||");
     assert!(session < hot_start);
+    assert!(session < reporting);
+    assert!(reporting < first_timed_closure);
+    assert_eq!(cell.matches("assert_facade_reporting_contract(").count(), 1);
     let hot = &cell[hot_start..hot_end];
-    assert!(hot.contains("facade_value(black_box(&facade_session)"));
+    assert!(hot.contains("facade_value_only(black_box(&facade_session), black_box(&haystack))"));
     assert!(!hot.contains("begin_current_thread_session"));
+    assert!(!hot.contains("assert_facade_reporting_contract"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !hot.contains(reporting_call),
+            "hot timed region contains reporting call {reporting_call}"
+        );
+    }
 }
