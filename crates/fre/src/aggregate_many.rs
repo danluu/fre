@@ -1,9 +1,12 @@
 use core::{fmt, mem::size_of};
 
 use fre_aggregate::{
-    AdmittedCount, AdmittedSpanSum, AdmittedSpans, CompileAccounting, CompileLimits, CompiledRegex,
-    Error as AggregateEngineError, ExecutionAccounting, OperationCertificate, OperationLimits,
-    PlanId, Resource as AggregateResource, RustByteProfile, SpanIter, Strategy,
+    AdmittedCount, AdmittedSpanSum, AdmittedSpans, CachedCountSession, CachedCountSessionFootprint,
+    CompileAccounting, CompileLimits, CompiledRegex, CountValueCounterAttempt,
+    Error as AggregateEngineError, ExecutionAccounting, OperationAttemptKind, OperationCertificate,
+    OperationCounterValue, OperationLimits, OperationPhysicalRoute,
+    OperationPrepublicationFallback, PlanId, Resource as AggregateResource, RustByteProfile,
+    SpanIter, Strategy,
 };
 use fre_kernels::{
     ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
@@ -20,11 +23,15 @@ use fre_syntax::{
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Stable report schema for one ordered multi-pattern aggregate plan.
-pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 3;
+pub const AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION: u32 = 4;
 
 /// Stable identity for the source-independent total byte-cover theorem.
 pub const AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID: &str =
     "aggregate-many.nonnullable-look-free-one-byte-cover-span-sum.v1";
+
+/// Stable identity for the construction-sealed byte unit-cover proof.
+pub const AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID: &str =
+    "aggregate-many.nonnullable-look-free-one-byte-cover-proof.v1";
 
 /// Requested output boundary for ordered multi-pattern construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +129,30 @@ pub struct AggregateManyTotalByteCoverBuildAccounting {
     pub persistent_bytes: usize,
 }
 
+/// Construction-sealed proof that every source byte begins at least one
+/// accepted one-byte witness.
+///
+/// Earlier ordered arms may contain assertions or accept longer strings. The
+/// proof requires every arm to be non-nullable and only uses the exact
+/// one-byte languages of look-free arms as witnesses. A complete 256-byte
+/// union therefore proves that ordered matching advances from every source
+/// boundary without changing priority or match length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateManyByteUnitCoverProof {
+    pub algorithm: &'static str,
+    pub patterns: usize,
+    pub nonnullable_patterns: usize,
+    pub look_free_patterns: usize,
+    pub contributing_patterns: usize,
+    pub covered_bytes: usize,
+    pub unicode: bool,
+    pub hir_visits: usize,
+    pub class_byte_visits: usize,
+    pub union_word_visits: usize,
+    pub work: usize,
+    pub allocations: usize,
+}
+
 /// Source-independent execution envelope for one total-cover span sum.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateManyTotalByteCoverUpperBounds {
@@ -200,6 +231,9 @@ pub struct AggregateManyCompositionAccounting {
     pub pattern_bytes: usize,
     pub source_preflight_work: u64,
     pub parser_work: u64,
+    /// Exact source-independent HIR work sealed by a retained byte unit-cover
+    /// proof for `CaptureCount`; zero when no proof is published.
+    pub byte_unit_cover_proof_work: u64,
     pub composition_work: u64,
     pub hir_capacity_bytes: usize,
     pub literal_view_capacity_bytes: usize,
@@ -232,6 +266,9 @@ pub struct AggregateManyBuildReport {
     pub captures_erased: usize,
     pub capture_semantics: Option<AggregateManyCaptureSemantics>,
     pub participating_captures_per_match: Option<usize>,
+    /// Optional construction-sealed eligibility proof for a caller-owned
+    /// cached `CaptureCount` session.
+    pub byte_unit_cover: Option<AggregateManyByteUnitCoverProof>,
     pub composition: AggregateManyCompositionAccounting,
     pub build: AggregateManyBuildAccounting,
     pub plan_identity: AggregateManyPlanIdentity,
@@ -461,6 +498,9 @@ pub enum AggregateManyExecutionSource {
     OrderedLiteral(OrderedLiteralAggregateReduceError),
     TotalByteCover(AggregateEngineError),
     Continuation(AggregateEngineError),
+    CaptureSessionPlanMismatch,
+    CaptureSessionHaystackLengthMismatch { expected: usize, actual: usize },
+    CaptureSessionLimitsMismatch,
     CaptureEventsLimit { needed: u64, limit: u64 },
     CaptureCountLimit { needed: u64, limit: u64 },
     ArithmeticOverflow { computation: &'static str },
@@ -522,6 +562,37 @@ pub struct AggregateManyCaptureCountResult {
     matches: u64,
     capture_events: u64,
     details: AggregateManyExecutionDetails,
+}
+
+/// Exact retained storage for one aggregate-many capture Count session.
+pub type AggregateManyCaptureCountSessionFootprint = CachedCountSessionFootprint;
+
+/// Caller-owned reusable value-only session for one semantically proved
+/// Unicode-off aggregate-many `CaptureCount` plan.
+///
+/// The session is bound to one compiled plan, one exact haystack length and
+/// one exact complete capture policy. It retains no source bytes, match spans,
+/// capture offsets or prior result.
+#[derive(Debug)]
+pub struct AggregateManyCaptureCountSession {
+    selector: CachedCountSession,
+    plan_id: PlanId,
+    haystack_len: usize,
+    limits: AggregateManyCaptureRunLimits,
+}
+
+impl AggregateManyCaptureCountSession {
+    /// Exact source-free storage retained by this session.
+    #[must_use]
+    pub const fn footprint(&self) -> AggregateManyCaptureCountSessionFootprint {
+        self.selector.footprint()
+    }
+
+    /// Exact haystack length sealed at construction.
+    #[must_use]
+    pub const fn haystack_len(&self) -> usize {
+        self.haystack_len
+    }
 }
 
 impl AggregateManyCaptureCountResult {
@@ -906,6 +977,40 @@ impl<'a> AggregateManyBuilder<'a> {
             });
             hirs.push(rust.hir);
         }
+        let unicode = self.profile.options.unicode;
+        let byte_cover_shape = (!unicode
+            && matches!(
+                operation,
+                AggregateManyOperation::CaptureCount | AggregateManyOperation::SpanSum
+            ))
+        .then(|| total_byte_cover_shape(&hirs))
+        .flatten();
+        let byte_unit_cover = if operation == AggregateManyOperation::CaptureCount {
+            byte_cover_shape.map(|shape| AggregateManyByteUnitCoverProof {
+                algorithm: AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID,
+                patterns: shape.patterns,
+                nonnullable_patterns: shape.nonnullable_patterns,
+                look_free_patterns: shape.look_free_patterns,
+                contributing_patterns: shape.contributing_patterns,
+                covered_bytes: shape.covered_bytes,
+                unicode: false,
+                hir_visits: shape.hir_visits,
+                class_byte_visits: shape.byte_visits,
+                union_word_visits: shape.union_word_visits,
+                work: shape.work,
+                allocations: 0,
+            })
+        } else {
+            None
+        };
+        let byte_unit_cover_proof_work = byte_unit_cover
+            .map(|proof| {
+                u64::try_from(proof.work).map_err(|_| AggregateManyBuildError::ArithmeticOverflow {
+                    computation: "byte unit-cover proof work as u64",
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         let composition_visits =
             count_u64
                 .checked_add(1)
@@ -915,6 +1020,7 @@ impl<'a> AggregateManyBuilder<'a> {
         let composition_work = source_preflight_work
             .checked_add(parser_work)
             .and_then(|work| work.checked_add(composition_visits))
+            .and_then(|work| work.checked_add(byte_unit_cover_proof_work))
             .ok_or(AggregateManyBuildError::ArithmeticOverflow {
                 computation: "total composition work",
             })?;
@@ -938,7 +1044,6 @@ impl<'a> AggregateManyBuilder<'a> {
                 computation: "engine persistent allowance",
             })?;
 
-        let unicode = self.profile.options.unicode;
         let case_insensitive = self.profile.options.case_insensitive;
         let mut all_literals = !case_insensitive;
         let mut first_nonliteral = None;
@@ -953,8 +1058,8 @@ impl<'a> AggregateManyBuilder<'a> {
         } else {
             first_nonliteral = Some(0);
         }
-        let total_byte_cover_shape = (!unicode && operation == AggregateManyOperation::SpanSum)
-            .then(|| total_byte_cover_shape(&hirs))
+        let total_byte_cover_shape = (operation == AggregateManyOperation::SpanSum)
+            .then_some(byte_cover_shape)
             .flatten();
         if unicode && !all_literals {
             return Err(AggregateManyBuildError::UnicodeNonLiteral {
@@ -1126,6 +1231,7 @@ impl<'a> AggregateManyBuilder<'a> {
             pattern_bytes,
             source_preflight_work,
             parser_work,
+            byte_unit_cover_proof_work,
             composition_work,
             hir_capacity_bytes,
             literal_view_capacity_bytes,
@@ -1145,6 +1251,7 @@ impl<'a> AggregateManyBuilder<'a> {
                 .then_some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty),
             participating_captures_per_match: (operation == AggregateManyOperation::CaptureCount)
                 .then_some(1),
+            byte_unit_cover,
             composition,
             build,
             plan_identity,
@@ -1335,6 +1442,80 @@ impl AggregateManyPlan {
             ))
         })
     }
+
+    fn capture_count_session_engine(
+        &self,
+    ) -> Result<Option<&CompiledRegex>, AggregateManyExecutionError> {
+        if self.report.operation != AggregateManyOperation::CaptureCount {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session requested from another operation",
+                )),
+            );
+        }
+        if self.report.profile.options.unicode
+            || self.report.plan != AggregateManyPlanKind::ContinuationProgram
+            || self.strategy != Strategy::ReverseSequentialRows
+        {
+            return Ok(None);
+        }
+        let Some(proof) = self.report.byte_unit_cover else {
+            return Ok(None);
+        };
+        let proof_work = u64::try_from(proof.work).map_err(|_| {
+            self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                "byte unit-cover proof work does not fit u64",
+            ))
+        })?;
+        if proof.algorithm != AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID
+            || proof.patterns != self.report.patterns.len()
+            || proof.nonnullable_patterns != proof.patterns
+            || proof.covered_bytes != 256
+            || proof.unicode
+            || proof.allocations != 0
+            || proof_work != self.report.composition.byte_unit_cover_proof_work
+            || self.report.capture_semantics
+                != Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty)
+            || self.report.participating_captures_per_match != Some(1)
+            || self.report.captures_erased != proof.patterns
+            || self.report.strategy != Some(self.strategy)
+        {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session proof does not close",
+                )),
+            );
+        }
+        let AggregateManyPlanIdentity::Continuation(identity) = self.report.plan_identity else {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session plan identity is not a continuation",
+                )),
+            );
+        };
+        let AggregateManyBuildAccounting::Continuation(_) = self.report.build else {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session build accounting is not a continuation",
+                )),
+            );
+        };
+        let AggregateManyEngine::Continuation(engine) = &self.engine else {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session retained a non-continuation engine",
+                )),
+            );
+        };
+        if identity != engine.plan_id() {
+            return Err(
+                self.execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "capture Count session engine identity differs from its report",
+                )),
+            );
+        }
+        Ok(Some(engine))
+    }
 }
 
 /// Fresh complete ordered multi-pattern compile artifact.
@@ -1400,6 +1581,173 @@ impl AggregateManyCaptureCountRegex {
         limits: AggregateManyCaptureRunLimits,
     ) -> Result<AggregateManyCaptureCountResult, AggregateManyExecutionError> {
         let selected = self.0.count(haystack, limits.selector)?;
+        let value = self.capture_value_from_matches(selected.value, limits)?;
+        Ok(AggregateManyCaptureCountResult {
+            value,
+            matches: selected.value,
+            capture_events: value,
+            details: selected.details,
+        })
+    }
+
+    pub fn count_captures_value(
+        &self,
+        haystack: &[u8],
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<u64, AggregateManyExecutionError> {
+        self.count_captures(haystack, limits)
+            .map(|result| result.value)
+    }
+
+    /// Return the exact source-free retained storage required by an eligible
+    /// caller-owned cached `CaptureCount` session.
+    ///
+    /// `Ok(None)` means the immutable plan lacks the byte unit-cover,
+    /// Unicode-off continuation, reverse-row, or byte-transition proof. No
+    /// source bytes are inspected.
+    pub fn cached_count_session_footprint(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<AggregateManyCaptureCountSessionFootprint>, AggregateManyExecutionError>
+    {
+        let Some(engine) = self.0.capture_count_session_engine()? else {
+            return Ok(None);
+        };
+        engine
+            .cached_count_session_footprint(haystack_len)
+            .map_err(|source| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::Continuation(source))
+            })
+    }
+
+    /// Construct a caller-owned session for repeated full-haystack
+    /// `CaptureCount` operations at one exact input length and policy.
+    ///
+    /// Construction allocates the complete fixed storage. Every successful
+    /// operation through the returned session performs zero allocation.
+    pub fn prepare_cached_count_session(
+        &self,
+        haystack_len: usize,
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<Option<AggregateManyCaptureCountSession>, AggregateManyExecutionError> {
+        let Some(engine) = self.0.capture_count_session_engine()? else {
+            return Ok(None);
+        };
+        let maximum_matches = u64::try_from(haystack_len).map_err(|_| {
+            self.0
+                .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
+                    computation: "capture session maximum matches",
+                })
+        })?;
+        let maximum_capture_events = maximum_matches.checked_mul(2).ok_or_else(|| {
+            self.0
+                .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
+                    computation: "capture session maximum capture events",
+                })
+        })?;
+        if maximum_capture_events > limits.max_capture_events
+            || maximum_capture_events > limits.max_capture_count
+        {
+            return Ok(None);
+        }
+        let Some(selector) = engine
+            .cached_count_session(haystack_len, limits.selector.continuation)
+            .map_err(|source| {
+                self.0
+                    .execution_error(AggregateManyExecutionSource::Continuation(source))
+            })?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AggregateManyCaptureCountSession {
+            selector,
+            plan_id: engine.plan_id(),
+            haystack_len,
+            limits,
+        }))
+    }
+
+    /// Execute one full-haystack value-only `CaptureCount` operation through a
+    /// caller-owned cache.
+    ///
+    /// Cache saturation or an operation-local refusal cold-replays through
+    /// the ordinary admitted path and authenticates its complete accounting.
+    /// Plan, length and policy binding failures refuse before source access.
+    pub fn count_captures_value_with_session(
+        &self,
+        session: &mut AggregateManyCaptureCountSession,
+        haystack: &[u8],
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<u64, AggregateManyExecutionError> {
+        let Some(engine) = self.0.capture_count_session_engine()? else {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::CaptureSessionPlanMismatch));
+        };
+        if session.plan_id != engine.plan_id() {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::CaptureSessionPlanMismatch));
+        }
+        if session.haystack_len != haystack.len() {
+            return Err(self.0.execution_error(
+                AggregateManyExecutionSource::CaptureSessionHaystackLengthMismatch {
+                    expected: session.haystack_len,
+                    actual: haystack.len(),
+                },
+            ));
+        }
+        if session.limits != limits {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::CaptureSessionLimitsMismatch));
+        }
+
+        let attempt = engine.count_value_with_cached_session_and_counters(
+            &mut session.selector,
+            haystack,
+            limits.selector.continuation,
+        );
+        if let Err(
+            AggregateEngineError::SessionPlanMismatch
+            | AggregateEngineError::SessionHaystackLengthMismatch { .. }
+            | AggregateEngineError::SessionLimitsMismatch,
+        ) = &attempt
+        {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "validated aggregate session diverged from its selector binding",
+                )));
+        }
+        match attempt {
+            Ok(attempt)
+                if Self::cached_count_attempt_closes(
+                    engine,
+                    &attempt,
+                    session.footprint(),
+                    haystack.len(),
+                    limits,
+                ) =>
+            {
+                let matches = u64::try_from(attempt.value).map_err(|_| {
+                    self.0
+                        .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                            "cached continuation Count does not fit u64",
+                        ))
+                })?;
+                self.capture_value_from_matches(matches, limits)
+            }
+            Ok(_) | Err(_) => self.authenticated_cold_replay(haystack, limits),
+        }
+    }
+
+    fn capture_value_from_matches(
+        &self,
+        matches: u64,
+        limits: AggregateManyCaptureRunLimits,
+    ) -> Result<u64, AggregateManyExecutionError> {
         let participating = self
             .0
             .report
@@ -1429,15 +1777,12 @@ impl AggregateManyCaptureCountRegex {
                         computation: "capture groups per match",
                     })
             })?;
-        let capture_events = selected
-            .value
-            .checked_mul(groups_per_match)
-            .ok_or_else(|| {
-                self.0
-                    .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
-                        computation: "capture events",
-                    })
-            })?;
+        let capture_events = matches.checked_mul(groups_per_match).ok_or_else(|| {
+            self.0
+                .execution_error(AggregateManyExecutionSource::ArithmeticOverflow {
+                    computation: "capture events",
+                })
+        })?;
         if capture_events > limits.max_capture_events {
             return Err(self
                 .0
@@ -1446,31 +1791,127 @@ impl AggregateManyCaptureCountRegex {
                     limit: limits.max_capture_events,
                 }));
         }
-        let value = capture_events;
-        if value > limits.max_capture_count {
+        if capture_events > limits.max_capture_count {
             return Err(self
                 .0
                 .execution_error(AggregateManyExecutionSource::CaptureCountLimit {
-                    needed: value,
+                    needed: capture_events,
                     limit: limits.max_capture_count,
                 }));
         }
-        Ok(AggregateManyCaptureCountResult {
-            value,
-            matches: selected.value,
-            capture_events,
-            details: selected.details,
-        })
+        Ok(capture_events)
     }
 
-    pub fn count_captures_value(
+    fn cached_count_attempt_closes(
+        engine: &CompiledRegex,
+        attempt: &CountValueCounterAttempt,
+        footprint: AggregateManyCaptureCountSessionFootprint,
+        haystack_len: usize,
+        limits: AggregateManyCaptureRunLimits,
+    ) -> bool {
+        let receipt = &attempt.receipt;
+        let certificate = &receipt.certificate;
+        receipt.closes()
+            && receipt.value == OperationCounterValue::Count(attempt.value)
+            && certificate.regex_plan_id == engine.plan_id()
+            && certificate.authenticates_limits(limits.selector.continuation)
+            && certificate.strategy == Strategy::ReverseSequentialRows
+            && certificate.operation == OperationAttemptKind::Count
+            && certificate.physical_route == OperationPhysicalRoute::CachedFrontier
+            && certificate.prepublication_fallback == OperationPrepublicationFallback::None
+            && certificate.range == (0..haystack_len)
+            && certificate.actual_allocations == 0
+            && certificate.prospective_allocations == 0
+            && certificate.log_bytes == footprint.boundary_bytes
+            && certificate.random_access_bytes == footprint.cache_bytes
+            && certificate.scratch_bytes == footprint.cache_bytes
+            && certificate.sequential_bytes_bound == footprint.sequential_bytes
+            && certificate.peak_bytes == footprint.retained_bytes
+            && receipt.accounting.log_bytes == footprint.boundary_bytes
+            && receipt.accounting.random_access_peak_bytes == footprint.cache_bytes
+            && receipt.accounting.scratch_peak_bytes == footprint.cache_bytes
+            && receipt.accounting.peak_bytes == footprint.retained_bytes
+            && receipt.accounting.emitted_matches == attempt.value
+            && receipt.counters.allocations == 0
+    }
+
+    fn authenticated_cold_replay(
         &self,
         haystack: &[u8],
         limits: AggregateManyCaptureRunLimits,
     ) -> Result<u64, AggregateManyExecutionError> {
-        self.count_captures(haystack, limits)
-            .map(|result| result.value)
+        let result = self.count_captures(haystack, limits)?;
+        let AggregateManyExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = result.details()
+        else {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "cached capture Count cold replay selected a non-continuation plan",
+                )));
+        };
+        let AggregateManyPlanIdentity::Continuation(plan_id) = self.0.report.plan_identity else {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "cached capture Count cold replay lost its continuation identity",
+                )));
+        };
+        if !continuation_count_accounting_closes(
+            certificate,
+            accounting,
+            plan_id,
+            haystack.len(),
+            limits.selector.continuation,
+            result.matches(),
+        ) || result.capture_events() != result.value()
+            || self.capture_value_from_matches(result.matches(), limits)? != result.value()
+        {
+            return Err(self
+                .0
+                .execution_error(AggregateManyExecutionSource::InternalInvariant(
+                    "cached capture Count cold replay accounting did not close",
+                )));
+        }
+        Ok(result.value())
     }
+}
+
+fn continuation_count_accounting_closes(
+    certificate: &OperationCertificate,
+    accounting: &ExecutionAccounting,
+    plan_id: PlanId,
+    haystack_len: usize,
+    limits: OperationLimits,
+    matches: u64,
+) -> bool {
+    let Ok(matches) = usize::try_from(matches) else {
+        return false;
+    };
+    let Some(sequential_bytes) = accounting
+        .sequential_bytes_written
+        .checked_add(accounting.sequential_bytes_read)
+    else {
+        return false;
+    };
+    certificate.regex_plan_id == plan_id
+        && certificate.authenticates_limits(limits)
+        && certificate.strategy == Strategy::ReverseSequentialRows
+        && certificate.operation == OperationAttemptKind::Count
+        && certificate.range == (0..haystack_len)
+        && certificate.actual_allocations <= certificate.prospective_allocations
+        && sequential_bytes <= certificate.sequential_bytes_bound
+        && accounting.random_access_peak_bytes <= certificate.random_access_bytes
+        && accounting.scratch_peak_bytes <= certificate.scratch_bytes
+        && accounting.log_bytes <= certificate.log_bytes
+        && accounting.output_bytes <= certificate.output_bytes
+        && accounting.peak_bytes <= certificate.peak_bytes
+        && accounting.work <= certificate.work_bound
+        && accounting.successful_paths <= certificate.match_events
+        && accounting.emitted_matches == matches
+        && matches <= certificate.output_matches
 }
 
 /// Compiled ordered multi-pattern complete-span operation.

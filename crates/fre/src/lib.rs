@@ -187,10 +187,12 @@ pub use aggregate_construction::{
     AggregateConstructionTerminal, AggregateConstructionTransition,
 };
 pub use aggregate_many::{
-    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
-    AggregateManyCaptureCountResult, AggregateManyCaptureIneligibility,
+    AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+    AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID, AggregateManyBuildAccounting,
+    AggregateManyBuildError, AggregateManyBuildLimits, AggregateManyBuildReport,
+    AggregateManyBuilder, AggregateManyByteUnitCoverProof, AggregateManyCaptureCountRegex,
+    AggregateManyCaptureCountResult, AggregateManyCaptureCountSession,
+    AggregateManyCaptureCountSessionFootprint, AggregateManyCaptureIneligibility,
     AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
     AggregateManyCompositionAccounting, AggregateManyCountRegex, AggregateManyCountResult,
     AggregateManyExecutionDetails, AggregateManyExecutionError, AggregateManyExecutionSource,

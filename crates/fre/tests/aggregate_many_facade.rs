@@ -1,11 +1,12 @@
 use fre::{
-    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
-    AggregateEngineError, AggregateManyBuildAccounting, AggregateManyBuildError,
-    AggregateManyBuildLimits, AggregateManyBuilder, AggregateManyCaptureIneligibility,
-    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyExecutionDetails,
-    AggregateManyExecutionSource, AggregateManyOperation, AggregateManyOutput,
-    AggregateManyPlanIdentity, AggregateManyPlanKind, AggregateManyRegex, AggregateManyRunLimits,
-    AggregateResource, AggregateStrategy, CompatibilityProfile, RustProfile,
+    AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+    AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID, AggregateEngineError,
+    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
+    AggregateManyBuilder, AggregateManyCaptureIneligibility, AggregateManyCaptureRunLimits,
+    AggregateManyCaptureSemantics, AggregateManyExecutionDetails, AggregateManyExecutionSource,
+    AggregateManyOperation, AggregateManyOutput, AggregateManyPlanIdentity, AggregateManyPlanKind,
+    AggregateManyRegex, AggregateManyRunLimits, AggregateResource, AggregateStrategy,
+    CompatibilityProfile, RustProfile,
 };
 use regex::bytes::RegexBuilder;
 use regex_automata::{Input, meta::Regex as MetaRegex};
@@ -446,6 +447,139 @@ fn uniform_capture_count_matches_pinned_build_many_exhaustively() {
 }
 
 #[test]
+fn byte_unit_cover_capture_session_preserves_assertions_priority_and_binding() {
+    let values = patterns(&[
+        r"(\balways_comb\b)",
+        r"([A-Za-z_][A-Za-z0-9_]*)",
+        r"(\r\n|\r|\n)",
+        r"(.)",
+    ]);
+    let regex = AggregateManyBuilder::new(&values)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_capture_count()
+        .unwrap();
+    let proof = regex
+        .build_report()
+        .byte_unit_cover
+        .expect("the final dot is a complete look-free byte witness");
+    assert_eq!(
+        AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID,
+        proof.algorithm
+    );
+    assert_eq!(values.len(), proof.patterns);
+    assert_eq!(values.len(), proof.nonnullable_patterns);
+    assert!(proof.look_free_patterns < proof.patterns);
+    assert_eq!(256, proof.covered_bytes);
+    assert!(!proof.unicode);
+    assert_eq!(0, proof.allocations);
+    assert_eq!(
+        u64::try_from(proof.work).unwrap(),
+        regex.build_report().composition.byte_unit_cover_proof_work
+    );
+
+    let sources: [&[u8]; 3] = [b"always_comb!", b"alpha_\xff beta", b"\xff\xfe !?\tvalue!"];
+    assert!(
+        sources
+            .iter()
+            .all(|source| source.len() == sources[0].len())
+    );
+    let limits = AggregateManyCaptureRunLimits::unlimited();
+    let footprint = regex
+        .cached_count_session_footprint(sources[0].len())
+        .unwrap()
+        .expect("source-free byte session footprint");
+    assert!(footprint.allocations > 0);
+    assert!(footprint.retained_bytes >= footprint.boundary_bytes);
+    let mut session = regex
+        .prepare_cached_count_session(sources[0].len(), limits)
+        .unwrap()
+        .expect("proved byte session");
+    assert_eq!(footprint, session.footprint());
+
+    for source in sources.into_iter().cycle().take(12) {
+        assert_eq!(
+            meta_capture_count(&values, source),
+            regex
+                .count_captures_value_with_session(&mut session, source, limits)
+                .unwrap(),
+            "{source:?}"
+        );
+    }
+
+    assert!(matches!(
+        regex
+            .count_captures_value_with_session(&mut session, b"short", limits)
+            .unwrap_err()
+            .source,
+        AggregateManyExecutionSource::CaptureSessionHaystackLengthMismatch { .. }
+    ));
+    let mut other_limits = limits;
+    other_limits.max_capture_count -= 1;
+    assert!(matches!(
+        regex
+            .count_captures_value_with_session(&mut session, sources[0], other_limits)
+            .unwrap_err()
+            .source,
+        AggregateManyExecutionSource::CaptureSessionLimitsMismatch
+    ));
+
+    let mut reordered = values.clone();
+    reordered.swap(0, 1);
+    let other = AggregateManyBuilder::new(&reordered)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .strategy(AggregateStrategy::ReverseSequentialRows)
+        .build_capture_count()
+        .unwrap();
+    assert!(matches!(
+        other
+            .count_captures_value_with_session(&mut session, sources[0], limits)
+            .unwrap_err()
+            .source,
+        AggregateManyExecutionSource::CaptureSessionPlanMismatch
+    ));
+
+    assert_eq!(
+        meta_capture_count(&values, sources[1]),
+        regex
+            .count_captures_value_with_session(&mut session, sources[1], limits)
+            .unwrap(),
+        "binding refusals must not poison reusable state"
+    );
+}
+
+#[test]
+fn byte_unit_cover_capture_session_refuses_incomplete_or_wrong_strategy_plans() {
+    let incomplete = patterns(&[r"(\bword\b)", r"([a-z]+)"]);
+    let regex = AggregateManyBuilder::new(&incomplete)
+        .unicode(false)
+        .build_capture_count()
+        .unwrap();
+    assert!(regex.build_report().byte_unit_cover.is_none());
+    assert_eq!(
+        0,
+        regex.build_report().composition.byte_unit_cover_proof_work
+    );
+    assert!(regex.cached_count_session_footprint(64).unwrap().is_none());
+
+    let covered = patterns(&[r"(\bword\b)", r"(\n)", r"(.)"]);
+    let full_table = AggregateManyBuilder::new(&covered)
+        .unicode(false)
+        .strategy(AggregateStrategy::FullTable)
+        .build_capture_count()
+        .unwrap();
+    assert!(full_table.build_report().byte_unit_cover.is_some());
+    assert!(
+        full_table
+            .prepare_cached_count_session(64, AggregateManyCaptureRunLimits::unlimited())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn complete_spans_match_pinned_ordered_alternation_exhaustively() {
     let pattern_sets = [
         patterns(&["ab", "a"]),
@@ -506,7 +640,7 @@ fn complete_spans_preserve_unicode_literal_boundaries_and_schema_identity() {
         .unicode(true)
         .build_spans()
         .unwrap();
-    assert_eq!(3, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
+    assert_eq!(4, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION);
     assert_eq!(
         AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
         regex.build_report().schema_version
@@ -934,6 +1068,13 @@ fn sealed_veryl_count_span_sum_and_captures_fit_default_execution_work() {
         AggregateManyPlanKind::ContinuationProgram,
         captures.build_report().plan
     );
+    let proof = captures
+        .build_report()
+        .byte_unit_cover
+        .expect("Veryl capture patterns retain the complete byte-unit cover");
+    assert_eq!(88, proof.patterns);
+    assert_eq!(88, proof.nonnullable_patterns);
+    assert_eq!(256, proof.covered_bytes);
     assert_eq!(
         oracle_count,
         count
@@ -950,6 +1091,17 @@ fn sealed_veryl_count_span_sum_and_captures_fit_default_execution_work() {
         124_800,
         captures
             .count_captures_value(&haystack, AggregateManyCaptureRunLimits::default())
+            .unwrap()
+    );
+    let capture_limits = AggregateManyCaptureRunLimits::default();
+    let mut session = captures
+        .prepare_cached_count_session(haystack.len(), capture_limits)
+        .unwrap()
+        .expect("Veryl byte-unit cover admits its caller-owned session");
+    assert_eq!(
+        124_800,
+        captures
+            .count_captures_value_with_session(&mut session, &haystack, capture_limits)
             .unwrap()
     );
 }

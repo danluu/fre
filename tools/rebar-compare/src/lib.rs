@@ -19,7 +19,8 @@ use std::{fmt::Write as _, io::Write as _};
 
 use bstr::ByteSlice;
 use fre::{
-    AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
+    AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID, AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
+    AGGREGATE_MANY_TOTAL_BYTE_COVER_SPAN_SUM_ALGORITHM_ID,
     ANCHORED_ASCII_SEPARATED_FIELDS_CAPTURE_PATTERN,
     ANCHORED_ASCII_SEPARATED_FIELDS_INSPECTION_WORK, ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION,
     ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION, ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID,
@@ -241,7 +242,13 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v8-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+
+/// Stable current-FRE adapter identity used by the formal KLV runner.
+#[must_use]
+pub const fn current_fre_adapter_id() -> &'static str {
+    FRE_ADAPTER
+}
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -613,10 +620,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences whose non-ASCII folded root has at most four canonical members and whose Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
         );
         identity.identity.push_str(
-            "; aggregate-many-total-byte-cover-v1 proves from canonical HIR alone that every pattern is nonnullable and that the one-byte slices of a look-free subset cover all 256 byte values, making ordered span sum exactly the haystack length without reading source bytes",
+            "; aggregate-many-total-byte-cover-v1 proves from canonical HIR alone that every pattern is nonnullable and that the one-byte slices of a look-free subset cover all 256 byte values, making ordered span sum exactly the haystack length without reading source bytes; aggregate-many-byte-unit-cover-session-v1 seals the same theorem into eligible Unicode-off capture-many continuation reports and binds caller-owned cached-frontier storage to one plan, source length, and exact policy",
         );
         identity.availability.push_str(
-            "; Unicode-off ordered build-many span-sum uses the total-cover theorem when its structural witnesses are complete; count, capture-count, nullable sets, incomplete covers, and looked witnesses retain their incumbent plans",
+            "; Unicode-off ordered build-many span-sum uses the total-cover theorem when its structural witnesses are complete; eligible steady capture-many Count uses a zero-allocation caller-owned cached frontier while preserving ordered priority and assertion context, and cold-replays authenticated accounting after cache refusal; count, nullable sets, incomplete covers, scalar programs, and other capture operations retain their incumbent plans",
         );
         identity
             .identity
@@ -15432,14 +15439,7 @@ fn require_aggregate_many_report_identity(
     }
     match operation {
         AggregateManyOperation::CaptureCount => {
-            if report.capture_semantics
-                != Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty)
-                || report.participating_captures_per_match != Some(1)
-            {
-                return Err(ExecutionError::fault(
-                    "FRE ordered build-many capture participation identity mismatch",
-                ));
-            }
+            require_aggregate_many_capture_identity(patterns.len(), unicode, report)?;
         }
         AggregateManyOperation::Compile
         | AggregateManyOperation::Count
@@ -15447,12 +15447,34 @@ fn require_aggregate_many_report_identity(
         | AggregateManyOperation::Spans => {
             if report.capture_semantics.is_some()
                 || report.participating_captures_per_match.is_some()
+                || report.byte_unit_cover.is_some()
+                || report.composition.byte_unit_cover_proof_work != 0
             {
                 return Err(ExecutionError::fault(
-                    "FRE non-capture build-many plan retained capture participation identity",
+                    "FRE non-capture build-many plan retained capture-specific identity",
                 ));
             }
         }
+    }
+    let composition_visits = u64::try_from(patterns.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE ordered build-many composition visits overflow")
+        })?;
+    let expected_composition_work = report
+        .composition
+        .source_preflight_work
+        .checked_add(report.composition.parser_work)
+        .and_then(|work| work.checked_add(composition_visits))
+        .and_then(|work| work.checked_add(report.composition.byte_unit_cover_proof_work))
+        .ok_or_else(|| ExecutionError::fault("FRE ordered build-many composition work overflow"))?;
+    if report.composition.patterns != patterns.len()
+        || report.composition.composition_work != expected_composition_work
+    {
+        return Err(ExecutionError::fault(
+            "FRE ordered build-many composition accounting mismatch",
+        ));
     }
     if report.patterns.len() != patterns.len() {
         return Err(ExecutionError::fault(
@@ -15486,6 +15508,48 @@ fn require_aggregate_many_report_identity(
     {
         return Err(ExecutionError::fault(
             "FRE byte ordered build-many literal proof identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn require_aggregate_many_capture_identity(
+    pattern_count: usize,
+    unicode: bool,
+    report: &AggregateManyBuildReport,
+) -> Result<(), ExecutionError> {
+    if report.capture_semantics
+        != Some(AggregateManyCaptureSemantics::UniformSingleWholeMatchCaptureNonempty)
+        || report.participating_captures_per_match != Some(1)
+    {
+        return Err(ExecutionError::fault(
+            "FRE ordered build-many capture participation identity mismatch",
+        ));
+    }
+    let Some(proof) = report.byte_unit_cover else {
+        if report.composition.byte_unit_cover_proof_work != 0 {
+            return Err(ExecutionError::fault(
+                "FRE ordered build-many absent unit-cover proof retained proof work",
+            ));
+        }
+        return Ok(());
+    };
+    let proof_work = u64::try_from(proof.work)
+        .map_err(|_| ExecutionError::fault("FRE byte unit-cover proof work does not fit u64"))?;
+    if unicode
+        || report.plan != AggregateManyPlanKind::ContinuationProgram
+        || report.strategy != Some(AggregateStrategy::ReverseSequentialRows)
+        || proof.algorithm != AGGREGATE_MANY_BYTE_UNIT_COVER_PROOF_ALGORITHM_ID
+        || proof.patterns != pattern_count
+        || proof.nonnullable_patterns != proof.patterns
+        || proof.covered_bytes != 256
+        || proof.unicode
+        || proof.allocations != 0
+        || proof_work != report.composition.byte_unit_cover_proof_work
+        || report.captures_erased != proof.patterns
+    {
+        return Err(ExecutionError::fault(
+            "FRE ordered build-many byte unit-cover identity mismatch",
         ));
     }
     Ok(())
@@ -15679,7 +15743,10 @@ fn aggregate_many_execution_error(
         | AggregateManyExecutionSource::CaptureCountLimit { .. } => {
             ExecutionError::unsupported(message)
         }
-        AggregateManyExecutionSource::ArithmeticOverflow { .. }
+        AggregateManyExecutionSource::CaptureSessionPlanMismatch
+        | AggregateManyExecutionSource::CaptureSessionHaystackLengthMismatch { .. }
+        | AggregateManyExecutionSource::CaptureSessionLimitsMismatch
+        | AggregateManyExecutionSource::ArithmeticOverflow { .. }
         | AggregateManyExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
     }
 }
@@ -23002,10 +23069,10 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v8-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
-        assert!(identity.adapter.contains("-continuation-accounting-v8-"));
-        assert!(!identity.adapter.contains("-continuation-accounting-v7-"));
+        assert!(identity.adapter.contains("-continuation-accounting-v9-"));
+        assert!(!identity.adapter.contains("-continuation-accounting-v8-"));
         assert!(identity.identity.contains("capture-word-run-v1"));
         assert!(
             identity
@@ -23046,7 +23113,17 @@ mod tests {
                 .identity
                 .contains("aggregate-many-total-byte-cover-v1")
         );
+        assert!(
+            identity
+                .identity
+                .contains("aggregate-many-byte-unit-cover-session-v1")
+        );
         assert!(identity.availability.contains("total-cover theorem"));
+        assert!(
+            identity
+                .availability
+                .contains("zero-allocation caller-owned cached frontier")
+        );
         assert!(identity.identity.contains("fixed class-sandwich"));
         assert!(identity.identity.contains("finite-packed-v2"));
         assert!(identity.availability.contains("bounded packed scanner"));

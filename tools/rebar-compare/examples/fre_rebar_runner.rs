@@ -19,22 +19,24 @@ use bstr::ByteSlice;
 use fre::PortableRegex;
 use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits,
-    AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID,
-    PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
+    AggregateManyBuilder, AggregateManyCaptureCountRegex, AggregateManyCaptureCountSession,
+    AggregateManyCaptureRunLimits, AggregateManyPlanKind, AggregateOperationLimits,
+    AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID, PlanKind, SearchLimits,
+    SimdDispatchContext, simd_dispatch_profile,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
     CurrentFreAdapter, CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
     CurrentFreAggregateOperationLifecycle, CurrentFreGrepSession,
     CurrentFreHotByteOperationLifecycle, InputReceipt, REPORT_SCHEMA, RunLimits,
-    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
-    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
-    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
-    current_fre_rebar_compile_run_limits, current_fre_rebar_count_run_limits,
-    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
-    current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
-    current_fre_rebar_span_sum_run_limits, current_fre_rebar_validate_aggregate_identity,
+    current_fre_adapter_id, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_rebar_capture_lifecycle, current_fre_rebar_compile_run_limits,
+    current_fre_rebar_count_run_limits, current_fre_rebar_grep_session,
+    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
+    current_fre_rebar_search_limits, current_fre_rebar_span_sum_run_limits,
+    current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
@@ -79,7 +81,9 @@ fn main() -> Result<(), DynError> {
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 let simd_capabilities = SimdDispatchContext::capture().capabilities();
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v8-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1 report={REPORT_SCHEMA} aggregate-explain=44 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain=44 aggregate-many-explain={} aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+                    current_fre_adapter_id(),
+                    fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
                     env!("CARGO_PKG_VERSION"),
                     simd_dispatch_profile().name(),
                     simd_capabilities.architecture(),
@@ -989,15 +993,9 @@ fn model_performance_raw(
             model_many_capture_performance_raw_with_measurement(
                 benchmark,
                 expectations,
-                |regex, haystack, limits| {
+                |regex, session, haystack, limits| {
                     let start = Instant::now();
-                    let actual = regex
-                        .count_captures_value(haystack, limits)
-                        .map_err(|error| {
-                            CompareError::new(format!(
-                                "FRE aggregate-many capture lifecycle execution: {error}"
-                            ))
-                        })?;
+                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
                     Ok((start.elapsed(), actual))
                 },
             )
@@ -1178,6 +1176,7 @@ fn model_many_capture_performance_raw_with_measurement<F>(
 where
     F: FnOnce(
         &AggregateManyCaptureCountRegex,
+        Option<&mut AggregateManyCaptureCountSession>,
         &[u8],
         AggregateManyCaptureRunLimits,
     ) -> Result<(Duration, u64), CompareError>,
@@ -1204,22 +1203,68 @@ where
             &expected_plan,
             aggregate_many_plan("count-captures", regex.build_report()),
         )?;
-        let selector = current_fre_rebar_aggregate_many_run_limits(
+        let mut selector = current_fre_rebar_aggregate_many_run_limits(
             benchmark.haystack.len(),
             regex.build_report(),
         )?;
+        if steady
+            && let Some(footprint) = regex
+                .cached_count_session_footprint(benchmark.haystack.len())
+                .map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE aggregate-many capture session footprint: {error}"
+                    ))
+                })?
+        {
+            let caps = AggregateOperationLimits::default();
+            selector.continuation.max_random_access_bytes = selector
+                .continuation
+                .max_random_access_bytes
+                .max(footprint.cache_bytes)
+                .min(caps.max_random_access_bytes);
+            selector.continuation.max_scratch_bytes = selector
+                .continuation
+                .max_scratch_bytes
+                .max(footprint.cache_bytes)
+                .min(caps.max_scratch_bytes);
+            selector.continuation.max_log_bytes = selector
+                .continuation
+                .max_log_bytes
+                .max(footprint.boundary_bytes)
+                .min(caps.max_log_bytes);
+            selector.continuation.max_sequential_bytes = selector
+                .continuation
+                .max_sequential_bytes
+                .max(footprint.sequential_bytes)
+                .min(caps.max_sequential_bytes);
+            selector.continuation.max_peak_bytes = selector
+                .continuation
+                .max_peak_bytes
+                .max(footprint.retained_bytes)
+                .min(caps.max_peak_bytes);
+        }
         let limits = AggregateManyCaptureRunLimits {
             selector,
             ..AggregateManyCaptureRunLimits::default()
         };
-        if steady {
-            let primed = regex
-                .count_captures_value(&benchmark.haystack, limits)
+        let mut session = if steady {
+            regex
+                .prepare_cached_count_session(benchmark.haystack.len(), limits)
                 .map_err(|error| {
                     CompareError::new(format!(
-                        "FRE aggregate-many capture lifecycle prime: {error}"
+                        "FRE aggregate-many capture session preparation: {error}"
                     ))
-                })?;
+                })?
+        } else {
+            None
+        };
+        if steady {
+            let primed = execute_aggregate_many_capture(
+                &regex,
+                session.as_mut(),
+                &benchmark.haystack,
+                limits,
+            )?;
             if primed != identity.expected {
                 return Err(CompareError::new(format!(
                     "aggregate-many capture lifecycle prime returned {primed}, expected {}",
@@ -1227,9 +1272,26 @@ where
                 )));
             }
         }
-        measure(&regex, &benchmark.haystack, limits)
+        measure(&regex, session.as_mut(), &benchmark.haystack, limits)
     })
     .map_err(Into::into)
+}
+
+fn execute_aggregate_many_capture(
+    regex: &AggregateManyCaptureCountRegex,
+    session: Option<&mut AggregateManyCaptureCountSession>,
+    haystack: &[u8],
+    limits: AggregateManyCaptureRunLimits,
+) -> Result<u64, CompareError> {
+    let result = match session {
+        Some(session) => regex.count_captures_value_with_session(session, haystack, limits),
+        None => regex.count_captures_value(haystack, limits),
+    };
+    result.map_err(|error| {
+        CompareError::new(format!(
+            "FRE aggregate-many capture lifecycle execution: {error}"
+        ))
+    })
 }
 
 fn model_regex_redux_performance_raw_with_measurement<F>(
@@ -2198,11 +2260,9 @@ mod tests {
             let observation = model_many_capture_performance_raw_with_measurement(
                 &benchmark,
                 &expectations,
-                |regex, haystack, limits| {
+                |regex, session, haystack, limits| {
                     measured.set(measured.get() + 1);
-                    let actual = regex
-                        .count_captures_value(haystack, limits)
-                        .map_err(|error| CompareError::new(error.to_string()))?;
+                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
                     Ok((Duration::from_nanos(elapsed), actual))
                 },
             )
@@ -2229,11 +2289,9 @@ mod tests {
             model_many_capture_performance_raw_with_measurement(
                 &benchmark,
                 &wrong_plan,
-                |regex, haystack, limits| {
+                |regex, session, haystack, limits| {
                     measured.set(true);
-                    let actual = regex
-                        .count_captures_value(haystack, limits)
-                        .map_err(|error| CompareError::new(error.to_string()))?;
+                    let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
                     Ok((Duration::from_nanos(1), actual))
                 },
             )
@@ -2243,6 +2301,43 @@ mod tests {
             !measured.get(),
             "wrong capture-many plan reached measurement"
         );
+
+        let covered = Benchmark {
+            name: "test/model/covered-multi-count-captures".to_string(),
+            model: "count-captures".to_string(),
+            patterns: vec![
+                r"(\bword\b)".to_string(),
+                r"(\n)".to_string(),
+                r"(.)".to_string(),
+            ],
+            case_insensitive: false,
+            unicode: false,
+            haystack: b"word\n!".to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_nanos(1),
+            max_warmup_time: Duration::ZERO,
+        };
+        let expectations = performance_expectations(
+            "steady-public-operation",
+            "capture-many-continuation-program",
+            6,
+        );
+        let observation = model_many_capture_performance_raw_with_measurement(
+            &covered,
+            &expectations,
+            |regex, session, haystack, limits| {
+                assert!(
+                    session.is_some(),
+                    "proved byte unit-cover must reach measurement with its caller-owned session"
+                );
+                let actual = execute_aggregate_many_capture(regex, session, haystack, limits)?;
+                Ok((Duration::from_nanos(53), actual))
+            },
+        )
+        .expect("covered aggregate-many capture raw arm");
+        assert_eq!(observation.actual, 6);
+        assert_eq!(observation.priming_operations, 1);
     }
 
     #[test]

@@ -83,6 +83,21 @@ pub enum Error {
         end: usize,
         haystack_len: usize,
     },
+    /// A caller-owned cached Count session was used with a different compiled
+    /// continuation plan.
+    SessionPlanMismatch,
+    /// A caller-owned cached Count session was used with a different exact
+    /// input length.
+    SessionHaystackLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    /// A caller-owned cached Count session was used with a different exact
+    /// operation policy.
+    SessionLimitsMismatch,
+    /// The bounded frontier or transition interner filled during an earlier
+    /// operation. The caller may cold-replay through the ordinary exact route.
+    SessionCacheSaturated,
     /// Exact Unicode word-boundary iteration over malformed UTF-8 is outside
     /// the continuation table's static assertion model.
     InvalidUtf8ForUnicodeWordBoundary,
@@ -119,6 +134,19 @@ impl fmt::Display for Error {
                 f,
                 "invalid operation range {start}..{end} for haystack length {haystack_len}"
             ),
+            Self::SessionPlanMismatch => {
+                f.write_str("cached Count session belongs to a different compiled plan")
+            }
+            Self::SessionHaystackLengthMismatch { expected, actual } => write!(
+                f,
+                "cached Count session expects haystack length {expected}, got {actual}"
+            ),
+            Self::SessionLimitsMismatch => {
+                f.write_str("cached Count session limits differ from the operation")
+            }
+            Self::SessionCacheSaturated => {
+                f.write_str("cached Count session exhausted its bounded frontier cache")
+            }
             Self::InvalidUtf8ForUnicodeWordBoundary => {
                 f.write_str("Unicode word boundary requires valid UTF-8 input")
             }

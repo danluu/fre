@@ -43,6 +43,38 @@ pub enum Strategy {
     ReverseSequentialRows,
 }
 
+/// Exact source-free storage retained by one caller-owned cached Count
+/// session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CachedCountSessionFootprint {
+    /// Exact number of retained heap buffers.
+    pub allocations: usize,
+    /// Boundary-state bytes bound to the session's exact input length.
+    pub boundary_bytes: usize,
+    /// Interned frontier, transition, and replay-buffer bytes.
+    pub cache_bytes: usize,
+    /// Complete boundary-log traffic ceiling for one Count operation.
+    pub sequential_bytes: usize,
+    /// Maximum simultaneously retained bytes.
+    pub retained_bytes: usize,
+}
+
+/// Caller-owned reusable storage for the byte Count executor.
+///
+/// A session is bound to one compiled plan, one exact operation policy, and
+/// one exact haystack length. It retains only Boolean frontier images,
+/// source-independent transition keys, and source-derived work buffers that
+/// are reset or overwritten before reuse. It never retains haystack bytes,
+/// spans, or reducer results.
+#[derive(Debug)]
+pub struct CachedCountSession {
+    plan_id: PlanId,
+    haystack_len: usize,
+    limits_id: OperationLimitsId,
+    footprint: CachedCountSessionFootprint,
+    cache: CachedFrontierStore,
+}
+
 /// Construction-selected record stored by [`Strategy::ReverseSequentialRows`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RowStorage {
@@ -279,12 +311,12 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 4;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 5;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 6;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 7;
 
-/// Maximum allocation count representable by every route in accounting v6.
+/// Maximum allocation count representable by every route in accounting v7.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -801,7 +833,7 @@ impl OperationCounterValue {
 /// attempt.
 ///
 /// Fields that are not present in the capture-free continuation executor are
-/// explicitly zero rather than omitted. In particular, accounting v6 has no
+/// explicitly zero rather than omitted. In particular, accounting v7 has no
 /// DFA cache, line-domain, persistent-history, or reusable-scratch-clear
 /// facility. This makes a zero an auditable statement about the selected
 /// implementation rather than an absent measurement.
@@ -813,7 +845,7 @@ pub struct OperationStructuralCounters {
     pub verified_bytes: usize,
     /// Exact transition checks performed by the selected continuation route.
     pub state_transitions: usize,
-    /// Cache misses in a DFA cache. Accounting v5 has no DFA cache.
+    /// Cache misses in a DFA cache. Accounting v7 has no DFA cache.
     pub dfa_cache_misses: usize,
     /// One whole-operation selector invocation, published before source use.
     pub selector_invocations: usize,
@@ -873,7 +905,7 @@ impl OperationStructuralCounters {
 /// created only after that receipt has authenticated a successful terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v6.
+    /// Schema for the structural projection, independent from accounting v7.
     pub schema_version: u8,
     /// Sealed route, invocation, prospective bounds, and actual accounting.
     pub attempt: OperationAttemptReceipt,
@@ -962,7 +994,7 @@ fn attempt_counter_components_close(
 /// operation already produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationHotCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v6.
+    /// Schema for the structural projection, independent from accounting v7.
     pub schema_version: u8,
     /// Exact route certificate emitted by the ordinary value-only operation.
     pub certificate: OperationCertificate,
@@ -1805,6 +1837,30 @@ impl CompiledRegex {
         Ok(CountValueCounterAttempt { value, receipt })
     }
 
+    /// Evaluate full-haystack Count through one caller-owned cached byte
+    /// session and publish immutable structural counters after the hot
+    /// operation succeeds.
+    ///
+    /// The session route never allocates and never switches to another
+    /// executor. A saturated cache returns a typed refusal before reading the
+    /// next haystack so an enclosing owner can perform its authenticated cold
+    /// replay.
+    pub fn count_value_with_cached_session_and_counters(
+        &self,
+        session: &mut CachedCountSession,
+        haystack: &[u8],
+        limits: OperationLimits,
+    ) -> Result<CountValueCounterAttempt, Error> {
+        let result = self.execute_with_cached_count_session(session, haystack, limits)?;
+        let value = result.summary.matches;
+        let receipt = OperationHotCounterReceipt::new(
+            result.certificate,
+            &result.accounting,
+            OperationCounterValue::Count(value),
+        )?;
+        Ok(CountValueCounterAttempt { value, receipt })
+    }
+
     /// Evaluate the ordinary construction-selected continuation Count route
     /// with observed-work admission and a complete P/A receipt.
     #[allow(
@@ -2311,6 +2367,7 @@ impl CompiledRegex {
                 allocation_limit,
                 Some(publication),
                 prospective_observer,
+                None,
             )
         };
         match result {
@@ -2390,6 +2447,31 @@ impl CompiledRegex {
             usize::MAX,
             None,
             None,
+            None,
+        )
+    }
+
+    fn execute_with_cached_count_session(
+        &self,
+        session: &mut CachedCountSession,
+        haystack: &[u8],
+        limits: OperationLimits,
+    ) -> Result<ExecutionResult, Error> {
+        let mut accounting = ExecutionAccounting::default();
+        let mut actual_allocations = 0_usize;
+        self.execute_tracked::<true>(
+            haystack,
+            0..haystack.len(),
+            Strategy::ReverseSequentialRows,
+            OperationKind::Count,
+            Some(GenericCountRoute::CachedFrontier),
+            limits,
+            &mut accounting,
+            &mut actual_allocations,
+            usize::MAX,
+            None,
+            None,
+            Some(session),
         )
     }
 
@@ -2687,6 +2769,7 @@ impl CompiledRegex {
         allocation_limit: usize,
         mut attempt: Option<AttemptPublication<'_>>,
         mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+        session: Option<&mut CachedCountSession>,
     ) -> Result<ExecutionResult, Error> {
         if range.start > range.end || range.end > haystack.len() {
             return Err(Error::InvalidRange {
@@ -2695,8 +2778,34 @@ impl CompiledRegex {
                 haystack_len: haystack.len(),
             });
         }
+        let session_cache = if let Some(session) = session {
+            session.validate(self, haystack.len(), limits)?;
+            if range.start != 0
+                || range.end != haystack.len()
+                || strategy != Strategy::ReverseSequentialRows
+                || kind != OperationKind::Count
+                || forced_generic_count_route != Some(GenericCountRoute::CachedFrontier)
+            {
+                return Err(Error::InternalInvariant(
+                    "cached Count session requires full-range observed Count",
+                ));
+            }
+            if session.cache.saturated {
+                return Err(Error::SessionCacheSaturated);
+            }
+            Some(&mut session.cache)
+        } else {
+            None
+        };
+        let session_cache_active = session_cache.is_some();
         match forced_generic_count_route {
-            Some(_) if kind != OperationKind::Count || attempt.is_none() => {
+            Some(_)
+                if kind != OperationKind::Count
+                    || (attempt.is_none()
+                        && !(session_cache_active
+                            && forced_generic_count_route
+                                == Some(GenericCountRoute::CachedFrontier))) =>
+            {
                 return Err(Error::InternalInvariant(
                     "generic Count route requires a receipt-bearing Count attempt",
                 ));
@@ -3070,7 +3179,21 @@ impl CompiledRegex {
             == Some(GenericCountRoute::CachedFrontier)
         {
             (
-                Requirements::new_forced_cached(&self.program, boundaries, passes, engine_limits)?,
+                if session_cache_active {
+                    Requirements::new_session_cached(
+                        &self.program,
+                        boundaries,
+                        passes,
+                        engine_limits,
+                    )?
+                } else {
+                    Requirements::new_forced_cached(
+                        &self.program,
+                        boundaries,
+                        passes,
+                        engine_limits,
+                    )?
+                },
                 None,
             )
         } else if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
@@ -3439,6 +3562,7 @@ impl CompiledRegex {
                 limits,
                 receipt_bearing,
                 fully_admitted_work,
+                session_cache,
                 accounting,
                 actual_allocations,
             )?
@@ -6563,6 +6687,35 @@ impl Requirements {
         })
     }
 
+    fn new_session_cached(
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        let cache = CachedFrontierRequirements::new(program.insts.len(), boundaries, passes)?;
+        cache.enforce(limits)?;
+        Ok(Self {
+            table_cells: 0,
+            row_storage: None,
+            record_bytes: cache.record_bytes,
+            requested_log_bytes: cache.log_bytes,
+            random_access_bound: cache.random_bytes,
+            scratch_bound: cache.scratch_bytes,
+            peak_bound: cache.peak_bytes,
+            sequential_bound: cache.sequential_bound,
+            // Every buffer is constructed before the operation boundary.
+            allocations: 0,
+            // Individual cache charges remain observed against this exact
+            // caller ceiling; only fixed construction initialization is gone.
+            work_bound: limits.max_work,
+            terminal_frontier: false,
+            frontier: None,
+            cached_frontier: Some(cache),
+            cache_attempt_work: 1,
+        })
+    }
+
     fn new_cached_after_refusal(
         refusal: Error,
         program: &Program,
@@ -6785,6 +6938,16 @@ struct CachedFrontierRequirements {
 }
 
 impl CachedFrontierRequirements {
+    fn session_footprint(self) -> CachedCountSessionFootprint {
+        CachedCountSessionFootprint {
+            allocations: self.allocations(),
+            boundary_bytes: self.log_bytes,
+            cache_bytes: self.random_bytes,
+            sequential_bytes: self.sequential_bound,
+            retained_bytes: self.peak_bytes,
+        }
+    }
+
     fn allocations(self) -> usize {
         [
             self.boundary_count,
@@ -6933,6 +7096,97 @@ impl CachedFrontierRequirements {
     }
 }
 
+impl CachedCountSession {
+    /// Exact source-free storage retained by this session.
+    #[must_use]
+    pub const fn footprint(&self) -> CachedCountSessionFootprint {
+        self.footprint
+    }
+
+    /// Exact haystack length bound at construction.
+    #[must_use]
+    pub const fn haystack_len(&self) -> usize {
+        self.haystack_len
+    }
+
+    fn validate(
+        &self,
+        regex: &CompiledRegex,
+        haystack_len: usize,
+        limits: OperationLimits,
+    ) -> Result<(), Error> {
+        if self.plan_id != regex.plan_id() {
+            return Err(Error::SessionPlanMismatch);
+        }
+        if self.haystack_len != haystack_len {
+            return Err(Error::SessionHaystackLengthMismatch {
+                expected: self.haystack_len,
+                actual: haystack_len,
+            });
+        }
+        if self.limits_id != operation_limits_identity(limits) {
+            return Err(Error::SessionLimitsMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl CompiledRegex {
+    fn cached_count_session_requirements(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<CachedFrontierRequirements>, Error> {
+        if self.program.contains_scalar_transition() {
+            return Ok(None);
+        }
+        let boundaries = add(haystack_len, 1, Resource::Boundaries)?;
+        CachedFrontierRequirements::new(self.program.insts.len(), boundaries, 1).map(Some)
+    }
+
+    /// Return the exact source-free storage and traffic envelope for a
+    /// caller-owned cached Count session.
+    ///
+    /// Only byte-transition programs are eligible. Assertions are included in
+    /// each source-derived transition symbol. This method performs no
+    /// allocation and does not observe source bytes.
+    pub fn cached_count_session_footprint(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<CachedCountSessionFootprint>, Error> {
+        Ok(self
+            .cached_count_session_requirements(haystack_len)?
+            .map(CachedFrontierRequirements::session_footprint))
+    }
+
+    /// Construct a caller-owned cache for repeated full-haystack Count
+    /// operations over one exact byte length and policy.
+    ///
+    /// Only byte-transition programs are eligible. Unsupported program shapes
+    /// and policies return `Ok(None)` without observing source bytes.
+    /// Allocation failure while creating an otherwise eligible fixed cache is
+    /// a typed construction error.
+    pub fn cached_count_session(
+        &self,
+        haystack_len: usize,
+        limits: OperationLimits,
+    ) -> Result<Option<CachedCountSession>, Error> {
+        let Some(requirements) = self.cached_count_session_requirements(haystack_len)? else {
+            return Ok(None);
+        };
+        if requirements.boundary_count > limits.max_boundaries || !requirements.fits(limits)? {
+            return Ok(None);
+        }
+        let footprint = requirements.session_footprint();
+        Ok(Some(CachedCountSession {
+            plan_id: self.plan_id(),
+            haystack_len,
+            limits_id: operation_limits_identity(limits),
+            footprint,
+            cache: CachedFrontierStore::allocate_session(requirements)?,
+        }))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ReverseRowRequirements {
     storage: RowStorage,
@@ -7060,15 +7314,16 @@ impl ReverseRowRequirements {
     }
 }
 
-enum Engine {
+enum Engine<'session> {
     Full(FullTable),
     Rows(RowStore),
     SparseRows(RowStore),
     TerminalFrontier(RowStore),
     CachedFrontiers(CachedFrontierStore),
+    SessionCachedFrontiers(&'session mut CachedFrontierStore),
 }
 
-impl Engine {
+impl<'session> Engine<'session> {
     #[allow(
         clippy::too_many_arguments,
         reason = "engine construction binds the exact program, range, selected route, limits, and accounting"
@@ -7083,6 +7338,7 @@ impl Engine {
         limits: OperationLimits,
         track_source: bool,
         fully_admitted_work: bool,
+        session_cache: Option<&'session mut CachedFrontierStore>,
         accounting: &mut ExecutionAccounting,
         actual_allocations: &mut usize,
     ) -> Result<Self, Error> {
@@ -7094,6 +7350,19 @@ impl Engine {
             )?;
         }
         if let Some(cache) = requirements.cached_frontier {
+            if let Some(session_cache) = session_cache {
+                session_cache.populate_session(
+                    program,
+                    haystack,
+                    assertions,
+                    requirements,
+                    cache,
+                    limits,
+                    track_source,
+                    accounting,
+                )?;
+                return Ok(Self::SessionCachedFrontiers(session_cache));
+            }
             return CachedFrontierStore::build(
                 program,
                 haystack,
@@ -7297,6 +7566,15 @@ impl Engine {
                 track_source,
                 &mut emit,
             ),
+            Self::SessionCachedFrontiers(cache) => cache.scan(
+                program,
+                haystack,
+                assertions,
+                accounting,
+                admitted_work_bound,
+                track_source,
+                &mut emit,
+            ),
         }
     }
 
@@ -7317,6 +7595,10 @@ impl Engine {
                 Ok(build.max(replay))
             }
             Self::CachedFrontiers(cache) => {
+                let replay = add(cache.replay_bytes, output_bytes, Resource::PeakBytes)?;
+                Ok(cache.build_peak_bytes.max(replay))
+            }
+            Self::SessionCachedFrontiers(cache) => {
                 let replay = add(cache.replay_bytes, output_bytes, Resource::PeakBytes)?;
                 Ok(cache.build_peak_bytes.max(replay))
             }
@@ -7543,7 +7825,6 @@ fn exact_allocation_error(error: CopyError, resource: Resource, items: usize) ->
     }
 }
 
-#[cfg(test)]
 fn exact_filled<T: Copy>(
     length: usize,
     value: T,
@@ -7729,19 +8010,62 @@ fn cached_replay_scalar(
 /// sufficient during the reverse sweep: replay consults the retained row at
 /// each boundary and therefore applies preferred/fallback priority exactly at
 /// the original decision point.
+#[derive(Debug)]
 struct CachedFrontierStore {
     boundary_states: ExactVec<u16>,
     state_bits: ExactVec<u64>,
+    state_hashes: ExactVec<u64>,
+    transitions: ExactVec<CachedTransitionSlot>,
     replay_current: ExactVec<u64>,
     replay_next: ExactVec<u64>,
     words: usize,
+    state_count: usize,
+    transition_count: usize,
+    saturated: bool,
+    has_run: bool,
+    poisoned: bool,
     used_assertions: u32,
     checkpoint_log_bytes_read: usize,
     build_peak_bytes: usize,
     replay_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CachedFrontierRow {
+    Retained(u16),
+    Materialized,
+}
+
 impl CachedFrontierStore {
+    fn allocate_session(cache: CachedFrontierRequirements) -> Result<Self, Error> {
+        Ok(Self {
+            boundary_states: exact_filled(cache.boundary_count, 0_u16, Resource::LogBytes)?,
+            state_bits: exact_filled(
+                cache.state_word_capacity,
+                0_u64,
+                Resource::RandomAccessBytes,
+            )?,
+            state_hashes: exact_filled(MAX_CACHED_FRONTIERS, 0_u64, Resource::ScratchBytes)?,
+            transitions: exact_filled(
+                CACHED_TRANSITION_SLOTS,
+                CachedTransitionSlot::EMPTY,
+                Resource::ScratchBytes,
+            )?,
+            replay_current: exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?,
+            replay_next: exact_filled(cache.words, 0_u64, Resource::ScratchBytes)?,
+            words: cache.words,
+            state_count: 0,
+            transition_count: 0,
+            saturated: false,
+            has_run: false,
+            poisoned: false,
+            used_assertions: 0,
+            checkpoint_log_bytes_read: 0,
+            build_peak_bytes: cache.peak_bytes,
+            replay_bytes: cache.replay_bytes()?,
+        })
+    }
+
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -7881,10 +8205,12 @@ impl CachedFrontierStore {
 
         // State zero is the all-failing successor beyond the terminal row.
         let mut state_count = 1_usize;
+        let mut saturated = false;
         try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
         state_hashes[0] = cached_row_hash(&candidate, accounting, requirements.work_bound)?;
         let mut transition_count = 0_usize;
         let mut next_state = Some(0_u16);
+        let mut next_frontier_materialized = true;
         let used_assertions =
             cached_program_assertion_mask(program, accounting, requirements.work_bound)?;
         for position in (0..cache.boundary_count).rev() {
@@ -7910,15 +8236,25 @@ impl CachedFrontierStore {
             } else {
                 (None, None)
             };
-            let current = if let Some(state) = cached {
-                let start = mul(usize::from(state), cache.words, Resource::ScratchBytes)?;
-                let end = add(start, cache.words, Resource::ScratchBytes)?;
-                try_charge_frontier_amount(accounting, requirements.work_bound, cache.words)?;
-                candidate.copy_from_slice(state_bits.get(start..end).ok_or(
-                    Error::InternalInvariant("cached frontier hit outside retained store"),
-                )?);
-                Some(state)
+            let (current, current_frontier_materialized) = if let Some(state) = cached {
+                // A run of hits needs only interned frontier IDs. Defer the
+                // retained-row copy until a following miss actually consumes
+                // the Boolean successor image.
+                (Some(state), false)
             } else {
+                if !next_frontier_materialized {
+                    let state = next_state.ok_or(Error::InternalInvariant(
+                        "cached frontier lost the retained successor for a cache miss",
+                    ))?;
+                    cached_copy_retained_row(
+                        &state_bits,
+                        cache.words,
+                        state,
+                        &mut next_frontier,
+                        accounting,
+                        requirements.work_bound,
+                    )?;
+                }
                 cached_compute_row(
                     program,
                     symbol,
@@ -7975,6 +8311,7 @@ impl CachedFrontierStore {
                     state_count = required;
                     Some(state)
                 } else {
+                    saturated = true;
                     None
                 };
                 if let (Some(slot), Some(next_state), Some(result_state)) =
@@ -7990,8 +8327,11 @@ impl CachedFrontierStore {
                         occupied: true,
                     };
                     transition_count = required;
+                } else if result.is_some() && transition_count >= MAX_CACHED_TRANSITIONS {
+                    saturated = true;
                 }
-                result
+                core::mem::swap(&mut candidate, &mut next_frontier);
+                (result, true)
             };
             try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
             boundary_states[position] = current.unwrap_or(UNCACHED_FRONTIER);
@@ -8000,8 +8340,8 @@ impl CachedFrontierStore {
                 core::mem::size_of::<u16>(),
                 Resource::SequentialBytes,
             )?;
-            core::mem::swap(&mut candidate, &mut next_frontier);
             next_state = current;
+            next_frontier_materialized = current_frontier_materialized;
         }
 
         accounting.random_access_peak_bytes = cache.random_bytes;
@@ -8029,14 +8369,225 @@ impl CachedFrontierStore {
         Ok(Self {
             boundary_states,
             state_bits,
+            // One-shot execution deliberately releases construction-only
+            // cache metadata before replay. Caller-owned sessions retain it.
+            state_hashes: fre_exact_alloc::ExactVec::default(),
+            transitions: fre_exact_alloc::ExactVec::default(),
             replay_current: candidate,
             replay_next: next_frontier,
             words: cache.words,
+            state_count,
+            transition_count,
+            saturated,
+            has_run: true,
+            poisoned: false,
             used_assertions,
             checkpoint_log_bytes_read: 0,
             build_peak_bytes: cache.peak_bytes,
             replay_bytes,
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "session population mirrors the audited cache sweep while retaining only source-independent cache state"
+    )]
+    fn populate_session(
+        &mut self,
+        program: &Program,
+        haystack: &[u8],
+        assertions: AssertionContext<'_>,
+        requirements: Requirements,
+        cache: CachedFrontierRequirements,
+        limits: OperationLimits,
+        track_source: bool,
+        accounting: &mut ExecutionAccounting,
+    ) -> Result<(), Error> {
+        cache.enforce(limits)?;
+        if self.boundary_states.len() != cache.boundary_count
+            || self.state_bits.len() != cache.state_word_capacity
+            || self.state_hashes.len() != MAX_CACHED_FRONTIERS
+            || self.transitions.len() != CACHED_TRANSITION_SLOTS
+            || self.replay_current.len() != cache.words
+            || self.replay_next.len() != cache.words
+            || self.words != cache.words
+        {
+            return Err(Error::InternalInvariant(
+                "cached Count session storage differs from its bound shape",
+            ));
+        }
+
+        accounting.log_bytes = cache.log_bytes;
+        accounting.random_access_peak_bytes = cache.random_bytes;
+        accounting.scratch_peak_bytes = cache.scratch_bytes;
+        accounting.peak_bytes = cache.peak_bytes;
+        self.checkpoint_log_bytes_read = 0;
+
+        // Every successful prior scan and every interrupted population may
+        // leave source-derived frontier rows in these two buffers. Clear them
+        // before reuse without disturbing the source-independent interner or
+        // transition table. A failed first population leaves `poisoned` set,
+        // so the next attempt performs the same reset.
+        if self.has_run || self.poisoned {
+            try_charge_frontier_amount(
+                accounting,
+                requirements.work_bound,
+                mul(cache.words, 2, Resource::ExecutionWork)?,
+            )?;
+            self.replay_current.fill(0);
+            self.replay_next.fill(0);
+        }
+        self.poisoned = true;
+        if self.state_count == 0 {
+            self.state_count = 1;
+            try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+            self.state_hashes[0] =
+                cached_row_hash(&self.replay_current, accounting, requirements.work_bound)?;
+        }
+
+        let used_assertions =
+            cached_program_assertion_mask(program, accounting, requirements.work_bound)?;
+        self.used_assertions = used_assertions;
+        let mut next_state = Some(0_u16);
+        let mut next_frontier_materialized = true;
+        for position in (0..cache.boundary_count).rev() {
+            let symbol = cached_boundary_symbol(
+                program,
+                assertions,
+                haystack,
+                position,
+                used_assertions,
+                accounting,
+                requirements.work_bound,
+                track_source,
+            )?;
+            let (cached, slot) = if let Some(state) = next_state {
+                let (cached, slot) = cached_transition_lookup(
+                    &self.transitions,
+                    state,
+                    symbol,
+                    accounting,
+                    requirements.work_bound,
+                )?;
+                (cached, Some(slot))
+            } else {
+                (None, None)
+            };
+            let (current, current_frontier_materialized) = if let Some(state) = cached {
+                // Persistent cache hits need only their interned IDs. Keep
+                // both work rows untouched until a following miss needs the
+                // exact retained successor image.
+                (Some(state), false)
+            } else {
+                if !next_frontier_materialized {
+                    let state = next_state.ok_or(Error::InternalInvariant(
+                        "session cache lost the retained successor for a cache miss",
+                    ))?;
+                    cached_copy_retained_row(
+                        &self.state_bits,
+                        cache.words,
+                        state,
+                        &mut self.replay_next,
+                        accounting,
+                        requirements.work_bound,
+                    )?;
+                }
+                cached_compute_row(
+                    program,
+                    symbol,
+                    &self.replay_next,
+                    &mut self.replay_current,
+                    accounting,
+                    requirements.work_bound,
+                )?;
+                let hash =
+                    cached_row_hash(&self.replay_current, accounting, requirements.work_bound)?;
+                let mut interned = None;
+                for state in 0..self.state_count {
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    if self.state_hashes[state] != hash {
+                        continue;
+                    }
+                    let start = mul(state, cache.words, Resource::ScratchBytes)?;
+                    let end = add(start, cache.words, Resource::ScratchBytes)?;
+                    let retained =
+                        self.state_bits
+                            .get(start..end)
+                            .ok_or(Error::InternalInvariant(
+                                "session cached frontier row outside store",
+                            ))?;
+                    let mut equal = true;
+                    for (&left, &right) in retained.iter().zip(self.replay_current.iter()) {
+                        try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                        if left != right {
+                            equal = false;
+                            break;
+                        }
+                    }
+                    if equal {
+                        interned = Some(u16::try_from(state).map_err(|_| {
+                            Error::InternalInvariant("session cached frontier ID does not fit u16")
+                        })?);
+                        break;
+                    }
+                }
+                let result = if let Some(state) = interned {
+                    Some(state)
+                } else if self.state_count < MAX_CACHED_FRONTIERS {
+                    let required = add(self.state_count, 1, Resource::TableCells)?;
+                    let start = mul(self.state_count, cache.words, Resource::ScratchBytes)?;
+                    let end = add(start, cache.words, Resource::ScratchBytes)?;
+                    try_charge_frontier_amount(accounting, requirements.work_bound, cache.words)?;
+                    self.state_bits
+                        .get_mut(start..end)
+                        .ok_or(Error::InternalInvariant(
+                            "session cached frontier insertion outside store",
+                        ))?
+                        .copy_from_slice(&self.replay_current);
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    self.state_hashes[self.state_count] = hash;
+                    let state = u16::try_from(self.state_count).map_err(|_| {
+                        Error::InternalInvariant("session cached frontier ID does not fit u16")
+                    })?;
+                    self.state_count = required;
+                    Some(state)
+                } else {
+                    self.saturated = true;
+                    None
+                };
+                if let (Some(slot), Some(next_state), Some(result_state)) =
+                    (slot, next_state, result)
+                    && self.transition_count < MAX_CACHED_TRANSITIONS
+                {
+                    let required = add(self.transition_count, 1, Resource::TableCells)?;
+                    try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+                    self.transitions[slot] = CachedTransitionSlot {
+                        symbol,
+                        next_state,
+                        result_state,
+                        occupied: true,
+                    };
+                    self.transition_count = required;
+                } else if result.is_some() && self.transition_count >= MAX_CACHED_TRANSITIONS {
+                    self.saturated = true;
+                }
+                core::mem::swap(&mut self.replay_current, &mut self.replay_next);
+                (result, true)
+            };
+            try_charge_frontier_amount(accounting, requirements.work_bound, 1)?;
+            self.boundary_states[position] = current.unwrap_or(UNCACHED_FRONTIER);
+            accounting.sequential_bytes_written = add(
+                accounting.sequential_bytes_written,
+                core::mem::size_of::<u16>(),
+                Resource::SequentialBytes,
+            )?;
+            next_state = current;
+            next_frontier_materialized = current_frontier_materialized;
+        }
+        self.has_run = true;
+        self.poisoned = false;
+        Ok(())
     }
 
     #[allow(
@@ -8088,7 +8639,7 @@ impl CachedFrontierStore {
         admitted_work_bound: usize,
         track_source: bool,
     ) -> Result<Option<usize>, Error> {
-        self.load_boundary(
+        let mut frontier = self.load_boundary(
             program,
             haystack,
             assertions,
@@ -8097,7 +8648,7 @@ impl CachedFrontierStore {
             admitted_work_bound,
             track_source,
         )?;
-        if !cached_candidate_bit(&self.replay_current, program.entry)? {
+        if !self.candidate_bit(frontier, program.entry, accounting, admitted_work_bound)? {
             return Ok(None);
         }
         let mut pc = program.entry;
@@ -8125,7 +8676,7 @@ impl CachedFrontierStore {
                         ));
                     }
                     position = add(position, 1, Resource::Boundaries)?;
-                    self.load_boundary(
+                    frontier = self.load_boundary(
                         program,
                         haystack,
                         assertions,
@@ -8150,7 +8701,7 @@ impl CachedFrontierStore {
                         track_source,
                     )?;
                     position = add(position, 1, Resource::Boundaries)?;
-                    self.load_boundary(
+                    frontier = self.load_boundary(
                         program,
                         haystack,
                         assertions,
@@ -8183,7 +8734,12 @@ impl CachedFrontierStore {
                     preferred,
                     fallback,
                 } => {
-                    pc = if cached_candidate_bit(&self.replay_current, *preferred)? {
+                    pc = if self.candidate_bit(
+                        frontier,
+                        *preferred,
+                        accounting,
+                        admitted_work_bound,
+                    )? {
                         *preferred
                     } else {
                         *fallback
@@ -8206,7 +8762,7 @@ impl CachedFrontierStore {
         accounting: &mut ExecutionAccounting,
         admitted_work_bound: usize,
         track_source: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<CachedFrontierRow, Error> {
         accounting.sequential_bytes_read = add(
             accounting.sequential_bytes_read,
             core::mem::size_of::<u16>(),
@@ -8220,14 +8776,7 @@ impl CachedFrontierStore {
                 "cached frontier boundary outside state stream",
             ))?;
         if first != UNCACHED_FRONTIER {
-            return cached_copy_retained_row(
-                &self.state_bits,
-                self.words,
-                first,
-                &mut self.replay_current,
-                accounting,
-                admitted_work_bound,
-            );
+            return Ok(CachedFrontierRow::Retained(first));
         }
 
         let mut checkpoint = add(position, 1, Resource::Boundaries)?;
@@ -8288,7 +8837,27 @@ impl CachedFrontierStore {
                 admitted_work_bound,
             )?;
         }
-        Ok(())
+        Ok(CachedFrontierRow::Materialized)
+    }
+
+    fn candidate_bit(
+        &self,
+        row: CachedFrontierRow,
+        pc: usize,
+        accounting: &mut ExecutionAccounting,
+        admitted_work_bound: usize,
+    ) -> Result<bool, Error> {
+        match row {
+            CachedFrontierRow::Retained(state) => cached_retained_candidate_bit(
+                &self.state_bits,
+                self.words,
+                state,
+                pc,
+                accounting,
+                admitted_work_bound,
+            ),
+            CachedFrontierRow::Materialized => cached_candidate_bit(&self.replay_current, pc),
+        }
     }
 }
 
@@ -8505,6 +9074,24 @@ fn cached_copy_retained_row(
         "cached frontier state outside store",
     ))?);
     Ok(())
+}
+
+fn cached_retained_candidate_bit(
+    rows: &[u64],
+    words: usize,
+    state: u16,
+    pc: usize,
+    accounting: &mut ExecutionAccounting,
+    admitted_work_bound: usize,
+) -> Result<bool, Error> {
+    let row_start = mul(usize::from(state), words, Resource::ScratchBytes)?;
+    let word = add(row_start, pc / 64, Resource::ScratchBytes)?;
+    try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+    rows.get(word)
+        .map(|bits| bits & (1_u64 << (pc % 64)) != 0)
+        .ok_or(Error::InternalInvariant(
+            "cached retained frontier bit outside state store",
+        ))
 }
 
 fn cached_candidate_bit(row: &[u64], pc: usize) -> Result<bool, Error> {
@@ -10434,9 +11021,9 @@ mod tests {
         RequiredLiteralScan, Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumPlan,
         StateByteSpanSumTopology, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol,
         cached_compute_row, cached_frontier_words, cached_program_assertion_mask,
-        compact_operation_allocation_count, decode, dense_reduction_work_floor, encoded_width,
-        exact_filled, fixed_continuation_beats_dense, operation_identity, read_encoded,
-        scan_required_literals, write_encoded,
+        cached_retained_candidate_bit, compact_operation_allocation_count, decode,
+        dense_reduction_work_floor, encoded_width, exact_filled, fixed_continuation_beats_dense,
+        operation_identity, read_encoded, scan_required_literals, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -11896,7 +12483,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v6_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+    fn accounting_v7_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
         let compiled = terminal_frontier_count();
         let haystack = b"no terminal prefix here";
         let limits = OperationLimits::default();
@@ -11998,7 +12585,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v6_allocation_encoding_is_checked_at_its_route_maximum() {
+    fn accounting_v7_allocation_encoding_is_checked_at_its_route_maximum() {
         for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
             assert_eq!(
                 compact_operation_allocation_count(allocations).unwrap(),
@@ -14461,9 +15048,16 @@ mod tests {
         let mut store = CachedFrontierStore {
             boundary_states,
             state_bits,
+            state_hashes: fre_exact_alloc::ExactVec::default(),
+            transitions: fre_exact_alloc::ExactVec::default(),
             replay_current: exact_filled(words, 0_u64, Resource::ScratchBytes).unwrap(),
             replay_next: exact_filled(words, 0_u64, Resource::ScratchBytes).unwrap(),
             words,
+            state_count: 0,
+            transition_count: 0,
+            saturated: false,
+            has_run: true,
+            poisoned: false,
             used_assertions,
             checkpoint_log_bytes_read: 0,
             build_peak_bytes: 0,
@@ -14563,6 +15157,159 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn cached_count_session_recovers_after_interrupted_population() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"(\bword\b)|(\r\n|\r|\n)|([\t ]+)|(.)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let hard: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        let easy = vec![b'a'; hard.len()];
+        let defaults = OperationLimits::default();
+
+        let measured_work = |haystack: &[u8]| {
+            let mut session = compiled
+                .cached_count_session(haystack.len(), defaults)
+                .unwrap()
+                .expect("assertion-bearing byte session");
+            compiled
+                .count_value_with_cached_session_and_counters(&mut session, haystack, defaults)
+                .unwrap()
+                .receipt
+                .accounting
+                .work
+        };
+        let hard_work = measured_work(&hard);
+        let easy_work = measured_work(&easy);
+        let reset_work = cached_frontier_words(compiled.program.insts.len())
+            .unwrap()
+            .checked_mul(2)
+            .unwrap();
+        // The interrupted diverse source may retain a small number of
+        // source-independent states that the repeated-byte recovery probes
+        // before hitting its established transition. Admit that bounded
+        // lookup variance while remaining strictly below the diverse scan.
+        let admitted_work = easy_work
+            .checked_add(reset_work)
+            .and_then(|work| work.checked_add(32))
+            .unwrap();
+        assert!(
+            hard_work > admitted_work,
+            "fixture must interrupt the diverse population after admitting a repeated-byte scan"
+        );
+
+        let limits = OperationLimits {
+            max_work: admitted_work,
+            ..defaults
+        };
+        let mut session = compiled
+            .cached_count_session(hard.len(), limits)
+            .unwrap()
+            .expect("bounded cached Count session");
+        let interrupted = compiled
+            .count_value_with_cached_session_and_counters(&mut session, &hard, limits)
+            .unwrap_err();
+        assert!(matches!(
+            interrupted,
+            Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            } if required == limit + 1 && limit == admitted_work
+        ));
+
+        let recovered = compiled
+            .count_value_with_cached_session_and_counters(&mut session, &easy, limits)
+            .expect("interrupted population must not poison the next source");
+        assert_eq!(recovered.value, easy.len());
+        assert!(recovered.receipt.closes());
+        assert_eq!(
+            recovered.receipt.certificate.physical_route,
+            OperationPhysicalRoute::CachedFrontier
+        );
+        assert_eq!(recovered.receipt.certificate.actual_allocations, 0);
+        assert_eq!(recovered.receipt.certificate.prospective_allocations, 0);
+    }
+
+    #[test]
+    fn cached_count_session_defers_multiword_hit_rows_and_recovers_hit_to_miss() {
+        let mut retained = [0_u64; 6];
+        retained[5] = 1_u64 << 6;
+        let mut direct_accounting = ExecutionAccounting::default();
+        assert!(
+            cached_retained_candidate_bit(&retained, 2, 2, 70, &mut direct_accounting, 1,).unwrap()
+        );
+        assert_eq!(direct_accounting.work, 1);
+
+        let pattern = "[ab]".repeat(80);
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(&pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            compiled.program.insts.len() > 64,
+            "fixture must exercise retained bits beyond the first word"
+        );
+        let repeated = vec![b'a'; 80 * 8];
+        let mut changed = repeated.clone();
+        let middle = changed.len() / 2;
+        changed[middle] = b'b';
+        changed[middle + 1] = b'c';
+        let limits = OperationLimits::default();
+        let mut session = compiled
+            .cached_count_session(repeated.len(), limits)
+            .unwrap()
+            .expect("multiword byte session");
+
+        let populated = compiled
+            .count_value_with_cached_session_and_counters(&mut session, &repeated, limits)
+            .unwrap();
+        let hit_run = compiled
+            .count_value_with_cached_session_and_counters(&mut session, &repeated, limits)
+            .unwrap();
+        assert_eq!(populated.value, 8);
+        assert_eq!(hit_run.value, populated.value);
+        assert!(
+            hit_run.receipt.accounting.work < populated.receipt.accounting.work,
+            "a complete transition-hit run should avoid frontier materialization"
+        );
+
+        let hit_then_miss = compiled
+            .count_value_with_cached_session_and_counters(&mut session, &changed, limits)
+            .unwrap();
+        let expected = regex::bytes::RegexBuilder::new(&pattern)
+            .unicode(false)
+            .build()
+            .unwrap()
+            .find_iter(&changed)
+            .count();
+        assert_eq!(hit_then_miss.value, expected);
+        assert_eq!(
+            compiled
+                .count_value_with_cached_session_and_counters(&mut session, &repeated, limits)
+                .unwrap()
+                .value,
+            populated.value,
+            "materializing a retained successor after a hit run must not poison later hits"
+        );
     }
 
     #[test]
@@ -16457,7 +17204,10 @@ mod tests {
             count.receipt.identity.physical_route,
             Some(OperationPhysicalRoute::RootAssertion)
         );
-        assert_eq!(count.receipt.identity.algorithm_version, 4);
+        assert_eq!(
+            count.receipt.identity.algorithm_version,
+            CONTINUATION_OPERATION_ALGORITHM_VERSION
+        );
         assert_eq!(
             count.receipt.identity.accounting_version,
             CONTINUATION_OPERATION_ACCOUNTING_VERSION

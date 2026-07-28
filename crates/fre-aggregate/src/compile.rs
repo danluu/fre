@@ -531,7 +531,12 @@ fn construction_error_matches_receipt(
         | Error::EmptyAlternation
         | Error::SameBoundaryCycle
         | Error::InternalInvariant(_) => true,
-        Error::InvalidRange { .. } | Error::InvalidUtf8ForUnicodeWordBoundary => false,
+        Error::InvalidRange { .. }
+        | Error::SessionPlanMismatch
+        | Error::SessionHaystackLengthMismatch { .. }
+        | Error::SessionLimitsMismatch
+        | Error::SessionCacheSaturated
+        | Error::InvalidUtf8ForUnicodeWordBoundary => false,
     }
 }
 
