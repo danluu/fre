@@ -242,7 +242,7 @@ pub use fixed_predicate_word64::{
     ReduceActualCounters as FixedPredicateWord64ActualCounters,
     ReduceError as FixedPredicateWord64ReduceError,
     ReduceLimits as FixedPredicateWord64ReduceLimits,
-    ReduceUpperBounds as FixedPredicateWord64UpperBounds,
+    ReduceUpperBounds as FixedPredicateWord64UpperBounds, Reducer as FixedPredicateWord64Reducer,
     SPAN_SUM_OPERATION_ID as FIXED_PREDICATE_WORD64_SPAN_SUM_OPERATION_ID,
     SpanSumResult as FixedPredicateWord64SpanSumResult,
 };

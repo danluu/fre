@@ -1,24 +1,30 @@
-//! Fixed-width byte-predicate matching with one 64-bit Shift-And state.
+//! Fixed-width ASCII byte-predicate matching with an exact anchor when one
+//! exists and one 64-bit Shift-And state otherwise.
 //!
 //! Construction accepts between two and 64 nonempty byte predicates. Each
 //! predicate is supplied as inclusive ASCII-byte ranges and is compiled into
-//! a full byte-to-position mask table. Non-ASCII entries remain zero, so
-//! reduction performs exactly one state transition per haystack byte, resets
-//! after each accepted word, allocates no operation memory, and materializes no
-//! spans.
+//! a full byte-to-position mask table. Non-ASCII entries remain zero. An exact
+//! one-or-two-byte predicate drives a monotone candidate stream when available;
+//! otherwise reduction performs one Shift-And transition per haystack byte.
+//! Both reducers restart after each accepted word, allocate no operation
+//! memory, and materialize no spans.
 
 use core::{fmt, mem::size_of};
 
-/// Stable identity for the fixed-predicate Shift-And strategy.
-pub const PLAN_ID: &str = "fixed-predicate-word64.shift-and.byte-table.nonoverlap.v2";
+use memchr::{memchr, memchr2};
+
+use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
+
+/// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
+pub const PLAN_ID: &str = "fixed-predicate-word64.fixed-anchor-or-shift-and.nonoverlap.v3";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v1";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v2";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v1";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v2";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 3;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 3;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 2;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -29,7 +35,12 @@ pub const MASK_SLOTS: usize = 256;
 const MAX_MEMBERS_PER_RANGE: usize = 128;
 const BUILD_FIXED_WORK: usize = 4;
 const RANGE_FIXED_WORK: usize = 2;
+const ANCHOR_MASK_DOMAIN: usize = 128;
 const TRANSITION_WORK: usize = 6;
+const FINDER_SCAN_BYTE_WORK: usize = 1;
+const FINDER_CALL_WORK: usize = 1;
+const ANCHOR_CANDIDATE_WORK: usize = 1;
+const PREDICATE_CHECK_WORK: usize = 1;
 const MATCH_WORK: usize = 3;
 const REDUCE_FINAL_WORK: usize = 1;
 
@@ -56,6 +67,17 @@ pub enum MatchSelection {
     LeftmostFirstNonOverlapping,
 }
 
+/// Concrete reducer selected by the immutable plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reducer {
+    /// One exact anchor byte drives a monotone candidate stream.
+    OneByteAnchor,
+    /// Either of two exact anchor bytes drives a monotone candidate stream.
+    TwoByteAnchor,
+    /// No one-or-two-byte position exists, so reduction uses Shift-And.
+    ShiftAnd,
+}
+
 /// Immutable semantic and implementation identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -71,6 +93,12 @@ pub struct OperationIdentity {
     pub selection: MatchSelection,
     /// Exact fixed word width.
     pub width: usize,
+    /// Authenticated reducer representation.
+    pub reducer: Reducer,
+    /// Fixed position used by an anchor reducer, or zero for Shift-And.
+    pub anchor_offset: u8,
+    /// Exact anchor bytes. The second slot is zero for a one-byte anchor.
+    pub anchor_bytes: [u8; 2],
 }
 
 /// Limits checked before any supplied range value is inspected.
@@ -134,6 +162,8 @@ pub struct BuildAccounting {
     pub range_inspections: usize,
     /// Byte-to-position mask writes, including duplicate union writes.
     pub member_writes: usize,
+    /// ASCII mask cells inspected while selecting a fixed anchor.
+    pub anchor_mask_reads: usize,
     /// Bound admitted before reading source range values.
     pub work_upper_bound: u64,
     /// Exact logical work charged by successful construction.
@@ -157,7 +187,7 @@ pub struct BuildAccounting {
 pub struct ReduceLimits {
     /// Maximum input bytes.
     pub max_input_bytes: usize,
-    /// Maximum Shift-And transitions.
+    /// Maximum Shift-And transitions or logical anchor-scanner service bytes.
     pub max_transitions: usize,
     /// Maximum semantic match events.
     pub max_match_events: usize,
@@ -218,8 +248,14 @@ impl Default for ReduceLimits {
 pub struct ReduceUpperBounds {
     /// Complete input bytes.
     pub input_bytes: usize,
-    /// One transition for every input byte.
+    /// Maximum Shift-And transitions or logical anchor-scanner service bytes.
     pub transitions: usize,
+    /// Maximum fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Maximum fixed-anchor candidates.
+    pub anchor_candidates: usize,
+    /// Maximum per-position predicate checks.
+    pub predicate_checks: usize,
     /// Maximum fixed-width non-overlapping matches.
     pub match_events: usize,
     /// Same event bound represented in the count type.
@@ -249,8 +285,14 @@ pub struct ReduceUpperBounds {
 pub struct ReduceActualCounters {
     /// Input bytes consumed.
     pub input_bytes: usize,
-    /// Shift-And state transitions.
+    /// Shift-And transitions or logical anchor-scanner service bytes.
     pub transitions: usize,
+    /// Fixed-anchor finder invocations.
+    pub finder_calls: usize,
+    /// Fixed-anchor candidates visited.
+    pub anchor_candidates: usize,
+    /// Per-position predicate checks.
+    pub predicate_checks: usize,
     /// Semantic match events.
     pub match_events: usize,
     /// Exact count result.
@@ -438,6 +480,7 @@ pub struct BuildAttemptActual {
     pub position_visits: usize,
     pub range_inspections: usize,
     pub member_writes: usize,
+    pub anchor_mask_reads: usize,
     pub work: u64,
     pub allocations: usize,
     pub reserves: usize,
@@ -502,6 +545,7 @@ impl BuildAttemptReceipt {
             && self.actual.position_visits == accounting.position_visits
             && self.actual.range_inspections == accounting.range_inspections
             && self.actual.member_writes == accounting.member_writes
+            && self.actual.anchor_mask_reads == accounting.anchor_mask_reads
             && self.actual.work == accounting.work_charged
             && self.actual.allocations == accounting.allocations
             && self.actual.reserves == accounting.reserves
@@ -623,6 +667,7 @@ impl BuildAttemptTracker {
                 position_visits: 0,
                 range_inspections: 0,
                 member_writes: 0,
+                anchor_mask_reads: 0,
                 work: 0,
                 allocations: 0,
                 reserves: 0,
@@ -701,6 +746,18 @@ impl BuildAttemptTracker {
                     computation: "actual member writes",
                 })?;
         self.observe_initialization(size_of::<u64>())
+    }
+
+    fn read_anchor_mask(&mut self) -> Result<(), BuildError> {
+        self.charge(1)?;
+        self.actual.anchor_mask_reads =
+            self.actual
+                .anchor_mask_reads
+                .checked_add(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "anchor mask read count",
+                })?;
+        Ok(())
     }
 
     fn finish(&mut self, preflight: BuildPreflight) -> Result<(), BuildError> {
@@ -824,7 +881,54 @@ pub struct FixedPredicateWord64Plan {
     masks: [u64; MASK_SLOTS],
     width: usize,
     accepting_bit: u64,
+    anchor: Anchor,
     build: BuildAccounting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Anchor {
+    One { offset: u8, byte: u8 },
+    Two { offset: u8, first: u8, second: u8 },
+    ShiftAnd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReducerUpper {
+    transitions: usize,
+    finder_calls: usize,
+    anchor_candidates: usize,
+    predicate_checks: usize,
+    work: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SemanticUpper {
+    match_events: usize,
+    count: u64,
+    span_sum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AnchorActual {
+    finder_scanned_bytes: usize,
+    finder_calls: usize,
+    anchor_candidates: usize,
+    predicate_checks: usize,
+    match_events: usize,
+}
+
+impl Anchor {
+    const fn identity(self) -> (Reducer, u8, [u8; 2]) {
+        match self {
+            Self::One { offset, byte } => (Reducer::OneByteAnchor, offset, [byte, 0]),
+            Self::Two {
+                offset,
+                first,
+                second,
+            } => (Reducer::TwoByteAnchor, offset, [first, second]),
+            Self::ShiftAnd => (Reducer::ShiftAnd, 0, [0, 0]),
+        }
+    }
 }
 
 /// Successful fixed-predicate construction and its closed receipt.
@@ -891,6 +995,7 @@ fn preflight_build(
 
     let base_work = MASK_SLOTS
         .checked_add(width)
+        .and_then(|work| work.checked_add(width.checked_mul(ANCHOR_MASK_DOMAIN)?))
         .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "base build work",
@@ -1007,15 +1112,83 @@ fn compile_masks(
     Ok((masks, member_writes))
 }
 
+fn select_anchor(
+    masks: &[u64; MASK_SLOTS],
+    width: usize,
+    tracker: &mut BuildAttemptTracker,
+) -> Result<Anchor, BuildError> {
+    let mut selected = Anchor::ShiftAnd;
+    let mut selected_score = None;
+    for position in 0..width {
+        let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "anchor position shift conversion",
+        })?;
+        let bit = 1_u64
+            .checked_shl(shift)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "anchor position mask",
+            })?;
+        let mut bytes = [0_u8; 2];
+        let mut members = 0_usize;
+        for byte in 0_u8..=127 {
+            tracker.read_anchor_mask()?;
+            if masks[usize::from(byte)] & bit != 0 {
+                if let Some(slot) = bytes.get_mut(members) {
+                    *slot = byte;
+                }
+                members = members
+                    .checked_add(1)
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "anchor member count",
+                    })?;
+            }
+        }
+        if (1..=2).contains(&members) {
+            let rank = bytes[..members]
+                .iter()
+                .copied()
+                .map(byte_frequency_rank)
+                .max()
+                .ok_or(BuildError::InternalInvariant(
+                    "nonempty anchor lost its frequency rank",
+                ))?;
+            let score = (rank, members);
+            if selected_score.is_some_and(|prior| score > prior) {
+                continue;
+            }
+            selected_score = Some(score);
+            selected = if members == 1 {
+                Anchor::One {
+                    offset: u8::try_from(position).map_err(|_| {
+                        BuildError::InternalInvariant("anchor offset exceeded one byte")
+                    })?,
+                    byte: bytes[0],
+                }
+            } else {
+                Anchor::Two {
+                    offset: u8::try_from(position).map_err(|_| {
+                        BuildError::InternalInvariant("anchor offset exceeded one byte")
+                    })?,
+                    first: bytes[0],
+                    second: bytes[1],
+                }
+            };
+        }
+    }
+    Ok(selected)
+}
+
 fn actual_build_work(
     width: usize,
     source_ranges: usize,
     member_writes: usize,
+    anchor_mask_reads: usize,
 ) -> Result<u64, BuildError> {
     let work = source_ranges
         .checked_mul(RANGE_FIXED_WORK)
         .and_then(|range_work| MASK_SLOTS.checked_add(width)?.checked_add(range_work))
         .and_then(|work| work.checked_add(member_writes))
+        .and_then(|work| work.checked_add(anchor_mask_reads))
         .and_then(|work| work.checked_add(BUILD_FIXED_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "actual build work",
@@ -1071,9 +1244,14 @@ impl FixedPredicateWord64Plan {
         let result = (|| {
             let preflight = preflight_build(positions, limits)?;
             let (masks, member_writes) = compile_masks(positions, &mut tracker)?;
+            let anchor = select_anchor(&masks, preflight.width, &mut tracker)?;
             tracker.finish(preflight)?;
-            let independently_counted_work =
-                actual_build_work(preflight.width, preflight.source_ranges, member_writes)?;
+            let independently_counted_work = actual_build_work(
+                preflight.width,
+                preflight.source_ranges,
+                member_writes,
+                tracker.actual.anchor_mask_reads,
+            )?;
             if tracker.actual.work != independently_counted_work {
                 return Err(BuildError::InternalInvariant(
                     "observed build work disagreed with independent exact count",
@@ -1103,6 +1281,7 @@ impl FixedPredicateWord64Plan {
                 position_visits: tracker.actual.position_visits,
                 range_inspections: tracker.actual.range_inspections,
                 member_writes: tracker.actual.member_writes,
+                anchor_mask_reads: tracker.actual.anchor_mask_reads,
                 work_upper_bound: preflight.work_upper_bound,
                 work_charged: tracker.actual.work,
                 allocations: tracker.actual.allocations,
@@ -1116,6 +1295,7 @@ impl FixedPredicateWord64Plan {
                 masks,
                 width: preflight.width,
                 accepting_bit,
+                anchor,
                 build,
             })
         })();
@@ -1161,6 +1341,7 @@ impl FixedPredicateWord64Plan {
             Operation::Count => COUNT_OPERATION_ID,
             Operation::SpanSum => SPAN_SUM_OPERATION_ID,
         };
+        let (reducer, anchor_offset, anchor_bytes) = self.anchor.identity();
         OperationIdentity {
             plan_id: PLAN_ID,
             operation_id,
@@ -1168,6 +1349,9 @@ impl FixedPredicateWord64Plan {
             semantics: MatchSemantics::FixedBytePredicates,
             selection: MatchSelection::LeftmostFirstNonOverlapping,
             width: self.width,
+            reducer,
+            anchor_offset,
+            anchor_bytes,
         }
     }
 
@@ -1218,12 +1402,149 @@ impl FixedPredicateWord64Plan {
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
         enforce_reduce_usize(input_bytes, limits.max_input_bytes, ReduceResource::Input)?;
-        let transitions = input_bytes;
+        let reducer = self.reducer_upper(input_bytes)?;
         enforce_reduce_usize(
-            transitions,
+            reducer.transitions,
             limits.max_transitions,
             ReduceResource::Transitions,
         )?;
+        let semantic = self.semantic_upper(input_bytes, operation, limits)?;
+        let reducer_steps = reducer.transitions.checked_add(REDUCE_FINAL_WORK).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "reducer step bound",
+            },
+        )?;
+        enforce_reduce_usize(
+            reducer_steps,
+            limits.max_reducer_steps,
+            ReduceResource::ReducerSteps,
+        )?;
+        let work_usize = reducer
+            .work
+            .checked_add(semantic.match_events.checked_mul(MATCH_WORK).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "match-event work bound",
+                },
+            )?)
+            .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "reducer work upper bound",
+            })?;
+        let work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "reducer work upper bound conversion",
+        })?;
+        if work > limits.max_work {
+            return Err(ReduceError::WorkLimit {
+                needed: work,
+                limit: limits.max_work,
+            });
+        }
+        let scratch_bytes = 0;
+        if scratch_bytes > limits.max_scratch_bytes {
+            return Err(ReduceError::ScratchLimit {
+                needed: scratch_bytes,
+                limit: limits.max_scratch_bytes,
+            });
+        }
+        let persistent_bytes = self.build.persistent_bytes;
+        enforce_reduce_usize(
+            persistent_bytes,
+            limits.max_persistent_bytes,
+            ReduceResource::Persistent,
+        )?;
+        let peak_bytes = persistent_bytes;
+        enforce_reduce_usize(peak_bytes, limits.max_peak_bytes, ReduceResource::Peak)?;
+        Ok(ReduceUpperBounds {
+            input_bytes,
+            transitions: reducer.transitions,
+            finder_calls: reducer.finder_calls,
+            anchor_candidates: reducer.anchor_candidates,
+            predicate_checks: reducer.predicate_checks,
+            match_events: semantic.match_events,
+            count: semantic.count,
+            span_sum: semantic.span_sum,
+            reducer_steps,
+            work,
+            allocations: 0,
+            reserves: 0,
+            temporary_copies: 0,
+            scratch_bytes,
+            persistent_bytes,
+            peak_bytes,
+        })
+    }
+
+    fn reducer_upper(&self, input_bytes: usize) -> Result<ReducerUpper, ReduceError> {
+        match self.anchor {
+            Anchor::One { .. } | Anchor::Two { .. } => {
+                let candidate_positions = match input_bytes.checked_sub(self.width) {
+                    Some(last_start) => {
+                        last_start
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "anchor candidate-position bound",
+                            })?
+                    }
+                    None => 0,
+                };
+                let finder_calls = if candidate_positions == 0 {
+                    0
+                } else {
+                    candidate_positions
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "anchor finder-call bound",
+                        })?
+                };
+                let predicate_checks = candidate_positions
+                    .checked_mul(self.width.checked_sub(1).ok_or(
+                        ReduceError::InternalInvariant("validated word width became zero"),
+                    )?)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "anchor predicate-check bound",
+                    })?;
+                let work = candidate_positions
+                    .checked_mul(FINDER_SCAN_BYTE_WORK)
+                    .and_then(|value| {
+                        value.checked_add(finder_calls.checked_mul(FINDER_CALL_WORK)?)
+                    })
+                    .and_then(|value| {
+                        value.checked_add(candidate_positions.checked_mul(ANCHOR_CANDIDATE_WORK)?)
+                    })
+                    .and_then(|value| {
+                        value.checked_add(predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?)
+                    })
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "anchor reducer work bound",
+                    })?;
+                Ok(ReducerUpper {
+                    transitions: input_bytes,
+                    finder_calls,
+                    anchor_candidates: candidate_positions,
+                    predicate_checks,
+                    work,
+                })
+            }
+            Anchor::ShiftAnd => Ok(ReducerUpper {
+                transitions: input_bytes,
+                finder_calls: 0,
+                anchor_candidates: 0,
+                predicate_checks: 0,
+                work: input_bytes.checked_mul(TRANSITION_WORK).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "Shift-And reducer work bound",
+                    },
+                )?,
+            }),
+        }
+    }
+
+    fn semantic_upper(
+        &self,
+        input_bytes: usize,
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Result<SemanticUpper, ReduceError> {
         let match_events =
             input_bytes
                 .checked_div(self.width)
@@ -1258,66 +1579,36 @@ impl FixedPredicateWord64Plan {
                 limit: limits.max_span_sum,
             });
         }
-        let reducer_steps =
-            transitions
-                .checked_add(REDUCE_FINAL_WORK)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "reducer step bound",
-                })?;
-        enforce_reduce_usize(
-            reducer_steps,
-            limits.max_reducer_steps,
-            ReduceResource::ReducerSteps,
-        )?;
-        let work_usize = transitions
-            .checked_mul(TRANSITION_WORK)
-            .and_then(|work| work.checked_add(match_events.checked_mul(MATCH_WORK)?))
-            .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "reducer work upper bound",
-            })?;
-        let work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "reducer work upper bound conversion",
-        })?;
-        if work > limits.max_work {
-            return Err(ReduceError::WorkLimit {
-                needed: work,
-                limit: limits.max_work,
-            });
-        }
-        let scratch_bytes = 0;
-        if scratch_bytes > limits.max_scratch_bytes {
-            return Err(ReduceError::ScratchLimit {
-                needed: scratch_bytes,
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        let persistent_bytes = self.build.persistent_bytes;
-        enforce_reduce_usize(
-            persistent_bytes,
-            limits.max_persistent_bytes,
-            ReduceResource::Persistent,
-        )?;
-        let peak_bytes = persistent_bytes;
-        enforce_reduce_usize(peak_bytes, limits.max_peak_bytes, ReduceResource::Peak)?;
-        Ok(ReduceUpperBounds {
-            input_bytes,
-            transitions,
+        Ok(SemanticUpper {
             match_events,
             count,
             span_sum,
-            reducer_steps,
-            work,
-            allocations: 0,
-            reserves: 0,
-            temporary_copies: 0,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
         })
     }
 
     fn execute(
+        &self,
+        haystack: &[u8],
+        upper_bounds: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        match self.anchor {
+            Anchor::One { offset, byte } => {
+                self.execute_anchor(haystack, upper_bounds, usize::from(offset), |bytes| {
+                    memchr(byte, bytes)
+                })
+            }
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.execute_anchor(haystack, upper_bounds, usize::from(offset), |bytes| {
+                memchr2(first, second, bytes)
+            }),
+            Anchor::ShiftAnd => self.execute_shift_and(haystack, upper_bounds),
+        }
+    }
+
+    fn execute_shift_and(
         &self,
         haystack: &[u8],
         upper_bounds: ReduceUpperBounds,
@@ -1369,6 +1660,9 @@ impl FixedPredicateWord64Plan {
         let actual = ReduceActualCounters {
             input_bytes: haystack.len(),
             transitions,
+            finder_calls: 0,
+            anchor_candidates: 0,
+            predicate_checks: 0,
             match_events,
             count,
             matched_bytes,
@@ -1388,11 +1682,233 @@ impl FixedPredicateWord64Plan {
         }
         Ok(actual)
     }
+
+    fn execute_anchor(
+        &self,
+        haystack: &[u8],
+        upper_bounds: ReduceUpperBounds,
+        anchor_offset: usize,
+        find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let actual = self.scan_anchor(haystack, anchor_offset, find)?;
+        self.finish_anchor_actual(haystack.len(), upper_bounds, actual)
+    }
+
+    fn scan_anchor(
+        &self,
+        haystack: &[u8],
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Result<AnchorActual, ReduceError> {
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        let mut actual = AnchorActual::default();
+        while cursor < anchor_end {
+            let search = haystack
+                .get(cursor..anchor_end)
+                .ok_or(ReduceError::InternalInvariant(
+                    "anchor search window escaped the input",
+                ))?;
+            actual.finder_calls =
+                actual
+                    .finder_calls
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual anchor finder calls",
+                    })?;
+            let Some(relative) = find(search) else {
+                actual.finder_scanned_bytes = actual
+                    .finder_scanned_bytes
+                    .checked_add(search.len())
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual unsuccessful anchor service bytes",
+                    })?;
+                break;
+            };
+            let service = relative
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual successful anchor service bytes",
+                })?;
+            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(service).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "actual anchor service bytes",
+                },
+            )?;
+            let anchor = cursor
+                .checked_add(relative)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual anchor position",
+                })?;
+            let start = anchor
+                .checked_sub(anchor_offset)
+                .ok_or(ReduceError::InternalInvariant(
+                    "anchor position preceded its fixed offset",
+                ))?;
+            actual.anchor_candidates =
+                actual
+                    .anchor_candidates
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual anchor candidates",
+                    })?;
+            let matched = self.anchor_candidate_matches(
+                haystack,
+                start,
+                anchor_offset,
+                &mut actual.predicate_checks,
+            )?;
+            if matched {
+                actual.match_events =
+                    actual
+                        .match_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual anchor match events",
+                        })?;
+                cursor = anchor
+                    .checked_add(self.width)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "accepted anchor restart",
+                    })?;
+            } else {
+                cursor = anchor
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "rejected anchor restart",
+                    })?;
+            }
+        }
+        Ok(actual)
+    }
+
+    #[inline]
+    fn anchor_candidate_matches(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        anchor_offset: usize,
+        predicate_checks: &mut usize,
+    ) -> Result<bool, ReduceError> {
+        for position in 0..self.width {
+            if position == anchor_offset {
+                continue;
+            }
+            *predicate_checks =
+                predicate_checks
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual predicate checks",
+                    })?;
+            let index = start
+                .checked_add(position)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual predicate position",
+                })?;
+            let byte = *haystack.get(index).ok_or(ReduceError::InternalInvariant(
+                "fixed predicate candidate escaped the input",
+            ))?;
+            let shift = u32::try_from(position).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual predicate bit shift",
+            })?;
+            let bit = 1_u64
+                .checked_shl(shift)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual predicate bit",
+                })?;
+            if self.masks[usize::from(byte)] & bit == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish_anchor_actual(
+        &self,
+        input_bytes: usize,
+        upper_bounds: ReduceUpperBounds,
+        actual: AnchorActual,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let transitions = actual.finder_scanned_bytes;
+        let count =
+            u64::try_from(actual.match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual anchor count conversion",
+            })?;
+        let width = u64::try_from(self.width).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "actual anchor word width conversion",
+        })?;
+        let matched_bytes = count
+            .checked_mul(width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual anchor matched bytes",
+            })?;
+        let reducer_steps =
+            transitions
+                .checked_add(REDUCE_FINAL_WORK)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual anchor reducer steps",
+                })?;
+        let work_usize = actual
+            .finder_scanned_bytes
+            .checked_mul(FINDER_SCAN_BYTE_WORK)
+            .and_then(|work| work.checked_add(actual.finder_calls.checked_mul(FINDER_CALL_WORK)?))
+            .and_then(|work| {
+                work.checked_add(
+                    actual
+                        .anchor_candidates
+                        .checked_mul(ANCHOR_CANDIDATE_WORK)?,
+                )
+            })
+            .and_then(|work| {
+                work.checked_add(actual.predicate_checks.checked_mul(PREDICATE_CHECK_WORK)?)
+            })
+            .and_then(|work| work.checked_add(actual.match_events.checked_mul(MATCH_WORK)?))
+            .and_then(|work| work.checked_add(REDUCE_FINAL_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual anchor reducer work",
+            })?;
+        let work_charged =
+            u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual anchor reducer work conversion",
+            })?;
+        let counters = ReduceActualCounters {
+            input_bytes,
+            transitions,
+            finder_calls: actual.finder_calls,
+            anchor_candidates: actual.anchor_candidates,
+            predicate_checks: actual.predicate_checks,
+            match_events: actual.match_events,
+            count,
+            matched_bytes,
+            reducer_steps,
+            work_charged,
+            allocations: 0,
+            reserves: 0,
+            temporary_copies: 0,
+            scratch_bytes: 0,
+            persistent_bytes: self.build.persistent_bytes,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        if !actual_within_upper(counters, upper_bounds) {
+            return Err(ReduceError::InternalInvariant(
+                "actual anchor counters exceeded prospective upper bounds",
+            ));
+        }
+        Ok(counters)
+    }
 }
 
 fn actual_within_upper(actual: ReduceActualCounters, upper: ReduceUpperBounds) -> bool {
     actual.input_bytes <= upper.input_bytes
         && actual.transitions <= upper.transitions
+        && actual.finder_calls <= upper.finder_calls
+        && actual.anchor_candidates <= upper.anchor_candidates
+        && actual.predicate_checks <= upper.predicate_checks
         && actual.match_events <= upper.match_events
         && actual.count <= upper.count
         && actual.matched_bytes <= upper.span_sum
@@ -1494,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_and_matches_exhaustive_short_reference_and_resets_on_accept() {
+    fn fixed_anchor_matches_exhaustive_short_reference_and_restarts_on_accept() {
         let plan = ab_plan();
         let alphabet = [b'A', b'a', b'B', b'b', b'x'];
         for length in 0..=5 {
@@ -1563,6 +2079,42 @@ mod tests {
     }
 
     #[test]
+    fn shift_and_fallback_matches_exhaustive_short_reference_and_resets_on_accept() {
+        const LEFT: &[(u8, u8)] = &[(b'a', b'c')];
+        const RIGHT: &[(u8, u8)] = &[(b'd', b'f')];
+        let predicates = [LEFT, RIGHT];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        let alphabet = [b'a', b'b', b'c', b'd', b'e', b'f', b'x'];
+        assert_eq!(
+            plan.operation_identity(Operation::Count).reducer,
+            Reducer::ShiftAnd
+        );
+        for length in 0..=5 {
+            let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0_u8; length];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = naive_count(&haystack, &predicates);
+                let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+                let sum = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+                assert_eq!(count.count, expected, "haystack={haystack:?}");
+                assert_eq!(sum.span_sum, expected.checked_mul(2).unwrap());
+                assert_eq!(count.accounting.actual.transitions, haystack.len());
+                assert_eq!(count.accounting.actual.finder_calls, 0);
+                assert_eq!(count.accounting.actual.anchor_candidates, 0);
+                assert_eq!(count.accounting.actual.predicate_checks, 0);
+                assert!(actual_within_upper(
+                    count.accounting.actual,
+                    count.accounting.upper_bounds
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn partially_overlapping_predicates_match_the_reference() {
         const LEFT: &[(u8, u8)] = &[(b'a', b'b')];
         const RIGHT: &[(u8, u8)] = &[(b'b', b'c')];
@@ -1609,7 +2161,11 @@ mod tests {
         assert_eq!(sum.span_sum, 45);
         assert_eq!(plan.width(), 15);
         assert_eq!(count.accounting.identity.width, 15);
-        assert_eq!(count.accounting.actual.transitions, haystack.len());
+        assert_eq!(count.accounting.identity.reducer, Reducer::TwoByteAnchor);
+        assert_eq!(count.accounting.identity.anchor_offset, 7);
+        assert_eq!(count.accounting.identity.anchor_bytes, [b'K', b'k']);
+        assert!(count.accounting.actual.transitions <= haystack.len());
+        assert!(count.accounting.actual.predicate_checks > 0);
         assert_eq!(count.accounting.actual.input_bytes, haystack.len());
         assert_eq!(count.accounting.actual.match_events, 3);
     }
@@ -1691,10 +2247,12 @@ mod tests {
         assert_eq!(accounting.reserves, 0);
         assert_eq!(accounting.temporary_copies, 0);
         assert_eq!(accounting.scratch_bytes, 0);
-        // P=2, R=4 and every range has one member: U=256+P+130R+4,
-        // while A=256+P+2R+B+4 with B=4.
-        assert_eq!(accounting.work_upper_bound, 782);
-        assert_eq!(accounting.work_charged, 274);
+        // P=2, R=4 and every range has one member. Construction additionally
+        // reads all 128 ASCII mask cells for each position to select the
+        // smallest exact anchor, without allocating.
+        assert_eq!(accounting.anchor_mask_reads, 256);
+        assert_eq!(accounting.work_upper_bound, 1_038);
+        assert_eq!(accounting.work_charged, 530);
         assert!(accounting.work_charged <= accounting.work_upper_bound);
 
         let exact = BuildLimits {
@@ -1858,15 +2416,19 @@ mod tests {
         assert_eq!(exact_result.accounting.actual.allocations, 0);
         assert_eq!(exact_result.accounting.actual.reserves, 0);
         assert_eq!(exact_result.accounting.actual.temporary_copies, 0);
-        // N=12, W=2, M=6 and m=3: U=6N+3M+1 and A=6N+3m+1.
+        // The rightmost two-byte predicate is the authenticated anchor. The
+        // prospective bound admits every valid start; actual service skips
+        // past each accepted non-overlapping word.
         assert_eq!(upper.transitions, 12);
+        assert_eq!(upper.anchor_candidates, 11);
+        assert_eq!(upper.predicate_checks, 11);
         assert_eq!(upper.match_events, 6);
         assert_eq!(upper.span_sum, 12);
         assert_eq!(upper.reducer_steps, 13);
-        assert_eq!(upper.work, 91);
+        assert_eq!(upper.work, 64);
         assert_eq!(exact_result.accounting.actual.match_events, 3);
         assert_eq!(exact_result.accounting.actual.matched_bytes, 6);
-        assert_eq!(exact_result.accounting.actual.work_charged, 82);
+        assert_eq!(exact_result.accounting.actual.work_charged, 28);
 
         let count_limits = ReduceLimits {
             max_span_sum: 0,

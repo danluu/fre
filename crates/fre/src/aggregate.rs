@@ -88,9 +88,10 @@ use fre_kernels::{
     OrderedLiteralAggregateOperation, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
     OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PackedOrderedLiteralAggregateActualCounters,
+    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
+    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PackedOrderedLiteralAggregateActualCounters,
     PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
     PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
     PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
@@ -1812,6 +1813,26 @@ fn include_construction_work(
 ) -> Option<AggregateConstructionEffect> {
     effect.work = effect.work.checked_add(u64::try_from(work).ok()?)?;
     Some(effect)
+}
+
+fn include_completed_transient_effect(
+    prior: AggregateConstructionEffect,
+    next: AggregateConstructionEffect,
+) -> Option<AggregateConstructionEffect> {
+    debug_assert_eq!(prior.retained_persistent_bytes, 0);
+    debug_assert_eq!(prior.released_persistent_bytes, 0);
+    Some(AggregateConstructionEffect {
+        work: prior.work.checked_add(next.work)?,
+        allocations: prior.allocations.checked_add(next.allocations)?,
+        allocated_bytes: prior.allocated_bytes.checked_add(next.allocated_bytes)?,
+        copied_bytes: prior.copied_bytes.checked_add(next.copied_bytes)?,
+        initialized_bytes: prior
+            .initialized_bytes
+            .checked_add(next.initialized_bytes)?,
+        retained_persistent_bytes: next.retained_persistent_bytes,
+        released_persistent_bytes: next.released_persistent_bytes,
+        co_live_bytes: prior.co_live_bytes.max(next.co_live_bytes),
+    })
 }
 
 const fn direct_build_attempt_effect(
@@ -11816,7 +11837,10 @@ impl AggregateBuilder {
         let mut fixed_predicate_refused = false;
         let mut dense_finite_refused = false;
         let mut fixed_predicate_prior_effect = None;
+        let mut fixed_predicate_inspection = None;
+        let mut dense_finite_probe_effect = AggregateConstructionEffect::default();
         let mut general_finite_completed_effect = None;
+        let mut general_finite_abandonable_bytes = 0_usize;
         let finite_words_candidate = match finite {
             Some(finite::FiniteOutcome::Fits { words, receipt }) => {
                 let effect = finite_extraction_effect(&receipt).ok_or(
@@ -11834,6 +11858,14 @@ impl AggregateBuilder {
                     unreachable!("general finite completion violated construction order");
                 }
                 general_finite_completed_effect = Some(effect);
+                general_finite_abandonable_bytes = receipt
+                    .boundary_actual()
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "general finite success lost its boundary receipt",
+                    })?
+                    .abandonable_bytes;
                 Some(words)
             }
             Some(finite::FiniteOutcome::GuardedFiniteBody {
@@ -12160,7 +12192,7 @@ impl AggregateBuilder {
                 None
             }
         };
-        let (finite_words, finite_boundary_work) = match finite_words_candidate {
+        let (mut finite_words, finite_boundary_work) = match finite_words_candidate {
             Some(words) if unicode => {
                 let boundary_work = unicode_finite_boundary_prospective(&words).ok_or(
                     AggregateBuildError::InternalInvariant {
@@ -12216,13 +12248,13 @@ impl AggregateBuilder {
         {
             record_construction_policy_skip(construction, AggregateConstructionStage::PackedFinite);
         }
-        if let Some(words) = finite_words {
+        if let Some(words) = finite_words.as_ref() {
             let packed_limits = packed_finite_build_limits(limits.finite_literal);
             let packed_build = match operation {
                 AggregateOperation::Compile | AggregateOperation::Count => {
                     PackedOrderedLiteralCountPlan::build_attempt_with_dispatch(
                         simd_dispatch,
-                        &words,
+                        words,
                         packed_limits,
                     )
                     .map(|attempt| {
@@ -12243,7 +12275,7 @@ impl AggregateBuilder {
                 AggregateOperation::SpanSum => {
                     PackedOrderedLiteralSpanSumPlan::build_attempt_with_dispatch(
                         simd_dispatch,
-                        &words,
+                        words,
                         packed_limits,
                     )
                     .map(|attempt| {
@@ -12381,6 +12413,88 @@ impl AggregateBuilder {
                             "packed finite semantic refusal violated construction order: {error:?}"
                         );
                     }
+                    if !unicode && words.len() > PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS {
+                        let inspected =
+                            finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+                                &rust.hir,
+                                finite_planner_work,
+                                limits.max_finite_planner_work,
+                            );
+                        debug_assert!(inspected.has_closed_receipt());
+                        let receipt = inspected.receipt();
+                        let inspection_effect = fixed_predicate_inspection_effect(receipt).ok_or(
+                            AggregateBuildError::InternalInvariant {
+                                operation,
+                                selection,
+                                detail: "pre-dense fixed-predicate inspection effect overflow",
+                            },
+                        )?;
+                        finite_planner_work = receipt.actual().work;
+                        match inspected {
+                            finite::FixedPredicateInspectionAttempt::Succeeded {
+                                source,
+                                receipt,
+                            } => {
+                                record_construction_policy_skip(
+                                    construction,
+                                    AggregateConstructionStage::DenseFinite,
+                                );
+                                fixed_predicate_refused = true;
+                                fixed_predicate_prior_effect = Some((
+                                    general_finite_completed_effect.unwrap_or_default(),
+                                    general_finite_abandonable_bytes,
+                                ));
+                                fixed_predicate_inspection =
+                                    Some(finite::FixedPredicateInspectionAttempt::Succeeded {
+                                        source,
+                                        receipt,
+                                    });
+                            }
+                            finite::FixedPredicateInspectionAttempt::Refused { .. } => {
+                                dense_finite_probe_effect = inspection_effect;
+                            }
+                            finite::FixedPredicateInspectionAttempt::ResourceFailure {
+                                error,
+                                ..
+                            } => {
+                                let mut terminal_effect = inspection_effect;
+                                terminal_effect.released_persistent_bytes =
+                                    general_finite_completed_effect
+                                        .unwrap_or_default()
+                                        .retained_persistent_bytes;
+                                select_construction_stage(
+                                    construction,
+                                    AggregateConstructionStage::DenseFinite,
+                                    terminal_effect,
+                                );
+                                construction.pending_terminal_effect = terminal_effect;
+                                return Err(match error {
+                                    BuildError::PlannerWorkLimit { needed, limit } => {
+                                        AggregateBuildError::FinitePlannerWorkLimit {
+                                            operation,
+                                            selection,
+                                            needed,
+                                            limit,
+                                        }
+                                    }
+                                    BuildError::AllocationFailed {
+                                        structure,
+                                        additional,
+                                    } => AggregateBuildError::FinitePlannerAllocationFailed {
+                                        operation,
+                                        selection,
+                                        structure,
+                                        additional,
+                                    },
+                                    _ => AggregateBuildError::InternalInvariant {
+                                        operation,
+                                        selection,
+                                        detail: "pre-dense fixed-predicate planner returned an unrelated facade error",
+                                    },
+                                });
+                            }
+                        }
+                    }
                 }
                 Err(error) if packed_finite_build_limit_allows_dense(error.source()) => {
                     let effect = include_construction_work(
@@ -12428,6 +12542,13 @@ impl AggregateBuilder {
                     });
                 }
             }
+        }
+        let dense_words = if fixed_predicate_inspection.is_some() {
+            None
+        } else {
+            finite_words.take()
+        };
+        if let Some(words) = dense_words {
             select_construction_stage(
                 construction,
                 AggregateConstructionStage::DenseFinite,
@@ -12482,13 +12603,15 @@ impl AggregateBuilder {
             };
             match finite_build {
                 Ok((engine, build, operation_id, build_actual)) => {
-                    let mut build_effect =
-                        include_construction_work(ordered_finite_build_effect(build_actual), 0)
-                            .ok_or(AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "dense finite boundary/build effect overflow",
-                            })?;
+                    let mut build_effect = include_completed_transient_effect(
+                        dense_finite_probe_effect,
+                        ordered_finite_build_effect(build_actual),
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "dense finite probe/build effect overflow",
+                    })?;
                     build_effect.released_persistent_bytes = general_finite_completed_effect
                         .unwrap_or_default()
                         .retained_persistent_bytes;
@@ -12563,13 +12686,15 @@ impl AggregateBuilder {
                 Err(error) if finite_build_limit_allows_continuation(error.source()) => {
                     let prior = general_finite_completed_effect.unwrap_or_default();
                     let build_actual = error.receipt().actual();
-                    let mut effect =
-                        include_construction_work(ordered_finite_build_effect(build_actual), 0)
-                            .ok_or(AggregateBuildError::InternalInvariant {
-                                operation,
-                                selection,
-                                detail: "dense finite refusal boundary/build effect overflow",
-                            })?;
+                    let mut effect = include_completed_transient_effect(
+                        dense_finite_probe_effect,
+                        ordered_finite_build_effect(build_actual),
+                    )
+                    .ok_or(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "dense finite refusal probe/build effect overflow",
+                    })?;
                     effect.released_persistent_bytes = prior.retained_persistent_bytes;
                     let abandonment = dense_finite_abandonment(prior, effect).ok_or(
                         AggregateBuildError::InternalInvariant {
@@ -12592,14 +12717,14 @@ impl AggregateBuilder {
                     dense_finite_refused = !unicode;
                 }
                 Err(error) => {
-                    let mut effect = include_construction_work(
+                    let mut effect = include_completed_transient_effect(
+                        dense_finite_probe_effect,
                         ordered_finite_build_effect(error.receipt().actual()),
-                        0,
                     )
                     .ok_or(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        detail: "dense finite terminal boundary/build effect overflow",
+                        detail: "dense finite terminal probe/build effect overflow",
                     })?;
                     effect.released_persistent_bytes = general_finite_completed_effect
                         .unwrap_or_default()
@@ -12619,11 +12744,15 @@ impl AggregateBuilder {
             record_construction_policy_skip(construction, AggregateConstructionStage::DenseFinite);
         }
         if fixed_predicate_refused {
-            let inspected = finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
-                &rust.hir,
-                finite_planner_work,
-                limits.max_finite_planner_work,
-            );
+            let inspected = if let Some(inspected) = fixed_predicate_inspection.take() {
+                inspected
+            } else {
+                finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
+                    &rust.hir,
+                    finite_planner_work,
+                    limits.max_finite_planner_work,
+                )
+            };
             debug_assert!(inspected.has_closed_receipt());
             let inspection_receipt = inspected.receipt();
             let inspection_effect = fixed_predicate_inspection_effect(inspection_receipt).ok_or(
@@ -12685,11 +12814,11 @@ impl AggregateBuilder {
                         detail: "fixed-predicate inspection work moved backwards",
                     });
                 }
-                if unicode || source.case_pairs() == 0 {
+                if unicode || source.variable_predicates() == 0 {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        detail: "fixed-predicate source escaped its ASCII case-fold proof",
+                        detail: "fixed-predicate source escaped its variable ASCII predicate proof",
                     });
                 }
                 if source.hir_nodes() != expected_nodes || source.captures() != expected_captures {
@@ -12729,13 +12858,15 @@ impl AggregateBuilder {
                     Ok(attempt) => {
                         debug_assert!(attempt.closes());
                         let (engine, receipt) = attempt.into_parts();
-                        let terminal_effect =
+                        let mut terminal_effect =
                             fixed_predicate_build_effect(receipt.actual(), inspection_effect)
                                 .ok_or(AggregateBuildError::InternalInvariant {
                                     operation,
                                     selection,
                                     detail: "fixed-predicate construction effect overflow",
                                 })?;
+                        terminal_effect.released_persistent_bytes = fixed_predicate_prior_effect
+                            .map_or(0, |(prior, _)| prior.retained_persistent_bytes);
                         construction.pending_terminal_effect = terminal_effect;
                         let publication_effect = include_selected_plan_owner_effect(
                             terminal_effect,
@@ -12846,9 +12977,10 @@ impl AggregateBuilder {
                             abandonment,
                             AggregateConstructionPrepublicationFallback::FixedPredicateWord64BuildResource,
                         );
+                        drop(finite_words.take());
                     }
                     Err(error) => {
-                        construction.pending_terminal_effect = fixed_predicate_build_effect(
+                        let mut terminal_effect = fixed_predicate_build_effect(
                             error.receipt().actual(),
                             inspection_effect,
                         )
@@ -12857,6 +12989,9 @@ impl AggregateBuilder {
                             selection,
                             detail: "fixed-predicate terminal effect overflow",
                         })?;
+                        terminal_effect.released_persistent_bytes = fixed_predicate_prior_effect
+                            .map_or(0, |(prior, _)| prior.retained_persistent_bytes);
+                        construction.pending_terminal_effect = terminal_effect;
                         return Err(AggregateBuildError::FixedPredicateWord64Build {
                             operation,
                             selection,

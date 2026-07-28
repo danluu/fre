@@ -862,16 +862,16 @@ impl FixedPredicateInspectionAttempt {
     }
 }
 
-/// Inline proof source for a fixed-width ASCII-byte predicate word.
+/// Inline proof source for a fixed-width ASCII-byte Cartesian predicate word.
 ///
 /// Construction is only attempted after the incumbent finite route has
-/// returned a typed refusal, so this source cannot displace a finite or
-/// guarded-dictionary success.
+/// declined its compact representation, so this source cannot displace a
+/// packed finite or guarded-dictionary success.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FixedPredicateWord64Source {
     positions: [FixedPredicate; FIXED_PREDICATE_WORD64_MAX_WIDTH],
     width: usize,
-    case_pairs: usize,
+    variable_predicates: usize,
     hir_nodes: usize,
     captures: usize,
 }
@@ -880,7 +880,7 @@ impl FixedPredicateWord64Source {
     const EMPTY: Self = Self {
         positions: [FixedPredicate::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH],
         width: 0,
-        case_pairs: 0,
+        variable_predicates: 0,
         hir_nodes: 0,
         captures: 0,
     };
@@ -896,8 +896,8 @@ impl FixedPredicateWord64Source {
         self.width
     }
 
-    pub(crate) const fn case_pairs(&self) -> usize {
-        self.case_pairs
+    pub(crate) const fn variable_predicates(&self) -> usize {
+        self.variable_predicates
     }
 
     pub(crate) const fn hir_nodes(&self) -> usize {
@@ -908,7 +908,7 @@ impl FixedPredicateWord64Source {
         self.captures
     }
 
-    fn push(&mut self, predicate: FixedPredicate, is_case_pair: bool) -> Result<bool, BuildError> {
+    fn push(&mut self, predicate: FixedPredicate, is_variable: bool) -> Result<bool, BuildError> {
         let index = self.width();
         if index == FIXED_PREDICATE_WORD64_MAX_WIDTH {
             return Ok(false);
@@ -920,12 +920,12 @@ impl FixedPredicateWord64Source {
             .ok_or(BuildError::InternalInvariant(
                 "fixed-predicate width accounting overflow",
             ))?;
-        if is_case_pair {
-            self.case_pairs =
-                self.case_pairs
+        if is_variable {
+            self.variable_predicates =
+                self.variable_predicates
                     .checked_add(1)
                     .ok_or(BuildError::InternalInvariant(
-                        "fixed-predicate case-pair accounting overflow",
+                        "fixed-predicate variable-position accounting overflow",
                     ))?;
         }
         Ok(true)
@@ -933,32 +933,50 @@ impl FixedPredicateWord64Source {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FixedPredicate(u16);
+struct FixedPredicate(u32);
 
 impl FixedPredicate {
     const EMPTY: Self = Self(0);
 
     fn singleton(byte: u8) -> Self {
-        let byte = u16::from(byte);
-        Self(byte | (byte << 8))
+        Self(u32::from_le_bytes([byte | 0x80, byte, 0, 0]))
     }
 
-    fn pair(first: u8, second: u8) -> Self {
-        Self(u16::from(first) | (u16::from(second) << 8))
+    fn from_ascii_class(class: &regex_syntax::hir::ClassBytes) -> Option<(Self, bool)> {
+        let ranges = class.ranges();
+        if ranges.is_empty() || ranges.len() > FIXED_PREDICATE_MAX_RANGES {
+            return None;
+        }
+        let mut encoded = [0_u8; 4];
+        let mut members = 0_usize;
+        for (index, range) in ranges.iter().enumerate() {
+            let start = range.start();
+            let end = range.end();
+            if !start.is_ascii() || !end.is_ascii() {
+                return None;
+            }
+            let offset = index.checked_mul(2)?;
+            *encoded.get_mut(offset)? = start;
+            *encoded.get_mut(offset.checked_add(1)?)? = end;
+            let inclusive_members = end.checked_sub(start)?.checked_add(1)?;
+            members = members.checked_add(usize::from(inclusive_members))?;
+        }
+        encoded[0] |= 0x80;
+        if ranges.len() == 2 {
+            encoded[2] |= 0x80;
+        }
+        Some((Self(u32::from_le_bytes(encoded)), members > 1))
     }
 
     fn ranges(self) -> FixedPredicateRanges {
-        let [first, second] = self.0.to_le_bytes();
-        if first == second {
-            FixedPredicateRanges {
-                ranges: [(first, first), (0, 0)],
-                range_count: 1,
-            }
-        } else {
-            FixedPredicateRanges {
-                ranges: [(first, first), (second, second)],
-                range_count: 2,
-            }
+        let encoded = self.0.to_le_bytes();
+        debug_assert_ne!(encoded[0] & 0x80, 0);
+        FixedPredicateRanges {
+            ranges: [
+                (encoded[0] & 0x7F, encoded[1]),
+                (encoded[2] & 0x7F, encoded[3]),
+            ],
+            range_count: if encoded[2] & 0x80 == 0 { 1 } else { 2 },
         }
     }
 }
@@ -1413,14 +1431,14 @@ fn inspect_fixed_predicate_word64(
                 }
             }
             HirKind::Class(Class::Bytes(class)) => {
-                if !push_fixed_ascii_case_pair(&mut source, class, context)? {
+                if !push_fixed_ascii_class(&mut source, class, context)? {
                     return Ok(None);
                 }
             }
             _ => return Ok(None),
         }
     }
-    if source.width() < FIXED_PREDICATE_WORD64_MIN_WIDTH || source.case_pairs() == 0 {
+    if source.width() < FIXED_PREDICATE_WORD64_MIN_WIDTH || source.variable_predicates() == 0 {
         return Ok(None);
     }
     Ok(Some(source))
@@ -1453,34 +1471,23 @@ fn push_fixed_ascii_literal(
     Ok(true)
 }
 
-fn push_fixed_ascii_case_pair(
+fn push_fixed_ascii_class(
     source: &mut FixedPredicateWord64Source,
     class: &regex_syntax::hir::ClassBytes,
     context: &FiniteExtractionContext,
 ) -> Result<bool, BuildError> {
-    let [first, second] = class.ranges() else {
-        return Ok(false);
-    };
     if source.width() == FIXED_PREDICATE_WORD64_MAX_WIDTH {
         return Ok(false);
     }
-    context.charge(2)?;
-    if first.start() != first.end() || second.start() != second.end() {
+    if class.ranges().is_empty() || class.ranges().len() > FIXED_PREDICATE_MAX_RANGES {
         return Ok(false);
     }
-    let first = first.start();
-    let second = second.start();
-    let is_ascii_case_pair = (first.is_ascii_uppercase()
-        && second.is_ascii_lowercase()
-        && first.to_ascii_lowercase() == second)
-        || (first.is_ascii_lowercase()
-            && second.is_ascii_uppercase()
-            && first == second.to_ascii_lowercase());
-    if !is_ascii_case_pair {
+    context.charge(u64::try_from(class.ranges().len()).unwrap_or(u64::MAX))?;
+    let Some((predicate, is_variable)) = FixedPredicate::from_ascii_class(class) else {
         return Ok(false);
-    }
+    };
     context.charge(1)?;
-    source.push(FixedPredicate::pair(first, second), true)
+    source.push(predicate, is_variable)
 }
 
 enum PlainFailure {
@@ -4627,7 +4634,7 @@ mod tests {
             .source
             .expect("typed refusal should retain the compact predicate proof");
         assert_eq!(source.width(), 15);
-        assert_eq!(source.case_pairs(), 14);
+        assert_eq!(source.variable_predicates(), 14);
         assert_eq!(source.captures(), 0);
         assert!(source.hir_nodes() >= source.width());
         assert!(inspected.work > refusal_work);
@@ -4660,7 +4667,7 @@ mod tests {
                 .unwrap();
         let source = inspected.source.unwrap();
         assert_eq!(source.width(), 2);
-        assert_eq!(source.case_pairs(), 2);
+        assert_eq!(source.variable_predicates(), 2);
         assert_eq!(source.captures(), 1);
 
         let width_64 = parse_case_insensitive(&"a".repeat(64));
@@ -4676,7 +4683,6 @@ mod tests {
             parse_case_insensitive("a"),
             parse_case_insensitive(&"a".repeat(65)),
             parse("ab"),
-            parse("[ace]x"),
             parse_case_insensitive("a+"),
             parse_case_insensitive(r"\ba"),
             parse_case_insensitive(r"\xFFa"),
@@ -4688,5 +4694,38 @@ mod tests {
                     .is_none()
             );
         }
+        let ranged = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[a-z]shing"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("one bounded ASCII range is a compact fixed predicate");
+        assert_eq!(ranged.width(), 6);
+        assert_eq!(ranged.variable_predicates(), 1);
+        assert_eq!(ranged.positions().next().unwrap().ranges(), &[(b'a', b'z')]);
+        let two_ranged = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[A-Za-z]x"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("two bounded ASCII ranges remain inline");
+        assert_eq!(
+            two_ranged.positions().next().unwrap().ranges(),
+            &[(b'A', b'Z'), (b'a', b'z')]
+        );
+        assert!(
+            super::inspect_fixed_predicate_word64_after_finite_refusal(
+                &parse("[ace]x"),
+                0,
+                u64::MAX,
+            )
+            .unwrap()
+            .source
+            .is_none()
+        );
     }
 }

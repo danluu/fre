@@ -5,7 +5,8 @@ use fre::{
     AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
-    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, RustProfile,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FixedPredicateWord64Reducer,
+    RustProfile,
 };
 
 const PATTERN: &str = "Sherlock Holmes";
@@ -28,6 +29,83 @@ fn upstream_spans(pattern: &str, haystack: &[u8], case_insensitive: bool) -> Vec
         .find_iter(haystack)
         .map(|matched| (matched.start(), matched.end()))
         .collect()
+}
+
+#[test]
+fn dense_finite_cartesian_words_select_the_authenticated_anchor_route() {
+    let cases: [(&str, bool, &[u8]); 2] = [
+        (
+            "[a-z]shing",
+            false,
+            b"ashing xshing zshing shing \xFFzshing",
+        ),
+        ("Twain", true, b"TWAIN twain tWaIn Twainx xTwain \xFFTWaIN"),
+    ];
+    for (pattern, case_insensitive, haystack) in cases {
+        let expected = upstream_spans(pattern, haystack, case_insensitive);
+        let build = || {
+            AggregateBuilder::new(pattern)
+                .profile(RustProfile::rebar_1_12_4())
+                .unicode(false)
+                .case_insensitive(case_insensitive)
+        };
+        let counted = build().build_count().unwrap();
+        assert_eq!(
+            counted.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        let AggregatePlanIdentity::FixedPredicateWord64(identity) =
+            counted.build_report().plan_identity
+        else {
+            panic!("Cartesian fixed word selected another identity");
+        };
+        assert!(matches!(
+            identity.reducer,
+            FixedPredicateWord64Reducer::OneByteAnchor | FixedPredicateWord64Reducer::TwoByteAnchor
+        ));
+        assert_eq!(
+            counted
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(expected.len()).unwrap()
+        );
+
+        let span_sum = build().build_span_sum().unwrap();
+        assert_eq!(
+            span_sum.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        assert_eq!(
+            span_sum
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected
+                .iter()
+                .map(|(start, end)| u64::try_from(end - start).unwrap())
+                .sum::<u64>()
+        );
+    }
+}
+
+#[test]
+fn non_cartesian_large_finite_language_remains_on_the_dense_route() {
+    let pattern = "(?:a|bb|ccc|dddd|eeeee|ffffff|ggggggg|hhhhhhhh|iiiiiiiii|jjjjjjjjjj|kkkkkkkkkkk|llllllllllll|mmmmmmmmmmmmm|nnnnnnnnnnnnnn|ooooooooooooooo|pppppppppppppppp|qqqqqqqqqqqqqqqqq)";
+    let haystack = b"a bb ccc dddd eeeee ffffff ggggggg hhhhhhhh iiiiiiiii qqqqqqqqqqqqqqqqq";
+    let expected = upstream_spans(pattern, haystack, false);
+    let plan = AggregateBuilder::new(pattern)
+        .profile(RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .build_count()
+        .unwrap();
+    assert_eq!(
+        plan.build_report().plan,
+        AggregatePlanKind::FiniteLiteralDfa
+    );
+    assert_eq!(
+        plan.count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        u64::try_from(expected.len()).unwrap()
+    );
 }
 
 #[test]
@@ -93,10 +171,8 @@ fn count_identity_and_accounting_are_closed() {
     };
     assert_eq!(accounting.identity, identity);
     assert_eq!(accounting.actual.input_bytes, HAYSTACK.len());
-    assert_eq!(
-        accounting.actual.transitions,
-        accounting.upper_bounds.transitions
-    );
+    assert!(accounting.actual.transitions <= accounting.upper_bounds.transitions);
+    assert!(accounting.actual.predicate_checks <= accounting.upper_bounds.predicate_checks);
     assert_eq!(accounting.actual.match_events, 3);
     assert_eq!(accounting.actual.count, 3);
     assert_eq!(accounting.actual.matched_bytes, expected_sum);
@@ -282,7 +358,7 @@ fn span_sum_compile_captures_and_exclusions_are_closed() {
             .unwrap()
             .build_report()
             .plan,
-        AggregatePlanKind::FiniteLiteralDfa
+        AggregatePlanKind::FixedPredicateWord64
     );
     assert_ne!(
         AggregateBuilder::new(PATTERN)
@@ -383,7 +459,7 @@ fn planner_work_is_cumulative_for_typed_and_dense_refusals() {
         captured.build_report().plan,
         AggregatePlanKind::FixedPredicateWord64
     );
-    assert_eq!(captured.build_report().capture_erasure_work, 6);
+    assert_eq!(captured.build_report().capture_erasure_work, 4);
 }
 
 #[test]
