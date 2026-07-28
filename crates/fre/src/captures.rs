@@ -2679,6 +2679,48 @@ impl CaptureRegex {
             .transpose()
     }
 
+    /// Return the exact source-free direct-operation envelope only after the
+    /// retained kernel, published report, and construction-owned Count route
+    /// authenticate one another.
+    pub fn retained_prefix_class_participation_prospective(
+        &self,
+        haystack_len: usize,
+    ) -> Result<Option<PrefixClassUniformParticipationProspective>, CaptureExecutionSource> {
+        let report_selects_direct =
+            self.report.plan_identity.plan == CapturePlanKind::UniformPrefixClassParticipation;
+        let report_identity = self.report.plan_identity.prefix_class_participation;
+        let report_build = self.report.prefix_class_participation;
+        let Some(plan) = self.prefix_class_participation.as_ref() else {
+            if report_selects_direct || report_identity.is_some() || report_build.is_some() {
+                return Err(CaptureExecutionSource::InternalInvariant(
+                    "direct capture report retained no direct owner",
+                ));
+            }
+            return Ok(None);
+        };
+        let Some(owner) = self.count_owner.as_ref() else {
+            return Err(CaptureExecutionSource::InternalInvariant(
+                "direct capture kernel retained no Count owner",
+            ));
+        };
+        let route = owner.identity();
+        if !report_selects_direct
+            || report_identity != Some(plan.identity())
+            || report_build != Some(plan.engine.uniform_participation_build_accounting())
+            || route.branch != CaptureCountBranch::DirectPrefixClassParticipation
+            || route.plan != self.report.plan_identity
+            || route.build_limits != self.build_limits
+        {
+            return Err(CaptureExecutionSource::InternalInvariant(
+                "direct capture kernel, report, and Count owner do not authenticate",
+            ));
+        }
+        plan.engine
+            .uniform_participation_prospective(haystack_len, plan.schema)
+            .map(Some)
+            .map_err(CaptureExecutionSource::PrefixClassParticipation)
+    }
+
     /// Recompute the exact source-independent envelope for one quotient
     /// replay. Plans that retained full persistent history return `Ok(None)`.
     pub fn participation_quotient_prospective(

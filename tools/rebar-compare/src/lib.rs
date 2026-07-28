@@ -5359,7 +5359,8 @@ fn authenticates_direct_capture_error(
     let Some(receipt) = error.prefix_class_participation_receipt.as_ref() else {
         return false;
     };
-    let Ok(Some(expected_prospective)) = regex.prefix_class_participation_prospective(haystack_len)
+    let Ok(Some(expected_prospective)) =
+        regex.retained_prefix_class_participation_prospective(haystack_len)
     else {
         return false;
     };
@@ -5394,7 +5395,8 @@ fn authenticates_direct_capture_success(
     ) else {
         return false;
     };
-    let Ok(Some(expected_prospective)) = regex.prefix_class_participation_prospective(haystack_len)
+    let Ok(Some(expected_prospective)) =
+        regex.retained_prefix_class_participation_prospective(haystack_len)
     else {
         return false;
     };
@@ -5623,11 +5625,105 @@ fn capture_build_limits(limits: &RunLimits) -> CaptureBuildLimits {
     }
 }
 
+fn project_direct_capture_run_limits(
+    prospective: Option<fre::PrefixClassUniformParticipationProspective>,
+    haystack_len: usize,
+    selector_work: usize,
+    selector_sequential_bytes: usize,
+    reducer_events: usize,
+    reducer_count: usize,
+    limits: &RunLimits,
+) -> Result<fre::PrefixClassUniformParticipationLimits, ExecutionError> {
+    let (
+        first_finder_bytes,
+        second_finder_bytes,
+        prefix_candidates,
+        start_arbitrations,
+        first_class_probes,
+        greedy_extension_reads,
+        results,
+        capture_count,
+        capture_events,
+        work,
+        operation_allocations,
+        operation_bytes,
+        scratch_bytes,
+        peak_bytes,
+    ) = if let Some(prospective) = prospective {
+        if prospective.haystack_bytes != haystack_len {
+            return Err(ExecutionError::fault(
+                "FRE retained direct-capture envelope changed its source length",
+            ));
+        }
+        (
+            prospective.first_finder_bytes,
+            prospective.second_finder_bytes,
+            prospective.prefix_candidates,
+            prospective.start_arbitrations,
+            prospective.first_class_probes,
+            prospective.greedy_extension_reads,
+            prospective.results,
+            prospective.capture_count,
+            prospective.capture_events,
+            prospective.work,
+            prospective.operation_allocations,
+            prospective.operation_bytes,
+            prospective.scratch_bytes,
+            prospective.peak_bytes,
+        )
+    } else {
+        (
+            haystack_len,
+            haystack_len,
+            checked_aggregate_mul(haystack_len, 2, "direct capture prefix candidates")?,
+            checked_aggregate_mul(haystack_len, 4, "direct capture start arbitrations")?,
+            checked_aggregate_mul(haystack_len, 2, "direct capture first-class probes")?,
+            checked_aggregate_mul(haystack_len, 2, "direct capture greedy extension reads")?,
+            haystack_len,
+            reducer_count,
+            reducer_events,
+            selector_work,
+            0,
+            0,
+            0,
+            limits.fre_aggregate_peak_bytes,
+        )
+    };
+    let finder_bytes = checked_aggregate_add(
+        first_finder_bytes,
+        second_finder_bytes,
+        "direct capture finder source bytes",
+    )?;
+    let (max_first_finder_bytes, max_second_finder_bytes) =
+        if finder_bytes <= selector_sequential_bytes {
+            (first_finder_bytes, second_finder_bytes)
+        } else {
+            (0, 0)
+        };
+    Ok(fre::PrefixClassUniformParticipationLimits {
+        max_work: work.min(selector_work),
+        max_first_finder_bytes,
+        max_second_finder_bytes,
+        max_prefix_candidates: prefix_candidates,
+        max_start_arbitrations: start_arbitrations,
+        max_first_class_probes: first_class_probes,
+        max_greedy_extension_reads: greedy_extension_reads,
+        max_results: results,
+        max_capture_count: capture_count.min(reducer_count),
+        max_capture_events: capture_events.min(reducer_events),
+        max_operation_allocations: operation_allocations,
+        max_operation_bytes: operation_bytes,
+        max_scratch_bytes: scratch_bytes,
+        max_peak_bytes: peak_bytes.min(limits.fre_aggregate_peak_bytes),
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "independent capture reducer ledgers remain explicit at each line invocation"
 )]
 fn capture_run_limits(
+    regex: &CaptureRegex,
     haystack_len: usize,
     selector_shape: ContinuationProgramShape,
     selector_work: usize,
@@ -5653,21 +5749,38 @@ fn capture_run_limits(
     selector.max_sequential_bytes = selector_sequential_bytes;
     selector.max_peak_bytes = limits.fre_aggregate_peak_bytes;
     selector.max_work = selector_work;
-    let direct_prefix_candidates =
-        checked_aggregate_mul(haystack_len, 2, "direct capture prefix candidates")?;
-    let direct_start_arbitrations =
-        checked_aggregate_mul(haystack_len, 4, "direct capture start arbitrations")?;
-    let direct_first_class_probes =
-        checked_aggregate_mul(haystack_len, 2, "direct capture first-class probes")?;
-    let direct_greedy_extension_reads =
-        checked_aggregate_mul(haystack_len, 2, "direct capture greedy extension reads")?;
-    let direct_finder_bytes =
-        checked_aggregate_mul(haystack_len, 2, "direct capture finder source bytes")?;
-    let admitted_finder_service = if direct_finder_bytes <= selector_sequential_bytes {
-        haystack_len
-    } else {
-        0
-    };
+    let direct_prospective = regex
+        .retained_prefix_class_participation_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE retained direct-capture preflight failed: {error}"
+            ))
+        })?;
+    let report_has_direct_identity = regex
+        .build_report()
+        .plan_identity
+        .prefix_class_participation
+        .is_some();
+    let report_has_direct_build = regex.build_report().prefix_class_participation.is_some();
+    let report_selects_direct =
+        regex.build_report().plan_identity.plan == CapturePlanKind::UniformPrefixClassParticipation;
+    if report_has_direct_identity != report_has_direct_build
+        || report_has_direct_identity != report_selects_direct
+        || report_has_direct_identity != direct_prospective.is_some()
+    {
+        return Err(ExecutionError::fault(
+            "FRE retained direct-capture owner/report binding is absent or transplanted",
+        ));
+    }
+    let prefix_class_participation = project_direct_capture_run_limits(
+        direct_prospective,
+        haystack_len,
+        selector_work,
+        selector_sequential_bytes,
+        reducer_events,
+        reducer_count,
+        limits,
+    )?;
     Ok(CaptureRunLimits {
         aggregate: CaptureAggregateLimits {
             per_search: CaptureSearchLimits {
@@ -5690,22 +5803,7 @@ fn capture_run_limits(
         },
         selector,
         max_combined_peak_bytes: limits.fre_aggregate_peak_bytes,
-        prefix_class_participation: fre::PrefixClassUniformParticipationLimits {
-            max_work: selector_work,
-            max_first_finder_bytes: admitted_finder_service,
-            max_second_finder_bytes: admitted_finder_service,
-            max_prefix_candidates: direct_prefix_candidates,
-            max_start_arbitrations: direct_start_arbitrations,
-            max_first_class_probes: direct_first_class_probes,
-            max_greedy_extension_reads: direct_greedy_extension_reads,
-            max_results: haystack_len,
-            max_capture_count: reducer_count,
-            max_capture_events: reducer_events,
-            max_operation_allocations: 0,
-            max_operation_bytes: 0,
-            max_scratch_bytes: 0,
-            max_peak_bytes: limits.fre_aggregate_peak_bytes,
-        },
+        prefix_class_participation,
     })
 }
 
@@ -5855,6 +5953,7 @@ fn capture_count_run_limits(
 ) -> Result<CaptureRunLimits, ExecutionError> {
     let (reducer, work) = capture_reducer_budget(limits)?;
     capture_run_limits(
+        regex,
         haystack_len,
         regex.build_report().selector.into(),
         work,
@@ -6858,6 +6957,7 @@ fn execute_grep_captures_inner(
             .checked_sub(history_walk)
             .ok_or_else(|| ExecutionError::fault("FRE capture walk accounting underflow"))?;
         let run_limits = capture_run_limits(
+            regex,
             line.len(),
             regex.build_report().selector.into(),
             selector_work_remaining,
@@ -15041,6 +15141,16 @@ mod tests {
         );
         let run_limits = capture_count_run_limits(&regex, input.haystack.len(), &limits)
             .expect("derive authenticated direct-capture limits");
+        let retained = regex
+            .retained_prefix_class_participation_prospective(input.haystack.len())
+            .expect("derive retained direct-capture envelope")
+            .expect("direct Rust-functions owner");
+        assert_eq!(
+            run_limits
+                .prefix_class_participation
+                .max_greedy_extension_reads,
+            retained.greedy_extension_reads
+        );
         let report = regex
             .count_captures(&input.haystack, run_limits)
             .expect("authenticated direct capture Count");
@@ -16771,6 +16881,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_capture_limits_project_retained_simd_physical_reads() {
+        let prospective = fre::PrefixClassUniformParticipationProspective {
+            haystack_bytes: 10,
+            shape_units: 3,
+            minimum_match_bytes: 4,
+            first_finder_bytes: 10,
+            second_finder_bytes: 10,
+            first_finder_candidates: 10,
+            second_finder_candidates: 10,
+            prefix_candidates: 20,
+            start_arbitrations: 40,
+            first_class_probes: 20,
+            greedy_extension_reads: 180,
+            results: 2,
+            capture_count: 4,
+            capture_events: 6,
+            work: 300,
+            operation_allocations: 0,
+            operation_bytes: 0,
+            scratch_bytes: 0,
+            persistent_bytes: 64,
+            peak_bytes: 64,
+        };
+        let projected = project_direct_capture_run_limits(
+            Some(prospective),
+            prospective.haystack_bytes,
+            250,
+            20,
+            5,
+            3,
+            &RunLimits::default(),
+        )
+        .expect("project retained dispatched envelope");
+        assert_eq!(projected.max_greedy_extension_reads, 180);
+        assert_eq!(projected.max_work, 250);
+        assert_eq!(projected.max_capture_count, 3);
+        assert_eq!(projected.max_capture_events, 5);
+        assert_eq!(projected.max_first_finder_bytes, 10);
+        assert_eq!(projected.max_second_finder_bytes, 10);
+
+        let sequential_one_below = project_direct_capture_run_limits(
+            Some(prospective),
+            prospective.haystack_bytes,
+            usize::MAX,
+            19,
+            usize::MAX,
+            usize::MAX,
+            &RunLimits::default(),
+        )
+        .expect("project one-below sequential policy");
+        assert_eq!(sequential_one_below.max_first_finder_bytes, 0);
+        assert_eq!(sequential_one_below.max_second_finder_bytes, 0);
+    }
+
+    #[test]
     fn rust_functions_direct_capture_lifecycle_is_eager_and_stable() {
         let pattern = r"fn is_(\w+)|fn as_(\w+)";
         let first = b"fn is_alpha fn as_beta ";
@@ -16813,6 +16978,20 @@ mod tests {
             .expect("direct capture artifact");
         let run_limits = capture_count_run_limits(&regex, haystack.len(), &adapter_limits)
             .expect("direct run limits");
+        let retained = regex
+            .retained_prefix_class_participation_prospective(haystack.len())
+            .expect("direct retained envelope")
+            .expect("direct artifact");
+        assert_eq!(
+            run_limits
+                .prefix_class_participation
+                .max_greedy_extension_reads,
+            retained.greedy_extension_reads
+        );
+        assert_eq!(
+            run_limits.prefix_class_participation.max_work,
+            retained.work
+        );
         let result = regex
             .count_captures(haystack, run_limits)
             .expect("direct capture result");
@@ -16839,6 +17018,30 @@ mod tests {
             .prefix_class_participation
             .expect("direct success accounting")
             .prospective;
+        assert_eq!(prospective, retained);
+        let mut greedy_one_below = run_limits;
+        greedy_one_below
+            .prefix_class_participation
+            .max_greedy_extension_reads = prospective.greedy_extension_reads - 1;
+        let greedy_terminal = regex
+            .count_captures(haystack, greedy_one_below)
+            .expect_err("direct greedy-extension one-below");
+        assert!(matches!(
+            greedy_terminal.source,
+            fre::CaptureExecutionSource::PrefixClassParticipation(
+                fre::PrefixClassUniformParticipationError::GreedyExtensionReadsLimit {
+                    needed,
+                    limit,
+                }
+            ) if needed == prospective.greedy_extension_reads
+                && limit == prospective.greedy_extension_reads - 1
+        ));
+        assert!(authenticates_direct_capture_error(
+            &regex,
+            haystack.len(),
+            &greedy_one_below,
+            &greedy_terminal
+        ));
         let mut one_below = run_limits;
         one_below.prefix_class_participation.max_work = prospective.work - 1;
         let terminal = regex
