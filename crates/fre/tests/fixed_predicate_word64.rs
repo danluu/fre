@@ -668,7 +668,10 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     let mut one_below = exact;
     one_below.finite_literal.max_transitions -= 1;
     assert!(matches!(
-        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        regex
+            .count_value(HAYSTACK, one_below)
+            .unwrap_err()
+            .source,
         AggregateExecutionSource::FixedPredicateWord64(
             FixedPredicateWord64ReduceError::InputLimit { needed, limit }
         ) if needed == upper.input_bytes && limit + 1 == needed
@@ -684,7 +687,10 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     one_below = exact;
     one_below.finite_literal.max_count -= 1;
     assert!(matches!(
-        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        regex
+            .count_value(HAYSTACK, one_below)
+            .unwrap_err()
+            .source,
         AggregateExecutionSource::FixedPredicateWord64(
             FixedPredicateWord64ReduceError::CountLimit { needed, limit }
         ) if needed == upper.count && limit + 1 == needed
@@ -692,7 +698,10 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     one_below = exact;
     one_below.finite_literal.max_reducer_steps -= 1;
     assert!(matches!(
-        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        regex
+            .count_value(HAYSTACK, one_below)
+            .unwrap_err()
+            .source,
         AggregateExecutionSource::FixedPredicateWord64(
             FixedPredicateWord64ReduceError::ReducerStepsLimit { needed, limit }
         ) if needed == upper.reducer_steps && limit + 1 == needed
@@ -700,14 +709,17 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     one_below = exact;
     one_below.finite_literal.max_total_work -= 1;
     assert!(matches!(
-        regex.count(HAYSTACK, one_below).unwrap_err().source,
+        regex
+            .count_value(HAYSTACK, one_below)
+            .unwrap_err()
+            .source,
         AggregateExecutionSource::FixedPredicateWord64(
             FixedPredicateWord64ReduceError::WorkLimit { needed, limit }
         ) if needed == upper.work && limit + 1 == needed
     ));
     one_below = exact;
     one_below.finite_literal.max_peak_bytes -= 1;
-    let error = regex.count(HAYSTACK, one_below).unwrap_err();
+    let error = regex.count_value(HAYSTACK, one_below).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(
         error
@@ -734,7 +746,7 @@ fn shared_run_envelope_is_exact_and_failures_are_typed() {
     let sum = builder().build_span_sum().unwrap();
     one_below = exact;
     one_below.finite_literal.max_span_sum -= 1;
-    let error = sum.span_sum(HAYSTACK, one_below).unwrap_err();
+    let error = sum.span_sum_value(HAYSTACK, one_below).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(
         error

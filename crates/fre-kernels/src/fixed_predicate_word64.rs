@@ -920,6 +920,12 @@ struct AnchorActual {
     match_events: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ValueReduction {
+    count: u64,
+    matched_bytes: u64,
+}
+
 impl Anchor {
     const fn identity(self) -> (Reducer, u8, [u8; 2]) {
         match self {
@@ -1368,6 +1374,23 @@ impl FixedPredicateWord64Plan {
         })
     }
 
+    /// Return only a successfully admitted count without materializing exact
+    /// execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments so failures
+    /// retain the complete typed resource identity.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let upper_bounds = self
+            .preflight(haystack.len(), Operation::Count, limits)
+            .ok()?;
+        self.execute_value(haystack, upper_bounds)
+            .map(|value| value.count)
+    }
+
     /// Sum the widths of successive leftmost non-overlapping matches.
     ///
     /// # Errors
@@ -1388,6 +1411,23 @@ impl FixedPredicateWord64Plan {
                 actual,
             },
         })
+    }
+
+    /// Return only a successfully admitted span sum without materializing
+    /// exact execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::span_sum`] with the same arguments so
+    /// failures retain the complete typed resource identity.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let upper_bounds = self
+            .preflight(haystack.len(), Operation::SpanSum, limits)
+            .ok()?;
+        self.execute_value(haystack, upper_bounds)
+            .map(|value| value.matched_bytes)
     }
 
     fn preflight(
@@ -1601,6 +1641,106 @@ impl FixedPredicateWord64Plan {
             }),
             Anchor::ShiftAnd => self.execute_shift_and(haystack, upper_bounds),
         }
+    }
+
+    #[inline]
+    fn execute_value(
+        &self,
+        haystack: &[u8],
+        upper_bounds: ReduceUpperBounds,
+    ) -> Option<ValueReduction> {
+        let count = match self.anchor {
+            Anchor::One { offset, byte } => {
+                self.scan_anchor_value(haystack, usize::from(offset), |bytes| memchr(byte, bytes))?
+            }
+            Anchor::Two {
+                offset,
+                first,
+                second,
+            } => self.scan_anchor_value(haystack, usize::from(offset), |bytes| {
+                memchr2(first, second, bytes)
+            })?,
+            Anchor::ShiftAnd => self.scan_shift_and_value(haystack)?,
+        };
+        let width = u64::try_from(self.width).ok()?;
+        let matched_bytes = count.checked_mul(width)?;
+        let match_events = usize::try_from(count).ok()?;
+        (upper_bounds.input_bytes == haystack.len()
+            && match_events <= upper_bounds.match_events
+            && count <= upper_bounds.count
+            && matched_bytes <= upper_bounds.span_sum)
+            .then_some(ValueReduction {
+                count,
+                matched_bytes,
+            })
+    }
+
+    #[inline]
+    fn scan_shift_and_value(&self, haystack: &[u8]) -> Option<u64> {
+        let mut state = 0_u64;
+        let mut count = 0_u64;
+        for &byte in haystack {
+            state = (state.wrapping_shl(1) | 1) & self.masks[usize::from(byte)];
+            if state & self.accepting_bit != 0 {
+                count = count.checked_add(1)?;
+                state = 0;
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn scan_anchor_value(
+        &self,
+        haystack: &[u8],
+        anchor_offset: usize,
+        mut find: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> Option<u64> {
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(anchor_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = anchor_offset.min(anchor_end);
+        let mut count = 0_u64;
+        while cursor < anchor_end {
+            let search = haystack.get(cursor..anchor_end)?;
+            let Some(relative) = find(search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative)?;
+            let start = anchor.checked_sub(anchor_offset)?;
+            if self.anchor_candidate_matches_value(haystack, start, anchor_offset)? {
+                count = count.checked_add(1)?;
+                cursor = anchor.checked_add(self.width)?;
+            } else {
+                cursor = anchor.checked_add(1)?;
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn anchor_candidate_matches_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        anchor_offset: usize,
+    ) -> Option<bool> {
+        let end = start.checked_add(self.width)?;
+        let candidate = haystack.get(start..end)?;
+        for (position, &byte) in candidate.iter().enumerate() {
+            if position == anchor_offset {
+                continue;
+            }
+            let shift = u32::try_from(position).ok()?;
+            let bit = 1_u64.checked_shl(shift)?;
+            if self.masks[usize::from(byte)] & bit == 0 {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     fn execute_shift_and(
@@ -2021,6 +2161,16 @@ mod tests {
                 let sum = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
                 assert_eq!(count.count, expected, "haystack={haystack:?}");
                 assert_eq!(sum.span_sum, expected.checked_mul(2).unwrap());
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "compact count haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    expected.checked_mul(2),
+                    "compact span sum haystack={haystack:?}"
+                );
                 assert!(actual_within_upper(
                     count.accounting.actual,
                     count.accounting.upper_bounds
@@ -2071,6 +2221,14 @@ mod tests {
                 .count,
             1
         );
+        assert_eq!(
+            dense.count_value_success(b"aaaaaa", ReduceLimits::unlimited()),
+            Some(2)
+        );
+        assert_eq!(
+            dense.span_sum_value_success(b"aaaaa", ReduceLimits::unlimited()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -2097,6 +2255,16 @@ mod tests {
                 let sum = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
                 assert_eq!(count.count, expected, "haystack={haystack:?}");
                 assert_eq!(sum.span_sum, expected.checked_mul(2).unwrap());
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "compact count haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    expected.checked_mul(2),
+                    "compact span sum haystack={haystack:?}"
+                );
                 assert_eq!(count.accounting.actual.transitions, haystack.len());
                 assert_eq!(count.accounting.actual.finder_calls, 0);
                 assert_eq!(count.accounting.actual.anchor_candidates, 0);
@@ -2105,6 +2273,48 @@ mod tests {
                     count.accounting.actual,
                     count.accounting.upper_bounds
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn one_byte_anchor_compact_values_match_exhaustive_reference() {
+        const LEFT: &[(u8, u8)] = &[(b'b', b'd')];
+        const ANCHOR: &[(u8, u8)] = &[(b'a', b'a')];
+        const RIGHT: &[(u8, u8)] = &[(b'c', b'e')];
+        let predicates = [LEFT, ANCHOR, RIGHT];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.operation_identity(Operation::Count).reducer,
+            Reducer::OneByteAnchor
+        );
+        let alphabet = [b'a', b'b', b'c', b'd', b'e', b'x', 0xFF];
+        for length in 0..=6 {
+            let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0_u8; length];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = naive_count(&haystack, &predicates);
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected),
+                    "compact count haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    expected.checked_mul(3),
+                    "compact span sum haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.count(&haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .count,
+                    expected,
+                    "receipt count haystack={haystack:?}"
+                );
             }
         }
     }
@@ -2163,6 +2373,14 @@ mod tests {
         assert!(count.accounting.actual.predicate_checks > 0);
         assert_eq!(count.accounting.actual.input_bytes, haystack.len());
         assert_eq!(count.accounting.actual.match_events, 3);
+        assert_eq!(
+            plan.count_value_success(haystack, ReduceLimits::unlimited()),
+            Some(3)
+        );
+        assert_eq!(
+            plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+            Some(45)
+        );
     }
 
     #[test]
@@ -2406,6 +2624,8 @@ mod tests {
         };
         let exact_result = plan.span_sum(haystack, exact).unwrap();
         assert_eq!(exact_result.span_sum, 6);
+        assert_eq!(plan.count_value_success(haystack, exact), Some(3));
+        assert_eq!(plan.span_sum_value_success(haystack, exact), Some(6));
         assert!(actual_within_upper(
             exact_result.accounting.actual,
             exact_result.accounting.upper_bounds
@@ -2438,14 +2658,18 @@ mod tests {
 
         macro_rules! assert_one_below {
             ($field:ident, $variant:ident) => {
+                let one_below = ReduceLimits {
+                    $field: exact.$field - 1,
+                    ..exact
+                };
+                assert_eq!(
+                    plan.span_sum_value_success(haystack, one_below),
+                    None,
+                    "compact path admitted one-below {}",
+                    stringify!($field)
+                );
                 assert!(matches!(
-                    plan.span_sum(
-                        haystack,
-                        ReduceLimits {
-                            $field: exact.$field - 1,
-                            ..exact
-                        }
-                    ),
+                    plan.span_sum(haystack, one_below),
                     Err(ReduceError::$variant { .. })
                 ));
             };

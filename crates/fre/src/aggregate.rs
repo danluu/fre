@@ -16420,6 +16420,32 @@ impl AggregatePlan {
         }
     }
 
+    #[inline(never)]
+    fn execute_fixed_predicate_count_value(
+        &self,
+        engine: &FixedPredicateWord64Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let reduce_limits = fixed_predicate_word64_reduce_limits(limits.finite_literal);
+        if let Some(value) = engine.count_value_success(haystack, reduce_limits) {
+            return Ok(value);
+        }
+        match engine.count(haystack, reduce_limits) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FixedPredicateWord64(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-predicate count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode count plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16450,6 +16476,9 @@ impl AggregatePlan {
             }
             AggregateEngine::Continuation(engine) => {
                 self.execute_continuation_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::FixedPredicateWord64(engine) => {
+                self.execute_fixed_predicate_count_value(engine, haystack, limits)
             }
             _ => self.execute_count_value_fallback(haystack, limits),
         }
@@ -16710,19 +16739,9 @@ impl AggregatePlan {
                         AggregateExecutionSource::GuardedUnicodeWord(Box::new(source)),
                     )
                 }),
-            AggregateEngine::FixedPredicateWord64(engine) => engine
-                .count(
-                    haystack,
-                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
-                )
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::FixedPredicateWord64(source),
-                    )
-                }),
+            AggregateEngine::FixedPredicateWord64(engine) => {
+                self.execute_fixed_predicate_count_value(engine, haystack, limits)
+            }
             AggregateEngine::Continuation(engine) => {
                 self.execute_continuation_count_value(engine, haystack, limits)
             }
@@ -16994,6 +17013,32 @@ impl AggregatePlan {
         }
     }
 
+    #[inline(never)]
+    fn execute_fixed_predicate_span_sum_value(
+        &self,
+        engine: &FixedPredicateWord64Plan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let reduce_limits = fixed_predicate_word64_reduce_limits(limits.finite_literal);
+        if let Some(value) = engine.span_sum_value_success(haystack, reduce_limits) {
+            return Ok(value);
+        }
+        match engine.span_sum(haystack, reduce_limits) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FixedPredicateWord64(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-predicate span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode span-sum plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -17024,6 +17069,9 @@ impl AggregatePlan {
             }
             AggregateEngine::Continuation(engine) => {
                 self.execute_continuation_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::FixedPredicateWord64(engine) => {
+                self.execute_fixed_predicate_span_sum_value(engine, haystack, limits)
             }
             _ => self.execute_span_sum_value_fallback(haystack, limits),
         }
@@ -17266,19 +17314,9 @@ impl AggregatePlan {
                         AggregateExecutionSource::GuardedUnicodeWord(Box::new(source)),
                     )
                 }),
-            AggregateEngine::FixedPredicateWord64(engine) => engine
-                .span_sum(
-                    haystack,
-                    fixed_predicate_word64_reduce_limits(limits.finite_literal),
-                )
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::FixedPredicateWord64(source),
-                    )
-                }),
+            AggregateEngine::FixedPredicateWord64(engine) => {
+                self.execute_fixed_predicate_span_sum_value(engine, haystack, limits)
+            }
             AggregateEngine::Continuation(engine) => {
                 self.execute_continuation_span_sum_value(engine, haystack, limits)
             }
