@@ -438,8 +438,7 @@ fn require_target() -> Result<(), DynError> {
         "requires the exact checked release-profile overrides",
     )?;
     require(
-        env::var("CARGO_ENCODED_RUSTFLAGS").as_deref()
-            == Ok(REQUIRED_ENCODED_RUSTFLAGS),
+        env::var("CARGO_ENCODED_RUSTFLAGS").as_deref() == Ok(REQUIRED_ENCODED_RUSTFLAGS),
         "requires exact native non-stripping CARGO_ENCODED_RUSTFLAGS",
     )?;
     let target_features = env::var("CARGO_CFG_TARGET_FEATURE")?;
