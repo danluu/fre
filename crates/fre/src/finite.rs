@@ -24,7 +24,7 @@ use crate::guarded_ascii_word::{
 
 const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 2;
 const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
-const FIXED_PREDICATE_MAX_RANGES: usize = 2;
+const FIXED_PREDICATE_MAX_RANGES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FiniteExtractionTerminal {
@@ -933,13 +933,13 @@ impl FixedPredicateWord64Source {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FixedPredicate(u32);
+struct FixedPredicate(u64);
 
 impl FixedPredicate {
     const EMPTY: Self = Self(0);
 
     fn singleton(byte: u8) -> Self {
-        Self(u32::from_le_bytes([byte | 0x80, byte, 0, 0]))
+        Self(u64::from_le_bytes([byte | 0x80, byte, 0, 0, 0, 0, 0, 0]))
     }
 
     fn from_ascii_class(class: &regex_syntax::hir::ClassBytes) -> Option<(Self, bool)> {
@@ -947,7 +947,7 @@ impl FixedPredicate {
         if ranges.is_empty() || ranges.len() > FIXED_PREDICATE_MAX_RANGES {
             return None;
         }
-        let mut encoded = [0_u8; 4];
+        let mut encoded = [0_u8; 8];
         let mut members = 0_usize;
         for (index, range) in ranges.iter().enumerate() {
             let start = range.start();
@@ -956,28 +956,36 @@ impl FixedPredicate {
                 return None;
             }
             let offset = index.checked_mul(2)?;
-            *encoded.get_mut(offset)? = start;
+            *encoded.get_mut(offset)? = start | 0x80;
             *encoded.get_mut(offset.checked_add(1)?)? = end;
             let inclusive_members = end.checked_sub(start)?.checked_add(1)?;
             members = members.checked_add(usize::from(inclusive_members))?;
         }
-        encoded[0] |= 0x80;
-        if ranges.len() == 2 {
-            encoded[2] |= 0x80;
-        }
-        Some((Self(u32::from_le_bytes(encoded)), members > 1))
+        Some((Self(u64::from_le_bytes(encoded)), members > 1))
     }
 
     fn ranges(self) -> FixedPredicateRanges {
         let encoded = self.0.to_le_bytes();
         debug_assert_ne!(encoded[0] & 0x80, 0);
+        let range_count = encoded
+            .chunks_exact(2)
+            .take_while(|range| range[0] & 0x80 != 0)
+            .count();
         FixedPredicateRanges {
             ranges: [
                 (encoded[0] & 0x7F, encoded[1]),
                 (encoded[2] & 0x7F, encoded[3]),
+                (encoded[4] & 0x7F, encoded[5]),
+                (encoded[6] & 0x7F, encoded[7]),
             ],
-            range_count: if encoded[2] & 0x80 == 0 { 1 } else { 2 },
+            range_count: u8::try_from(range_count)
+                .unwrap_or_else(|_| unreachable!("at most four ranges are encoded")),
         }
+    }
+
+    fn is_variable(self) -> bool {
+        let ranges = self.ranges();
+        ranges.ranges().len() > 1 || ranges.ranges().iter().any(|(start, end)| start != end)
     }
 }
 
@@ -1441,10 +1449,19 @@ fn inspect_fixed_predicate_word64(
 ) -> Result<Option<FixedPredicateWord64Source>, BuildError> {
     let mut tasks = AccountedVec::new(context, FiniteStorage::Scratch);
     tasks.reserve_planner(1, "fixed-predicate task stack")?;
-    tasks.push_reserved(hir)?;
+    tasks.push_reserved(FixedPredicateTask::Visit(hir))?;
     let mut source = FixedPredicateWord64Source::EMPTY;
-    while let Some(node) = tasks.pop() {
+    while let Some(task) = tasks.pop() {
         context.charge(1)?;
+        let node = match task {
+            FixedPredicateTask::Visit(node) => node,
+            FixedPredicateTask::FinishExactRepetition { start, repetitions } => {
+                if !repeat_fixed_predicate_suffix(&mut source, start, repetitions, context)? {
+                    return Ok(None);
+                }
+                continue;
+            }
+        };
         source.hir_nodes = source
             .hir_nodes
             .checked_add(1)
@@ -1461,11 +1478,32 @@ fn inspect_fixed_predicate_word64(
                             "fixed-predicate capture accounting overflow",
                         ))?;
                 tasks.reserve_planner(1, "fixed-predicate task stack")?;
-                tasks.push_reserved(capture.sub.as_ref())?;
+                tasks.push_reserved(FixedPredicateTask::Visit(capture.sub.as_ref()))?;
             }
             HirKind::Concat(children) if !children.is_empty() => {
                 tasks.reserve_planner(children.len(), "fixed-predicate task stack")?;
-                tasks.extend_reserved(children.iter().rev(), children.len())?;
+                tasks.extend_reserved(
+                    children.iter().rev().map(FixedPredicateTask::Visit),
+                    children.len(),
+                )?;
+            }
+            HirKind::Repetition(repetition)
+                if repetition.max == Some(repetition.min) && repetition.min > 0 =>
+            {
+                let repetitions = usize::try_from(repetition.min).map_err(|_| {
+                    BuildError::InternalInvariant(
+                        "fixed-predicate exact repetition does not fit usize",
+                    )
+                })?;
+                if repetitions > FIXED_PREDICATE_WORD64_MAX_WIDTH {
+                    return Ok(None);
+                }
+                tasks.reserve_planner(2, "fixed-predicate exact repetition tasks")?;
+                tasks.push_reserved(FixedPredicateTask::FinishExactRepetition {
+                    start: source.width(),
+                    repetitions,
+                })?;
+                tasks.push_reserved(FixedPredicateTask::Visit(repetition.sub.as_ref()))?;
             }
             HirKind::Literal(literal) if !literal.0.is_empty() => {
                 if !push_fixed_ascii_literal(&mut source, &literal.0, context)? {
@@ -1484,6 +1522,55 @@ fn inspect_fixed_predicate_word64(
         return Ok(None);
     }
     Ok(Some(source))
+}
+
+#[derive(Clone, Copy)]
+enum FixedPredicateTask<'hir> {
+    Visit(&'hir Hir),
+    FinishExactRepetition { start: usize, repetitions: usize },
+}
+
+fn repeat_fixed_predicate_suffix(
+    source: &mut FixedPredicateWord64Source,
+    start: usize,
+    repetitions: usize,
+    context: &FiniteExtractionContext,
+) -> Result<bool, BuildError> {
+    let end = source.width();
+    let Some(width) = end.checked_sub(start) else {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate repetition suffix start exceeded current width",
+        ));
+    };
+    if width == 0 || repetitions == 0 {
+        return Ok(false);
+    }
+    let Some(total_width) = width
+        .checked_mul(repetitions)
+        .and_then(|repeated| start.checked_add(repeated))
+    else {
+        return Err(BuildError::InternalInvariant(
+            "fixed-predicate exact repetition width overflow",
+        ));
+    };
+    if total_width > FIXED_PREDICATE_WORD64_MAX_WIDTH {
+        return Ok(false);
+    }
+    let additional = total_width
+        .checked_sub(end)
+        .ok_or(BuildError::InternalInvariant(
+            "fixed-predicate exact repetition shrank its source",
+        ))?;
+    context.charge(u64::try_from(additional).unwrap_or(u64::MAX))?;
+    for _ in 1..repetitions {
+        for index in start..end {
+            let predicate = source.positions[index];
+            if !source.push(predicate, predicate.is_variable())? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn push_fixed_ascii_literal(
@@ -4793,9 +4880,25 @@ mod tests {
             two_ranged.positions().next().unwrap().ranges(),
             &[(b'A', b'Z'), (b'a', b'z')]
         );
+        let four_ranged = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[aceg]x"),
+            0,
+            u64::MAX,
+        );
+        assert_eq!(
+            four_ranged
+                .unwrap()
+                .source
+                .expect("four bounded ASCII ranges remain inline")
+                .positions()
+                .next()
+                .unwrap()
+                .ranges(),
+            &[(b'a', b'a'), (b'c', b'c'), (b'e', b'e'), (b'g', b'g')]
+        );
         assert!(
             super::inspect_fixed_predicate_word64_after_finite_refusal(
-                &parse("[ace]x"),
+                &parse("[acegi]x"),
                 0,
                 u64::MAX,
             )
@@ -4803,5 +4906,37 @@ mod tests {
             .source
             .is_none()
         );
+    }
+
+    #[test]
+    fn compact_predicate_inspection_expands_exact_repetitions_within_word_width() {
+        let source = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse(r"[A-Za-z0-9_]{5}[ \t\n\r\u{B}\u{C}]\w{6}\s\w{7}"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("exact ASCII class repetitions form one fixed predicate word");
+        assert_eq!(source.width(), 20);
+        assert_eq!(source.variable_predicates(), 20);
+        assert_eq!(
+            source.positions().next().unwrap().ranges(),
+            &[(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')]
+        );
+
+        for pattern in [r"[ab]{0}", r"[ab]{2,3}", r"[ab]{65}", r"(?:[ab]{8}){9}"] {
+            assert!(
+                super::inspect_fixed_predicate_word64_after_finite_refusal(
+                    &parse(pattern),
+                    0,
+                    u64::MAX,
+                )
+                .unwrap()
+                .source
+                .is_none(),
+                "{pattern} must remain outside the fixed-width word"
+            );
+        }
     }
 }

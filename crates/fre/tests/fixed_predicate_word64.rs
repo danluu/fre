@@ -88,6 +88,55 @@ fn dense_finite_cartesian_words_select_the_authenticated_anchor_route() {
 }
 
 #[test]
+fn exact_repeated_ascii_classes_select_one_retained_predicate_word() {
+    let pattern = r"\w{5}\s\w{6}\s\w{7}";
+    let haystack =
+        b"alpha bravo1 charlie; short words miss; alpha\tbravo1\ncharlie; alpha bravo1 charlie";
+    let expected = upstream_spans(pattern, haystack, false);
+    assert_eq!(expected.len(), 3);
+    let build = || {
+        AggregateBuilder::new(pattern)
+            .profile(RustProfile::rebar_1_12_4())
+            .unicode(false)
+    };
+
+    let count = build().build_count().unwrap();
+    assert_eq!(
+        count.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64,
+        "{:#?}",
+        count.build_report()
+    );
+    let AggregatePlanIdentity::FixedPredicateWord64(identity) = count.build_report().plan_identity
+    else {
+        panic!("exact repeated classes selected another identity");
+    };
+    assert_eq!(identity.width, 20);
+    assert_eq!(identity.reducer, FixedPredicateWord64Reducer::ShiftAnd);
+    assert_eq!(
+        count
+            .count_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        u64::try_from(expected.len()).unwrap()
+    );
+
+    let span_sum = build().build_span_sum().unwrap();
+    assert_eq!(
+        span_sum.build_report().plan,
+        AggregatePlanKind::FixedPredicateWord64
+    );
+    assert_eq!(
+        span_sum
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected
+            .iter()
+            .map(|(start, end)| u64::try_from(end - start).unwrap())
+            .sum::<u64>()
+    );
+}
+
+#[test]
 fn non_cartesian_large_finite_language_remains_on_the_dense_route() {
     let pattern = "(?:a|bb|ccc|dddd|eeeee|ffffff|ggggggg|hhhhhhhh|iiiiiiiii|jjjjjjjjjj|kkkkkkkkkkk|llllllllllll|mmmmmmmmmmmmm|nnnnnnnnnnnnnn|ooooooooooooooo|pppppppppppppppp|qqqqqqqqqqqqqqqqq)";
     let haystack = b"a bb ccc dddd eeeee ffffff ggggggg hhhhhhhh iiiiiiiii qqqqqqqqqqqqqqqqq";
