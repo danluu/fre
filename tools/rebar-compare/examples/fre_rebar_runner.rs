@@ -76,7 +76,7 @@ fn main() -> Result<(), DynError> {
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 let simd_capabilities = SimdDispatchContext::capture().capabilities();
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1 report={REPORT_SCHEMA} aggregate-explain=38 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter=fre-current-aggregate-capture-v41-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v1-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1 report={REPORT_SCHEMA} aggregate-explain=39 aggregate-many-explain=3 aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
                     env!("CARGO_PKG_VERSION"),
                     simd_dispatch_profile().name(),
                     simd_capabilities.architecture(),
@@ -625,6 +625,9 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         ("compile", AggregatePlanKind::FiniteLiteralDfa, false) => {
             "compile-aggregate-finite-literal-dfa"
         }
+        ("compile", AggregatePlanKind::PackedFiniteLiteral, _) => {
+            "compile-aggregate-finite-literal-packed-v1"
+        }
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
         }
@@ -653,6 +656,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::FixedAbsoluteDomain, _) => "aggregate-fixed-absolute-domain",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v1",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -3011,6 +3015,64 @@ mod tests {
         );
         current_fre_rebar_validate_aggregate_identity(compile.build_report(), true, "compile")
             .expect("Unicode scalar compile identity");
+    }
+
+    #[test]
+    fn authenticates_packed_finite_plan_names() {
+        let benchmark = Benchmark {
+            name: "test/packed-finite".to_owned(),
+            model: "count".to_owned(),
+            patterns: vec![r"(?:cat|dog)".to_owned()],
+            case_insensitive: false,
+            unicode: false,
+            haystack: b"cat x dog".to_vec(),
+            max_iters: 1,
+            max_warmup_iters: 0,
+            max_time: Duration::from_secs(1),
+            max_warmup_time: Duration::ZERO,
+        };
+
+        let count = aggregate_builder(&benchmark)
+            .build_count()
+            .expect("packed finite count plan");
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::PackedFiniteLiteral
+        );
+        assert!(matches!(
+            count.build_report().build,
+            AggregateBuildAccounting::PackedFiniteLiteral(_)
+        ));
+        assert_eq!(
+            aggregate_plan("count", count.build_report()),
+            "aggregate-finite-literal-packed-v1"
+        );
+        current_fre_rebar_validate_aggregate_identity(count.build_report(), false, "count")
+            .expect("packed finite count identity");
+
+        let span_sum = aggregate_builder(&benchmark)
+            .build_span_sum()
+            .expect("packed finite span-sum plan");
+        assert_eq!(
+            aggregate_plan("count-spans", span_sum.build_report()),
+            "aggregate-finite-literal-packed-v1"
+        );
+        current_fre_rebar_validate_aggregate_identity(
+            span_sum.build_report(),
+            false,
+            "count-spans",
+        )
+        .expect("packed finite span-sum identity");
+
+        let compile = aggregate_builder(&benchmark)
+            .build_compile()
+            .expect("packed finite compile plan");
+        assert_eq!(
+            aggregate_plan("compile", compile.build_report()),
+            "compile-aggregate-finite-literal-packed-v1"
+        );
+        current_fre_rebar_validate_aggregate_identity(compile.build_report(), false, "compile")
+            .expect("packed finite compile identity");
     }
 
     #[test]

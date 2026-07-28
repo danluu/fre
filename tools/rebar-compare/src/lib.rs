@@ -206,7 +206,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v41-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v1-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -551,6 +551,12 @@ impl CandidateAdapter for CurrentFreAdapter {
                 .to_string(),
             runtime_sha256,
         };
+        identity.identity.push_str(
+            "; finite-packed-v1 selects a bounded packed literal scanner as a distinct physical finite-language plan before dense construction",
+        );
+        identity.availability.push_str(
+            "; eligible small nonempty finite literal languages use the bounded packed scanner under the existing finite build and run envelope",
+        );
         identity.identity.push_str(
             "; unicode-casefold-suffix-domain-v2 retains at most eight canonical terminal Unicode scalars as exact UTF-8 candidate domains while the original scalar continuation program remains the semantic authority, derives route storage P from intrinsic engine limits before caller-policy refusal while observed work stays caller-capped, and receipt-meters every logical required-suffix-row construction and replay source read",
         );
@@ -2172,6 +2178,9 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         ("compile", AggregatePlanKind::FiniteLiteralDfa, false) => {
             "compile-aggregate-finite-literal-dfa"
         }
+        ("compile", AggregatePlanKind::PackedFiniteLiteral, _) => {
+            "compile-aggregate-finite-literal-packed-v1"
+        }
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
         }
@@ -2200,6 +2209,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::BoundedLiteralPair, _) => "aggregate-bounded-literal-pair-v1",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
+        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v1",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -4366,6 +4376,7 @@ fn composite_build_work(report: &AggregateBuildReport) -> Result<u64, ExecutionE
     work = composite_checked_add(work, report.finite_planner_work, "finite planner work")?;
     let selected = match report.build {
         AggregateBuildAccounting::FiniteLiteral(build) => build.build_work_upper_bound,
+        AggregateBuildAccounting::PackedFiniteLiteral(build) => build.build_work_upper_bound,
         AggregateBuildAccounting::SparseFiniteLiteral(build) => build.build_work,
         AggregateBuildAccounting::FixedAbsoluteDomain(_) => {
             let build = report
@@ -4421,6 +4432,7 @@ fn require_composite_build_plan_identity(
         AggregateOperation::Count => matches!(
             report.build,
             AggregateBuildAccounting::FiniteLiteral(_)
+                | AggregateBuildAccounting::PackedFiniteLiteral(_)
                 | AggregateBuildAccounting::SparseFiniteLiteral(_)
         ),
         AggregateOperation::Spans => {
@@ -4445,6 +4457,9 @@ fn require_composite_count_minimum_identity(
             !build.has_empty_pattern
                 && build.min_nonempty_pattern_bytes == Some(minimum_match_bytes)
         }
+        AggregateBuildAccounting::PackedFiniteLiteral(build) => {
+            build.min_pattern_bytes == minimum_match_bytes
+        }
         AggregateBuildAccounting::SparseFiniteLiteral(build) => {
             !build.has_empty_pattern
                 && build.min_nonempty_pattern_bytes == Some(minimum_match_bytes)
@@ -4465,6 +4480,11 @@ fn composite_component_build_peak(report: &AggregateBuildReport) -> Result<usize
             build.persistent_bytes,
             build.peak_bytes,
             build.persistent_bytes.checked_add(build.scratch_bytes) == Some(build.peak_bytes),
+        ),
+        AggregateBuildAccounting::PackedFiniteLiteral(build) => (
+            build.persistent_bytes,
+            build.build_peak_upper_bound,
+            build.build_peak_upper_bound >= build.persistent_bytes,
         ),
         AggregateBuildAccounting::SparseFiniteLiteral(build) => (
             build.persistent_bytes,
@@ -4557,6 +4577,28 @@ fn charge_count_execution(
                 actual.match_events,
                 actual.peak_bytes,
             )
+        }
+        AggregateExecutionDetails::PackedFiniteLiteral {
+            upper_bounds,
+            actual,
+        } => {
+            if actual.work > upper_bounds.work
+                || actual.match_events
+                    > composite_u64(upper_bounds.match_events, "packed match events")?
+                || actual.iterator_next_calls > upper_bounds.reducer_steps
+                || actual.classified_positions != upper_bounds.candidate_positions
+                || actual.candidate_events > upper_bounds.candidate_positions
+                || actual.pattern_checks > upper_bounds.pattern_checks
+                || actual.source_byte_reads != upper_bounds.source_byte_reads
+                || actual.scratch_bytes > upper_bounds.scratch_bytes
+                || actual.peak_bytes > upper_bounds.peak_bytes
+                || actual.count != Some(value)
+            {
+                return Err(ExecutionError::fault(
+                    "regex-redux packed finite execution accounting mismatch",
+                ));
+            }
+            (upper_bounds.work, actual.match_events, actual.peak_bytes)
         }
         AggregateExecutionDetails::SparseFiniteLiteral {
             upper_bounds,
@@ -8896,6 +8938,50 @@ fn ordered_literal_operation_limits(
     })
 }
 
+fn packed_ordered_literal_operation_limits(
+    haystack_len: usize,
+    build: fre::PackedOrderedLiteralAggregateBuildAccounting,
+    limits: &RunLimits,
+) -> Result<OrderedLiteralAggregateReduceLimits, ExecutionError> {
+    if build.min_pattern_bytes == 0 {
+        return Err(ExecutionError::fault(
+            "FRE packed finite literal minimum is zero",
+        ));
+    }
+    let match_events = haystack_len
+        .checked_div(build.min_pattern_bytes)
+        .ok_or_else(|| ExecutionError::fault("FRE packed finite literal minimum is zero"))?;
+    let candidate_positions = if haystack_len < build.min_pattern_bytes {
+        0
+    } else {
+        haystack_len
+            .checked_sub(build.min_pattern_bytes)
+            .and_then(|remaining| remaining.checked_add(1))
+            .ok_or_else(|| {
+                ExecutionError::fault("FRE packed finite candidate-position bound overflow")
+            })?
+    };
+    let reducer_steps = candidate_positions
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE packed finite reducer-step bound overflow"))?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
+    let count = u64::try_from(match_events)
+        .map_err(|_| ExecutionError::fault("FRE packed finite count bound does not fit u64"))?;
+    Ok(OrderedLiteralAggregateReduceLimits {
+        max_transitions: haystack_len,
+        max_match_events: match_events.min(reducer_limit),
+        max_count: count.min(limits.reducer_steps),
+        max_span_sum: u64::try_from(haystack_len)
+            .map_err(|_| ExecutionError::fault("FRE packed finite span bound does not fit u64"))?,
+        max_reducer_steps: reducer_steps.min(reducer_limit),
+        max_ring_initializations: 0,
+        max_total_work: limits.fre_aggregate_operation_work,
+        max_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+    })
+}
+
 fn sparse_ordered_literal_operation_limits(
     haystack_len: usize,
     build: fre::SparseOrderedLiteralAggregateBuildAccounting,
@@ -9554,6 +9640,30 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
+        AggregateBuildAccounting::PackedFiniteLiteral(build) => Ok(AggregateRunLimits {
+            exact_literal: inactive_literal_operation_limits(limits),
+            unicode_scalar: inactive_unicode_scalar_operation_limits(),
+            word_run: inactive_word_run_operation_limits(),
+            literal_assertions: inactive_literal_assertions_operation_limits(),
+            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+            token_phrase: inactive_token_phrase_operation_limits(),
+            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+            bounded_context: inactive_bounded_context_operation_limits(),
+            fixed_absolute: inactive_fixed_absolute_operation_limits(),
+            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+            finite_literal: packed_ordered_literal_operation_limits(haystack_len, build, limits)?,
+            continuation: continuation_operation_limits(
+                haystack_len,
+                inactive_continuation_shape(),
+                limits,
+            )?,
+        }),
         AggregateBuildAccounting::SparseFiniteLiteral(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
@@ -9729,13 +9839,16 @@ fn finite_plan_identity_matches(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> bool {
-    let (dense_finite_operation, sparse_finite_operation) = match operation {
+    let (dense_finite_operation, packed_finite_operation, sparse_finite_operation) = match operation
+    {
         LiteralAggregateOperation::Count => (
             ORDERED_LITERAL_COUNT_PLAN_ID,
+            fre::PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
             SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
         ),
         LiteralAggregateOperation::SpanSum => (
             ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+            fre::PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
             SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
         ),
     };
@@ -9746,6 +9859,8 @@ fn finite_plan_identity_matches(
     };
     let representation_matches = (identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
         && identity.operation == dense_finite_operation)
+        || (identity.algorithm == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+            && identity.operation == packed_finite_operation)
         || (identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
             && identity.operation == sparse_finite_operation);
     identity.semantics == expected_semantics && representation_matches
@@ -10683,7 +10798,23 @@ fn require_unicode_plan_identity(
         )));
     }
     if let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity {
-        if finite_plan_identity_matches(identity, unicode, operation) {
+        let representation_matches = matches!(
+            (report.plan, report.build, identity.algorithm),
+            (
+                AggregatePlanKind::FiniteLiteralDfa,
+                AggregateBuildAccounting::FiniteLiteral(_),
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+            ) | (
+                AggregatePlanKind::PackedFiniteLiteral,
+                AggregateBuildAccounting::PackedFiniteLiteral(_),
+                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+            ) | (
+                AggregatePlanKind::FiniteLiteralDfa,
+                AggregateBuildAccounting::SparseFiniteLiteral(_),
+                SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+            )
+        );
+        if representation_matches && finite_plan_identity_matches(identity, unicode, operation) {
             return Ok(());
         }
         return Err(ExecutionError::fault(format!(
@@ -11705,6 +11836,24 @@ fn sparse_ordered_literal_build_error(
     }
 }
 
+fn packed_ordered_literal_build_error(
+    source: &fre::PackedOrderedLiteralAggregateBuildError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        fre::PackedOrderedLiteralAggregateBuildError::PatternLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::PatternBytesLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::TotalPatternBytesLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::IdentityLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::WorkLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::BuildPeakLimit { .. }
+        | fre::PackedOrderedLiteralAggregateBuildError::PersistentLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
 fn sparse_ordered_literal_reduce_error(
     source: &SparseOrderedLiteralAggregateReduceError,
     message: String,
@@ -11722,6 +11871,24 @@ fn sparse_ordered_literal_reduce_error(
         | SparseOrderedLiteralAggregateReduceError::TotalWorkLimit { .. }
         | SparseOrderedLiteralAggregateReduceError::ScratchLimit { .. }
         | SparseOrderedLiteralAggregateReduceError::PeakLimit { .. } => {
+            ExecutionError::unsupported(message)
+        }
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn packed_ordered_literal_reduce_error(
+    source: &fre::PackedOrderedLiteralAggregateReduceError,
+    message: String,
+) -> ExecutionError {
+    match source {
+        fre::PackedOrderedLiteralAggregateReduceError::WorkLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::MatchEventsLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::CountLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::SpanSumLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::ReducerStepsLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::ScratchLimit { .. }
+        | fre::PackedOrderedLiteralAggregateReduceError::PeakLimit { .. } => {
             ExecutionError::unsupported(message)
         }
         _ => ExecutionError::fault(message),
@@ -11924,6 +12091,9 @@ fn aggregate_execution_error(source: &AggregateExecutionSource, message: String)
         | AggregateExecutionSource::InternalInvariant(_) => ExecutionError::fault(message),
         AggregateExecutionSource::FiniteLiteral(source) => {
             ordered_literal_many_reduce_error(source, message)
+        }
+        AggregateExecutionSource::PackedFiniteLiteral(source) => {
+            packed_ordered_literal_reduce_error(source, message)
         }
         AggregateExecutionSource::SparseFiniteLiteral(source) => {
             sparse_ordered_literal_reduce_error(source, message)
@@ -12149,6 +12319,9 @@ fn aggregate_build_error(error: &AggregateBuildError) -> ExecutionError {
         ),
         AggregateBuildError::FiniteLiteralBuild { source, .. } => {
             ordered_literal_many_build_error(source, message)
+        }
+        AggregateBuildError::PackedFiniteLiteralBuild { source, .. } => {
+            packed_ordered_literal_build_error(source, message)
         }
         AggregateBuildError::SparseFiniteLiteralBuild { source, .. } => {
             sparse_ordered_literal_build_error(source, message)
@@ -14482,6 +14655,10 @@ mod tests {
                     Some(build.peak_bytes)
                 );
                 build.peak_bytes
+            }
+            AggregateBuildAccounting::PackedFiniteLiteral(build) => {
+                assert!(build.build_peak_upper_bound >= build.persistent_bytes);
+                build.build_peak_upper_bound
             }
             AggregateBuildAccounting::SparseFiniteLiteral(build) => {
                 assert!(build.peak_bytes >= build.persistent_bytes);
@@ -19251,7 +19428,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v40-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v41-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v1-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -19265,6 +19442,8 @@ mod tests {
                 .contains("canonical terminal-scalar encodings")
         );
         assert!(identity.identity.contains("fixed class-sandwich"));
+        assert!(identity.identity.contains("finite-packed-v1"));
+        assert!(identity.availability.contains("bounded packed scanner"));
         assert!(
             identity
                 .identity
@@ -19634,7 +19813,7 @@ mod tests {
                 &limits,
             ),
             2,
-            "aggregate-finite-literal-dfa",
+            "aggregate-finite-literal-packed-v1",
         );
         assert_current_fre_execution(
             current_fre(
@@ -19646,7 +19825,7 @@ mod tests {
                 &limits,
             ),
             6,
-            "aggregate-finite-literal-dfa",
+            "aggregate-finite-literal-packed-v1",
         );
 
         assert_current_fre_execution(
@@ -19661,6 +19840,112 @@ mod tests {
             2,
             "capture-linear-selector-uniform-participation",
         );
+    }
+
+    #[test]
+    fn current_fre_packed_finite_route_has_exact_labels_identity_and_limits() {
+        let pattern = r"(?:cat|dog)";
+        let haystack = b"catdogxxxx";
+
+        let count = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_count()
+            .expect("packed finite count plan");
+        let count_report = count.build_report();
+        assert_eq!(count_report.plan, AggregatePlanKind::PackedFiniteLiteral);
+        let AggregateBuildAccounting::PackedFiniteLiteral(build) = count_report.build else {
+            panic!("packed finite count plan lost packed build accounting");
+        };
+        assert_eq!(build.min_pattern_bytes, 3);
+        current_fre_rebar_validate_aggregate_identity(count_report, false, "count")
+            .expect("packed finite count identity");
+        assert_eq!(
+            aggregate_single_plan_label("count", count_report),
+            "aggregate-finite-literal-packed-v1"
+        );
+
+        let count_limits = current_fre_rebar_aggregate_run_limits(haystack.len(), count_report)
+            .expect("packed finite count limits");
+        assert_eq!(count_limits.finite_literal.max_match_events, 3);
+        assert_eq!(count_limits.finite_literal.max_reducer_steps, 9);
+        let one_below = aggregate_run_limits(
+            haystack.len(),
+            count_report,
+            &RunLimits {
+                reducer_steps: 8,
+                ..RunLimits::default()
+            },
+        )
+        .expect("one-below packed finite count limits");
+        assert_eq!(one_below.finite_literal.max_reducer_steps, 8);
+        let refusal = count
+            .count(haystack, one_below)
+            .expect_err("one below packed candidate steps");
+        assert!(matches!(
+            refusal.source,
+            AggregateExecutionSource::PackedFiniteLiteral(
+                fre::PackedOrderedLiteralAggregateReduceError::ReducerStepsLimit {
+                    needed: 9,
+                    limit: 8,
+                }
+            )
+        ));
+        let counted = count
+            .count(haystack, count_limits)
+            .expect("packed finite count");
+        assert_eq!(counted.value(), 2);
+        let AggregateExecutionDetails::PackedFiniteLiteral {
+            upper_bounds,
+            actual,
+        } = counted.report().details()
+        else {
+            panic!("packed finite count lost packed execution details");
+        };
+        assert_eq!(upper_bounds.candidate_positions, 8);
+        assert_eq!(upper_bounds.reducer_steps, 9);
+        assert_eq!(actual.classified_positions, 8);
+        assert!(actual.candidate_events <= upper_bounds.candidate_positions);
+        assert!(actual.pattern_checks <= upper_bounds.pattern_checks);
+        assert_eq!(actual.source_byte_reads, upper_bounds.source_byte_reads);
+        assert!(actual.work <= upper_bounds.work);
+
+        let span_sum = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_span_sum()
+            .expect("packed finite span-sum plan");
+        current_fre_rebar_validate_aggregate_identity(
+            span_sum.build_report(),
+            false,
+            "count-spans",
+        )
+        .expect("packed finite span-sum identity");
+        assert_eq!(
+            aggregate_single_plan_label("count-spans", span_sum.build_report()),
+            "aggregate-finite-literal-packed-v1"
+        );
+        let span_limits = current_fre_rebar_span_sum_run_limits(haystack.len(), &span_sum)
+            .expect("packed finite span-sum limits");
+        let spanned = span_sum
+            .span_sum(haystack, span_limits)
+            .expect("packed finite span sum");
+        assert_eq!(spanned.value(), 6);
+        assert!(matches!(
+            spanned.report().details(),
+            AggregateExecutionDetails::PackedFiniteLiteral { .. }
+        ));
+
+        let compile = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_compile()
+            .expect("packed finite compile plan");
+        current_fre_rebar_validate_aggregate_identity(compile.build_report(), false, "compile")
+            .expect("packed finite compile identity");
+        assert_eq!(
+            aggregate_single_plan_label("compile", compile.build_report()),
+            "compile-aggregate-finite-literal-packed-v1"
+        );
+
+        let mut forged = count_report.clone();
+        forged.plan = AggregatePlanKind::FiniteLiteralDfa;
+        assert!(current_fre_rebar_validate_aggregate_identity(&forged, false, "count").is_err());
+        assert!(current_fre_rebar_aggregate_run_limits(haystack.len(), &forged).is_err());
     }
 
     #[test]
@@ -19740,7 +20025,7 @@ mod tests {
     }
 
     #[test]
-    fn current_fre_unicode_finite_literals_use_the_shared_dfa() {
+    fn current_fre_unicode_finite_literals_use_the_packed_scanner() {
         let limits = RunLimits::default();
         let haystack = "--∞--✓--∞--".as_bytes();
         assert_current_fre_execution(
@@ -19753,7 +20038,7 @@ mod tests {
                 &limits,
             ),
             3,
-            "aggregate-finite-literal-dfa",
+            "aggregate-finite-literal-packed-v1",
         );
         assert_current_fre_execution(
             current_fre(
@@ -19765,7 +20050,7 @@ mod tests {
                 &limits,
             ),
             9,
-            "aggregate-finite-literal-dfa",
+            "aggregate-finite-literal-packed-v1",
         );
     }
 
@@ -20538,7 +20823,7 @@ mod tests {
             true,
             &limits,
         );
-        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-dfa");
+        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-packed-v1");
         assert_current_fre_execution(
             current_fre(
                 "count",
@@ -22341,7 +22626,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_identity_requires_matching_dense_or_sparse_algorithm_operation_pair() {
+    fn finite_identity_requires_matching_dense_packed_or_sparse_algorithm_operation_pair() {
         let identity = |algorithm, operation| AggregateFiniteLiteralIdentity {
             semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
             algorithm,
@@ -22363,6 +22648,22 @@ mod tests {
             true,
             LiteralAggregateOperation::Count,
         ));
+        assert!(finite_plan_identity_matches(
+            identity(
+                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                fre::PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(finite_plan_identity_matches(
+            identity(
+                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                fre::PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::SpanSum,
+        ));
         assert!(!finite_plan_identity_matches(
             identity(
                 ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
@@ -22375,6 +22676,22 @@ mod tests {
             identity(
                 SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
                 ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                ORDERED_LITERAL_COUNT_PLAN_ID,
+            ),
+            true,
+            LiteralAggregateOperation::Count,
+        ));
+        assert!(!finite_plan_identity_matches(
+            identity(
+                ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                fre::PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
             ),
             true,
             LiteralAggregateOperation::Count,
@@ -22465,5 +22782,34 @@ mod tests {
             "sparse reduce invariant".to_string(),
         );
         assert_eq!(sparse_reduce_fault.status, Status::Fault);
+
+        let packed_build_resource = packed_ordered_literal_build_error(
+            &fre::PackedOrderedLiteralAggregateBuildError::WorkLimit {
+                needed: 2,
+                limit: 1,
+            },
+            "packed build resource".to_string(),
+        );
+        assert_eq!(packed_build_resource.status, Status::Unsupported);
+        let packed_build_fault = packed_ordered_literal_build_error(
+            &fre::PackedOrderedLiteralAggregateBuildError::ArithmeticOverflow {
+                computation: "fixture",
+            },
+            "packed build arithmetic".to_string(),
+        );
+        assert_eq!(packed_build_fault.status, Status::Fault);
+        let packed_reduce_resource = packed_ordered_literal_reduce_error(
+            &fre::PackedOrderedLiteralAggregateReduceError::ReducerStepsLimit {
+                needed: 2,
+                limit: 1,
+            },
+            "packed reduce resource".to_string(),
+        );
+        assert_eq!(packed_reduce_resource.status, Status::Unsupported);
+        let packed_reduce_fault = packed_ordered_literal_reduce_error(
+            &fre::PackedOrderedLiteralAggregateReduceError::InternalInvariant { detail: "fixture" },
+            "packed reduce invariant".to_string(),
+        );
+        assert_eq!(packed_reduce_fault.status, Status::Fault);
     }
 }

@@ -2598,6 +2598,7 @@ fn performance_runner_route(
             "compile-aggregate-exact-literal"
             | "compile-aggregate-unicode-scalar-class"
             | "compile-aggregate-finite-literal-dfa"
+            | "compile-aggregate-finite-literal-packed-v1"
             | "compile-aggregate-continuation-program"
             | "compile-aggregate-url",
             1,
@@ -2608,6 +2609,7 @@ fn performance_runner_route(
             | "aggregate-fixed-absolute-domain"
             | "aggregate-unicode-scalar-class"
             | "aggregate-finite-literal-dfa"
+            | "aggregate-finite-literal-packed-v1"
             | "aggregate-continuation-program"
             | "aggregate-url",
             1,
@@ -6044,6 +6046,29 @@ mod tests {
         );
         assert!(
             performance_runner_route("count", "aggregate-fixed-absolute-domain-alias", 1).is_err()
+        );
+    }
+
+    #[test]
+    fn packed_finite_is_registered_only_for_single_aggregate_operations() {
+        assert_eq!(
+            performance_runner_route("compile", "compile-aggregate-finite-literal-packed-v1", 1,)
+                .expect("packed finite compile route"),
+            PerformanceRunnerRoute::AggregateSingle
+        );
+        for model in ["count", "count-spans"] {
+            assert_eq!(
+                performance_runner_route(model, "aggregate-finite-literal-packed-v1", 1,)
+                    .expect("packed finite operation route"),
+                PerformanceRunnerRoute::AggregateSingle
+            );
+            assert!(
+                performance_runner_route(model, "aggregate-finite-literal-packed-v1", 2,).is_err()
+            );
+        }
+        assert!(
+            performance_runner_route("count", "aggregate-finite-literal-packed-v1-alias", 1,)
+                .is_err()
         );
     }
 
