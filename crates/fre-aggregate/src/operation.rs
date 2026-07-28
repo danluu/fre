@@ -3922,7 +3922,15 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     let work_factor = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => 6,
         StateByteSpanSumTopology::DisjointRunsLiteral => {
-            add(plan.literal().len(), 7, Resource::ExecutionWork)?
+            if plan.literal().len() > 1 {
+                add(
+                    mul(plan.literal().len(), 2, Resource::ExecutionWork)?,
+                    12,
+                    Resource::ExecutionWork,
+                )?
+            } else {
+                add(plan.literal().len(), 7, Resource::ExecutionWork)?
+            }
         }
     };
     let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
@@ -3931,22 +3939,38 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
     } else {
         structural_work_bound
     };
-    let state_transition_bound = mul(input_bytes, 2, Resource::ExecutionWork)?;
+    let state_transition_factor = match plan.topology() {
+        StateByteSpanSumTopology::DisjointRunsLiteral if plan.literal().len() > 1 => 4,
+        _ => 2,
+    };
+    let state_transition_bound = mul(
+        input_bytes,
+        state_transition_factor,
+        Resource::ExecutionWork,
+    )?;
     let root_probe_bound = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
         StateByteSpanSumTopology::DisjointRunsLiteral => {
-            mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
+            let factor = if plan.literal().len() > 1 {
+                add(plan.literal().len(), 1, Resource::ExecutionWork)?
+            } else {
+                plan.literal().len()
+            };
+            mul(input_bytes, factor, Resource::ExecutionWork)?
         }
     };
     let random_access_bytes_read = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => input_bytes,
-        StateByteSpanSumTopology::DisjointRunsLiteral => mul(
-            input_bytes,
-            add(plan.literal().len(), 1, Resource::ExecutionWork)?,
-            Resource::ExecutionWork,
-        )?,
+        StateByteSpanSumTopology::DisjointRunsLiteral => {
+            let factor = if plan.literal().len() > 1 {
+                add(plan.literal().len(), 3, Resource::ExecutionWork)?
+            } else {
+                add(plan.literal().len(), 1, Resource::ExecutionWork)?
+            };
+            mul(input_bytes, factor, Resource::ExecutionWork)?
+        }
     };
     let accounting = ExecutionAccounting {
         state_evaluations: state_transition_bound.min(work_bound),
@@ -4090,6 +4114,148 @@ fn reduce_disjoint_runs_literal(
     work_limit: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(usize, usize), Error> {
+    if plan.literal().len() > 1 {
+        reduce_disjoint_runs_literal_anchored(plan, haystack, work_limit, accounting)
+    } else {
+        reduce_disjoint_runs_literal_scalar(plan, haystack, work_limit, accounting)
+    }
+}
+
+// The compile-selected byte offset is a necessary literal witness, so a
+// monotone `memchr` stream is overlap-complete even when the literal itself is
+// bordered. After a complete literal comparison, its first byte (proved in
+// `first` and therefore outside disjoint `second`) seals the preceding
+// `second+` run. Scanning that run and the adjacent `first+` run backward
+// yields the unique greedy start for this literal occurrence.
+//
+// Literal comparisons cost at most `N * L`. Candidate run scans are linear:
+// every candidate start is a `first` barrier, so distinct preceding `second`
+// runs cannot overlap; every accepted/rejected `second` run similarly
+// partitions the adjacent `first` run. The source-independent prospective
+// leaves four full classification passes, including one terminating probe per
+// candidate for each run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the monotone anchor traversal keeps literal, reverse-run, result, and resource accounting adjacent"
+)]
+fn reduce_disjoint_runs_literal_anchored(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let first = plan.first();
+    let second = plan.second();
+    let literal = plan.literal();
+    let anchor_offset = plan.literal_anchor_offset();
+    let anchor_byte = *literal.get(anchor_offset).ok_or(Error::InternalInvariant(
+        "state-byte literal anchor offset exceeds retained literal",
+    ))?;
+    let mut match_floor = 0_usize;
+    let mut search = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while search < haystack.len() {
+        let Some(anchor_index) =
+            state_byte_find_anchor(anchor_byte, haystack, search, work_limit, accounting)?
+        else {
+            break;
+        };
+        search = add(anchor_index, 1, Resource::Boundaries)?;
+        let Some(candidate_start) = anchor_index.checked_sub(anchor_offset) else {
+            continue;
+        };
+        if candidate_start < match_floor {
+            continue;
+        }
+        let Some(candidate_end) = candidate_start.checked_add(literal.len()) else {
+            return Err(Error::ArithmeticOverflow {
+                resource: Resource::Boundaries,
+            });
+        };
+        if candidate_end > haystack.len() {
+            continue;
+        }
+        if !state_byte_literal_matches_at(
+            literal,
+            anchor_offset,
+            haystack,
+            candidate_start,
+            work_limit,
+            accounting,
+        )? {
+            continue;
+        }
+
+        let mut second_start = candidate_start;
+        while second_start > match_floor {
+            let previous = second_start.checked_sub(1).ok_or(Error::InternalInvariant(
+                "positive state-byte second-run cursor lost predecessor",
+            ))?;
+            if !state_byte_classify(
+                second,
+                haystack,
+                previous,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+            {
+                break;
+            }
+            second_start = previous;
+        }
+        if second_start == candidate_start {
+            continue;
+        }
+
+        let mut first_start = second_start;
+        while first_start > match_floor {
+            let previous = first_start.checked_sub(1).ok_or(Error::InternalInvariant(
+                "positive state-byte first-run cursor lost predecessor",
+            ))?;
+            if !state_byte_classify(
+                first,
+                haystack,
+                previous,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+            {
+                break;
+            }
+            first_start = previous;
+        }
+        if first_start == second_start {
+            continue;
+        }
+
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            candidate_end
+                .checked_sub(first_start)
+                .ok_or(Error::InternalInvariant(
+                    "state-byte anchored reducer selected a reversed span",
+                ))?,
+            Resource::SpanSum,
+        )?;
+        match_floor = candidate_end;
+        search = candidate_end;
+    }
+    Ok((matches, span_sum))
+}
+
+fn reduce_disjoint_runs_literal_scalar(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
     let first = plan.first();
     let second = plan.second();
     let literal = plan.literal();
@@ -4182,6 +4348,73 @@ fn reduce_disjoint_runs_literal(
         }
     }
     Ok((matches, span_sum))
+}
+
+fn state_byte_find_anchor(
+    anchor: u8,
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<Option<usize>, Error> {
+    let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
+        "state-byte anchor search start exceeds admitted source",
+    ))?;
+    let available_work = work_limit.saturating_sub(accounting.work);
+    let admitted_len = remaining.len().min(available_work);
+    let admitted = &remaining[..admitted_len];
+    let relative = memchr::memchr(anchor, admitted);
+    let scanned = match relative {
+        Some(offset) => add(offset, 1, Resource::SequentialBytes)?,
+        None => admitted_len,
+    };
+    let sequential_bytes_read = add(
+        accounting.sequential_bytes_read,
+        scanned,
+        Resource::SequentialBytes,
+    )?;
+    let root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
+    let work = add(accounting.work, scanned, Resource::ExecutionWork)?;
+    enforce(work, work_limit, Resource::ExecutionWork)?;
+    accounting.sequential_bytes_read = sequential_bytes_read;
+    accounting.root_probes = root_probes;
+    accounting.work = work;
+    if let Some(relative) = relative {
+        return Ok(Some(add(start, relative, Resource::Boundaries)?));
+    }
+    if admitted_len < remaining.len() {
+        let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+        enforce(required, work_limit, Resource::ExecutionWork)?;
+        return Err(Error::InternalInvariant(
+            "state-byte anchor work refusal unexpectedly admitted progress",
+        ));
+    }
+    Ok(None)
+}
+
+fn state_byte_literal_matches_at(
+    literal: &[u8],
+    anchor_offset: usize,
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<bool, Error> {
+    for (offset, &expected) in literal.iter().enumerate() {
+        if offset == anchor_offset {
+            if !state_byte_compare_cached(expected, expected, work_limit, accounting)? {
+                return Err(Error::InternalInvariant(
+                    "state-byte cached literal anchor compared unequal to itself",
+                ));
+            }
+            continue;
+        }
+        let index = add(start, offset, Resource::Boundaries)?;
+        if !state_byte_compare_source(haystack, index, expected, work_limit, accounting)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn state_byte_disjoint_literal_matches(
@@ -14070,10 +14303,11 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_exhaustive_small_differential() {
-        let cases: [(&str, &[u8]); 3] = [
+        let cases: [(&str, &[u8]); 4] = [
             (r"[ab]*ab[abc]*", b"abc\n"),
             (r"[ab]*abab[abc]*", b"abc\n"),
             (r"[ab]+[ ]+a", b"ab \n"),
+            (r"[a]+[b]+aba", b"abx\n"),
         ];
         for (pattern, alphabet) in cases {
             let compiled = state_byte_span_sum_fixture(pattern);
@@ -14314,6 +14548,45 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_disjoint_accounting_caches_literal_head_and_orders_source() {
+        assert_eq!(
+            state_byte_span_sum_fixture(r"[ax]+[ ]+aaaaab")
+                .state_byte_span_sum
+                .as_ref()
+                .unwrap()
+                .literal_anchor_offset(),
+            5
+        );
+        let overlap = state_byte_span_sum_fixture(r"[a]+[b]+aba");
+        assert_eq!(
+            overlap
+                .state_byte_span_sum
+                .as_ref()
+                .unwrap()
+                .literal_anchor_offset(),
+            1
+        );
+        assert_eq!(
+            overlap
+                .span_sum_value(
+                    b"bababa",
+                    0..6,
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            overlap
+                .count_value(
+                    b"bababa",
+                    0..6,
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+            1
+        );
         for (haystack, state, sequential, random, root, events, work, span_sum) in [
             (b"ab  a".as_slice(), 6, 3, 3, 1, 1, 14, 5),
             (b"abx".as_slice(), 4, 3, 1, 0, 0, 8, 0),
@@ -14353,14 +14626,14 @@ mod tests {
             refusal.source,
             Error::ResourceLimit {
                 resource: Resource::ExecutionWork,
-                required: 14,
+                required: 15,
                 limit: 13,
             }
         );
         assert_eq!(refusal.receipt.actual.work, 13);
-        assert_eq!(refusal.receipt.actual.root_probes, 1);
-        assert_eq!(refusal.receipt.actual.random_access_bytes_read, 3);
-        assert_eq!(refusal.receipt.actual.sequential_bytes_read, 3);
+        assert_eq!(refusal.receipt.actual.root_probes, 11);
+        assert_eq!(refusal.receipt.actual.random_access_bytes_read, 5);
+        assert_eq!(refusal.receipt.actual.sequential_bytes_read, 5);
         assert!(
             refusal
                 .receipt

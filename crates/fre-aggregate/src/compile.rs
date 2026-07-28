@@ -647,6 +647,7 @@ pub(crate) struct StateByteSpanSumPlan {
     literal: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
     literal_failure: [u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES],
     literal_len: usize,
+    literal_anchor_offset: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -676,6 +677,10 @@ impl StateByteSpanSumPlan {
 
     pub(crate) fn literal_failure(&self) -> &[u8] {
         &self.literal_failure[..self.literal_len]
+    }
+
+    pub(crate) fn literal_anchor_offset(&self) -> usize {
+        usize::from(self.literal_anchor_offset)
     }
 
     const fn materialized_bytes() -> usize {
@@ -1583,6 +1588,12 @@ fn build_state_byte_span_sum_plan(
     let retained_bytes = StateByteSpanSumPlan::materialized_bytes();
     budget.charge(add(retained_bytes, literal.len(), Resource::CompileWork)?)?;
     let literal_failure = state_byte_literal_failure(literal, budget)?;
+    let literal_anchor_offset =
+        if topology == StateByteSpanSumTopology::DisjointRunsLiteral && literal.len() > 1 {
+            state_byte_literal_anchor_offset(literal, budget)?
+        } else {
+            0
+        };
     let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
     retained_literal[..literal.len()].copy_from_slice(literal);
     let plan = StateByteSpanSumPlan {
@@ -1592,6 +1603,7 @@ fn build_state_byte_span_sum_plan(
         literal: retained_literal,
         literal_failure,
         literal_len: literal.len(),
+        literal_anchor_offset,
     };
     budget.accounting.state_byte_span_sum_plans = 1;
     budget.accounting.state_byte_span_sum_literal_bytes = literal.len();
@@ -1603,6 +1615,31 @@ fn build_state_byte_span_sum_plan(
             "state-byte SpanSum build work underflow",
         ))?;
     Ok(Some(plan))
+}
+
+fn state_byte_literal_anchor_offset(
+    literal: &[u8],
+    budget: &mut CompileBudget,
+) -> Result<u8, Error> {
+    let mut selected_offset = 0_usize;
+    let mut selected_occurrences = usize::MAX;
+    for (offset, &candidate) in literal.iter().enumerate() {
+        let mut occurrences = 0_usize;
+        for &byte in literal {
+            budget.charge(1)?;
+            occurrences = add(
+                occurrences,
+                usize::from(byte == candidate),
+                Resource::CompileWork,
+            )?;
+        }
+        if occurrences < selected_occurrences {
+            selected_offset = offset;
+            selected_occurrences = occurrences;
+        }
+    }
+    u8::try_from(selected_offset)
+        .map_err(|_| Error::InternalInvariant("state-byte literal anchor offset exceeds u8"))
 }
 
 fn state_byte_literal_failure(
@@ -7224,8 +7261,8 @@ fn bind_state_byte_span_sum_identity(
     plan: &StateByteSpanSumPlan,
     budget: &mut CompileBudget,
 ) -> Result<PlanId, Error> {
-    let domain = b"fre.aggregate.state-byte-span-sum-plan.v2";
-    let operation = b"fre.aggregate.state-byte-span-sum-operation.v2";
+    let domain = b"fre.aggregate.state-byte-span-sum-plan.v3";
+    let operation = b"fre.aggregate.state-byte-span-sum-operation.v3";
     let class_bytes = mul(8, core::mem::size_of::<u64>(), Resource::CompileWork)?;
     let payload = add(
         add(
@@ -7235,7 +7272,7 @@ fn bind_state_byte_span_sum_identity(
         )?,
         add(
             add(
-                class_bytes,
+                add(class_bytes, 1, Resource::CompileWork)?,
                 add(
                     plan.literal().len(),
                     plan.literal_failure().len(),
@@ -7263,6 +7300,7 @@ fn bind_state_byte_span_sum_identity(
             hash.bytes(&word.to_le_bytes());
         }
         hash_usize(hash, plan.literal().len());
+        hash.byte(plan.literal_anchor_offset);
         hash.bytes(plan.literal());
         hash.bytes(plan.literal_failure());
     }
