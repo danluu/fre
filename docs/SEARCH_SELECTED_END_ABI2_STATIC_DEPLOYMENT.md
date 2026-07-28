@@ -23,13 +23,17 @@ The reusable qualification-private source candidate is split deliberately:
   `selected-end-qualification-private-v2` feature provides only a
   neither-`Send`-nor-`Sync` current-thread token, exact-literal scalar
   preflight, and strict `x0` end-or-zero decoding. The generated binding
-  compares its embedded 16-byte literal with the portable `LiteralPlan` once
-  while creating a plan-bound session and encloses it in a module-private
-  nominal type; repeated hot calls then authenticate the private preflight
-  token with only plan identity. Equal bytes owned by another plan are
-  rejected, while the distinct generated type prevents a plan session bound
-  by another module from entering the call. Successful session creation admits
-  Arm
+  compares its embedded 16-byte literal with the portable `LiteralPlan` once,
+  records its hardcoded private compile-identity key, and consumes the
+  current-thread token into an owning plan-bound session. The generated module
+  encloses that value in a private nominal type, structurally fixing the key
+  without claiming a separate runtime key comparison. The type borrows only
+  the external owner and plan, so a consumer can store it without a
+  self-reference. Repeated hot calls then
+  authenticate the private preflight token with only plan identity. Equal bytes
+  owned by another plan are rejected, while the distinct generated type
+  prevents a plan session bound by another module from entering the call.
+  Successful session creation admits Arm
   `0x41/0xd84` with ASIMD+SVE+SVE2 and observes the calling thread's SVE vector
   length once, requiring 16 bytes. Calls inside the session perform no VL
   query and no literal-byte comparison.
@@ -66,10 +70,14 @@ their bounded canonical forms and identities; and prove:
 The proof callsite is intentionally not the safe hot API. The reusable checker
 therefore reports `primary_hot_route_final_observed=false`: it checks that the
 generated hot-route source calls the exact entry, but does not infer a final
-hot callsite from an unrelated direct call. Each consumer must expose and
-externally pin a stable symbol covering its actual hot route and add a
-consumer-specific final-image disassembly proof.
+hot callsite from an unrelated direct call. The default-off three-engine
+consumer now supplies the required consumer-specific half: it includes the
+exact generated binding, emits and externally pins a stable hidden
+`inline(never)` symbol on its actual timed AOT loop, and its separate verifier
+authenticates the binding/deployment receipt before disassembling that exact
+symbol. This source implementation does not itself make the deferred
+final-image observation true.
 
-Until that exact-tree consumer proof and separate qualification review exist,
-this candidate is diagnostic source infrastructure, not a complete deployment
-closure or performance claim.
+Until that exact-tree consumer proof actually passes and receives separate
+qualification review, this candidate is diagnostic source infrastructure, not
+a complete deployment closure or performance claim.

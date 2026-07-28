@@ -56,7 +56,7 @@ and separate from the Linux `SelectedEnd` ABI2 work:
 | Operation | Whole-haystack, non-overlapping `Count-v2` | Generic search/find, captures, replace, split, or arbitrary aggregates |
 | Pattern | Private qualification Candidate row: exact byte literal `needle`, selector 11. The production table is empty while its promotion atom is all-zero. The focused compiler itself accepts exact byte literals from 0 through 32 bytes. | Other literals are not production-qualified; general regex syntax such as alternation, repetition, classes, or Unicode semantics is not lowered by this compiler. |
 | Code generator | FRE's direct custom AArch64 Count emitter | LLVM, Inkwell, Cranelift, x86-64, or other native backends |
-| Production object and host | arm64 Mach-O on macOS | Linux retains a separate Search V1 qualification architecture, while the current `SelectedEnd` ABI2 P2b ELF bundle has no adopter or authority row. COFF/Windows, other operating systems, and cross-host deployment are not implemented here. |
+| Production object and host | arm64 Mach-O on macOS | Linux retains a separate Search V1 qualification architecture; `SelectedEnd` ABI2 has a default-off qualification-private owning-session consumer but no authority row, completed post-link observation, or production deployment. COFF/Windows, other operating systems, and cross-host deployment are not implemented here. |
 | Deployment | Statically linked implementation and final-image glue, immutable mapped-image verification, authenticated process-static handle | General artifact discovery, cache/distribution, dynamic loading, or runtime code generation |
 | Promotion | One reviewed manifest digest in the C5 `support.rs` atom | Automatic qualification or registration of arbitrary compiler output |
 
@@ -101,10 +101,12 @@ The glue receipt carries mandatory future final-image checks: the call must
 remain a direct `bl`, may not resolve through a PLT, and the linked wrapper
 must contain no `blr`, `x4` argument, or result slot; all implementation and
 wrapper bindings must remain hidden and identity-suffixed. The checked-in
-receipt is not that observation. Its `observation_complete` field is false,
-every exposed P2b value reports `SelectedEndAotRuntimeAuthorityV2::Absent`,
-and this Candidate contains no ABI2 static adopter, authority row, mapped
-callable, linked-image inspection receipt, or deployment path.
+receipt is not that observation. Its `observation_complete` field is false and
+every exposed P2b value reports `SelectedEndAotRuntimeAuthorityV2::Absent`.
+This Candidate now contains a default-off qualification-private safe consumer
+that includes the exact generated binding and owns a consumed same-thread token
+without storing a callable address. It still has no ABI2 authority row,
+completed linked-image inspection receipt, or production deployment path.
 
 This is the AOT half of the same native-image architecture as JIT, not a second
 optimizer: JIT publishes the sealed image under strict W^X, while P2b stops
@@ -166,13 +168,14 @@ adopters, for the same implementation intentionally creates duplicate strong
 definitions and must be rejected by the linker. That duplicate-link refusal
 still needs post-fence validation.
 
-The retained standalone Search V8 bakeoff source and checked-in Linux
-three-engine harness exercise the Search V1 Span contracts: raw or privately
-adopted static AOT, raw strict-W^X Span JIT, and the portable plan. They do not
-exercise the new `SelectedEnd` ABI2 P2b bundle and cannot serve as its
-qualification evidence.
+The retained standalone Search V8 bakeoff remains a separate Search V1
+contract and cannot serve as `SelectedEnd` ABI2 qualification evidence. The
+checked-in Linux three-engine harness has now moved to the P2b register-return
+ABI2 bundle and compiler-generated owning-session consumer described below;
+the source change is not evidence that its deferred final-image or hardware
+gates passed.
 
-### Public bakeoff V3 and deferred ABI2 three-engine work
+### Public bakeoff V3 and ABI2 three-engine source consumer
 
 The current public JIT bakeoff source emits 48-column
 `fre-jit-bakeoff-v3` rows for explicit V8 `SelectedEnd` ABI2. It establishes
@@ -190,13 +193,16 @@ binding, and evidence hash were rewritten together. This Candidate contains
 that source repair; this checkpoint did not run it and records no V3
 correctness or performance result.
 
-The new P2b three-engine benchmark must compare the exact same sealed tag-21
-artifact through authenticated static AOT, strict-W^X session-only JIT, and
-the portable semantic owner. That benchmark is still in progress and deferred
-at this Candidate. The checked-in Linux three-engine harness is for Search V1
-Span, not the register-return ABI2 path. P2b currently has neither a completed
-post-link observation nor a runtime adopter, so there is no honest callable
-AOT engine to time and no sealed ABI2 three-engine result bundle.
+The P2b three-engine benchmark now sources the exact same sealed tag-21
+artifact through the compiler-generated static AOT binding, strict-WX
+session-only JIT, and the portable semantic owner. Its AOT bind consumes the
+static-runtime thread token into the generated private nominal type, and its
+actual hot loop is covered by a separately named hidden consumer symbol. The
+benchmark-specific verifier authenticates the generated binding/deployment
+receipt and requires a symbol-bounded direct entry `bl`; an unrelated call
+cannot satisfy it. This is source/static work only. P2b still has no completed
+post-link observation, retained run, or sealed result bundle, so no current
+performance claim is available.
 
 The remaining ABI2 closure order is therefore:
 
@@ -204,9 +210,10 @@ The remaining ABI2 closure order is therefore:
    tuple;
 2. after explicit admission, build/link it and issue the missing post-link
    observation only after all direct-call, hidden-binding, no-PLT, no-`blr`,
-   no-`x4`, and no-result-slot checks pass;
-3. add and review a qualification-private adopter without changing the empty
-   production authority state;
+   proof-callsite no-`x4`, consumer-loop call-target, and no-result-slot checks
+   pass (the consumer loop may use `x4` only as non-ABI scratch);
+3. independently review the qualification-private owning-session consumer
+   without changing the empty production authority state;
 4. complete separately bound tag-21 public-facade evidence for the same sealed
    artifact; and
 5. seal and run the replacement ABI2 AOT/JIT/portable benchmark before making

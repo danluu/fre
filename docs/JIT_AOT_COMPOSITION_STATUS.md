@@ -84,16 +84,19 @@ source/KIR/image/object/glue tuple. The glue's sole relocation is
 `R_AARCH64_CALL26` on a direct `bl`.
 
 The declarations expose no generic alias or function-pointer typedef. The
-glue and receipt contracts reject `blr`, a PLT target, any `x4` argument, and
-any caller-owned result slot. These are source-level requirements for a future
-linked-image inspection. The receipt reports `observation_complete = false`,
-every P2b value reports runtime authority `Absent`, and this source contains
-no ABI2 runtime adopter, authority row, mapped callable, or completed
-post-link observation. The qualification-private safe binding compares its
-embedded literal with one portable plan when the plan-bound session is
-created, then encloses that session in a generated artifact-private nominal
-type. Repeated preflighted calls use only plan identity rather than
-re-comparing the 16 literal bytes.
+glue and receipt contracts reject `blr`, a PLT target, any ABI `x4` argument,
+and any caller-owned result slot. These are source-level requirements until a
+linked-image inspection passes. The receipt reports
+`observation_complete = false`, every P2b value reports runtime authority
+`Absent`, and there is still no ABI2 authority row or completed post-link
+observation. There is now a default-off qualification-private safe consumer:
+the generated bind consumes the static-runtime current-thread token, compares
+its embedded literal with one external portable plan, records its hardcoded
+private compile-identity key, then owns that token inside a generated
+artifact-private nominal type. The generated type structurally fixes that key
+without claiming a separate runtime key comparison. Repeated preflighted calls
+use only plan identity rather than re-comparing literal bytes or the artifact
+key, and no callable address is stored.
 
 The retained Count-v2 and Search V1 Span adoption paths are separate
 contracts. Their features, registries, or linked symbols cannot authorize the
@@ -122,12 +125,17 @@ and permits tag-19 authority only beside an independently verified V8
 fallback. No producer has been run at this checkpoint, so this is not
 qualification or a speed result.
 
-The existing checked-in Linux three-engine harness still measures the retained
-Search V1 Span adoption/raw-Span-JIT contract. A replacement that exercises
-the P2b `SelectedEnd` ABI2 AOT/JIT/portable tuple is in progress and remains
-deferred at this Candidate: there is no sealed ABI2 three-engine source,
-linked image, runtime adopter, post-link observation, retained run, or result
-bundle to report.
+The checked-in Linux three-engine harness now consumes the exact deterministic
+P2b `SelectedEnd` ABI2 deployment binding and compares that safe static AOT
+route with the byte-identical strict-WX tag21 JIT and portable plan. The JIT
+benchmark session is bound once to that exact portable literal plan, matching
+the qualified facade's one-pointer hot-path identity check. The harness
+persists the compiler binding and deployment receipt separately from benchmark
+metadata and exposes an exact hidden consumer hot-loop symbol for a
+benchmark-specific post-link proof. This checkpoint is source/static-only:
+the binding, owning sessions, verifier, and campaign updates have not been
+built or run, so there is no completed linked-image observation, retained
+campaign, speed result, or production authority to report.
 
 Historical macOS Count and Search evidence remains development evidence only
 for its exact source/artifact tuples. No Search row is promoted and no current

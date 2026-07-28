@@ -252,18 +252,33 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
         StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>,
         StaticSearchSelectedEndCallErrorV2,
     > {
-        let literal = plan.needle();
-        let actual_bytes = literal.len();
-        if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
-            return Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
-                expected_bytes: SELECTED_END_LITERAL_BYTES_V2,
-                actual_bytes,
-            });
-        }
-        if literal != exact_literal {
-            return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
-        }
+        validate_literal_plan_v2(plan, exact_literal)?;
         Ok(StaticSearchSelectedEndPlanSessionV2 {
+            session: self,
+            plan,
+            binding,
+        })
+    }
+
+    /// Consume this thread token and bind one exact portable literal plan.
+    ///
+    /// Unlike [`Self::bind_literal_plan`], the returned token owns the
+    /// non-transferable current-thread session. A consumer can therefore keep
+    /// the plan-bound token in an ordinary session aggregate without storing
+    /// both a value and a reference to that same value. The generated
+    /// artifact-specific nominal wrapper remains responsible for discharging
+    /// the binding-key proof before it uses the plan-only hot path.
+    pub fn bind_literal_plan_owned<'plan>(
+        self,
+        plan: &'plan LiteralPlan,
+        exact_literal: &[u8; SELECTED_END_LITERAL_BYTES_V2],
+        binding: &'static StaticSearchSelectedEndBindingKeyV2,
+    ) -> Result<
+        StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        validate_literal_plan_v2(plan, exact_literal)?;
+        Ok(StaticSearchSelectedEndOwnedPlanSessionV2 {
             session: self,
             plan,
             binding,
@@ -301,6 +316,24 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
             accounting: preflight.accounting(),
         })
     }
+}
+
+fn validate_literal_plan_v2(
+    plan: &LiteralPlan,
+    exact_literal: &[u8; SELECTED_END_LITERAL_BYTES_V2],
+) -> Result<(), StaticSearchSelectedEndCallErrorV2> {
+    let literal = plan.needle();
+    let actual_bytes = literal.len();
+    if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
+        return Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+            expected_bytes: SELECTED_END_LITERAL_BYTES_V2,
+            actual_bytes,
+        });
+    }
+    if literal != exact_literal {
+        return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
+    }
+    Ok(())
 }
 
 /// Same-thread AOT session bound once to the exact portable literal plan and
@@ -355,7 +388,7 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
     }
 
     /// Consume one authoritative preflight after a generated private wrapper
-    /// has already authenticated this session's artifact key.
+    /// has structurally fixed this session's artifact key.
     ///
     /// This qualification-private primitive performs only the plan-identity
     /// check. It does not itself authorize any native call: generated source
@@ -365,7 +398,7 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
     /// from repeated calls without allowing one generated module's session to
     /// enter another module's safe call boundary.
     #[doc(hidden)]
-    #[inline]
+    #[inline(always)]
     pub fn prepare_plan_bound<'haystack>(
         &self,
         preflight: LiteralSearchPreflight<'_, 'haystack>,
@@ -391,6 +424,83 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
     }
 }
 
+/// Owning same-thread AOT session bound once to an exact portable literal plan
+/// and one generated artifact key.
+///
+/// This token owns, rather than borrows, its non-transferable thread session.
+/// It borrows only the external qualification owner and portable plan, is
+/// neither [`Send`] nor [`Sync`], and stores no callable address or function
+/// pointer.
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndOwnedPlanSessionV2;
+/// fn assert_send<T: Send>() {}
+/// assert_send::<StaticSearchSelectedEndOwnedPlanSessionV2<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::StaticSearchSelectedEndOwnedPlanSessionV2;
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<StaticSearchSelectedEndOwnedPlanSessionV2<'static, 'static>>();
+/// ```
+#[derive(Debug)]
+pub struct StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan> {
+    session: StaticSearchSelectedEndThreadSessionV2<'owner>,
+    plan: &'plan LiteralPlan,
+    binding: &'static StaticSearchSelectedEndBindingKeyV2,
+}
+
+impl<'owner, 'plan> StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan> {
+    /// Consume one authoritative preflight after authenticating the generated
+    /// artifact key and issuing plan.
+    #[inline]
+    pub fn prepare<'session, 'haystack>(
+        &'session self,
+        preflight: LiteralSearchPreflight<'_, 'haystack>,
+        binding: &StaticSearchSelectedEndBindingKeyV2,
+    ) -> Result<
+        StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        if !core::ptr::eq(self.binding, binding) {
+            return Err(StaticSearchSelectedEndCallErrorV2::BindingIdentityMismatch);
+        }
+        self.prepare_plan_bound(preflight)
+    }
+
+    /// Consume one authoritative preflight after a generated private nominal
+    /// wrapper has structurally fixed this owning session's artifact key.
+    ///
+    /// The successful hot path performs only issuing-plan pointer identity.
+    /// The returned prepared value borrows the owned thread token for this
+    /// call, retaining its same-thread lifetime without self-reference.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn prepare_plan_bound<'session, 'haystack>(
+        &'session self,
+        preflight: LiteralSearchPreflight<'_, 'haystack>,
+    ) -> Result<
+        StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
+        if !preflight.was_issued_by(self.plan) {
+            let actual_bytes = preflight.literal_bytes();
+            if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
+                return Err(StaticSearchSelectedEndCallErrorV2::LiteralWidthMismatch {
+                    expected_bytes: SELECTED_END_LITERAL_BYTES_V2,
+                    actual_bytes,
+                });
+            }
+            return Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch);
+        }
+        Ok(StaticSearchSelectedEndPreparedCallV2 {
+            _session: &self.session,
+            checked: preflight.checked_window(),
+            accounting: preflight.accounting(),
+        })
+    }
+}
+
 /// Session-bound scalar-preflight certificate consumed by generated source.
 ///
 /// This type exposes only the four ABI2 scalar inputs and strict result
@@ -404,19 +514,20 @@ pub struct StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack> {
 
 impl StaticSearchSelectedEndPreparedCallV2<'_, '_, '_> {
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn haystack(&self) -> &[u8] {
         self.checked.haystack()
     }
 
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn window(&self) -> SearchWindow {
         self.checked.window()
     }
 
     /// Decode the exact `x0` end-or-zero result after the generated module has
     /// made its literal direct-symbol call.
+    #[inline(always)]
     pub fn decode(
         self,
         end_or_zero: usize,
@@ -427,6 +538,7 @@ impl StaticSearchSelectedEndPreparedCallV2<'_, '_, '_> {
     }
 }
 
+#[inline(always)]
 fn decode_selected_end_v2(
     end_or_zero: usize,
     window: SearchWindow,
@@ -434,8 +546,15 @@ fn decode_selected_end_v2(
     if end_or_zero == 0 {
         return Ok(None);
     }
-    let start = end_or_zero.checked_sub(SELECTED_END_LITERAL_BYTES_V2);
-    if end_or_zero > window.end() || start.is_none_or(|start| start < window.start()) {
+    let Some(start) = end_or_zero.checked_sub(SELECTED_END_LITERAL_BYTES_V2) else {
+        return Err(StaticSearchSelectedEndCallErrorV2::InvalidNativeEnd {
+            end_or_zero,
+            literal_bytes: SELECTED_END_LITERAL_BYTES_V2,
+            window_start: window.start(),
+            window_end: window.end(),
+        });
+    };
+    if end_or_zero > window.end() || start < window.start() {
         return Err(StaticSearchSelectedEndCallErrorV2::InvalidNativeEnd {
             end_or_zero,
             literal_bytes: SELECTED_END_LITERAL_BYTES_V2,
@@ -443,10 +562,7 @@ fn decode_selected_end_v2(
             window_end: window.end(),
         });
     }
-    Ok(Some(MatchSpan::new(
-        start.expect("validated SelectedEnd ABI2 start"),
-        end_or_zero,
-    )))
+    Ok(Some(MatchSpan::new(start, end_or_zero)))
 }
 
 #[cfg(all(
@@ -753,17 +869,65 @@ mod tests {
     }
 
     #[test]
+    fn owning_plan_bound_session_is_storable_and_retains_exact_plan_identity() {
+        static BINDING: StaticSearchSelectedEndBindingKeyV2 =
+            StaticSearchSelectedEndBindingKeyV2::qualification_private([0x19; 32]);
+        static OTHER_BINDING: StaticSearchSelectedEndBindingKeyV2 =
+            StaticSearchSelectedEndBindingKeyV2::qualification_private([0x21; 32]);
+        let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
+        let session = StaticSearchSelectedEndThreadSessionV2 {
+            _owner: &owner,
+            _thread_bound: PhantomData,
+        };
+        let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
+        let bound = session
+            .bind_literal_plan_owned(&exact, b"0123456789abcdef", &BINDING)
+            .expect("the consuming exact-plan bind succeeds");
+        let haystack = b"before-0123456789abcdef-after";
+        let window = CheckedSearchWindow::new(haystack, SearchWindow::new(0, haystack.len()))
+            .expect("checked test window");
+        let exact_preflight = exact
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        let prepared = bound
+            .prepare(exact_preflight, &BINDING)
+            .expect("the owned token accepts its issuing plan");
+        assert_eq!(prepared.decode(23).unwrap().0, Some(MatchSpan::new(7, 23)));
+
+        let equal_bytes =
+            LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
+        let equal_preflight = equal_bytes
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            bound.prepare_plan_bound(equal_preflight),
+            Err(StaticSearchSelectedEndCallErrorV2::LiteralIdentityMismatch)
+        ));
+
+        let exact_preflight = exact
+            .preflight_checked_window(window, LiteralSearchLimits::unlimited())
+            .unwrap();
+        assert!(matches!(
+            bound.prepare(exact_preflight, &OTHER_BINDING),
+            Err(StaticSearchSelectedEndCallErrorV2::BindingIdentityMismatch)
+        ));
+    }
+
+    #[test]
     fn source_has_one_session_only_vl_query_and_no_callable_storage() {
         let source = include_str!("selected_end_direct_v2.rs");
         let bind = source.find("    pub fn bind_literal_plan<").unwrap();
         let plan_prepare = source
             .find("impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2")
             .unwrap();
+        let owned_prepare = source
+            .find("impl<'owner, 'plan> StaticSearchSelectedEndOwnedPlanSessionV2")
+            .unwrap();
         let decode = source.find("fn decode_selected_end_v2(").unwrap();
         let tests = source.find("#[cfg(test)]").unwrap();
         let implementation = &source[..tests];
         assert!(!implementation[bind..decode].contains("prctl("));
-        let plan_prepare = &implementation[plan_prepare..decode];
+        let plan_prepare = &implementation[plan_prepare..owned_prepare];
         let binding_check = plan_prepare
             .find("core::ptr::eq(self.binding, binding)")
             .unwrap();
@@ -776,6 +940,33 @@ mod tests {
         assert!(plan_bound_prepare < pointer_check);
         assert!(pointer_check < literal_width);
         assert!(!plan_prepare.contains("preflight.literal()"));
+        let owned_prepare = &implementation[owned_prepare..decode];
+        let owned_binding_check = owned_prepare
+            .find("core::ptr::eq(self.binding, binding)")
+            .unwrap();
+        let owned_plan_bound_prepare = owned_prepare.find("pub fn prepare_plan_bound<").unwrap();
+        let owned_pointer_check = owned_prepare
+            .find("preflight.was_issued_by(self.plan)")
+            .unwrap();
+        let owned_literal_width = owned_prepare.find("preflight.literal_bytes()").unwrap();
+        assert!(owned_binding_check < owned_plan_bound_prepare);
+        assert!(owned_plan_bound_prepare < owned_pointer_check);
+        assert!(owned_pointer_check < owned_literal_width);
+        assert!(owned_prepare.contains("_session: &self.session"));
+        assert!(!owned_prepare.contains("preflight.literal()"));
+        assert_eq!(
+            implementation
+                .matches("#[inline(always)]\n    pub fn prepare_plan_bound<")
+                .count(),
+            2
+        );
+        assert!(implementation.contains(
+            "#[inline(always)]\n    pub fn decode(\n        self,\n        end_or_zero: usize,"
+        ));
+        assert!(implementation.contains("#[inline(always)]\nfn decode_selected_end_v2("));
+        let decode_implementation = &implementation[decode..];
+        assert!(!decode_implementation.contains("expect("));
+        assert!(!decode_implementation.contains("unwrap("));
         assert_eq!(implementation.matches("libc::prctl(").count(), 1);
         assert!(!implementation.contains("transmute::<"));
         assert!(!implementation.contains("extern \"C\" fn("));

@@ -29,7 +29,7 @@ CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v1"
 BENCHMARK_SCHEMA = "fre-aot-selected-end-abi2-three-engine-v2"
 ADMISSION_SCHEMA = "fre-aot-selected-end-abi2-retained-admission-v1"
 HEARTBEAT_SCHEMA = "fre-aot-selected-end-abi2-admission-heartbeat-v1"
-POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v2"
+POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v3"
 SUMMARY_SCHEMA = "fre-aot-selected-end-abi2-three-engine-summary-v1"
 EVIDENCE_CLASS = "diagnostic-nonpromotion"
 AUTHORITY = "absent"
@@ -80,11 +80,17 @@ POST_LINK_FIELDS = {
     "implementation_object_identity",
     "glue_object_identity",
     "bundle_identity",
+    "deployment_binding_identity",
+    "deployment_receipt_identity",
     "final_binary_sha256",
     "helper_sha256",
     "profile",
     "wrapper_call",
+    "generated_proof_callsite",
     "primary_aot_call",
+    "consumer_hot_callsite_final_observed",
+    "generated_binding_authenticated",
+    "deployment_receipt_authenticated",
     "entry_bytes_equal",
     "payload_bytes_equal",
     "metadata_bytes_equal",
@@ -92,6 +98,7 @@ POST_LINK_FIELDS = {
     "reject_plt",
     "reject_blr",
     "reject_x4_argument",
+    "consumer_loop_x4_scratch",
     "result_slot_bytes",
     "runtime_authority",
     "promotion_authority",
@@ -375,7 +382,7 @@ def validate_metadata(
         "sve2": "true",
         "sve_vector_bytes": "16",
         "engine_order_rotation": "all-six-permutations-by-repetition",
-        "aot_primary_hot_route": "exact-entry-direct",
+        "aot_primary_hot_route": "generated-owned-plan-consumer-loop-direct",
         "aot_compiler_cost_scope": "offline-excluded",
         "aot_linker_cost_scope": "offline-excluded",
     }
@@ -387,8 +394,40 @@ def validate_metadata(
         "implementation_object_identity",
         "glue_object_identity",
         "bundle_identity",
+        "deployment_binding_identity",
+        "deployment_receipt_identity",
     ):
         require(HEX64.fullmatch(metadata.get(key, "")) is not None, f"{command} {key} malformed")
+    compile_identity = metadata["compile_identity"]
+    for key, expected in (
+        (
+            "aot_wrapper_symbol",
+            "fre_aot_search_selected_end_qualification_direct_v2_" + compile_identity,
+        ),
+        (
+            "aot_entry_symbol",
+            "fre_aot_search_selected_end_entry_v2_" + compile_identity,
+        ),
+        (
+            "aot_payload_symbol",
+            "fre_aot_search_selected_end_payload_v2_" + compile_identity,
+        ),
+        (
+            "aot_metadata_symbol",
+            "fre_aot_search_selected_end_metadata_v2_" + compile_identity,
+        ),
+        (
+            "aot_generated_proof_callsite_symbol",
+            "fre_aot_search_selected_end_qualification_primary_callsite_v2_"
+            + compile_identity,
+        ),
+        (
+            "aot_consumer_hot_callsite_symbol",
+            "fre_aot_search_selected_end_three_engine_hot_callsite_v2_"
+            + compile_identity,
+        ),
+    ):
+        require(metadata.get(key) == expected, f"{command} META {key} changed namespace")
     require(
         metadata["implementation_object_identity"] != metadata["glue_object_identity"],
         f"{command} object identities unexpectedly alias",
@@ -400,10 +439,14 @@ def validate_metadata(
             "implementation_object_identity",
             "glue_object_identity",
             "bundle_identity",
+            "deployment_binding_identity",
+            "deployment_receipt_identity",
             "aot_wrapper_symbol",
             "aot_entry_symbol",
             "aot_payload_symbol",
             "aot_metadata_symbol",
+            "aot_generated_proof_callsite_symbol",
+            "aot_consumer_hot_callsite_symbol",
         ):
             require(metadata.get(key) == baseline.get(key), f"{command} META {key} drifted")
     if command in ("qualification", "cell"):
@@ -437,7 +480,7 @@ def validate_qualification(
         "qualification comparison count changed",
     )
     for key, expected in (
-        ("aot_primary", "exact-entry-direct"),
+        ("aot_primary", "generated-owned-plan-consumer-loop-direct"),
         ("qualification_wrapper", "linked-and-exercised"),
         ("jit_publication", "strict-wx"),
         ("jit_aot_artifact_equal", "true"),
@@ -936,10 +979,18 @@ def parse_post_link(
         ("profile", identity["profile"]),
         ("final_binary_sha256", binary_sha256),
         ("wrapper_call", "R_AARCH64_CALL26-to-direct-bl"),
-        ("primary_aot_call", "direct-bl-exact-entry"),
+        ("generated_proof_callsite", "hidden-direct-bl-exact-entry"),
+        (
+            "primary_aot_call",
+            "hidden-consumer-loop-direct-bl-exact-entry",
+        ),
+        ("consumer_hot_callsite_final_observed", "true"),
+        ("generated_binding_authenticated", "true"),
+        ("deployment_receipt_authenticated", "true"),
         ("reject_plt", "true"),
         ("reject_blr", "true"),
         ("reject_x4_argument", "true"),
+        ("consumer_loop_x4_scratch", "unconstrained-nonabi"),
         ("result_slot_bytes", "0"),
         ("entry_bytes_equal", "true"),
         ("payload_bytes_equal", "true"),
@@ -955,6 +1006,8 @@ def parse_post_link(
         "implementation_object_identity",
         "glue_object_identity",
         "bundle_identity",
+        "deployment_binding_identity",
+        "deployment_receipt_identity",
         "final_binary_sha256",
     ):
         require(HEX64.fullmatch(fields.get(key, "")) is not None, f"post-link {key} malformed")
@@ -1673,6 +1726,24 @@ def main() -> int:
         )
 
         post_link_manifest = manifest["post_link"]
+        require(
+            type(post_link_manifest) is dict
+            and set(post_link_manifest)
+            == {
+                "observation",
+                "observed_binary_sha256",
+                "artifact_identity",
+                "compile_identity",
+                "implementation_object_identity",
+                "glue_object_identity",
+                "bundle_identity",
+                "deployment_binding_identity",
+                "deployment_receipt_identity",
+                "runtime_authority",
+                "promotion_authority",
+            },
+            "post-link manifest field set changed",
+        )
         post_link_raw = verify_file_record(
             post_link_manifest["observation"],
             "evidence/post-link-observation.txt",
@@ -1689,6 +1760,8 @@ def main() -> int:
             "implementation_object_identity",
             "glue_object_identity",
             "bundle_identity",
+            "deployment_binding_identity",
+            "deployment_receipt_identity",
         ):
             require(post_link_manifest.get(key) == post_link[key], f"post-link manifest {key} drifted")
         require(
@@ -1898,6 +1971,8 @@ def main() -> int:
             "implementation_object_identity",
             "glue_object_identity",
             "bundle_identity",
+            "deployment_binding_identity",
+            "deployment_receipt_identity",
         ):
             require(baseline[key] == post_link[key], f"qualification/post-link {key} drifted")
         expected_keys = {

@@ -18,7 +18,10 @@
 //! compiler-generated identity-suffixed source retains the direct call. This
 //! crate supplies only exact-literal scalar preflight/result decoding and a
 //! neither-`Send`-nor-`Sync` current-thread token whose construction performs
-//! the sole VL16 observation. There is no ABI2 production row.
+//! the sole VL16 observation. A consuming exact-plan bind lets generated
+//! modules own that token inside an artifact-private nominal session while
+//! borrowing only the external owner and plan. There is no ABI2 production
+//! row.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
@@ -82,7 +85,8 @@ pub use search_linked::{
 #[doc(hidden)]
 pub use selected_end_direct_v2::{
     StaticSearchSelectedEndBindingKeyV2, StaticSearchSelectedEndCallErrorV2,
-    StaticSearchSelectedEndPlanSessionV2, StaticSearchSelectedEndPreparedCallV2,
-    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndQualificationV2,
-    StaticSearchSelectedEndThreadContractErrorV2, StaticSearchSelectedEndThreadSessionV2,
+    StaticSearchSelectedEndOwnedPlanSessionV2, StaticSearchSelectedEndPlanSessionV2,
+    StaticSearchSelectedEndPreparedCallV2, StaticSearchSelectedEndProductionAuthorityV2,
+    StaticSearchSelectedEndQualificationV2, StaticSearchSelectedEndThreadContractErrorV2,
+    StaticSearchSelectedEndThreadSessionV2,
 };

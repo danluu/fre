@@ -84,7 +84,7 @@ emitter.
 | `fre-jit-cache` | immutable AArch64 image, typed output contract, fixed publication/cache limits | callable lease plus exact current/peak/event snapshot | same-key single-flight, different-key concurrency, deterministic LRU, unique-token retirement, outstanding-lease accounting, O(1) precomputed full-AOT identity, forced races/failures, and 14 cache tests; process-local only and no speed claim |
 | `fre-aot-macho` / `fre-aot-elf` | audited AArch64 native image plus an external planner binding | deterministic relocatable object, metadata, identity-derived symbols, and object receipts | independently reparse and validate emitted bytes; the Linux tag-21 V2 object preserves the sealed `SelectedEnd` ABI2 image and declares only hidden identity-suffixed four-argument symbols; object creation is inert |
 | `fre-aot-compiler` | authenticated facade source/plan plus sealed Count or Search manifest | deterministic machine-code object plus source/KIR/native/object receipts and inert glue material | the Linux `SelectedEnd` P2b slice retains the same sealed tag-21 image used by JIT, emits deterministic ELF plus exact hidden direct-`bl` glue/declarations/receipts, and explicitly grants no runtime authority or completed post-link observation |
-| `fre-aot-static-runtime` | linked Count-v2 or retained Search V1 Span symbols plus pinned source-qualified expectations, or an already-completed raw Search V1 call | registry-owned authenticated Count/Search V1 Span handle, or typed inert raw Search V1 result | mapped-image adoption verifies immutable code and metadata for those retained contracts; the new `SelectedEnd` ABI2 P2b bundle has no runtime adopter or callable authority in this source |
+| `fre-aot-static-runtime` | linked Count-v2 or retained Search V1 Span symbols plus pinned source-qualified expectations, an already-completed raw Search V1 call, or a default-off generated `SelectedEnd` ABI2 binding plus an external literal plan | registry-owned authenticated Count/Search V1 Span handle, typed inert raw Search V1 result, or a qualification-private same-thread owning plan session | mapped-image adoption verifies immutable code and metadata for the retained contracts; the ABI2 boundary consumes one VL16 thread token into the generated artifact-private nominal type, stores no callable address, and grants no production/runtime authority |
 | `fre-capi` | caller-owned versioned C records and byte views | opaque retained matcher plus plan/exists/end/span results | ten ABI/lifetime/failure/plan-tag tests and debug/release exact-symbol C11/C++17 smokes; only the current Rust-bytes portable subset is advertised and admission remains upstream-oracle-pending |
 | `fre-holdout` | authenticated frozen visible suite/schema/digests | deterministic correctness receipts plus separate diagnostic timing | 1,014 hot/one-shot operation comparisons, canonical cross-architecture framing, tamper/resource/fault gates, and byte-identical 1,014-pass/zero-unsupported/zero-failure reruns; not blind or performance qualification |
 | `rebar-manifest` | retained canonical Rebar inventory | deterministic qualification manifest and summary | runner provenance/configuration; semantic and performance results are separate gates |
@@ -162,15 +162,23 @@ P2b path packages the same sealed tag-21 ABI2 image as deterministic ELF,
 then emits exact hidden identity-suffixed declarations and a four-instruction
 wrapper whose only call relocation is `R_AARCH64_CALL26` for a direct `bl`.
 Its receipts require the final image to retain that exact hidden direct call
-and reject a PLT target, `blr`, any `x4` argument, and any result slot. Those
-receipt bits are requirements, not observations: `observation_complete` is
-false, `RuntimeAuthority` is `Absent`, and this source has no ABI2 adopter or
-callable AOT path. Its qualification-private generated safe binding performs
-the 16-byte literal comparison once when binding a portable plan to the
-current-thread session, then encloses it in a generated artifact-private
-nominal type; hot preflighted calls use only plan identity. The retained
-Count-v2 and Search V1 static-adoption architectures remain separate; their
-existence cannot authorize ABI2.
+and reject a PLT target, `blr`, any ABI `x4` argument, and any result slot.
+Those receipt bits constrain the wrapper and compiler proof callsite; a
+separately inspected Rust consumer loop may use `x4` only as non-ABI scratch.
+They are requirements, not observations: `observation_complete` is false and
+`RuntimeAuthority` is `Absent`. A default-off qualification-private
+ABI2 consumer now persists and includes the exact compiler-generated binding.
+Its bind consumes the current-thread token, validates the 16-byte literal once,
+records the generated module's hardcoded private artifact key, and encloses the
+owning session in a generated artifact-private nominal type; that construction
+structurally discharges artifact identity, so hot preflighted calls use only
+plan identity before naming the exact linked entry. It stores no callable
+address and is not a production adopter or authority row. The three-engine
+consumer also emits a stable hidden hot-call symbol for a deferred
+symbol-bounded post-link proof. No build, final-image observation, or speed
+result exists yet.
+The retained Count-v2 and Search V1 static-adoption architectures remain
+separate; their existence cannot authorize ABI2.
 
 ## Qualification status language
 

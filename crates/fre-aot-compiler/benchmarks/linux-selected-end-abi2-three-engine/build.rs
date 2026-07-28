@@ -9,7 +9,9 @@ use std::{
 use fre::RustProfile;
 use fre_aot_compiler::{
     LinuxAarch64SelectedEndManifestV2, LinuxSelectedEndDirectGlueLimitsV2,
-    SelectedEndAotRuntimeAuthorityV2, build_linux_selected_end_qualification_bundle_v2,
+    LinuxSelectedEndQualificationDeploymentLimitsV2, SelectedEndAotRuntimeAuthorityV2,
+    build_linux_selected_end_qualification_bundle_v2,
+    build_linux_selected_end_qualification_deployment_v2,
     plan_and_compile_linux_aarch64_selected_end_v2,
 };
 
@@ -77,6 +79,16 @@ fn run() -> Result<(), DynError> {
         bundle.compiled().literal() == LITERAL,
         "compiled literal differs from the benchmark literal",
     )?;
+    let deployment_limits = LinuxSelectedEndQualificationDeploymentLimitsV2::default();
+    let deployment =
+        build_linux_selected_end_qualification_deployment_v2(&bundle, deployment_limits)?;
+    deployment.validate(&bundle, deployment_limits)?;
+    require(
+        deployment.runtime_authority() == SelectedEndAotRuntimeAuthorityV2::Absent
+            && deployment.binding().runtime_authority() == SelectedEndAotRuntimeAuthorityV2::Absent
+            && deployment.receipt().runtime_authority() == SelectedEndAotRuntimeAuthorityV2::Absent,
+        "generated deployment unexpectedly granted runtime authority",
+    )?;
     let requirements = bundle.post_link_disassembly_requirements();
     require(
         requirements.requires_direct_bl()
@@ -97,8 +109,11 @@ fn run() -> Result<(), DynError> {
     let expectation_path = output_directory.join("selected-end-expectation-v2.bin");
     let compiler_receipt_path = output_directory.join("selected-end-compiler-receipt-v2.bin");
     let bundle_receipt_path = output_directory.join("selected-end-bundle-receipt-v2.bin");
-    let contract_path = output_directory.join("selected-end-post-link-contract-v1.tsv");
-    let generated_path = output_directory.join("linked_selected_end_v2.rs");
+    let deployment_receipt_path = output_directory.join("selected-end-deployment-receipt-v2.bin");
+    let deployment_binding_path = output_directory.join("linked_selected_end_deployment_v2.rs");
+    let contract_path = output_directory.join("selected-end-post-link-contract-v2.tsv");
+    let metadata_path = output_directory.join("linked_selected_end_metadata_v2.rs");
+    let hot_callsite_path = output_directory.join("linked_selected_end_hot_callsite_v2.rs");
 
     fs::write(&implementation_path, bundle.compiled().object().as_bytes())?;
     fs::write(&glue_path, bundle.glue().as_bytes())?;
@@ -109,6 +124,11 @@ fn run() -> Result<(), DynError> {
         bundle.compiled().receipt().canonical_receipt_bytes()?,
     )?;
     fs::write(&bundle_receipt_path, bundle.receipt().canonical_bytes())?;
+    fs::write(
+        &deployment_receipt_path,
+        deployment.receipt().canonical_bytes(),
+    )?;
+    fs::write(&deployment_binding_path, deployment.binding().as_bytes())?;
 
     let symbols = bundle.glue().symbols()?;
     let receipt = bundle.compiled().receipt();
@@ -120,6 +140,11 @@ fn run() -> Result<(), DynError> {
     let source_identity = hex(receipt.source_identity().as_bytes());
     let compiler_receipt_identity = hex(receipt.receipt_identity().as_bytes());
     let expectation_identity = hex(bundle.expectation().expectation_identity().as_bytes());
+    let deployment_binding_identity = deployment.binding().identity().to_string();
+    let deployment_receipt_identity = deployment.receipt().receipt_identity().to_string();
+    let primary_proof_callsite = deployment.binding().primary_callsite_symbol();
+    let consumer_hot_callsite =
+        format!("fre_aot_search_selected_end_three_engine_hot_callsite_v2_{compile_identity}");
 
     let contract = render_contract(
         &source_commit,
@@ -138,10 +163,14 @@ fn run() -> Result<(), DynError> {
         &source_identity,
         &compiler_receipt_identity,
         &expectation_identity,
+        &deployment_binding_identity,
+        &deployment_receipt_identity,
+        primary_proof_callsite,
+        &consumer_hot_callsite,
     )?;
     fs::write(&contract_path, contract)?;
 
-    let generated = render_rust_bindings(
+    let metadata = render_benchmark_metadata(
         &source_commit,
         &source_tree,
         &helper_sha256,
@@ -149,22 +178,27 @@ fn run() -> Result<(), DynError> {
         &contract_path,
         &implementation_path,
         &glue_path,
-        symbols.wrapper().as_str(),
-        symbols.entry().as_str(),
-        symbols.payload().as_str(),
-        symbols.metadata().as_str(),
-        receipt.artifact_identity().as_bytes(),
-        receipt.compile_identity().as_bytes(),
-        receipt.object_identity().as_bytes(),
-        bundle.glue().object_identity().as_bytes(),
-        bundle.bundle_identity().as_bytes(),
+        &deployment_binding_path,
+        &deployment_receipt_path,
+        &deployment_binding_identity,
+        &deployment_receipt_identity,
+        &consumer_hot_callsite,
     )?;
-    fs::write(&generated_path, generated)?;
+    fs::write(&metadata_path, metadata)?;
+    fs::write(
+        &hot_callsite_path,
+        render_benchmark_hot_callsite(&consumer_hot_callsite)?,
+    )?;
 
     for link_input in [&implementation_path, &glue_path] {
         println!("cargo:rustc-link-arg-bin={BIN}={}", link_input.display());
     }
-    for retained in [symbols.payload().as_str(), symbols.metadata().as_str()] {
+    for retained in [
+        symbols.payload().as_str(),
+        symbols.metadata().as_str(),
+        primary_proof_callsite,
+        &consumer_hot_callsite,
+    ] {
         println!("cargo:rustc-link-arg-bin={BIN}=-Wl,--undefined={retained}");
     }
     println!("cargo:rustc-link-arg-bin={BIN}=-Wl,-z,separate-code");
@@ -194,10 +228,14 @@ fn render_contract(
     source_identity: &str,
     compiler_receipt_identity: &str,
     expectation_identity: &str,
+    deployment_binding_identity: &str,
+    deployment_receipt_identity: &str,
+    primary_proof_callsite: &str,
+    consumer_hot_callsite: &str,
 ) -> Result<String, std::fmt::Error> {
     let mut output = String::new();
     for (key, value) in [
-        ("schema", "fre-aot-selected-end-abi2-post-link-contract-v1"),
+        ("schema", "fre-aot-selected-end-abi2-post-link-contract-v2"),
         ("evidence_class", "diagnostic-nonpromotion"),
         ("promotion_authority", "absent"),
         ("runtime_authority", "absent"),
@@ -220,13 +258,20 @@ fn render_contract(
         ("compiler_receipt_identity", compiler_receipt_identity),
         ("expectation_identity", expectation_identity),
         ("bundle_identity", bundle_identity),
+        ("deployment_binding_identity", deployment_binding_identity),
+        ("deployment_receipt_identity", deployment_receipt_identity),
         ("wrapper_symbol", wrapper),
+        ("primary_proof_callsite_symbol", primary_proof_callsite),
+        ("consumer_hot_callsite_symbol", consumer_hot_callsite),
         ("entry_symbol", entry),
         ("payload_symbol", payload),
         ("metadata_symbol", metadata),
         ("required_relocation", "R_AARCH64_CALL26"),
         ("required_final_call", "direct-bl-exact-entry"),
-        ("primary_aot_hot_route", "exact-entry-direct"),
+        (
+            "primary_aot_hot_route",
+            "generated-owned-plan-consumer-loop-direct",
+        ),
         (
             "qualification_wrapper_route",
             "linked-validated-diagnostic-only",
@@ -247,9 +292,9 @@ fn render_contract(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "generated code binds the complete exact candidate namespace and identity tuple"
+    reason = "benchmark metadata keeps every separately persisted build artifact explicit"
 )]
-fn render_rust_bindings(
+fn render_benchmark_metadata(
     source_commit: &str,
     source_tree: &str,
     helper_sha256: &str,
@@ -257,15 +302,11 @@ fn render_rust_bindings(
     contract_path: &Path,
     implementation_path: &Path,
     glue_path: &Path,
-    wrapper: &str,
-    entry: &str,
-    payload: &str,
-    metadata: &str,
-    artifact_identity: &[u8; 32],
-    compile_identity: &[u8; 32],
-    implementation_object_identity: &[u8; 32],
-    glue_object_identity: &[u8; 32],
-    bundle_identity: &[u8; 32],
+    deployment_binding_path: &Path,
+    deployment_receipt_path: &Path,
+    deployment_binding_identity: &str,
+    deployment_receipt_identity: &str,
+    consumer_hot_callsite: &str,
 ) -> Result<String, std::fmt::Error> {
     let mut output = String::new();
     writeln!(
@@ -301,44 +342,43 @@ fn render_rust_bindings(
     )?;
     writeln!(
         output,
-        "pub(super) const WRAPPER_SYMBOL: &str = {wrapper:?};"
-    )?;
-    writeln!(output, "pub(super) const ENTRY_SYMBOL: &str = {entry:?};")?;
-    writeln!(
-        output,
-        "pub(super) const PAYLOAD_SYMBOL: &str = {payload:?};"
+        "pub(super) const DEPLOYMENT_BINDING_PATH: &str = {:?};",
+        deployment_binding_path.display().to_string()
     )?;
     writeln!(
         output,
-        "pub(super) const METADATA_SYMBOL: &str = {metadata:?};"
+        "pub(super) const DEPLOYMENT_RECEIPT_PATH: &str = {:?};",
+        deployment_receipt_path.display().to_string()
     )?;
     writeln!(
         output,
-        "pub(super) const AOT_ARTIFACT_IDENTITY: [u8; 32] = {artifact_identity:?};"
+        "pub(super) const DEPLOYMENT_BINDING_IDENTITY: &str = {deployment_binding_identity:?};"
     )?;
     writeln!(
         output,
-        "pub(super) const AOT_COMPILE_IDENTITY: [u8; 32] = {compile_identity:?};"
+        "pub(super) const DEPLOYMENT_RECEIPT_IDENTITY: &str = {deployment_receipt_identity:?};"
     )?;
     writeln!(
         output,
-        "pub(super) const AOT_IMPLEMENTATION_OBJECT_IDENTITY: [u8; 32] = {implementation_object_identity:?};"
+        "pub(super) const CONSUMER_HOT_CALLSITE_SYMBOL: &str = {consumer_hot_callsite:?};"
+    )?;
+    Ok(output)
+}
+
+fn render_benchmark_hot_callsite(consumer_hot_callsite: &str) -> Result<String, std::fmt::Error> {
+    let mut output = String::new();
+    writeln!(
+        output,
+        "// @generated benchmark adapter; the exact AOT declaration and safe call remain in the compiler deployment binding."
     )?;
     writeln!(
         output,
-        "pub(super) const AOT_GLUE_OBJECT_IDENTITY: [u8; 32] = {glue_object_identity:?};"
+        "#[allow(unsafe_code, reason = \"the benchmark retains one exact hidden consumer hot-call symbol for post-link inspection\")]\ncore::arch::global_asm!({:?});",
+        format!(".hidden {consumer_hot_callsite}"),
     )?;
     writeln!(
         output,
-        "pub(super) const AOT_BUNDLE_IDENTITY: [u8; 32] = {bundle_identity:?};"
-    )?;
-    writeln!(
-        output,
-        "#[allow(unsafe_code, reason = \"generated FFI declares only the sealed exact ABI2 symbols\")]\nunsafe extern \"C\" {{\n    #[link_name = {entry:?}]\n    fn exact_linked_aot_selected_end_entry_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n    #[link_name = {wrapper:?}]\n    fn exact_linked_aot_selected_end_qualification_wrapper_v2(haystack: *const u8, haystack_len: usize, window_start: usize, window_end: usize) -> usize;\n}}"
-    )?;
-    writeln!(
-        output,
-        "#[allow(unsafe_code, reason = \"the checked AOT session guards this exact ABI2 call\")]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_entry_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: the private generated entry requires the non-transferable\n    // AotThreadSession constructed after one same-thread tag21 VL16 check;\n    // its caller also supplies scalar-preflighted bounds. The exact linked\n    // entry has the sealed four-argument ABI2 contract and no result slot.\n    unsafe {{ exact_linked_aot_selected_end_entry_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}\n\n#[allow(unsafe_code, reason = \"the checked AOT session guards this diagnostic ABI2 call\")]\n#[inline(always)]\npub(super) fn call_exact_linked_aot_selected_end_qualification_wrapper_v2(_session: &super::AotThreadSession<'_>, haystack: &[u8], window_start: usize, window_end: usize) -> usize {{\n    // SAFETY: this diagnostic-only route requires the same private checked\n    // thread token and scalar-preflighted inputs as the primary direct route.\n    unsafe {{ exact_linked_aot_selected_end_qualification_wrapper_v2(haystack.as_ptr(), haystack.len(), window_start, window_end) }}\n}}"
+        "#[derive(Clone, Copy, Debug, Eq, PartialEq)]\npub(super) enum AotHotLoopErrorV2 {{\n    Call(fre_aot_static_runtime::StaticSearchSelectedEndCallErrorV2),\n    AccountingMismatch,\n}}\n\n#[allow(unsafe_code, reason = \"the exact export name pins the real measured consumer loop for post-link inspection\")]\n#[unsafe(export_name = {consumer_hot_callsite:?})]\n#[inline(never)]\npub(super) fn run_exact_linked_aot_selected_end_hot_loop_v2<'preflight, 'haystack>(\n    plan_session: &super::aot_deployment::ExactLinkedAotSelectedEndPlanSessionV2<'_, '_>,\n    preflight: fre_kernels::LiteralSearchPreflight<'preflight, 'haystack>,\n    iterations: usize,\n) -> Result<u64, AotHotLoopErrorV2> {{\n    let expected_accounting = preflight.accounting();\n    let mut checksum = 0_u64;\n    for iteration in 0..iterations {{\n        let (matched, accounting) =\n            match super::aot_deployment::search_exact_linked_aot_selected_end_v2(\n                plan_session,\n                core::hint::black_box(preflight),\n            ) {{\n                Ok(result) => result,\n                Err(error) => return Err(AotHotLoopErrorV2::Call(error)),\n            }};\n        if accounting != expected_accounting {{\n            return Err(AotHotLoopErrorV2::AccountingMismatch);\n        }}\n        let span = core::hint::black_box(matched).map(|span| (span.start(), span.end()));\n        checksum = checksum.wrapping_add(super::span_checksum(\n            span,\n            super::usize_u64(iteration),\n        ));\n    }}\n    Ok(core::hint::black_box(checksum))\n}}"
     )?;
     Ok(output)
 }

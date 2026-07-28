@@ -771,12 +771,12 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
     require(
         (
             "pub(super) struct "
-            "ExactLinkedAotSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+            "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
         )
         in nominal_source
         and (
             "inner: fre_aot_static_runtime::"
-            "StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+            "StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan>"
         )
         in nominal_source
         and "pub(super) inner:" not in nominal_source
@@ -785,17 +785,26 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "binding does not keep the artifact session inside a private nominal wrapper",
     )
     require(
-        "StaticSearchSelectedEndThreadSessionV2<'owner>" in bind_source
-        and (
-            "ExactLinkedAotSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        (
+            "session: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndThreadSessionV2<'owner>"
         )
         in bind_source
         and (
-            "inner: session.bind_literal_plan("
+            "session: &'session fre_aot_static_runtime::"
+            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+        )
+        not in bind_source
+        and (
+            "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
+        )
+        in bind_source
+        and (
+            "inner: session.bind_literal_plan_owned("
             "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
         )
         in bind_source,
-        "binding omits one-time exact-literal/artifact plan binding",
+        "binding omits its consuming one-time exact-literal/artifact plan binding",
     )
     require(
         f"{entry_local}(" in primary_source
@@ -813,7 +822,7 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         )
         == 2
         and source.count(
-            "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_, '_>"
+            "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_>"
         )
         == 2
         and source.count("&EXACT_PLAN_BINDING_KEY") == 1

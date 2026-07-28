@@ -32,11 +32,19 @@ import subprocess
 from pathlib import Path
 
 
-SCHEMA = "fre-aot-selected-end-abi2-post-link-contract-v1"
-OBSERVATION_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v2"
+SCHEMA = "fre-aot-selected-end-abi2-post-link-contract-v2"
+OBSERVATION_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v3"
 MAX_BINARY_BYTES = 256 << 20
 MAX_OBJECT_BYTES = 16 << 20
 MAX_CONTRACT_BYTES = 64 << 10
+MAX_BINDING_BYTES = 256 << 10
+DEPLOYMENT_RECEIPT_BYTES = 672
+RUST_BINDING_IDENTITY_DOMAIN = (
+    b"FRE-AOT-LINUX-SEARCH-SELECTED-END-QUALIFICATION-RUST-BINDING\0\x02"
+)
+DEPLOYMENT_RECEIPT_IDENTITY_DOMAIN = (
+    b"FRE-AOT-LINUX-SEARCH-SELECTED-END-QUALIFICATION-DEPLOYMENT-RECEIPT\0\x02"
+)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -78,7 +86,11 @@ CONTRACT_KEYS = (
     "compiler_receipt_identity",
     "expectation_identity",
     "bundle_identity",
+    "deployment_binding_identity",
+    "deployment_receipt_identity",
     "wrapper_symbol",
+    "primary_proof_callsite_symbol",
+    "consumer_hot_callsite_symbol",
     "entry_symbol",
     "payload_symbol",
     "metadata_symbol",
@@ -352,6 +364,8 @@ def parse_contract(raw: bytes) -> dict[str, str]:
         "compiler_receipt_identity",
         "expectation_identity",
         "bundle_identity",
+        "deployment_binding_identity",
+        "deployment_receipt_identity",
     ):
         require(
             HEX64.fullmatch(fields[key]) is not None and fields[key] != "0" * 64,
@@ -361,6 +375,14 @@ def parse_contract(raw: bytes) -> dict[str, str]:
     expected_symbols = {
         "wrapper_symbol": (
             "fre_aot_search_selected_end_qualification_direct_v2_"
+            + compile_identity
+        ),
+        "primary_proof_callsite_symbol": (
+            "fre_aot_search_selected_end_qualification_primary_callsite_v2_"
+            + compile_identity
+        ),
+        "consumer_hot_callsite_symbol": (
+            "fre_aot_search_selected_end_three_engine_hot_callsite_v2_"
             + compile_identity
         ),
         "entry_symbol": "fre_aot_search_selected_end_entry_v2_" + compile_identity,
@@ -379,7 +401,8 @@ def parse_contract(raw: bytes) -> dict[str, str]:
     require(
         fields["required_relocation"] == "R_AARCH64_CALL26"
         and fields["required_final_call"] == "direct-bl-exact-entry"
-        and fields["primary_aot_hot_route"] == "exact-entry-direct"
+        and fields["primary_aot_hot_route"]
+        == "generated-owned-plan-consumer-loop-direct"
         and fields["qualification_wrapper_route"]
         == "linked-validated-diagnostic-only"
         and fields["reject_indirect_branch"] == "blr"
@@ -393,6 +416,223 @@ def parse_contract(raw: bytes) -> dict[str, str]:
         "post-link or timing-scope obligations changed",
     )
     return fields
+
+
+def validate_deployment(
+    binding: bytes,
+    receipt: bytes,
+    contract: dict[str, str],
+) -> None:
+    require(
+        binding.endswith(b"\n") and b"\r" not in binding and b"\0" not in binding,
+        "deployment binding is not canonical LF-terminated text",
+    )
+    try:
+        source = binding.decode("ascii")
+    except UnicodeError as error:
+        raise Refusal("deployment binding is not ASCII") from error
+    binding_hasher = hashlib.sha256()
+    binding_hasher.update(RUST_BINDING_IDENTITY_DOMAIN)
+    binding_hasher.update(struct.pack("<Q", len(binding)))
+    binding_hasher.update(binding)
+    binding_identity = binding_hasher.hexdigest()
+    require(
+        binding_identity == contract["deployment_binding_identity"],
+        "deployment binding differs from its contract identity",
+    )
+
+    require(
+        len(receipt) == DEPLOYMENT_RECEIPT_BYTES
+        and receipt[:8] == b"FRESDP\0\x02"
+        and struct.unpack_from("<H", receipt, 8)[0] == 2
+        and struct.unpack_from("<H", receipt, 10)[0] == 2
+        and struct.unpack_from("<I", receipt, 12)[0] == DEPLOYMENT_RECEIPT_BYTES
+        and struct.unpack_from("<I", receipt, 16)[0] == len(binding)
+        and receipt[20] == 4
+        and receipt[21] == 0
+        and struct.unpack_from("<H", receipt, 22)[0] == 0
+        and struct.unpack_from("<H", receipt, 24)[0] == 21
+        and struct.unpack_from("<H", receipt, 26)[0] == 2
+        and struct.unpack_from("<H", receipt, 28)[0] == 16
+        and receipt[30] == 0
+        and receipt[31] == 2
+        and struct.unpack_from("<I", receipt, 32)[0] == 0x7F
+        and struct.unpack_from("<I", receipt, 36)[0] == 16
+        and 0 < struct.unpack_from("<I", receipt, 40)[0] <= MAX_OBJECT_BYTES
+        and struct.unpack_from("<H", receipt, 44)[0] == 18
+        and receipt[46:64] == bytes(18)
+        and all(
+            receipt[offset : offset + 32] != bytes(32)
+            for offset in range(64, 640, 32)
+        ),
+        "deployment receipt header changed",
+    )
+    receipt_hasher = hashlib.sha256()
+    receipt_hasher.update(DEPLOYMENT_RECEIPT_IDENTITY_DOMAIN)
+    receipt_hasher.update(receipt[:640])
+    require(
+        receipt_hasher.digest() == receipt[640:672]
+        and receipt[640:672].hex() == contract["deployment_receipt_identity"],
+        "deployment receipt identity is invalid",
+    )
+    for offset, key in (
+        (96, "source_identity"),
+        (224, "artifact_identity"),
+        (288, "compile_identity"),
+        (320, "implementation_object_identity"),
+        (352, "compiler_receipt_identity"),
+        (384, "expectation_identity"),
+        (544, "glue_object_identity"),
+        (576, "bundle_identity"),
+        (608, "deployment_binding_identity"),
+    ):
+        require(
+            receipt[offset : offset + 32].hex() == contract[key],
+            f"deployment receipt {key} differs from the contract",
+        )
+
+    entry = contract["entry_symbol"]
+    wrapper = contract["wrapper_symbol"]
+    proof = contract["primary_proof_callsite_symbol"]
+    compile_identity = contract["compile_identity"]
+    literal = ", ".join(str(byte) for byte in bytes.fromhex(contract["literal_hex"]))
+    require(
+        f'#[link_name = "{entry}"]' in source
+        and f'#[link_name = "{wrapper}"]' in source
+        and f'#[unsafe(export_name = "{proof}")]' in source
+        and f'core::arch::global_asm!(".hidden {proof}");' in source,
+        "deployment binding omits its exact symbol namespace",
+    )
+    key_start = source.find(
+        "static EXACT_PLAN_BINDING_KEY: "
+        "fre_aot_static_runtime::StaticSearchSelectedEndBindingKeyV2"
+    )
+    nominal_start = source.find(
+        "pub(super) struct ExactLinkedAotSelectedEndPlanSessionV2"
+    )
+    bind_start = source.find(
+        "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+    )
+    primary_start = source.find(
+        "pub(super) fn search_exact_linked_aot_selected_end_v2"
+    )
+    diagnostic_start = source.find(
+        "pub(super) fn search_exact_linked_aot_selected_end_qualification_wrapper_v2"
+    )
+    require(
+        0 <= key_start < nominal_start < bind_start < primary_start < diagnostic_start,
+        "deployment binding key/nominal/bind/primary/diagnostic order changed",
+    )
+    key_source = source[key_start:nominal_start]
+    nominal_source = source[nominal_start:bind_start]
+    bind_source = source[bind_start:primary_start]
+    primary_source = source[primary_start:diagnostic_start]
+    entry_local = (
+        f"exact_linked_aot_selected_end_entry_v2_{compile_identity}"
+    )
+    wrapper_local = (
+        "exact_linked_aot_selected_end_qualification_wrapper_v2_"
+        f"{compile_identity}"
+    )
+    proof_local = (
+        f"exact_linked_aot_selected_end_primary_callsite_v2_{compile_identity}"
+    )
+    for local in (entry_local, wrapper_local):
+        declaration = (
+            f"fn {local}(haystack: *const u8, haystack_len: usize, "
+            "window_start: usize, window_end: usize) -> usize;"
+        )
+        require(
+            declaration in source,
+            f"deployment binding declaration changed for {local}",
+        )
+    require(
+        (
+            "StaticSearchSelectedEndBindingKeyV2::"
+            "qualification_private(COMPILE_IDENTITY)"
+        )
+        in key_source,
+        "deployment binding key is not tied to COMPILE_IDENTITY",
+    )
+    require(
+        (
+            "pub(super) struct "
+            "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
+        )
+        in nominal_source
+        and (
+            "inner: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndOwnedPlanSessionV2<'owner, 'plan>"
+        )
+        in nominal_source
+        and "pub(super) inner:" not in nominal_source
+        and "pub(crate) inner:" not in nominal_source
+        and "pub inner:" not in nominal_source,
+        "deployment binding does not keep its owning session nominal field private",
+    )
+    require(
+        (
+            "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
+            "<'owner, 'plan>"
+        )
+        in bind_source
+        and (
+            "session: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+        )
+        in bind_source
+        and (
+            "session: &'session fre_aot_static_runtime::"
+            "StaticSearchSelectedEndThreadSessionV2<'owner>"
+        )
+        not in bind_source
+        and (
+            "inner: session.bind_literal_plan_owned("
+            "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
+        )
+        in bind_source,
+        "deployment binding omits its exact consuming plan bind",
+    )
+    require(
+        f"{entry_local}(" in primary_source
+        and f"{proof_local}(" not in primary_source,
+        "deployment primary source does not directly name the exact entry",
+    )
+    require(
+        source.count(
+            "let prepared = plan_session.inner.prepare_plan_bound(preflight)?;"
+        )
+        == 2
+        and source.count(
+            "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_>"
+        )
+        == 2
+        and source.count("&EXACT_PLAN_BINDING_KEY") == 1
+        and "session.prepare(preflight, &EXACT_LITERAL)?" not in source
+        and "plan_session.prepare(preflight)?" not in source
+        and (
+            "plan_session.prepare(preflight, &EXACT_PLAN_BINDING_KEY)?;"
+            not in source
+        ),
+        "deployment binding omits its owning nominal plan-bound hot path",
+    )
+    require(
+        f"pub(super) const EXACT_LITERAL: [u8; 16] = [{literal}];" in source,
+        "deployment binding literal differs from the contract",
+    )
+    for forbidden in (
+        "transmute",
+        "dyn Fn",
+        "extern \"C\" fn(",
+        "*mut",
+        "result_slot",
+        " x4",
+        "blr",
+    ):
+        require(
+            forbidden not in source,
+            f"deployment binding contains forbidden form {forbidden!r}",
+        )
 
 
 def run_tool(tool: str, *arguments: str, pass_fds: tuple[int, ...] = ()) -> str:
@@ -469,7 +709,7 @@ def require_symbol(
     defined: bool,
     hidden: bool,
     kind: str,
-) -> None:
+) -> tuple[int, int]:
     matches = [row for row in rows if row[-1] == symbol]
     require(len(matches) == 1, f"{symbol} does not have one symbol-table row")
     row = matches[0]
@@ -483,6 +723,17 @@ def require_symbol(
         (row[5] == "HIDDEN") == hidden,
         f"{symbol} hidden visibility changed",
     )
+    try:
+        value = int(row[1], 16)
+        size = int(row[2], 10)
+    except ValueError as error:
+        raise Refusal(f"{symbol} has a malformed value or extent") from error
+    if defined:
+        require(
+            value > 0 and 0 < size <= MAX_OBJECT_BYTES,
+            f"{symbol} has a zero or unbounded defined extent",
+        )
+    return value, size
 
 
 def require_glue_relocation(glue: SealedSnapshot, entry: str) -> None:
@@ -552,11 +803,90 @@ def require_wrapper(binary: SealedSnapshot, wrapper: str, entry: str) -> None:
     )
 
 
-def require_primary_direct_entry_call(
+def require_named_direct_entry_call(
     binary: SealedSnapshot,
-    wrapper: str,
+    callsite: str,
+    extent: tuple[int, int],
     entry: str,
+    label: str,
+    *,
+    exactly_one_call: bool,
+    reject_x4: bool,
 ) -> None:
+    start, size = extent
+    stop = start + size
+    require(
+        size % 4 == 0 and stop > start,
+        f"{label} does not have a bounded AArch64 instruction extent",
+    )
+    output = run_tool(
+        "/usr/bin/objdump",
+        "-d",
+        f"--start-address=0x{start:x}",
+        f"--stop-address=0x{stop:x}",
+        os.fspath(binary.path),
+        pass_fds=(binary.descriptor,),
+    )
+    require(f"<{callsite}>:" in output, f"{label} symbol label is absent")
+    require(
+        f"<{entry}@plt>" not in output and f"<{entry}.plt>" not in output,
+        f"{label} reaches the exact entry through a PLT spelling",
+    )
+    decoded = instructions(output)
+    require(
+        [address for address, _, _, _ in decoded] == list(range(start, stop, 4))
+        and all(len(encoded) == 8 for _, encoded, _, _ in decoded),
+        f"{label} is not fully decoded inside its exact symbol extent",
+    )
+    all_calls = [
+        (address, mnemonic, operands)
+        for address, _, mnemonic, operands in decoded
+        if mnemonic == "bl" or mnemonic.startswith("blr")
+    ]
+    direct_branches = [
+        (address, mnemonic, operands)
+        for address, _, mnemonic, operands in decoded
+        if mnemonic == "b"
+        or mnemonic.startswith("b.")
+        or mnemonic in ("cbz", "cbnz", "tbz", "tbnz")
+    ]
+    for address, mnemonic, operands in direct_branches:
+        target_match = re.search(
+            r"(?:^|,\s*)([0-9a-f]+)\s*(?:<[^>]+>)?\s*$",
+            operands,
+        )
+        require(
+            target_match is not None
+            and start <= int(target_match.group(1), 16) < stop,
+            f"{label} has an external direct transfer at 0x{address:x} ({mnemonic})",
+        )
+    text = "\n".join(
+        f"{mnemonic} {operands}" for _, _, mnemonic, operands in decoded
+    )
+    require(
+        bool(all_calls)
+        and (not exactly_one_call or len(all_calls) == 1)
+        and all(
+            mnemonic == "bl" and f"<{entry}>" in operands
+            for _, mnemonic, operands in all_calls
+        )
+        and all(
+            "@plt" not in operands.lower() and ".plt" not in operands.lower()
+            for _, _, _, operands in decoded
+        )
+        and not any(mnemonic.startswith("blr") for _, _, mnemonic, _ in decoded)
+        and not any(mnemonic.startswith("br") for _, _, mnemonic, _ in decoded)
+        and (not reject_x4 or re.search(r"\bx4\b", text) is None),
+        (
+            f"{label} does not contain "
+            + ("exactly one" if exactly_one_call else "one or more")
+            + " total direct non-PLT bl instructions, all to the exact entry, without blr"
+            + ("/x4" if reject_x4 else "")
+        ),
+    )
+
+
+def require_no_entry_plt_or_blr(binary: SealedSnapshot, entry: str) -> None:
     output = run_tool(
         "/usr/bin/objdump",
         "-d",
@@ -566,37 +896,8 @@ def require_primary_direct_entry_call(
     require(
         f"<{entry}@plt>" not in output
         and f"<{entry}.plt>" not in output
-        and re.search(rf"\bblr\b[^\n]*<{re.escape(entry)}>", output) is None,
-        "exact entry is reachable through PLT or blr",
-    )
-    direct_calls = [
-        (address, operands)
-        for address, _, mnemonic, operands in instructions(output)
-        if mnemonic == "bl"
-        and f"<{entry}>" in operands
-        and "@plt" not in operands.lower()
-        and ".plt" not in operands.lower()
-    ]
-    require(
-        len(direct_calls) >= 2,
-        "final image lacks separate direct bl calls for the P2b wrapper and primary AOT route",
-    )
-    wrapper_output = run_tool(
-        "/usr/bin/objdump",
-        "-d",
-        f"--disassemble={wrapper}",
-        os.fspath(binary.path),
-        pass_fds=(binary.descriptor,),
-    )
-    wrapper_calls = {
-        address
-        for address, _, mnemonic, operands in instructions(wrapper_output)
-        if mnemonic == "bl" and f"<{entry}>" in operands
-    }
-    require(
-        len(wrapper_calls) == 1
-        and any(address not in wrapper_calls for address, _ in direct_calls),
-        "all exact-entry calls came from the qualification wrapper",
+        and re.search(rf"\bblr[a-z]*\b[^\n]*<{re.escape(entry)}>", output) is None,
+        "exact entry is reachable through a PLT spelling or disassembler-annotated blr",
     )
 
 
@@ -619,6 +920,33 @@ def require_linked_implementation_bytes(
             and linked["size"] == relocatable["size"],
             f"linked {description} bytes differ from the input implementation object",
         )
+
+
+def require_deployment_payload_crosslink(
+    receipt: bytes,
+    implementation: bytes,
+    payload: str,
+    metadata: str,
+) -> None:
+    payload_bytes = elf_symbol(
+        implementation,
+        payload,
+        "implementation object",
+    )["bytes"]
+    metadata_bytes = elf_symbol(
+        implementation,
+        metadata,
+        "implementation object",
+    )["bytes"]
+    require(
+        isinstance(payload_bytes, bytes)
+        and isinstance(metadata_bytes, bytes)
+        and len(metadata_bytes) == 224
+        and struct.unpack_from("<I", receipt, 40)[0] == len(payload_bytes)
+        and receipt[416:448] == hashlib.sha256(payload_bytes).digest()
+        and receipt[416:448] == metadata_bytes[160:192],
+        "deployment receipt full-payload identity/extent is not cross-linked to the implementation",
+    )
 
 
 def require_metadata_contract(
@@ -778,6 +1106,8 @@ def verify(arguments: argparse.Namespace) -> None:
     implementation_path = arguments.implementation.resolve(strict=True)
     glue_path = arguments.glue.resolve(strict=True)
     contract_path = arguments.contract.resolve(strict=True)
+    binding_path = arguments.binding.resolve(strict=True)
+    deployment_receipt_path = arguments.deployment_receipt.resolve(strict=True)
     binary_bytes = read_regular(binary_path, MAX_BINARY_BYTES, "final executable")
     implementation_bytes = read_regular(
         implementation_path,
@@ -788,6 +1118,17 @@ def verify(arguments: argparse.Namespace) -> None:
     contract = parse_contract(
         read_regular(contract_path, MAX_CONTRACT_BYTES, "post-link contract")
     )
+    binding_bytes = read_regular(
+        binding_path,
+        MAX_BINDING_BYTES,
+        "generated deployment binding",
+    )
+    deployment_receipt_bytes = read_regular(
+        deployment_receipt_path,
+        DEPLOYMENT_RECEIPT_BYTES,
+        "deployment receipt",
+    )
+    validate_deployment(binding_bytes, deployment_receipt_bytes, contract)
     require(
         arguments.source_commit == contract["source_commit"]
         and arguments.source_tree == contract["source_tree"],
@@ -819,6 +1160,8 @@ def verify(arguments: argparse.Namespace) -> None:
         require_aarch64_elf(glue, "direct-glue object", True)
 
         wrapper = contract["wrapper_symbol"]
+        proof_callsite = contract["primary_proof_callsite_symbol"]
+        consumer_hot_callsite = contract["consumer_hot_callsite_symbol"]
         entry = contract["entry_symbol"]
         payload = contract["payload_symbol"]
         metadata = contract["metadata_symbol"]
@@ -860,19 +1203,48 @@ def verify(arguments: argparse.Namespace) -> None:
             hidden=True,
             kind="OBJECT",
         )
-        require_symbol(
+        wrapper_extent = require_symbol(
             binary_symbols,
             wrapper,
             defined=True,
             hidden=True,
             kind="FUNC",
         )
-        require_symbol(
+        proof_extent = require_symbol(
+            binary_symbols,
+            proof_callsite,
+            defined=True,
+            hidden=True,
+            kind="FUNC",
+        )
+        consumer_extent = require_symbol(
+            binary_symbols,
+            consumer_hot_callsite,
+            defined=True,
+            hidden=True,
+            kind="FUNC",
+        )
+        entry_extent = require_symbol(
             binary_symbols,
             entry,
             defined=True,
             hidden=True,
             kind="FUNC",
+        )
+        function_extents = sorted(
+            (
+                wrapper_extent,
+                proof_extent,
+                consumer_extent,
+                entry_extent,
+            )
+        )
+        require(
+            all(
+                left[0] + left[1] <= right[0]
+                for left, right in zip(function_extents, function_extents[1:])
+            ),
+            "wrapper, proof, consumer, and entry function extents overlap",
         )
         require_symbol(
             binary_symbols,
@@ -890,7 +1262,25 @@ def verify(arguments: argparse.Namespace) -> None:
         )
         require_glue_relocation(glue, entry)
         require_wrapper(binary, wrapper, entry)
-        require_primary_direct_entry_call(binary, wrapper, entry)
+        require_no_entry_plt_or_blr(binary, entry)
+        require_named_direct_entry_call(
+            binary,
+            proof_callsite,
+            proof_extent,
+            entry,
+            "generated primary proof callsite",
+            exactly_one_call=True,
+            reject_x4=True,
+        )
+        require_named_direct_entry_call(
+            binary,
+            consumer_hot_callsite,
+            consumer_extent,
+            entry,
+            "benchmark consumer hot loop",
+            exactly_one_call=False,
+            reject_x4=False,
+        )
         require_exact_linked_wrapper_bytes(
             binary_bytes,
             glue_bytes,
@@ -901,6 +1291,12 @@ def verify(arguments: argparse.Namespace) -> None:
             binary_bytes,
             implementation_bytes,
             entry,
+            payload,
+            metadata,
+        )
+        require_deployment_payload_crosslink(
+            deployment_receipt_bytes,
+            implementation_bytes,
             payload,
             metadata,
         )
@@ -925,11 +1321,17 @@ def verify(arguments: argparse.Namespace) -> None:
         f"\timplementation_object_identity={contract['implementation_object_identity']}"
         f"\tglue_object_identity={contract['glue_object_identity']}"
         f"\tbundle_identity={contract['bundle_identity']}"
+        f"\tdeployment_binding_identity={contract['deployment_binding_identity']}"
+        f"\tdeployment_receipt_identity={contract['deployment_receipt_identity']}"
         f"\tfinal_binary_sha256={hashlib.sha256(binary_bytes).hexdigest()}"
         f"\thelper_sha256={contract['helper_sha256']}"
         f"\tprofile={contract['profile']}"
         "\twrapper_call=R_AARCH64_CALL26-to-direct-bl"
-        "\tprimary_aot_call=direct-bl-exact-entry"
+        "\tgenerated_proof_callsite=hidden-direct-bl-exact-entry"
+        "\tprimary_aot_call=hidden-consumer-loop-direct-bl-exact-entry"
+        "\tconsumer_hot_callsite_final_observed=true"
+        "\tgenerated_binding_authenticated=true"
+        "\tdeployment_receipt_authenticated=true"
         "\tentry_bytes_equal=true"
         "\tpayload_bytes_equal=true"
         "\tmetadata_bytes_equal=true"
@@ -937,6 +1339,7 @@ def verify(arguments: argparse.Namespace) -> None:
         "\treject_plt=true"
         "\treject_blr=true"
         "\treject_x4_argument=true"
+        "\tconsumer_loop_x4_scratch=unconstrained-nonabi"
         "\tresult_slot_bytes=0"
         "\truntime_authority=absent"
         "\tpromotion_authority=absent"
@@ -949,6 +1352,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--implementation", required=True, type=Path)
     result.add_argument("--glue", required=True, type=Path)
     result.add_argument("--contract", required=True, type=Path)
+    result.add_argument("--binding", required=True, type=Path)
+    result.add_argument("--deployment-receipt", required=True, type=Path)
     result.add_argument("--source-commit", required=True)
     result.add_argument("--source-tree", required=True)
     return result

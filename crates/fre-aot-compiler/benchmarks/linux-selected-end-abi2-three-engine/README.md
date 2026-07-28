@@ -17,17 +17,27 @@ deterministic P2b bundle itself says `runtime_authority=absent`.
 
 `build.rs` deterministically runs
 `plan_and_compile_linux_aarch64_selected_end_v2` and
-`build_linux_selected_end_qualification_bundle_v2` for
+`build_linux_selected_end_qualification_bundle_v2`, then passes that exact
+bundle to `build_linux_selected_end_qualification_deployment_v2` for
 `0123456789abcdef`. It writes the implementation object, canonical P2b
-direct-glue object, expectation, receipts, header, exact Rust symbol bindings,
-and a post-link contract into Cargo's private `OUT_DIR`, then links the two
-objects into this binary.
+direct-glue object, expectation, receipts, header, and exact compiler-generated
+deployment binding into Cargo's private `OUT_DIR`, then links the two objects
+into this binary. The deployment binding is persisted separately from the
+benchmark-only source/tree/path metadata and the consumer-loop adapter; the
+benchmark does not render another FFI declaration or session
+boundary.
 
-The primary AOT hot route calls the exact hidden implementation entry directly.
-It does not use a function pointer, PLT entry, x4 argument, or result slot. The
-canonical P2b `stp/bl/ldp/ret` wrapper stays linked and is exercised during
-correctness qualification, but its avoidable extra call is not charged to the
-primary AOT hot sample.
+Each hot sample enters one `inline(never)` engine-specific loop after the
+timer starts, with engine selection outside that loop. The stable hidden AOT
+loop symbol inlines the compiler-generated safe exact-entry function on every
+iteration, so it adds one host boundary per sample rather than one AOT-only
+boundary per searched value. The JIT and portable routes have the same
+one-loop-boundary shape. The generated AOT body names the exact hidden
+implementation entry directly and stores no function pointer, PLT target, ABI
+x4 argument, or result slot. The compiler-generated raw proof callsite and
+canonical P2b `stp/bl/ldp/ret` wrapper also stay linked; the wrapper is
+exercised during correctness qualification but is not charged to the primary
+AOT hot sample.
 
 The AOT compiler and linker run before process start. Their cost is explicitly
 `offline-excluded`; it is never folded into an AOT runtime-lifecycle sample.
@@ -51,15 +61,26 @@ Both native routes require OS-usable ASIMD, SVE, and SVE2 on the admitted
 homogeneous Arm `0x41/0xd84` host class. The benchmark never changes the
 calling thread's vector length.
 
-The AOT route exposes no call without `AotThreadSession`. That token contains an
-`Rc` marker, so it is neither `Send` nor `Sync`; construction checks process
-features/tuning and observes `PR_SVE_GET_VL == 16` once on the calling thread.
-The JIT route uses the runtime's own non-transferable tag21 ABI2 session and its
-independent VL16 check.
+The AOT route uses
+`StaticSearchSelectedEndQualificationV2::begin_current_thread_session`; the
+returned static-runtime token is neither `Send` nor `Sync`, checks
+features/tuning, and observes `PR_SVE_GET_VL == 16` once on the calling thread.
+The compiler-generated bind function consumes that token, validates the exact
+literal once, and records the generated module's hardcoded private
+compile-identity key in a module-private nominal session that borrows only the
+external portable plan and qualification owner. Nominal construction
+discharges artifact identity; there is no runtime key comparison in the hot
+path. This owning shape is storable without a self-reference. Repeated calls
+check only issuing-plan identity before the exact direct symbol call. The JIT
+route uses the runtime's independent non-transferable tag21 ABI2 session and
+VL16 check, binds the same portable plan once at session creation, and likewise
+uses plan provenance rather than literal bytes per call.
 
-Hot cells construct both sessions outside the timer and reuse one authoritative
-scalar preflight token. Lifecycle cells construct each applicable session
-inside the timer. Native hot calls make no vector-length syscall.
+Hot cells construct and bind both sessions outside the timer and reuse one
+authoritative scalar preflight token. Lifecycle and AOT-activation `session_ns`
+include AOT thread admission plus the consuming exact-plan bind. Native hot
+calls make no vector-length syscall, literal-byte comparison, artifact-pointer
+comparison, or callable lookup.
 
 ## Semantics and timing
 
@@ -102,7 +123,8 @@ does not yet have a generated `Cargo.lock`. It is not correct to claim
    admitted clean checkout/helper, rather than accepting caller-provided labels;
 3. build that exact source with the four required binding variables;
 4. run `verify_post_link.py` against the final executable and the exact
-   `OUT_DIR` implementation/glue/contract paths;
+   `OUT_DIR` implementation, glue, contract, generated binding, and deployment
+   receipt paths;
 5. run correctness qualification;
 6. only then run controlled, source-bound hot and lifecycle cells.
 
@@ -124,23 +146,33 @@ python3 -I -B verify_post_link.py \
   --implementation <metadata-implementation-object-path> \
   --glue <metadata-direct-glue-object-path> \
   --contract <metadata-post-link-contract-path> \
+  --binding <metadata-deployment-binding-path> \
+  --deployment-receipt <metadata-deployment-receipt-path> \
   --source-commit <exact-commit> \
   --source-tree <exact-tree>
 ```
 
 The build roots both the payload and metadata symbols against section garbage
-collection. The verifier parses the original glue relocation and final ELF
-image from sealed in-memory snapshots. It requires exactly one glue
-`R_AARCH64_CALL26` to the identity-suffixed entry, the exact four-instruction
-wrapper, a resolved direct `bl` with no PLT, and a separate direct `bl` from the
-primary benchmark path. It independently hashes the implementation object and
-the domain-separated glue object, and requires the final entry, complete
-code/padding/literal payload, and metadata symbol bytes to equal the input
-implementation object's exact symbol extents. It rejects `blr`, x4 in the
-wrapper, result-slot contracts, RWX load segments, and executable stack, and
-reports the final executable SHA-256. Its successful output is still an
-observation with `runtime_authority=absent` and
-`promotion_authority=absent`.
+collection and explicitly retains the compiler proof and benchmark consumer
+symbols. The verifier authenticates the exact generated binding and deployment
+receipt, parses the original glue relocation and final ELF image from sealed
+in-memory snapshots, and requires distinct nonzero extents for the exact
+wrapper, entry, generated proof, and consumer-loop symbols. It
+checks the glue's sole `R_AARCH64_CALL26`, the exact four-instruction wrapper,
+the generated proof callsite, and the separately named consumer hot callsite.
+The tiny generated proof must contain exactly one direct non-PLT `bl` to the
+entry and no `blr` or x4. The actual timed consumer loop must contain one or
+more direct calls, all to that exact entry, and no other host call, PLT target,
+or `blr`; x4 is unconstrained there because rustc may legitimately use it as a
+non-ABI loop scratch register. An unrelated direct call cannot satisfy either
+symbol-bounded proof. The authenticated generated source, metadata, raw proof,
+and P2b wrapper establish the four-argument/no-slot ABI. The verifier also
+hashes the implementation and glue objects, cross-links the deployment
+receipt's complete payload extent/digest, requires final entry/payload/metadata
+bytes to equal the exact input extents, and rejects RWX load segments and an
+executable stack. Observation schema v3 reports
+`consumer_hot_callsite_final_observed=true` only after those checks. Runtime
+and promotion authority remain absent.
 
 ## Fresh-process campaign and independent results verification
 

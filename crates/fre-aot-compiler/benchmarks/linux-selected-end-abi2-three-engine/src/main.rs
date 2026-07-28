@@ -7,16 +7,15 @@ use std::{
     error::Error,
     fs,
     hint::black_box,
-    marker::PhantomData,
-    rc::Rc,
     time::{Duration, Instant},
 };
 
+use fre_aot_static_runtime::StaticSearchSelectedEndQualificationV2;
 use fre_jit_aarch64::{EmitLimits, SelectedEndRegisterBackendV2, emit_selected_end_register_v2};
 use fre_jit_runtime::{
-    PublicationLimits, PublishedSelectedEndRegisterThreadSessionV2, PublishedSelectedEndRegisterV2,
-    native_host_capabilities, native_selected_end_register_backend_support_v2,
-    publish_selected_end_register_v2,
+    PublicationLimits, PublishedSelectedEndRegisterPlanThreadSessionV2,
+    PublishedSelectedEndRegisterV2, native_host_capabilities,
+    native_selected_end_register_backend_support_v2, publish_selected_end_register_v2,
 };
 use fre_kernel_ir::{
     AnchorFlags, CheckedSearchWindow, SearchWindow, SelectedEnd, ValidateLimits,
@@ -25,8 +24,25 @@ use fre_kernel_ir::{
 use fre_kernels::{LiteralBuildLimits, LiteralPlan, LiteralSearchLimits, LiteralSearchPreflight};
 use fre_target_features::TuningClass;
 
+mod aot_deployment {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/linked_selected_end_deployment_v2.rs"
+    ));
+}
+
+mod aot_hot_callsite {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/linked_selected_end_hot_callsite_v2.rs"
+    ));
+}
+
 mod linked {
-    include!(concat!(env!("OUT_DIR"), "/linked_selected_end_v2.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/linked_selected_end_metadata_v2.rs"
+    ));
 }
 
 type DynError = Box<dyn Error>;
@@ -174,85 +190,9 @@ impl Fixture {
     }
 }
 
-/// Static linked-code owner. It exposes no call method without first opening
-/// a current-thread tag21 session.
-#[derive(Debug)]
-struct AotLinked;
-
-/// Same-thread AOT invocation capability.
-///
-/// `Rc` in the marker deliberately makes this token neither `Send` nor
-/// `Sync`. Construction performs process-wide tag21 feature/tuning admission
-/// and one current-thread `PR_SVE_GET_VL` observation. Hot calls perform no
-/// feature or vector-length syscall.
-#[derive(Debug)]
-struct AotThreadSession<'owner> {
-    _owner: &'owner AotLinked,
-    _thread_bound: PhantomData<Rc<()>>,
-}
-
-impl AotLinked {
-    fn begin_current_thread_session(&self) -> Result<AotThreadSession<'_>, DynError> {
-        native_selected_end_register_backend_support_v2(
-            SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
-        )?;
-        let capabilities = native_host_capabilities()?;
-        if !capabilities.has_asimd()
-            || !capabilities.has_sve()
-            || !capabilities.has_sve2()
-            || capabilities.sve_vector_bytes() != Some(16)
-        {
-            return Err(format!(
-                "AOT thread session requires ASIMD+SVE+SVE2 and PR_SVE_GET_VL=16, got {capabilities:?}"
-            )
-            .into());
-        }
-        Ok(AotThreadSession {
-            _owner: self,
-            _thread_bound: PhantomData,
-        })
-    }
-}
-
-impl AotThreadSession<'_> {
-    #[inline]
-    fn search(&self, preflight: LiteralSearchPreflight<'_, '_>) -> Result<SpanValue, DynError> {
-        if preflight.literal_bytes() != LITERAL.len() {
-            return Err("AOT preflight literal width differs from linked artifact".into());
-        }
-        let checked = preflight.checked_window();
-        let window = checked.window();
-        let end_or_zero = linked::call_exact_linked_aot_selected_end_entry_v2(
-            self,
-            checked.haystack(),
-            window.start(),
-            window.end(),
-        );
-        decode_selected_end(end_or_zero, window)
-    }
-
-    fn search_qualification_wrapper(
-        &self,
-        preflight: LiteralSearchPreflight<'_, '_>,
-    ) -> Result<SpanValue, DynError> {
-        if preflight.literal_bytes() != LITERAL.len() {
-            return Err("AOT wrapper preflight literal width differs from linked artifact".into());
-        }
-        let checked = preflight.checked_window();
-        let window = checked.window();
-        let end_or_zero = linked::call_exact_linked_aot_selected_end_qualification_wrapper_v2(
-            self,
-            checked.haystack(),
-            window.start(),
-            window.end(),
-        );
-        decode_selected_end(end_or_zero, window)
-    }
-}
-
 struct Engines {
     portable: LiteralPlan,
-    aot: AotLinked,
+    aot: StaticSearchSelectedEndQualificationV2,
     jit: PublishedSelectedEndRegisterV2,
     jit_code_bytes: u32,
     jit_vector_instructions: u32,
@@ -260,8 +200,8 @@ struct Engines {
 
 struct EngineSessions<'engines> {
     engines: &'engines Engines,
-    aot: AotThreadSession<'engines>,
-    jit: PublishedSelectedEndRegisterThreadSessionV2<'engines>,
+    aot: aot_deployment::ExactLinkedAotSelectedEndPlanSessionV2<'engines, 'engines>,
+    jit: PublishedSelectedEndRegisterPlanThreadSessionV2<'engines>,
 }
 
 impl Engines {
@@ -282,13 +222,13 @@ impl Engines {
         )?;
         if image.backend() != SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
             || image.literal_bytes() != u32::try_from(LITERAL.len())?
-            || image.artifact_identity().as_bytes() != &linked::AOT_ARTIFACT_IDENTITY
+            || image.artifact_identity().as_bytes() != &aot_deployment::ARTIFACT_IDENTITY
         {
             return Err("runtime JIT image differs from exact linked AOT image".into());
         }
         let stats = image.stats();
         let jit = publish_selected_end_register_v2(&image, PublicationLimits::default())?;
-        if jit.artifact_identity().as_bytes() != &linked::AOT_ARTIFACT_IDENTITY
+        if jit.artifact_identity().as_bytes() != &aot_deployment::ARTIFACT_IDENTITY
             || jit.backend() != SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
             || jit.literal_bytes() != u32::try_from(LITERAL.len())?
         {
@@ -296,7 +236,7 @@ impl Engines {
         }
         Ok(Self {
             portable,
-            aot: AotLinked,
+            aot: StaticSearchSelectedEndQualificationV2::qualification_private(),
             jit,
             jit_code_bytes: stats.code_bytes,
             jit_vector_instructions: stats.vector_instructions,
@@ -304,10 +244,15 @@ impl Engines {
     }
 
     fn begin_sessions(&self) -> Result<EngineSessions<'_>, DynError> {
+        let aot_thread = self.aot.begin_current_thread_session()?;
+        let aot =
+            aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(aot_thread, &self.portable)?;
         Ok(EngineSessions {
             engines: self,
-            aot: self.aot.begin_current_thread_session()?,
-            jit: self.jit.begin_current_thread_session()?,
+            aot,
+            jit: self
+                .jit
+                .begin_current_thread_session_for_literal_plan(&self.portable)?,
         })
     }
 }
@@ -332,7 +277,15 @@ impl EngineSessions<'_> {
         preflight: LiteralSearchPreflight<'_, '_>,
     ) -> Result<SpanValue, DynError> {
         match engine {
-            Engine::Aot => self.aot.search(preflight),
+            Engine::Aot => {
+                let expected_accounting = preflight.accounting();
+                let (matched, accounting) =
+                    aot_deployment::search_exact_linked_aot_selected_end_v2(&self.aot, preflight)?;
+                if accounting != expected_accounting {
+                    return Err("AOT changed authoritative scalar preflight accounting".into());
+                }
+                Ok(matched.map(|span| (span.start(), span.end())))
+            }
             Engine::Jit => {
                 let expected_accounting = preflight.accounting();
                 let (matched, accounting) = self.jit.search_preflighted(preflight)?;
@@ -358,7 +311,15 @@ impl EngineSessions<'_> {
         let portable = self.search(Engine::Portable, preflight)?;
         let jit = self.search(Engine::Jit, preflight)?;
         let aot = self.search(Engine::Aot, preflight)?;
-        let wrapper = self.aot.search_qualification_wrapper(preflight)?;
+        let expected_accounting = preflight.accounting();
+        let (wrapper, wrapper_accounting) =
+            aot_deployment::search_exact_linked_aot_selected_end_qualification_wrapper_v2(
+                &self.aot, preflight,
+            )?;
+        if wrapper_accounting != expected_accounting {
+            return Err("AOT wrapper changed authoritative scalar preflight accounting".into());
+        }
+        let wrapper = wrapper.map(|span| (span.start(), span.end()));
         if portable != expected || jit != expected || aot != expected || wrapper != expected {
             return Err(format!(
                 "{category}: expected={expected:?}, portable={portable:?}, jit={jit:?}, aot={aot:?}, qualification_wrapper={wrapper:?}"
@@ -429,13 +390,13 @@ fn qualification(arguments: &[String]) -> Result<(), DynError> {
         }
     }
     println!(
-        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=exact-entry-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
+        "QUALIFICATION\t{SCHEMA}\tPASS\tcases={cases}\tcomparisons={comparisons}\taot_primary=generated-owned-plan-consumer-loop-direct\tqualification_wrapper=linked-and-exercised\tjit_publication=strict-wx\tjit_aot_artifact_equal=true\tvl16_sessions=aot-and-jit\tpost_link_observation={POST_LINK_OBSERVATION}\trun_id={}\tinstance_type={}\thelper_sha256={}\tprofile={}\taffinity_cpu={affinity_cpu}\tartifact_identity={}\tbundle_identity={}\tsource_commit={}\tsource_tree={}\tevidence_class={EVIDENCE_CLASS}\truntime_authority={RUNTIME_AUTHORITY}\tpromotion_authority={PROMOTION_AUTHORITY}",
         identity.run_id,
         identity.instance_type,
         identity.helper_sha256,
         identity.profile,
-        hex(&linked::AOT_ARTIFACT_IDENTITY),
-        hex(&linked::AOT_BUNDLE_IDENTITY),
+        hex(&aot_deployment::ARTIFACT_IDENTITY),
+        hex(&aot_deployment::BUNDLE_IDENTITY),
         identity.source_commit,
         identity.source_tree,
     );
@@ -482,8 +443,8 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
         identity.instance_type,
         identity.helper_sha256,
         identity.profile,
-        hex(&linked::AOT_ARTIFACT_IDENTITY),
-        hex(&linked::AOT_BUNDLE_IDENTITY),
+        hex(&aot_deployment::ARTIFACT_IDENTITY),
+        hex(&aot_deployment::BUNDLE_IDENTITY),
         identity.source_commit,
         identity.source_tree,
     );
@@ -513,8 +474,8 @@ fn cell(arguments: &[String]) -> Result<(), DynError> {
             identity.instance_type,
             identity.helper_sha256,
             identity.profile,
-            hex(&linked::AOT_ARTIFACT_IDENTITY),
-            hex(&linked::AOT_BUNDLE_IDENTITY),
+            hex(&aot_deployment::ARTIFACT_IDENTITY),
+            hex(&aot_deployment::BUNDLE_IDENTITY),
             identity.source_commit,
             identity.source_tree,
         );
@@ -551,8 +512,8 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
         identity.instance_type,
         identity.helper_sha256,
         identity.profile,
-        hex(&linked::AOT_ARTIFACT_IDENTITY),
-        hex(&linked::AOT_BUNDLE_IDENTITY),
+        hex(&aot_deployment::ARTIFACT_IDENTITY),
+        hex(&aot_deployment::BUNDLE_IDENTITY),
         identity.source_commit,
         identity.source_tree,
     );
@@ -606,8 +567,8 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
             identity.instance_type,
             identity.helper_sha256,
             identity.profile,
-            hex(&linked::AOT_ARTIFACT_IDENTITY),
-            hex(&linked::AOT_BUNDLE_IDENTITY),
+            hex(&aot_deployment::ARTIFACT_IDENTITY),
+            hex(&aot_deployment::BUNDLE_IDENTITY),
             identity.source_commit,
             identity.source_tree,
         );
@@ -618,7 +579,11 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
     let activation_preflight = activation_plan
         .preflight_checked_window(activation_checked, LiteralSearchLimits::unlimited())?;
     for _ in 0..LIFECYCLE_WARMUP_CALLS {
-        black_box(measure_aot_activation_once(activation_preflight, expected)?);
+        black_box(measure_aot_activation_once(
+            &activation_plan,
+            activation_preflight,
+            expected,
+        )?);
     }
     let activation_cpu_before = observed_cpu()?;
     let mut activation = LifecycleSample {
@@ -632,7 +597,7 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
         checksum: 0,
     };
     for iteration in 0..LIFECYCLE_ITERATIONS {
-        let sample = measure_aot_activation_once(activation_preflight, expected)?;
+        let sample = measure_aot_activation_once(&activation_plan, activation_preflight, expected)?;
         activation.session_ns = checked_add(activation.session_ns, sample.session_ns)?;
         activation.first_call_ns = checked_add(activation.first_call_ns, sample.first_call_ns)?;
         activation.total_ns = checked_add(activation.total_ns, sample.total_ns)?;
@@ -656,8 +621,8 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
         identity.instance_type,
         identity.helper_sha256,
         identity.profile,
-        hex(&linked::AOT_ARTIFACT_IDENTITY),
-        hex(&linked::AOT_BUNDLE_IDENTITY),
+        hex(&aot_deployment::ARTIFACT_IDENTITY),
+        hex(&aot_deployment::BUNDLE_IDENTITY),
         identity.source_commit,
         identity.source_tree,
     );
@@ -665,16 +630,24 @@ fn lifecycle(arguments: &[String]) -> Result<(), DynError> {
 }
 
 fn measure_aot_activation_once(
+    plan: &LiteralPlan,
     preflight: LiteralSearchPreflight<'_, '_>,
     expected: SpanValue,
 ) -> Result<LifecycleSample, DynError> {
     let total_started = Instant::now();
-    let aot = AotLinked;
+    let aot = StaticSearchSelectedEndQualificationV2::qualification_private();
     let session_started = Instant::now();
-    let session = aot.begin_current_thread_session()?;
+    let thread_session = aot.begin_current_thread_session()?;
+    let session = aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(thread_session, plan)?;
     let session_ns = session_started.elapsed().as_nanos();
     let first_call_started = Instant::now();
-    let actual = session.search(preflight)?;
+    let expected_accounting = preflight.accounting();
+    let (actual, accounting) =
+        aot_deployment::search_exact_linked_aot_selected_end_v2(&session, preflight)?;
+    if accounting != expected_accounting {
+        return Err("AOT activation changed authoritative scalar preflight accounting".into());
+    }
+    let actual = actual.map(|span| (span.start(), span.end()));
     let first_call_ns = first_call_started.elapsed().as_nanos();
     if actual != expected {
         return Err(
@@ -694,7 +667,7 @@ fn measure_aot_activation_once(
         session_ns,
         first_call_ns,
         total_ns,
-        checksum: span_checksum(actual, 0)?,
+        checksum: span_checksum(actual, 0),
     })
 }
 
@@ -731,10 +704,9 @@ fn measure_lifecycle_once(
     } else {
         (None, 0)
     };
-    if image
-        .as_ref()
-        .is_some_and(|image| image.artifact_identity().as_bytes() != &linked::AOT_ARTIFACT_IDENTITY)
-    {
+    if image.as_ref().is_some_and(|image| {
+        image.artifact_identity().as_bytes() != &aot_deployment::ARTIFACT_IDENTITY
+    }) {
         return Err("lifecycle JIT image differs from linked AOT artifact".into());
     }
 
@@ -752,11 +724,15 @@ fn measure_lifecycle_once(
     let preflight = portable.preflight_checked_window(checked, LiteralSearchLimits::unlimited())?;
     let preflight_ns = preflight_started.elapsed().as_nanos();
 
-    let aot = AotLinked;
+    let aot = StaticSearchSelectedEndQualificationV2::qualification_private();
     let (aot_session, jit_session, session_ns) = match engine {
         Engine::Aot => {
             let session_started = Instant::now();
-            let session = aot.begin_current_thread_session()?;
+            let thread_session = aot.begin_current_thread_session()?;
+            let session = aot_deployment::bind_exact_linked_aot_selected_end_plan_v2(
+                thread_session,
+                &portable,
+            )?;
             (Some(session), None, session_started.elapsed().as_nanos())
         }
         Engine::Jit => {
@@ -764,7 +740,7 @@ fn measure_lifecycle_once(
             let session = jit
                 .as_ref()
                 .ok_or("JIT lifecycle omitted its publication")?
-                .begin_current_thread_session()?;
+                .begin_current_thread_session_for_literal_plan(&portable)?;
             (None, Some(session), session_started.elapsed().as_nanos())
         }
         Engine::Portable => (None, None, 0),
@@ -772,10 +748,19 @@ fn measure_lifecycle_once(
 
     let first_call_started = Instant::now();
     let actual = match engine {
-        Engine::Aot => aot_session
-            .as_ref()
-            .ok_or("AOT lifecycle omitted its session")?
-            .search(preflight)?,
+        Engine::Aot => {
+            let expected_accounting = preflight.accounting();
+            let (matched, accounting) = aot_deployment::search_exact_linked_aot_selected_end_v2(
+                aot_session
+                    .as_ref()
+                    .ok_or("AOT lifecycle omitted its session")?,
+                preflight,
+            )?;
+            if accounting != expected_accounting {
+                return Err("lifecycle AOT accounting mismatch".into());
+            }
+            matched.map(|span| (span.start(), span.end()))
+        }
         Engine::Jit => {
             let expected_accounting = preflight.accounting();
             let (matched, accounting) = jit_session
@@ -819,7 +804,7 @@ fn measure_lifecycle_once(
         session_ns,
         first_call_ns,
         total_ns,
-        checksum: span_checksum(actual, 0)?,
+        checksum: span_checksum(actual, 0),
     })
 }
 
@@ -859,33 +844,49 @@ fn time_hot(
     iterations: usize,
 ) -> Result<(Duration, u64), DynError> {
     let started = Instant::now();
-    let mut checksum = 0_u64;
-    for iteration in 0..iterations {
-        let matched = sessions.search(engine, black_box(preflight))?;
-        checksum = checksum.wrapping_add(span_checksum(
-            black_box(matched),
-            u64::try_from(iteration)?,
-        )?);
-    }
+    let checksum = match engine {
+        Engine::Aot => aot_hot_callsite::run_exact_linked_aot_selected_end_hot_loop_v2(
+            &sessions.aot,
+            preflight,
+            iterations,
+        )
+        .map_err(|error| -> DynError { format!("AOT hot loop failed: {error:?}").into() })?,
+        Engine::Jit => run_jit_hot_loop(&sessions.jit, preflight, iterations)?,
+        Engine::Portable => run_portable_hot_loop(preflight, iterations)?,
+    };
     Ok((started.elapsed(), black_box(checksum)))
 }
 
-fn decode_selected_end(end_or_zero: usize, window: SearchWindow) -> Result<SpanValue, DynError> {
-    if end_or_zero == 0 {
-        return Ok(None);
+#[inline(never)]
+fn run_jit_hot_loop(
+    session: &PublishedSelectedEndRegisterPlanThreadSessionV2<'_>,
+    preflight: LiteralSearchPreflight<'_, '_>,
+    iterations: usize,
+) -> Result<u64, DynError> {
+    let expected_accounting = preflight.accounting();
+    let mut checksum = 0_u64;
+    for iteration in 0..iterations {
+        let (matched, accounting) = session.search_preflighted(black_box(preflight))?;
+        if accounting != expected_accounting {
+            return Err("JIT hot loop changed authoritative preflight accounting".into());
+        }
+        let matched = black_box(matched).map(|span| (span.start(), span.end()));
+        checksum = checksum.wrapping_add(span_checksum(matched, usize_u64(iteration)));
     }
-    let start = end_or_zero
-        .checked_sub(LITERAL.len())
-        .ok_or("native selected end is shorter than the literal")?;
-    if start < window.start() || end_or_zero > window.end() {
-        return Err(format!(
-            "native selected end {end_or_zero} is outside {}..{}",
-            window.start(),
-            window.end()
-        )
-        .into());
+    Ok(black_box(checksum))
+}
+
+#[inline(never)]
+fn run_portable_hot_loop(
+    preflight: LiteralSearchPreflight<'_, '_>,
+    iterations: usize,
+) -> Result<u64, DynError> {
+    let mut checksum = 0_u64;
+    for iteration in 0..iterations {
+        let matched = black_box(preflight).find()?;
+        checksum = checksum.wrapping_add(span_checksum(black_box(matched), usize_u64(iteration)));
     }
-    Ok(Some((start, end_or_zero)))
+    Ok(black_box(checksum))
 }
 
 fn independent_oracle(fixture: &Fixture) -> Result<SpanValue, DynError> {
@@ -903,15 +904,21 @@ fn independent_oracle(fixture: &Fixture) -> Result<SpanValue, DynError> {
         }))
 }
 
-fn span_checksum(span: SpanValue, salt: u64) -> Result<u64, DynError> {
+#[inline(always)]
+fn span_checksum(span: SpanValue, salt: u64) -> u64 {
     let encoded = match span {
         None => 0x9e37_79b9_7f4a_7c15,
-        Some((start, end)) => u64::try_from(start)?
+        Some((start, end)) => usize_u64(start)
             .rotate_left(17)
-            .wrapping_add(u64::try_from(end)?.rotate_left(41))
+            .wrapping_add(usize_u64(end).rotate_left(41))
             .wrapping_add(1),
     };
-    Ok(encoded ^ salt.wrapping_mul(0xd6e8_feb8_6659_fd93))
+    encoded ^ salt.wrapping_mul(0xd6e8_feb8_6659_fd93)
+}
+
+#[inline(always)]
+fn usize_u64(value: usize) -> u64 {
+    u64::from_le_bytes(value.to_le_bytes())
 }
 
 fn make_fixture(bytes: usize, scenario: Scenario, alignment: usize) -> Result<Fixture, DynError> {
@@ -1227,28 +1234,49 @@ fn print_static_metadata() {
     print_meta("source_tree", linked::BOUND_SOURCE_TREE);
     print_meta("helper_sha256", linked::BOUND_HELPER_SHA256);
     print_meta("profile", linked::BOUND_PROFILE);
-    print_meta("artifact_identity", hex(&linked::AOT_ARTIFACT_IDENTITY));
-    print_meta("compile_identity", hex(&linked::AOT_COMPILE_IDENTITY));
+    print_meta("artifact_identity", hex(&aot_deployment::ARTIFACT_IDENTITY));
+    print_meta("compile_identity", hex(&aot_deployment::COMPILE_IDENTITY));
     print_meta(
         "implementation_object_identity",
-        hex(&linked::AOT_IMPLEMENTATION_OBJECT_IDENTITY),
+        hex(&aot_deployment::IMPLEMENTATION_OBJECT_IDENTITY),
     );
     print_meta(
         "glue_object_identity",
-        hex(&linked::AOT_GLUE_OBJECT_IDENTITY),
+        hex(&aot_deployment::GLUE_OBJECT_IDENTITY),
     );
-    print_meta("bundle_identity", hex(&linked::AOT_BUNDLE_IDENTITY));
-    print_meta("aot_wrapper_symbol", linked::WRAPPER_SYMBOL);
-    print_meta("aot_entry_symbol", linked::ENTRY_SYMBOL);
-    print_meta("aot_payload_symbol", linked::PAYLOAD_SYMBOL);
-    print_meta("aot_metadata_symbol", linked::METADATA_SYMBOL);
+    print_meta("bundle_identity", hex(&aot_deployment::BUNDLE_IDENTITY));
+    print_meta(
+        "deployment_binding_identity",
+        linked::DEPLOYMENT_BINDING_IDENTITY,
+    );
+    print_meta(
+        "deployment_receipt_identity",
+        linked::DEPLOYMENT_RECEIPT_IDENTITY,
+    );
+    print_meta("aot_wrapper_symbol", aot_deployment::WRAPPER_SYMBOL);
+    print_meta("aot_entry_symbol", aot_deployment::ENTRY_SYMBOL);
+    print_meta("aot_payload_symbol", aot_deployment::PAYLOAD_SYMBOL);
+    print_meta("aot_metadata_symbol", aot_deployment::METADATA_SYMBOL);
+    print_meta(
+        "aot_generated_proof_callsite_symbol",
+        aot_deployment::PRIMARY_CALLSITE_SYMBOL,
+    );
+    print_meta(
+        "aot_consumer_hot_callsite_symbol",
+        linked::CONSUMER_HOT_CALLSITE_SYMBOL,
+    );
     print_meta("post_link_contract_path", linked::POST_LINK_CONTRACT_PATH);
     print_meta(
         "implementation_object_path",
         linked::IMPLEMENTATION_OBJECT_PATH,
     );
     print_meta("direct_glue_object_path", linked::DIRECT_GLUE_OBJECT_PATH);
-    print_meta("aot_primary_hot_route", "exact-entry-direct");
+    print_meta("deployment_binding_path", linked::DEPLOYMENT_BINDING_PATH);
+    print_meta("deployment_receipt_path", linked::DEPLOYMENT_RECEIPT_PATH);
+    print_meta(
+        "aot_primary_hot_route",
+        "generated-owned-plan-consumer-loop-direct",
+    );
     print_meta(
         "qualification_wrapper",
         "linked-diagnostic-evidence-not-primary-hot-route",

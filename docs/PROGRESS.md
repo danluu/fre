@@ -151,15 +151,22 @@ operation-typed facade plans and the exact Rebar semantic adapter. General
 match-sequence exposure remains separate. Pattern-specialized AArch64 code can
 be published under a strict audited W^X lifecycle through the explicit
 qualified-search API, but every facade V8/tag-19/tag-21 ABI2 call requires a
-same-thread session and no default portable facade selects it. There is still
-no capture API, general Unicode execution, qualified `SelectedEnd` AOT
-authority, or compatibility-qualified embedding surface. The P2b source-first
-AOT compiler and deterministic object/glue/receipt bundle are implemented as
-inert source; they provide neither a post-link observation nor a runtime
-adopter. The retained Search V1 adopter/default-off binding is a different ABI
-and cannot authorize P2b. A small implemented C11/C++17 surface exists for the
-current portable subset and reports `UPSTREAM_ORACLE_PENDING` in every plan
-record.
+same-thread session and no default portable facade selects it. The qualified
+facade uses the distinct plan-bound ABI2 JIT session: literal identity is
+proved once at session construction and each successful preflighted hot call
+checks only that its certificate came from the same plan before native
+invocation. There is still no capture API, general Unicode execution, qualified
+`SelectedEnd` AOT authority, or compatibility-qualified embedding surface. The
+P2b source-first AOT compiler and deterministic object/glue/receipt bundle now
+feed a default-off qualification-private ABI2 consumer. Its generated nominal
+session owns a consumed same-thread VL16 token, borrows the external portable
+plan, stores no callable address, and retains authority `Absent`. The
+three-engine source exposes an exact hidden consumer hot-loop symbol and
+authenticates the generated binding/receipt, but no build or post-link
+observation has run. The retained Search V1 adopter/default-off binding is a
+different ABI and cannot authorize P2b. A small implemented C11/C++17 surface
+exists for the current portable subset and reports `UPSTREAM_ORACLE_PENDING`
+in every plan record.
 
 Seven-process diagnostic medians put exact literals and packed literal
 alternation at parity within noise; the retained literal-set DFA cross-check is
@@ -282,19 +289,23 @@ only package already-emitted bytes. The qualified facade routes V8 plus SVE
 tag 19 and SVE2 tag 21 through the `SelectedEnd` register-return ABI2 in JIT;
 the versioned low-level Search-v1 APIs remain separate, and tag-21 P2b AOT
 retains the same sealed ABI2 image in a deterministic
-ELF/direct-hidden-glue bundle. P2b still has
+ELF/direct-hidden-glue bundle. The qualified JIT facade binds each callable
+session once to the exact portable literal plan, so a successful preflighted
+hot call uses only plan identity before native invocation. P2b still has
 `RuntimeAuthority::Absent`, no completed post-link observation, and no
-callable adopter.
+production authority row. Its default-off qualification-private consumer owns
+a consumed same-thread token inside the generated nominal binding without
+storing a callable address; it is not a production adopter or authority.
 
 The public JIT bakeoff source has moved to 48-column V3 session/value-call
 rows. Its evidence verifier now requires an external ABI2 artifact witness and
 binds the V8 policy, target, ABI, and no-VL facts instead of trusting a
 self-consistent row rewrite. No V3 execution result is claimed here. The
-checked-in three-engine harness still targets Search V1 Span; a replacement
-P2b AOT/JIT/portable benchmark is in progress and deferred until its direct
-call is observed after link and a private adopter exists. No current
-correctness, lifecycle, benchmark, AOT promotion, or speed claim follows from
-this source checkpoint.
+checked-in three-engine harness now includes the exact P2b
+AOT/JIT/portable binding and an independently named consumer hot loop, but
+it remains deferred until that call is built and observed after link. No
+current correctness, lifecycle, benchmark, AOT promotion, or speed claim
+follows from this source checkpoint.
 
 ## Non-negotiable gates
 

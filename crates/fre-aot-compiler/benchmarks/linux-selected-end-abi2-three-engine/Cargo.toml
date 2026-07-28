@@ -10,6 +10,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+fre-aot-static-runtime = { path = "../../../fre-aot-static-runtime", features = ["selected-end-qualification-private-v2"] }
 fre-jit-aarch64 = { path = "../../../fre-jit-aarch64" }
 fre-jit-runtime = { path = "../../../fre-jit-runtime" }
 fre-kernel-ir = { path = "../../../fre-kernel-ir" }
