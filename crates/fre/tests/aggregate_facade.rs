@@ -1732,7 +1732,7 @@ fn guarded_ascii_word_execution_limits_refuse_before_source_access() {
 }
 
 #[test]
-fn guarded_ascii_word_scope_includes_span_sum_but_not_unicode_or_spans() {
+fn guarded_ascii_word_scope_includes_span_sum_and_unicode_uses_its_distinct_owner() {
     let pattern = r"\b(?:as|break|Self|ab|ba)\b";
     assert_eq!(
         aggregate_builder(pattern)
@@ -1740,7 +1740,7 @@ fn guarded_ascii_word_scope_includes_span_sum_but_not_unicode_or_spans() {
             .unwrap()
             .build_report()
             .plan,
-        AggregatePlanKind::ContinuationProgram
+        AggregatePlanKind::GuardedUnicodeWordLiteralSet
     );
     assert_eq!(
         aggregate_builder(pattern)
