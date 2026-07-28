@@ -1360,6 +1360,7 @@ impl CompiledRegex {
             max_scalar_search_checks: certificate.max_scalar_search_checks,
             has_unicode_word_boundary: false,
             start_domain: StartDomain::AnyBoundary,
+            root_assertion: None,
         };
         start_domain = partitioned_start_domain(start_domain, &program, budget)?;
         program.start_domain = start_domain;
@@ -4154,6 +4155,16 @@ fn build_retained_components(
         budget.acquire_checked_construction_bytes(start_domain_proof_bytes)?;
     }
     budget.record_initialization(start_domain_proof_bytes, false)?;
+    let root_assertion_proof_bytes = core::mem::size_of::<Option<Assertion>>();
+    budget.accounting.root_assertion_proof_bytes = u8::try_from(root_assertion_proof_bytes)
+        .map_err(|_| Error::ArithmeticOverflow {
+            resource: Resource::ProgramBytes,
+        })?;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(root_assertion_proof_bytes)?;
+        budget.acquire_checked_construction_bytes(root_assertion_proof_bytes)?;
+    }
+    budget.record_initialization(root_assertion_proof_bytes, false)?;
     let seed_program_bytes = add(
         add(
             required_suffixes.retained_bytes()?,
@@ -4163,8 +4174,12 @@ fn build_retained_components(
         add(
             minimum_match_bytes_proof_bytes,
             add(
-                start_domain_proof_bytes,
-                RequiredLiteralSets::retained_bytes(),
+                root_assertion_proof_bytes,
+                add(
+                    start_domain_proof_bytes,
+                    RequiredLiteralSets::retained_bytes(),
+                    Resource::ProgramBytes,
+                )?,
                 Resource::ProgramBytes,
             )?,
             Resource::ProgramBytes,
@@ -4504,6 +4519,7 @@ impl CompileBudget {
                 candidate_bytes: 0,
                 minimum_match_bytes_proof_bytes: 0,
                 start_domain_proof_bytes: 0,
+                root_assertion_proof_bytes: 0,
                 program_states: 0,
                 temporary_states_peak: 0,
                 program_bytes: 0,
@@ -7099,10 +7115,13 @@ fn finalize_program(
     hash_usize(&mut first, program.entry);
     hash_usize(&mut second, program.entry);
     let mut has_unicode_word_boundary = false;
-    for inst in &program.insts {
+    let mut entry_assertion = None;
+    let mut accepting_state = None;
+    for (pc, inst) in program.insts.iter().enumerate() {
         // This one per-instruction identity unit includes both stable hashing
-        // and the immutable assertion-property classification. Classification
-        // is not a second traversal or a separate uncharged unit.
+        // and the immutable assertion-property/root-topology classification.
+        // Classification is not a second traversal or a separate uncharged
+        // unit.
         budget.charge(1)?;
         budget.accounting.unicode_word_boundary_checks = add(
             budget.accounting.unicode_word_boundary_checks,
@@ -7113,6 +7132,14 @@ fn finalize_program(
             inst,
             Inst::Assert { assertion, .. } if assertion.is_unicode_word()
         );
+        if pc == program.entry
+            && let Inst::Assert { assertion, next } = inst
+        {
+            entry_assertion = Some((*assertion, *next));
+        }
+        if matches!(inst, Inst::Match) {
+            accepting_state = Some(pc);
+        }
         if let Inst::ConsumeScalar { scalars, .. } = inst {
             budget.charge(scalars.len())?;
         }
@@ -7120,6 +7147,12 @@ fn finalize_program(
         hash_inst(&mut second, inst);
     }
     program.has_unicode_word_boundary = has_unicode_word_boundary;
+    program.root_assertion = match (entry_assertion, accepting_state) {
+        (Some((assertion, next)), Some(accept)) if program.insts.len() == 2 && next == accept => {
+            Some(assertion)
+        }
+        _ => None,
+    };
     budget.accounting.requires_utf8_validation = has_unicode_word_boundary;
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&first.finish().to_le_bytes());

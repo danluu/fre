@@ -811,11 +811,21 @@ pub(crate) struct Program {
     /// program flags so this optional execution hint occupies existing
     /// structure padding instead of enlarging every compiled-regex owner.
     pub(crate) start_domain: StartDomain,
+    /// Exact compiler-retained proof that the complete program is one
+    /// zero-width assertion followed immediately by acceptance.
+    ///
+    /// This is populated during the already-budgeted identity traversal, so
+    /// execution never reclassifies the program or source spelling.
+    pub(crate) root_assertion: Option<Assertion>,
 }
 
 impl Program {
     pub(crate) const fn contains_unicode_word_boundary(&self) -> bool {
         self.has_unicode_word_boundary
+    }
+
+    pub(crate) const fn root_assertion(&self) -> Option<Assertion> {
+        self.root_assertion
     }
 
     pub(crate) fn instruction(&self, pc: usize) -> Result<&Inst, Error> {

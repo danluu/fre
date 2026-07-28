@@ -96,6 +96,12 @@ pub struct CompileAccounting {
     /// This exact count is compact because every supported representation is
     /// statically bounded by the one-byte inline proof.
     pub start_domain_proof_bytes: u8,
+    /// Bytes in the compiler-retained exact root-assertion proof.
+    ///
+    /// `None` means the continuation is not exactly one assertion followed
+    /// by acceptance. `Some` retains the already-lowered assertion variant
+    /// and permits the allocation-free Count/`SpanSum` physical route.
+    pub root_assertion_proof_bytes: u8,
     pub program_states: usize,
     pub temporary_states_peak: usize,
     pub program_bytes: usize,
@@ -131,6 +137,12 @@ impl CompileAccounting {
     #[must_use]
     pub fn start_domain_proof_bytes(self) -> usize {
         usize::from(self.start_domain_proof_bytes)
+    }
+
+    /// Exact retained bytes for the root-assertion proof.
+    #[must_use]
+    pub fn root_assertion_proof_bytes(self) -> usize {
+        usize::from(self.root_assertion_proof_bytes)
     }
 }
 

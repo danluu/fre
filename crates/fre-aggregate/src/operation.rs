@@ -330,6 +330,8 @@ pub enum OperationPhysicalRoute {
     StartDomain,
     /// Source-independent mirrored finite-chunk `SpanSum` frontier.
     OrderedBoundedSpanSum,
+    /// Compiler-retained exact root zero-width assertion reducer.
+    RootAssertion,
 }
 
 /// The only route-selection edge allowed before an attempt publishes its
@@ -2524,6 +2526,129 @@ impl CompiledRegex {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the certified route receives the shared publication and accounting state explicitly"
+    )]
+    fn execute_root_assertion<const OBSERVED_WORK: bool>(
+        &self,
+        assertion: Assertion,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        kind: OperationKind,
+        limits: OperationLimits,
+        mut attempt: Option<&mut AttemptPublication<'_>>,
+        attempt_accounting: &mut ExecutionAccounting,
+        actual_allocations: &mut usize,
+        allocation_limit: usize,
+        mut prospective_observer: Option<&mut dyn FnMut(OperationProspective) -> Result<(), Error>>,
+    ) -> Result<ExecutionResult, Error> {
+        let input_bytes = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(Error::InternalInvariant(
+                "validated root-assertion range underflow",
+            ))?;
+        let prospective = root_assertion_prospective::<OBSERVED_WORK>(
+            &self.program,
+            assertion,
+            haystack.len(),
+            input_bytes,
+            limits,
+        )?;
+        if let Some(publication) = attempt.as_mut() {
+            publication.identity.physical_route = Some(OperationPhysicalRoute::RootAssertion);
+            publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
+            *publication.prospective = Some(prospective);
+            if let Some(observer) = prospective_observer.as_mut() {
+                observer(prospective)?;
+            }
+        }
+        enforce(
+            prospective.allocations,
+            allocation_limit,
+            Resource::Allocations,
+        )?;
+        prospective.enforce_limits(limits)?;
+
+        // Route and complete input-only envelope are fixed. No source-aware
+        // fallback is permitted beyond this point.
+        *actual_allocations = 0;
+        let utf8_validation = if assertion.is_unicode_word() {
+            haystack.len()
+        } else {
+            0
+        };
+        enforce(
+            utf8_validation,
+            prospective.work_bound,
+            Resource::ExecutionWork,
+        )?;
+        validate_unicode_word_utf8(haystack, utf8_validation, attempt_accounting)?;
+
+        let assertions = AssertionContext::new(haystack, range.start, input_bytes)?;
+        let mut matches = 0_usize;
+        for position in 0..=input_bytes {
+            try_charge_root(attempt_accounting, prospective.work_bound)?;
+            try_charge_assertion(attempt_accounting, prospective.work_bound)?;
+            if assertion_matches(assertions, assertion, position, attempt_accounting, true)? {
+                try_charge_event(attempt_accounting, prospective.work_bound)?;
+                matches = add(matches, 1, Resource::MatchEvents)?;
+                attempt_accounting.emitted_matches = add(
+                    attempt_accounting.emitted_matches,
+                    1,
+                    Resource::OutputMatches,
+                )?;
+            }
+        }
+        validate_admitted_work(attempt_accounting, prospective.work_bound, limits.max_work)?;
+        if !prospective.contains(*attempt_accounting) {
+            return Err(Error::InternalInvariant(
+                "root-assertion actual accounting exceeds its prospective",
+            ));
+        }
+        let certificate = OperationCertificate {
+            regex_plan_id: self.plan_id(),
+            operation_limits_id: operation_limits_identity(limits),
+            strategy,
+            operation: operation_attempt_kind(kind),
+            physical_route: OperationPhysicalRoute::RootAssertion,
+            algorithm_version: CONTINUATION_OPERATION_ALGORITHM_VERSION,
+            accounting_version: CONTINUATION_OPERATION_ACCOUNTING_VERSION,
+            prepublication_fallback: OperationPrepublicationFallback::None,
+            prospective_allocations: 0,
+            actual_allocations: 0,
+            range,
+            states: prospective.states,
+            table_cells: prospective.table_cells,
+            row_storage: prospective.row_storage,
+            row_record_bytes: prospective.row_record_bytes,
+            terminal_frontier: prospective.terminal_frontier,
+            work_bound: prospective.work_bound,
+            random_access_bytes: prospective.random_access_bytes,
+            scratch_bytes: prospective.scratch_bytes,
+            log_bytes: prospective.log_bytes,
+            sequential_bytes_bound: prospective.sequential_bytes,
+            match_events: prospective.match_events,
+            output_matches: prospective.output_matches,
+            output_bytes: prospective.output_bytes,
+            span_sum: prospective.span_sum,
+            peak_bytes: prospective.peak_bytes,
+        };
+        Ok(ExecutionResult {
+            certificate,
+            accounting: *attempt_accounting,
+            summary: ScanSummary {
+                matches,
+                events: matches,
+                suppressed: 0,
+                span_sum: 0,
+            },
+            spans: Vec::new(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "whole-operation admission keeps failure-before-publication ordering auditable"
     )]
@@ -2617,6 +2742,25 @@ impl CompiledRegex {
             Some(_) | None => {}
         }
         let local = &haystack[range.clone()];
+        if forced_generic_count_route.is_none()
+            && matches!(kind, OperationKind::Count | OperationKind::Sum)
+            && strategy == Strategy::ReverseSequentialRows
+            && let Some(assertion) = self.program.root_assertion()
+        {
+            return self.execute_root_assertion::<OBSERVED_WORK>(
+                assertion,
+                haystack,
+                range,
+                strategy,
+                kind,
+                limits,
+                attempt.as_mut(),
+                accounting,
+                actual_allocations,
+                allocation_limit,
+                prospective_observer,
+            );
+        }
         if forced_generic_count_route.is_none()
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
@@ -3981,6 +4125,82 @@ const fn fixed_continuation_beats_dense(
     dense_work_floor: usize,
 ) -> bool {
     candidate_work_upper < dense_work_floor
+}
+
+fn root_assertion_prospective<const OBSERVED_WORK: bool>(
+    program: &Program,
+    assertion: Assertion,
+    haystack_bytes: usize,
+    input_bytes: usize,
+    limits: OperationLimits,
+) -> Result<OperationProspective, Error> {
+    let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+    let utf8_validation = if assertion.is_unicode_word() {
+        haystack_bytes
+    } else {
+        0
+    };
+    // One root probe and one assertion transition are charged at every
+    // operation boundary. Every successful zero-width path adds one event.
+    let boundary_work = mul(boundaries, 3, Resource::ExecutionWork)?;
+    let structural_work_bound = add(utf8_validation, boundary_work, Resource::ExecutionWork)?;
+    let work_bound = if OBSERVED_WORK {
+        structural_work_bound.min(limits.max_work)
+    } else {
+        structural_work_bound
+    };
+    let source_factor = match assertion {
+        Assertion::StartText | Assertion::EndText => 0,
+        Assertion::StartLf
+        | Assertion::EndLf
+        | Assertion::WordStartHalfAscii
+        | Assertion::WordEndHalfAscii => 1,
+        Assertion::StartCrlf
+        | Assertion::EndCrlf
+        | Assertion::WordAscii
+        | Assertion::WordAsciiNegate
+        | Assertion::WordStartAscii
+        | Assertion::WordEndAscii => 2,
+        Assertion::WordUnicode
+        | Assertion::WordUnicodeNegate
+        | Assertion::WordStartUnicode
+        | Assertion::WordEndUnicode
+        | Assertion::WordStartHalfUnicode
+        | Assertion::WordEndHalfUnicode => 8,
+    };
+    let random_access_bytes = mul(boundaries, source_factor, Resource::RandomAccessBytes)?;
+    let accounting = ExecutionAccounting {
+        transition_checks: boundaries.min(work_bound),
+        assertion_checks: boundaries.min(work_bound),
+        root_probes: boundaries.min(work_bound),
+        successful_paths: boundaries.min(work_bound),
+        emitted_matches: boundaries.min(work_bound),
+        utf8_validation_work: utf8_validation.min(work_bound),
+        sequential_bytes_read: utf8_validation,
+        random_access_bytes_read: random_access_bytes,
+        work: work_bound,
+        ..ExecutionAccounting::default()
+    };
+    Ok(OperationProspective {
+        states: program.insts.len(),
+        boundaries,
+        table_cells: 0,
+        row_storage: None,
+        row_record_bytes: 0,
+        terminal_frontier: false,
+        work_bound,
+        random_access_bytes,
+        scratch_bytes: 0,
+        log_bytes: 0,
+        sequential_bytes: utf8_validation,
+        match_events: boundaries,
+        output_matches: boundaries,
+        output_bytes: 0,
+        span_sum: 0,
+        allocations: 0,
+        peak_bytes: 0,
+        accounting,
+    })
 }
 
 #[allow(
@@ -10121,6 +10341,7 @@ fn operation_identity(
         // independently typed so the two source-independent SpanSum proofs
         // can never authenticate the same operation identity.
         OperationPhysicalRoute::OrderedBoundedSpanSum => 181,
+        OperationPhysicalRoute::RootAssertion => 193,
     };
     let mut bytes = plan.bytes();
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -16055,6 +16276,316 @@ mod tests {
         assert_eq!(refusal.receipt.actual_allocations, 0);
         assert!(prospective.contains(refusal.receipt.actual));
         assert!(refusal.closes());
+    }
+
+    #[test]
+    fn root_assertion_route_matches_dense_rows_for_every_assertion_and_range() {
+        let cases = [
+            (r"\A", false),
+            (r"\z", false),
+            (r"(?m:^)", false),
+            (r"(?m:$)", false),
+            (r"(?Rm:^)", false),
+            (r"(?Rm:$)", false),
+            (r"\b", false),
+            (r"\B", false),
+            (r"\b{start}", false),
+            (r"\b{end}", false),
+            (r"\b{start-half}", false),
+            (r"\b{end-half}", false),
+            (r"\b", true),
+            (r"\B", true),
+            (r"\b{start}", true),
+            (r"\b{end}", true),
+            (r"\b{start-half}", true),
+            (r"\b{end-half}", true),
+        ];
+        for (pattern, unicode) in cases {
+            let compiled = root_assertion_fixture(pattern, unicode);
+            assert!(
+                compiled.program.root_assertion().is_some(),
+                "missing retained root assertion for {pattern:?}, unicode={unicode}"
+            );
+            let haystack: &[u8] = if unicode {
+                "aé_ β\r\n".as_bytes()
+            } else {
+                b"a_ z\r\n"
+            };
+            let mut ranges = vec![0..haystack.len(), 0..0, haystack.len()..haystack.len()];
+            if haystack.len() > 2 {
+                ranges.push(1..haystack.len() - 1);
+                ranges.push(2..haystack.len());
+            }
+            for range in ranges {
+                let dense_count = compiled
+                    .count_value(
+                        haystack,
+                        range.clone(),
+                        Strategy::FullTable,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                let direct_count = compiled
+                    .count_value(
+                        haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    direct_count, dense_count,
+                    "count mismatch for {pattern:?}, unicode={unicode}, range={range:?}"
+                );
+                let dense_sum = compiled
+                    .span_sum_value(
+                        haystack,
+                        range.clone(),
+                        Strategy::FullTable,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                let direct_sum = compiled
+                    .span_sum_value(
+                        haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                assert_eq!(direct_sum, 0);
+                assert_eq!(
+                    direct_sum, dense_sum,
+                    "span-sum mismatch for {pattern:?}, unicode={unicode}, range={range:?}"
+                );
+            }
+
+            let reference = RegexBuilder::new(pattern).unicode(unicode).build().unwrap();
+            let expected = reference.find_iter(haystack).count();
+            assert_eq!(
+                compiled
+                    .count_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                expected,
+                "regex oracle mismatch for {pattern:?}, unicode={unicode}"
+            );
+        }
+    }
+
+    #[test]
+    fn root_assertion_route_seals_identity_accounting_and_one_below_limits() {
+        let compiled = root_assertion_fixture(r"\b", true);
+        let haystack = "aé_ β".as_bytes();
+        let count = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert!(count.receipt.authenticates_success());
+        assert_eq!(
+            count.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RootAssertion)
+        );
+        let prospective = count.receipt.prospective.unwrap();
+        assert!(prospective.contains(count.receipt.actual));
+        assert_eq!(count.receipt.actual_allocations, 0);
+        assert_eq!(prospective.allocations, 0);
+        assert_eq!(count.value, count.receipt.actual.emitted_matches);
+        assert!(count.receipt.actual.assertion_checks > 0);
+        assert_eq!(
+            count.receipt.actual.assertion_checks,
+            count.receipt.actual.root_probes
+        );
+        assert_eq!(
+            count.receipt.actual.work,
+            count.receipt.actual.utf8_validation_work
+                + count.receipt.actual.transition_checks
+                + count.receipt.actual.root_probes
+                + count.receipt.actual.successful_paths
+        );
+
+        let sum = compiled
+            .span_sum_value_with_receipt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(sum.value, 0);
+        assert!(sum.receipt.authenticates_success());
+        assert_eq!(
+            sum.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RootAssertion)
+        );
+        assert_ne!(
+            count.receipt.identity.operation_id(),
+            sum.receipt.identity.operation_id()
+        );
+
+        let exact = OperationLimits {
+            max_boundaries: prospective.boundaries,
+            max_table_cells: prospective.table_cells,
+            max_random_access_bytes: prospective.random_access_bytes,
+            max_scratch_bytes: prospective.scratch_bytes,
+            max_log_bytes: prospective.log_bytes,
+            max_sequential_bytes: prospective.sequential_bytes,
+            max_match_events: prospective.match_events,
+            max_output_matches: prospective.output_matches,
+            max_output_bytes: prospective.output_bytes,
+            max_span_sum: prospective.span_sum,
+            max_peak_bytes: prospective.peak_bytes,
+            max_work: count.receipt.actual.work,
+        };
+        let exact_success = compiled
+            .count_value_attempt(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                exact,
+            )
+            .unwrap();
+        assert_eq!(exact_success.value, count.value);
+        assert!(exact_success.receipt.authenticates_success());
+
+        let one_below_cases = [
+            OperationLimits {
+                max_boundaries: exact.max_boundaries - 1,
+                ..exact
+            },
+            OperationLimits {
+                max_random_access_bytes: exact.max_random_access_bytes - 1,
+                ..exact
+            },
+            OperationLimits {
+                max_sequential_bytes: exact.max_sequential_bytes - 1,
+                ..exact
+            },
+            OperationLimits {
+                max_match_events: exact.max_match_events - 1,
+                ..exact
+            },
+            OperationLimits {
+                max_output_matches: exact.max_output_matches - 1,
+                ..exact
+            },
+            OperationLimits {
+                max_work: exact.max_work - 1,
+                ..exact
+            },
+        ];
+        for limits in one_below_cases {
+            let refusal = compiled
+                .count_value_attempt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    limits,
+                )
+                .unwrap_err();
+            assert_eq!(
+                refusal.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::RootAssertion)
+            );
+            assert!(refusal.receipt.prospective.is_some());
+            assert!(refusal.closes());
+        }
+    }
+
+    #[test]
+    fn root_assertion_unicode_validation_and_compile_proof_are_exact() {
+        let compiled = root_assertion_fixture(r"\b", true);
+        let accounting = compiled.compile_accounting();
+        assert_eq!(
+            accounting.root_assertion_proof_bytes(),
+            core::mem::size_of::<Option<crate::program::Assertion>>()
+        );
+        let hir = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\b")
+            .unwrap();
+        let exact = CompileLimits {
+            max_program_bytes: accounting.program_bytes,
+            max_work: accounting.work,
+            ..CompileLimits::default()
+        };
+        let replay = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            exact,
+        )
+        .unwrap();
+        assert_eq!(replay.compile_accounting(), accounting);
+        assert!(matches!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits {
+                    max_program_bytes: accounting.program_bytes - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+                CompileLimits {
+                    max_work: accounting.work - 1,
+                    ..exact
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::CompileWork,
+                ..
+            })
+        ));
+        assert!(matches!(
+            compiled.count_value(
+                b"a\xFFz",
+                0..3,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            ),
+            Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+        ));
+        let nearby = root_assertion_fixture(r"a\b", true);
+        assert!(nearby.program.root_assertion().is_none());
+        let captured = root_assertion_fixture(r"(\b)", true);
+        assert!(captured.program.root_assertion().is_some());
+    }
+
+    fn root_assertion_fixture(pattern: &str, unicode: bool) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .unicode(unicode)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            if unicode {
+                RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE
+            } else {
+                RustByteProfile::PINNED_1_12_4
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
     }
 
     fn state_byte_span_sum_fixture_with_limits(
