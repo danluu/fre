@@ -633,6 +633,12 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; grep-captures admits bounded absolute-start literal/byte-class/greedy-single-byte-repeat sequences whose variable boundaries are disjoint, including mandatory empty-span root captures and exact line-end matching, with zero execution allocation/scratch/output",
         );
         identity.identity.push_str(
+            "; capture-run-alternation-v1 binds the canonical source digest, exact descending-width mask, shared class digest, fixed two-group participation, and accounting-v2 class-equality/materialization plus explicit malformed-UTF8 byte-probe ledgers to one allocation-free execution plan",
+        );
+        identity.availability.push_str(
+            "; one-pattern count-captures and grep-captures admit direct captured pairwise-disjoint greedy singleton-byte runs or strictly descending positive exact-width alternatives over one nonempty shared byte/Unicode class, excluding CR/LF; intrinsic widths above 31, retained Unicode classes above 1024 ranges, and empty canonical classes retain the incumbent generic route, while caller quotas remain typed refusals",
+        );
+        identity.identity.push_str(
             "; capture-word-run-v1 derives bounded captured same-subclass whole-word alternatives from canonical HIR and counts their fixed mandatory participation while preserving full ASCII or Unicode word context",
         );
         identity.availability.push_str(
@@ -7201,10 +7207,10 @@ fn fre_grep_captures(
     if let Some(reduction) = anchored_word_capture_reduction(request, limits)? {
         return Ok(reduction);
     }
-    if let Some(reduction) = capture_word_run_reduction(request, limits)? {
+    if let Some(reduction) = capture_run_alternation_reduction(request, limits)? {
         return Ok(reduction);
     }
-    if let Some(reduction) = capture_run_alternation_reduction(request, limits)? {
+    if let Some(reduction) = capture_word_run_reduction(request, limits)? {
         return Ok(reduction);
     }
     if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
@@ -8101,7 +8107,8 @@ fn capture_run_alternation_plan_one(
             )));
         }
         Err(
-            error @ (CaptureRunAlternationBuildError::ArithmeticOverflow(_)
+            error @ (CaptureRunAlternationBuildError::AllocationFailure { .. }
+            | CaptureRunAlternationBuildError::ArithmeticOverflow(_)
             | CaptureRunAlternationBuildError::InternalInvariant(_)),
         ) => {
             return Err(ExecutionError::fault(format!(
@@ -8140,20 +8147,28 @@ fn authenticate_capture_run_alternation_plan(
     );
     let shape_is_coherent = match operation.kind {
         fre::CaptureRunAlternationKind::DisjointByteRuns => {
-            operation.minimum_length == 1
+            operation.exact_lengths == 0
+                && operation.minimum_length == 1
                 && operation.maximum_length.is_none()
                 && operation.class_ranges == 0
         }
         fre::CaptureRunAlternationKind::DescendingExactByteClass
         | fre::CaptureRunAlternationKind::DescendingExactUnicodeClass => {
-            operation.minimum_length > 0
-                && operation
-                    .maximum_length
-                    .is_some_and(|maximum| operation.minimum_length <= maximum && maximum <= 31)
+            operation.exact_lengths != 0
+                && usize::try_from(operation.exact_lengths.count_ones())
+                    .is_ok_and(|count| count == operation.alternatives)
+                && operation.minimum_length == operation.exact_lengths.trailing_zeros()
+                && u32::BITS
+                    .checked_sub(1)
+                    .and_then(|maximum| {
+                        maximum.checked_sub(operation.exact_lengths.leading_zeros())
+                    })
+                    .is_some_and(|maximum| operation.maximum_length == Some(maximum))
                 && operation.class_ranges > 0
         }
     };
-    if report.identity.profile != expected_profile
+    if !plan.authenticates_identity()
+        || report.identity.profile != expected_profile
         || report.identity.algorithm_version != fre::CAPTURE_RUN_ALTERNATION_ALGORITHM_VERSION
         || report.identity.accounting_version != fre::CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION
         || operation.plan_id != fre::CAPTURE_RUN_ALTERNATION_PLAN_ID
@@ -8270,13 +8285,25 @@ fn execute_capture_run_alternation_with_limits(
             )),
         })?;
     let report = plan.build_report();
+    let unicode = matches!(
+        report.identity.operation.kind,
+        fre::CaptureRunAlternationKind::DescendingExactUnicodeClass
+    );
+    let expected_source_upper = haystack
+        .len()
+        .checked_mul(if unicode { 4 } else { 1 })
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE capture run-alternation source upper bound overflow")
+        })?;
     if result.identity != report.identity.operation
         || result.capture_count != result.actual.capture_count
         || result.upper_bounds.input_bytes != haystack.len()
-        || result.upper_bounds.sequential_bytes != haystack.len()
+        || result.upper_bounds.source_reads != expected_source_upper
+        || result.upper_bounds.sequential_bytes != result.upper_bounds.source_reads
         || result.upper_bounds.peak_bytes != report.persistent_bytes
-        || result.actual.source_reads != haystack.len()
-        || result.actual.sequential_bytes != haystack.len()
+        || result.actual.source_reads < haystack.len()
+        || result.actual.source_reads > result.upper_bounds.source_reads
+        || result.actual.sequential_bytes != result.actual.source_reads
         || result.actual.matches > result.upper_bounds.matches
         || result.actual.capture_count > result.upper_bounds.capture_count
         || result.actual.work > result.upper_bounds.work
@@ -16792,6 +16819,8 @@ pub fn report_bytes(report: &Report) -> Result<Vec<u8>, CompareError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
     use fre::AggregateResource;
 
@@ -19820,6 +19849,158 @@ mod tests {
         }
     }
 
+    fn wide_capture_run_class_pattern(ranges: usize) -> String {
+        let mut class = String::from("[");
+        for ordinal in 0..ranges {
+            let scalar = u32::try_from(ordinal)
+                .unwrap()
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(0x1000))
+                .unwrap();
+            write!(&mut class, r"\u{{{scalar:x}}}").unwrap();
+        }
+        class.push(']');
+        format!("({class}{{3}})|({class}{{2}})")
+    }
+
+    #[test]
+    fn capture_run_intrinsic_caps_and_empty_class_retain_public_generic_route() {
+        let cases = [
+            (
+                r"([a-z]{32})|([a-z]{31})".to_string(),
+                false,
+                b"abcdefghijklmnopqrstuvwxyzabcdef".as_slice(),
+            ),
+            (
+                wide_capture_run_class_pattern(1_025),
+                true,
+                "\u{1000}\u{1002}\u{1004}".as_bytes(),
+            ),
+            (
+                r"([a&&b]{3})|([a&&b]{2})".to_string(),
+                false,
+                b"aaabbb".as_slice(),
+            ),
+        ];
+        for (pattern, unicode, haystack) in cases {
+            assert!(
+                capture_run_alternation_plan_one(&pattern, unicode, false, &RunLimits::default(),)
+                    .expect("intrinsic ineligibility is not a caller resource failure")
+                    .is_none(),
+                "{pattern}"
+            );
+            let reference = rust_compile_options(std::slice::from_ref(&pattern), unicode, false)
+                .expect("generic incumbent pattern");
+            let expected = count_captures(&reference, haystack, u64::MAX)
+                .expect("generic incumbent capture result");
+            match current_fre(
+                "count-captures",
+                std::slice::from_ref(&pattern),
+                haystack,
+                unicode,
+                false,
+                &RunLimits::default(),
+            ) {
+                CandidateOutcome::ExecutedWithPlan { actual, plan } => {
+                    assert_eq!(actual, expected);
+                    assert_ne!(plan, CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+                }
+                other => panic!("intrinsic shape must retain public generic route: {other:?}"),
+            }
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                "count-captures",
+                &pattern,
+                unicode,
+                false,
+                haystack.len(),
+            )
+            .expect("intrinsic shape generic lifecycle");
+            assert_ne!(lifecycle.plan(), CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+            assert_eq!(
+                lifecycle
+                    .execute(haystack)
+                    .expect("generic lifecycle result"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn capture_run_caller_quotas_remain_typed_terminal_refusals() {
+        for (pattern, limits, expected) in [
+            (
+                r"([a-z]{4})|([a-z]{3})",
+                RunLimits {
+                    fre_aggregate_repeat_bound: 3,
+                    ..RunLimits::default()
+                },
+                "exact repetition length",
+            ),
+            (
+                r"([A-Za-z]{4})|([A-Za-z]{3})",
+                RunLimits {
+                    pattern_bytes_per_job: 1,
+                    ..RunLimits::default()
+                },
+                "class ranges",
+            ),
+        ] {
+            let outcome = current_fre(
+                "count-captures",
+                &[pattern.to_string()],
+                b"abcdef",
+                false,
+                false,
+                &limits,
+            );
+            let CandidateOutcome::Unsupported(reason) = outcome else {
+                panic!("caller quota must be a typed refusal: {outcome:?}");
+            };
+            assert!(
+                reason.contains("capture run-alternation build refused execution")
+                    && reason.contains(expected),
+                "{reason}"
+            );
+            let error = current_fre_rebar_capture_lifecycle_with_limits(
+                "count-captures",
+                pattern,
+                false,
+                false,
+                6,
+                limits,
+            )
+            .expect_err("caller quota must refuse lifecycle construction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("capture run-alternation build refused execution")
+                    && error.to_string().contains(expected),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_run_unicode_malformed_probe_ledger_reaches_lifecycle() {
+        let pattern = r"(\p{L}{3})|(\p{L}{2})";
+        let haystack = [b'a', b'b', 0xf0, 0x90, 0x80, b'A', b'c', b'd', 0xe2, 0x82];
+        let reference = rust_compile_options(&[pattern.to_string()], true, false)
+            .expect("malformed Unicode reference");
+        let expected = count_captures(&reference, &haystack, u64::MAX)
+            .expect("malformed Unicode reference result");
+        let mut lifecycle = current_fre_rebar_capture_lifecycle(
+            "count-captures",
+            pattern,
+            true,
+            false,
+            haystack.len(),
+        )
+        .expect("malformed Unicode run lifecycle");
+        assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_RUN_ALTERNATION_PLAN);
+        assert_eq!(lifecycle.execute(&haystack).expect("first"), expected);
+        assert_eq!(lifecycle.execute(&haystack).expect("steady"), expected);
+    }
+
     #[test]
     fn capture_run_alternation_lifecycle_closes_one_below_build_resource() {
         let pattern = r"([A-Za-z]{4})|([A-Za-z]{3})|([A-Za-z]{2})";
@@ -22582,6 +22763,12 @@ mod tests {
             "fre-current-aggregate-capture-v50-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(identity.identity.contains("capture-word-run-v1"));
+        assert!(
+            identity
+                .identity
+                .contains("capture-run-alternation-v1 binds the canonical source digest")
+        );
+        assert!(identity.availability.contains("intrinsic widths above 31"));
         assert!(identity.identity.contains("anchored-word-capture-v1"));
         assert!(
             identity

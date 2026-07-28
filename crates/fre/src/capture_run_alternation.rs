@@ -16,10 +16,11 @@ pub const CAPTURE_RUN_ALTERNATION_PLAN_ID: &str = "capture-run-alternation-linea
 pub const CAPTURE_RUN_ALTERNATION_COUNT_OPERATION_ID: &str =
     "capture-run-alternation.participation-count.v1";
 pub const CAPTURE_RUN_ALTERNATION_ALGORITHM_VERSION: u32 = 1;
-pub const CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION: u32 = 1;
+pub const CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION: u32 = 2;
 
 const MAX_CLASS_RANGES: usize = 1_024;
 const MAX_EXACT_LENGTH: u32 = 31;
+const MAX_UTF8_PROBES_PER_POSITION: usize = 4;
 const GROUPS_PER_MATCH: usize = 2;
 const DIGEST_OFFSET_A: u64 = 0xcbf2_9ce4_8422_2325;
 const DIGEST_OFFSET_B: u64 = 0x8422_2325_cbf2_9ce4;
@@ -68,6 +69,9 @@ pub struct CaptureRunAlternationHirAccounting {
     pub class_ranges: usize,
     pub alternatives: usize,
     pub captures: usize,
+    pub class_equality_work: usize,
+    pub mask_initializations: usize,
+    pub range_materializations: usize,
     pub inspection_work: usize,
 }
 
@@ -77,6 +81,7 @@ pub struct CaptureRunAlternationOperationIdentity {
     pub operation_id: &'static str,
     pub kind: CaptureRunAlternationKind,
     pub alternatives: usize,
+    pub exact_lengths: u32,
     pub minimum_length: u32,
     pub maximum_length: Option<u32>,
     pub class_ranges: usize,
@@ -115,6 +120,10 @@ pub enum CaptureRunAlternationBuildError {
         needed: usize,
         limit: usize,
     },
+    AllocationFailure {
+        resource: &'static str,
+        bytes: usize,
+    },
     ArithmeticOverflow(&'static str),
     InternalInvariant(&'static str),
 }
@@ -137,6 +146,10 @@ impl fmt::Display for CaptureRunAlternationBuildError {
                 formatter,
                 "capture run-alternation {resource} needs {needed}, limit is {limit}"
             ),
+            Self::AllocationFailure { resource, bytes } => write!(
+                formatter,
+                "capture run-alternation failed to allocate {bytes} bytes for {resource}"
+            ),
             Self::ArithmeticOverflow(computation) => write!(
                 formatter,
                 "capture run-alternation overflow while computing {computation}"
@@ -154,6 +167,7 @@ impl std::error::Error for CaptureRunAlternationBuildError {
             Self::Syntax(error) => Some(error),
             Self::Unsupported(_)
             | Self::Resource { .. }
+            | Self::AllocationFailure { .. }
             | Self::ArithmeticOverflow(_)
             | Self::InternalInvariant(_) => None,
         }
@@ -372,6 +386,7 @@ impl CaptureRunAlternationBuilder {
             operation_id: CAPTURE_RUN_ALTERNATION_COUNT_OPERATION_ID,
             kind: inspection.kind,
             alternatives: inspection.accounting.alternatives,
+            exact_lengths: inspection.exact_lengths,
             minimum_length: inspection.minimum_length,
             maximum_length: inspection.maximum_length,
             class_ranges: inspection.accounting.class_ranges,
@@ -413,6 +428,111 @@ impl CaptureRunAlternationPlan {
         &self.report
     }
 
+    /// Verify that the public report still closes over the retained matcher.
+    #[must_use]
+    pub fn authenticates_identity(&self) -> bool {
+        let report = &self.report;
+        let operation = report.identity.operation;
+        let hir = report.hir;
+        let Some(expected_hir_nodes) = operation
+            .alternatives
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(1))
+        else {
+            return false;
+        };
+        let Some(expected_inspection_work) = hir
+            .hir_nodes
+            .checked_add(operation.alternatives)
+            .and_then(|value| value.checked_add(hir.class_equality_work))
+            .and_then(|value| value.checked_add(hir.mask_initializations))
+            .and_then(|value| value.checked_add(hir.range_materializations))
+        else {
+            return false;
+        };
+        let matcher_closes = match &self.matcher {
+            CaptureRunAlternationMatcher::DisjointByteRuns { members } => {
+                operation.kind == CaptureRunAlternationKind::DisjointByteRuns
+                    && !report.identity.profile.options.unicode
+                    && operation.exact_lengths == 0
+                    && operation.minimum_length == 1
+                    && operation.maximum_length.is_none()
+                    && operation.class_ranges == 0
+                    && operation.class_digest == digest_words(*members)
+                    && usize::try_from(members.iter().map(|word| word.count_ones()).sum::<u32>())
+                        .is_ok_and(|members| members == operation.alternatives)
+                    && hir.class_equality_work == 0
+                    && hir.mask_initializations == operation.alternatives
+                    && hir.range_materializations == 0
+            }
+            CaptureRunAlternationMatcher::ExactByteClass {
+                members,
+                exact_lengths,
+            } => {
+                operation.kind == CaptureRunAlternationKind::DescendingExactByteClass
+                    && !report.identity.profile.options.unicode
+                    && exact_length_identity_closes(operation, *exact_lengths)
+                    && byte_range_count(*members) == operation.class_ranges
+                    && operation.class_ranges > 0
+                    && operation.class_digest == digest_words(*members)
+                    && expected_class_equality_work(operation.alternatives, operation.class_ranges)
+                        .is_some_and(|expected| hir.class_equality_work == expected)
+                    && hir.mask_initializations
+                        == usize::try_from(
+                            members.iter().map(|word| word.count_ones()).sum::<u32>(),
+                        )
+                        .unwrap_or(usize::MAX)
+                    && hir.range_materializations == operation.class_ranges
+            }
+            CaptureRunAlternationMatcher::ExactUnicodeClass {
+                ranges,
+                exact_lengths,
+            } => {
+                operation.kind == CaptureRunAlternationKind::DescendingExactUnicodeClass
+                    && report.identity.profile.options.unicode
+                    && exact_length_identity_closes(operation, *exact_lengths)
+                    && operation.class_ranges == ranges.len()
+                    && operation.class_ranges > 0
+                    && operation.class_digest == digest_ranges(ranges)
+                    && expected_class_equality_work(operation.alternatives, operation.class_ranges)
+                        .is_some_and(|expected| hir.class_equality_work == expected)
+                    && hir.mask_initializations == 0
+                    && ranges
+                        .len()
+                        .checked_mul(2)
+                        .is_some_and(|expected| hir.range_materializations == expected)
+            }
+        };
+        let retained_class_bytes = match &self.matcher {
+            CaptureRunAlternationMatcher::ExactUnicodeClass { ranges, .. } => {
+                ranges.len().checked_mul(size_of::<ScalarRange>())
+            }
+            CaptureRunAlternationMatcher::DisjointByteRuns { .. }
+            | CaptureRunAlternationMatcher::ExactByteClass { .. } => Some(0),
+        };
+        matcher_closes
+            && report.identity.algorithm_version == CAPTURE_RUN_ALTERNATION_ALGORITHM_VERSION
+            && report.identity.accounting_version == CAPTURE_RUN_ALTERNATION_ACCOUNTING_VERSION
+            && operation.plan_id == CAPTURE_RUN_ALTERNATION_PLAN_ID
+            && operation.operation_id == CAPTURE_RUN_ALTERNATION_COUNT_OPERATION_ID
+            && operation.alternatives >= 2
+            && operation.participating_captures_per_match == 1
+            && operation.groups_per_match == GROUPS_PER_MATCH
+            && operation.line_partition_invariant
+            && operation.non_overlapping
+            && !report.identity.profile.options.case_insensitive
+            && hir.hir_nodes == expected_hir_nodes
+            && hir.class_ranges == operation.class_ranges
+            && hir.alternatives == operation.alternatives
+            && hir.captures == operation.alternatives
+            && hir.inspection_work == expected_inspection_work
+            && retained_class_bytes == Some(report.retained_class_bytes)
+            && size_of::<Self>()
+                .checked_add(report.retained_class_bytes)
+                .is_some_and(|expected| report.persistent_bytes == expected)
+            && report.peak_bytes == report.persistent_bytes
+    }
+
     pub fn run_upper_bounds(
         &self,
         input_bytes: usize,
@@ -437,20 +557,26 @@ impl CaptureRunAlternationPlan {
                 computation: "capture-count upper bound",
             },
         )?;
-        let comparisons_per_unit = match &self.matcher {
+        let (source_reads, comparisons_per_unit) = match &self.matcher {
             CaptureRunAlternationMatcher::ExactUnicodeClass { ranges, .. } => {
-                binary_search_comparison_bound(ranges.len())
+                let source_reads = input_bytes
+                    .checked_mul(MAX_UTF8_PROBES_PER_POSITION)
+                    .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
+                        computation: "Unicode source-read upper bound",
+                    })?;
+                (source_reads, binary_search_comparison_bound(ranges.len()))
             }
             CaptureRunAlternationMatcher::DisjointByteRuns { .. }
-            | CaptureRunAlternationMatcher::ExactByteClass { .. } => 0,
+            | CaptureRunAlternationMatcher::ExactByteClass { .. } => (input_bytes, 0),
         };
         let class_comparisons = input_bytes.checked_mul(comparisons_per_unit).ok_or(
             CaptureRunAlternationRunError::ArithmeticOverflow {
                 computation: "class-comparison upper bound",
             },
         )?;
-        let work = input_bytes
-            .checked_mul(3)
+        let work = source_reads
+            .checked_add(input_bytes)
+            .and_then(|value| value.checked_add(input_bytes))
             .and_then(|value| value.checked_add(class_comparisons))
             .and_then(|value| value.checked_add(matches))
             .ok_or(CaptureRunAlternationRunError::ArithmeticOverflow {
@@ -458,14 +584,14 @@ impl CaptureRunAlternationPlan {
             })?;
         Ok(CaptureRunAlternationRunUpperBounds {
             input_bytes,
-            source_reads: input_bytes,
+            source_reads,
             decoded_units: input_bytes,
             class_comparisons,
             run_events: input_bytes,
             matches,
             capture_count,
             work,
-            sequential_bytes: input_bytes,
+            sequential_bytes: source_reads,
             peak_bytes: self.report.persistent_bytes,
         })
     }
@@ -503,10 +629,33 @@ impl CaptureRunAlternationPlan {
 struct Inspection {
     kind: CaptureRunAlternationKind,
     matcher: CaptureRunAlternationMatcher,
+    exact_lengths: u32,
     minimum_length: u32,
     maximum_length: Option<u32>,
     class_digest: [u64; 2],
     accounting: CaptureRunAlternationHirAccounting,
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the preceding nonzero-mask check proves leading_zeros is at most 31"
+)]
+fn exact_length_identity_closes(
+    operation: CaptureRunAlternationOperationIdentity,
+    retained_mask: u32,
+) -> bool {
+    retained_mask != 0
+        && operation.exact_lengths == retained_mask
+        && usize::try_from(retained_mask.count_ones())
+            .is_ok_and(|count| count == operation.alternatives)
+        && operation.minimum_length == retained_mask.trailing_zeros()
+        && operation.maximum_length == Some(u32::BITS - 1 - retained_mask.leading_zeros())
+}
+
+fn expected_class_equality_work(alternatives: usize, class_ranges: usize) -> Option<usize> {
+    alternatives
+        .checked_sub(1)?
+        .checked_mul(class_ranges.checked_add(1)?)
 }
 
 fn inspect(
@@ -562,6 +711,9 @@ fn base_accounting(
         class_ranges: 0,
         alternatives,
         captures: alternatives,
+        class_equality_work: 0,
+        mask_initializations: 0,
+        range_materializations: 0,
         inspection_work: hir_nodes,
     })
 }
@@ -618,11 +770,13 @@ fn inspect_disjoint_byte_runs(
                 "singleton-byte runs must be pairwise disjoint",
             ));
         }
+        charge_mask_initializations(&mut accounting, 1, limits)?;
         members[word] |= bit;
     }
     Ok(Inspection {
         kind: CaptureRunAlternationKind::DisjointByteRuns,
         matcher: CaptureRunAlternationMatcher::DisjointByteRuns { members },
+        exact_lengths: 0,
         minimum_length: 1,
         maximum_length: None,
         class_digest: digest_words(members),
@@ -664,12 +818,16 @@ fn inspect_exact_class_runs(
                 "exact repetitions must be in strictly descending source order",
             ));
         }
-        let max_exact = limits.max_exact_length.min(MAX_EXACT_LENGTH);
-        if repetition.min > max_exact {
+        if repetition.min > MAX_EXACT_LENGTH {
+            return Err(CaptureRunAlternationBuildError::Unsupported(
+                "exact repetition exceeds the intrinsic length-mask width",
+            ));
+        }
+        if repetition.min > limits.max_exact_length {
             return Err(CaptureRunAlternationBuildError::Resource {
                 resource: "exact repetition length",
                 needed: usize::try_from(repetition.min).unwrap_or(usize::MAX),
-                limit: usize::try_from(max_exact).unwrap_or(usize::MAX),
+                limit: usize::try_from(limits.max_exact_length).unwrap_or(usize::MAX),
             });
         }
         let HirKind::Class(class) = repetition.sub.kind() else {
@@ -677,10 +835,22 @@ fn inspect_exact_class_runs(
                 "exact repetition body must be one class",
             ));
         };
-        if shared_class.is_some_and(|shared| shared != class) {
-            return Err(CaptureRunAlternationBuildError::Unsupported(
-                "every exact repetition must use the same class",
-            ));
+        let range_count = class_range_count(class);
+        enforce_intrinsic_class_ranges(range_count)?;
+        enforce_build("class ranges", range_count, limits.max_class_ranges)?;
+        if let Some(shared) = shared_class {
+            let equality_work = class_range_count(shared)
+                .max(range_count)
+                .checked_add(1)
+                .ok_or(CaptureRunAlternationBuildError::ArithmeticOverflow(
+                    "class equality work",
+                ))?;
+            charge_class_equality(&mut accounting, equality_work, limits)?;
+            if shared != class {
+                return Err(CaptureRunAlternationBuildError::Unsupported(
+                    "every exact repetition must use the same class",
+                ));
+            }
         }
         shared_class.get_or_insert(class);
         maximum.get_or_insert(repetition.min);
@@ -692,12 +862,12 @@ fn inspect_exact_class_runs(
         "nonempty alternatives lost their shared class",
     ))?;
     let (kind, matcher, class_ranges, class_digest) =
-        build_exact_matcher(class, unicode, exact_lengths, limits)?;
+        build_exact_matcher(class, unicode, exact_lengths, &mut accounting, limits)?;
     accounting.class_ranges = class_ranges;
-    charge_inspection(&mut accounting, class_ranges, limits)?;
     Ok(Inspection {
         kind,
         matcher,
+        exact_lengths,
         minimum_length: minimum,
         maximum_length: maximum,
         class_digest,
@@ -709,6 +879,7 @@ fn build_exact_matcher(
     class: &Class,
     unicode: bool,
     exact_lengths: u32,
+    accounting: &mut CaptureRunAlternationHirAccounting,
     limits: CaptureRunAlternationBuildLimits,
 ) -> Result<
     (
@@ -721,11 +892,25 @@ fn build_exact_matcher(
 > {
     match (unicode, class) {
         (false, Class::Bytes(class)) => {
-            enforce_build(
-                "class ranges",
-                class.ranges().len(),
-                limits.max_class_ranges.min(MAX_CLASS_RANGES),
-            )?;
+            let range_count = class.ranges().len();
+            enforce_intrinsic_class_ranges(range_count)?;
+            enforce_build("class ranges", range_count, limits.max_class_ranges)?;
+            let mut initializations = 0_usize;
+            for range in class.ranges() {
+                let width = usize::from(range.end())
+                    .checked_sub(usize::from(range.start()))
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(CaptureRunAlternationBuildError::ArithmeticOverflow(
+                        "byte-mask initialization work",
+                    ))?;
+                initializations = initializations.checked_add(width).ok_or(
+                    CaptureRunAlternationBuildError::ArithmeticOverflow(
+                        "byte-mask initialization work",
+                    ),
+                )?;
+            }
+            charge_range_materializations(accounting, range_count, limits)?;
+            charge_mask_initializations(accounting, initializations, limits)?;
             let mut members = [0_u64; 4];
             for range in class.ranges() {
                 for byte in range.start()..=range.end() {
@@ -743,25 +928,34 @@ fn build_exact_matcher(
                     members,
                     exact_lengths,
                 },
-                class.ranges().len(),
+                range_count,
                 digest_words(members),
             ))
         }
         (true, Class::Unicode(class)) => {
             let range_count = class.ranges().len();
-            enforce_build(
-                "class ranges",
-                range_count,
-                limits.max_class_ranges.min(MAX_CLASS_RANGES),
+            enforce_intrinsic_class_ranges(range_count)?;
+            enforce_build("class ranges", range_count, limits.max_class_ranges)?;
+            let range_work = range_count.checked_mul(2).ok_or(
+                CaptureRunAlternationBuildError::ArithmeticOverflow(
+                    "Unicode range validation and materialization work",
+                ),
             )?;
-            let mut ranges = Vec::new();
-            ranges.try_reserve_exact(range_count).map_err(|_| {
-                CaptureRunAlternationBuildError::Resource {
-                    resource: "class range allocation",
-                    needed: range_count,
-                    limit: limits.max_class_ranges.min(MAX_CLASS_RANGES),
-                }
-            })?;
+            charge_range_materializations(accounting, range_work, limits)?;
+            let retained_class_bytes = range_count.checked_mul(size_of::<ScalarRange>()).ok_or(
+                CaptureRunAlternationBuildError::ArithmeticOverflow("retained class bytes"),
+            )?;
+            let persistent_bytes = size_of::<CaptureRunAlternationPlan>()
+                .checked_add(retained_class_bytes)
+                .ok_or(CaptureRunAlternationBuildError::ArithmeticOverflow(
+                    "persistent bytes",
+                ))?;
+            enforce_build(
+                "persistent bytes",
+                persistent_bytes,
+                limits.max_persistent_bytes,
+            )?;
+            enforce_build("peak bytes", persistent_bytes, limits.max_peak_bytes)?;
             for range in class.ranges() {
                 if (range.start() <= '\n' && '\n' <= range.end())
                     || (range.start() <= '\r' && '\r' <= range.end())
@@ -770,6 +964,15 @@ fn build_exact_matcher(
                         "shared Unicode class must exclude line terminators",
                     ));
                 }
+            }
+            let mut ranges = Vec::new();
+            ranges.try_reserve_exact(range_count).map_err(|_| {
+                CaptureRunAlternationBuildError::AllocationFailure {
+                    resource: "retained Unicode class ranges",
+                    bytes: retained_class_bytes,
+                }
+            })?;
+            for range in class.ranges() {
                 ranges.push(ScalarRange {
                     start: u32::from(range.start()),
                     end: u32::from(range.end()),
@@ -859,6 +1062,7 @@ fn scan_exact_unicode_class(
     exact_lengths: u32,
 ) -> Result<CaptureRunAlternationRunActual, CaptureRunAlternationRunError> {
     let mut position = 0_usize;
+    let mut source_reads = 0_usize;
     let mut decoded_units = 0_usize;
     let mut comparisons = 0_usize;
     let mut run_length = 0_usize;
@@ -866,12 +1070,11 @@ fn scan_exact_unicode_class(
     let mut matches = 0_usize;
     while position < haystack.len() {
         let decoded = decode_first(&haystack[position..]);
-        let (in_class, width) = if let Some((scalar, width)) = decoded {
-            (scalar_member(ranges, scalar, &mut comparisons), width)
-        } else {
-            (false, 1)
-        };
-        position += width;
+        let in_class = decoded
+            .scalar
+            .is_some_and(|scalar| scalar_member(ranges, scalar, &mut comparisons));
+        position += decoded.width;
+        source_reads += decoded.source_reads;
         decoded_units += 1;
         if in_class {
             if run_length == 0 {
@@ -887,7 +1090,7 @@ fn scan_exact_unicode_class(
         matches += count_run_matches(run_length, exact_lengths)?;
     }
     finish_actual(
-        haystack.len(),
+        source_reads,
         decoded_units,
         comparisons,
         run_events,
@@ -1118,6 +1321,29 @@ fn enforce_build(
     Ok(())
 }
 
+fn class_range_count(class: &Class) -> usize {
+    match class {
+        Class::Bytes(class) => class.ranges().len(),
+        Class::Unicode(class) => class.ranges().len(),
+    }
+}
+
+fn enforce_intrinsic_class_ranges(
+    range_count: usize,
+) -> Result<(), CaptureRunAlternationBuildError> {
+    if range_count == 0 {
+        return Err(CaptureRunAlternationBuildError::Unsupported(
+            "shared class must be nonempty",
+        ));
+    }
+    if range_count > MAX_CLASS_RANGES {
+        return Err(CaptureRunAlternationBuildError::Unsupported(
+            "class exceeds the intrinsic retained-range capacity",
+        ));
+    }
+    Ok(())
+}
+
 fn charge_inspection(
     accounting: &mut CaptureRunAlternationHirAccounting,
     amount: usize,
@@ -1131,8 +1357,67 @@ fn charge_inspection(
     Ok(())
 }
 
+fn charge_class_equality(
+    accounting: &mut CaptureRunAlternationHirAccounting,
+    amount: usize,
+    limits: CaptureRunAlternationBuildLimits,
+) -> Result<(), CaptureRunAlternationBuildError> {
+    let component = accounting.class_equality_work.checked_add(amount).ok_or(
+        CaptureRunAlternationBuildError::ArithmeticOverflow("class equality work"),
+    )?;
+    charge_inspection(accounting, amount, limits)?;
+    accounting.class_equality_work = component;
+    Ok(())
+}
+
+fn charge_mask_initializations(
+    accounting: &mut CaptureRunAlternationHirAccounting,
+    amount: usize,
+    limits: CaptureRunAlternationBuildLimits,
+) -> Result<(), CaptureRunAlternationBuildError> {
+    let component = accounting.mask_initializations.checked_add(amount).ok_or(
+        CaptureRunAlternationBuildError::ArithmeticOverflow("byte-mask initializations"),
+    )?;
+    charge_inspection(accounting, amount, limits)?;
+    accounting.mask_initializations = component;
+    Ok(())
+}
+
+fn charge_range_materializations(
+    accounting: &mut CaptureRunAlternationHirAccounting,
+    amount: usize,
+    limits: CaptureRunAlternationBuildLimits,
+) -> Result<(), CaptureRunAlternationBuildError> {
+    let component = accounting
+        .range_materializations
+        .checked_add(amount)
+        .ok_or(CaptureRunAlternationBuildError::ArithmeticOverflow(
+            "range materializations",
+        ))?;
+    charge_inspection(accounting, amount, limits)?;
+    accounting.range_materializations = component;
+    Ok(())
+}
+
 fn byte_member(members: [u64; 4], byte: u8) -> bool {
     members[usize::from(byte) / 64] & (1_u64 << (usize::from(byte) % 64)) != 0
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the fixed 256-byte domain can start at most 128 disjoint nonempty ranges"
+)]
+fn byte_range_count(members: [u64; 4]) -> usize {
+    let mut ranges = 0_usize;
+    let mut previous = false;
+    for byte in u8::MIN..=u8::MAX {
+        let current = byte_member(members, byte);
+        if current && !previous {
+            ranges += 1;
+        }
+        previous = current;
+    }
+    ranges
 }
 
 #[allow(
@@ -1158,22 +1443,132 @@ fn scalar_member(ranges: &[ScalarRange], scalar: char, comparisons: &mut usize) 
     false
 }
 
-fn decode_first(bytes: &[u8]) -> Option<(char, usize)> {
-    let first = *bytes.first()?;
-    let width = utf8_width(first)?;
-    let prefix = bytes.get(..width)?;
-    let text = core::str::from_utf8(prefix).ok()?;
-    Some((text.chars().next()?, width))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedUnit {
+    scalar: Option<char>,
+    width: usize,
+    source_reads: usize,
 }
 
-const fn utf8_width(first: u8) -> Option<usize> {
-    match first {
-        0x00..=0x7f => Some(1),
-        0xc2..=0xdf => Some(2),
-        0xe0..=0xef => Some(3),
-        0xf0..=0xf4 => Some(4),
-        _ => None,
+impl DecodedUnit {
+    const fn valid(scalar: char, width: usize, source_reads: usize) -> Self {
+        Self {
+            scalar: Some(scalar),
+            width,
+            source_reads,
+        }
     }
+
+    const fn invalid(source_reads: usize) -> Self {
+        Self {
+            scalar: None,
+            width: 1,
+            source_reads,
+        }
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a UTF-8 scalar has at most four bytes, and each successful bounded probe increments this local counter once"
+)]
+fn probe_byte(bytes: &[u8], index: usize, source_reads: &mut usize) -> Option<u8> {
+    let byte = bytes.get(index).copied()?;
+    *source_reads += 1;
+    Some(byte)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated UTF-8 payload masks and fixed shifts construct one Unicode scalar"
+)]
+fn decode_first(bytes: &[u8]) -> DecodedUnit {
+    let mut source_reads = 0_usize;
+    let first = probe_byte(bytes, 0, &mut source_reads)
+        .expect("Unicode scan only decodes a known nonempty suffix");
+    match first {
+        0x00..=0x7f => DecodedUnit::valid(char::from(first), 1, source_reads),
+        0xc2..=0xdf => {
+            let Some(second) = probe_byte(bytes, 1, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            if !is_utf8_continuation(second) {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let scalar = (u32::from(first & 0x1f) << 6) | u32::from(second & 0x3f);
+            DecodedUnit::valid(
+                char::from_u32(scalar).expect("validated two-byte UTF-8 is a scalar"),
+                2,
+                source_reads,
+            )
+        }
+        0xe0..=0xef => {
+            let Some(second) = probe_byte(bytes, 1, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            let valid_second = match first {
+                0xe0 => (0xa0..=0xbf).contains(&second),
+                0xed => (0x80..=0x9f).contains(&second),
+                _ => is_utf8_continuation(second),
+            };
+            if !valid_second {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let Some(third) = probe_byte(bytes, 2, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            if !is_utf8_continuation(third) {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let scalar = (u32::from(first & 0x0f) << 12)
+                | (u32::from(second & 0x3f) << 6)
+                | u32::from(third & 0x3f);
+            DecodedUnit::valid(
+                char::from_u32(scalar).expect("validated three-byte UTF-8 is a scalar"),
+                3,
+                source_reads,
+            )
+        }
+        0xf0..=0xf4 => {
+            let Some(second) = probe_byte(bytes, 1, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            let valid_second = match first {
+                0xf0 => (0x90..=0xbf).contains(&second),
+                0xf4 => (0x80..=0x8f).contains(&second),
+                _ => is_utf8_continuation(second),
+            };
+            if !valid_second {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let Some(third) = probe_byte(bytes, 2, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            if !is_utf8_continuation(third) {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let Some(fourth) = probe_byte(bytes, 3, &mut source_reads) else {
+                return DecodedUnit::invalid(source_reads);
+            };
+            if !is_utf8_continuation(fourth) {
+                return DecodedUnit::invalid(source_reads);
+            }
+            let scalar = (u32::from(first & 0x07) << 18)
+                | (u32::from(second & 0x3f) << 12)
+                | (u32::from(third & 0x3f) << 6)
+                | u32::from(fourth & 0x3f);
+            DecodedUnit::valid(
+                char::from_u32(scalar).expect("validated four-byte UTF-8 is a scalar"),
+                4,
+                source_reads,
+            )
+        }
+        _ => DecodedUnit::invalid(source_reads),
+    }
+}
+
+const fn is_utf8_continuation(byte: u8) -> bool {
+    matches!(byte, 0x80..=0xbf)
 }
 
 fn binary_search_comparison_bound(items: usize) -> usize {
@@ -1225,9 +1620,12 @@ fn digest_ranges(ranges: &[ScalarRange]) -> [u64; 2] {
 
 #[cfg(test)]
 mod tests {
+    use core::fmt::Write as _;
+
     use regex::bytes::RegexBuilder;
 
     use super::{
+        CaptureRunAlternationBuildError, CaptureRunAlternationBuildLimits,
         CaptureRunAlternationBuilder, CaptureRunAlternationKind, CaptureRunAlternationRunLimits,
     };
 
@@ -1258,6 +1656,20 @@ mod tests {
             .captures_iter(haystack)
             .map(|captures| captures.iter().flatten().count())
             .sum()
+    }
+
+    fn wide_class_pattern(ranges: usize) -> String {
+        let mut class = String::from("[");
+        for ordinal in 0..ranges {
+            let scalar = u32::try_from(ordinal)
+                .unwrap()
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(0x1000))
+                .unwrap();
+            write!(&mut class, r"\u{{{scalar:x}}}").unwrap();
+        }
+        class.push(']');
+        format!("({class}{{3}})|({class}{{2}})")
     }
 
     #[test]
@@ -1302,6 +1714,246 @@ mod tests {
                 .unwrap();
             assert_eq!(result.capture_count, reference(pattern, unicode, haystack));
         }
+    }
+
+    #[test]
+    fn exact_length_mask_closes_identity_and_rejects_forgery() {
+        let plan = CaptureRunAlternationBuilder::new(r"([A-Za-z]{5})|([A-Za-z]{3})|([A-Za-z]{2})")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let operation = plan.build_report().identity.operation;
+        assert_eq!(
+            operation.exact_lengths,
+            (1_u32 << 5) | (1_u32 << 3) | (1_u32 << 2)
+        );
+        assert_eq!(operation.exact_lengths.count_ones(), 3);
+        assert_eq!(operation.minimum_length, 2);
+        assert_eq!(operation.maximum_length, Some(5));
+        assert!(plan.authenticates_identity());
+
+        let mut forged = plan.clone();
+        forged.report.identity.operation.exact_lengths ^= 1_u32 << 4;
+        assert!(!forged.authenticates_identity());
+        forged.report.identity.operation.exact_lengths = operation.exact_lengths;
+        forged.report.identity.operation.minimum_length = 1;
+        assert!(!forged.authenticates_identity());
+    }
+
+    #[test]
+    fn gapped_exact_widths_match_every_short_maximal_run() {
+        let pattern = r"([ab]{5})|([ab]{3})|([ab]{2})";
+        let plan = CaptureRunAlternationBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        for length in 0..=16 {
+            let haystack = "a".repeat(length);
+            let result = plan
+                .capture_count(haystack.as_bytes(), exact_limits(&plan, haystack.len()))
+                .unwrap();
+            assert_eq!(
+                result.capture_count,
+                reference(pattern, false, haystack.as_bytes()),
+                "maximal run length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_work_charges_equality_masks_ranges_and_exact_boundary() {
+        for (pattern, unicode) in [
+            (r"(?:(a+)|(b+)|(c+))", false),
+            (r"([A-Za-z]{4})|([A-Za-z]{3})|([A-Za-z]{2})", false),
+            (r"(\p{L}{4})|(\p{L}{3})|(\p{L}{2})", true),
+        ] {
+            let plan = CaptureRunAlternationBuilder::new(pattern)
+                .unicode(unicode)
+                .build()
+                .unwrap();
+            let report = plan.build_report();
+            let expected = report
+                .hir
+                .hir_nodes
+                .checked_add(report.hir.alternatives)
+                .and_then(|value| value.checked_add(report.hir.class_equality_work))
+                .and_then(|value| value.checked_add(report.hir.mask_initializations))
+                .and_then(|value| value.checked_add(report.hir.range_materializations))
+                .unwrap();
+            assert_eq!(report.hir.inspection_work, expected);
+            match report.identity.operation.kind {
+                CaptureRunAlternationKind::DisjointByteRuns => {
+                    assert_eq!(report.hir.class_equality_work, 0);
+                    assert_eq!(report.hir.mask_initializations, 3);
+                    assert_eq!(report.hir.range_materializations, 0);
+                }
+                CaptureRunAlternationKind::DescendingExactByteClass => {
+                    assert_eq!(report.hir.class_equality_work, 6);
+                    assert_eq!(report.hir.mask_initializations, 52);
+                    assert_eq!(report.hir.range_materializations, 2);
+                }
+                CaptureRunAlternationKind::DescendingExactUnicodeClass => {
+                    let ranges = report.hir.class_ranges;
+                    assert_eq!(report.hir.class_equality_work, 2 * ranges.saturating_add(1));
+                    assert_eq!(report.hir.mask_initializations, 0);
+                    assert_eq!(report.hir.range_materializations, 2 * ranges);
+                }
+            }
+
+            let defaults = CaptureRunAlternationBuildLimits::default();
+            let exact = CaptureRunAlternationBuildLimits {
+                max_inspection_work: report.hir.inspection_work,
+                ..defaults
+            };
+            let rebuilt = CaptureRunAlternationBuilder::new(pattern)
+                .unicode(unicode)
+                .limits(exact)
+                .build()
+                .expect("exact inspection-work boundary");
+            assert_eq!(
+                rebuilt.build_report().hir.inspection_work,
+                report.hir.inspection_work
+            );
+            let one_below = CaptureRunAlternationBuildLimits {
+                max_inspection_work: report.hir.inspection_work - 1,
+                ..defaults
+            };
+            assert!(matches!(
+                CaptureRunAlternationBuilder::new(pattern)
+                    .unicode(unicode)
+                    .limits(one_below)
+                    .build(),
+                Err(CaptureRunAlternationBuildError::Resource {
+                    resource: "inspection work",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn unicode_retained_storage_is_preflighted_at_exact_boundaries() {
+        let pattern = r"(\p{L}{4})|(\p{L}{3})|(\p{L}{2})";
+        let plan = CaptureRunAlternationBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let needed = plan.build_report().persistent_bytes;
+        let defaults = CaptureRunAlternationBuildLimits::default();
+        let exact = CaptureRunAlternationBuildLimits {
+            max_persistent_bytes: needed,
+            max_peak_bytes: needed,
+            ..defaults
+        };
+        CaptureRunAlternationBuilder::new(pattern)
+            .unicode(true)
+            .limits(exact)
+            .build()
+            .expect("exact retained and peak byte boundaries");
+
+        for limits in [
+            CaptureRunAlternationBuildLimits {
+                max_persistent_bytes: needed - 1,
+                ..defaults
+            },
+            CaptureRunAlternationBuildLimits {
+                max_peak_bytes: needed - 1,
+                ..defaults
+            },
+        ] {
+            assert!(matches!(
+                CaptureRunAlternationBuilder::new(pattern)
+                    .unicode(true)
+                    .limits(limits)
+                    .build(),
+                Err(CaptureRunAlternationBuildError::Resource { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_unicode_probes_are_explicit_bounded_and_semantic() {
+        for (bytes, scalar, width, source_reads) in [
+            ("💩".as_bytes(), Some('💩'), 4_usize, 4_usize),
+            (&[0xf0, 0x90, 0x80, b'A'][..], None, 1, 4),
+            (&[0xe2, 0x82][..], None, 1, 2),
+            (&[0xed, 0xa0, 0x80][..], None, 1, 2),
+            (&[0x80][..], None, 1, 1),
+        ] {
+            let decoded = super::decode_first(bytes);
+            assert_eq!(decoded.scalar, scalar);
+            assert_eq!(decoded.width, width);
+            assert_eq!(decoded.source_reads, source_reads);
+        }
+
+        let pattern = r"(\p{L}{3})|(\p{L}{2})";
+        let haystack = [b'a', b'b', 0xf0, 0x90, 0x80, b'A', b'c', b'd', 0xe2, 0x82];
+        let plan = CaptureRunAlternationBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap();
+        let result = plan
+            .capture_count(&haystack, exact_limits(&plan, haystack.len()))
+            .unwrap();
+        assert_eq!(result.capture_count, reference(pattern, true, &haystack));
+        assert_eq!(result.actual.source_reads, 14);
+        assert_eq!(result.actual.sequential_bytes, 14);
+        assert_eq!(result.actual.decoded_units, haystack.len());
+        assert!(result.actual.source_reads <= result.upper_bounds.source_reads);
+        assert_eq!(
+            result.upper_bounds.source_reads,
+            haystack.len() * super::MAX_UTF8_PROBES_PER_POSITION
+        );
+    }
+
+    #[test]
+    fn intrinsic_caps_fall_back_while_caller_quotas_refuse() {
+        assert!(matches!(
+            CaptureRunAlternationBuilder::new(r"([a-z]{32})|([a-z]{31})")
+                .unicode(false)
+                .build(),
+            Err(CaptureRunAlternationBuildError::Unsupported(_))
+        ));
+        assert!(matches!(
+            CaptureRunAlternationBuilder::new(wide_class_pattern(super::MAX_CLASS_RANGES + 1))
+                .unicode(true)
+                .build(),
+            Err(CaptureRunAlternationBuildError::Unsupported(_))
+        ));
+        assert!(matches!(
+            CaptureRunAlternationBuilder::new(r"([a&&b]{3})|([a&&b]{2})")
+                .unicode(false)
+                .build(),
+            Err(CaptureRunAlternationBuildError::Unsupported(_))
+        ));
+
+        let defaults = CaptureRunAlternationBuildLimits::default();
+        assert!(matches!(
+            CaptureRunAlternationBuilder::new(r"([a-z]{4})|([a-z]{3})")
+                .unicode(false)
+                .limits(CaptureRunAlternationBuildLimits {
+                    max_exact_length: 3,
+                    ..defaults
+                })
+                .build(),
+            Err(CaptureRunAlternationBuildError::Resource {
+                resource: "exact repetition length",
+                ..
+            })
+        ));
+        assert!(matches!(
+            CaptureRunAlternationBuilder::new(r"([A-Za-z]{4})|([A-Za-z]{3})")
+                .unicode(false)
+                .limits(CaptureRunAlternationBuildLimits {
+                    max_class_ranges: 1,
+                    ..defaults
+                })
+                .build(),
+            Err(CaptureRunAlternationBuildError::Resource {
+                resource: "class ranges",
+                ..
+            })
+        ));
     }
 
     #[test]
