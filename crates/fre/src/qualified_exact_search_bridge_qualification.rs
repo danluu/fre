@@ -7,7 +7,9 @@ use fre_kernel_ir::{
 
 use super::*;
 
-const SCHEMA: &str = "fre-jit-bridge-qualification-v1";
+// V2 is a new public-facade value-only timing boundary. Existing V1
+// reporting-path rows remain historical evidence and must never be relabeled.
+const SCHEMA: &str = "fre-jit-bridge-qualification-v2";
 const PATTERN: &str = "0123456789abcdef";
 const LITERAL: &[u8] = PATTERN.as_bytes();
 const V8_WIDE_CANDIDATE_STARTS: usize = 64;
@@ -420,15 +422,86 @@ fn portable_value(portable: &PortableRegex, operation: Operation, haystack: &[u8
     operation.encode(matched.map(|span| (span.start(), span.end())))
 }
 
-fn bridge_value(bridge: &QualifiedExactSearchFacade, operation: Operation, haystack: &[u8]) -> u64 {
-    let (matched, execution) = bridge
-        .find(black_box(haystack), SearchLimits::unlimited())
-        .expect("bridge search");
+fn bridge_value_only(
+    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    operation: Operation,
+    haystack: &[u8],
+) -> u64 {
+    match operation {
+        Operation::Exists => u64::from(
+            session
+                .is_match_value(black_box(haystack), SearchLimits::unlimited())
+                .expect("value-only bridge existence search"),
+        ),
+        Operation::End | Operation::Span => {
+            let matched = session
+                .find_value(black_box(haystack), SearchLimits::unlimited())
+                .expect("value-only bridge span search");
+            operation.encode(matched.map(|span| (span.start(), span.end())))
+        }
+    }
+}
+
+fn assert_bridge_reporting_contract(
+    session: &QualifiedExactSearchFacadeThreadSession<'_>,
+    operation: Operation,
+    haystack: &[u8],
+    expected: u64,
+) {
+    let (matched, execution) = session
+        .find(haystack, SearchLimits::unlimited())
+        .expect("untimed bridge reporting search");
     assert_eq!(
         execution.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
     );
-    operation.encode(matched.map(|span| (span.start(), span.end())))
+    assert_eq!(
+        execution.accounting,
+        SearchAccounting::ExactLiteral(LiteralAccounting {
+            needle_bytes: QUALIFIED_EXACT_SEARCH_LITERAL_BYTES,
+            searched_bytes: haystack.len(),
+            linear_terms: haystack
+                .len()
+                .checked_add(QUALIFIED_EXACT_SEARCH_LITERAL_BYTES)
+                .expect("bounded bridge reporting accounting"),
+            scratch_bytes: 0,
+        })
+    );
+    assert_eq!(
+        operation.encode(matched.map(|span| (span.start(), span.end()))),
+        expected
+    );
+    assert_eq!(bridge_value_only(session, operation, haystack), expected);
+}
+
+fn measure_bridge_full(
+    workload: QualifiedExactSearchWorkload,
+    operation: Operation,
+    haystack: &[u8],
+    calls: usize,
+) -> Timed {
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
+    let started = Instant::now();
+    let bridge = build_bridge(workload);
+    let session = bridge
+        .begin_current_thread_session()
+        .expect("V8 bridge current-thread session");
+    for iteration in 0..calls {
+        let value = black_box(bridge_value_only(&session, operation, haystack));
+        checksum = checksum.rotate_left(9)
+            ^ value.wrapping_add(
+                u64::try_from(iteration)
+                    .unwrap_or(u64::MAX)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            );
+    }
+    let total_ns = started.elapsed().as_nanos();
+    black_box(checksum);
+    Timed {
+        iterations: calls,
+        total_ns,
+        checksum,
+    }
 }
 
 fn artifact(bridge: &QualifiedExactSearchFacade) -> ([u8; 32], u16) {
@@ -483,6 +556,12 @@ fn run_cell(operation: Operation, size: Size, scenario: Scenario, repetition: u3
     let portable = build_portable();
     let bridge = build_bridge(size.workload());
     let (artifact_sha256, backend) = artifact(&bridge);
+    // Session creation is deliberately outside the hot-search timer. The
+    // full helper creates both facade and self-borrowing session after its
+    // timer starts so that stage continues to represent the full lifecycle.
+    let bridge_session = bridge
+        .begin_current_thread_session()
+        .expect("V8 bridge current-thread session");
     let kir =
         build_exact_literal::<KirSpan>(LITERAL, AnchorFlags::default(), ValidateLimits::default())
             .expect("KIR build");
@@ -497,7 +576,9 @@ fn run_cell(operation: Operation, size: Size, scenario: Scenario, repetition: u3
         .map(|span| (span.start(), span.end()));
     let expected = operation.encode(kir_span);
     assert_eq!(portable_value(&portable, operation, haystack), expected);
-    assert_eq!(bridge_value(&bridge, operation, haystack), expected);
+    // Exercise and prove the reporting boundary once outside every timer.
+    // Timed bridge searches consume only the semantic value projection.
+    assert_bridge_reporting_contract(&bridge_session, operation, haystack, expected);
 
     let calls = size.calls();
     let portable_build = || {
@@ -514,19 +595,18 @@ fn run_cell(operation: Operation, size: Size, scenario: Scenario, repetition: u3
         })
     };
     let portable_search = || measure(calls, || portable_value(&portable, operation, haystack));
-    let bridge_search = || measure(calls, || bridge_value(&bridge, operation, haystack));
+    let bridge_search = || {
+        measure(calls, || {
+            bridge_value_only(black_box(&bridge_session), operation, black_box(haystack))
+        })
+    };
     let portable_full = || {
         measure_full_workload(calls, build_portable, |cold| {
             portable_value(cold, operation, haystack)
         })
     };
-    let bridge_full = || {
-        measure_full_workload(
-            calls,
-            || build_bridge(size.workload()),
-            |cold| bridge_value(cold, operation, haystack),
-        )
-    };
+    let bridge_full =
+        || measure_bridge_full(size.workload(), operation, black_box(haystack), calls);
 
     let (pb, jb, ps, js, pf, jf, order) = if repetition.is_multiple_of(2) {
         (
@@ -766,6 +846,8 @@ fn driver() {
 
 #[test]
 fn qualification_csv_schema_and_row_cardinality_are_closed() {
+    assert_eq!(SCHEMA, "fre-jit-bridge-qualification-v2");
+    assert_eq!(LITERAL.len(), QUALIFIED_EXACT_SEARCH_LITERAL_BYTES);
     let columns: Vec<_> = CSV_HEADER.split(',').collect();
     assert_eq!(columns.len(), 25);
     let mut deduplicated = columns.clone();
@@ -795,6 +877,122 @@ fn qualification_csv_schema_and_row_cardinality_are_closed() {
         1,
     );
     assert_eq!(row.split(',').count(), columns.len());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one source seal keeps the value helper, untimed reporting proof, hot closure, and full lifecycle auditable together"
+)]
+fn current_thread_session_timing_boundaries_are_source_sealed() {
+    fn position(source: &str, marker: &str) -> usize {
+        source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing bridge lifecycle marker: {marker}"))
+    }
+
+    let source = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/qualified_exact_search_bridge_qualification.rs"
+    ));
+
+    let value_start = position(source, "fn bridge_value_only(");
+    let value_end = value_start
+        + position(
+            &source[value_start..],
+            "\nfn assert_bridge_reporting_contract(",
+        );
+    let value = &source[value_start..value_end];
+    assert!(value.contains(".find_value("));
+    assert!(value.contains(".is_match_value("));
+    assert!(!value.contains("execution"));
+    assert!(!value.contains("begin_current_thread_session"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !value.contains(reporting_call),
+            "value-only timed helper contains reporting call {reporting_call}"
+        );
+    }
+
+    let reporting_start = position(source, "fn assert_bridge_reporting_contract(");
+    let reporting_end =
+        reporting_start + position(&source[reporting_start..], "\nfn measure_bridge_full(");
+    let reporting = &source[reporting_start..reporting_end];
+    assert!(reporting.contains(".find(haystack, SearchLimits::unlimited())"));
+    assert!(reporting.contains("execution.route"));
+    assert!(reporting.contains("execution.accounting"));
+    assert!(reporting.contains("bridge_value_only(session, operation, haystack)"));
+    assert!(!reporting.contains("Instant::now"));
+
+    let full_start = position(source, "fn measure_bridge_full(");
+    let full_end = full_start + position(&source[full_start..], "\nfn artifact(");
+    let full = &source[full_start..full_end];
+    let full_timer = position(full, "let started = Instant::now();");
+    let full_build = position(full, "let bridge = build_bridge(workload);");
+    let full_session = position(full, ".begin_current_thread_session()");
+    let full_loop = position(full, "for iteration in 0..calls");
+    assert!(full_timer < full_build);
+    assert!(full_build < full_session);
+    assert!(full_session < full_loop);
+    assert_eq!(full.matches("begin_current_thread_session").count(), 1);
+    assert!(!full.contains("assert_bridge_reporting_contract"));
+    let full_loop_body = &full[full_loop..];
+    assert!(full_loop_body.contains("bridge_value_only(&session, operation, haystack)"));
+    assert!(!full_loop_body.contains("begin_current_thread_session"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !full_loop_body.contains(reporting_call),
+            "full-workload loop contains reporting call {reporting_call}"
+        );
+    }
+
+    let cell_start = position(source, "fn run_cell(");
+    let cell_end = cell_start
+        + position(
+            &source[cell_start..],
+            "\n#[allow(clippy::too_many_arguments",
+        );
+    let cell = &source[cell_start..cell_end];
+    let session = position(cell, "let bridge_session = bridge");
+    let reporting = position(cell, "assert_bridge_reporting_contract(");
+    let first_timed_closure = position(cell, "let portable_build = ||");
+    let hot_start = position(cell, "let bridge_search = ||");
+    let hot_end = position(cell, "let portable_full = ||");
+    assert!(session < reporting);
+    assert!(session < hot_start);
+    assert!(reporting < first_timed_closure);
+    assert_eq!(cell.matches("begin_current_thread_session").count(), 1);
+    assert_eq!(cell.matches("assert_bridge_reporting_contract(").count(), 1);
+    assert!(cell.contains("measure_bridge_full("));
+    let hot = &cell[hot_start..hot_end];
+    assert!(hot.contains("bridge_value_only("));
+    assert!(hot.contains("&bridge_session"));
+    assert!(!hot.contains("begin_current_thread_session"));
+    assert!(!hot.contains("assert_bridge_reporting_contract"));
+    for reporting_call in [
+        ".find(",
+        ".find_at(",
+        ".find_window(",
+        ".find_borrowed(",
+        ".is_match(",
+    ] {
+        assert!(
+            !hot.contains(reporting_call),
+            "hot timed region contains reporting call {reporting_call}"
+        );
+    }
 }
 
 #[test]
