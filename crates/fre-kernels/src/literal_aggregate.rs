@@ -3,7 +3,9 @@
 //! Nonempty needles traverse one pinned `memchr::memmem::Finder::find_iter`.
 //! That iterator's public contract is non-overlapping, worst-case
 //! `O(needle.len() + haystack.len())` time, and worst-case constant space.
-//! This plan does not restart a black-box search on successive suffixes.
+//! The physical iterator is reduced directly to a count; fixed literal width
+//! then reconstructs the complete logical event and span ledger once. This
+//! plan does not restart a black-box search on successive suffixes.
 //!
 //! Empty matching is deliberately a separate Unicode-disabled byte-boundary
 //! formula: a haystack of `N` bytes has `N + 1` empty matches and zero matched
@@ -34,7 +36,7 @@ pub const DISPATCHED_PLAN_ID: &str =
 /// Version of the exact-literal reduction algorithm.
 pub const ALGORITHM_VERSION: u32 = 1;
 /// Version of the exact-literal prospective/actual attempt protocol.
-pub const ACCOUNTING_VERSION: u32 = 1;
+pub const ACCOUNTING_VERSION: u32 = 2;
 /// Stable identity for the match-count reducer.
 pub const COUNT_OPERATION_ID: &str = "exact-literal-aggregate.count.byte-boundary.v1";
 /// Stable identity for the checked matched-byte span-sum reducer.
@@ -326,9 +328,9 @@ impl ReduceUpperBounds {
 pub struct ReduceActualCounters {
     /// Semantic matches represented by the reduction.
     pub match_events: usize,
-    /// Logical match-event observations plus termination. The established
-    /// owner makes these pinned-iterator `next` calls physically; the
-    /// dispatched block owner retains the equivalent logical ledger.
+    /// Logical match-event observations plus termination. Exact-literal
+    /// owners may reduce a physical stream in bulk and retain this equivalent
+    /// logical ledger.
     pub iterator_next_calls: usize,
     /// Direct formula evaluations; one for an empty needle, otherwise zero.
     pub empty_formula_evaluations: usize,
@@ -474,6 +476,7 @@ enum ReceiptInvariantStage {
     MatchEventCount,
     NeedleWidth,
     MatchedBytes,
+    BulkTraversal,
 }
 
 /// Identity, invocation, published prospective, and cumulative actual ledger.
@@ -815,6 +818,9 @@ fn receipt_invariant_stage(detail: &str) -> Option<ReceiptInvariantStage> {
         "actual count and needle width do not equal matched bytes" => {
             Some(ReceiptInvariantStage::MatchedBytes)
         }
+        "bulk exact-literal traversal escaped its prospective envelope" => {
+            Some(ReceiptInvariantStage::BulkTraversal)
+        }
         _ => None,
     }
 }
@@ -1001,6 +1007,17 @@ fn receipt_invariant_closes(
         "actual count and needle width do not equal matched bytes" => prospective
             .and_then(|prospective| u64::try_from(prospective.needle_bytes).ok())
             .is_some_and(|needle| actual.count.checked_mul(needle) != Some(actual.matched_bytes)),
+        "bulk exact-literal traversal escaped its prospective envelope" => {
+            prospective.is_some_and(|prospective| {
+                actual
+                    == ReduceActualCounters {
+                        scratch_bytes: prospective.scratch_bytes,
+                        persistent_bytes: prospective.persistent_bytes,
+                        peak_bytes: prospective.peak_bytes,
+                        ..ReduceActualCounters::default()
+                    }
+            })
+        }
         "count success did not close its identity/invocation/P/A receipt"
         | "span-sum success did not close its identity/invocation/P/A receipt" => {
             prospective.is_some()
@@ -2387,9 +2404,86 @@ impl LiteralAggregatePlan {
         haystack: &[u8],
         receipt: &mut ReduceAttemptReceipt,
     ) -> Result<(), ReduceError> {
-        self.execute_with_observer(haystack, receipt, |_| Ok(()))
+        let Some(upper) = receipt.prospective else {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "execution started before prospective publication",
+            });
+        };
+        if receipt.invocation.haystack_bytes != haystack.len()
+            || !receipt
+                .identity
+                .authenticates_operation(receipt.identity.operation)
+        {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "execution identity or source length differs from admitted invocation",
+            });
+        }
+        commit_actual(receipt, |actual| {
+            actual.operation_allocations = 0;
+            actual.scratch_bytes = upper.scratch_bytes;
+            actual.persistent_bytes = upper.persistent_bytes;
+            actual.peak_bytes = upper.peak_bytes;
+            Ok(())
+        })?;
+
+        if self.needle().is_empty() {
+            commit_actual(receipt, |actual| {
+                actual.match_events = upper.match_events;
+                actual.empty_formula_evaluations = 1;
+                actual.reducer_steps = 1;
+                actual.count = upper.count;
+                actual.matched_bytes = 0;
+                Ok(())
+            })?;
+            return Ok(());
+        }
+
+        // The preflight proves that the complete non-overlapping event count,
+        // its terminal iterator observation and the fixed-width span product
+        // all fit their published dimensions. Keep the physical traversal as
+        // the iterator's optimized count reduction, then reconstruct its
+        // logical event ledger once instead of mutating the receipt twice per
+        // match.
+        let match_events = self.finder.find_iter(haystack).count();
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ReceiptInvariant {
+            detail: "bulk exact-literal traversal escaped its prospective envelope",
+        })?;
+        let iterator_next_calls =
+            match_events
+                .checked_add(1)
+                .ok_or(ReduceError::ReceiptInvariant {
+                    detail: "bulk exact-literal traversal escaped its prospective envelope",
+                })?;
+        let needle =
+            u64::try_from(self.needle().len()).map_err(|_| ReduceError::ReceiptInvariant {
+                detail: "bulk exact-literal traversal escaped its prospective envelope",
+            })?;
+        let matched_bytes = count
+            .checked_mul(needle)
+            .ok_or(ReduceError::ReceiptInvariant {
+                detail: "bulk exact-literal traversal escaped its prospective envelope",
+            })?;
+        let derived = ReduceActualCounters {
+            match_events,
+            iterator_next_calls,
+            reducer_steps: iterator_next_calls,
+            count,
+            matched_bytes,
+            ..receipt.actual
+        };
+        if !upper.contains(&derived) {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "bulk exact-literal traversal escaped its prospective envelope",
+            });
+        }
+        commit_actual(receipt, |actual| {
+            *actual = derived;
+            Ok(())
+        })?;
+        Ok(())
     }
 
+    #[cfg(test)]
     fn execute_with_observer(
         &self,
         haystack: &[u8],
@@ -3186,6 +3280,33 @@ mod tests {
             seal: super::AttemptFailureSeal::Invalid,
         };
         assert!(!receipt_invariant.closes());
+        let mut bulk_receipt = initial_receipt(
+            &reducer,
+            Operation::Count,
+            haystack.len(),
+            invocation.limits,
+        );
+        let bulk_upper = reducer.preflight(&mut bulk_receipt).unwrap();
+        commit_actual(&mut bulk_receipt, |actual| {
+            actual.scratch_bytes = bulk_upper.scratch_bytes;
+            actual.persistent_bytes = bulk_upper.persistent_bytes;
+            actual.peak_bytes = bulk_upper.peak_bytes;
+            Ok(())
+        })
+        .unwrap();
+        let sealed_bulk_invariant = attempt_error(
+            ReduceError::ReceiptInvariant {
+                detail: "bulk exact-literal traversal escaped its prospective envelope",
+            },
+            bulk_receipt,
+            identity,
+            invocation,
+            AttemptFailurePhase::Execution,
+        );
+        assert!(sealed_bulk_invariant.closes());
+        let mut forged_bulk_partial = sealed_bulk_invariant;
+        forged_bulk_partial.receipt.actual.match_events = 1;
+        assert!(!forged_bulk_partial.closes());
         let postpublication_overflow = ReduceAttemptError {
             source: ReduceError::ArithmeticOverflow {
                 computation: "injected",
@@ -3768,6 +3889,32 @@ mod tests {
             assert_eq!(error.receipt.actual_allocations, 0);
             assert!(error.receipt.authenticates(identity, invocation));
             assert!(error.receipt.retains_bounded_actual());
+        }
+    }
+
+    #[test]
+    fn bulk_execution_reconstructs_the_incremental_logical_ledger() {
+        for (needle, haystack) in [
+            (&b""[..], &b"abababa"[..]),
+            (&b"ab"[..], &b"abababa"[..]),
+            (&b"aba"[..], &b"abababa"[..]),
+            (&[0xFF, 0x00][..], &[0xFF, 0x00, 0xFF, 0x00, 0xFF][..]),
+        ] {
+            let reducer = plan(needle);
+            for operation in [Operation::Count, Operation::SpanSum] {
+                let limits = ReduceLimits::unlimited();
+                let mut bulk = initial_receipt(&reducer, operation, haystack.len(), limits);
+                let mut incremental = bulk;
+                assert_eq!(
+                    reducer.preflight(&mut bulk).unwrap(),
+                    reducer.preflight(&mut incremental).unwrap()
+                );
+                reducer.execute(haystack, &mut bulk).unwrap();
+                reducer
+                    .execute_with_observer(haystack, &mut incremental, |_| Ok(()))
+                    .unwrap();
+                assert_eq!(bulk, incremental);
+            }
         }
     }
 
