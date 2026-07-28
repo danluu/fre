@@ -1132,11 +1132,13 @@ pub fn build_linux_selected_end_qualification_bundle_v2(
         emit_direct_glue_bytes(expectation.as_bytes(), &binding.compile_identity, limits)?;
     let inspection =
         inspect_linux_selected_end_direct_glue_v2(&glue_bytes, expectation.as_bytes(), limits)?;
+    let object_identity = inspection.object_identity();
+    let code_identity = inspection.code_identity();
     let glue = LinuxSelectedEndDirectGlueObjectV2 {
         bytes: glue_bytes,
         compile_identity: binding.compile_identity,
-        object_identity: inspection.object_identity(),
-        code_identity: inspection.code_identity(),
+        object_identity,
+        code_identity,
     };
     let receipt = build_qualification_receipt(binding, &source, &header, &glue)?;
     let bundle = LinuxSelectedEndQualificationBundleV2 {

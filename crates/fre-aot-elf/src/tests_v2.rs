@@ -304,9 +304,22 @@ fn selected_end_v2_symbols_sections_visibility_and_c_abi_are_distinct() {
         .write_c_declarations(&mut declarations)
         .expect("String formatting");
     assert!(declarations.contains(&format!(
-        "extern size_t {}(const uint8_t *haystack, size_t haystack_len, size_t window_start, size_t window_end);",
+        "extern size_t {}(const uint8_t *haystack, size_t haystack_len, size_t window_start, size_t window_end) FRE_AOT_SELECTED_END_HIDDEN_V2;",
         symbols.entry()
     )));
+    assert!(declarations.contains(&format!(
+        "extern const uint8_t {}[] FRE_AOT_SELECTED_END_HIDDEN_V2;",
+        symbols.payload()
+    )));
+    assert!(declarations.contains(&format!(
+        "extern const struct fre_aot_search_selected_end_metadata_v2 {} FRE_AOT_SELECTED_END_HIDDEN_V2;",
+        symbols.metadata()
+    )));
+    assert!(declarations.contains(
+        "#define FRE_AOT_SELECTED_END_HIDDEN_V2 __attribute__((visibility(\"hidden\")))"
+    ));
+    assert!(declarations.contains("#undef FRE_AOT_SELECTED_END_HIDDEN_V2"));
+    assert!(!declarations.contains("(*"));
     assert!(!declarations.contains("fre_aot_search_result_v1"));
     assert!(!C_SELECTED_END_HEADER_V2.contains("fre_aot_search_result_v1"));
     assert!(!C_SELECTED_END_HEADER_V2.contains("typedef"));

@@ -117,23 +117,36 @@ impl ExportedSymbolsV2 {
         &self.metadata
     }
 
+    /// Write exact identity-suffixed declarations with hidden visibility.
+    ///
+    /// The entry remains a direct four-argument declaration; this emits no
+    /// callable alias or function-pointer typedef.
     pub fn write_c_declarations(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        writeln!(
+            output,
+            "#if defined(__GNUC__) || defined(__clang__)\n#define FRE_AOT_SELECTED_END_HIDDEN_V2 __attribute__((visibility(\"hidden\")))\n#else\n#define FRE_AOT_SELECTED_END_HIDDEN_V2\n#endif"
+        )?;
         writeln!(output, "#if defined(__cplusplus)")?;
         writeln!(output, "extern \"C\" {{")?;
         writeln!(output, "#endif")?;
         writeln!(
             output,
-            "extern size_t {}(const uint8_t *haystack, size_t haystack_len, size_t window_start, size_t window_end);",
+            "extern size_t {}(const uint8_t *haystack, size_t haystack_len, size_t window_start, size_t window_end) FRE_AOT_SELECTED_END_HIDDEN_V2;",
             self.entry
         )?;
-        writeln!(output, "extern const uint8_t {}[];", self.payload)?;
         writeln!(
             output,
-            "extern const struct fre_aot_search_selected_end_metadata_v2 {};",
+            "extern const uint8_t {}[] FRE_AOT_SELECTED_END_HIDDEN_V2;",
+            self.payload
+        )?;
+        writeln!(
+            output,
+            "extern const struct fre_aot_search_selected_end_metadata_v2 {} FRE_AOT_SELECTED_END_HIDDEN_V2;",
             self.metadata
         )?;
         writeln!(output, "#if defined(__cplusplus)")?;
         writeln!(output, "}}")?;
-        writeln!(output, "#endif")
+        writeln!(output, "#endif")?;
+        writeln!(output, "#undef FRE_AOT_SELECTED_END_HIDDEN_V2")
     }
 }
