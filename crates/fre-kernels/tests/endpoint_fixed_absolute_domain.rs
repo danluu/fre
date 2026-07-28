@@ -880,14 +880,54 @@ fn endpoint_compact_values_match_full_results_and_refuse_without_receipts() {
         .prospective();
     let exact = exact_reduce_limits(upper);
     assert_eq!(end_masks.span_sum_value_success(b"xabc", exact), Some(3));
-    let one_below = FixedAbsoluteDomainReduceLimits {
+    let one_below = [
+        FixedAbsoluteDomainReduceLimits {
+            max_byte_probes: exact.max_byte_probes.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_branch_checks: exact.max_branch_checks.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_match_events: exact.max_match_events.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_count: exact.max_count.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_span_sum: exact.max_span_sum.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_reducer_steps: exact.max_reducer_steps.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_total_work: exact.max_total_work.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_persistent_bytes: exact.max_persistent_bytes.checked_sub(1).unwrap(),
+            ..exact
+        },
+        FixedAbsoluteDomainReduceLimits {
+            max_peak_bytes: exact.max_peak_bytes.checked_sub(1).unwrap(),
+            ..exact
+        },
+    ];
+    for limits in one_below {
+        assert_eq!(end_masks.span_sum_value_success(b"xabc", limits), None);
+    }
+    let one_below_work = FixedAbsoluteDomainReduceLimits {
         max_total_work: exact.max_total_work.checked_sub(1).unwrap(),
         ..exact
     };
-    assert_eq!(end_masks.span_sum_value_success(b"xabc", one_below), None);
     assert_eq!(
         end_masks
-            .span_sum(b"xabc", one_below)
+            .span_sum(b"xabc", one_below_work)
             .unwrap_err()
             .receipt
             .prospective,

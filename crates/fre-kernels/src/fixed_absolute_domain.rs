@@ -513,6 +513,12 @@ struct CompactMatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValueAdmission {
+    prospective: ReduceProspective,
+    candidate_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReduceResource {
     ByteProbes,
     BranchChecks,
@@ -2038,18 +2044,11 @@ impl FixedAbsoluteDomainPlan {
     #[must_use]
     #[inline]
     pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
-        let admission = self
-            .preflight(
-                haystack.len(),
-                Window::full(haystack),
-                Operation::Count,
-                limits,
-            )
-            .ok()?;
+        let admission = self.value_preflight(haystack, Operation::Count, limits)?;
         if admission.prospective.disposition != Disposition::Complete {
             return None;
         }
-        let compact = self.compact_match(haystack, &admission)?;
+        let compact = self.compact_value_match(haystack, admission.candidate_active)?;
         let count = u64::from(compact.matched);
         (compact.variable_span.is_none()
             && count <= admission.prospective.count
@@ -2119,18 +2118,11 @@ impl FixedAbsoluteDomainPlan {
     #[must_use]
     #[inline]
     pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
-        let admission = self
-            .preflight(
-                haystack.len(),
-                Window::full(haystack),
-                Operation::SpanSum,
-                limits,
-            )
-            .ok()?;
+        let admission = self.value_preflight(haystack, Operation::SpanSum, limits)?;
         if admission.prospective.disposition != Disposition::Complete {
             return None;
         }
-        let compact = self.compact_match(haystack, &admission)?;
+        let compact = self.compact_value_match(haystack, admission.candidate_active)?;
         let span_sum = if compact.matched {
             match compact.variable_span {
                 Some(span) => u64::try_from(span).ok()?,
@@ -2383,21 +2375,68 @@ impl FixedAbsoluteDomainPlan {
     }
 
     #[inline]
-    fn compact_match(&self, haystack: &[u8], admission: &Admission<'_>) -> Option<CompactMatch> {
-        if !core::ptr::eq(self, admission.owner)
-            || admission.identity != self.operation_identity(admission.operation)
-            || admission.haystack_len != haystack.len()
-            || admission.prospective.disposition != Disposition::Complete
+    fn value_preflight(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Option<ValueAdmission> {
+        self.check_operation(operation).ok()?;
+        let candidate = self
+            .candidate(haystack.len(), Window::full(haystack))
+            .ok()?;
+        let span_sum = if operation == Operation::SpanSum {
+            u64::try_from(candidate.span_sum).ok()?
+        } else {
+            0
+        };
+        let reducer_steps = 1_usize;
+        let total_work = candidate
+            .byte_probes
+            .checked_add(candidate.branch_checks)?
+            .checked_add(reducer_steps)?;
+        let persistent_bytes = self.build.actual.persistent_bytes;
+        let prospective = ReduceProspective {
+            disposition: candidate.disposition,
+            byte_probes: candidate.byte_probes,
+            branch_checks: candidate.branch_checks,
+            match_events: candidate.match_events,
+            count: candidate.count,
+            span_sum,
+            reducer_steps,
+            total_work,
+            allocations: 0,
+            scratch_bytes: 0,
+            persistent_bytes,
+            peak_bytes: persistent_bytes,
+        };
+        if prospective.byte_probes > limits.max_byte_probes
+            || prospective.branch_checks > limits.max_branch_checks
+            || prospective.match_events > limits.max_match_events
+            || prospective.count > limits.max_count
+            || prospective.span_sum > limits.max_span_sum
+            || prospective.reducer_steps > limits.max_reducer_steps
+            || prospective.total_work > limits.max_total_work
+            || prospective.scratch_bytes > limits.max_scratch_bytes
+            || prospective.persistent_bytes > limits.max_persistent_bytes
+            || prospective.peak_bytes > limits.max_peak_bytes
         {
             return None;
         }
-        if !admission.candidate_active {
+        Some(ValueAdmission {
+            prospective,
+            candidate_active: candidate.active,
+        })
+    }
+
+    #[inline]
+    fn compact_value_match(&self, haystack: &[u8], candidate_active: bool) -> Option<CompactMatch> {
+        if !candidate_active {
             return Some(CompactMatch {
                 matched: false,
                 variable_span: None,
             });
         }
-        let window = admission.window;
         let result = match &self.descriptor {
             Descriptor::MaskSequence(masks) => {
                 if matches!(self.identity, DescriptorIdentity::StartMaskSequence { .. }) {
@@ -2428,7 +2467,7 @@ impl FixedAbsoluteDomainPlan {
                     });
                 }
                 let mut start = suffix_start;
-                while start > window.start() {
+                while start > 0 {
                     let index = start.checked_sub(1)?;
                     if !class.contains(*haystack.get(index)?) {
                         break;
