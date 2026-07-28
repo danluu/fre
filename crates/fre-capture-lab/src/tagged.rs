@@ -12,6 +12,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 
 use crate::compile::{Program, State};
 use crate::model::Span;
+use crate::participation_cache::ParticipationCache;
 
 /// Semantic algorithm version of reusable tag storage.
 pub const TAG_WORKSPACE_ALGORITHM_VERSION: u32 = 1;
@@ -603,7 +604,7 @@ struct HistoryParticipationSummary {
 
 #[derive(Debug)]
 enum ParticipationStore {
-    Inline,
+    Inline { cache: ParticipationCache },
     Spill { words: usize, cells: ExactVec<u64> },
 }
 
@@ -653,6 +654,21 @@ pub struct TagWorkspace {
 }
 
 impl TagWorkspace {
+    pub(crate) fn install_participation_cache(&mut self, cache: ParticipationCache) -> bool {
+        let ParticipationStore::Inline { cache: retained } = &mut self.participation else {
+            return false;
+        };
+        *retained = cache;
+        true
+    }
+
+    pub(crate) fn participation_cache_mut(&mut self) -> Option<&mut ParticipationCache> {
+        let ParticipationStore::Inline { cache } = &mut self.participation else {
+            return None;
+        };
+        Some(cache)
+    }
+
     /// Derive the complete construction envelope without allocating.
     #[allow(
         clippy::too_many_lines,
@@ -883,7 +899,9 @@ impl TagWorkspace {
             exact_push(&mut slot_presence, 0, TagWorkspaceResource::PersistentBytes)?;
         }
         let participation = match prospective.participation_storage {
-            ParticipationStorage::Inline => ParticipationStore::Inline,
+            ParticipationStorage::Inline => ParticipationStore::Inline {
+                cache: ParticipationCache::disabled(),
+            },
             ParticipationStorage::Spill => {
                 let cells = prospective
                     .mask_states
@@ -940,7 +958,7 @@ impl TagWorkspace {
             .and_then(|value| value.checked_add(self.histories.len()))
             .and_then(|value| {
                 value.checked_add(match &self.participation {
-                    ParticipationStore::Inline => 0,
+                    ParticipationStore::Inline { .. } => 0,
                     ParticipationStore::Spill { cells, .. } => cells.len(),
                 })
             })
@@ -1380,7 +1398,7 @@ impl TagWorkspace {
             workspace: self.identity,
             epoch: self.epoch,
             representation: match self.participation {
-                ParticipationStore::Inline => ParticipationStateRepr::Inline {
+                ParticipationStore::Inline { .. } => ParticipationStateRepr::Inline {
                     open: 0,
                     participated: 0,
                 },
@@ -1450,9 +1468,10 @@ impl TagWorkspace {
         let validated = self.validate_participation_transition(state, action)?;
 
         let representation = match (&mut self.participation, validated) {
-            (ParticipationStore::Inline, ValidatedParticipation::Inline { open, participated }) => {
-                ParticipationStateRepr::Inline { open, participated }
-            }
+            (
+                ParticipationStore::Inline { .. },
+                ValidatedParticipation::Inline { open, participated },
+            ) => ParticipationStateRepr::Inline { open, participated },
             (
                 ParticipationStore::Spill { words, cells },
                 ValidatedParticipation::Spill(transition),
@@ -1473,7 +1492,7 @@ impl TagWorkspace {
                 self.accounting.mask_word_copies = word_copies;
                 ParticipationStateRepr::Spill(id)
             }
-            (ParticipationStore::Inline, ValidatedParticipation::Spill(_))
+            (ParticipationStore::Inline { .. }, ValidatedParticipation::Spill(_))
             | (ParticipationStore::Spill { .. }, ValidatedParticipation::Inline { .. }) => {
                 return Err(TagWorkspaceError::InvalidState);
             }
@@ -1498,7 +1517,10 @@ impl TagWorkspace {
             return Err(TagWorkspaceError::InvalidState);
         }
         let representation = match (&self.participation, state.representation) {
-            (ParticipationStore::Inline, ParticipationStateRepr::Inline { open, participated }) => {
+            (
+                ParticipationStore::Inline { .. },
+                ParticipationStateRepr::Inline { open, participated },
+            ) => {
                 validate_inline_masks(self.prospective.groups, open, participated)?;
                 ParticipationMaskRepr::Inline { open, participated }
             }
@@ -1529,7 +1551,7 @@ impl TagWorkspace {
                     history_summary: None,
                 }
             }
-            (ParticipationStore::Inline, ParticipationStateRepr::Spill(_))
+            (ParticipationStore::Inline { .. }, ParticipationStateRepr::Spill(_))
             | (ParticipationStore::Spill { .. }, ParticipationStateRepr::Inline { .. }) => {
                 return Err(TagWorkspaceError::InvalidState);
             }
@@ -1572,7 +1594,7 @@ impl TagWorkspace {
         self.validate_action(action)?;
         match (&self.participation, state.representation) {
             (
-                ParticipationStore::Inline,
+                ParticipationStore::Inline { .. },
                 ParticipationStateRepr::Inline {
                     mut open,
                     mut participated,
@@ -1592,7 +1614,7 @@ impl TagWorkspace {
                 )
                 .map(ValidatedParticipation::Spill)
             }
-            (ParticipationStore::Inline, ParticipationStateRepr::Spill(_))
+            (ParticipationStore::Inline { .. }, ParticipationStateRepr::Spill(_))
             | (ParticipationStore::Spill { .. }, ParticipationStateRepr::Inline { .. }) => {
                 Err(TagWorkspaceError::InvalidState)
             }
@@ -1609,12 +1631,12 @@ impl TagWorkspace {
         }
         self.validate_action(action)?;
         match (&self.participation, state.representation) {
-            (ParticipationStore::Inline, ParticipationStateRepr::Inline { .. }) => Ok(0),
+            (ParticipationStore::Inline { .. }, ParticipationStateRepr::Inline { .. }) => Ok(0),
             (ParticipationStore::Spill { words, .. }, ParticipationStateRepr::Spill(parent)) => {
                 spill_parent_base(parent, self.accounting.mask_states, *words)?;
                 Ok(usize::from(parent != NO_ID))
             }
-            (ParticipationStore::Inline, ParticipationStateRepr::Spill(_))
+            (ParticipationStore::Inline { .. }, ParticipationStateRepr::Spill(_))
             | (ParticipationStore::Spill { .. }, ParticipationStateRepr::Inline { .. }) => {
                 Err(TagWorkspaceError::InvalidState)
             }
@@ -3388,7 +3410,7 @@ mod tests {
             .checked_add(workspace.slot_presence.len())
             .and_then(|value| value.checked_add(workspace.histories.len()))
             .and_then(|value| match &workspace.participation {
-                ParticipationStore::Inline => Some(value),
+                ParticipationStore::Inline { .. } => Some(value),
                 ParticipationStore::Spill { cells, .. } => value.checked_add(cells.len()),
             })
             .expect("retained cells");

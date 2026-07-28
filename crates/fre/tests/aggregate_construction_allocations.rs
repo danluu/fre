@@ -67,8 +67,9 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
             // The composed continuation owner includes complete fixed inline
             // state-byte and ordered bounded-span slots. The latter moves the
             // owner to the next allocator size class, adding 56 bytes without
-            // adding an allocation.
-            bytes_allocated: 4_236,
+            // adding an allocation. The bounded participation cache adds 272
+            // bytes of authenticated fixed-envelope storage for this shape.
+            bytes_allocated: 4_508,
             bytes_deallocated: 1_894,
             bytes_reallocated: 149,
         }
@@ -135,7 +136,7 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
         .construction_attempt_receipt()
         .expect("fallback construction lost its receipt");
     assert_controlled_allocation_ledger(fallback_receipt);
-    assert_eq!(fallback_receipt.actual.allocations, 20);
+    assert_eq!(fallback_receipt.actual.allocations, 21);
     assert!(fallback_receipt.actual.abandoned_work > 0);
     let fallback_entry = fallback_receipt
         .ledger
@@ -159,13 +160,14 @@ fn whole_construction_has_an_exact_controlled_allocation_census() {
     assert_eq!(
         census,
         Stats {
-            allocations: 47,
-            deallocations: 39,
+            allocations: 48,
+            deallocations: 40,
             reallocations: 5,
             // The same composed continuation owner reaches publication after
-            // the optional fixed-route refusal.
-            bytes_allocated: 7_434,
-            bytes_deallocated: 4_297,
+            // the optional fixed-route refusal. Its fused-capture alternative
+            // now includes the bounded participation-cache envelope.
+            bytes_allocated: 7_802,
+            bytes_deallocated: 4_393,
             bytes_reallocated: 912,
         }
     );

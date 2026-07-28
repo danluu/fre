@@ -216,7 +216,20 @@ fn assert_capture_stream_census() {
         .expect("peak");
     let mut allocations = limits;
     allocations.max_allocations = prospective.allocations.checked_sub(1).expect("allocations");
-    for one_below in [source, state_limit, work, bytes, peak, allocations] {
+    let mut cache_cells = limits;
+    cache_cells.max_mask_states = prospective
+        .participation_cache_cells()
+        .checked_sub(1)
+        .expect("participation cache cells");
+    for one_below in [
+        source,
+        state_limit,
+        work,
+        bytes,
+        peak,
+        allocations,
+        cache_cells,
+    ] {
         let (result, stats) = census(|| {
             CaptureStream::new(
                 Arc::clone(&program),

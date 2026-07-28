@@ -39,7 +39,9 @@ fn exact_limits(program: &Program, haystack_len: usize) -> CaptureStreamLimits {
         max_materialization_reads: operation.materialization_reads,
         max_materialization_writes: operation.materialization_writes,
         max_materialization_preview_writes: operation.materialization_preview_writes,
-        max_mask_states: operation.mask_states,
+        max_mask_states: operation
+            .mask_states
+            .max(prospective.participation_cache_cells()),
         max_mask_word_copies: operation.mask_word_copies,
         max_mask_word_reads: operation.mask_word_reads,
         max_reset_cells: operation.reset_cells,
@@ -344,6 +346,25 @@ fn construction_and_operation_limits_refuse_at_exact_one_below_before_source_acc
     ]);
     let program = compile(&ast);
     let prospective = CaptureStream::prospective(&program, 2).expect("prospective");
+    let mut cache_cells = exact_limits(&program, 2);
+    cache_cells.max_mask_states = prospective
+        .participation_cache_cells()
+        .checked_sub(1)
+        .expect("positive cache cells");
+    assert_eq!(
+        CaptureStream::new(
+            Arc::clone(&program),
+            2,
+            CaptureStreamDomains::Whole,
+            cache_cells,
+        )
+        .expect_err("one below cache cells"),
+        CaptureStreamError::Resource {
+            resource: CaptureStreamResource::ParticipationCacheCells,
+            required: prospective.participation_cache_cells(),
+            limit: prospective.participation_cache_cells() - 1,
+        }
+    );
     let mut limits = exact_limits(&program, 2);
     limits.max_persistent_bytes = prospective
         .persistent_bytes
@@ -449,7 +470,9 @@ fn exact_span_workspace_preserves_priority_and_refuses_one_below() {
         max_materialization_reads: accounting.materialization_reads,
         max_materialization_writes: accounting.materialization_writes,
         max_materialization_preview_writes: accounting.materialization_preview_writes,
-        max_mask_states: accounting.mask_states,
+        max_mask_states: accounting
+            .mask_states
+            .max(prospective.participation_cache_cells()),
         max_mask_word_copies: accounting.mask_word_copies,
         max_mask_word_reads: accounting.mask_word_reads,
         max_reset_cells: accounting.reset_cells,

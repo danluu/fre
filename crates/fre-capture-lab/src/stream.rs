@@ -16,6 +16,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 use crate::compile::{Program, State};
 use crate::line::SemanticBoundary;
 use crate::model::{CaptureCountOutcome, Span, Window};
+use crate::participation_cache::{ParticipationCache, ParticipationCacheShape};
 use crate::tagged::{
     HistoryId, ParticipationState, ParticipationStorage, TagAction, TagRunAccounting, TagRunLimits,
     TagWorkspace, TagWorkspaceError, TagWorkspaceLimits, TagWorkspaceProspective,
@@ -26,7 +27,7 @@ use crate::tagged::{
 pub const CAPTURE_STREAM_ALGORITHM_VERSION: u32 = 1;
 
 /// Resource-accounting version of the fused capture stream.
-pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 3;
+pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 4;
 
 const INLINE_GROUP_BITS: usize = 64;
 
@@ -66,6 +67,8 @@ pub enum CaptureStreamResource {
     CombinedPeakBytes,
     /// Exact-layout construction allocations.
     Allocations,
+    /// Direct lazy participation-cache transition cells.
+    ParticipationCacheCells,
     /// Logical line domains.
     LineDomains,
     /// Independently selected searches.
@@ -268,7 +271,8 @@ pub struct CaptureStreamLimits {
     pub max_materialization_writes: usize,
     /// Maximum exact-materialization preview scratch writes.
     pub max_materialization_preview_writes: usize,
-    /// Maximum spill participation states.
+    /// Maximum spill participation states or direct participation-cache
+    /// transition cells, according to the construction-selected projection.
     pub max_mask_states: usize,
     /// Maximum spill participation word copies.
     pub max_mask_word_copies: usize,
@@ -505,6 +509,11 @@ impl CaptureStreamOperationProspective {
             CaptureStreamResource::Allocations,
             self.construction.allocations,
             limits.max_allocations,
+        )?;
+        check(
+            CaptureStreamResource::ParticipationCacheCells,
+            self.construction.participation_cache_shape()?.cells,
+            limits.max_mask_states,
         )
     }
 
@@ -620,6 +629,36 @@ impl CaptureStreamOperationProspective {
 }
 
 impl CaptureStreamProspective {
+    fn participation_cache_shape(self) -> Result<ParticipationCacheShape, CaptureStreamError> {
+        if self.projection != CaptureStreamProjection::ParticipationMask {
+            return Ok(ParticipationCacheShape::default());
+        }
+        let full = ParticipationCacheShape::for_dimensions(self.states, self.source_bytes)?;
+        let outer_allocations =
+            usize::from(self.states > 0)
+                .checked_mul(4)
+                .ok_or(CaptureStreamError::Overflow(
+                    CaptureStreamResource::Allocations,
+                ))?;
+        let base_allocations = outer_allocations.checked_add(self.tags.allocations).ok_or(
+            CaptureStreamError::Overflow(CaptureStreamResource::Allocations),
+        )?;
+        match self.allocations.checked_sub(base_allocations) {
+            Some(0) => Ok(ParticipationCacheShape::default()),
+            Some(extra) if extra == full.allocations => Ok(full),
+            _ => Err(CaptureStreamError::InvalidProgram),
+        }
+    }
+
+    /// Direct byte/end-boundary transition cells retained by the bounded lazy
+    /// participation cache, or zero when this construction uses the
+    /// established inline executor alone.
+    #[must_use]
+    pub fn participation_cache_cells(self) -> usize {
+        self.participation_cache_shape()
+            .map_or(0, |shape| shape.cells)
+    }
+
     /// Check only the fixed prepared-workspace envelope before any source
     /// byte is observed. Exact-span callers use this separately from the
     /// selected-span replay counters, whose bounds depend on the certified
@@ -657,6 +696,11 @@ impl CaptureStreamProspective {
             CaptureStreamResource::Allocations,
             self.allocations,
             limits.max_allocations,
+        )?;
+        check(
+            CaptureStreamResource::ParticipationCacheCells,
+            self.participation_cache_shape()?.cells,
+            limits.max_mask_states,
         )
     }
 
@@ -689,17 +733,23 @@ impl CaptureStreamProspective {
                     .checked_mul(size_of::<usize>())
                     .and_then(|seen| bytes.checked_add(seen))
             });
+        let Ok(participation_cache) = self.participation_cache_shape() else {
+            return false;
+        };
         let outer_allocations = usize::from(self.states > 0).checked_mul(4);
-        let expected_allocations =
-            outer_allocations.and_then(|outer| outer.checked_add(self.tags.allocations));
+        let expected_allocations = outer_allocations
+            .and_then(|outer| outer.checked_add(self.tags.allocations))
+            .and_then(|value| value.checked_add(participation_cache.allocations));
         let expected_build_work = self
             .states
             .checked_mul(2)
             .and_then(|work| work.checked_add(outer_allocations?))
             .and_then(|work| work.checked_add(1))
-            .and_then(|work| work.checked_add(self.tags.build_work));
-        let expected_allocator_bytes =
-            expected_frontier_bytes.and_then(|bytes| bytes.checked_add(self.tags.allocator_bytes));
+            .and_then(|work| work.checked_add(self.tags.build_work))
+            .and_then(|work| work.checked_add(participation_cache.build_work));
+        let expected_allocator_bytes = expected_frontier_bytes
+            .and_then(|bytes| bytes.checked_add(self.tags.allocator_bytes))
+            .and_then(|bytes| bytes.checked_add(participation_cache.bytes));
         let expected_persistent_bytes = expected_allocator_bytes
             .and_then(|bytes| bytes.checked_add(size_of::<CaptureStream>()))
             .and_then(|bytes| bytes.checked_add(self.program_bytes));
@@ -718,6 +768,9 @@ impl CaptureStreamProspective {
                 } else {
                     ParticipationStorage::Spill
                 }
+            && participation_cache.closes(self.states)
+            && (self.projection == CaptureStreamProjection::ParticipationMask
+                || participation_cache == ParticipationCacheShape::default())
             && expected_frontier_cells == Some(self.frontier_cells)
             && expected_frontier_bytes == Some(self.frontier_bytes)
             && expected_allocations == Some(self.allocations)
@@ -1053,6 +1106,10 @@ struct CaptureStreamRun {
 
 impl CaptureStream {
     /// Derive a complete source-independent envelope without allocating.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free constructor closes the complete cache, frontier, tag, and allocation envelope in one auditable derivation"
+    )]
     pub fn prospective(
         program: &Program,
         source_bytes: usize,
@@ -1100,29 +1157,38 @@ impl CaptureStream {
             .ok_or(CaptureStreamError::Overflow(
                 CaptureStreamResource::PersistentBytes,
             ))?;
+        let participation_cache = if projection == CaptureStreamProjection::ParticipationMask {
+            ParticipationCacheShape::for_program(program, source_bytes)?
+        } else {
+            ParticipationCacheShape::default()
+        };
         let outer_allocations =
             usize::from(states > 0)
                 .checked_mul(4)
                 .ok_or(CaptureStreamError::Overflow(
                     CaptureStreamResource::Allocations,
                 ))?;
-        let allocations =
-            outer_allocations
-                .checked_add(tags.allocations)
-                .ok_or(CaptureStreamError::Overflow(
-                    CaptureStreamResource::Allocations,
-                ))?;
+        let allocations = outer_allocations
+            .checked_add(tags.allocations)
+            .and_then(|value| value.checked_add(participation_cache.allocations))
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::Allocations,
+            ))?;
         let build_work = states
             .checked_mul(2)
             .and_then(|value| value.checked_add(outer_allocations))
             .and_then(|value| value.checked_add(1))
             .and_then(|value| value.checked_add(tags.build_work))
+            .and_then(|value| value.checked_add(participation_cache.build_work))
             .ok_or(CaptureStreamError::Overflow(
                 CaptureStreamResource::BuildWork,
             ))?;
-        let allocator_bytes = frontier_bytes.checked_add(tags.allocator_bytes).ok_or(
-            CaptureStreamError::Overflow(CaptureStreamResource::PersistentBytes),
-        )?;
+        let allocator_bytes = frontier_bytes
+            .checked_add(tags.allocator_bytes)
+            .and_then(|value| value.checked_add(participation_cache.bytes))
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::PersistentBytes,
+            ))?;
         let program_bytes = program.build_report().program_bytes;
         let persistent_bytes = size_of::<Self>()
             .checked_add(allocator_bytes)
@@ -1321,7 +1387,7 @@ impl CaptureStream {
         let operation = Self::operation_prospective(&program, source_bytes, domains)?;
         let prospective = operation.construction;
         operation.admits(limits)?;
-        let tags = TagWorkspace::new(
+        let mut tags = TagWorkspace::new(
             prospective.groups,
             prospective.tags.history_nodes,
             0,
@@ -1357,6 +1423,12 @@ impl CaptureStream {
         let mut seen = exact_vec(prospective.states)?;
         for _ in 0..prospective.states {
             exact_push(&mut seen, 0)?;
+        }
+        let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
+        if prospective.projection == CaptureStreamProjection::ParticipationMask
+            && !tags.install_participation_cache(participation_cache)
+        {
+            return Err(CaptureStreamError::InvalidProgram);
         }
         Ok(Self {
             program,
@@ -1392,7 +1464,7 @@ impl CaptureStream {
             Self::operation_prospective(&program, source_bytes, CaptureStreamDomains::Whole)?;
         let prospective = operation.construction;
         operation.admits_construction(limits)?;
-        let tags = TagWorkspace::new(
+        let mut tags = TagWorkspace::new(
             prospective.groups,
             prospective.tags.history_nodes,
             0,
@@ -1429,6 +1501,12 @@ impl CaptureStream {
         for _ in 0..prospective.states {
             exact_push(&mut seen, 0)?;
         }
+        let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
+        if prospective.projection == CaptureStreamProjection::ParticipationMask
+            && !tags.install_participation_cache(participation_cache)
+        {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
         Ok(Self {
             program,
             domains: CaptureStreamDomains::Whole,
@@ -1463,6 +1541,31 @@ impl CaptureStream {
     /// replay with [`Self::execute`] so the authoritative terminal retains the
     /// complete P/A evidence.
     pub fn count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureStreamError> {
+        if self.exact_only {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        if haystack.len() != self.prospective.source_bytes {
+            return Err(CaptureStreamError::SourceLength {
+                expected: self.prospective.source_bytes,
+                actual: haystack.len(),
+            });
+        }
+        if self.domains == CaptureStreamDomains::Whole
+            && self.prospective.projection == CaptureStreamProjection::ParticipationMask
+        {
+            let cache = self
+                .tags
+                .participation_cache_mut()
+                .ok_or(CaptureStreamError::InvalidProgram)?;
+            if let Some(result) = cache.count_value(
+                &self.program,
+                haystack,
+                self.prospective.groups,
+                self.operation,
+            ) {
+                return result;
+            }
+        }
         let run = self.execute_run::<false>(haystack)?;
         if run.count <= self.operation.capture_count {
             Ok(run.count)

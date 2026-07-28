@@ -3438,6 +3438,72 @@ fn capture_stream_count_values_alternate_sources_and_recover_from_poisoned_attem
 }
 
 #[test]
+fn participation_cache_matches_upstream_exhaustively_across_priority_and_boundaries() {
+    let patterns = [
+        r"(?:(a())|(a))",
+        r"(?:(a)|(a()))",
+        r"(?:(a)|b)+",
+        r"(a)?b",
+        r"(?:a.*z|(a))",
+        r"^([ab]+)(a)?$",
+        r"((ab)|(a))+",
+    ];
+    let alphabet = [b'a', b'b', b'z', b'\n'];
+    for pattern in patterns {
+        let regex = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("FRE pattern={pattern:?}: {error:?}"));
+        assert_eq!(
+            regex.build_report().plan_identity.plan,
+            fre::CapturePlanKind::FusedCaptureStreamParticipationV1,
+            "pattern={pattern:?}"
+        );
+        let upstream = RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("upstream pattern={pattern:?}: {error:?}"));
+        for length in 0..=5 {
+            let mut session = regex
+                .prepare_capture_stream_session(
+                    length,
+                    CaptureRunLimits::default(),
+                    CaptureStreamDomains::Whole,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("prepare pattern={pattern:?} length={length}: {error:?}")
+                })
+                .unwrap_or_else(|| {
+                    panic!("participation stream refused pattern={pattern:?} length={length}")
+                });
+            let cases = alphabet.len().pow(length as u32);
+            for mut ordinal in 0..cases {
+                let mut haystack = vec![0_u8; length];
+                for byte in &mut haystack {
+                    *byte = alphabet[ordinal % alphabet.len()];
+                    ordinal /= alphabet.len();
+                }
+                let expected = upstream
+                    .captures_iter(&haystack)
+                    .map(|captures| captures.iter().flatten().count())
+                    .sum::<usize>();
+                let first = session.count_value(&haystack).unwrap_or_else(|error| {
+                    panic!("first pattern={pattern:?} haystack={haystack:?}: {error:?}")
+                });
+                let warmed = session.count_value(&haystack).unwrap_or_else(|error| {
+                    panic!("warmed pattern={pattern:?} haystack={haystack:?}: {error:?}")
+                });
+                assert_eq!(
+                    (first, warmed),
+                    (expected, expected),
+                    "pattern={pattern:?} haystack={haystack:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn participation_quotient_preserves_interleaved_resource_terminal_priority() {
     let regex = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)

@@ -25,6 +25,7 @@ mod inline;
 mod limits;
 mod line;
 mod model;
+mod participation_cache;
 mod profile;
 mod runtime;
 mod stream;
