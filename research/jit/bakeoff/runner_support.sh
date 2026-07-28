@@ -9,6 +9,107 @@ fre_bakeoff_sha256() {
     shasum -a 256 "$1" | awk '{print $1}'
 }
 
+fre_bakeoff_abi2_identity_from_inspect() {
+    fre_bakeoff_inspect=$1
+    if [ ! -f "$fre_bakeoff_inspect" ] || [ -L "$fre_bakeoff_inspect" ]; then
+        fre_bakeoff_error "ABI2 witness must be a regular non-symlink inspect sidecar"
+        return $?
+    fi
+    fre_bakeoff_abi2_identity=$(
+        awk -F= '
+            $1 == "abi2_witness_schema" {
+                schema = $2
+                schema_count++
+            }
+            $1 == "abi2_backend_policy" {
+                backend_policy = $2
+                backend_policy_count++
+            }
+            $1 == "abi2_target" {
+                target = $2
+                target_count++
+            }
+            $1 == "abi2_backend" {
+                backend = $2
+                backend_count++
+            }
+            $1 == "abi2_native_output" {
+                native_output = $2
+                native_output_count++
+            }
+            $1 == "abi2_native_abi" {
+                native_abi = $2
+                native_abi_count++
+            }
+            $1 == "abi2_sve_vector_bytes_at_publication" {
+                sve_vector_bytes_at_publication = $2
+                sve_vector_bytes_at_publication_count++
+            }
+            $1 == "abi2_required_thread_sve_vector_bytes" {
+                required_thread_sve_vector_bytes = $2
+                required_thread_sve_vector_bytes_count++
+            }
+            $1 == "abi2_identity" {
+                identity = $2
+                identity_count++
+            }
+            END {
+                if (schema_count != 1 ||
+                    schema != "fre-jit-bakeoff-v3-asimd-v8-selected-end-register-v2-witness-v1" ||
+                    backend_policy_count != 1 ||
+                    backend_policy != "asimd-v8" ||
+                    target_count != 1 ||
+                    target != "aarch64-aapcs64-asimd" ||
+                    backend_count != 1 ||
+                    backend != "8" ||
+                    native_output_count != 1 ||
+                    native_output != "selected-end" ||
+                    native_abi_count != 1 ||
+                    native_abi != "selected-end-register-v2" ||
+                    sve_vector_bytes_at_publication_count != 1 ||
+                    sve_vector_bytes_at_publication != "none" ||
+                    required_thread_sve_vector_bytes_count != 1 ||
+                    required_thread_sve_vector_bytes != "none" ||
+                    identity_count != 1) exit 2
+                print identity
+            }
+        ' "$fre_bakeoff_inspect"
+    ) || {
+        fre_bakeoff_error "inspect sidecar does not carry the exact ASIMD V8 ABI2 witness"
+        return $?
+    }
+    case "$fre_bakeoff_abi2_identity" in
+        *[!0-9a-f]*|"")
+            fre_bakeoff_error "malformed ABI2 artifact identity"
+            return $?
+            ;;
+    esac
+    if [ "${#fre_bakeoff_abi2_identity}" != 64 ]; then
+        fre_bakeoff_error "ABI2 artifact identity must contain 64 lowercase hex digits"
+        return $?
+    fi
+    printf '%s\n' "$fre_bakeoff_abi2_identity"
+}
+
+fre_bakeoff_row_schema() {
+    fre_bakeoff_raw=$1
+    awk -F, '
+        NR == 1 {
+            if ($1 != "schema") exit 2
+            next
+        }
+        !found {
+            schema = $1
+            found = 1
+        }
+        $1 != schema { exit 2 }
+        END {
+            if (!found) exit 2
+            print schema
+        }
+    ' "$fre_bakeoff_raw"
+}
+
 fre_bakeoff_validate_exact_clean_commit() {
     fre_bakeoff_repository=$1
     fre_bakeoff_revision=$2

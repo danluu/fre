@@ -51,6 +51,14 @@ NR == 1 {
         print "row " NR " has the wrong row schema" > "/dev/stderr"
         bad = 1
     }
+    if (schema == "fre-jit-bakeoff-v3" && !checked_abi2_identity) {
+        checked_abi2_identity = 1
+        if (length(abi2_identity) != 64 ||
+            abi2_identity ~ /[^0-9a-f]/) {
+            print "V3 verification requires an external ABI2 artifact identity" > "/dev/stderr"
+            bad = 1
+        }
+    }
     engine = $(index_of["engine"])
     if (engine != "fre-qualified-exact" &&
         engine != "fre-qualified-exact-under-threshold") {
@@ -108,7 +116,7 @@ NR == 1 {
                 "aarch64-search-v8-selected-end-register-v2"
             expected_artifact_binding = \
                 "facade-reported-abi2-identity+deterministic-selected-end-register-v2-image"
-            identity_matches = 1
+            identity_matches = artifact == abi2_identity
         }
         if (backend != expected_backend ||
             !identity_matches ||
@@ -180,13 +188,19 @@ NR == 1 {
         native_output = route == "native-jit" ? "selected-end" : "none"
         native_abi = route == "native-jit" ? \
             "selected-end-register-v2" : "none"
+        target = route == "native-jit" ? \
+            "aarch64-aapcs64-asimd" : "none"
         expected_binding = \
             "fre-qualified-exact-evidence-v3|public_output=" output \
             "|native_output=" native_output \
             "|native_abi=" native_abi \
+            "|backend_policy=asimd-v8" \
+            "|target=" target \
             "|backend=" backend \
             "|route=" route \
             "|artifact=" artifact \
+            "|sve_vector_bytes_at_publication=none" \
+            "|required_thread_sve_vector_bytes=none" \
             "|qualification_state=" qualification_state \
             "|qualification_bundle=" qualification_bundle \
             "|minimum_window_bytes=" min_window \

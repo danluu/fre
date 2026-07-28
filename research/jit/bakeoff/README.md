@@ -13,6 +13,11 @@ session construction once, followed by the declared value-only workload.
 Before serializing a native row, the generator requires the facade-reported
 V8/ABI2 target, backend, image statistics, and artifact identity to match a
 separately emitted deterministic register-return image.
+The existing exact-Span inspection sidecar retains its `identity=` field for
+historical V2 verification and additionally records an independently named
+`abi2_identity=` plus the exact ASIMD V8, register ABI2, target, and no-VL
+facts. V3 verification requires that external ABI2 identity and rejects a row
+whose artifact, canonical binding, and evidence hash were rewritten together.
 Historical V2 rows remain V2 and continue to describe only the retired
 sessionless Search-v1/Span-image harness.
 
@@ -126,7 +131,8 @@ Both synthetic and Sherlock serializers exactly match the 48-column V3
 header. Sherlock rows explicitly report qualification state `not-applicable`
 and bundle `none`. `verify_evidence_rows.awk` accepts both current V3 rows and
 unaltered historical V2 rows, while applying the schema-specific backend, ABI,
-artifact, and accounting rules.
+artifact, VL, and accounting rules. V2 native rows remain bound to the legacy
+exact-Span sidecar identity; V3 rows require the distinct ABI2 witness identity.
 
 ## Semantic authentication
 

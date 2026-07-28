@@ -882,6 +882,12 @@ fn qualified_v8_artifact_witness() -> Result<QualifiedV8ArtifactWitness, Box<dyn
         SelectedEndRegisterBackendV2::AsimdV8,
         EmitLimits::default(),
     )?;
+    if image.backend() != SelectedEndRegisterBackendV2::AsimdV8
+        || image.backend_version() != BackendVersion::SEARCH_V8
+        || image.target() != TargetSpec::AARCH64_AAPCS64
+    {
+        return Err("deterministic qualified witness is not exact ASIMD V8 ABI2".into());
+    }
     Ok(QualifiedV8ArtifactWitness {
         image: image.stats(),
         target: image.target(),
@@ -1410,6 +1416,11 @@ fn qualified_row_evidence(
     measured_calls: u64,
 ) -> Result<RowEvidence, Box<dyn Error>> {
     let report = qualified.build_report();
+    if report.backend_policy != QualifiedExactSearchBackendPolicy::AsimdV8 {
+        return Err(
+            "qualified evidence owner was not built under the explicit ASIMD V8 policy".into(),
+        );
+    }
     let workload = report.workload;
     let (qualification_state, qualification_bundle_sha256) =
         qualification_row_fields(report.qualification)?;
@@ -1419,6 +1430,7 @@ fn qualified_row_evidence(
         route_name,
         native_abi,
         native_output,
+        target,
         artifact_binding,
         artifact_identity,
     ) = match route {
@@ -1481,6 +1493,7 @@ fn qualified_row_evidence(
                 "native-jit",
                 "selected-end-register-v2",
                 "selected-end",
+                "aarch64-aapcs64-asimd",
                 "facade-reported-abi2-identity+deterministic-selected-end-register-v2-image",
                 hex_encode(&identity.artifact_sha256),
             )
@@ -1491,12 +1504,13 @@ fn qualified_row_evidence(
             "portable-literal",
             "none",
             "none",
+            "none",
             "portable-semantic-owner",
             "none".to_owned(),
         ),
     };
     let evidence_binding = format!(
-        "fre-qualified-exact-evidence-v3|public_output=span|native_output={native_output}|native_abi={native_abi}|backend={backend}|route={route_name}|artifact={artifact_identity}|qualification_state={qualification_state}|qualification_bundle={qualification_bundle_sha256}|minimum_window_bytes={}|minimum_qualifying_calls={}",
+        "fre-qualified-exact-evidence-v3|public_output=span|native_output={native_output}|native_abi={native_abi}|backend_policy=asimd-v8|target={target}|backend={backend}|route={route_name}|artifact={artifact_identity}|sve_vector_bytes_at_publication=none|required_thread_sve_vector_bytes=none|qualification_state={qualification_state}|qualification_bundle={qualification_bundle_sha256}|minimum_window_bytes={}|minimum_qualifying_calls={}",
         workload.minimum_window_bytes(),
         workload.minimum_qualifying_searches(),
     );
@@ -1755,7 +1769,11 @@ fn inspect_image(shape: Shape, operation: OperationName) -> Result<(), Box<dyn E
         OperationName::Exists => inspect_typed::<Exists>(shape),
         OperationName::SelectedEnd => inspect_typed::<SelectedEnd>(shape),
         OperationName::Span => inspect_typed::<Span>(shape),
+    }?;
+    if shape == Shape::Exact && operation == OperationName::Span {
+        print_qualified_v8_abi2_witness()?;
     }
+    Ok(())
 }
 
 fn inspect_typed<O: Operation>(shape: Shape) -> Result<(), Box<dyn Error>> {
@@ -1770,6 +1788,20 @@ fn inspect_typed<O: Operation>(shape: Shape) -> Result<(), Box<dyn Error>> {
     for (index, instruction) in decode(image.code())?.iter().enumerate() {
         println!("{:#06x} {instruction:?}", index.wrapping_mul(4));
     }
+    Ok(())
+}
+
+fn print_qualified_v8_abi2_witness() -> Result<(), Box<dyn Error>> {
+    let witness = qualified_v8_artifact_witness()?;
+    println!("abi2_witness_schema=fre-jit-bakeoff-v3-asimd-v8-selected-end-register-v2-witness-v1");
+    println!("abi2_backend_policy=asimd-v8");
+    println!("abi2_target=aarch64-aapcs64-asimd");
+    println!("abi2_backend={}", witness.backend.0);
+    println!("abi2_native_output=selected-end");
+    println!("abi2_native_abi=selected-end-register-v2");
+    println!("abi2_sve_vector_bytes_at_publication=none");
+    println!("abi2_required_thread_sve_vector_bytes=none");
+    println!("abi2_identity={}", hex_encode(&witness.artifact_sha256));
     Ok(())
 }
 
@@ -2234,6 +2266,14 @@ mod tests {
         );
         assert!(builder.contains("QualifiedExactSearch::new_with_backend("));
         assert!(builder.contains("QualifiedExactSearchBackendPolicy::AsimdV8"));
+        let witness = between(
+            source,
+            "fn qualified_v8_artifact_witness(",
+            "\n/// Time the complete qualified lifecycle",
+        );
+        assert!(witness.contains("SelectedEndRegisterBackendV2::AsimdV8"));
+        assert!(witness.contains("BackendVersion::SEARCH_V8"));
+        assert!(witness.contains("TargetSpec::AARCH64_AAPCS64"));
 
         let bench = between(
             source,
@@ -2281,6 +2321,28 @@ mod tests {
         assert!(evidence.contains("BackendVersion::SEARCH_V8"));
         assert!(evidence.contains("fre-qualified-exact-evidence-v3"));
         assert!(evidence.contains("deterministic-selected-end-register-v2-image"));
+        assert!(evidence.contains("backend_policy=asimd-v8"));
+        assert!(evidence.contains("target={target}"));
+        assert!(evidence.contains("sve_vector_bytes_at_publication=none"));
+        assert!(evidence.contains("required_thread_sve_vector_bytes=none"));
+
+        let inspect = between(
+            source,
+            "fn inspect_image(",
+            "\n#[allow(\n    clippy::too_many_lines",
+        );
+        for fact in [
+            "abi2_witness_schema=fre-jit-bakeoff-v3-asimd-v8-selected-end-register-v2-witness-v1",
+            "abi2_backend_policy=asimd-v8",
+            "abi2_target=aarch64-aapcs64-asimd",
+            "abi2_native_output=selected-end",
+            "abi2_native_abi=selected-end-register-v2",
+            "abi2_sve_vector_bytes_at_publication=none",
+            "abi2_required_thread_sve_vector_bytes=none",
+            "abi2_identity=",
+        ] {
+            assert!(inspect.contains(fact));
+        }
     }
 
     #[test]

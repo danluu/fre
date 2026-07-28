@@ -4,6 +4,7 @@ set -eu
 directory=${1:?usage: verify_qualification_results.sh RESULT_DIRECTORY EXPECTED_SYNTHETIC_CELLS}
 expected_cells=${2:?usage: verify_qualification_results.sh RESULT_DIRECTORY EXPECTED_SYNTHETIC_CELLS}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$script_dir/runner_support.sh"
 raw="$directory/raw.csv"
 instructions="$directory/exact-span.instructions.txt"
 
@@ -30,7 +31,21 @@ if [ "${#span_identity}" != 64 ]; then
     exit 2
 fi
 
+row_schema=$(fre_bakeoff_row_schema "$raw")
+abi2_identity=
+case "$row_schema" in
+    fre-jit-bakeoff-v2) ;;
+    fre-jit-bakeoff-v3)
+        abi2_identity=$(fre_bakeoff_abi2_identity_from_inspect "$instructions")
+        ;;
+    *)
+        echo "unsupported qualification result schema: $row_schema" >&2
+        exit 2
+        ;;
+esac
+
 awk -v span_identity="$span_identity" \
+    -v abi2_identity="$abi2_identity" \
     -f "$script_dir/verify_evidence_rows.awk" "$raw"
 "$script_dir/verify_evidence_identity.sh" "$raw"
 
