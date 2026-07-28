@@ -53,6 +53,11 @@ const BYTE_FREQUENCY_RANK: [u8; 256] = [
     255,
 ];
 
+/// Frozen general-purpose byte-frequency rank shared by construction-time
+/// anchor selectors. Lower ranks are expected to be rarer.
+///
+/// This deliberately exposes only the immutable policy, not the packed
+/// reducer's bucket scoring or tie-breaking rules.
 pub(crate) fn byte_frequency_rank(byte: u8) -> u8 {
     BYTE_FREQUENCY_RANK[usize::from(byte)]
 }

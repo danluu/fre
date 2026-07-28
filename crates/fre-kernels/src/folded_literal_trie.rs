@@ -10,18 +10,24 @@
 use core::{fmt, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
+use memchr::{memchr_iter, memchr2_iter, memchr3_iter};
 
 use crate::{
     Window,
     literal_anchor::{CandidateEmissionOrder, LiteralCandidate},
+    packed_ordered_literal_aggregate::byte_frequency_rank,
 };
 
 /// Stable identity of the canonical folded-scalar trie primitive.
-pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v1";
+pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v2";
 
 const NONE: usize = usize::MAX;
 const CANDIDATE_WORK: usize = 2;
 const MAX_UTF8_WIDTH: usize = 4;
+const MAX_ROOT_PREFILTER_NEEDLES: usize = 3;
+const ROOT_PREFILTER_OFFSET_WORK: usize = 2;
+const ROOT_PREFILTER_EDGE_WORK: usize = 7;
+const ROOT_PREFILTER_NEEDLE_WORK: usize = 2;
 
 /// One sorted canonical simple-fold equivalence class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,12 +193,16 @@ pub struct BuildAccounting {
     pub max_pattern_scalars: usize,
     pub canonical_comparisons_upper_bound: usize,
     pub insertion_probes_upper_bound: usize,
+    pub root_prefilter_work_upper_bound: usize,
     pub work_upper_bound: usize,
     pub persistent_bytes_upper_bound: usize,
     pub peak_bytes_upper_bound: usize,
     pub allocations_upper_bound: usize,
     pub canonical_comparisons: usize,
     pub insertion_probes: usize,
+    pub root_prefilter_work: usize,
+    pub root_prefilter_needles: usize,
+    pub root_prefilter_offset: Option<usize>,
     pub work: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
@@ -268,6 +278,8 @@ pub struct ScanUpperBounds {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ScanActual {
     pub input_bytes: usize,
+    /// Scalar-start attempts on the complete path, or byte-anchor hits on the
+    /// prefiltered path. Both are bounded by `input_bytes`.
     pub candidate_starts: usize,
     pub scalar_decodes: usize,
     pub decoded_scalars: usize,
@@ -414,12 +426,61 @@ struct Output {
     next: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootPrefilter {
+    needles: [u8; MAX_ROOT_PREFILTER_NEEDLES],
+    needle_count: u8,
+    offset: u8,
+}
+
+impl RootPrefilter {
+    fn scan<F>(
+        self,
+        source: &[u8],
+        invalid_actual: ScanActual,
+        mut hit: F,
+    ) -> Result<(), ScanAttemptError>
+    where
+        F: FnMut(usize) -> Result<(), ScanAttemptError>,
+    {
+        match self.needle_count {
+            1 => {
+                for position in memchr_iter(self.needles[0], source) {
+                    hit(position)?;
+                }
+            }
+            2 => {
+                for position in memchr2_iter(self.needles[0], self.needles[1], source) {
+                    hit(position)?;
+                }
+            }
+            3 => {
+                for position in
+                    memchr3_iter(self.needles[0], self.needles[1], self.needles[2], source)
+                {
+                    hit(position)?;
+                }
+            }
+            _ => {
+                return Err(ScanAttemptError {
+                    source: ScanError::Invariant {
+                        detail: "folded root prefilter retained an invalid needle count",
+                    },
+                    actual: invalid_actual,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Immutable exact-allocation sparse folded-scalar trie.
 #[derive(Debug)]
 pub struct FoldedLiteralTriePlan {
     nodes: ExactVec<Node>,
     edges: ExactVec<Edge>,
     outputs: ExactVec<Output>,
+    root_prefilter: Option<RootPrefilter>,
     build: BuildAccounting,
 }
 
@@ -505,6 +566,17 @@ impl FoldedLiteralTriePlan {
         build.persistent_bytes =
             exact_retained_bytes(nodes.capacity(), edges.capacity(), outputs.capacity())?;
         build.peak_bytes = build.persistent_bytes;
+        let (root_prefilter, root_prefilter_work) = select_root_prefilter(&nodes, &edges)?;
+        work = checked_build_add(
+            work,
+            root_prefilter_work,
+            "folded root prefilter selection work",
+        )?;
+        build.root_prefilter_work = root_prefilter_work;
+        build.root_prefilter_needles =
+            root_prefilter.map_or(0, |prefilter| usize::from(prefilter.needle_count));
+        build.root_prefilter_offset = root_prefilter.map(|prefilter| usize::from(prefilter.offset));
+        build.work = work;
         if !build_actual_within(build) {
             return Err(BuildError::Invariant {
                 detail: "folded construction actual exceeded prospective",
@@ -514,6 +586,7 @@ impl FoldedLiteralTriePlan {
             nodes,
             edges,
             outputs,
+            root_prefilter,
             build,
         }))
     }
@@ -544,8 +617,20 @@ impl FoldedLiteralTriePlan {
         )?;
         let decoded_scalars = scalar_decodes;
         let invalid_bytes = candidate_starts;
-        let source_byte_reads =
-            checked_scan_mul(scalar_decodes, MAX_UTF8_WIDTH, "folded source byte reads")?;
+        let scalar_source_byte_reads = checked_scan_mul(
+            scalar_decodes,
+            MAX_UTF8_WIDTH,
+            "folded scalar source byte reads",
+        )?;
+        let source_byte_reads = if self.root_prefilter.is_some() {
+            scalar_source_byte_reads.checked_add(input_bytes).ok_or(
+                ScanError::ArithmeticOverflow {
+                    computation: "folded root-prefilter source byte reads",
+                },
+            )?
+        } else {
+            scalar_source_byte_reads
+        };
         let transition_probes = checked_scan_mul(
             scalar_decodes,
             self.build.transitions,
@@ -685,10 +770,65 @@ fn execute_folded_scan<F>(
 where
     F: FnMut(LiteralCandidate),
 {
+    execute_folded_scan_impl(
+        plan,
+        source,
+        absolute_base,
+        upper,
+        plan.root_prefilter,
+        emit,
+    )
+}
+
+fn execute_folded_scan_impl<F>(
+    plan: &FoldedLiteralTriePlan,
+    source: &[u8],
+    absolute_base: usize,
+    upper: ScanUpperBounds,
+    root_prefilter: Option<RootPrefilter>,
+    emit: &mut F,
+) -> Result<ScanActual, ScanAttemptError>
+where
+    F: FnMut(LiteralCandidate),
+{
     let mut actual = ScanActual {
         input_bytes: source.len(),
         ..ScanActual::default()
     };
+    if let Some(prefilter) = root_prefilter {
+        actual.source_byte_reads = checked_actual_add(
+            actual.source_byte_reads,
+            source.len(),
+            upper,
+            actual,
+            "folded root-prefilter source reads",
+        )?;
+        let offset = usize::from(prefilter.offset);
+        let invalid_actual = actual;
+        prefilter.scan(source, invalid_actual, |hit| {
+            let Some(relative_start) = hit.checked_sub(offset) else {
+                return Ok(());
+            };
+            actual.candidate_starts = checked_actual_add(
+                actual.candidate_starts,
+                1,
+                upper,
+                actual,
+                "folded root-prefilter candidate starts",
+            )?;
+            let _ = scan_folded_start(
+                plan,
+                source,
+                absolute_base,
+                relative_start,
+                upper,
+                &mut actual,
+                emit,
+            )?;
+            Ok(())
+        })?;
+        return Ok(actual);
+    }
     let mut relative_start = 0_usize;
     while relative_start < source.len() {
         actual.candidate_starts = checked_actual_add(
@@ -712,6 +852,105 @@ where
             .ok_or_else(|| attempt_overflow(upper, actual, "next folded candidate start"))?;
     }
     Ok(actual)
+}
+
+fn select_root_prefilter(
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<(Option<RootPrefilter>, usize), BuildError> {
+    let Some(root) = nodes.first() else {
+        return Err(BuildError::Invariant {
+            detail: "folded trie root is missing",
+        });
+    };
+    let mut selected = None::<(usize, u64, usize, RootPrefilter)>;
+    let mut work = 0_usize;
+    for offset in 0..MAX_UTF8_WIDTH {
+        work = checked_build_add(
+            work,
+            ROOT_PREFILTER_OFFSET_WORK,
+            "folded root prefilter offset work",
+        )?;
+        let mut needles = [0_u8; MAX_ROOT_PREFILTER_NEEDLES];
+        let mut needle_count = 0_usize;
+        let mut eligible = true;
+        let mut edge = root.first_edge;
+        while edge != NONE {
+            work = checked_build_add(
+                work,
+                ROOT_PREFILTER_EDGE_WORK,
+                "folded root prefilter edge work",
+            )?;
+            let transition = edges[edge];
+            let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+            let bytes = transition.scalar.encode_utf8(&mut encoded).as_bytes();
+            let Some(&needle) = bytes.get(offset) else {
+                eligible = false;
+                break;
+            };
+            if !needles[..needle_count].contains(&needle) {
+                if needle_count == MAX_ROOT_PREFILTER_NEEDLES {
+                    eligible = false;
+                    break;
+                }
+                needles[needle_count] = needle;
+                needle_count =
+                    needle_count
+                        .checked_add(1)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "folded root prefilter needle count",
+                        })?;
+            }
+            edge = transition.next;
+        }
+        if !eligible || needle_count == 0 {
+            continue;
+        }
+        let mut structural_leads = 0_usize;
+        let mut frequency_score = 0_u64;
+        for &needle in &needles[..needle_count] {
+            work = checked_build_add(
+                work,
+                ROOT_PREFILTER_NEEDLE_WORK,
+                "folded root prefilter needle work",
+            )?;
+            structural_leads = structural_leads
+                .checked_add(usize::from(matches!(needle, 0xC2..=0xF4)))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded root prefilter structural leads",
+                })?;
+            frequency_score = frequency_score
+                .checked_add(u64::from(byte_frequency_rank(needle)).saturating_add(1))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded root prefilter frequency score",
+                })?;
+        }
+        let prefilter = RootPrefilter {
+            needles,
+            needle_count: u8::try_from(needle_count).map_err(|_| BuildError::Invariant {
+                detail: "folded root prefilter needle count does not fit u8",
+            })?,
+            offset: u8::try_from(offset).map_err(|_| BuildError::Invariant {
+                detail: "folded root prefilter offset does not fit u8",
+            })?,
+        };
+        let replace = selected
+            .as_ref()
+            .is_none_or(|&(best_leads, best_score, best_offset, _)| {
+                (
+                    structural_leads,
+                    frequency_score,
+                    core::cmp::Reverse(offset),
+                ) < (best_leads, best_score, core::cmp::Reverse(best_offset))
+            });
+        if replace {
+            selected = Some((structural_leads, frequency_score, offset, prefilter));
+        }
+    }
+    let selected = selected.and_then(|(structural_leads, _, _, prefilter)| {
+        (structural_leads < usize::from(prefilter.needle_count)).then_some(prefilter)
+    });
+    Ok((selected, work))
 }
 
 fn scan_folded_start<F>(
@@ -928,6 +1167,8 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             computation: "folded canonical comparisons",
         })?;
     let insertion_probes_upper_bound = pairwise_comparisons;
+    let root_prefilter_work_upper_bound =
+        preflight_root_prefilter_work_upper_bound(equivalent_scalars)?;
     let insertion_work =
         insertion_probes_upper_bound
             .checked_add(equivalent_scalars.checked_mul(3).ok_or(
@@ -944,6 +1185,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             })?;
     let work_upper_bound = canonical_comparisons_upper_bound
         .checked_add(insertion_work)
+        .and_then(|work| work.checked_add(root_prefilter_work_upper_bound))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded construction work",
         })?;
@@ -956,12 +1198,16 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         max_pattern_scalars,
         canonical_comparisons_upper_bound,
         insertion_probes_upper_bound,
+        root_prefilter_work_upper_bound,
         work_upper_bound,
         persistent_bytes_upper_bound,
         peak_bytes_upper_bound: persistent_bytes_upper_bound,
         allocations_upper_bound: 3,
         canonical_comparisons: 0,
         insertion_probes: 0,
+        root_prefilter_work: 0,
+        root_prefilter_needles: 0,
+        root_prefilter_offset: None,
         work: 0,
         persistent_bytes: 0,
         peak_bytes: 0,
@@ -970,6 +1216,31 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         outputs: 0,
         allocations: 0,
     })
+}
+
+fn preflight_root_prefilter_work_upper_bound(
+    equivalent_scalars: usize,
+) -> Result<usize, BuildError> {
+    let needle_work = checked_build_mul(
+        MAX_ROOT_PREFILTER_NEEDLES,
+        ROOT_PREFILTER_NEEDLE_WORK,
+        "folded root prefilter needle upper work",
+    )?;
+    let per_offset_work = checked_build_mul(
+        equivalent_scalars,
+        ROOT_PREFILTER_EDGE_WORK,
+        "folded root prefilter edge upper work",
+    )?
+    .checked_add(ROOT_PREFILTER_OFFSET_WORK)
+    .and_then(|value| value.checked_add(needle_work))
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root prefilter per-offset upper work",
+    })?;
+    checked_build_mul(
+        MAX_UTF8_WIDTH,
+        per_offset_work,
+        "folded root prefilter upper work",
+    )
 }
 
 fn enforce_build_limits(
@@ -1305,6 +1576,7 @@ const fn actual_within(actual: ScanActual, upper: ScanUpperBounds) -> bool {
 const fn build_actual_within(actual: BuildAccounting) -> bool {
     actual.canonical_comparisons <= actual.canonical_comparisons_upper_bound
         && actual.insertion_probes <= actual.insertion_probes_upper_bound
+        && actual.root_prefilter_work <= actual.root_prefilter_work_upper_bound
         && actual.work <= actual.work_upper_bound
         && actual.persistent_bytes <= actual.persistent_bytes_upper_bound
         && actual.peak_bytes <= actual.peak_bytes_upper_bound
@@ -1585,13 +1857,15 @@ mod tests {
     use super::{
         BuildAccounting, BuildAttempt, BuildError, BuildLimits, BuildResource, DenseFallbackReason,
         FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass, ScanActual, ScanError, ScanLimits,
-        ScanResource, ScanUpperBounds, build_probe, scan_source_probe,
+        ScanResource, ScanUpperBounds, build_probe, execute_folded_scan_impl, scan_source_probe,
     };
     use crate::{LiteralCandidate, Window};
 
     const KELVIN: [char; 3] = ['K', 'k', '\u{212A}'];
     const SIGMA: [char; 3] = ['Σ', 'ς', 'σ'];
     const CYRILLIC_ES: [char; 3] = ['С', 'с', 'ᲃ'];
+    const CYRILLIC_SHA: [char; 2] = ['Ш', 'ш'];
+    const CYRILLIC_IE: [char; 2] = ['Е', 'е'];
 
     fn admitted(patterns: &[FoldedLiteral<'_>]) -> FoldedLiteralTriePlan {
         match FoldedLiteralTriePlan::build(patterns, BuildLimits::default()).unwrap() {
@@ -1781,6 +2055,164 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidates, [LiteralCandidate::new(0, 2, 4)]);
+    }
+
+    #[test]
+    fn russian_root_uses_rare_common_continuation_offset() {
+        let classes = [
+            FoldedScalarClass::new(&CYRILLIC_SHA),
+            FoldedScalarClass::new(&CYRILLIC_IE),
+        ];
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        let prefilter = plan
+            .root_prefilter
+            .expect("two Russian fold variants have a common-offset prefilter");
+        assert_eq!(prefilter.offset, 1);
+        assert_eq!(prefilter.needle_count, 2);
+        let mut needles = prefilter.needles[..usize::from(prefilter.needle_count)].to_vec();
+        needles.sort_unstable();
+        assert_eq!(needles, [0x88, 0xA8]);
+        assert_eq!(plan.build.root_prefilter_offset, Some(1));
+        assert_eq!(plan.build.root_prefilter_needles, 2);
+    }
+
+    #[test]
+    fn lead_only_root_needles_keep_complete_scalar_scan() {
+        const DENSE_CYRILLIC_ROOT: [char; 4] = ['А', 'Р', 'р', 'ё'];
+        let classes = one_class(&DENSE_CYRILLIC_ROOT);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        assert_eq!(plan.root_prefilter, None);
+        assert_eq!(plan.build.root_prefilter_offset, None);
+        assert_eq!(plan.build.root_prefilter_needles, 0);
+        assert_eq!(
+            collect(&plan, "xАРрё".as_bytes()),
+            [
+                LiteralCandidate::new(0, 1, 3),
+                LiteralCandidate::new(0, 3, 5),
+                LiteralCandidate::new(0, 5, 7),
+                LiteralCandidate::new(0, 7, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn four_byte_root_exercises_later_common_offset() {
+        const DESERET_LONG_I: [char; 2] = ['\u{10400}', '\u{10428}'];
+        let classes = one_class(&DESERET_LONG_I);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        let prefilter = plan
+            .root_prefilter
+            .expect("Deseret fold variants retain a later-byte prefilter");
+        assert_eq!(prefilter.offset, 2);
+        assert_eq!(prefilter.needle_count, 1);
+        assert_eq!(prefilter.needles[0], 0x90);
+        assert_eq!(
+            collect(&plan, "x\u{10400}\u{10428}".as_bytes()),
+            [
+                LiteralCandidate::new(0, 1, 5),
+                LiteralCandidate::new(0, 5, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn four_distinct_root_bytes_keep_complete_scalar_scan() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let classes = one_class(&FOUR);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        assert_eq!(plan.root_prefilter, None);
+        assert_eq!(
+            collect(&plan, b"xABCD"),
+            [
+                LiteralCandidate::new(0, 1, 2),
+                LiteralCandidate::new(0, 2, 3),
+                LiteralCandidate::new(0, 3, 4),
+                LiteralCandidate::new(0, 4, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn common_offset_prefilter_matches_scalar_reference_on_all_short_byte_strings_and_windows() {
+        let classes = [
+            FoldedScalarClass::new(&CYRILLIC_SHA),
+            FoldedScalarClass::new(&CYRILLIC_IE),
+        ];
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        let alphabet = [0x00, 0x88, 0xA8, 0xD0, 0xD1, 0xFF, b' ', b'x'];
+        for len in 0..=5 {
+            let variants = alphabet.len().pow(u32::try_from(len).unwrap());
+            for mut code in 0..variants {
+                let mut haystack = Vec::with_capacity(len);
+                for _ in 0..len {
+                    haystack.push(alphabet[code % alphabet.len()]);
+                    code /= alphabet.len();
+                }
+                for start in 0..=len {
+                    for end in start..=len {
+                        let source = &haystack[start..end];
+                        let upper = plan.scan_upper_bounds(source.len()).unwrap();
+                        let mut scalar = Vec::new();
+                        let scalar_actual = execute_folded_scan_impl(
+                            &plan,
+                            source,
+                            start,
+                            upper,
+                            None,
+                            &mut |candidate| scalar.push(candidate),
+                        )
+                        .unwrap();
+                        let mut prefetched = Vec::new();
+                        let prefetched_actual = execute_folded_scan_impl(
+                            &plan,
+                            source,
+                            start,
+                            upper,
+                            plan.root_prefilter,
+                            &mut |candidate| prefetched.push(candidate),
+                        )
+                        .unwrap();
+                        assert_eq!(prefetched, scalar);
+                        assert!(super::actual_within(scalar_actual, upper));
+                        assert!(super::actual_within(prefetched_actual, upper));
+                    }
+                }
+            }
+        }
+
+        let multi_hit = "ШЕшеШЕ".as_bytes();
+        let upper = plan.scan_upper_bounds(multi_hit.len()).unwrap();
+        let mut scalar = Vec::new();
+        execute_folded_scan_impl(&plan, multi_hit, 0, upper, None, &mut |candidate| {
+            scalar.push(candidate);
+        })
+        .unwrap();
+        let mut prefetched = Vec::new();
+        execute_folded_scan_impl(
+            &plan,
+            multi_hit,
+            0,
+            upper,
+            plan.root_prefilter,
+            &mut |candidate| {
+                prefetched.push(candidate);
+            },
+        )
+        .unwrap();
+        assert_eq!(prefetched, scalar);
+        assert_eq!(
+            prefetched,
+            [
+                LiteralCandidate::new(0, 0, 4),
+                LiteralCandidate::new(0, 4, 8),
+                LiteralCandidate::new(0, 8, 12),
+            ]
+        );
     }
 
     #[test]

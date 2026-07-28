@@ -53,7 +53,7 @@ use fre::{
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
-    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError,
+    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
     GraphemeScalarDfaOperation, GraphemeScalarDfaReduceError, GraphemeScalarDfaReduceLimits,
     HotByteProgramArtifact, HotByteProgramBuilder, HotByteRunLimits,
@@ -73,10 +73,10 @@ use fre::{
     OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
     OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
-    PortableGrepBuildError, PortableGrepSession, PortableRegex, PortableSearchSession,
-    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind,
+    PortableBuilder, PortableGrepBuildError, PortableGrepSession, PortableRegex,
+    PortableSearchSession, PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_COUNT_OPERATION_ID,
     REVERSE_INNER_PLAN_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildAccounting,
@@ -88,7 +88,11 @@ use fre::{
     STRING_QUOTE_PREFIX_INSPECTION_WORK, SearchLimits, SearchSessionLimits,
     SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateReduceError,
     TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
-    TokenPhraseReduceError, TokenPhraseReduceLimits, UnicodeScalarAggregateBuildError,
+    TokenPhraseReduceError, TokenPhraseReduceLimits, UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
+    UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
+    UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
+    UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits,
+    UnicodeFoldedLiteralSpanSumRegex, UnicodeScalarAggregateBuildError,
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
     WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK, guarded_ascii_word,
@@ -210,7 +214,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-unicode-folded-literal-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -568,6 +572,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; Unicode-on continuation count may use compact canonical terminal-scalar encodings to seed prospectively bounded required-suffix reverse rows, with wide domains retaining the incumbent route",
+        );
+        identity.identity.push_str(
+            "; unicode-folded-literal-v1 construction-selects a bounded finite canonical case-fold trie from one eligible nonempty literal/class sequence, then count and span-sum reuse one allocation-free common-offset byte prefilter plus exact scalar-trie validation under explicit build and run receipts",
+        );
+        identity.availability.push_str(
+            "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences whose non-ASCII folded root has at most four canonical members and whose Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
         );
         identity
             .identity
@@ -1721,8 +1731,16 @@ pub struct CurrentFreAggregateOperationLifecycle {
 
 #[derive(Debug)]
 enum CurrentFreAggregateOperationInner {
+    CountFolded(
+        UnicodeFoldedLiteralCountRegex,
+        UnicodeFoldedLiteralRunLimits,
+    ),
     CountSingle(AggregateCountRegex, AggregateRunLimits),
     CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
+    SpanSumFolded(
+        UnicodeFoldedLiteralSpanSumRegex,
+        UnicodeFoldedLiteralRunLimits,
+    ),
     SpanSumSingle(AggregateSpanSumRegex, AggregateRunLimits),
     SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
 }
@@ -1806,6 +1824,12 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
+                .execute(haystack, *limits)
+                .map(|result| result.value)
+                .map_err(|error| {
+                    CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
+                }),
             CurrentFreAggregateOperationInner::CountSingle(regex, limits) => {
                 regex.count_value(haystack, limits).map_err(|error| {
                     let message = format!("FRE count lifecycle: {error}");
@@ -1815,6 +1839,12 @@ impl CurrentFreAggregateOperationLifecycle {
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits) => regex
+                .execute(haystack, *limits)
+                .map(|result| result.value)
+                .map_err(|error| {
+                    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
+                }),
             CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
                 regex.span_sum_value(haystack, limits).map_err(|error| {
                     let message = format!("FRE span-sum lifecycle: {error}");
@@ -1853,6 +1883,15 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
+                .execute(haystack, *limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value,
+                    receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                })
+                .map_err(|error| {
+                    CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
+                }),
             CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -1876,6 +1915,15 @@ impl CurrentFreAggregateOperationLifecycle {
                         CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt,
                 })
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+            CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits) => regex
+                .execute(haystack, *limits)
+                .map(|result| CurrentFreAggregateOperationCounterResult {
+                    value: result.value,
+                    receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                })
+                .map_err(|error| {
+                    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
+                }),
             CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
                 .span_sum_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -1937,7 +1985,217 @@ pub fn current_fre_rebar_aggregate_operation_lifecycle(
     }
 }
 
+const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v1";
+
+fn unicode_folded_literal_build_limits(
+    limits: &RunLimits,
+) -> Result<UnicodeFoldedLiteralBuildLimits, ExecutionError> {
+    let positions = limits.pattern_bytes_per_job;
+    let equivalents = positions
+        .checked_mul(4)
+        .ok_or_else(|| ExecutionError::fault("folded-literal equivalent-scalar cap overflow"))?;
+    let states = positions
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("folded-literal state cap overflow"))?;
+    let aggregate = aggregate_build_limits(limits);
+    Ok(UnicodeFoldedLiteralBuildLimits {
+        admission: aggregate.admission,
+        syntax_safety: aggregate.syntax_safety,
+        max_scalar_positions: positions,
+        max_equivalent_scalars: equivalents,
+        max_planner_work: limits.fre_aggregate_compile_work,
+        max_planner_scratch_bytes: limits.fre_aggregate_scratch_bytes,
+        trie: FoldedLiteralTrieBuildLimits {
+            max_patterns: 1,
+            max_scalar_positions: positions,
+            max_equivalent_scalars: equivalents,
+            max_states: states,
+            max_transitions: equivalents,
+            max_work: limits.fre_aggregate_compile_work,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_program_bytes,
+            max_allocations: 3,
+        },
+    })
+}
+
+fn unicode_folded_literal_builder(
+    pattern: String,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<UnicodeFoldedLiteralBuilder, ExecutionError> {
+    Ok(UnicodeFoldedLiteralBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(case_insensitive)
+        .limits(unicode_folded_literal_build_limits(limits)?))
+}
+
+fn unicode_folded_literal_build_error(error: &UnicodeFoldedLiteralBuildError) -> ExecutionError {
+    let message = format!("FRE Unicode folded-literal build: {error}");
+    match error {
+        UnicodeFoldedLiteralBuildError::Resource { .. }
+        | UnicodeFoldedLiteralBuildError::Trie(fre::FoldedLiteralTrieBuildError::Resource {
+            ..
+        }) => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn unicode_folded_literal_run_error(
+    error: &UnicodeFoldedLiteralRunError,
+    context: &str,
+) -> ExecutionError {
+    let message = format!("{context}: {error}");
+    match error {
+        UnicodeFoldedLiteralRunError::Resource { .. }
+        | UnicodeFoldedLiteralRunError::Scan(fre::FoldedLiteralTrieScanAttemptError {
+            source: fre::FoldedLiteralTrieScanError::Resource { .. },
+            ..
+        }) => ExecutionError::unsupported(message),
+        _ => ExecutionError::fault(message),
+    }
+}
+
+fn validate_unicode_folded_literal_report(
+    report: &fre::UnicodeFoldedLiteralBuildReport,
+    operation: UnicodeFoldedLiteralOperation,
+) -> Result<(), CompareError> {
+    if report.algorithm != UNICODE_FOLDED_LITERAL_ALGORITHM_ID
+        || report.operation != operation
+        || report.operation.identity()
+            != match operation {
+                UnicodeFoldedLiteralOperation::Count => {
+                    fre::UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID
+                }
+                UnicodeFoldedLiteralOperation::SpanSum => {
+                    fre::UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID
+                }
+            }
+    {
+        return Err(CompareError::new(
+            "Unicode folded-literal lifecycle identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn unicode_folded_literal_displaces_packed_finite_language(
+    report: &fre::UnicodeFoldedLiteralBuildReport,
+    limits: &RunLimits,
+) -> bool {
+    report.planner.cartesian_sequences_saturated
+        > limits
+            .patterns_per_job
+            .min(PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS)
+}
+
+fn try_current_fre_folded_count_lifecycle(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<
+    Option<(
+        UnicodeFoldedLiteralCountRegex,
+        UnicodeFoldedLiteralRunLimits,
+    )>,
+    CompareError,
+> {
+    let limits = RunLimits::default();
+    let attempt =
+        unicode_folded_literal_builder(pattern.to_owned(), unicode, case_insensitive, &limits)
+            .map_err(|error| CompareError::new(error.message))?
+            .build_count()
+            .map_err(|error| {
+                CompareError::new(unicode_folded_literal_build_error(&error).message)
+            })?;
+    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
+        return Ok(None);
+    };
+    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), &limits) {
+        return Ok(None);
+    }
+    validate_unicode_folded_literal_report(
+        regex.build_report(),
+        UnicodeFoldedLiteralOperation::Count,
+    )?;
+    let upper = regex
+        .full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE folded-literal count lifecycle preflight: {error}"
+            ))
+        })?;
+    Ok(Some((regex, UnicodeFoldedLiteralRunLimits::exact(upper))))
+}
+
+fn try_current_fre_folded_span_sum_lifecycle(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<
+    Option<(
+        UnicodeFoldedLiteralSpanSumRegex,
+        UnicodeFoldedLiteralRunLimits,
+    )>,
+    CompareError,
+> {
+    let limits = RunLimits::default();
+    let attempt =
+        unicode_folded_literal_builder(pattern.to_owned(), unicode, case_insensitive, &limits)
+            .map_err(|error| CompareError::new(error.message))?
+            .build_span_sum()
+            .map_err(|error| {
+                CompareError::new(unicode_folded_literal_build_error(&error).message)
+            })?;
+    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
+        return Ok(None);
+    };
+    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), &limits) {
+        return Ok(None);
+    }
+    validate_unicode_folded_literal_report(
+        regex.build_report(),
+        UnicodeFoldedLiteralOperation::SpanSum,
+    )?;
+    let upper = regex
+        .full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            CompareError::new(format!(
+                "FRE folded-literal span-sum lifecycle preflight: {error}"
+            ))
+        })?;
+    Ok(Some((regex, UnicodeFoldedLiteralRunLimits::exact(upper))))
+}
+
 fn build_current_fre_count_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    if let [pattern] = patterns
+        && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle(
+            pattern,
+            unicode,
+            case_insensitive,
+            haystack_len,
+        )?
+    {
+        return Ok(CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::Count,
+            plan: UNICODE_FOLDED_LITERAL_PLAN,
+            haystack_len,
+            inner: CurrentFreAggregateOperationInner::CountFolded(regex, limits),
+        });
+    }
+    build_current_fre_count_lifecycle_incumbent(patterns, unicode, case_insensitive, haystack_len)
+}
+
+fn build_current_fre_count_lifecycle_incumbent(
     patterns: &[String],
     unicode: bool,
     case_insensitive: bool,
@@ -2013,6 +2271,35 @@ fn build_current_fre_count_lifecycle(
 }
 
 fn build_current_fre_span_sum_lifecycle(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    if let [pattern] = patterns
+        && let Some((regex, limits)) = try_current_fre_folded_span_sum_lifecycle(
+            pattern,
+            unicode,
+            case_insensitive,
+            haystack_len,
+        )?
+    {
+        return Ok(CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::SpanSum,
+            plan: UNICODE_FOLDED_LITERAL_PLAN,
+            haystack_len,
+            inner: CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits),
+        });
+    }
+    build_current_fre_span_sum_lifecycle_incumbent(
+        patterns,
+        unicode,
+        case_insensitive,
+        haystack_len,
+    )
+}
+
+fn build_current_fre_span_sum_lifecycle_incumbent(
     patterns: &[String],
     unicode: bool,
     case_insensitive: bool,
@@ -13548,6 +13835,9 @@ fn fre_aggregate_count(
     if let Some(reduction) = canonical_case_fold::try_count(request, limits)? {
         return Ok(reduction);
     }
+    if let Some(reduction) = try_unicode_folded_literal_count(request, limits)? {
+        return Ok(reduction);
+    }
     let pattern = one_fre_pattern(request)?;
     let regex = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
@@ -13582,6 +13872,9 @@ fn fre_aggregate_span_sum(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_span_sum(request, limits);
     }
+    if let Some(reduction) = try_unicode_folded_literal_span_sum(request, limits)? {
+        return Ok(reduction);
+    }
     let pattern = one_fre_pattern(request)?;
     let regex = AggregateBuilder::new(pattern)
         .profile(rebar_profile())
@@ -13607,6 +13900,115 @@ fn fre_aggregate_span_sum(
         })?;
     let plan = aggregate_single_plan_label("count-spans", regex.build_report());
     Ok(FreReduction { actual, plan })
+}
+
+fn validate_unicode_folded_literal_policy(
+    upper: fre::UnicodeFoldedLiteralRunUpperBounds,
+    limits: &RunLimits,
+) -> Result<UnicodeFoldedLiteralRunLimits, ExecutionError> {
+    if upper.work > limits.fre_aggregate_operation_work {
+        return Err(ExecutionError::unsupported(format!(
+            "FRE Unicode folded-literal work requires {}, limit is {}",
+            upper.work, limits.fre_aggregate_operation_work
+        )));
+    }
+    if upper.reducer_steps > usize::try_from(limits.reducer_steps).unwrap_or(usize::MAX) {
+        return Err(ExecutionError::unsupported(format!(
+            "FRE Unicode folded-literal reducer steps require {}, limit is {}",
+            upper.reducer_steps, limits.reducer_steps
+        )));
+    }
+    Ok(UnicodeFoldedLiteralRunLimits::exact(upper))
+}
+
+fn try_unicode_folded_literal_count(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    let [pattern] = request.patterns else {
+        return Ok(None);
+    };
+    let attempt = unicode_folded_literal_builder(
+        pattern.clone(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )?
+    .build_count()
+    .map_err(|error| unicode_folded_literal_build_error(&error))?;
+    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
+        return Ok(None);
+    };
+    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), limits) {
+        return Ok(None);
+    }
+    if regex.build_report().algorithm != UNICODE_FOLDED_LITERAL_ALGORITHM_ID
+        || regex.build_report().operation != UnicodeFoldedLiteralOperation::Count
+    {
+        return Err(ExecutionError::fault(
+            "FRE Unicode folded-literal Count identity mismatch",
+        ));
+    }
+    let upper = regex
+        .full_window_upper_bounds(request.haystack.len())
+        .map_err(|error| {
+            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal Count preflight")
+        })?;
+    let run_limits = validate_unicode_folded_literal_policy(upper, limits)?;
+    let result = regex
+        .execute(request.haystack, run_limits)
+        .map_err(|error| {
+            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal Count")
+        })?;
+    Ok(Some(FreReduction {
+        actual: result.value,
+        plan: UNICODE_FOLDED_LITERAL_PLAN,
+    }))
+}
+
+fn try_unicode_folded_literal_span_sum(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    let [pattern] = request.patterns else {
+        return Ok(None);
+    };
+    let attempt = unicode_folded_literal_builder(
+        pattern.clone(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )?
+    .build_span_sum()
+    .map_err(|error| unicode_folded_literal_build_error(&error))?;
+    let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
+        return Ok(None);
+    };
+    if !unicode_folded_literal_displaces_packed_finite_language(regex.build_report(), limits) {
+        return Ok(None);
+    }
+    if regex.build_report().algorithm != UNICODE_FOLDED_LITERAL_ALGORITHM_ID
+        || regex.build_report().operation != UnicodeFoldedLiteralOperation::SpanSum
+    {
+        return Err(ExecutionError::fault(
+            "FRE Unicode folded-literal SpanSum identity mismatch",
+        ));
+    }
+    let upper = regex
+        .full_window_upper_bounds(request.haystack.len())
+        .map_err(|error| {
+            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal SpanSum preflight")
+        })?;
+    let run_limits = validate_unicode_folded_literal_policy(upper, limits)?;
+    let result = regex
+        .execute(request.haystack, run_limits)
+        .map_err(|error| {
+            unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal SpanSum")
+        })?;
+    Ok(Some(FreReduction {
+        actual: result.value,
+        plan: UNICODE_FOLDED_LITERAL_PLAN,
+    }))
 }
 
 fn aggregate_many_build_limits(limits: &RunLimits) -> AggregateManyBuildLimits {
@@ -19698,7 +20100,9 @@ mod tests {
                         case.haystack.len(),
                     );
                 }
-                CurrentFreAggregateOperationInner::CountMany(_, _)
+                CurrentFreAggregateOperationInner::CountFolded(_, _)
+                | CurrentFreAggregateOperationInner::SpanSumFolded(_, _)
+                | CurrentFreAggregateOperationInner::CountMany(_, _)
                 | CurrentFreAggregateOperationInner::SpanSumMany(_, _) => {
                     panic!(
                         "{} unexpectedly selected a multi-pattern lifecycle",
@@ -20659,7 +21063,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-unicode-folded-literal-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -22309,6 +22713,72 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unicode_folded_literal_routes_semantic_and_reusable_lifecycles() {
+        let pattern = "Шерлок Холмс";
+        let patterns = [pattern.to_string()];
+        let haystack = "xx Шерлок Холмс yy шерлок холмс zz".as_bytes();
+        let limits = RunLimits::default();
+        assert_current_fre_execution(
+            current_fre("count", &patterns, haystack, true, true, &limits),
+            2,
+            UNICODE_FOLDED_LITERAL_PLAN,
+        );
+        assert_current_fre_execution(
+            current_fre("count-spans", &patterns, haystack, true, true, &limits),
+            u64::try_from(pattern.len().checked_mul(2).unwrap()).unwrap(),
+            UNICODE_FOLDED_LITERAL_PLAN,
+        );
+        for (model, expected) in [
+            ("count", 2),
+            (
+                "count-spans",
+                u64::try_from(pattern.len().checked_mul(2).unwrap()).unwrap(),
+            ),
+        ] {
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                model,
+                &patterns,
+                true,
+                true,
+                haystack.len(),
+            )
+            .expect("folded-literal lifecycle");
+            assert_eq!(lifecycle.plan(), UNICODE_FOLDED_LITERAL_PLAN);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first operation"),
+                expected
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady operation"),
+                expected
+            );
+            let counters = lifecycle
+                .execute_with_counters(haystack)
+                .expect("out-of-band folded counters");
+            assert_eq!(counters.value(), expected);
+            assert!(matches!(
+                counters.receipt_status(),
+                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+            ));
+        }
+    }
+
+    #[test]
+    fn unicode_folded_literal_unsupported_hir_falls_through() {
+        let unsupported = [r"Ш+".to_string()];
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &unsupported,
+            true,
+            true,
+            "ШШ".len(),
+        )
+        .expect("unsupported folded shape falls through");
+        assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+        assert_eq!(lifecycle.execute("ШШ".as_bytes()).unwrap(), 1);
     }
 
     #[test]

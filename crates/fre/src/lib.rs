@@ -69,7 +69,19 @@ mod text;
 mod text_match;
 mod text_set;
 mod token_phrase;
+mod unicode_folded_literal;
 mod unicode_word_run;
+
+pub use unicode_folded_literal::{
+    UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
+    UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID, UnicodeFoldedLiteralBuildAttempt,
+    UnicodeFoldedLiteralBuildError, UnicodeFoldedLiteralBuildLimits,
+    UnicodeFoldedLiteralBuildReport, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
+    UnicodeFoldedLiteralIneligibility, UnicodeFoldedLiteralOperation,
+    UnicodeFoldedLiteralPlannerAccounting, UnicodeFoldedLiteralRunError,
+    UnicodeFoldedLiteralRunLimits, UnicodeFoldedLiteralRunReceipt, UnicodeFoldedLiteralRunResult,
+    UnicodeFoldedLiteralRunUpperBounds, UnicodeFoldedLiteralSpanSumRegex,
+};
 
 pub use aggregate::{
     AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
@@ -279,6 +291,9 @@ pub use fre_kernels::{
     ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID, ANCHORED_LINE_CAPTURE_MAX_ATOMS,
     ANCHORED_LINE_CAPTURE_PLAN_ID, AnchoredLineCaptureCountResult, AnchoredLineCaptureRunActual,
     AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredLineCaptureRunUpperBounds,
+    FoldedLiteralTrieBuildError, FoldedLiteralTrieBuildLimits, FoldedLiteralTrieScanAttemptError,
+    FoldedLiteralTrieScanError, FoldedLiteralTrieScanLimits,
+    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
 };
 pub use fre_kernels::{
     AsciiSelection as SimdAsciiSelection, DispatchPolicy as SimdDispatchPolicy,
