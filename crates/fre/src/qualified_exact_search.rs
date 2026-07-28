@@ -1,6 +1,7 @@
 //! Experimental, explicit opt-in routing for the narrow exact-literal JIT leaf.
 
 use core::fmt;
+use std::sync::OnceLock;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -11,6 +12,10 @@ mod qualification_subject;
 use fre_jit_aarch64::{
     BackendVersion, EmitError, EmitLimits, ImageStats, SelectedEndRegisterBackendV2, TargetSpec,
     emit_audited_with_backend, emit_selected_end_register_v2,
+};
+use fre_jit_cache::{
+    CacheCreateError, CacheError, CacheLimits, SelectedEndRegisterCacheErrorV2,
+    SelectedEndRegisterCacheV2, SelectedEndRegisterLeaseV2,
 };
 use fre_jit_runtime::{
     CallError, PublicationAccounting, PublicationLimits, PublishError, PublishedKernel,
@@ -461,6 +466,33 @@ pub struct QualifiedExactSearchNativeIdentity {
     pub required_thread_sve_vector_bytes: Option<u16>,
 }
 
+/// Typed reason the bounded process cache could not retain an ABI2 route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QualifiedExactSearchCacheUnavailable {
+    /// The bounded process cache could not reserve its bookkeeping arrays.
+    Create(CacheCreateError),
+    /// This lookup was refused or failed a cache-owned contract check.
+    Request(SelectedEndRegisterCacheErrorV2),
+}
+
+impl fmt::Display for QualifiedExactSearchCacheUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "qualified exact-search native cache unavailable: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for QualifiedExactSearchCacheUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Create(error) => Some(error),
+            Self::Request(error) => Some(error),
+        }
+    }
+}
+
 /// Native publication state retained by a qualified exact matcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QualifiedExactSearchNativeStatus {
@@ -494,6 +526,13 @@ pub enum QualifiedExactSearchNativeStatus {
     /// Searches safely retain the portable route, and the complete typed
     /// reason remains inspectable instead of becoming a silent fallback.
     Unavailable(PublishError),
+    /// The default ABI2 cache could not serve this request.
+    ///
+    /// Searches safely retain the portable route. Kernel-IR, emission, and
+    /// publication failures retain their existing dedicated status/error
+    /// routes; this variant covers cache construction, admission, accounting,
+    /// and cache-owned contract failures.
+    CacheUnavailable(QualifiedExactSearchCacheUnavailable),
     /// This source revision does not expose an invocation ABI for a retired
     /// candidate backend.
     UnsupportedBackendAbi {
@@ -641,7 +680,23 @@ pub struct QualifiedExactSearch {
 #[derive(Debug)]
 enum QualifiedExactSearchNative {
     LegacyV1(PublishedKernel<NativeSelectedEnd>),
-    RegisterV2(PublishedSelectedEndRegisterV2),
+    RegisterV2(QualifiedExactSearchRegisterV2Owner),
+}
+
+#[derive(Debug)]
+enum QualifiedExactSearchRegisterV2Owner {
+    Owned(PublishedSelectedEndRegisterV2),
+    Cached(SelectedEndRegisterLeaseV2),
+}
+
+impl QualifiedExactSearchRegisterV2Owner {
+    #[inline]
+    fn kernel(&self) -> &PublishedSelectedEndRegisterV2 {
+        match self {
+            Self::Owned(kernel) => kernel,
+            Self::Cached(lease) => lease.kernel(),
+        }
+    }
 }
 
 impl QualifiedExactSearchNative {
@@ -657,11 +712,59 @@ impl QualifiedExactSearchNative {
             Self::LegacyV1(native) => native
                 .begin_current_thread_session()
                 .map(QualifiedExactSearchNativeThreadSession::LegacyV1),
-            Self::RegisterV2(native) => native
+            Self::RegisterV2(owner) => owner
+                .kernel()
                 .begin_current_thread_session_for_literal_plan(literal_plan)
                 .map(QualifiedExactSearchNativeThreadSession::RegisterV2),
         }
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the ownership-transfer boundary keeps the authenticated backend, artifact, image, mapping, and qualification receipts explicit"
+)]
+fn retained_selected_end_register_v2(
+    owner: QualifiedExactSearchRegisterV2Owner,
+    backend_policy: QualifiedExactSearchBackendPolicy,
+    qualification: QualifiedExactSearchQualification,
+    target: TargetSpec,
+    backend: BackendVersion,
+    artifact_sha256: [u8; 32],
+    image: ImageStats,
+    mapping: PublicationAccounting,
+) -> (
+    Option<QualifiedExactSearchNative>,
+    QualifiedExactSearchNativeStatus,
+) {
+    let abi = QualifiedExactSearchNativeAbi::SelectedEndRegisterV2;
+    let sve_vector_bytes_at_publication = None;
+    let required_thread_sve_vector_bytes =
+        match owner.kernel().backend().fixed_active_vector_bytes() {
+            0 => None,
+            bytes => Some(bytes),
+        };
+    let identity = QualifiedExactSearchNativeIdentity {
+        backend_policy,
+        target,
+        backend,
+        abi,
+        artifact_sha256,
+        qualification,
+        sve_vector_bytes_at_publication,
+        required_thread_sve_vector_bytes,
+    };
+    (
+        Some(QualifiedExactSearchNative::RegisterV2(owner)),
+        QualifiedExactSearchNativeStatus::Published {
+            image,
+            mapping,
+            abi,
+            sve_vector_bytes_at_publication,
+            required_thread_sve_vector_bytes,
+            identity,
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -744,6 +847,20 @@ fn qualified_exact_search_backend_support(
     } else {
         native_search_backend_support(backend_policy.backend_version())
     }
+}
+
+static DEFAULT_SELECTED_END_REGISTER_CACHE_V2: OnceLock<
+    Result<SelectedEndRegisterCacheV2, CacheCreateError>,
+> = OnceLock::new();
+
+fn default_selected_end_register_cache_v2()
+-> Result<&'static SelectedEndRegisterCacheV2, CacheCreateError> {
+    DEFAULT_SELECTED_END_REGISTER_CACHE_V2
+        .get_or_init(|| {
+            SelectedEndRegisterCacheV2::new(CacheLimits::default(), PublicationLimits::default())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 impl QualifiedExactSearch {
@@ -1001,87 +1118,118 @@ impl QualifiedExactSearch {
             .unwrap_or_else(|| qualified_exact_search_backend_support(backend_policy))
         {
             (None, QualifiedExactSearchNativeStatus::Unavailable(error))
-        } else {
-            let program = build_exact_literal::<NativeSelectedEnd>(
-                portable.needle(),
-                AnchorFlags::default(),
-                validation_limits,
-            )?;
-            if let Some(register_backend) = selected_end_register_backend_v2(backend_policy) {
+        } else if let Some(register_backend) = selected_end_register_backend_v2(backend_policy) {
+            if publication_limits == PublicationLimits::default() {
+                match default_selected_end_register_cache_v2() {
+                    Ok(cache) => match cache.get_or_compile_exact_literal(
+                        portable.needle(),
+                        AnchorFlags::default(),
+                        register_backend,
+                        validation_limits,
+                        emission_limits,
+                    ) {
+                        Ok(lease) => {
+                            let target = lease.target();
+                            let backend = lease.backend_version();
+                            let artifact_sha256 = *lease.artifact_identity().as_bytes();
+                            let image = lease.image_stats();
+                            let mapping = lease.accounting();
+                            retained_selected_end_register_v2(
+                                QualifiedExactSearchRegisterV2Owner::Cached(lease),
+                                backend_policy,
+                                qualification,
+                                target,
+                                backend,
+                                artifact_sha256,
+                                image,
+                                mapping,
+                            )
+                        }
+                        Err(CacheError::KernelIr(error)) => return Err(error.into()),
+                        Err(CacheError::Emit(error)) => return Err(error.into()),
+                        Err(CacheError::Publish(error)) => {
+                            (None, QualifiedExactSearchNativeStatus::Unavailable(error))
+                        }
+                        Err(error) => (
+                            None,
+                            QualifiedExactSearchNativeStatus::CacheUnavailable(
+                                QualifiedExactSearchCacheUnavailable::Request(error),
+                            ),
+                        ),
+                    },
+                    Err(error) => (
+                        None,
+                        QualifiedExactSearchNativeStatus::CacheUnavailable(
+                            QualifiedExactSearchCacheUnavailable::Create(error),
+                        ),
+                    ),
+                }
+            } else {
+                let program = build_exact_literal::<NativeSelectedEnd>(
+                    portable.needle(),
+                    AnchorFlags::default(),
+                    validation_limits,
+                )?;
                 let audited_image =
                     emit_selected_end_register_v2(&program, register_backend, emission_limits)?;
                 let image_stats = audited_image.stats();
                 match publish_selected_end_register_v2(&audited_image, publication_limits) {
                     Ok(kernel) => {
                         let mapping = kernel.accounting();
-                        let abi = QualifiedExactSearchNativeAbi::SelectedEndRegisterV2;
-                        let sve_vector_bytes_at_publication = None;
-                        let required_thread_sve_vector_bytes =
-                            match kernel.backend().fixed_active_vector_bytes() {
-                                0 => None,
-                                bytes => Some(bytes),
-                            };
-                        let identity = QualifiedExactSearchNativeIdentity {
+                        retained_selected_end_register_v2(
+                            QualifiedExactSearchRegisterV2Owner::Owned(kernel),
                             backend_policy,
-                            target: audited_image.target(),
-                            backend: audited_image.backend_version(),
-                            abi,
-                            artifact_sha256: *audited_image.artifact_identity().as_bytes(),
                             qualification,
-                            sve_vector_bytes_at_publication,
-                            required_thread_sve_vector_bytes,
-                        };
-                        (
-                            Some(QualifiedExactSearchNative::RegisterV2(kernel)),
-                            QualifiedExactSearchNativeStatus::Published {
-                                image: image_stats,
-                                mapping,
-                                abi,
-                                sve_vector_bytes_at_publication,
-                                required_thread_sve_vector_bytes,
-                                identity,
-                            },
+                            audited_image.target(),
+                            audited_image.backend_version(),
+                            *audited_image.artifact_identity().as_bytes(),
+                            image_stats,
+                            mapping,
                         )
                     }
                     Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
                 }
-            } else {
-                debug_assert!(legacy_selected_end_v1_backend(backend_policy));
-                let audited_image =
-                    emit_audited_with_backend(&program, backend_policy, emission_limits)?;
-                let image = audited_image.as_image();
-                let image_stats = image.stats();
-                match publish_audited::<NativeSelectedEnd>(&audited_image, publication_limits) {
-                    Ok(kernel) => {
-                        let mapping = kernel.accounting();
-                        let abi = QualifiedExactSearchNativeAbi::LegacySelectedEndV1;
-                        let sve_vector_bytes_at_publication =
-                            kernel.sve_vector_bytes_at_publication();
-                        let required_thread_sve_vector_bytes = sve_vector_bytes_at_publication;
-                        let identity = QualifiedExactSearchNativeIdentity {
-                            backend_policy,
-                            target: image.target(),
-                            backend: image.backend_version(),
+            }
+        } else {
+            debug_assert!(legacy_selected_end_v1_backend(backend_policy));
+            let program = build_exact_literal::<NativeSelectedEnd>(
+                portable.needle(),
+                AnchorFlags::default(),
+                validation_limits,
+            )?;
+            let audited_image =
+                emit_audited_with_backend(&program, backend_policy, emission_limits)?;
+            let image = audited_image.as_image();
+            let image_stats = image.stats();
+            match publish_audited::<NativeSelectedEnd>(&audited_image, publication_limits) {
+                Ok(kernel) => {
+                    let mapping = kernel.accounting();
+                    let abi = QualifiedExactSearchNativeAbi::LegacySelectedEndV1;
+                    let sve_vector_bytes_at_publication = kernel.sve_vector_bytes_at_publication();
+                    let required_thread_sve_vector_bytes = sve_vector_bytes_at_publication;
+                    let identity = QualifiedExactSearchNativeIdentity {
+                        backend_policy,
+                        target: image.target(),
+                        backend: image.backend_version(),
+                        abi,
+                        artifact_sha256: *image.artifact_identity().as_bytes(),
+                        qualification,
+                        sve_vector_bytes_at_publication,
+                        required_thread_sve_vector_bytes,
+                    };
+                    (
+                        Some(QualifiedExactSearchNative::LegacyV1(kernel)),
+                        QualifiedExactSearchNativeStatus::Published {
+                            image: image_stats,
+                            mapping,
                             abi,
-                            artifact_sha256: *image.artifact_identity().as_bytes(),
-                            qualification,
                             sve_vector_bytes_at_publication,
                             required_thread_sve_vector_bytes,
-                        };
-                        (
-                            Some(QualifiedExactSearchNative::LegacyV1(kernel)),
-                            QualifiedExactSearchNativeStatus::Published {
-                                image: image_stats,
-                                mapping,
-                                abi,
-                                sve_vector_bytes_at_publication,
-                                required_thread_sve_vector_bytes,
-                                identity,
-                            },
-                        )
-                    }
-                    Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
+                            identity,
+                        },
+                    )
                 }
+                Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
             }
         };
         Ok(Self {
@@ -2227,7 +2375,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one source seal keeps publication typing, session-only ABI2 invocation, and the authoritative-preflight handoff together"
+        reason = "one source seal keeps cache ownership, gate ordering, session-only ABI2 invocation, and the authoritative-preflight handoff together"
     )]
     fn public_native_abi2_and_single_preflight_boundaries_are_source_sealed() {
         fn position(source: &str, marker: &str) -> usize {
@@ -2245,7 +2393,10 @@ mod tests {
             );
         let owner = &source[owner_start..owner_end];
         assert!(owner.contains("LegacyV1(PublishedKernel<NativeSelectedEnd>)"));
-        assert!(owner.contains("RegisterV2(PublishedSelectedEndRegisterV2)"));
+        assert!(owner.contains("RegisterV2(QualifiedExactSearchRegisterV2Owner)"));
+        assert!(owner.contains("Owned(PublishedSelectedEndRegisterV2)"));
+        assert!(owner.contains("Cached(SelectedEndRegisterLeaseV2)"));
+        assert!(owner.contains("Self::Cached(lease) => lease.kernel()"));
 
         let session_start = position(
             source,
@@ -2270,6 +2421,7 @@ mod tests {
         assert!(
             native_session.contains(".begin_current_thread_session_for_literal_plan(literal_plan)")
         );
+        assert!(native_session.contains(".kernel()"));
 
         let construction_start = position(
             source,
@@ -2285,6 +2437,28 @@ mod tests {
         assert!(construction.contains("publish_selected_end_register_v2("));
         assert!(construction.contains("emit_audited_with_backend("));
         assert!(construction.contains("publish_audited::<NativeSelectedEnd>("));
+        assert!(construction.contains("QualifiedExactSearchRegisterV2Owner::Cached(lease)"));
+        assert!(construction.contains("QualifiedExactSearchRegisterV2Owner::Owned(kernel)"));
+        let literal_gate = position(construction, "literal_bytes !=");
+        let workload_gate = position(construction, "!workload.is_qualified()");
+        let qualification_gate = position(
+            construction,
+            "!qualification_authorizes_native_execution(qualification)",
+        );
+        let host_gate = position(
+            construction,
+            "qualified_exact_search_backend_support(backend_policy)",
+        );
+        let cache_lookup = position(construction, "cache.get_or_compile_exact_literal(");
+        let direct_kernel_ir = position(
+            construction,
+            "let program = build_exact_literal::<NativeSelectedEnd>(",
+        );
+        assert!(literal_gate < workload_gate);
+        assert!(workload_gate < qualification_gate);
+        assert!(qualification_gate < host_gate);
+        assert!(host_gate < cache_lookup);
+        assert!(cache_lookup < direct_kernel_ir);
 
         let sessionless_start = position(
             source,

@@ -107,8 +107,13 @@ an open P0 row.
   under the current admission fence.
 - [x] `fre-jit-cache`: bounded typed single-flight publication, deterministic
   eviction, exact live mapping/code/data accounting across leases, forced
-  retirement-race recovery, and O(1) allocation-free image identity access;
-  36 focused emitter/runtime/cache tests pass on host AArch64.
+  retirement-race recovery, and O(1) allocation-free image identity access.
+  The ABI2 cache now owns the complete pre-emission compile request and the
+  default-policy qualified facade retains its lease after all eligibility,
+  authority, and host gates. Repeated plan-bound sessions do not touch cache
+  state. The previous host-AArch64 checkpoint passed 36 focused
+  emitter/runtime/cache tests; the current cache/facade composition is
+  source-audited but remains unbuilt under the admission fence.
 - [x] `fre-capi`: versioned C11 records/symbols and a move-only nonthrowing
   C++17 wrapper for the current Rust-bytes single-search subset. Nine Rust
   tests plus debug/release exact-symbol and C/C++ compile/link/run smokes pass;
@@ -291,7 +296,11 @@ the versioned low-level Search-v1 APIs remain separate, and tag-21 P2b AOT
 retains the same sealed ABI2 image in a deterministic
 ELF/direct-hidden-glue bundle. The qualified JIT facade binds each callable
 session once to the exact portable literal plan, so a successful preflighted
-hot call uses only plan identity before native invocation. P2b still has
+hot call uses only plan identity before native invocation. Default-policy
+ABI2 construction now retains a lease from a bounded process-local
+pre-emission cache; cache lookup happens only after every eligibility,
+authority, ABI, and host gate, and never in the hot session. Custom publication
+limits retain direct mapping ownership. P2b still has
 `RuntimeAuthority::Absent`, no completed post-link observation, and no
 production authority row. Its default-off qualification-private consumer owns
 a consumed same-thread token inside the generated nominal binding without

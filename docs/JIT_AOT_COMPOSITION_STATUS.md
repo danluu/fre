@@ -58,6 +58,19 @@ the retained portable owner. Versioned low-level Search-v1 tag-19 emit/publish
 APIs remain distinct research/compatibility surfaces; their result-slot
 evidence cannot authorize this facade ABI2 route.
 
+For default publication limits, those ABI2 routes now consult one bounded
+process-local pre-emission cache only after the literal-width, workload,
+qualification, ABI, and host-support gates pass. A hit skips KIR construction,
+emission, image audit, executable mapping, and publication. The matcher owns a
+cache lease, and its plan-bound current-thread session borrows the retained
+publication; no cache lookup, mutex, or lease clone occurs in a repeated hot
+search. Cache construction/admission/accounting failures remain typed,
+observable portable fallbacks. Kernel-IR and emission errors remain build
+errors, publication errors retain the existing unavailable status, and
+nondefault publication limits retain the direct owned-publication path. This
+source checkpoint has not been built or benchmarked under the active admission
+fence.
+
 When independently authorized, automatic selection prefers tag 21 on an
 admitted Arm `0x41/0xd84` ASIMD+SVE+SVE2 host, then considers tag 10, tag 19,
 and V8 under their own authority. Tags 19 and 21 do not pin or query VL at

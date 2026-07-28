@@ -9,7 +9,11 @@ publish = false
 
 [features]
 default = ["qualified-exact-search-jit"]
-qualified-exact-search-jit = ["dep:fre-jit-aarch64", "dep:fre-jit-runtime"]
+qualified-exact-search-jit = [
+    "dep:fre-jit-aarch64",
+    "dep:fre-jit-cache",
+    "dep:fre-jit-runtime",
+]
 explicit-search-span-aot = ["dep:fre-aot-static-runtime"]
 static-dispatch = ["fre-kernels/static-dispatch"]
 static-dispatch-arm-41-d84 = [
@@ -24,6 +28,7 @@ fre-automata = { path = "../fre-automata" }
 fre-capture-lab = { path = "../fre-capture-lab" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-jit-aarch64 = { path = "../fre-jit-aarch64", optional = true }
+fre-jit-cache = { path = "../fre-jit-cache", optional = true }
 fre-jit-runtime = { path = "../fre-jit-runtime", optional = true }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }

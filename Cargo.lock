@@ -103,6 +103,7 @@ dependencies = [
  "fre-capture-lab",
  "fre-exact-alloc",
  "fre-jit-aarch64",
+ "fre-jit-cache",
  "fre-jit-runtime",
  "fre-kernel-ir",
  "fre-kernels",
