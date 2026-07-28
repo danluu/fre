@@ -297,8 +297,8 @@ pub use fre_aggregate::{
     CompileAttemptIdentity as AggregateCompileAttemptIdentity,
     CompileAttemptKind as AggregateCompileAttemptKind,
     CompileAttemptReceipt as AggregateCompileAttemptReceipt,
-    CompileLimits as AggregateCompileLimits, Error as AggregateEngineError,
-    ExecutionAccounting as AggregateExecutionAccounting,
+    CompileLimits as AggregateCompileLimits, ContinuationSweepUpperBounds,
+    Error as AggregateEngineError, ExecutionAccounting as AggregateExecutionAccounting,
     OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION as AGGREGATE_OPERATION_COUNTER_RECEIPT_SCHEMA_VERSION,
     OperationAttemptError as AggregateOperationAttemptError,
     OperationAttemptIdentity as AggregateOperationAttemptIdentity,
@@ -316,7 +316,7 @@ pub use fre_aggregate::{
     OperationStructuralCounters as AggregateOperationStructuralCounters,
     OperationWorkMode as AggregateOperationWorkMode, PlanId as AggregatePlanId,
     Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
-    Unsupported as AggregateUnsupported,
+    Unsupported as AggregateUnsupported, continuation_sweep_upper_bounds,
 };
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,

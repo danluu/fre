@@ -18,11 +18,11 @@ use bstr::ByteSlice;
 #[cfg(test)]
 use fre::PortableRegex;
 use fre::{
-    AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
-    AggregateManyBuilder, AggregateManyCaptureCountRegex, AggregateManyCaptureCountSession,
-    AggregateManyCaptureRunLimits, AggregateManyPlanKind, AggregateOperationLimits,
-    AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID, PlanKind, SearchLimits,
-    SimdDispatchContext, simd_dispatch_profile,
+    AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateCountWorkspace,
+    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
+    AggregateManyCaptureCountSession, AggregateManyCaptureRunLimits, AggregateManyPlanKind,
+    AggregateOperationLimits, AggregatePlanIdentity, AggregatePlanKind, AggregateSpanSumWorkspace,
+    BOUNDED_AFFIX_PLAN_ID, PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
@@ -835,11 +835,12 @@ fn model_count(
     )?;
     let limits = current_fre_rebar_count_run_limits(benchmark.haystack.len(), &regex)?;
     let limits = &limits;
+    let mut workspace = AggregateCountWorkspace::new();
     run(
         benchmark,
         || {
             regex
-                .count_value(&benchmark.haystack, limits)
+                .count_value_with_workspace(&benchmark.haystack, limits, &mut workspace)
                 .map_err(Into::into)
         },
         Ok,
@@ -886,11 +887,12 @@ fn model_count_spans(
     )?;
     let limits = current_fre_rebar_span_sum_run_limits(benchmark.haystack.len(), &regex)?;
     let limits = &limits;
+    let mut workspace = AggregateSpanSumWorkspace::new();
     run(
         benchmark,
         || {
             regex
-                .span_sum_value(&benchmark.haystack, limits)
+                .span_sum_value_with_workspace(&benchmark.haystack, limits, &mut workspace)
                 .map_err(Into::into)
         },
         Ok,

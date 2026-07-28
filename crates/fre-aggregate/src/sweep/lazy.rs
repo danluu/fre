@@ -1,0 +1,2554 @@
+//! Persistent ordered lazy DFA for ordinary byte continuations.
+//!
+//! A DFA state is an ordered set of consuming Thompson instructions. The
+//! ordering is the VM's leftmost-first priority order. A second state bit says
+//! that a lower-priority accepting path is pending; while it is set, later
+//! start positions are not injected. A transition that reaches `Match` drops
+//! that match and every lower-priority thread while retaining higher-priority
+//! consuming threads. The pending endpoint becomes final when that retained
+//! prefix dies.
+//!
+//! Selected endpoints are sufficient for Count. SpanSum recovers the selected
+//! start with a second, unprioritized reverse lazy DFA. Selected non-overlap
+//! intervals are disjoint, so successful reverse walks add at most one extra
+//! source pass. Both transition tables belong to the caller workspace and use
+//! direct byte indexing after each transition's first observed construction.
+//! If either fixed table saturates, the just-computed frontier continues
+//! inline from the current position; no source prefix is replayed.
+
+use core::mem::size_of;
+use core::ops::Range;
+
+use fre_exact_alloc::{CopyError, ExactVec};
+
+use crate::compile::PlanId;
+use crate::error::{add, enforce, mul};
+use crate::program::{ByteSet, Inst, Program};
+use crate::{Error, OperationLimits, Resource};
+
+use super::{ContinuationSweepUpperBounds, SweepKind, SweepMeter, SweepOutcome, SweepValue};
+
+const BYTE_ALPHABET: usize = 256;
+const MAX_DFA_STATES: usize = 1_024;
+const MAX_DFA_ITEMS: usize = 1 << 20;
+const CELL_ACCEPT: u32 = 1 << 31;
+const CELL_STATE_MASK: u32 = CELL_ACCEPT - 1;
+const CELL_UNFILLED: u32 = u32::MAX;
+const NO_STATE: u32 = u32::MAX;
+
+#[derive(Debug, Default)]
+struct LazyCache {
+    rows: ExactVec<u32>,
+    offsets: ExactVec<usize>,
+    lengths: ExactVec<u32>,
+    modes: ExactVec<u8>,
+    items: ExactVec<u32>,
+    state_len: usize,
+    item_len: usize,
+    initial: u32,
+}
+
+impl LazyCache {
+    const fn new() -> Self {
+        Self {
+            rows: ExactVec::new(),
+            offsets: ExactVec::new(),
+            lengths: ExactVec::new(),
+            modes: ExactVec::new(),
+            items: ExactVec::new(),
+            state_len: 0,
+            item_len: 0,
+            initial: NO_STATE,
+        }
+    }
+
+    fn allocated(
+        state_capacity: usize,
+        item_capacity: usize,
+        total_bytes: usize,
+        meter: &mut SweepMeter,
+    ) -> Result<Self, Error> {
+        let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        Ok(Self {
+            rows: allocated_slots(row_cells, CELL_UNFILLED, total_bytes, meter)?,
+            offsets: allocated_slots(state_capacity, 0_usize, total_bytes, meter)?,
+            lengths: allocated_slots(state_capacity, 0_u32, total_bytes, meter)?,
+            modes: allocated_slots(state_capacity, 0_u8, total_bytes, meter)?,
+            items: allocated_slots(item_capacity, 0_u32, total_bytes, meter)?,
+            state_len: 0,
+            item_len: 0,
+            initial: NO_STATE,
+        })
+    }
+
+    #[inline]
+    fn state_bounds(&self, state: u32) -> Result<(usize, usize, bool), Error> {
+        let state = usize::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit usize"))?;
+        if state >= self.state_len {
+            return Err(Error::InternalInvariant(
+                "lazy DFA state ID outside retained cache",
+            ));
+        }
+        let offset = *self.offsets.get(state).ok_or(Error::InternalInvariant(
+            "lazy DFA state offset outside metadata",
+        ))?;
+        let length = usize::try_from(*self.lengths.get(state).ok_or(Error::InternalInvariant(
+            "lazy DFA state length outside metadata",
+        ))?)
+        .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit usize"))?;
+        let end = add(offset, length, Resource::ScratchBytes)?;
+        if end > self.item_len || end > self.items.len() {
+            return Err(Error::InternalInvariant(
+                "lazy DFA state items outside retained arena",
+            ));
+        }
+        let mode = *self.modes.get(state).ok_or(Error::InternalInvariant(
+            "lazy DFA state mode outside metadata",
+        ))? != 0;
+        Ok((offset, length, mode))
+    }
+
+    #[inline]
+    fn item(&self, state: u32, ordinal: usize) -> Result<u32, Error> {
+        let (offset, length, _) = self.state_bounds(state)?;
+        if ordinal >= length {
+            return Err(Error::InternalInvariant(
+                "lazy DFA item ordinal outside state",
+            ));
+        }
+        self.items
+            .get(offset + ordinal)
+            .copied()
+            .ok_or(Error::InternalInvariant("lazy DFA item outside arena"))
+    }
+
+    #[inline]
+    fn cell(&self, state: u32, byte: u8) -> Result<u32, Error> {
+        let state = usize::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit usize"))?;
+        if state >= self.state_len {
+            return Err(Error::InternalInvariant(
+                "lazy DFA transition source outside cache",
+            ));
+        }
+        let row = mul(state, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        self.rows
+            .get(row + usize::from(byte))
+            .copied()
+            .ok_or(Error::InternalInvariant(
+                "lazy DFA transition cell outside direct-index table",
+            ))
+    }
+
+    #[inline]
+    fn set_cell(&mut self, state: u32, byte: u8, cell: u32) -> Result<(), Error> {
+        let state = usize::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit usize"))?;
+        if state >= self.state_len {
+            return Err(Error::InternalInvariant(
+                "lazy DFA transition source outside cache",
+            ));
+        }
+        let row = mul(state, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        *self
+            .rows
+            .get_mut(row + usize::from(byte))
+            .ok_or(Error::InternalInvariant(
+                "lazy DFA transition cell outside direct-index table",
+            ))? = cell;
+        Ok(())
+    }
+
+    fn intern(
+        &mut self,
+        items: &[u32],
+        mode: bool,
+        meter: &mut SweepMeter,
+    ) -> Result<Interned, Error> {
+        for state in 0..self.state_len {
+            meter.charge_work(1)?;
+            if self.modes[state] != u8::from(mode) {
+                continue;
+            }
+            let offset = self.offsets[state];
+            let length = usize::try_from(self.lengths[state]).map_err(|_| {
+                Error::InternalInvariant("lazy DFA state length does not fit usize")
+            })?;
+            if length != items.len() {
+                continue;
+            }
+            let end = add(offset, length, Resource::ScratchBytes)?;
+            let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
+                "lazy DFA candidate state outside item arena",
+            ))?;
+            meter.charge_work(items.len())?;
+            if retained == items {
+                return Ok(Interned::State(u32::try_from(state).map_err(|_| {
+                    Error::InternalInvariant("lazy DFA state ID does not fit u32")
+                })?));
+            }
+        }
+        if self.state_len == self.offsets.len() {
+            return Ok(Interned::Full);
+        }
+        let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
+        if end > self.items.len() {
+            return Ok(Interned::Full);
+        }
+        let state = self.state_len;
+        meter.charge_work(items.len())?;
+        self.items[self.item_len..end].copy_from_slice(items);
+        self.offsets[state] = self.item_len;
+        self.lengths[state] = u32::try_from(items.len())
+            .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
+        self.modes[state] = u8::from(mode);
+        self.item_len = end;
+        self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
+        Ok(Interned::State(u32::try_from(state).map_err(|_| {
+            Error::InternalInvariant("lazy DFA state ID does not fit u32")
+        })?))
+    }
+
+    fn retained_bytes(&self) -> Result<usize, Error> {
+        let rows = mul(
+            self.rows.capacity(),
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?;
+        let offsets = mul(
+            self.offsets.capacity(),
+            size_of::<usize>(),
+            Resource::ScratchBytes,
+        )?;
+        let lengths = mul(
+            self.lengths.capacity(),
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?;
+        let modes = self.modes.capacity();
+        let items = mul(
+            self.items.capacity(),
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?;
+        add(
+            add(rows, offsets, Resource::ScratchBytes)?,
+            add(
+                add(lengths, modes, Resource::ScratchBytes)?,
+                items,
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Interned {
+    State(u32),
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Transition {
+    Ready(u32),
+    Inline { accepted: bool, pending: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardState {
+    Cached(u32),
+    Inline { pending: bool },
+}
+
+/// Plan-owned graph and cache storage retained across aggregate calls.
+#[derive(Debug, Default)]
+pub(super) struct Workspace {
+    plan_id: Option<PlanId>,
+    admitted: bool,
+    seen: ExactVec<u64>,
+    generation: u64,
+    scratch: ExactVec<u32>,
+    scratch_len: usize,
+    frontier: ExactVec<u32>,
+    frontier_len: usize,
+    stack: ExactVec<u32>,
+    stack_len: usize,
+    cursors: ExactVec<usize>,
+    reverse_epsilon_offsets: ExactVec<usize>,
+    reverse_epsilon_sources: ExactVec<u32>,
+    reverse_consume_offsets: ExactVec<usize>,
+    reverse_consume_sources: ExactVec<u32>,
+    reverse_consume_bytes: ExactVec<ByteSet>,
+    forward: LazyCache,
+    reverse: LazyCache,
+    saturated: bool,
+    retained_bytes: usize,
+}
+
+impl Workspace {
+    pub(super) const fn new() -> Self {
+        Self {
+            plan_id: None,
+            admitted: false,
+            seen: ExactVec::new(),
+            generation: 0,
+            scratch: ExactVec::new(),
+            scratch_len: 0,
+            frontier: ExactVec::new(),
+            frontier_len: 0,
+            stack: ExactVec::new(),
+            stack_len: 0,
+            cursors: ExactVec::new(),
+            reverse_epsilon_offsets: ExactVec::new(),
+            reverse_epsilon_sources: ExactVec::new(),
+            reverse_consume_offsets: ExactVec::new(),
+            reverse_consume_sources: ExactVec::new(),
+            reverse_consume_bytes: ExactVec::new(),
+            forward: LazyCache::new(),
+            reverse: LazyCache::new(),
+            saturated: false,
+            retained_bytes: 0,
+        }
+    }
+
+    pub(super) const fn retained_bytes(&self) -> Option<usize> {
+        if self.plan_id.is_some() {
+            Some(self.retained_bytes)
+        } else {
+            None
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        plan_id: PlanId,
+        program: &Program,
+        limits: OperationLimits,
+    ) -> Result<(bool, usize), Error> {
+        self.prepare_bounded(plan_id, program, limits, MAX_DFA_STATES, MAX_DFA_ITEMS)
+    }
+
+    fn prepare_bounded(
+        &mut self,
+        plan_id: PlanId,
+        program: &Program,
+        limits: OperationLimits,
+        state_capacity: usize,
+        max_items: usize,
+    ) -> Result<(bool, usize), Error> {
+        let upper = prospective_upper_bounds(program.insts.len(), state_capacity, max_items)?;
+        if self.plan_id == Some(plan_id) {
+            // A warmed cache is still selected under the current invocation's
+            // complete source-free policy. Recheck the same fixed-table and
+            // conservative workspace envelope used by cold preparation; a
+            // caller cannot inherit admission from an earlier, wider policy.
+            if enforce_sweep_upper_bounds(upper, limits).is_err() {
+                *self = Self::disabled(plan_id);
+                return Ok((false, 0));
+            }
+            return Ok((self.admitted, 0));
+        }
+        *self = Self::new();
+        if enforce_sweep_upper_bounds(upper, limits).is_err() {
+            *self = Self::disabled(plan_id);
+            return Ok((false, 0));
+        }
+        let built = (|| {
+            let mut meter = SweepMeter::new(limits);
+            let mut replacement = Self::build(
+                plan_id,
+                program,
+                limits,
+                state_capacity,
+                max_items,
+                &mut meter,
+            )?;
+            replacement.initialize(program, &mut meter)?;
+            replacement.admitted = true;
+            replacement.retained_bytes = replacement.actual_retained_bytes()?;
+            enforce_workspace_bytes(replacement.retained_bytes, limits)?;
+            Ok::<_, Error>((replacement, meter.work))
+        })();
+        let (replacement, work) = match built {
+            Ok(result) => result,
+            Err(error) => {
+                *self = Self::new();
+                return Err(error);
+            }
+        };
+        *self = replacement;
+        Ok((true, work))
+    }
+
+    fn disabled(plan_id: PlanId) -> Self {
+        Self {
+            plan_id: Some(plan_id),
+            ..Self::new()
+        }
+    }
+
+    fn build(
+        plan_id: PlanId,
+        program: &Program,
+        limits: OperationLimits,
+        state_capacity: usize,
+        max_items: usize,
+        meter: &mut SweepMeter,
+    ) -> Result<Self, Error> {
+        let states = program.insts.len();
+        if states == 0 {
+            return Err(Error::InternalInvariant(
+                "lazy continuation requires a nonempty program",
+            ));
+        }
+        if states > u32::MAX as usize {
+            return Err(Error::ArithmeticOverflow {
+                resource: Resource::ProgramStates,
+            });
+        }
+        let mut epsilon_edges = 0_usize;
+        let mut consume_edges = 0_usize;
+        for inst in &program.insts {
+            meter.charge_work(1)?;
+            match inst {
+                Inst::Split { .. } | Inst::RootSplit { .. } => {
+                    epsilon_edges = add(epsilon_edges, 2, Resource::ScratchBytes)?;
+                }
+                Inst::Consume { .. } => {
+                    consume_edges = add(consume_edges, 1, Resource::ScratchBytes)?;
+                }
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "lazy continuation reached an unfilled program state",
+                    ));
+                }
+                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                    return Err(Error::InternalInvariant(
+                        "lazy continuation admitted an unsupported instruction",
+                    ));
+                }
+                Inst::Fail | Inst::Match => {}
+            }
+        }
+        let item_capacity = mul(states, state_capacity, Resource::ScratchBytes)?
+            .min(max_items)
+            .max(states);
+        let stack_slots = add(
+            mul(states, 2, Resource::ScratchBytes)?,
+            1,
+            Resource::ScratchBytes,
+        )?;
+        let logical_bytes = logical_workspace_bytes(
+            states,
+            stack_slots,
+            epsilon_edges,
+            consume_edges,
+            state_capacity,
+            item_capacity,
+        )?;
+        enforce_workspace_bytes(logical_bytes, limits)?;
+
+        let mut output = Self {
+            plan_id: Some(plan_id),
+            admitted: false,
+            seen: allocated_slots(states, 0_u64, logical_bytes, meter)?,
+            generation: 0,
+            scratch: allocated_slots(states, 0_u32, logical_bytes, meter)?,
+            scratch_len: 0,
+            frontier: allocated_slots(states, 0_u32, logical_bytes, meter)?,
+            frontier_len: 0,
+            stack: allocated_slots(stack_slots, 0_u32, logical_bytes, meter)?,
+            stack_len: 0,
+            cursors: allocated_slots(states, 0_usize, logical_bytes, meter)?,
+            reverse_epsilon_offsets: allocated_slots(
+                add(states, 1, Resource::ScratchBytes)?,
+                0_usize,
+                logical_bytes,
+                meter,
+            )?,
+            reverse_epsilon_sources: allocated_slots(epsilon_edges, 0_u32, logical_bytes, meter)?,
+            reverse_consume_offsets: allocated_slots(
+                add(states, 1, Resource::ScratchBytes)?,
+                0_usize,
+                logical_bytes,
+                meter,
+            )?,
+            reverse_consume_sources: allocated_slots(consume_edges, 0_u32, logical_bytes, meter)?,
+            reverse_consume_bytes: allocated_slots(
+                consume_edges,
+                ByteSet::empty(),
+                logical_bytes,
+                meter,
+            )?,
+            forward: LazyCache::allocated(state_capacity, item_capacity, logical_bytes, meter)?,
+            reverse: LazyCache::allocated(state_capacity, item_capacity, logical_bytes, meter)?,
+            saturated: false,
+            retained_bytes: 0,
+        };
+        output.build_reverse_graph(program, meter)?;
+        Ok(output)
+    }
+
+    fn build_reverse_graph(
+        &mut self,
+        program: &Program,
+        meter: &mut SweepMeter,
+    ) -> Result<(), Error> {
+        let states = program.insts.len();
+        for inst in &program.insts {
+            meter.charge_work(1)?;
+            match inst {
+                Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
+                } => {
+                    meter.charge_work(2)?;
+                    increment_edge_count(&mut self.reverse_epsilon_offsets, *preferred, states)?;
+                    increment_edge_count(&mut self.reverse_epsilon_offsets, *fallback, states)?;
+                }
+                Inst::Consume { next, .. } => {
+                    meter.charge_work(1)?;
+                    increment_edge_count(&mut self.reverse_consume_offsets, *next, states)?;
+                }
+                Inst::Unfilled
+                | Inst::Fail
+                | Inst::Match
+                | Inst::ConsumeScalar { .. }
+                | Inst::Assert { .. } => {}
+            }
+        }
+        prefix_counts(&mut self.reverse_epsilon_offsets, meter)?;
+        prefix_counts(&mut self.reverse_consume_offsets, meter)?;
+
+        meter.charge_work(states)?;
+        self.cursors
+            .copy_from_slice(&self.reverse_epsilon_offsets[..states]);
+        for (pc, inst) in program.insts.iter().enumerate() {
+            meter.charge_work(1)?;
+            let source = u32::try_from(pc).map_err(|_| {
+                Error::InternalInvariant("program state does not fit lazy DFA item")
+            })?;
+            match inst {
+                Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
+                } => {
+                    meter.charge_work(2)?;
+                    fill_source(
+                        &mut self.cursors,
+                        &mut self.reverse_epsilon_sources,
+                        *preferred,
+                        source,
+                    )?;
+                    fill_source(
+                        &mut self.cursors,
+                        &mut self.reverse_epsilon_sources,
+                        *fallback,
+                        source,
+                    )?;
+                }
+                Inst::Unfilled
+                | Inst::Fail
+                | Inst::Match
+                | Inst::Consume { .. }
+                | Inst::ConsumeScalar { .. }
+                | Inst::Assert { .. } => {}
+            }
+        }
+
+        meter.charge_work(states)?;
+        self.cursors
+            .copy_from_slice(&self.reverse_consume_offsets[..states]);
+        for (pc, inst) in program.insts.iter().enumerate() {
+            meter.charge_work(1)?;
+            if let Inst::Consume { bytes, next } = inst {
+                meter.charge_work(1)?;
+                let source = u32::try_from(pc).map_err(|_| {
+                    Error::InternalInvariant("program state does not fit lazy DFA item")
+                })?;
+                let slot = *self.cursors.get(*next).ok_or(Error::InternalInvariant(
+                    "reverse consume destination outside cursor table",
+                ))?;
+                *self
+                    .reverse_consume_sources
+                    .get_mut(slot)
+                    .ok_or(Error::InternalInvariant(
+                        "reverse consume source outside edge arena",
+                    ))? = source;
+                *self
+                    .reverse_consume_bytes
+                    .get_mut(slot)
+                    .ok_or(Error::InternalInvariant(
+                        "reverse consume byte set outside edge arena",
+                    ))? = *bytes;
+                self.cursors[*next] = add(slot, 1, Resource::ScratchBytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn initialize(&mut self, program: &Program, meter: &mut SweepMeter) -> Result<(), Error> {
+        self.begin_closure(meter)?;
+        let accepted = self.expand_forward(program, program.entry, meter)?;
+        if accepted {
+            return Err(Error::InternalInvariant(
+                "non-nullable lazy continuation accepted its initial boundary",
+            ));
+        }
+        let initial = match self
+            .forward
+            .intern(&self.scratch[..self.scratch_len], false, meter)?
+        {
+            Interned::State(state) => state,
+            Interned::Full => {
+                return Err(Error::InternalInvariant(
+                    "lazy forward cache cannot retain its initial state",
+                ));
+            }
+        };
+        self.forward.initial = initial;
+
+        self.begin_closure(meter)?;
+        for (pc, inst) in program.insts.iter().enumerate() {
+            meter.charge_work(1)?;
+            if matches!(inst, Inst::Match) {
+                self.expand_reverse(
+                    u32::try_from(pc).map_err(|_| {
+                        Error::InternalInvariant("program state does not fit lazy DFA item")
+                    })?,
+                    meter,
+                )?;
+            }
+        }
+        sort_exact(&mut self.scratch[..self.scratch_len], meter)?;
+        let reverse_initial =
+            match self
+                .reverse
+                .intern(&self.scratch[..self.scratch_len], false, meter)?
+            {
+                Interned::State(state) => state,
+                Interned::Full => {
+                    return Err(Error::InternalInvariant(
+                        "lazy reverse cache cannot retain its initial state",
+                    ));
+                }
+            };
+        self.reverse.initial = reverse_initial;
+        Ok(())
+    }
+
+    fn begin_closure(&mut self, meter: &mut SweepMeter) -> Result<(), Error> {
+        self.scratch_len = 0;
+        self.stack_len = 0;
+        if self.generation == u64::MAX {
+            meter.charge_work(self.seen.len())?;
+            self.seen.fill(0);
+            self.generation = 0;
+        }
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork,
+            })?;
+        Ok(())
+    }
+
+    fn retain_scratch_as_frontier(&mut self) {
+        core::mem::swap(&mut self.scratch, &mut self.frontier);
+        self.frontier_len = self.scratch_len;
+        self.scratch_len = 0;
+    }
+
+    fn clear_frontier(&mut self) {
+        self.frontier_len = 0;
+    }
+
+    fn load_forward_initial(&mut self, meter: &mut SweepMeter) -> Result<ForwardState, Error> {
+        let initial = self.forward.initial;
+        if initial == NO_STATE {
+            return Err(Error::InternalInvariant(
+                "prepared lazy forward cache lacks an initial state",
+            ));
+        }
+        if !self.saturated {
+            return Ok(ForwardState::Cached(initial));
+        }
+        let (offset, length, pending) = self.forward.state_bounds(initial)?;
+        meter.charge_work(length)?;
+        let end = add(offset, length, Resource::ScratchBytes)?;
+        self.frontier[..length].copy_from_slice(self.forward.items.get(offset..end).ok_or(
+            Error::InternalInvariant("lazy forward initial items outside arena"),
+        )?);
+        self.frontier_len = length;
+        Ok(ForwardState::Inline { pending })
+    }
+
+    fn load_reverse_initial(&mut self, meter: &mut SweepMeter) -> Result<ForwardState, Error> {
+        let initial = self.reverse.initial;
+        if initial == NO_STATE {
+            return Err(Error::InternalInvariant(
+                "prepared lazy reverse cache lacks an initial state",
+            ));
+        }
+        if !self.saturated {
+            return Ok(ForwardState::Cached(initial));
+        }
+        let (offset, length, _) = self.reverse.state_bounds(initial)?;
+        meter.charge_work(length)?;
+        let end = add(offset, length, Resource::ScratchBytes)?;
+        self.frontier[..length].copy_from_slice(self.reverse.items.get(offset..end).ok_or(
+            Error::InternalInvariant("lazy reverse initial items outside arena"),
+        )?);
+        self.frontier_len = length;
+        Ok(ForwardState::Inline { pending: false })
+    }
+
+    #[inline]
+    fn push_scratch(&mut self, pc: u32) -> Result<(), Error> {
+        *self
+            .scratch
+            .get_mut(self.scratch_len)
+            .ok_or(Error::InternalInvariant(
+                "lazy DFA closure output exceeded program states",
+            ))? = pc;
+        self.scratch_len = add(self.scratch_len, 1, Resource::ProgramStates)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn push_stack(&mut self, pc: u32) -> Result<(), Error> {
+        *self
+            .stack
+            .get_mut(self.stack_len)
+            .ok_or(Error::InternalInvariant(
+                "lazy DFA closure stack exceeded edge census",
+            ))? = pc;
+        self.stack_len = add(self.stack_len, 1, Resource::ProgramStates)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn pop_stack(&mut self) -> Option<u32> {
+        self.stack_len = self.stack_len.checked_sub(1)?;
+        self.stack.get(self.stack_len).copied()
+    }
+
+    fn expand_forward(
+        &mut self,
+        program: &Program,
+        root: usize,
+        meter: &mut SweepMeter,
+    ) -> Result<bool, Error> {
+        self.stack_len = 0;
+        self.push_stack(
+            u32::try_from(root).map_err(|_| {
+                Error::InternalInvariant("program state does not fit lazy DFA item")
+            })?,
+        )?;
+        while let Some(pc) = self.pop_stack() {
+            meter.charge_work(1)?;
+            let pc = usize::try_from(pc)
+                .map_err(|_| Error::InternalInvariant("lazy DFA PC does not fit usize"))?;
+            let seen = self.seen.get_mut(pc).ok_or(Error::InternalInvariant(
+                "lazy forward closure PC outside program",
+            ))?;
+            if *seen == self.generation {
+                continue;
+            }
+            *seen = self.generation;
+            match program.instruction(pc)? {
+                Inst::Fail => {}
+                Inst::Match => return Ok(true),
+                Inst::Consume { .. } => {
+                    self.push_scratch(u32::try_from(pc).map_err(|_| {
+                        Error::InternalInvariant("program state does not fit lazy DFA item")
+                    })?)?;
+                }
+                Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
+                } => {
+                    self.push_stack(u32::try_from(*fallback).map_err(|_| {
+                        Error::InternalInvariant("program state does not fit lazy DFA item")
+                    })?)?;
+                    self.push_stack(u32::try_from(*preferred).map_err(|_| {
+                        Error::InternalInvariant("program state does not fit lazy DFA item")
+                    })?)?;
+                }
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "lazy forward closure reached an unfilled state",
+                    ));
+                }
+                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                    return Err(Error::InternalInvariant(
+                        "lazy forward closure reached an unsupported instruction",
+                    ));
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn expand_reverse(&mut self, root: u32, meter: &mut SweepMeter) -> Result<(), Error> {
+        self.stack_len = 0;
+        self.push_stack(root)?;
+        while let Some(pc) = self.pop_stack() {
+            meter.charge_work(1)?;
+            let pc_usize = usize::try_from(pc)
+                .map_err(|_| Error::InternalInvariant("lazy DFA PC does not fit usize"))?;
+            let seen = self.seen.get_mut(pc_usize).ok_or(Error::InternalInvariant(
+                "lazy reverse closure PC outside program",
+            ))?;
+            if *seen == self.generation {
+                continue;
+            }
+            *seen = self.generation;
+            self.push_scratch(pc)?;
+            let start =
+                *self
+                    .reverse_epsilon_offsets
+                    .get(pc_usize)
+                    .ok_or(Error::InternalInvariant(
+                        "reverse epsilon offset outside graph",
+                    ))?;
+            let end =
+                *self
+                    .reverse_epsilon_offsets
+                    .get(pc_usize + 1)
+                    .ok_or(Error::InternalInvariant(
+                        "reverse epsilon end offset outside graph",
+                    ))?;
+            for edge in start..end {
+                self.push_stack(*self.reverse_epsilon_sources.get(edge).ok_or(
+                    Error::InternalInvariant("reverse epsilon source outside graph"),
+                )?)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn actual_retained_bytes(&self) -> Result<usize, Error> {
+        let u64s = mul(
+            self.seen.capacity(),
+            size_of::<u64>(),
+            Resource::ScratchBytes,
+        )?;
+        let u32s = add(
+            add(
+                add(
+                    self.scratch.capacity(),
+                    self.frontier.capacity(),
+                    Resource::ScratchBytes,
+                )?,
+                self.stack.capacity(),
+                Resource::ScratchBytes,
+            )?,
+            add(
+                self.reverse_epsilon_sources.capacity(),
+                self.reverse_consume_sources.capacity(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
+        let u32s = mul(u32s, size_of::<u32>(), Resource::ScratchBytes)?;
+        let usizes = add(
+            self.cursors.capacity(),
+            add(
+                self.reverse_epsilon_offsets.capacity(),
+                self.reverse_consume_offsets.capacity(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
+        let usizes = mul(usizes, size_of::<usize>(), Resource::ScratchBytes)?;
+        let byte_sets = mul(
+            self.reverse_consume_bytes.capacity(),
+            size_of::<ByteSet>(),
+            Resource::ScratchBytes,
+        )?;
+        add(
+            add(
+                add(u64s, u32s, Resource::ScratchBytes)?,
+                add(usizes, byte_sets, Resource::ScratchBytes)?,
+                Resource::ScratchBytes,
+            )?,
+            add(
+                self.forward.retained_bytes()?,
+                self.reverse.retained_bytes()?,
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )
+    }
+}
+
+/// Run the persistent lazy-DFA route.
+///
+/// Structural refusal is completed before the workspace inspects source
+/// bytes and before preparation charges work. Preparation allocates exact
+/// fixed arenas and its work is carried into execution. Cache saturation
+/// switches to the inline frontier at the already-advanced position. The
+/// current operation completes without replay; the saturated cache is then
+/// replaced with a compact sticky-disabled marker.
+pub(super) fn reduce(
+    plan_id: PlanId,
+    program: &Program,
+    haystack: &[u8],
+    range: Range<usize>,
+    kind: SweepKind,
+    limits: OperationLimits,
+    workspace: &mut Workspace,
+) -> Result<Option<SweepOutcome>, Error> {
+    if program.contains_scalar_transition()
+        || program.contains_assertion()
+        || program.contains_unicode_word_boundary()
+        || program.start_domain.is_sparse()
+    {
+        return Ok(None);
+    }
+    if range.start > range.end || range.end > haystack.len() {
+        return Err(Error::InvalidRange {
+            start: range.start,
+            end: range.end,
+            haystack_len: haystack.len(),
+        });
+    }
+    let local_len = range.end - range.start;
+    let boundaries = add(local_len, 1, Resource::Boundaries)?;
+    enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+    let (admitted, preparation_work) = workspace.prepare(plan_id, program, limits)?;
+    if !admitted {
+        return Ok(None);
+    }
+    let local = &haystack[range];
+    let mut meter = SweepMeter::new(limits);
+    meter.charge_work(preparation_work)?;
+    let result = execute_prepared(program, local, kind, workspace, &mut meter);
+    if workspace.saturated {
+        *workspace = Workspace::disabled(plan_id);
+    }
+    result.map(Some)
+}
+
+fn execute_prepared(
+    program: &Program,
+    local: &[u8],
+    kind: SweepKind,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<SweepOutcome, Error> {
+    let mut prefix = SweepValue {
+        count: 0,
+        span_sum: 0,
+    };
+    let mut cursor = 0_usize;
+    let mut position = cursor;
+    let mut state = workspace.load_forward_initial(meter)?;
+    let mut pending_end = None;
+
+    loop {
+        if position == local.len() {
+            let Some(end) = pending_end else {
+                meter.enforce_terminal_limits()?;
+                return Ok(SweepOutcome::Complete(complete_value(prefix, kind)));
+            };
+            commit(
+                local,
+                cursor,
+                end,
+                kind,
+                program.entry,
+                &mut prefix,
+                workspace,
+                meter,
+            )?;
+            cursor = end;
+            position = end;
+            pending_end = None;
+            if end == local.len() {
+                meter.enforce_terminal_limits()?;
+                return Ok(SweepOutcome::Complete(complete_value(prefix, kind)));
+            }
+            state = workspace.load_forward_initial(meter)?;
+            continue;
+        }
+
+        meter.charge_sequential(1)?;
+        meter.charge_work(1)?;
+        let byte = *local.get(position).ok_or(Error::InternalInvariant(
+            "lazy forward source position outside input",
+        ))?;
+        let transition = match state {
+            ForwardState::Cached(cached) => {
+                build_forward_transition(program, cached, byte, workspace, meter)?
+            }
+            ForwardState::Inline { pending } => {
+                build_inline_forward_transition(program, byte, pending, workspace, meter)?
+            }
+        };
+        position = add(position, 1, Resource::Boundaries)?;
+        let (accepted, next) = match transition {
+            Transition::Ready(cell) => {
+                let encoded = cell & CELL_STATE_MASK;
+                (
+                    cell & CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ForwardState::Cached(encoded - 1))
+                    },
+                )
+            }
+            Transition::Inline { accepted, pending } => {
+                (accepted, Some(ForwardState::Inline { pending }))
+            }
+        };
+        if accepted {
+            pending_end = Some(position);
+        }
+        if let Some(next) = next {
+            state = next;
+            continue;
+        }
+
+        let Some(end) = pending_end else {
+            // An unanchored state always injects the initial closure at the
+            // next boundary. Reaching dead without a pending match therefore
+            // means the pattern's initial closure itself has no consumers.
+            meter.enforce_terminal_limits()?;
+            return Ok(SweepOutcome::Complete(complete_value(prefix, kind)));
+        };
+        commit(
+            local,
+            cursor,
+            end,
+            kind,
+            program.entry,
+            &mut prefix,
+            workspace,
+            meter,
+        )?;
+        cursor = end;
+        position = end;
+        pending_end = None;
+        state = workspace.load_forward_initial(meter)?;
+    }
+}
+
+fn build_forward_transition(
+    program: &Program,
+    state: u32,
+    byte: u8,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<Transition, Error> {
+    let cached = workspace.forward.cell(state, byte)?;
+    if cached != CELL_UNFILLED {
+        return Ok(Transition::Ready(cached));
+    }
+
+    let (_, length, pending) = workspace.forward.state_bounds(state)?;
+    workspace.begin_closure(meter)?;
+    let mut accepted = false;
+    for ordinal in 0..length {
+        let pc = workspace.forward.item(state, ordinal)?;
+        meter.charge_work(1)?;
+        match program.instruction(
+            usize::try_from(pc)
+                .map_err(|_| Error::InternalInvariant("lazy forward item does not fit usize"))?,
+        )? {
+            Inst::Consume { bytes, next } => {
+                if bytes.contains(byte) && workspace.expand_forward(program, *next, meter)? {
+                    accepted = true;
+                    break;
+                }
+            }
+            Inst::Unfilled
+            | Inst::Fail
+            | Inst::Match
+            | Inst::ConsumeScalar { .. }
+            | Inst::Assert { .. }
+            | Inst::Split { .. }
+            | Inst::RootSplit { .. } => {
+                return Err(Error::InternalInvariant(
+                    "lazy forward state retained a non-consuming instruction",
+                ));
+            }
+        }
+    }
+    if !accepted && !pending {
+        accepted = workspace.expand_forward(program, program.entry, meter)?;
+    }
+    let next_pending = pending || accepted;
+    let encoded = if workspace.scratch_len == 0 {
+        0
+    } else {
+        match workspace.forward.intern(
+            &workspace.scratch[..workspace.scratch_len],
+            next_pending,
+            meter,
+        )? {
+            Interned::State(next) => next.checked_add(1).ok_or(Error::InternalInvariant(
+                "lazy DFA encoded state ID overflowed",
+            ))?,
+            Interned::Full => {
+                workspace.saturated = true;
+                workspace.retain_scratch_as_frontier();
+                return Ok(Transition::Inline {
+                    accepted,
+                    pending: next_pending,
+                });
+            }
+        }
+    };
+    let cell = encoded | if accepted { CELL_ACCEPT } else { 0 };
+    workspace.forward.set_cell(state, byte, cell)?;
+    Ok(Transition::Ready(cell))
+}
+
+fn build_inline_forward_transition(
+    program: &Program,
+    byte: u8,
+    pending: bool,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<Transition, Error> {
+    let length = workspace.frontier_len;
+    workspace.begin_closure(meter)?;
+    let mut accepted = false;
+    for ordinal in 0..length {
+        let pc = workspace
+            .frontier
+            .get(ordinal)
+            .copied()
+            .ok_or(Error::InternalInvariant(
+                "inline forward frontier item outside arena",
+            ))?;
+        meter.charge_work(1)?;
+        match program.instruction(
+            usize::try_from(pc)
+                .map_err(|_| Error::InternalInvariant("inline forward PC does not fit usize"))?,
+        )? {
+            Inst::Consume { bytes, next } => {
+                if bytes.contains(byte) && workspace.expand_forward(program, *next, meter)? {
+                    accepted = true;
+                    break;
+                }
+            }
+            Inst::Unfilled
+            | Inst::Fail
+            | Inst::Match
+            | Inst::ConsumeScalar { .. }
+            | Inst::Assert { .. }
+            | Inst::Split { .. }
+            | Inst::RootSplit { .. } => {
+                return Err(Error::InternalInvariant(
+                    "inline forward frontier retained a non-consuming instruction",
+                ));
+            }
+        }
+    }
+    if !accepted && !pending {
+        accepted = workspace.expand_forward(program, program.entry, meter)?;
+    }
+    let next_pending = pending || accepted;
+    if workspace.scratch_len == 0 {
+        workspace.clear_frontier();
+        let cell = if accepted { CELL_ACCEPT } else { 0 };
+        return Ok(Transition::Ready(cell));
+    }
+    workspace.retain_scratch_as_frontier();
+    Ok(Transition::Inline {
+        accepted,
+        pending: next_pending,
+    })
+}
+
+fn commit(
+    haystack: &[u8],
+    cursor: usize,
+    end: usize,
+    kind: SweepKind,
+    program_entry: usize,
+    prefix: &mut SweepValue,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<(), Error> {
+    if end <= cursor || end > haystack.len() {
+        return Err(Error::InternalInvariant(
+            "non-nullable lazy continuation selected an invalid endpoint",
+        ));
+    }
+    let start = if kind == SweepKind::SpanSum {
+        reverse_start(haystack, cursor, end, program_entry, workspace, meter)?
+    } else {
+        end
+    };
+    meter.charge_event()?;
+    let count = add(prefix.count, 1, Resource::OutputMatches)?;
+    enforce(
+        count,
+        meter.limits.max_output_matches,
+        Resource::OutputMatches,
+    )?;
+    let width = end.checked_sub(start).ok_or(Error::InternalInvariant(
+        "lazy continuation start follows endpoint",
+    ))?;
+    let span_sum = if kind == SweepKind::SpanSum {
+        let value = add(prefix.span_sum, width, Resource::SpanSum)?;
+        enforce(value, meter.limits.max_span_sum, Resource::SpanSum)?;
+        value
+    } else {
+        0
+    };
+    prefix.count = count;
+    prefix.span_sum = span_sum;
+    Ok(())
+}
+
+fn reverse_start(
+    haystack: &[u8],
+    cursor: usize,
+    end: usize,
+    program_entry: usize,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<usize, Error> {
+    let entry = u32::try_from(program_entry)
+        .map_err(|_| Error::InternalInvariant("reverse entry does not fit u32"))?;
+    let mut state = workspace.load_reverse_initial(meter)?;
+    let mut best = None;
+    let mut position = end;
+    while position > cursor {
+        position -= 1;
+        meter.charge_sequential(1)?;
+        meter.charge_work(1)?;
+        let byte = *haystack.get(position).ok_or(Error::InternalInvariant(
+            "lazy reverse source position outside input",
+        ))?;
+        let transition = match state {
+            ForwardState::Cached(cached) => {
+                build_reverse_transition(cached, byte, entry, workspace, meter)?
+            }
+            ForwardState::Inline { .. } => {
+                build_inline_reverse_transition(byte, entry, workspace, meter)?
+            }
+        };
+        let (accepted, next) = match transition {
+            Transition::Ready(cell) => {
+                let encoded = cell & CELL_STATE_MASK;
+                (
+                    cell & CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ForwardState::Cached(encoded - 1))
+                    },
+                )
+            }
+            Transition::Inline { accepted, .. } => {
+                (accepted, Some(ForwardState::Inline { pending: false }))
+            }
+        };
+        if accepted {
+            best = Some(position);
+        }
+        let Some(next) = next else {
+            break;
+        };
+        state = next;
+    }
+    workspace.clear_frontier();
+    best.ok_or(Error::InternalInvariant(
+        "lazy reverse selector could not recover the selected match start",
+    ))
+}
+
+fn build_reverse_transition(
+    state: u32,
+    byte: u8,
+    entry: u32,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<Transition, Error> {
+    let cached = workspace.reverse.cell(state, byte)?;
+    if cached != CELL_UNFILLED {
+        return Ok(Transition::Ready(cached));
+    }
+    let (_, length, _) = workspace.reverse.state_bounds(state)?;
+    workspace.begin_closure(meter)?;
+    for ordinal in 0..length {
+        let destination = usize::try_from(workspace.reverse.item(state, ordinal)?)
+            .map_err(|_| Error::InternalInvariant("lazy reverse item does not fit usize"))?;
+        meter.charge_work(1)?;
+        let start =
+            *workspace
+                .reverse_consume_offsets
+                .get(destination)
+                .ok_or(Error::InternalInvariant(
+                    "reverse consume offset outside graph",
+                ))?;
+        let end = *workspace
+            .reverse_consume_offsets
+            .get(destination + 1)
+            .ok_or(Error::InternalInvariant(
+                "reverse consume end offset outside graph",
+            ))?;
+        for edge in start..end {
+            meter.charge_work(1)?;
+            if workspace
+                .reverse_consume_bytes
+                .get(edge)
+                .copied()
+                .ok_or(Error::InternalInvariant(
+                    "reverse consume byte set outside graph",
+                ))?
+                .contains(byte)
+            {
+                workspace.expand_reverse(
+                    *workspace.reverse_consume_sources.get(edge).ok_or(
+                        Error::InternalInvariant("reverse consume source outside graph"),
+                    )?,
+                    meter,
+                )?;
+            }
+        }
+    }
+    sort_exact(&mut workspace.scratch[..workspace.scratch_len], meter)?;
+    let accepts = binary_search_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
+    let encoded = if workspace.scratch_len == 0 {
+        0
+    } else {
+        match workspace
+            .reverse
+            .intern(&workspace.scratch[..workspace.scratch_len], false, meter)?
+        {
+            Interned::State(next) => next.checked_add(1).ok_or(Error::InternalInvariant(
+                "lazy reverse encoded state ID overflowed",
+            ))?,
+            Interned::Full => {
+                workspace.saturated = true;
+                workspace.retain_scratch_as_frontier();
+                return Ok(Transition::Inline {
+                    accepted: accepts,
+                    pending: false,
+                });
+            }
+        }
+    };
+    let cell = encoded | if accepts { CELL_ACCEPT } else { 0 };
+    workspace.reverse.set_cell(state, byte, cell)?;
+    Ok(Transition::Ready(cell))
+}
+
+fn build_inline_reverse_transition(
+    byte: u8,
+    entry: u32,
+    workspace: &mut Workspace,
+    meter: &mut SweepMeter,
+) -> Result<Transition, Error> {
+    let length = workspace.frontier_len;
+    workspace.begin_closure(meter)?;
+    for ordinal in 0..length {
+        let destination = usize::try_from(workspace.frontier.get(ordinal).copied().ok_or(
+            Error::InternalInvariant("inline reverse frontier item outside arena"),
+        )?)
+        .map_err(|_| Error::InternalInvariant("inline reverse PC does not fit usize"))?;
+        meter.charge_work(1)?;
+        let start =
+            *workspace
+                .reverse_consume_offsets
+                .get(destination)
+                .ok_or(Error::InternalInvariant(
+                    "inline reverse consume offset outside graph",
+                ))?;
+        let end = *workspace
+            .reverse_consume_offsets
+            .get(destination + 1)
+            .ok_or(Error::InternalInvariant(
+                "inline reverse consume end offset outside graph",
+            ))?;
+        for edge in start..end {
+            meter.charge_work(1)?;
+            if workspace
+                .reverse_consume_bytes
+                .get(edge)
+                .copied()
+                .ok_or(Error::InternalInvariant(
+                    "inline reverse consume byte set outside graph",
+                ))?
+                .contains(byte)
+            {
+                workspace.expand_reverse(
+                    *workspace.reverse_consume_sources.get(edge).ok_or(
+                        Error::InternalInvariant("inline reverse consume source outside graph"),
+                    )?,
+                    meter,
+                )?;
+            }
+        }
+    }
+    sort_exact(&mut workspace.scratch[..workspace.scratch_len], meter)?;
+    let accepts = binary_search_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
+    if workspace.scratch_len == 0 {
+        workspace.clear_frontier();
+        let cell = if accepts { CELL_ACCEPT } else { 0 };
+        return Ok(Transition::Ready(cell));
+    }
+    workspace.retain_scratch_as_frontier();
+    Ok(Transition::Inline {
+        accepted: accepts,
+        pending: false,
+    })
+}
+
+const fn complete_value(value: SweepValue, kind: SweepKind) -> SweepValue {
+    SweepValue {
+        count: value.count,
+        span_sum: if matches!(kind, SweepKind::SpanSum) {
+            value.span_sum
+        } else {
+            0
+        },
+    }
+}
+
+fn sort_exact(values: &mut [u32], meter: &mut SweepMeter) -> Result<(), Error> {
+    if values.len() < 2 {
+        return Ok(());
+    }
+    for root in (0..values.len() / 2).rev() {
+        sift_down(values, root, values.len(), meter)?;
+    }
+    for end in (1..values.len()).rev() {
+        meter.charge_work(1)?;
+        values.swap(0, end);
+        sift_down(values, 0, end, meter)?;
+    }
+    Ok(())
+}
+
+fn binary_search_exact(values: &[u32], needle: u32, meter: &mut SweepMeter) -> Result<bool, Error> {
+    let mut left = 0_usize;
+    let mut right = values.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        meter.charge_work(1)?;
+        match values[middle].cmp(&needle) {
+            core::cmp::Ordering::Less => left = middle + 1,
+            core::cmp::Ordering::Greater => right = middle,
+            core::cmp::Ordering::Equal => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn sift_down(
+    values: &mut [u32],
+    mut root: usize,
+    end: usize,
+    meter: &mut SweepMeter,
+) -> Result<(), Error> {
+    loop {
+        let Some(mut child) = root.checked_mul(2).and_then(|value| value.checked_add(1)) else {
+            return Err(Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork,
+            });
+        };
+        if child >= end {
+            return Ok(());
+        }
+        if child + 1 < end {
+            meter.charge_work(1)?;
+            if values[child] < values[child + 1] {
+                child += 1;
+            }
+        }
+        meter.charge_work(1)?;
+        if values[root] >= values[child] {
+            return Ok(());
+        }
+        meter.charge_work(1)?;
+        values.swap(root, child);
+        root = child;
+    }
+}
+
+fn increment_edge_count(offsets: &mut [usize], target: usize, states: usize) -> Result<(), Error> {
+    if target >= states {
+        return Err(Error::InternalInvariant(
+            "lazy reverse edge target outside program",
+        ));
+    }
+    let slot = offsets.get_mut(target + 1).ok_or(Error::InternalInvariant(
+        "lazy reverse edge count outside offsets",
+    ))?;
+    *slot = add(*slot, 1, Resource::ScratchBytes)?;
+    Ok(())
+}
+
+fn prefix_counts(offsets: &mut [usize], meter: &mut SweepMeter) -> Result<(), Error> {
+    for index in 1..offsets.len() {
+        meter.charge_work(1)?;
+        offsets[index] = add(offsets[index], offsets[index - 1], Resource::ScratchBytes)?;
+    }
+    Ok(())
+}
+
+fn fill_source(
+    cursors: &mut [usize],
+    sources: &mut [u32],
+    target: usize,
+    source: u32,
+) -> Result<(), Error> {
+    let slot = *cursors.get(target).ok_or(Error::InternalInvariant(
+        "lazy reverse edge target outside cursors",
+    ))?;
+    *sources.get_mut(slot).ok_or(Error::InternalInvariant(
+        "lazy reverse edge source outside arena",
+    ))? = source;
+    cursors[target] = add(slot, 1, Resource::ScratchBytes)?;
+    Ok(())
+}
+
+pub(super) fn upper_bounds(program_states: usize) -> Result<ContinuationSweepUpperBounds, Error> {
+    prospective_upper_bounds(program_states, MAX_DFA_STATES, MAX_DFA_ITEMS)
+}
+
+fn prospective_upper_bounds(
+    states: usize,
+    state_capacity: usize,
+    max_items: usize,
+) -> Result<ContinuationSweepUpperBounds, Error> {
+    if states == 0 {
+        return Err(Error::InternalInvariant(
+            "lazy continuation requires a nonempty program",
+        ));
+    }
+    if states > u32::MAX as usize {
+        return Err(Error::ArithmeticOverflow {
+            resource: Resource::ProgramStates,
+        });
+    }
+    let stack_slots = add(
+        mul(states, 2, Resource::ScratchBytes)?,
+        1,
+        Resource::ScratchBytes,
+    )?;
+    let epsilon_edges = mul(states, 2, Resource::ScratchBytes)?;
+    let item_capacity = mul(states, state_capacity, Resource::ScratchBytes)?
+        .min(max_items)
+        .max(states);
+    let workspace_bytes = logical_workspace_bytes(
+        states,
+        stack_slots,
+        epsilon_edges,
+        states,
+        state_capacity,
+        item_capacity,
+    )?;
+    let table_cells = mul(
+        mul(state_capacity, BYTE_ALPHABET, Resource::TableCells)?,
+        2,
+        Resource::TableCells,
+    )?;
+
+    // Every fixed arena slot is initialized exactly once. The remaining
+    // source-independent setup traverses a graph with at most 2S epsilon
+    // edges and sorts at most S reverse-closure PCs. Sixty-four charged
+    // operations per state/log-level conservatively covers graph census,
+    // prefix sums, closure expansion, heapsort, binary search and both initial
+    // state copies.
+    let workspace_slots = add(
+        mul(states, 12, Resource::ExecutionWork)?,
+        3,
+        Resource::ExecutionWork,
+    )?;
+    let one_cache_slots = add(
+        mul(state_capacity, BYTE_ALPHABET + 3, Resource::ExecutionWork)?,
+        item_capacity,
+        Resource::ExecutionWork,
+    )?;
+    let initialization_work = add(
+        workspace_slots,
+        mul(one_cache_slots, 2, Resource::ExecutionWork)?,
+        Resource::ExecutionWork,
+    )?;
+    let log_levels = usize::try_from(usize::BITS - states.leading_zeros()).map_err(|_| {
+        Error::ArithmeticOverflow {
+            resource: Resource::ExecutionWork,
+        }
+    })?;
+    let setup_work = mul(
+        mul(states, log_levels, Resource::ExecutionWork)?,
+        64,
+        Resource::ExecutionWork,
+    )?;
+    let preparation_work = add(initialization_work, setup_work, Resource::ExecutionWork)?;
+    Ok(ContinuationSweepUpperBounds {
+        table_cells,
+        workspace_bytes,
+        preparation_work,
+    })
+}
+
+fn logical_workspace_bytes(
+    states: usize,
+    stack_slots: usize,
+    epsilon_edges: usize,
+    consume_edges: usize,
+    dfa_states: usize,
+    dfa_items: usize,
+) -> Result<usize, Error> {
+    let graph_offsets = mul(
+        add(
+            mul(
+                add(states, 1, Resource::ScratchBytes)?,
+                2,
+                Resource::ScratchBytes,
+            )?,
+            states,
+            Resource::ScratchBytes,
+        )?,
+        size_of::<usize>(),
+        Resource::ScratchBytes,
+    )?;
+    let graph_items = add(
+        mul(
+            add(epsilon_edges, consume_edges, Resource::ScratchBytes)?,
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?,
+        mul(consume_edges, size_of::<ByteSet>(), Resource::ScratchBytes)?,
+        Resource::ScratchBytes,
+    )?;
+    let closure = add(
+        mul(states, size_of::<u64>(), Resource::ScratchBytes)?,
+        mul(
+            add(
+                mul(states, 2, Resource::ScratchBytes)?,
+                stack_slots,
+                Resource::ScratchBytes,
+            )?,
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?,
+        Resource::ScratchBytes,
+    )?;
+    let one_cache = add(
+        mul(
+            mul(dfa_states, BYTE_ALPHABET, Resource::ScratchBytes)?,
+            size_of::<u32>(),
+            Resource::ScratchBytes,
+        )?,
+        add(
+            mul(dfa_states, size_of::<usize>(), Resource::ScratchBytes)?,
+            add(
+                mul(dfa_states, size_of::<u32>(), Resource::ScratchBytes)?,
+                add(
+                    dfa_states,
+                    mul(dfa_items, size_of::<u32>(), Resource::ScratchBytes)?,
+                    Resource::ScratchBytes,
+                )?,
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?,
+        Resource::ScratchBytes,
+    )?;
+    add(
+        add(graph_offsets, graph_items, Resource::ScratchBytes)?,
+        add(
+            closure,
+            mul(one_cache, 2, Resource::ScratchBytes)?,
+            Resource::ScratchBytes,
+        )?,
+        Resource::ScratchBytes,
+    )
+}
+
+fn enforce_workspace_bytes(bytes: usize, limits: OperationLimits) -> Result<(), Error> {
+    enforce(bytes, limits.max_scratch_bytes, Resource::ScratchBytes)?;
+    enforce(
+        bytes,
+        limits.max_random_access_bytes,
+        Resource::RandomAccessBytes,
+    )?;
+    enforce(bytes, limits.max_peak_bytes, Resource::PeakBytes)
+}
+
+fn enforce_sweep_upper_bounds(
+    upper: ContinuationSweepUpperBounds,
+    limits: OperationLimits,
+) -> Result<(), Error> {
+    enforce(
+        upper.table_cells,
+        limits.max_table_cells,
+        Resource::TableCells,
+    )?;
+    enforce_workspace_bytes(upper.workspace_bytes, limits)
+}
+
+fn allocated_slots<T: Copy>(
+    length: usize,
+    value: T,
+    total_bytes: usize,
+    meter: &mut SweepMeter,
+) -> Result<ExactVec<T>, Error> {
+    meter.charge_work(length)?;
+    let mut output = ExactVec::try_with_capacity(length).map_err(|error| match error {
+        CopyError::LayoutOverflow => Error::ArithmeticOverflow {
+            resource: Resource::ScratchBytes,
+        },
+        CopyError::AllocationFailed => Error::AllocationFailed {
+            resource: Resource::ScratchBytes,
+            items: total_bytes,
+        },
+    })?;
+    for _ in 0..length {
+        output
+            .try_push(value)
+            .map_err(|_| Error::InternalInvariant("exact lazy workspace changed capacity"))?;
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ops::Range;
+
+    use regex_syntax::ParserBuilder;
+
+    use super::{
+        BYTE_ALPHABET, CELL_UNFILLED, MAX_DFA_ITEMS, MAX_DFA_STATES, Workspace, allocated_slots,
+        execute_prepared, prospective_upper_bounds, reduce,
+    };
+    use crate::sweep::{SweepKind, SweepMeter, SweepOutcome, SweepValue};
+    use crate::{
+        CompileLimits, CompiledRegex, Error, OperationLimits, Resource, RustByteProfile, Strategy,
+    };
+
+    fn compiled(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn expected(regex: &CompiledRegex, haystack: &[u8], range: Range<usize>) -> SweepValue {
+        SweepValue {
+            count: regex
+                .count_value(
+                    haystack,
+                    range.clone(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+            span_sum: regex
+                .span_sum_value(
+                    haystack,
+                    range,
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+        }
+    }
+
+    fn complete(
+        regex: &CompiledRegex,
+        haystack: &[u8],
+        range: Range<usize>,
+        kind: SweepKind,
+        workspace: &mut Workspace,
+    ) -> SweepValue {
+        let outcome = reduce(
+            regex.plan_id(),
+            &regex.program,
+            haystack,
+            range,
+            kind,
+            OperationLimits::default(),
+            workspace,
+        )
+        .unwrap()
+        .expect("byte program is lazy-DFA eligible");
+        let SweepOutcome::Complete(value) = outcome;
+        value
+    }
+
+    fn complete_bounded(
+        regex: &CompiledRegex,
+        haystack: &[u8],
+        kind: SweepKind,
+        state_capacity: usize,
+        workspace: &mut Workspace,
+    ) -> (SweepValue, usize, bool) {
+        let (admitted, preparation_work) = workspace
+            .prepare_bounded(
+                regex.plan_id(),
+                &regex.program,
+                OperationLimits::default(),
+                state_capacity,
+                MAX_DFA_ITEMS,
+            )
+            .unwrap();
+        assert!(admitted);
+        let mut meter = SweepMeter::new(OperationLimits::default());
+        meter.charge_work(preparation_work).unwrap();
+        let SweepOutcome::Complete(value) =
+            execute_prepared(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
+        (value, meter.sequential, workspace.saturated)
+    }
+
+    #[test]
+    fn ordered_lazy_dfa_preserves_priority_non_greedy_and_raw_bytes() {
+        let cases: &[(&str, &[u8])] = &[
+            ("a|ab", b"abab"),
+            ("ab|a", b"abab"),
+            ("(?:a+b|a)", b"aaaaaaaaab--aaaa"),
+            ("(?:a.*z|a)", b"aqqqa--az--a123z"),
+            ("(?:ab|a)b", b"ababb"),
+            ("(?:ab|b)", b"ab"),
+            ("(?:a|ba)", b"ba"),
+            ("(?:a|aa)b", b"aab"),
+            ("(?:ab+c|a)", b"abbbx--abbbc"),
+            ("a+?", b"aaaa"),
+            ("a+", b"aaaa"),
+            ("(?:a|aa)+b", b"aaaaab aaab"),
+            ("(?:ab|ac)+?d", b"abacacdxxababd"),
+            ("(?i:Sherlock|Watson)+", b"xxsHeRlOcKWatSONyy"),
+            (r"(?:\xFF+\x00|\x80)", b"\xFF\xFF\x00a\x80\xC3\x28\xFF"),
+        ];
+        for &(pattern, haystack) in cases {
+            let regex = compiled(pattern);
+            let want = expected(&regex, haystack, 0..haystack.len());
+            let mut count_workspace = Workspace::new();
+            let mut sum_workspace = Workspace::new();
+            assert_eq!(
+                complete(
+                    &regex,
+                    haystack,
+                    0..haystack.len(),
+                    SweepKind::Count,
+                    &mut count_workspace,
+                )
+                .count,
+                want.count,
+                "count pattern={pattern:?}"
+            );
+            assert_eq!(
+                complete(
+                    &regex,
+                    haystack,
+                    0..haystack.len(),
+                    SweepKind::SpanSum,
+                    &mut sum_workspace,
+                )
+                .span_sum,
+                want.span_sum,
+                "span-sum pattern={pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_plan_binding_distinguishes_equal_size_program_shapes() {
+        let first = compiled("abcdefghijklmnopq");
+        let second = compiled("abcdefghijklmnopx");
+        assert_eq!(first.program.insts.len(), second.program.insts.len());
+        assert_ne!(first.plan_id(), second.plan_id());
+
+        let mut workspace = Workspace::new();
+        assert!(
+            workspace
+                .prepare(first.plan_id(), &first.program, OperationLimits::default(),)
+                .unwrap()
+                .0
+        );
+        assert_eq!(workspace.plan_id, Some(first.plan_id()));
+        assert!(
+            workspace
+                .prepare(
+                    second.plan_id(),
+                    &second.program,
+                    OperationLimits::default(),
+                )
+                .unwrap()
+                .0
+        );
+        assert_eq!(workspace.plan_id, Some(second.plan_id()));
+    }
+
+    #[test]
+    fn ordered_lazy_dfa_is_exhaustively_differential_and_length_agnostic() {
+        let patterns = [
+            "(?:ab|a)+z",
+            "(?:a+b|a)",
+            "(?:ab|ac)+d",
+            "(?:[ab][cd]|[cd][ab])+(?:x|yz)",
+            "[ab]+[cd]+",
+            "(?:a|bc)+d",
+            "(?:a+?|b+)c",
+            "(?:ab|a)b+",
+        ];
+        let alphabet = [b'a', b'b', b'c'];
+        let mut haystack = Vec::new();
+        let mut checked = 0_usize;
+        for pattern in patterns {
+            let regex = compiled(pattern);
+            let mut count_workspace = Workspace::new();
+            let mut sum_workspace = Workspace::new();
+            for encoded in 0_usize..729 {
+                haystack.clear();
+                let mut value = encoded;
+                let length = encoded % 7;
+                for _ in 0..length {
+                    haystack.push(alphabet[value % alphabet.len()]);
+                    value /= alphabet.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let range = start..end;
+                        let want = expected(&regex, &haystack, range.clone());
+                        let count = complete(
+                            &regex,
+                            &haystack,
+                            range.clone(),
+                            SweepKind::Count,
+                            &mut count_workspace,
+                        );
+                        let sum = complete(
+                            &regex,
+                            &haystack,
+                            range,
+                            SweepKind::SpanSum,
+                            &mut sum_workspace,
+                        );
+                        assert_eq!(
+                            count.count, want.count,
+                            "count pattern={pattern:?} haystack={haystack:?} start={start} end={end}"
+                        );
+                        assert_eq!(
+                            sum.span_sum, want.span_sum,
+                            "span pattern={pattern:?} haystack={haystack:?} start={start} end={end}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn inline_saturation_is_exhaustively_differential_on_small_inputs() {
+        let patterns = ["(?:ab|a)+z", "(?:a+b|a)", "(?:ab|ac)+d"];
+        let alphabet = [b'a', b'b', b'c'];
+        let mut haystack = Vec::new();
+        let mut saturated = 0_usize;
+        for pattern in patterns {
+            let regex = compiled(pattern);
+            let mut count_workspace = Workspace::new();
+            let mut sum_workspace = Workspace::new();
+            for encoded in 0_usize..243 {
+                haystack.clear();
+                let mut value = encoded;
+                let length = encoded % 6;
+                for _ in 0..length {
+                    haystack.push(alphabet[value % alphabet.len()]);
+                    value /= alphabet.len();
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let local = &haystack[start..end];
+                        let want = expected(&regex, &haystack, start..end);
+                        let (count, _, count_saturated) = complete_bounded(
+                            &regex,
+                            local,
+                            SweepKind::Count,
+                            1,
+                            &mut count_workspace,
+                        );
+                        let (sum, _, sum_saturated) = complete_bounded(
+                            &regex,
+                            local,
+                            SweepKind::SpanSum,
+                            1,
+                            &mut sum_workspace,
+                        );
+                        assert_eq!(
+                            count.count, want.count,
+                            "count pattern={pattern:?} local={local:?}"
+                        );
+                        assert_eq!(
+                            sum.span_sum, want.span_sum,
+                            "span pattern={pattern:?} local={local:?}"
+                        );
+                        saturated += usize::from(count_saturated || sum_saturated);
+                    }
+                }
+            }
+        }
+        assert!(saturated > 1_000);
+    }
+
+    #[test]
+    fn reverse_cache_saturation_hands_off_without_source_replay() {
+        let cases: &[(&str, &[u8])] = &[
+            ("(?:ab|ac|ad|ba|bc|bd)+z", b"bdacbcadabz"),
+            ("(?:a+b|a)", b"aaaaaaaaab"),
+            ("(?:ab|a)b+", b"ababbb"),
+            ("a(?:bc|de|fg|hi)+z", b"adefgbciz"),
+            ("abcdefghijklmnopq", b"abcdefghijklmnopq"),
+        ];
+        let mut selected = None;
+        for &(pattern, haystack) in cases {
+            let regex = compiled(pattern);
+            let mut full = Workspace::new();
+            let (value, sequential, saturated) = complete_bounded(
+                &regex,
+                haystack,
+                SweepKind::SpanSum,
+                MAX_DFA_STATES,
+                &mut full,
+            );
+            assert!(!saturated);
+            if full.reverse.state_len > full.forward.state_len {
+                selected = Some((regex, haystack, value, sequential, full.forward.state_len));
+                break;
+            }
+        }
+        let (regex, haystack, want, full_sequential, forward_states) =
+            selected.expect("test corpus must contain a reverse-wider path");
+        let mut capped = Workspace::new();
+        let (got, capped_sequential, saturated) = complete_bounded(
+            &regex,
+            haystack,
+            SweepKind::SpanSum,
+            forward_states,
+            &mut capped,
+        );
+        assert!(saturated);
+        assert_eq!(got, want);
+        assert_eq!(capped_sequential, full_sequential);
+        assert_eq!(capped.forward.state_len, forward_states);
+        assert_eq!(capped.reverse.state_len, forward_states);
+    }
+
+    #[test]
+    fn saturation_preserves_a_pending_endpoint_through_late_priority_death() {
+        let regex = compiled("(?:abcdefghijklmnopqa+b|abcdefghijklmnopqa)");
+        let mut haystack = b"abcdefghijklmnopq".to_vec();
+        haystack.extend(core::iter::repeat_n(b'a', 4_096));
+        let want = expected(&regex, &haystack, 0..haystack.len());
+
+        let mut full = Workspace::new();
+        let (full_value, full_sequential, full_saturated) = complete_bounded(
+            &regex,
+            &haystack,
+            SweepKind::SpanSum,
+            MAX_DFA_STATES,
+            &mut full,
+        );
+        assert!(!full_saturated);
+        assert_eq!(full_value, want);
+
+        let mut capped = Workspace::new();
+        let (capped_value, capped_sequential, capped_saturated) =
+            complete_bounded(&regex, &haystack, SweepKind::SpanSum, 1, &mut capped);
+        assert!(capped_saturated);
+        assert_eq!(capped_value, want);
+        assert_eq!(capped_sequential, full_sequential);
+    }
+
+    #[test]
+    fn admitted_runtime_limits_are_hard_and_one_below_fails_closed() {
+        let pattern = "abcdefghijklmnopq";
+        let regex = compiled(pattern);
+        let haystack = pattern.as_bytes();
+        let mut count_workspace = Workspace::new();
+        let mut sum_workspace = Workspace::new();
+        let _ = complete(
+            &regex,
+            haystack,
+            0..haystack.len(),
+            SweepKind::Count,
+            &mut count_workspace,
+        );
+        let _ = complete(
+            &regex,
+            haystack,
+            0..haystack.len(),
+            SweepKind::SpanSum,
+            &mut sum_workspace,
+        );
+
+        let mut exact_count = OperationLimits::default();
+        exact_count.max_work = haystack.len() + 1;
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::Count,
+                exact_count,
+                &mut count_workspace,
+            )
+            .unwrap(),
+            Some(SweepOutcome::Complete(_))
+        ));
+        exact_count.max_work -= 1;
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::Count,
+                exact_count,
+                &mut count_workspace,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                ..
+            })
+        ));
+
+        let mut exact_sum = OperationLimits::default();
+        exact_sum.max_sequential_bytes = haystack.len() * 2;
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::SpanSum,
+                exact_sum,
+                &mut sum_workspace,
+            )
+            .unwrap(),
+            Some(SweepOutcome::Complete(_))
+        ));
+        exact_sum.max_sequential_bytes -= 1;
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::SpanSum,
+                exact_sum,
+                &mut sum_workspace,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::SequentialBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cold_preparation_and_runtime_share_exact_work_limit() {
+        let pattern = "abcdefghijklmnopq";
+        let regex = compiled(pattern);
+        let haystack = pattern.as_bytes();
+        let mut probe = Workspace::new();
+        let (admitted, preparation_work) = probe
+            .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+            .unwrap();
+        assert!(admitted);
+        assert!(preparation_work > 0);
+        let mut probe_meter = SweepMeter::new(OperationLimits::default());
+        probe_meter.charge_work(preparation_work).unwrap();
+        assert!(matches!(
+            execute_prepared(
+                &regex.program,
+                haystack,
+                SweepKind::Count,
+                &mut probe,
+                &mut probe_meter,
+            )
+            .unwrap(),
+            SweepOutcome::Complete(_)
+        ));
+        let exact_work = probe_meter.work;
+
+        let mut exact = OperationLimits::default();
+        exact.max_work = exact_work;
+        let mut exact_workspace = Workspace::new();
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::Count,
+                exact,
+                &mut exact_workspace,
+            )
+            .unwrap(),
+            Some(SweepOutcome::Complete(_))
+        ));
+
+        let mut one_below = exact;
+        one_below.max_work -= 1;
+        let mut one_below_workspace = Workspace::new();
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::Count,
+                one_below,
+                &mut one_below_workspace,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required,
+                limit,
+            }) if required == exact_work && limit == exact_work - 1
+        ));
+    }
+
+    #[test]
+    fn fixed_workspace_initialization_writes_are_exactly_charged() {
+        let mut exact_limits = OperationLimits::default();
+        exact_limits.max_work = 4;
+        let mut exact = SweepMeter::new(exact_limits);
+        assert_eq!(
+            allocated_slots(4, 0_u32, 16, &mut exact)
+                .unwrap()
+                .as_slice(),
+            &[0_u32; 4]
+        );
+        assert_eq!(exact.work, 4);
+
+        let mut one_below_limits = exact_limits;
+        one_below_limits.max_work -= 1;
+        let mut one_below = SweepMeter::new(one_below_limits);
+        assert!(matches!(
+            allocated_slots(4, 0_u32, 16, &mut one_below),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 4,
+                limit: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn published_preparation_upper_bounds_admit_exact_fixed_arenas() {
+        let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
+        let upper =
+            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+                .unwrap();
+        let mut exact = OperationLimits::default();
+        exact.max_table_cells = upper.table_cells;
+        exact.max_random_access_bytes = upper.workspace_bytes;
+        exact.max_scratch_bytes = upper.workspace_bytes;
+        exact.max_peak_bytes = upper.workspace_bytes;
+        exact.max_work = upper.preparation_work;
+        let mut workspace = Workspace::new();
+        let (admitted, actual_work) = workspace
+            .prepare(regex.plan_id(), &regex.program, exact)
+            .unwrap();
+        assert!(admitted);
+        assert!(actual_work <= upper.preparation_work);
+        assert!(workspace.retained_bytes <= upper.workspace_bytes);
+
+        let mut table_one_below = Workspace::new();
+        let mut low_table = OperationLimits::default();
+        low_table.max_table_cells = upper.table_cells - 1;
+        assert_eq!(
+            table_one_below
+                .prepare(regex.plan_id(), &regex.program, low_table)
+                .unwrap(),
+            (false, 0)
+        );
+        assert_eq!(table_one_below.retained_bytes, 0);
+    }
+
+    #[test]
+    fn cache_saturation_hands_off_inline_and_optional_limits_are_sticky() {
+        let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
+        let haystack = b"bdacbcadabz--bdacbcadabz";
+        let want = expected(&regex, haystack, 0..haystack.len());
+        let mut full = Workspace::new();
+        let (full_count, full_sequential, full_saturated) = complete_bounded(
+            &regex,
+            haystack,
+            SweepKind::Count,
+            MAX_DFA_STATES,
+            &mut full,
+        );
+        assert_eq!(full_count.count, want.count);
+        assert!(!full_saturated);
+        let retained = full.retained_bytes;
+        let upper =
+            prospective_upper_bounds(regex.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+                .unwrap();
+
+        let mut capped_count = Workspace::new();
+        let (count, capped_count_sequential, count_saturated) =
+            complete_bounded(&regex, haystack, SweepKind::Count, 1, &mut capped_count);
+        assert_eq!(count.count, want.count);
+        assert!(count_saturated);
+        assert_eq!(capped_count_sequential, full_sequential);
+
+        let mut full_sum = Workspace::new();
+        let (full_sum_value, full_sum_sequential, full_sum_saturated) = complete_bounded(
+            &regex,
+            haystack,
+            SweepKind::SpanSum,
+            MAX_DFA_STATES,
+            &mut full_sum,
+        );
+        assert_eq!(full_sum_value.span_sum, want.span_sum);
+        assert!(!full_sum_saturated);
+
+        let mut capped_sum = Workspace::new();
+        let (sum, capped_sum_sequential, sum_saturated) =
+            complete_bounded(&regex, haystack, SweepKind::SpanSum, 1, &mut capped_sum);
+        assert_eq!(sum.span_sum, want.span_sum);
+        assert!(sum_saturated);
+        assert_eq!(capped_sum_sequential, full_sum_sequential);
+
+        capped_count = Workspace::disabled(regex.plan_id());
+        assert_eq!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                b"source-must-remain-uninspected",
+                0..2,
+                SweepKind::Count,
+                OperationLimits::default(),
+                &mut capped_count,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(capped_count.retained_bytes, 0);
+
+        let mut warmed_one_below = OperationLimits::default();
+        warmed_one_below.max_scratch_bytes = retained - 1;
+        assert_eq!(
+            full.prepare(regex.plan_id(), &regex.program, warmed_one_below)
+                .unwrap(),
+            (false, 0)
+        );
+        assert!(!full.admitted);
+        assert_eq!(full.retained_bytes, 0);
+        assert!(full.forward.rows.is_empty());
+        assert_eq!(
+            full.prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                .unwrap(),
+            (false, 0)
+        );
+
+        let mut warmed_low_table = Workspace::new();
+        assert!(
+            warmed_low_table
+                .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                .unwrap()
+                .0
+        );
+        let mut table_one_below = OperationLimits::default();
+        table_one_below.max_table_cells = upper.table_cells - 1;
+        assert_eq!(
+            warmed_low_table
+                .prepare(regex.plan_id(), &regex.program, table_one_below)
+                .unwrap(),
+            (false, 0)
+        );
+        assert!(!warmed_low_table.admitted);
+        assert_eq!(warmed_low_table.retained_bytes, 0);
+        assert!(warmed_low_table.forward.rows.is_empty());
+        assert_eq!(
+            warmed_low_table
+                .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                .unwrap(),
+            (false, 0)
+        );
+
+        let mut memory_limited = Workspace::new();
+        let mut one_below = OperationLimits::default();
+        one_below.max_scratch_bytes = retained - 1;
+        assert_eq!(
+            memory_limited
+                .prepare(regex.plan_id(), &regex.program, one_below,)
+                .unwrap(),
+            (false, 0)
+        );
+        assert_eq!(memory_limited.retained_bytes, 0);
+
+        for resource in [
+            Resource::ScratchBytes,
+            Resource::RandomAccessBytes,
+            Resource::PeakBytes,
+        ] {
+            let mut warmed = Workspace::new();
+            assert!(
+                warmed
+                    .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                    .unwrap()
+                    .0
+            );
+            let mut low = OperationLimits::default();
+            match resource {
+                Resource::ScratchBytes => low.max_scratch_bytes = retained - 1,
+                Resource::RandomAccessBytes => low.max_random_access_bytes = retained - 1,
+                Resource::PeakBytes => low.max_peak_bytes = retained - 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                warmed
+                    .prepare(regex.plan_id(), &regex.program, low)
+                    .unwrap(),
+                (false, 0)
+            );
+            assert_eq!(warmed.retained_bytes, 0);
+            assert!(warmed.forward.rows.is_empty());
+        }
+
+        let mut work_limited = Workspace::new();
+        let mut no_preparation_work = OperationLimits::default();
+        no_preparation_work.max_work = 0;
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                b"\xFF\x00source-must-remain-uninspected",
+                0..2,
+                SweepKind::Count,
+                no_preparation_work,
+                &mut work_limited,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 1,
+                limit: 0,
+            })
+        ));
+        assert_eq!(work_limited.retained_bytes, 0);
+    }
+
+    #[test]
+    fn cross_plan_rebind_drops_old_cache_before_exact_peak_preflight() {
+        let first = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
+        let second = compiled("(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z");
+        let prospective =
+            prospective_upper_bounds(second.program.insts.len(), MAX_DFA_STATES, MAX_DFA_ITEMS)
+                .unwrap()
+                .workspace_bytes;
+
+        let mut exact = Workspace::new();
+        assert!(
+            exact
+                .prepare(first.plan_id(), &first.program, OperationLimits::default())
+                .unwrap()
+                .0
+        );
+        assert!(exact.retained_bytes > 0);
+        let mut exact_peak = OperationLimits::default();
+        exact_peak.max_peak_bytes = prospective;
+        assert!(
+            exact
+                .prepare(second.plan_id(), &second.program, exact_peak)
+                .unwrap()
+                .0
+        );
+
+        let mut one_below = Workspace::new();
+        assert!(
+            one_below
+                .prepare(first.plan_id(), &first.program, OperationLimits::default())
+                .unwrap()
+                .0
+        );
+        let mut low_peak = OperationLimits::default();
+        low_peak.max_peak_bytes = prospective - 1;
+        assert_eq!(
+            one_below
+                .prepare(second.plan_id(), &second.program, low_peak)
+                .unwrap(),
+            (false, 0)
+        );
+        assert_eq!(one_below.plan_id, Some(second.plan_id()));
+        assert!(!one_below.admitted);
+        assert_eq!(one_below.retained_bytes, 0);
+        assert!(one_below.forward.rows.is_empty());
+    }
+
+    #[test]
+    fn encountered_transitions_are_retained_without_eager_table_fill() {
+        let regex = compiled("(?:ab|ac|ad|ba|bc|bd)+z");
+        let haystack = b"bdacbcadabz--bdacbcadabz";
+        let mut workspace = Workspace::new();
+        let (admitted, _) = workspace
+            .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+            .unwrap();
+        assert!(admitted);
+        for cache in [&workspace.forward, &workspace.reverse] {
+            let cells = cache.state_len * BYTE_ALPHABET;
+            assert!(
+                cache.rows[..cells]
+                    .iter()
+                    .all(|&cell| cell == CELL_UNFILLED)
+            );
+        }
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::SpanSum,
+                OperationLimits::default(),
+                &mut workspace,
+            )
+            .unwrap(),
+            Some(SweepOutcome::Complete(_))
+        ));
+        for cache in [&workspace.forward, &workspace.reverse] {
+            let cells = cache.state_len * BYTE_ALPHABET;
+            assert!(
+                cache.rows[..cells]
+                    .iter()
+                    .any(|&cell| cell != CELL_UNFILLED)
+            );
+            assert!(
+                cache.rows[..cells]
+                    .iter()
+                    .any(|&cell| cell == CELL_UNFILLED)
+            );
+        }
+    }
+}

@@ -20,6 +20,7 @@ use crate::error::{add, enforce, mul};
 use crate::program::{
     Assertion, AssertionContext, Inst, NO_SPLIT_RANK, Program, ScalarSet, decode_first_scalar,
 };
+use crate::sweep::{self, ContinuationSweepWorkspace, SweepKind, SweepOutcome};
 use crate::{Error, OperationLimits, Resource};
 
 mod ordered_bounded_span_sum;
@@ -1832,6 +1833,41 @@ impl CompiledRegex {
             .map(|result| result.summary.matches)
     }
 
+    /// Attempt the reusable ordered-DFA continuation route for a value-only
+    /// Count.
+    ///
+    /// `Ok(None)` is a source-free structural refusal. An admitted call learns
+    /// direct transitions in its caller workspace. Cache saturation carries
+    /// the current ordered frontier inline without rereading an earlier source
+    /// position or restarting through the incumbent.
+    #[doc(hidden)]
+    pub fn count_value_with_sweep_workspace(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        workspace: &mut ContinuationSweepWorkspace,
+    ) -> Result<Option<usize>, Error> {
+        if !self.sweep_value_route_eligible(strategy) {
+            return Ok(None);
+        }
+        let outcome = sweep::reduce_lazy(
+            self.plan_id(),
+            &self.program,
+            haystack,
+            range,
+            SweepKind::Count,
+            limits,
+            workspace,
+        )?;
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        let SweepOutcome::Complete(value) = outcome;
+        Ok(Some(value.count))
+    }
+
     /// Evaluate through the same ordinary value-only Count path as
     /// [`Self::count_value`] and publish structural counters only after that
     /// operation has completed. This does not make the selected route
@@ -2282,6 +2318,78 @@ impl CompiledRegex {
         }
         self.execute::<true>(haystack, range, strategy, OperationKind::Sum, limits)
             .map(|result| result.summary.span_sum)
+    }
+
+    /// Attempt the reusable ordered-DFA continuation route for a value-only
+    /// matched-byte sum.
+    ///
+    /// See [`Self::count_value_with_sweep_workspace`] for the source-free
+    /// refusal and no-replay saturation contract.
+    #[doc(hidden)]
+    pub fn span_sum_value_with_sweep_workspace(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        workspace: &mut ContinuationSweepWorkspace,
+    ) -> Result<Option<usize>, Error> {
+        if !self.sweep_value_route_eligible(strategy) {
+            return Ok(None);
+        }
+        let outcome = sweep::reduce_lazy(
+            self.plan_id(),
+            &self.program,
+            haystack,
+            range,
+            SweepKind::SpanSum,
+            limits,
+            workspace,
+        )?;
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        let SweepOutcome::Complete(value) = outcome;
+        Ok(Some(value.span_sum))
+    }
+
+    /// Publish the fixed workspace envelope only when this compiled artifact
+    /// can actually select the value-only continuation sweep.
+    ///
+    /// # Errors
+    ///
+    /// Returns an arithmetic error when the authenticated program dimensions
+    /// cannot be represented by the fixed-arena upper-bound calculation.
+    #[doc(hidden)]
+    pub fn continuation_sweep_upper_bounds(
+        &self,
+        strategy: Strategy,
+    ) -> Result<Option<crate::sweep::ContinuationSweepUpperBounds>, Error> {
+        if !self.sweep_value_route_eligible(strategy) {
+            return Ok(None);
+        }
+        crate::sweep::continuation_sweep_upper_bounds(self.program.insts.len()).map(Some)
+    }
+
+    fn sweep_value_route_eligible(&self, strategy: Strategy) -> bool {
+        if strategy != Strategy::ReverseSequentialRows
+            || self
+                .minimum_match_bytes
+                .is_none_or(|minimum| minimum == 0)
+            || self.program.root_assertion().is_some()
+            || self.program.contains_scalar_transition()
+            || self.program.contains_assertion()
+            || self.program.contains_unicode_word_boundary()
+            || self.program.start_domain.is_sparse()
+            // The incumbent two-row byte kernel is already dense and cheap
+            // for very small programs. Avoid a persistent DFA workspace and
+            // its first-call determinization until the program is large
+            // enough for direct indexed transitions to amortize that cost.
+            || self.program.insts.len() <= 16
+        {
+            return false;
+        }
+        true
     }
 
     /// Evaluate through the same ordinary value-only `SpanSum` path as

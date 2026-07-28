@@ -49,6 +49,7 @@ mod limits;
 mod operation;
 mod program;
 mod required_internal_anchor;
+mod sweep;
 
 pub use accounting::{CompileAccounting, ExecutionAccounting};
 pub use compile::{
@@ -70,4 +71,7 @@ pub use operation::{
     OperationPrepublicationFallback, OperationProspective, OperationStructuralCounters,
     OperationWorkMode, RowStorage, Span, SpanIter, SpanIteration, SpanSum, SpanSumValueAttempt,
     SpanSumValueCounterAttempt, Strategy,
+};
+pub use sweep::{
+    ContinuationSweepUpperBounds, ContinuationSweepWorkspace, continuation_sweep_upper_bounds,
 };

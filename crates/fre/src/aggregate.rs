@@ -3,8 +3,9 @@ use std::sync::{Arc, Weak};
 
 use fre_aggregate::{
     AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
-    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt,
-    OperationHotCounterReceipt, OperationProspective, RustByteProfile, SpanIter,
+    ContinuationSweepUpperBounds, ContinuationSweepWorkspace, OperationAttemptError,
+    OperationAttemptKind, OperationAttemptReceipt, OperationHotCounterReceipt,
+    OperationProspective, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
@@ -14203,6 +14204,22 @@ impl AggregatePlan {
         self.minimum_match_bytes
     }
 
+    fn continuation_sweep_upper_bounds(
+        &self,
+    ) -> Result<Option<ContinuationSweepUpperBounds>, AggregateExecutionSource> {
+        let AggregateEngine::Continuation(engine) = &self.engine else {
+            return Ok(None);
+        };
+        let strategy = self.report.continuation_strategy.ok_or(
+            AggregateExecutionSource::InternalInvariant(
+                "continuation plan lacks storage strategy for sweep preflight",
+            ),
+        )?;
+        engine
+            .continuation_sweep_upper_bounds(strategy)
+            .map_err(AggregateExecutionSource::Continuation)
+    }
+
     fn fixed_absolute_domain_seal(&self) -> Option<&AggregateFixedAbsoluteDomainSeal> {
         let owner = self.report.fixed_absolute_domain_owner()?;
         let sealed = owner.fixed_absolute_domain_seal();
@@ -16488,12 +16505,47 @@ impl AggregatePlan {
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
-        workspace: &mut OrderedLiteralCountWorkspace,
+        dense_finite: &mut OrderedLiteralCountWorkspace,
+        continuation: &mut ContinuationSweepWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
-        let AggregateEngine::FiniteCount(engine) = &self.engine else {
-            return self.execute_count_value(haystack, limits);
-        };
-        self.execute_dense_finite_count_value_with_workspace(engine, haystack, limits, workspace)
+        match &self.engine {
+            AggregateEngine::FiniteCount(engine) => self
+                .execute_dense_finite_count_value_with_workspace(
+                    engine,
+                    haystack,
+                    limits,
+                    dense_finite,
+                ),
+            AggregateEngine::Continuation(engine) => {
+                match engine.count_value_with_sweep_workspace(
+                    haystack,
+                    Self::full_range(haystack),
+                    self.report.continuation_strategy.ok_or_else(|| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "continuation count plan lacks storage strategy",
+                            ),
+                        )
+                    })?,
+                    limits.continuation,
+                    continuation,
+                ) {
+                    Ok(Some(value)) => u64::try_from(value).map_err(|_| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "continuation sweep count does not fit u64",
+                            ),
+                        )
+                    }),
+                    Ok(None) => self.execute_continuation_count_value(engine, haystack, limits),
+                    Err(source) => Err(self
+                        .execution_error(limits, AggregateExecutionSource::Continuation(source))),
+                }
+            }
+            _ => self.execute_count_value(haystack, limits),
+        }
     }
 
     #[allow(
@@ -17081,12 +17133,47 @@ impl AggregatePlan {
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
-        workspace: &mut OrderedLiteralSpanSumWorkspace,
+        dense_finite: &mut OrderedLiteralSpanSumWorkspace,
+        continuation: &mut ContinuationSweepWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
-        let AggregateEngine::FiniteSpanSum(engine) = &self.engine else {
-            return self.execute_span_sum_value(haystack, limits);
-        };
-        self.execute_dense_finite_span_sum_value_with_workspace(engine, haystack, limits, workspace)
+        match &self.engine {
+            AggregateEngine::FiniteSpanSum(engine) => self
+                .execute_dense_finite_span_sum_value_with_workspace(
+                    engine,
+                    haystack,
+                    limits,
+                    dense_finite,
+                ),
+            AggregateEngine::Continuation(engine) => {
+                match engine.span_sum_value_with_sweep_workspace(
+                    haystack,
+                    Self::full_range(haystack),
+                    self.report.continuation_strategy.ok_or_else(|| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "continuation span-sum plan lacks storage strategy",
+                            ),
+                        )
+                    })?,
+                    limits.continuation,
+                    continuation,
+                ) {
+                    Ok(Some(value)) => u64::try_from(value).map_err(|_| {
+                        self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "continuation sweep span sum does not fit u64",
+                            ),
+                        )
+                    }),
+                    Ok(None) => self.execute_continuation_span_sum_value(engine, haystack, limits),
+                    Err(source) => Err(self
+                        .execution_error(limits, AggregateExecutionSource::Continuation(source))),
+                }
+            }
+            _ => self.execute_span_sum_value(haystack, limits),
+        }
     }
 
     #[allow(
@@ -20182,12 +20269,14 @@ impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 
 /// Caller-owned scratch for repeated value-only count operations.
 ///
-/// Dense finite-literal plans retain their DP allocation here after the first
-/// call. Other selected plans ignore the workspace and keep their existing
+/// Dense finite-literal plans retain their DP allocation here. Eligible
+/// byte-only continuation plans retain a complete ordered transition cache.
+/// Other selected plans ignore the workspace and keep their existing
 /// operation boundary.
 #[derive(Debug, Default)]
 pub struct AggregateCountWorkspace {
     dense_finite: OrderedLiteralCountWorkspace,
+    continuation: ContinuationSweepWorkspace,
 }
 
 impl AggregateCountWorkspace {
@@ -20195,6 +20284,7 @@ impl AggregateCountWorkspace {
     pub const fn new() -> Self {
         Self {
             dense_finite: OrderedLiteralCountWorkspace::new(),
+            continuation: ContinuationSweepWorkspace::new(),
         }
     }
 
@@ -20202,6 +20292,12 @@ impl AggregateCountWorkspace {
     #[must_use]
     pub fn retained_dense_finite_bytes(&self) -> Option<usize> {
         self.dense_finite.retained_bytes()
+    }
+
+    /// Bytes retained for an eligible byte-only continuation sweep.
+    #[must_use]
+    pub const fn retained_continuation_bytes(&self) -> Option<usize> {
+        self.continuation.retained_bytes()
     }
 }
 
@@ -20209,6 +20305,7 @@ impl AggregateCountWorkspace {
 #[derive(Debug, Default)]
 pub struct AggregateSpanSumWorkspace {
     dense_finite: OrderedLiteralSpanSumWorkspace,
+    continuation: ContinuationSweepWorkspace,
 }
 
 impl AggregateSpanSumWorkspace {
@@ -20216,6 +20313,7 @@ impl AggregateSpanSumWorkspace {
     pub const fn new() -> Self {
         Self {
             dense_finite: OrderedLiteralSpanSumWorkspace::new(),
+            continuation: ContinuationSweepWorkspace::new(),
         }
     }
 
@@ -20223,6 +20321,12 @@ impl AggregateSpanSumWorkspace {
     #[must_use]
     pub fn retained_dense_finite_bytes(&self) -> Option<usize> {
         self.dense_finite.retained_bytes()
+    }
+
+    /// Bytes retained for an eligible byte-only continuation sweep.
+    #[must_use]
+    pub const fn retained_continuation_bytes(&self) -> Option<usize> {
+        self.continuation.retained_bytes()
     }
 }
 
@@ -20264,6 +20368,15 @@ impl AggregateCountRegex {
         input_bytes: usize,
     ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
         self.0.retained_full_window_upper_bounds(input_bytes)
+    }
+
+    /// Source-free fixed-workspace envelope for the retained continuation
+    /// sweep, or `None` when this artifact cannot select that route.
+    #[doc(hidden)]
+    pub fn continuation_sweep_upper_bounds(
+        &self,
+    ) -> Result<Option<ContinuationSweepUpperBounds>, AggregateExecutionSource> {
+        self.0.continuation_sweep_upper_bounds()
     }
 
     /// Exact intrinsic fixed-domain guard envelope for a complete haystack of
@@ -20336,8 +20449,12 @@ impl AggregateCountRegex {
         workspace: &mut AggregateCountWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
-        self.0
-            .execute_count_value_with_workspace(haystack, limits, &mut workspace.dense_finite)
+        self.0.execute_count_value_with_workspace(
+            haystack,
+            limits,
+            &mut workspace.dense_finite,
+            &mut workspace.continuation,
+        )
     }
 
     /// Count through the same selected value-only plan as [`Self::count_value`]
@@ -20434,6 +20551,15 @@ impl AggregateSpanSumRegex {
         self.0.retained_full_window_upper_bounds(input_bytes)
     }
 
+    /// Source-free fixed-workspace envelope for the retained continuation
+    /// sweep, or `None` when this artifact cannot select that route.
+    #[doc(hidden)]
+    pub fn continuation_sweep_upper_bounds(
+        &self,
+    ) -> Result<Option<ContinuationSweepUpperBounds>, AggregateExecutionSource> {
+        self.0.continuation_sweep_upper_bounds()
+    }
+
     /// Exact intrinsic fixed-domain guard envelope for a complete haystack of
     /// `haystack_len` bytes, computed without source access or allocation.
     ///
@@ -20497,8 +20623,12 @@ impl AggregateSpanSumRegex {
         workspace: &mut AggregateSpanSumWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
-        self.0
-            .execute_span_sum_value_with_workspace(haystack, limits, &mut workspace.dense_finite)
+        self.0.execute_span_sum_value_with_workspace(
+            haystack,
+            limits,
+            &mut workspace.dense_finite,
+            &mut workspace.continuation,
+        )
     }
 
     /// Sum spans through the same selected value-only plan as

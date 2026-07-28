@@ -2372,16 +2372,25 @@ fn build_current_fre_count_lifecycle_incumbent(
                     "FRE count lifecycle fixed-domain composite preflight: {error}"
                 ))
             })?;
+        let continuation_sweep = regex.continuation_sweep_upper_bounds().map_err(|error| {
+            CompareError::new(format!(
+                "FRE count lifecycle continuation-sweep preflight: {error}"
+            ))
+        })?;
         let limits = aggregate_run_limits_with_fixed_absolute(
             haystack_len,
             regex.build_report(),
             retained_upper_bounds,
             fixed_absolute_prospective,
             fixed_absolute_composite,
+            continuation_sweep,
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        let inner = if regex.build_report().plan == AggregatePlanKind::FiniteLiteralDfa {
+        let inner = if matches!(
+            regex.build_report().plan,
+            AggregatePlanKind::FiniteLiteralDfa | AggregatePlanKind::ContinuationProgram
+        ) {
             CurrentFreAggregateOperationInner::CountSingleDense(
                 regex,
                 limits,
@@ -2486,16 +2495,25 @@ fn build_current_fre_span_sum_lifecycle_incumbent(
                     "FRE span-sum lifecycle fixed-domain composite preflight: {error}"
                 ))
             })?;
+        let continuation_sweep = regex.continuation_sweep_upper_bounds().map_err(|error| {
+            CompareError::new(format!(
+                "FRE span-sum lifecycle continuation-sweep preflight: {error}"
+            ))
+        })?;
         let limits = aggregate_run_limits_with_fixed_absolute(
             haystack_len,
             regex.build_report(),
             retained_upper_bounds,
             fixed_absolute_prospective,
             fixed_absolute_composite,
+            continuation_sweep,
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        let inner = if regex.build_report().plan == AggregatePlanKind::FiniteLiteralDfa {
+        let inner = if matches!(
+            regex.build_report().plan,
+            AggregatePlanKind::FiniteLiteralDfa | AggregatePlanKind::ContinuationProgram
+        ) {
             CurrentFreAggregateOperationInner::SpanSumSingleDense(
                 regex,
                 limits,
@@ -3888,6 +3906,7 @@ fn compile_run_limits_with_policy(
         retained_upper_bounds,
         fixed_absolute_prospective,
         fixed_absolute_composite,
+        None,
         limits,
     )
 }
@@ -3914,12 +3933,16 @@ fn count_run_limits_with_policy(
                 "FRE count fixed-domain composite preflight: {error}"
             ))
         })?;
+    let continuation_sweep = regex.continuation_sweep_upper_bounds().map_err(|error| {
+        ExecutionError::fault(format!("FRE count continuation-sweep preflight: {error}"))
+    })?;
     aggregate_run_limits_with_fixed_absolute(
         haystack_len,
         regex.build_report(),
         retained_upper_bounds,
         fixed_absolute_prospective,
         fixed_absolute_composite,
+        continuation_sweep,
         limits,
     )
 }
@@ -3946,12 +3969,18 @@ fn span_sum_run_limits_with_policy(
                 "FRE span-sum fixed-domain composite preflight: {error}"
             ))
         })?;
+    let continuation_sweep = regex.continuation_sweep_upper_bounds().map_err(|error| {
+        ExecutionError::fault(format!(
+            "FRE span-sum continuation-sweep preflight: {error}"
+        ))
+    })?;
     aggregate_run_limits_with_fixed_absolute(
         haystack_len,
         regex.build_report(),
         retained_upper_bounds,
         fixed_absolute_prospective,
         fixed_absolute_composite,
+        continuation_sweep,
         limits,
     )
 }
@@ -10002,6 +10031,15 @@ fn continuation_operation_limits(
     shape: ContinuationProgramShape,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
+    continuation_operation_limits_with_sweep(haystack_len, shape, None, limits)
+}
+
+fn continuation_operation_limits_with_sweep(
+    haystack_len: usize,
+    shape: ContinuationProgramShape,
+    sweep: Option<fre::ContinuationSweepUpperBounds>,
+    limits: &RunLimits,
+) -> Result<AggregateOperationLimits, ExecutionError> {
     let program_states = shape.states;
     if program_states == 0 {
         return Err(ExecutionError::fault(
@@ -10072,12 +10110,38 @@ fn continuation_operation_limits(
         prefix.work,
         "operation work with prefixes",
     )?;
-    let available_work = work_upper.min(limits.fre_aggregate_operation_work);
+    if let Some(sweep) = sweep {
+        let expected = fre::continuation_sweep_upper_bounds(program_states).map_err(|error| {
+            ExecutionError::fault(format!("FRE continuation sweep bounds: {error}"))
+        })?;
+        if sweep != expected {
+            return Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is absent or transplanted",
+            ));
+        }
+    }
+    let sweep_workspace_bytes = sweep.map_or(0, |bounds| bounds.workspace_bytes);
+    let sweep_table_cells = sweep.map_or(0, |bounds| bounds.table_cells);
+    let sweep_storage_eligible = sweep.is_some()
+        && sweep_workspace_bytes <= limits.fre_aggregate_random_access_bytes
+        && sweep_workspace_bytes <= limits.fre_aggregate_scratch_bytes
+        && sweep_workspace_bytes <= limits.fre_aggregate_peak_bytes;
+    let route_work_upper = if sweep_storage_eligible {
+        checked_aggregate_add(
+            work_upper,
+            sweep.map_or(0, |bounds| bounds.preparation_work),
+            "operation work with continuation sweep preparation",
+        )?
+    } else {
+        work_upper
+    };
+    let incumbent_available_work = work_upper.min(limits.fre_aggregate_operation_work);
+    let available_work = route_work_upper.min(limits.fre_aggregate_operation_work);
     let storage = composed_continuation_storage_limits(
         program_states,
         boundaries,
         prefix.sequential,
-        available_work,
+        incumbent_available_work,
         terminal_frontier.is_some(),
         row_storage,
     )?;
@@ -10090,9 +10154,15 @@ fn continuation_operation_limits(
 
     Ok(AggregateOperationLimits {
         max_boundaries: boundaries,
-        max_table_cells: 0,
-        max_random_access_bytes: storage.random.min(limits.fre_aggregate_random_access_bytes),
-        max_scratch_bytes: storage.scratch.min(limits.fre_aggregate_scratch_bytes),
+        max_table_cells: sweep_table_cells,
+        max_random_access_bytes: storage
+            .random
+            .max(sweep_workspace_bytes)
+            .min(limits.fre_aggregate_random_access_bytes),
+        max_scratch_bytes: storage
+            .scratch
+            .max(sweep_workspace_bytes)
+            .min(limits.fre_aggregate_scratch_bytes),
         max_log_bytes: storage.log.min(limits.fre_aggregate_log_bytes),
         max_sequential_bytes: storage
             .sequential
@@ -10101,7 +10171,10 @@ fn continuation_operation_limits(
         max_output_matches: boundaries.min(reducer_matches),
         max_output_bytes: 0,
         max_span_sum: haystack_len,
-        max_peak_bytes: storage.peak.min(limits.fre_aggregate_peak_bytes),
+        max_peak_bytes: storage
+            .peak
+            .max(sweep_workspace_bytes)
+            .min(limits.fre_aggregate_peak_bytes),
         max_work: available_work,
     })
 }
@@ -11476,6 +11549,7 @@ fn aggregate_run_limits_with_fixed_absolute(
     retained_upper_bounds: Option<fre::AggregateRetainedFullWindowUpperBounds>,
     fixed_absolute_prospective: Option<fre::FixedAbsoluteDomainProspective>,
     fixed_absolute_composite: Option<fre::AggregateFixedAbsoluteDomainResidualProspective>,
+    continuation_sweep: Option<fre::ContinuationSweepUpperBounds>,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
     require_closed_bounded_separated_fields_identity(report)?;
@@ -11511,6 +11585,13 @@ fn aggregate_run_limits_with_fixed_absolute(
     if residual_fixed_absolute != fixed_absolute_composite.is_some() {
         return Err(ExecutionError::fault(
             "FRE fixed scalar artifact/composite prospective binding is absent or transplanted",
+        ));
+    }
+    if continuation_sweep.is_some()
+        && !matches!(report.build, AggregateBuildAccounting::Continuation(_))
+    {
+        return Err(ExecutionError::fault(
+            "FRE continuation sweep envelope is attached to a non-continuation plan",
         ));
     }
     match report.build {
@@ -12296,7 +12377,12 @@ fn aggregate_run_limits_with_fixed_absolute(
                 fixed_absolute: inactive_fixed_absolute_operation_limits(),
                 fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
                 finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-                continuation: continuation_operation_limits(haystack_len, shape, limits)?,
+                continuation: continuation_operation_limits_with_sweep(
+                    haystack_len,
+                    shape,
+                    continuation_sweep,
+                    limits,
+                )?,
             })
         }
     }
@@ -12307,7 +12393,7 @@ fn aggregate_run_limits(
     report: &AggregateBuildReport,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
-    aggregate_run_limits_with_fixed_absolute(haystack_len, report, None, None, None, limits)
+    aggregate_run_limits_with_fixed_absolute(haystack_len, report, None, None, None, None, limits)
 }
 
 fn finite_plan_identity_matches(
@@ -26603,43 +26689,50 @@ mod tests {
     #[test]
     fn aggregate_operation_limits_are_fully_derived_and_quota_capped() {
         let mut run = RunLimits::default();
-        let derived =
-            continuation_operation_limits(10, conservative_continuation_shape(5).unwrap(), &run)
-                .unwrap();
+        let sweep = fre::continuation_sweep_upper_bounds(5).unwrap();
+        let derived = continuation_operation_limits_with_sweep(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
+            &run,
+        )
+        .unwrap();
         let cached_frontier = cached_frontier_limits(5, 11, 1).unwrap();
         assert_eq!(cached_frontier.random, 2_162_704);
         assert_eq!(cached_frontier.scratch, 2_162_704);
         assert_eq!(cached_frontier.log, 22);
         assert_eq!(cached_frontier.sequential, 88);
         assert_eq!(cached_frontier.peak, 2_162_726);
-        assert!(cached_frontier_initialization_work(5, 11).unwrap() > derived.max_work);
+        assert!(cached_frontier_initialization_work(5, 11).unwrap() > 429);
         assert_eq!(derived.max_boundaries, 11);
-        assert_eq!(derived.max_table_cells, 0);
-        assert_eq!(derived.max_random_access_bytes, 81);
-        assert_eq!(derived.max_scratch_bytes, 81);
+        assert_eq!(derived.max_table_cells, sweep.table_cells);
+        assert_eq!(derived.max_random_access_bytes, sweep.workspace_bytes);
+        assert_eq!(derived.max_scratch_bytes, sweep.workspace_bytes);
         assert_eq!(derived.max_log_bytes, 11);
         assert_eq!(derived.max_sequential_bytes, 22);
         assert_eq!(derived.max_match_events, 22);
         assert_eq!(derived.max_output_matches, 11);
         assert_eq!(derived.max_output_bytes, 0);
         assert_eq!(derived.max_span_sum, 10);
-        assert_eq!(derived.max_peak_bytes, 92);
-        assert_eq!(derived.max_work, 429);
+        assert_eq!(derived.max_peak_bytes, sweep.workspace_bytes);
+        assert_eq!(derived.max_work, 429 + sweep.preparation_work);
 
-        let unicode = continuation_operation_limits(
+        let unicode = continuation_operation_limits_with_sweep(
             10,
             ContinuationProgramShape {
                 requires_utf8_validation: true,
                 ..conservative_continuation_shape(5).unwrap()
             },
+            Some(sweep),
             &run,
         )
         .unwrap();
         assert_eq!(unicode.max_sequential_bytes, 32);
 
-        let one_below = continuation_operation_limits(
+        let one_below = continuation_operation_limits_with_sweep(
             10,
             conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
             &RunLimits {
                 fre_aggregate_sequential_bytes: derived.max_sequential_bytes - 1,
                 fre_aggregate_operation_work: derived.max_work - 1,
@@ -26653,9 +26746,10 @@ mod tests {
         );
         assert_eq!(one_below.max_work, derived.max_work - 1);
 
-        let row_one_below = continuation_operation_limits(
+        let row_one_below = continuation_operation_limits_with_sweep(
             10,
             conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
             &RunLimits {
                 fre_aggregate_random_access_bytes: derived.max_random_access_bytes - 1,
                 fre_aggregate_scratch_bytes: derived.max_scratch_bytes - 1,
@@ -26680,15 +26774,76 @@ mod tests {
         run.fre_aggregate_sequential_bytes = 4;
         run.fre_aggregate_peak_bytes = 3;
         run.fre_aggregate_operation_work = 2;
-        let capped =
-            continuation_operation_limits(10, conservative_continuation_shape(5).unwrap(), &run)
-                .unwrap();
+        let capped = continuation_operation_limits_with_sweep(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
+            &run,
+        )
+        .unwrap();
         assert_eq!(capped.max_random_access_bytes, 7);
         assert_eq!(capped.max_scratch_bytes, 6);
         assert_eq!(capped.max_log_bytes, 5);
         assert_eq!(capped.max_sequential_bytes, 4);
         assert_eq!(capped.max_peak_bytes, 3);
         assert_eq!(capped.max_work, 2);
+    }
+
+    #[test]
+    fn retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes() {
+        let policy = RunLimits::default();
+        let eligible = AggregateBuilder::new(r"(?:abcdefghijklmnopqa+b|abcdefghijklmnopqa)")
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&policy))
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        let sweep = eligible
+            .continuation_sweep_upper_bounds()
+            .unwrap()
+            .expect("large byte continuation must publish its sweep envelope");
+        let retained = count_run_limits_with_policy(4_096, &eligible, &policy).unwrap();
+        assert_eq!(retained.continuation.max_table_cells, sweep.table_cells);
+        assert_eq!(
+            retained.continuation.max_random_access_bytes,
+            sweep.workspace_bytes
+        );
+
+        let report_only = aggregate_run_limits(4_096, eligible.build_report(), &policy).unwrap();
+        assert_eq!(report_only.continuation.max_table_cells, 0);
+        assert!(
+            report_only.continuation.max_random_access_bytes
+                < retained.continuation.max_random_access_bytes
+        );
+
+        let small = AggregateBuilder::new(r"a+")
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&policy))
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        assert_eq!(small.continuation_sweep_upper_bounds().unwrap(), None);
+        assert_eq!(
+            count_run_limits_with_policy(4_096, &small, &policy)
+                .unwrap()
+                .continuation
+                .max_table_cells,
+            0
+        );
+
+        let shape = ContinuationProgramShape::from(match eligible.build_report().build {
+            AggregateBuildAccounting::Continuation(compile) => compile,
+            _ => panic!("forced continuation returned another plan"),
+        });
+        let transplanted = fre::continuation_sweep_upper_bounds(shape.states + 1).unwrap();
+        assert!(
+            continuation_operation_limits_with_sweep(4_096, shape, Some(transplanted), &policy,)
+                .is_err()
+        );
     }
 
     #[test]

@@ -159,6 +159,12 @@ impl<T> Default for ExactVec<T> {
 }
 
 impl<T> ExactVec<T> {
+    /// Create empty storage without allocating.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+
     /// Allocate exactly `capacity` elements without initializing them.
     pub fn try_with_capacity(capacity: usize) -> Result<Self, CopyError> {
         exact_vec_with_capacity(capacity, false)
