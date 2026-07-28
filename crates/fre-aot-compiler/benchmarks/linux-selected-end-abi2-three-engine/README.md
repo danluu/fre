@@ -283,6 +283,19 @@ seconds. It never enumerates or signals unrelated processes. The parent-death
 setting covers an otherwise uncatchable runner exit by killing the direct
 benchmark leader when Linux reports parent death.
 
+Handled runner signals use a non-throwing one-shot latch: the Python signal
+handler never raises through an already-active exception or cleanup. The
+bounded child-wait loop polls that latch at intervals of at most 250 ms.
+Signals delivered during child launch or a durable progress-journal write stay
+latched and are checked at the immediately following safe point; cleanup then
+kills and reaps only the active owned process group, records the interruption,
+and exits with the conventional signal status. Each absolute child deadline is
+captured before `Popen`, capped by the absolute campaign deadline, and is not
+rebased after launch or progress publication. The final manifest rename is a
+short signal-blocked commit region, so a signal already latched before entry
+aborts publication while a signal arriving after commit cannot invalidate or
+retract complete evidence.
+
 The campaign root contains `progress.v1.ndjson`. Each canonical event is at
 most 4096 bytes, is appended through the runner's exclusive open descriptor,
 and is `fsync`ed before the same record is emitted on standard error with a
@@ -295,6 +308,33 @@ failure/interruption event and is made read-only when the runner can execute
 cleanup. An uncatchable runner death can instead leave the already-`fsync`ed
 prefix at mode `0600`; it still has no manifest, and every event explicitly
 records `resumable=false` and `selective_retry=false`.
+
+The manifest and digest sidecar are first written under private pending names.
+After all raw/evidence directories and both pending files are durable, the
+runner validates the deadline and live admission again, publishes the digest
+sidecar without replacement, and publishes `manifest.v1.json` last. Handled
+failures before that commit remove every pending/final completion file whose
+exclusive inode ownership was established and append a failure/interruption
+event through the still-open progress descriptor, even if a provisional
+`campaign-finalizing` event was already written. If the kernel cannot report
+the inode of a just-created pending file, cleanup leaves that unowned pending
+name as fail-closed residue rather than risk deleting a replacement; it can
+never become the final completion name.
+
+The manifest's `completed_unix_ns` is the evidence/admission completion
+boundary, sampled after the final child, final heartbeat, and finalizing event
+and checked against both the monotonic campaign deadline and live admission.
+File staging is then rechecked before publication, but scheduler delay between
+that user-space check and `renameat2` does not redefine the already-recorded
+evidence boundary. The final manifest name is the filesystem transaction
+commit point. The runner retains the exact output-parent descriptor, verifies
+that the parent still names the opened output-directory inode, and syncs both
+the campaign root and its parent after commit. Reporting or directory-sync
+errors after the name becomes visible do not retract a complete campaign. A
+process death before that final publication may leave pending files or a
+provisional finalizing journal but no final manifest; once the final name is
+visible, all bound content and the sidecar were already staged and synced even
+if the runner dies before printing its summary.
 
 ### Invocation and evidence
 
@@ -325,10 +365,12 @@ snapshot through its already-open file descriptor, pins each child directly
 with `sched_setaffinity`, and sets common thread-pool variables to one. It
 stores the bounded progress journal, read-only raw stdout, stderr, before/after
 admission heartbeats, the binary, host/admission/post-link evidence, a
-canonical manifest, and a manifest digest sidecar. A partial or failed
-campaign never gets a final manifest. Operators can follow the durable status
-with `tail -f <campaign-directory>/progress.v1.ndjson`; the emitted stderr
-records provide the same live child boundaries.
+canonical manifest, and a manifest digest sidecar. A partial campaign or any
+pre-commit failure never gets a final manifest. A post-commit reporting or
+directory-sync error may produce a nonzero runner exit, but it does not
+reclassify or retract the already-complete manifest. Operators can follow the
+durable status by running `tail -f` on the campaign's `progress.v1.ndjson`;
+the emitted stderr records provide the same live child boundaries.
 
 Retain the runner-printed manifest digest outside the campaign directory.
 Verify using that digest and the other expected digests supplied independently

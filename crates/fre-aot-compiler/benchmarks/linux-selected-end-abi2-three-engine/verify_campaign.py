@@ -67,6 +67,7 @@ UINT = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 SAFE_RUN = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
 SAFE_INSTANCE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 SAFE_INSTANCE_TYPE = re.compile(r"(?:c9g|m9g)\.[A-Za-z0-9.-]{1,80}\Z")
+SAFE_PROTOCOL = re.compile(r"[A-Za-z0-9_.:/+-]{1,160}\Z")
 MANIFEST_NAME = "manifest.v1.json"
 MANIFEST_SHA_NAME = "manifest.v1.json.sha256"
 MAX_MANIFEST_BYTES = 256 << 20
@@ -77,7 +78,8 @@ MAX_CAMPAIGN_PROCESSES = 1 + 96 * len(SIZES) * len(SCENARIOS) * 2
 MAX_PROGRESS_EVENTS = 2 * MAX_CAMPAIGN_PROCESSES + 4
 MAX_PROGRESS_EVENT_BYTES = 4096
 MAX_PROGRESS_JOURNAL_BYTES = 8 << 20
-OWNED_CHILD_REAP_SECONDS = 5.0
+OWNED_CHILD_REAP_SECONDS = 5
+RUNNER_SIGNAL_POLL_MILLISECONDS = 250
 PROGRESS_NAME = "progress.v1.ndjson"
 POST_LINK_FIELDS = {
     "source_commit",
@@ -285,7 +287,8 @@ def verify_file_record(
     require(record["mode"] == f"{expected_mode:04o}", f"{label} recorded mode drifted")
     require_hex(record["sha256"], 64, f"{label} digest")
     raw = read_relative(raw_fd, evidence_fd, expected_path, maximum, expected_mode, label)
-    require(record["bytes"] == len(raw), f"{label} byte length drifted")
+    recorded_bytes = integer(record["bytes"], 0, maximum, f"{label} byte length")
+    require(recorded_bytes == len(raw), f"{label} byte length drifted")
     require(record["sha256"] == sha256(raw), f"{label} digest drifted")
     return raw
 
@@ -684,6 +687,12 @@ def validate_receipt(
         ("profile", identity["profile"]),
     ):
         require(receipt[key] == expected, f"admission receipt {key} drifted")
+    integer(
+        receipt["target_cpu"],
+        identity["target_cpu"],
+        identity["target_cpu"],
+        "admission receipt target CPU",
+    )
     require(
         type(receipt["receipt_id"]) is str
         and SAFE_RUN.fullmatch(receipt["receipt_id"]) is not None,
@@ -691,8 +700,7 @@ def validate_receipt(
     )
     require(
         type(receipt["helper_protocol"]) is str
-        and 1 <= len(receipt["helper_protocol"]) <= 160
-        and "\x00" not in receipt["helper_protocol"],
+        and SAFE_PROTOCOL.fullmatch(receipt["helper_protocol"]) is not None,
         "admission helper protocol is malformed",
     )
 
@@ -729,6 +737,12 @@ def validate_receipt(
         "admission headroom field set changed",
     )
     require(headroom["target_cpu_admitted"] is True, "receipt did not admit target CPU")
+    require(
+        type(headroom["basis"]) is str
+        and 1 <= len(headroom["basis"]) <= 512
+        and "\x00" not in headroom["basis"],
+        "receipt headroom basis is malformed",
+    )
     require(
         headroom["unrelated_cpu_work"] == "coexist-if-target-cpu-admitted",
         "receipt coexistence policy drifted",
@@ -907,6 +921,18 @@ def validate_heartbeat(
         ("continuous_since_unix_ns", admission["continuous_since_unix_ns"]),
     ):
         require(heartbeat[key] == expected, f"{label} heartbeat {key} drifted")
+    integer(
+        heartbeat["target_cpu"],
+        identity["target_cpu"],
+        identity["target_cpu"],
+        f"{label} heartbeat target CPU",
+    )
+    integer(
+        heartbeat["continuous_since_unix_ns"],
+        admission["continuous_since_unix_ns"],
+        admission["continuous_since_unix_ns"],
+        f"{label} heartbeat continuous start",
+    )
     sequence = integer(heartbeat["sequence"], 0, (1 << 63) - 1, f"{label} heartbeat sequence")
     observed = integer(
         heartbeat["observed_unix_ns"],
@@ -1413,13 +1439,31 @@ def validate_progress_journal(
             f"progress event {event_sequence} field set changed",
         )
         require(record["schema"] == PROGRESS_SCHEMA, "progress schema drifted")
-        require(
-            record["event_sequence"] == event_sequence,
-            f"progress event {event_sequence} sequence drifted",
+        observed_event_sequence = integer(
+            record["event_sequence"],
+            0,
+            MAX_PROGRESS_EVENTS - 1,
+            f"progress event {event_sequence} sequence",
         )
         require(
-            record["expected_processes"] == len(schedule),
+            observed_event_sequence == event_sequence,
+            f"progress event {event_sequence} sequence drifted",
+        )
+        observed_expected_processes = integer(
+            record["expected_processes"],
+            1,
+            MAX_CAMPAIGN_PROCESSES,
+            f"progress event {event_sequence} expected processes",
+        )
+        require(
+            observed_expected_processes == len(schedule),
             f"progress event {event_sequence} process bound drifted",
+        )
+        record["completed_processes"] = integer(
+            record["completed_processes"],
+            0,
+            len(schedule),
+            f"progress event {event_sequence} completed processes",
         )
         require(
             record["resumable"] is False and record["selective_retry"] is False,
@@ -1436,6 +1480,7 @@ def validate_progress_journal(
             f"progress event {event_sequence} timestamp moved backward or escaped campaign",
         )
         previous_emitted = emitted
+        record["emitted_unix_ns"] = emitted
         observed_runner_pid = integer(
             record["runner_pid"],
             1,
@@ -1448,6 +1493,7 @@ def validate_progress_journal(
             observed_runner_pid == runner_pid,
             f"progress event {event_sequence} runner PID drifted",
         )
+        record["runner_pid"] = observed_runner_pid
         records.append(record)
 
     for index in (0, len(records) - 1):
@@ -1475,16 +1521,47 @@ def validate_progress_journal(
     ):
         started = records[1 + sequence * 2]
         completed = records[2 + sequence * 2]
-        expected_child = {
-            "child_sequence": sequence,
-            "child_command": command,
-            "coordinate": coordinate,
-        }
-        for key, value in expected_child.items():
+        for event_name, record in (("start", started), ("completion", completed)):
             require(
-                started[key] == value and completed[key] == value,
-                f"progress child {sequence} {key} drifted",
+                integer(
+                    record["child_sequence"],
+                    0,
+                    len(schedule) - 1,
+                    f"progress child {sequence} {event_name} sequence",
+                )
+                == sequence,
+                f"progress child {sequence} {event_name} sequence drifted",
             )
+            require(
+                type(record["child_command"]) is str
+                and record["child_command"] == command,
+                f"progress child {sequence} {event_name} command drifted",
+            )
+            observed_coordinate = record["coordinate"]
+            require(
+                type(observed_coordinate) is dict
+                and set(observed_coordinate) == set(coordinate),
+                f"progress child {sequence} {event_name} coordinate shape drifted",
+            )
+            for key, expected_value in coordinate.items():
+                observed_value = observed_coordinate[key]
+                if type(expected_value) is int:
+                    require(
+                        integer(
+                            observed_value,
+                            0,
+                            95,
+                            f"progress child {sequence} {event_name} coordinate {key}",
+                        )
+                        == expected_value,
+                        f"progress child {sequence} {event_name} coordinate {key} drifted",
+                    )
+                else:
+                    require(
+                        type(observed_value) is str
+                        and observed_value == expected_value,
+                        f"progress child {sequence} {event_name} coordinate {key} drifted",
+                    )
         child_pid = integer(
             started["child_pid"],
             1,
@@ -1492,7 +1569,13 @@ def validate_progress_journal(
             f"progress child {sequence} PID",
         )
         require(
-            completed["child_pid"] == child_pid,
+            integer(
+                completed["child_pid"],
+                1,
+                (1 << 31) - 1,
+                f"progress child {sequence} completion PID",
+            )
+            == child_pid,
             f"progress child {sequence} PID drifted",
         )
         require(
@@ -1655,7 +1738,26 @@ def main() -> int:
             ("decision", "diagnostic-raw-evidence-only"),
         ):
             require(manifest[key] == expected, f"manifest {key} drifted")
-        require(manifest["identity"] == identity, "manifest identity differs from verifier inputs")
+        manifest_identity = manifest["identity"]
+        require(
+            type(manifest_identity) is dict
+            and set(manifest_identity) == set(identity),
+            "manifest identity field set changed",
+        )
+        for key, expected in identity.items():
+            if type(expected) is int:
+                integer(
+                    manifest_identity[key],
+                    expected,
+                    expected,
+                    f"manifest identity {key}",
+                )
+            else:
+                require(
+                    type(manifest_identity[key]) is str
+                    and manifest_identity[key] == expected,
+                    f"manifest identity {key} differs from verifier input",
+                )
         started_unix_ns = integer(
             manifest["started_unix_ns"], 1, (1 << 63) - 1, "campaign start"
         )
@@ -1665,20 +1767,49 @@ def main() -> int:
         require(started_unix_ns <= completed_unix_ns, "campaign timestamps are reversed")
 
         benchmark = manifest["benchmark"]
-        require(type(benchmark) is dict, "benchmark manifest is not an object")
+        require(
+            type(benchmark) is dict
+            and set(benchmark)
+            == {
+                "schema",
+                "sizes",
+                "scenarios",
+                "engines",
+                "repetitions",
+                "engine_order_rotation",
+                "qualification_processes",
+                "fresh_process_per_hot_cell",
+                "fresh_process_per_lifecycle_cell",
+                "expected_processes",
+            },
+            "benchmark manifest field set changed",
+        )
         repetitions = integer(benchmark.get("repetitions"), 6, 96, "campaign repetitions")
         require(repetitions % 6 == 0, "repetitions are not a multiple of six")
         expected_process_count = 1 + repetitions * len(SIZES) * len(SCENARIOS) * 2
+        integer(
+            benchmark.get("qualification_processes"),
+            1,
+            1,
+            "qualification process count",
+        )
+        integer(
+            benchmark.get("expected_processes"),
+            expected_process_count,
+            expected_process_count,
+            "expected process count",
+        )
+        require(
+            benchmark.get("fresh_process_per_hot_cell") is True
+            and benchmark.get("fresh_process_per_lifecycle_cell") is True,
+            "benchmark fresh-process contract drifted",
+        )
         for key, expected in (
             ("schema", BENCHMARK_SCHEMA),
             ("sizes", list(SIZES)),
             ("scenarios", list(SCENARIOS)),
             ("engines", list(ENGINES)),
             ("engine_order_rotation", "all-six-permutations-by-repetition"),
-            ("qualification_processes", 1),
-            ("fresh_process_per_hot_cell", True),
-            ("fresh_process_per_lifecycle_cell", True),
-            ("expected_processes", expected_process_count),
         ):
             require(benchmark.get(key) == expected, f"benchmark manifest {key} drifted")
         bounds = manifest["bounds"]
@@ -1698,6 +1829,7 @@ def main() -> int:
                 "maximum_progress_event_bytes",
                 "maximum_progress_journal_bytes",
                 "owned_child_reap_seconds",
+                "runner_signal_poll_milliseconds",
                 "owned_child_cleanup_scope",
                 "parent_death_signal",
                 "handled_runner_signals",
@@ -1713,6 +1845,28 @@ def main() -> int:
             bounds.get("campaign_deadline_seconds"), 600, 86400, "campaign deadline"
         )
         integer(bounds.get("child_timeout_seconds"), 10, 3600, "child timeout")
+        integer(
+            bounds.get("owned_child_reap_seconds"),
+            OWNED_CHILD_REAP_SECONDS,
+            OWNED_CHILD_REAP_SECONDS,
+            "owned child reap bound",
+        )
+        integer(
+            bounds.get("runner_signal_poll_milliseconds"),
+            RUNNER_SIGNAL_POLL_MILLISECONDS,
+            RUNNER_SIGNAL_POLL_MILLISECONDS,
+            "runner signal poll bound",
+        )
+        for key, expected in (
+            ("measurement_retries", 0),
+            ("maximum_repetitions", 96),
+            ("maximum_child_output_bytes", MAX_CHILD_OUTPUT_BYTES),
+            ("maximum_campaign_processes", MAX_CAMPAIGN_PROCESSES),
+            ("maximum_progress_events", MAX_PROGRESS_EVENTS),
+            ("maximum_progress_event_bytes", MAX_PROGRESS_EVENT_BYTES),
+            ("maximum_progress_journal_bytes", MAX_PROGRESS_JOURNAL_BYTES),
+        ):
+            integer(bounds.get(key), expected, expected, f"campaign bound {key}")
         require(
             bounds.get("maximum_campaign_processes") == MAX_CAMPAIGN_PROCESSES
             and bounds.get("maximum_progress_events") == MAX_PROGRESS_EVENTS
@@ -1722,6 +1876,8 @@ def main() -> int:
             == MAX_PROGRESS_JOURNAL_BYTES
             and bounds.get("owned_child_reap_seconds")
             == OWNED_CHILD_REAP_SECONDS
+            and bounds.get("runner_signal_poll_milliseconds")
+            == RUNNER_SIGNAL_POLL_MILLISECONDS
             and bounds.get("owned_child_cleanup_scope")
             == "active-runner-owned-process-group-only"
             and bounds.get("parent_death_signal") == "SIGKILL"
@@ -1755,6 +1911,18 @@ def main() -> int:
             "progress manifest contract drifted",
         )
         require_hex(progress["sha256"], 64, "progress journal digest")
+        progress_bytes = integer(
+            progress["bytes"],
+            1,
+            MAX_PROGRESS_JOURNAL_BYTES,
+            "progress journal byte count",
+        )
+        progress_event_count = integer(
+            progress["events"],
+            1,
+            MAX_PROGRESS_EVENTS,
+            "progress journal event count",
+        )
         progress_raw = read_named(
             root_fd,
             PROGRESS_NAME,
@@ -1763,7 +1931,7 @@ def main() -> int:
             "progress journal",
         )
         require(
-            progress["bytes"] == len(progress_raw)
+            progress_bytes == len(progress_raw)
             and progress["sha256"] == sha256(progress_raw),
             "progress journal record drifted",
         )
@@ -1794,8 +1962,35 @@ def main() -> int:
             0o555,
             "benchmark binary",
         )
+        require(bool(binary_raw), "benchmark binary is empty")
         binary_sha256 = sha256(binary_raw)
         require(binary_sha256 == expected_binary_sha256, "binary differs from verifier expectation")
+        source_path = binary["source_path"]
+        require(
+            type(source_path) is str
+            and 1 <= len(source_path) <= 4096
+            and "\x00" not in source_path
+            and Path(source_path).is_absolute(),
+            "binary source path is malformed",
+        )
+        integer(
+            binary["source_device"],
+            0,
+            (1 << 64) - 1,
+            "binary source device",
+        )
+        integer(
+            binary["source_inode"],
+            0,
+            (1 << 64) - 1,
+            "binary source inode",
+        )
+        integer(
+            binary["source_mtime_ns"],
+            -(1 << 63),
+            (1 << 63) - 1,
+            "binary source modification time",
+        )
         require(
             binary["post_link_observed_sha256"] == binary_sha256,
             "binary differs from recorded post-link digest",
@@ -1855,6 +2050,7 @@ def main() -> int:
             0o444,
             "admission evidence",
         )
+        require(bool(evidence_raw), "admission evidence is empty")
         require(sha256(receipt_raw) == expected_receipt_sha256, "receipt digest differs")
         require(sha256(evidence_raw) == expected_evidence_sha256, "evidence digest differs")
         require(
@@ -1893,10 +2089,20 @@ def main() -> int:
             "lease_epoch",
             "maximum_heartbeat_age_ns",
         ):
-            require(
-                admission_manifest.get(key) == admission[key],
-                f"manifest admission {key} differs from receipt",
-            )
+            actual = admission_manifest.get(key)
+            expected = admission[key]
+            if type(expected) is int:
+                integer(
+                    actual,
+                    expected,
+                    expected,
+                    f"manifest admission {key}",
+                )
+            else:
+                require(
+                    type(actual) is str and actual == expected,
+                    f"manifest admission {key} differs from receipt",
+                )
 
         initial_heartbeat_raw = verify_file_record(
             admission_manifest["initial_heartbeat"],
@@ -1932,11 +2138,21 @@ def main() -> int:
             completed_unix_ns,
             "final",
         )
+        initial_heartbeat_sequence = integer(
+            admission_manifest["initial_heartbeat_sequence"],
+            0,
+            (1 << 63) - 1,
+            "manifest initial heartbeat sequence",
+        )
+        final_heartbeat_sequence = integer(
+            admission_manifest["final_heartbeat_sequence"],
+            0,
+            (1 << 63) - 1,
+            "manifest final heartbeat sequence",
+        )
         require(
-            initial_heartbeat["sequence"]
-            == admission_manifest.get("initial_heartbeat_sequence")
-            and final_heartbeat["sequence"]
-            == admission_manifest.get("final_heartbeat_sequence"),
+            initial_heartbeat["sequence"] == initial_heartbeat_sequence
+            and final_heartbeat["sequence"] == final_heartbeat_sequence,
             "manifest heartbeat sequence drifted",
         )
         require(
@@ -1945,12 +2161,17 @@ def main() -> int:
             >= initial_heartbeat["observed_unix_ns"],
             "campaign heartbeat chain moved backward",
         )
-        for key, expected in (
-            ("target_cpu", identity["target_cpu"]),
-            ("admitted_unrelated_cpu_work_may_continue", True),
-            ("runner_never_kills_other_work", True),
-        ):
-            require(admission_manifest.get(key) == expected, f"manifest admission {key} drifted")
+        integer(
+            admission_manifest["target_cpu"],
+            identity["target_cpu"],
+            identity["target_cpu"],
+            "manifest admission target CPU",
+        )
+        require(
+            admission_manifest["admitted_unrelated_cpu_work_may_continue"] is True
+            and admission_manifest["runner_never_kills_other_work"] is True,
+            "manifest admission policy claims drifted",
+        )
         runner_allowed_cpus = admission_manifest["runner_allowed_cpus"]
         require(
             type(runner_allowed_cpus) is list
@@ -2012,10 +2233,42 @@ def main() -> int:
         host = manifest["host"]
         require(
             type(host) is dict
-            and host.get("system") == "Linux"
-            and str(host.get("machine", "")).lower() in ("aarch64", "arm64")
-            and host.get("target_cpu") == identity["target_cpu"],
-            "host manifest drifted",
+            and set(host)
+            == {
+                "system",
+                "machine",
+                "release",
+                "target_cpu",
+                "runner_allowed_cpus",
+                "proc_cpuinfo",
+            },
+            "host manifest field set changed",
+        )
+        require(
+            type(host["system"]) is str
+            and host["system"] == "Linux"
+            and type(host["machine"]) is str
+            and host["machine"].lower() in ("aarch64", "arm64")
+            and type(host["release"]) is str
+            and 1 <= len(host["release"]) <= 256
+            and "\x00" not in host["release"],
+            "host manifest identity drifted",
+        )
+        integer(
+            host["target_cpu"],
+            identity["target_cpu"],
+            identity["target_cpu"],
+            "host target CPU",
+        )
+        host_allowed_cpus = host["runner_allowed_cpus"]
+        require(
+            type(host_allowed_cpus) is list
+            and all(
+                type(cpu) is int and 0 <= cpu < (1 << 20)
+                for cpu in host_allowed_cpus
+            )
+            and host_allowed_cpus == runner_allowed_cpus,
+            "host runner CPU affinity set drifted",
         )
         cpuinfo_raw = verify_file_record(
             host["proc_cpuinfo"],
@@ -2041,6 +2294,7 @@ def main() -> int:
         baseline: dict[str, str] | None = None
         previous_completed = started_unix_ns
         previous_heartbeat = initial_heartbeat
+        total_runner_elapsed_ns = 0
 
         for sequence, (process, expected) in enumerate(zip(processes, schedule)):
             command, coordinate, command_arguments = expected
@@ -2066,17 +2320,63 @@ def main() -> int:
                 },
                 f"process {sequence} field set changed",
             )
-            for key, expected_value in (
-                ("sequence", sequence),
-                ("command", command),
-                ("arguments", command_arguments),
-                ("coordinate", coordinate),
-                ("fresh_process", True),
-                ("single_thread_environment", True),
-                ("target_cpu", identity["target_cpu"]),
-                ("exit_code", 0),
-            ):
-                require(process[key] == expected_value, f"process {sequence} {key} drifted")
+            require(
+                integer(
+                    process["sequence"],
+                    sequence,
+                    sequence,
+                    f"process {sequence} sequence",
+                )
+                == sequence,
+                f"process {sequence} sequence drifted",
+            )
+            require(
+                type(process["command"]) is str and process["command"] == command,
+                f"process {sequence} command drifted",
+            )
+            require(
+                type(process["arguments"]) is list
+                and all(type(value) is str for value in process["arguments"])
+                and process["arguments"] == command_arguments,
+                f"process {sequence} arguments drifted",
+            )
+            process_coordinate = process["coordinate"]
+            require(
+                type(process_coordinate) is dict
+                and set(process_coordinate) == set(coordinate),
+                f"process {sequence} coordinate shape drifted",
+            )
+            for key, expected_value in coordinate.items():
+                observed_value = process_coordinate[key]
+                if type(expected_value) is int:
+                    require(
+                        integer(
+                            observed_value,
+                            0,
+                            95,
+                            f"process {sequence} coordinate {key}",
+                        )
+                        == expected_value,
+                        f"process {sequence} coordinate {key} drifted",
+                    )
+                else:
+                    require(
+                        type(observed_value) is str
+                        and observed_value == expected_value,
+                        f"process {sequence} coordinate {key} drifted",
+                    )
+            require(
+                process["fresh_process"] is True
+                and process["single_thread_environment"] is True,
+                f"process {sequence} execution mode drifted",
+            )
+            integer(
+                process["target_cpu"],
+                identity["target_cpu"],
+                identity["target_cpu"],
+                f"process {sequence} target CPU",
+            )
+            integer(process["exit_code"], 0, 0, f"process {sequence} exit status")
             process_started = integer(
                 process["started_unix_ns"], 1, (1 << 63) - 1, f"process {sequence} start"
             )
@@ -2086,11 +2386,17 @@ def main() -> int:
                 (1 << 63) - 1,
                 f"process {sequence} completion",
             )
-            integer(
+            runner_elapsed_ns = integer(
                 process["runner_elapsed_ns"],
                 1,
                 (1 << 63) - 1,
                 f"process {sequence} elapsed",
+            )
+            total_runner_elapsed_ns += runner_elapsed_ns
+            require(
+                total_runner_elapsed_ns
+                <= campaign_deadline_seconds * 1_000_000_000,
+                f"process {sequence} cumulative elapsed exceeds the campaign bound",
             )
             require(
                 previous_completed <= process_started <= process_completed <= completed_unix_ns,
@@ -2201,7 +2507,7 @@ def main() -> int:
             completed_unix_ns,
         )
         require(
-            progress["events"] == progress_events,
+            progress_event_count == progress_events,
             "progress manifest event count drifted",
         )
         require(baseline is not None, "qualification metadata is absent")
