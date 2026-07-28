@@ -12,6 +12,13 @@
 //! transactions; neither a feature nor compiler output can populate them.
 //! Compiler `RuntimeAuthority::Absent` remains conceptually separate from this
 //! runtime's source-qualified private or production authority.
+//!
+//! The default-off Linux tag21 `SelectedEnd` ABI2 qualification boundary is
+//! intentionally narrower. It owns no address adopter or function pointer:
+//! compiler-generated identity-suffixed source retains the direct call. This
+//! crate supplies only exact-literal scalar preflight/result decoding and a
+//! neither-`Send`-nor-`Sync` current-thread token whose construction performs
+//! the sole VL16 observation. There is no ABI2 production row.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
@@ -25,6 +32,8 @@ mod search_linked;
 mod search_support;
 #[cfg(test)]
 mod search_test_fixture;
+#[cfg(feature = "selected-end-qualification-private-v2")]
+mod selected_end_direct_v2;
 mod support;
 #[cfg(test)]
 mod test_fixture;
@@ -68,4 +77,11 @@ pub use search_linked::{
     adopt_linked_static_search_span_qualification_v1,
     configure_current_thread_sve_vl16_for_search_qualification_v1,
     fre_aot_static_search_span_adopt_qualification_raw_v1,
+};
+#[cfg(feature = "selected-end-qualification-private-v2")]
+#[doc(hidden)]
+pub use selected_end_direct_v2::{
+    StaticSearchSelectedEndCallErrorV2, StaticSearchSelectedEndPreparedCallV2,
+    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndQualificationV2,
+    StaticSearchSelectedEndThreadContractErrorV2, StaticSearchSelectedEndThreadSessionV2,
 };

@@ -32,7 +32,10 @@
 //! one hidden `R_AARCH64_CALL26` `bl` to the exact four-argument entry and no
 //! function-pointer API, x4 argument, or result slot. Final-image disassembly
 //! remains an explicit pending qualification obligation; no V2 artifact grants
-//! runtime or deployment authority.
+//! runtime or deployment authority. A separate deterministic, receipt-bound
+//! Rust consumer module can retain the exact direct symbol call behind the
+//! default-off static-runtime same-thread session; this qualification-private
+//! candidate likewise grants no production authority.
 
 #![forbid(unsafe_code)]
 
@@ -51,6 +54,7 @@ mod search_linux;
 mod search_linux_expectation;
 mod search_linux_glue;
 mod search_selected_end_bundle_v2;
+mod search_selected_end_deployment_v2;
 mod search_selected_end_expectation_v2;
 mod search_selected_end_v2;
 mod search_static_expectation;
@@ -159,6 +163,16 @@ pub use search_selected_end_bundle_v2::{
     POST_LINK_REQUIRE_HIDDEN_BINDINGS_V2, POST_LINK_REQUIRE_IDENTITY_SUFFIXED_BINDINGS_V2,
     R_AARCH64_CALL26_V2, build_linux_selected_end_qualification_bundle_v2,
     inspect_linux_selected_end_direct_glue_v2,
+};
+pub use search_selected_end_deployment_v2::{
+    HARD_MAX_LINUX_SELECTED_END_QUALIFICATION_RUST_BINDING_BYTES_V2,
+    LINUX_SELECTED_END_QUALIFICATION_DEPLOYMENT_RECEIPT_BYTES_V2,
+    LinuxSelectedEndQualificationDeploymentErrorV2,
+    LinuxSelectedEndQualificationDeploymentLimitsV2,
+    LinuxSelectedEndQualificationDeploymentReceiptIdentityV2,
+    LinuxSelectedEndQualificationDeploymentReceiptV2, LinuxSelectedEndQualificationDeploymentV2,
+    LinuxSelectedEndQualificationRustBindingIdentityV2, LinuxSelectedEndQualificationRustBindingV2,
+    build_linux_selected_end_qualification_deployment_v2,
 };
 pub use search_selected_end_expectation_v2::{
     LinuxStaticSearchSelectedEndExpectationBuildErrorV2,
