@@ -50,9 +50,11 @@ use fre::{
     CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
     CaptureRequiredLiteralSearchOperation, CaptureRunLimits, CaptureSearchError,
     CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession,
-    CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
-    FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
+    CaptureWordRunBuildError, CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan,
+    CaptureWordRunRunError, CaptureWordRunRunLimits, CompatibilityProfile,
+    DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, FixedClassSandwichBuildError,
+    FixedClassSandwichBuildLimits, FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FoldedLiteralTrieBuildLimits,
     GraphemeScalarDfaBuildAccounting, GraphemeScalarDfaBuildError, GraphemeScalarDfaBuildLimits,
@@ -165,6 +167,8 @@ pub const CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN: &str =
 /// Stable plan label for a generic deterministic absolute-start byte line.
 pub const CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN: &str =
     fre::ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID;
+/// Stable plan label for generic bounded captured whole-word alternatives.
+pub const CURRENT_FRE_CAPTURE_WORD_RUN_PLAN: &str = fre::CAPTURE_WORD_RUN_COUNT_OPERATION_ID;
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
@@ -184,6 +188,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
             | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
             | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
             | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
+            | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
             | fre::NOQA_ASCII_LEADING_PLAN_ID
             | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
             | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -204,6 +209,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
                 | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
                 | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
                 | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
+                | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
                 | fre::NOQA_ASCII_LEADING_PLAN_ID
                 | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
                 | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -3227,6 +3233,7 @@ enum CurrentFreCapturePreparation {
     Stream(CaptureStreamSession),
     RuffGrep(Box<LineCaptureRunLimits>),
     AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
+    WordRunGrep(Box<CaptureWordRunRunLimits>),
 }
 
 #[derive(Clone, Debug)]
@@ -3235,6 +3242,7 @@ enum CurrentFreCaptureRegex {
     Noqa(Box<NoqaGrepCaptureRegex>),
     Ruff(Box<LineCapturePlan>),
     AnchoredLine(Box<AnchoredLineCapturePlan>),
+    WordRun(Box<CaptureWordRunPlan>),
 }
 
 impl CurrentFreCaptureModel {
@@ -3305,6 +3313,9 @@ impl CurrentFreCaptureLifecycle {
             CurrentFreCaptureRegex::AnchoredLine(plan) => {
                 plan.build_report().identity.kernel.operation_id
             }
+            CurrentFreCaptureRegex::WordRun(plan) => {
+                plan.build_report().identity.operation.operation_id
+            }
         }
     }
 
@@ -3368,6 +3379,10 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::AnchoredLine(plan),
                 CurrentFreCapturePreparation::AnchoredLineGrep(run_limits),
             ) => execute_anchored_line_capture_with_limits(plan, haystack, **run_limits),
+            (
+                CurrentFreCaptureRegex::WordRun(plan),
+                CurrentFreCapturePreparation::WordRunGrep(run_limits),
+            ) => execute_capture_word_run_with_limits(plan, haystack, **run_limits),
             (CurrentFreCaptureRegex::Noqa(_), CurrentFreCapturePreparation::Count(_)) => {
                 return Err(CompareError::new(
                     "noqa grep-only artifact reached count-captures lifecycle",
@@ -3383,6 +3398,11 @@ impl CurrentFreCaptureLifecycle {
                     "anchored-line grep-only artifact reached an incompatible capture lifecycle",
                 ));
             }
+            (CurrentFreCaptureRegex::WordRun(_), _) => {
+                return Err(CompareError::new(
+                    "word-run grep-only artifact reached an incompatible capture lifecycle",
+                ));
+            }
             (_, CurrentFreCapturePreparation::RuffGrep(_)) => {
                 return Err(CompareError::new(
                     "Ruff grep preparation reached an incompatible capture artifact",
@@ -3391,6 +3411,11 @@ impl CurrentFreCaptureLifecycle {
             (_, CurrentFreCapturePreparation::AnchoredLineGrep(_)) => {
                 return Err(CompareError::new(
                     "anchored-line grep preparation reached an incompatible capture artifact",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::WordRunGrep(_)) => {
+                return Err(CompareError::new(
+                    "word-run grep preparation reached an incompatible capture artifact",
                 ));
             }
             (_, CurrentFreCapturePreparation::Stream(_)) => {
@@ -3476,6 +3501,16 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                 (
                     CurrentFreCaptureRegex::AnchoredLine(Box::new(plan)),
                     CurrentFreCapturePreparation::AnchoredLineGrep(Box::new(run_limits)),
+                )
+            } else if let Some(plan) =
+                capture_word_run_plan_one(pattern, unicode, case_insensitive, &limits)
+                    .map_err(|error| CompareError::new(error.message))?
+            {
+                let run_limits = capture_word_run_run_limits(&plan, haystack_len, &limits)
+                    .map_err(|error| CompareError::new(error.message))?;
+                (
+                    CurrentFreCaptureRegex::WordRun(Box::new(plan)),
+                    CurrentFreCapturePreparation::WordRunGrep(Box::new(run_limits)),
                 )
             } else {
                 let general = capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
@@ -7021,6 +7056,9 @@ fn fre_grep_captures(
     if let Some(reduction) = anchored_line_capture_reduction(request, limits)? {
         return Ok(reduction);
     }
+    if let Some(reduction) = capture_word_run_reduction(request, limits)? {
+        return Ok(reduction);
+    }
     if let Some((regex, participating)) = uniform_capture_scalar_regex(request, limits) {
         let actual =
             execute_uniform_capture_scalar(&regex, participating, request.haystack, true, limits)?;
@@ -7636,6 +7674,224 @@ fn anchored_line_capture_reduction(
     Ok(Some(FreReduction {
         actual,
         plan: CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
+    }))
+}
+
+fn capture_word_run_plan_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<Option<CaptureWordRunPlan>, ExecutionError> {
+    if case_insensitive {
+        return Ok(None);
+    }
+    let defaults = CaptureWordRunBuildLimits::default();
+    let plan = CaptureWordRunBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(false)
+        .limits(CaptureWordRunBuildLimits {
+            max_inspection_work: limits.fre_capture_scalar_planner_work,
+            max_hir_nodes: limits.fre_aggregate_hir_nodes,
+            max_class_ranges: limits.pattern_bytes_per_job,
+            max_alternatives: limits.patterns_per_job,
+            max_exact_length: limits.fre_aggregate_repeat_bound,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+            ..defaults
+        })
+        .build();
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(CaptureWordRunBuildError::Syntax(_) | CaptureWordRunBuildError::Unsupported(_)) => {
+            return Ok(None);
+        }
+        Err(error @ CaptureWordRunBuildError::Resource { .. }) => {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE capture word-run build refused execution: {error}"
+            )));
+        }
+        Err(
+            error @ (CaptureWordRunBuildError::ArithmeticOverflow(_)
+            | CaptureWordRunBuildError::InternalInvariant(_)),
+        ) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE capture word-run build faulted: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE capture word-run build returned an unknown failure: {error}"
+            )));
+        }
+    };
+    authenticate_capture_word_run_plan(&plan, unicode)?;
+    Ok(Some(plan))
+}
+
+fn authenticate_capture_word_run_plan(
+    plan: &CaptureWordRunPlan,
+    unicode: bool,
+) -> Result<(), ExecutionError> {
+    let report = plan.build_report();
+    let operation = report.identity.operation;
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = false;
+    if report.identity.profile != expected_profile
+        || report.identity.algorithm_version != fre::CAPTURE_WORD_RUN_ALGORITHM_VERSION
+        || report.identity.accounting_version != fre::CAPTURE_WORD_RUN_ACCOUNTING_VERSION
+        || operation.plan_id != fre::CAPTURE_WORD_RUN_PLAN_ID
+        || operation.operation_id != fre::CAPTURE_WORD_RUN_COUNT_OPERATION_ID
+        || operation.mode
+            != if unicode {
+                fre::CaptureWordRunMode::Unicode
+            } else {
+                fre::CaptureWordRunMode::Ascii
+            }
+        || operation.exact_lengths == 0
+        || operation.minimum_length == 0
+        || operation.minimum_length > operation.maximum_length
+        || operation.maximum_length > 31
+        || operation.class_ranges == 0
+        || operation.participating_captures_per_match != 1
+        || operation.groups_per_match != 2
+        || !operation.complete_word_boundaries
+        || !operation.invalid_bytes_are_non_word
+        || !operation.line_partition_invariant
+        || !operation.non_overlapping
+        || report.hir.hir_nodes == 0
+        || report.hir.class_ranges != operation.class_ranges
+        || report.hir.alternatives == 0
+        || report.hir.captures != report.hir.alternatives
+        || report.hir.inspection_work < report.hir.hir_nodes
+        || report.persistent_bytes != core::mem::size_of::<CaptureWordRunPlan>()
+        || report.peak_bytes != report.persistent_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE capture word-run plan identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn capture_word_run_run_limits(
+    plan: &CaptureWordRunPlan,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CaptureWordRunRunLimits, ExecutionError> {
+    let unicode = matches!(
+        plan.build_report().identity.operation.mode,
+        fre::CaptureWordRunMode::Unicode
+    );
+    authenticate_capture_word_run_plan(plan, unicode)?;
+    let upper = plan.run_upper_bounds(haystack_len).map_err(|error| {
+        ExecutionError::fault(format!("FRE capture word-run preflight faulted: {error}"))
+    })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps)
+        .map_err(|_| ExecutionError::fault("capture word-run reducer limit does not fit usize"))?;
+    for (resource, needed, limit) in [
+        (
+            "ExecutionWork",
+            upper.work,
+            limits.fre_aggregate_operation_work,
+        ),
+        (
+            "SequentialBytes",
+            upper.sequential_bytes,
+            limits.fre_aggregate_sequential_bytes,
+        ),
+        ("Matches", upper.matches, reducer_limit),
+        ("CaptureCount", upper.capture_count, reducer_limit),
+        (
+            "PeakBytes",
+            upper.peak_bytes,
+            limits.fre_aggregate_peak_bytes,
+        ),
+    ] {
+        if needed > limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE capture word-run lifecycle resource {resource} requires {needed}, limit is {limit}"
+            )));
+        }
+    }
+    Ok(CaptureWordRunRunLimits {
+        max_input_bytes: upper.input_bytes,
+        max_source_reads: upper.source_reads,
+        max_decoded_units: upper.decoded_units,
+        max_block_events: upper.block_events,
+        max_class_comparisons: upper.class_comparisons,
+        max_boundary_probes: upper.boundary_probes,
+        max_matches: upper.matches,
+        max_capture_count: upper.capture_count,
+        max_work: upper.work,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    })
+}
+
+fn execute_capture_word_run_with_limits(
+    plan: &CaptureWordRunPlan,
+    haystack: &[u8],
+    run_limits: CaptureWordRunRunLimits,
+) -> Result<u64, ExecutionError> {
+    let result = plan
+        .grep_capture_count(haystack, run_limits)
+        .map_err(|error| match error {
+            CaptureWordRunRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE capture word-run reducer refused execution: {error}"
+            )),
+            CaptureWordRunRunError::ArithmeticOverflow { .. }
+            | CaptureWordRunRunError::AccountingInvariant { .. } => {
+                ExecutionError::fault(format!("FRE capture word-run reducer faulted: {error}"))
+            }
+            error => ExecutionError::fault(format!(
+                "FRE capture word-run reducer returned an unknown failure: {error}"
+            )),
+        })?;
+    let report = plan.build_report();
+    if result.identity != report.identity.operation
+        || result.capture_count != result.actual.capture_count
+        || result.upper_bounds.input_bytes != haystack.len()
+        || result.upper_bounds.sequential_bytes != haystack.len()
+        || result.upper_bounds.peak_bytes != report.persistent_bytes
+        || result.actual.source_reads != haystack.len()
+        || result.actual.sequential_bytes != haystack.len()
+        || result.actual.matches > result.upper_bounds.matches
+        || result.actual.capture_count > result.upper_bounds.capture_count
+        || result.actual.work > result.upper_bounds.work
+        || result.actual.capture_count != result.actual.matches.saturating_mul(2)
+    {
+        return Err(ExecutionError::fault(
+            "FRE capture word-run execution identity or accounting mismatch",
+        ));
+    }
+    u64::try_from(result.capture_count)
+        .map_err(|_| ExecutionError::fault("FRE capture word-run count does not fit u64"))
+}
+
+fn capture_word_run_reduction(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return Ok(None);
+    }
+    let Some(plan) = capture_word_run_plan_one(
+        request.patterns[0].as_str(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    let run_limits = capture_word_run_run_limits(&plan, request.haystack.len(), limits)?;
+    let actual = execute_capture_word_run_with_limits(&plan, request.haystack, run_limits)?;
+    Ok(Some(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_WORD_RUN_PLAN,
     }))
 }
 
@@ -18069,6 +18325,55 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), ROWS.len());
+    }
+
+    #[test]
+    fn generic_capture_word_run_routes_and_preserves_full_word_context() {
+        let fixtures = [
+            (
+                r"\b(?:(\w{6})|(\w{5}))\b",
+                false,
+                b"alpha planets sixes longer foo1\r\nbravo".as_slice(),
+                8_u64,
+            ),
+            (
+                r"\b(?:([\w&&\p{Cyrillic}]{6})|([\w&&\p{Cyrillic}]{5}))\b",
+                true,
+                "привет слово xслово слово7 абвгд абвгде"
+                    .as_bytes(),
+                8_u64,
+            ),
+            (
+                r"\b([A-Za-z]{3})\b",
+                false,
+                b"foo foo1 _foo foo_ 1foo bar".as_slice(),
+                4_u64,
+            ),
+        ];
+        for (pattern, unicode, haystack, expected) in fixtures {
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                unicode,
+                false,
+                haystack.len(),
+            )
+            .expect("capture word-run lifecycle");
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_WORD_RUN_PLAN);
+            assert_eq!(lifecycle.execute(haystack).expect("first"), expected);
+            assert_eq!(lifecycle.execute(haystack).expect("steady"), expected);
+        }
+
+        for pattern in [
+            r"(?:(\w{6})|(\w{5}))\b",
+            r"\b(?:\w{6}|\w{5})\b",
+            r"\b(?:(\w{6})|([a-z]{5}))\b",
+        ] {
+            let lifecycle =
+                current_fre_rebar_capture_lifecycle("grep-captures", pattern, false, false, 16)
+                    .expect("nearby general capture lifecycle");
+            assert_ne!(lifecycle.plan(), CURRENT_FRE_CAPTURE_WORD_RUN_PLAN);
+        }
     }
 
     #[derive(Clone, Copy)]

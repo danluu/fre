@@ -39,6 +39,7 @@ mod capture_count_seal;
 mod capture_iteration_seal;
 mod capture_noqa;
 mod capture_required_literal;
+mod capture_word_run;
 mod captures;
 mod finite;
 mod finite_root;
@@ -227,6 +228,15 @@ pub use capture_required_literal::{
     CaptureRequiredLiteralIdentity, CaptureRequiredLiteralLinePartitionMatches,
     CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchError,
     CaptureRequiredLiteralSearchOperation, CaptureRequiredLiteralSearchReport,
+};
+pub use capture_word_run::{
+    CAPTURE_WORD_RUN_ACCOUNTING_VERSION, CAPTURE_WORD_RUN_ALGORITHM_VERSION,
+    CAPTURE_WORD_RUN_COUNT_OPERATION_ID, CAPTURE_WORD_RUN_PLAN_ID, CaptureWordRunBuildError,
+    CaptureWordRunBuildLimits, CaptureWordRunBuildReport, CaptureWordRunBuilder,
+    CaptureWordRunCountResult, CaptureWordRunHirAccounting, CaptureWordRunMode,
+    CaptureWordRunOperationIdentity, CaptureWordRunPlan, CaptureWordRunPlanIdentity,
+    CaptureWordRunRunActual, CaptureWordRunRunError, CaptureWordRunRunLimits,
+    CaptureWordRunRunResource, CaptureWordRunRunUpperBounds,
 };
 pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
