@@ -3740,15 +3740,108 @@ fn sve16_v6_candidate_is_distinct_audited_and_matches_the_oracle() {
         assert_eq!(image, repeated);
         assert_eq!(image.backend_version(), BackendVersion::SEARCH_SVE16_V6);
         assert_eq!(image.target().features, CpuFeatures::ASIMD_SVE);
-        assert_eq!(
-            image
-                .search_manifest()
-                .expect("SVE16 v6 manifest")
-                .candidate_policy_version,
-            5
-        );
+        let manifest = image.search_manifest().expect("SVE16 v6 manifest");
+        assert_eq!(manifest.candidate_policy_version, 5);
         audit(&image).expect("independent SVE16 v6 whole-template audit");
         let instructions = decode(image.code()).expect("SVE16 v6 decode");
+        let ptrue_positions: Vec<_> = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                matches!(
+                    instruction,
+                    DecodedInstruction::SvePtrueBytesVl16 { destination: 0 }
+                )
+                .then_some(index)
+            })
+            .collect();
+        let literal_vector_positions: Vec<_> = instructions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, instruction)| {
+                matches!(
+                    instruction,
+                    DecodedInstruction::SveLoadBytes {
+                        destination: 31,
+                        predicate: 0,
+                        base: 8,
+                    }
+                )
+                .then_some(index)
+            })
+            .collect();
+        assert_eq!(ptrue_positions.len(), 1);
+        assert_eq!(literal_vector_positions.len(), 1);
+        assert_eq!(literal_vector_positions[0], ptrue_positions[0] + 1);
+        let first_wide_pair = instructions
+            .iter()
+            .position(|instruction| {
+                matches!(
+                    instruction,
+                    DecodedInstruction::LoadVectorPair128 {
+                        first_destination: 0,
+                        second_destination: 2,
+                        base: 15,
+                        offset: 0,
+                    }
+                )
+            })
+            .expect("tag19 primary wide pair");
+        assert!(
+            literal_vector_positions[0] < first_wide_pair,
+            "tag19 must establish P0/Z31 once before entering the wide screen"
+        );
+        let filters_cover_zero = manifest.primary_offset == 0
+            || manifest.secondary_offset == 0
+            || manifest.verification_offset == 0
+            || manifest.quaternary_offset == 0;
+        if !filters_cover_zero {
+            assert_eq!(
+                instructions
+                    .iter()
+                    .filter(|instruction| {
+                        **instruction
+                            == DecodedInstruction::MoveZero64 {
+                                destination: 11,
+                                immediate: u16::from(literal[0]),
+                                shift: 0,
+                            }
+                    })
+                    .count(),
+                1,
+                "tag19 retains literal[0] in x11 once per invocation"
+            );
+            assert!(
+                instructions.windows(2).any(|window| matches!(
+                    window,
+                    [
+                        DecodedInstruction::LoadByteRegister {
+                            destination: 10,
+                            base: 9,
+                            index: 5,
+                        },
+                        DecodedInstruction::CompareRegister32 {
+                            left: 10,
+                            right: 11,
+                        },
+                    ]
+                )),
+                "tag19 recovery must compare directly against retained x11"
+            );
+        }
+        if width > 16 {
+            assert!(
+                instructions.iter().any(|instruction| matches!(
+                    instruction,
+                    DecodedInstruction::LoadByte {
+                        destination: 13,
+                        base: 16,
+                        offset: 0,
+                    }
+                )),
+                "tag19 remainder confirmation must preserve retained x11"
+            );
+        }
         assert!(instructions.iter().any(|instruction| matches!(
             instruction,
             DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
@@ -5231,12 +5324,10 @@ fn v7_canonical_image_identity_remains_frozen_after_v8() {
     reason = "the V8 mutation matrix keeps the wide and adaptive control-flow contracts together"
 )]
 fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
-    let program = build_exact_literal::<Span>(
-        b"0123456789abcdef",
-        AnchorFlags::default(),
-        ValidateLimits::default(),
-    )
-    .expect("v8 mutation program");
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("v8 mutation program");
     let canonical_v8 = emit_with_backend(
         &program,
         SearchBackendPolicy::AsimdV8,
@@ -5274,13 +5365,105 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
     assert_resealed_search_rejected(v7_as_v8, "v7 code resealed as v8");
 
     let decoded = decode(canonical_v8.code()).expect("canonical v8 decode");
+    let wide_pairs: Vec<_> = decoded
+        .iter()
+        .filter(|instruction| matches!(instruction, DecodedInstruction::LoadVectorPair128 { .. }))
+        .copied()
+        .collect();
+    assert_eq!(
+        wide_pairs,
+        [
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 0,
+                second_destination: 2,
+                base: 15,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 4,
+                second_destination: 6,
+                base: 15,
+                offset: 32,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 18,
+                second_destination: 19,
+                base: 10,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 20,
+                second_destination: 21,
+                base: 10,
+                offset: 32,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 0,
+                second_destination: 2,
+                base: 10,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 4,
+                second_destination: 6,
+                base: 10,
+                offset: 32,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 18,
+                second_destination: 19,
+                base: 15,
+                offset: 0,
+            },
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 20,
+                second_destination: 21,
+                base: 15,
+                offset: 32,
+            },
+        ],
+        "V8 uses the tag21 paired-load shape for every wide 64-byte group"
+    );
+    assert_eq!(
+        decoded
+            .iter()
+            .filter(|instruction| {
+                **instruction
+                    == DecodedInstruction::MoveZero64 {
+                        destination: 11,
+                        immediate: u16::from(literal[0]),
+                        shift: 0,
+                    }
+            })
+            .count(),
+        1,
+        "V8 retains literal[0] in x11 once per invocation"
+    );
+    assert!(
+        decoded.windows(2).any(|window| matches!(
+            window,
+            [
+                DecodedInstruction::LoadByteRegister {
+                    destination: 10,
+                    base: 9,
+                    index: 5,
+                },
+                DecodedInstruction::CompareRegister32 {
+                    left: 10,
+                    right: 11,
+                },
+            ]
+        )),
+        "V8 recovery must compare directly against retained x11"
+    );
     let wide_secondary_load = decoded
         .iter()
         .position(|instruction| {
             matches!(
                 instruction,
-                DecodedInstruction::LoadVector128 {
-                    destination: 18,
+                DecodedInstruction::LoadVectorPair128 {
+                    first_destination: 18,
+                    second_destination: 19,
                     base: 10,
                     offset: 0
                 }
@@ -5291,8 +5474,9 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
     replace_test_decoded_at(
         &mut vector_operand,
         wide_secondary_load,
-        DecodedInstruction::LoadVector128 {
-            destination: 22,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 22,
+            second_destination: 19,
             base: 10,
             offset: 0,
         },
@@ -5304,8 +5488,9 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
         .position(|instruction| {
             matches!(
                 instruction,
-                DecodedInstruction::LoadVector128 {
-                    destination: 18,
+                DecodedInstruction::LoadVectorPair128 {
+                    first_destination: 18,
+                    second_destination: 19,
                     base: 15,
                     offset: 0
                 }
@@ -5324,10 +5509,17 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
         })
     ));
     let adaptive_recheck = [
-        DecodedInstruction::LoadVector128 {
-            destination: 18,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 18,
+            second_destination: 19,
             base: 15,
             offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 20,
+            second_destination: 21,
+            base: 15,
+            offset: 32,
         },
         DecodedInstruction::CompareEqualBytes16 {
             destination: 18,
@@ -5339,11 +5531,6 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
             left: 0,
             right: 18,
         },
-        DecodedInstruction::LoadVector128 {
-            destination: 19,
-            base: 15,
-            offset: 16,
-        },
         DecodedInstruction::CompareEqualBytes16 {
             destination: 19,
             left: 19,
@@ -5354,11 +5541,6 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
             left: 2,
             right: 19,
         },
-        DecodedInstruction::LoadVector128 {
-            destination: 20,
-            base: 15,
-            offset: 32,
-        },
         DecodedInstruction::CompareEqualBytes16 {
             destination: 20,
             left: 20,
@@ -5368,11 +5550,6 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
             destination: 4,
             left: 4,
             right: 20,
-        },
-        DecodedInstruction::LoadVector128 {
-            destination: 21,
-            base: 15,
-            offset: 48,
         },
         DecodedInstruction::CompareEqualBytes16 {
             destination: 21,
@@ -5456,8 +5633,9 @@ fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
     replace_test_decoded_at(
         &mut adaptive_operand,
         adaptive_primary_load,
-        DecodedInstruction::LoadVector128 {
-            destination: 18,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 18,
+            second_destination: 19,
             base: 10,
             offset: 0,
         },

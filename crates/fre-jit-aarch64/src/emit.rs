@@ -1099,6 +1099,7 @@ fn emit_aggregate_multi_byte(
             candidate_miss,
             4,
             5,
+            X11,
         )?;
     }
     let delta = match output {
@@ -2609,6 +2610,7 @@ fn emit_vector_candidate_skip_v7(
             candidate_miss,
             16,
             17,
+            X11,
         )?;
     }
     assembler.mov_reg(X13, X5)?;
@@ -2722,7 +2724,16 @@ fn emit_vector_candidate_skip_sve16(
     assembler.sve_count_predicate_bytes(X10, 0, 3)?;
     assembler.add_reg(X13, X5, X10)?;
     assembler.add_reg(X15, X9, X13)?;
-    emit_literal_equality_with_vectors(assembler, X15, X8, literal.len(), candidate_miss, 0, 2)?;
+    emit_literal_equality_with_vectors(
+        assembler,
+        X15,
+        X8,
+        literal.len(),
+        candidate_miss,
+        0,
+        2,
+        X11,
+    )?;
     assembler.add_reg(X14, X13, X12)?;
     assembler.branch(found)?;
 
@@ -2741,7 +2752,7 @@ fn emit_vector_candidate_skip_sve16(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the versioned v8 graph keeps its lazy 64-candidate screen and immutable v7-compatible recovery explicit"
+    reason = "the versioned v8 graph keeps its paired 64-candidate screen and authenticated staged recovery explicit"
 )]
 fn emit_vector_candidate_skip_v8(
     assembler: &mut Assembler,
@@ -2802,6 +2813,18 @@ fn emit_vector_candidate_skip_v8(
         assembler.load_byte(X11, X8, offset)?;
         assembler.dup_byte16(7, X11)?;
     }
+    if sve_confirmation {
+        // Establish the fixed predicate and immutable literal once per call.
+        // Neither the ASIMD screen nor recovery confirmation clobbers P0/Z31.
+        assembler.sve_ptrue_bytes_vl16(0)?;
+        assembler.sve_load_bytes(31, 0, X8)?;
+    }
+    if !filters_cover_zero {
+        // X11 remains live across the staged screen. Candidate confirmation
+        // uses X13 for its scalar needle byte so this compile-time literal
+        // byte is not reloaded from rodata for every recovered lane.
+        assembler.mov_imm64(X11, u64::from(literal[0]))?;
+    }
     // X14 remains dead until a successful return. The narrow recovery keeps
     // the historical sparse-mask representation and v16/v17 confirmation
     // temporaries. V8's wide screen uses only caller-saved v16-v21.
@@ -2819,18 +2842,17 @@ fn emit_vector_candidate_skip_v8(
     assembler.branch_cond(Condition::CarryClear, narrow_setup)?;
     assembler.sub_imm(X7, X6, 63)?;
 
-    // Test four primary columns before loading any secondary data. A primary
-    // miss proves all 64 candidate starts impossible. A pair hit permanently
-    // enters the unchanged 16-wide staged recovery graph so pair-heavy inputs
-    // pay this wide probe only once.
+    // Test four primary columns before loading any secondary data. Paired Q
+    // loads halve the load-instruction footprint without changing the exact
+    // authenticated 64-byte range. A primary miss proves all 64 candidate
+    // starts impossible. A pair hit permanently enters the unchanged 16-wide
+    // staged recovery graph so pair-heavy inputs pay this wide probe only once.
     assembler.bind(wide)?;
-    assembler.load_vector128(0, X15, 0)?;
+    assembler.load_vector_pair128(0, 2, X15, 0)?;
+    assembler.load_vector_pair128(4, 6, X15, 32)?;
     assembler.compare_equal_bytes16(0, 0, 1)?;
-    assembler.load_vector128(2, X15, 16)?;
     assembler.compare_equal_bytes16(2, 2, 1)?;
-    assembler.load_vector128(4, X15, 32)?;
     assembler.compare_equal_bytes16(4, 4, 1)?;
-    assembler.load_vector128(6, X15, 48)?;
     assembler.compare_equal_bytes16(6, 6, 1)?;
     emit_four_block_presence_v8(assembler)?;
     if let Some(wide_second_filter) = wide_second_filter {
@@ -2855,16 +2877,14 @@ fn emit_vector_candidate_skip_v8(
         } else {
             assembler.sub_imm(X10, X15, delta)?;
         }
-        assembler.load_vector128(18, X10, 0)?;
+        assembler.load_vector_pair128(18, 19, X10, 0)?;
+        assembler.load_vector_pair128(20, 21, X10, 32)?;
         assembler.compare_equal_bytes16(18, 18, 3)?;
         assembler.and_bytes16(0, 0, 18)?;
-        assembler.load_vector128(19, X10, 16)?;
         assembler.compare_equal_bytes16(19, 19, 3)?;
         assembler.and_bytes16(2, 2, 19)?;
-        assembler.load_vector128(20, X10, 32)?;
         assembler.compare_equal_bytes16(20, 20, 3)?;
         assembler.and_bytes16(4, 4, 20)?;
-        assembler.load_vector128(21, X10, 48)?;
         assembler.compare_equal_bytes16(21, 21, 3)?;
         assembler.and_bytes16(6, 6, 21)?;
         emit_four_block_presence_v8(assembler)?;
@@ -2895,26 +2915,22 @@ fn emit_vector_candidate_skip_v8(
         } else {
             assembler.sub_imm(X10, X15, delta)?;
         }
-        assembler.load_vector128(0, X10, 0)?;
+        assembler.load_vector_pair128(0, 2, X10, 0)?;
+        assembler.load_vector_pair128(4, 6, X10, 32)?;
         assembler.compare_equal_bytes16(0, 0, 3)?;
-        assembler.load_vector128(2, X10, 16)?;
         assembler.compare_equal_bytes16(2, 2, 3)?;
-        assembler.load_vector128(4, X10, 32)?;
         assembler.compare_equal_bytes16(4, 4, 3)?;
-        assembler.load_vector128(6, X10, 48)?;
         assembler.compare_equal_bytes16(6, 6, 3)?;
         emit_four_block_presence_v8(assembler)?;
         assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
-        assembler.load_vector128(18, X15, 0)?;
+        assembler.load_vector_pair128(18, 19, X15, 0)?;
+        assembler.load_vector_pair128(20, 21, X15, 32)?;
         assembler.compare_equal_bytes16(18, 18, 1)?;
         assembler.and_bytes16(0, 0, 18)?;
-        assembler.load_vector128(19, X15, 16)?;
         assembler.compare_equal_bytes16(19, 19, 1)?;
         assembler.and_bytes16(2, 2, 19)?;
-        assembler.load_vector128(20, X15, 32)?;
         assembler.compare_equal_bytes16(20, 20, 1)?;
         assembler.and_bytes16(4, 4, 20)?;
-        assembler.load_vector128(21, X15, 48)?;
         assembler.compare_equal_bytes16(21, 21, 1)?;
         assembler.and_bytes16(6, 6, 21)?;
         emit_four_block_presence_v8(assembler)?;
@@ -3008,10 +3024,6 @@ fn emit_vector_candidate_skip_v8(
     }
 
     assembler.bind(recover)?;
-    if sve_confirmation {
-        assembler.sve_ptrue_bytes_vl16(0)?;
-        assembler.sve_load_bytes(31, 0, X8)?;
-    }
     assembler.mov_reg(X7, X5)?;
     assembler.bind(lane_loop)?;
     assembler.rbit(X10, X0)?;
@@ -3020,7 +3032,6 @@ fn emit_vector_candidate_skip_v8(
     assembler.add_reg(X5, X7, X10)?;
     if !filters_cover_zero {
         assembler.load_byte_reg(X10, X9, X5)?;
-        assembler.load_byte(X11, X8, 0)?;
         assembler.cmp_reg32(X10, X11)?;
         assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
     }
@@ -3045,6 +3056,7 @@ fn emit_vector_candidate_skip_v8(
                 candidate_miss,
                 16,
                 17,
+                X13,
             )?;
         }
     } else if literal.len() == 16 {
@@ -3058,6 +3070,7 @@ fn emit_vector_candidate_skip_v8(
             candidate_miss,
             16,
             17,
+            X13,
         )?;
     }
     assembler.mov_reg(X13, X5)?;
@@ -3168,8 +3181,8 @@ fn emit_vector_candidate_skip_sve2_fixed16_v2(
     assembler.branch_cond(Condition::CarryClear, narrow_setup)?;
     assembler.sub_imm(X7, X6, 63)?;
 
-    // LDP Q halves the four-load front-end footprint while reading exactly the
-    // same authenticated 64-byte columns as V8.
+    // Match V8's paired-Q front end while reading exactly the same
+    // authenticated 64-byte columns.
     assembler.bind(wide)?;
     assembler.load_vector_pair128(0, 2, X15, 0)?;
     assembler.load_vector_pair128(4, 6, X15, 32)?;
@@ -4090,6 +4103,7 @@ fn emit_suffix_first_class(
             candidate_reject,
             0,
             2,
+            X11,
         )?;
     } else {
         emit_literal_equality(assembler, X15, X7, suffix.len(), candidate_reject)?;
@@ -4249,12 +4263,13 @@ fn emit_literal_equality(
         mismatch,
         0,
         1,
+        X11,
     )
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "explicit vector temporaries make enclosing filter liveness auditable"
+    reason = "explicit vector and scalar temporaries make enclosing filter liveness auditable"
 )]
 fn emit_literal_equality_with_vectors(
     assembler: &mut Assembler,
@@ -4264,6 +4279,7 @@ fn emit_literal_equality_with_vectors(
     mismatch: Label,
     left_vector: u8,
     right_vector: u8,
+    scalar_needle_byte: u8,
 ) -> Result<(), EmitError> {
     let scalar = assembler.new_label(LabelKind::Internal)?;
     let scalar_loop = assembler.new_label(LabelKind::Loop)?;
@@ -4299,8 +4315,8 @@ fn emit_literal_equality_with_vectors(
     assembler.compare_branch_zero(X17, false, equal)?;
     assembler.bind(scalar_loop)?;
     assembler.load_byte(X10, X15, 0)?;
-    assembler.load_byte(X11, X16, 0)?;
-    assembler.cmp_reg32(X10, X11)?;
+    assembler.load_byte(scalar_needle_byte, X16, 0)?;
+    assembler.cmp_reg32(X10, scalar_needle_byte)?;
     assembler.branch_cond(Condition::NotEqual, mismatch)?;
     assembler.add_imm(X15, X15, 1)?;
     assembler.add_imm(X16, X16, 1)?;

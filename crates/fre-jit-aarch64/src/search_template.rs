@@ -1551,7 +1551,16 @@ fn emit_exact_candidates_v7(
     if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(template, 15, 8, candidate_miss, 16, 17);
     } else {
-        emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 16, 17)?;
+        emit_literal_equality_with_vectors(
+            template,
+            15,
+            8,
+            literal.len(),
+            candidate_miss,
+            16,
+            17,
+            11,
+        )?;
     }
     template.mov_reg(13, 5);
     template.add_reg(14, 5, 12);
@@ -1652,7 +1661,7 @@ fn emit_exact_candidates_sve16(
     template.sve_count_predicate_bytes(10, 0, 3);
     template.add_reg(13, 5, 10);
     template.add_reg(15, 9, 13);
-    emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 0, 2)?;
+    emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 0, 2, 11)?;
     template.add_reg(14, 13, 12);
     template.branch(found);
 
@@ -1670,7 +1679,7 @@ fn emit_exact_candidates_sve16(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the independent v8 template reconstructs the wide lazy screen and historical staged fallback without sharing emitter control flow"
+    reason = "the independent v8 template reconstructs the paired wide screen and authenticated staged fallback without sharing emitter control flow"
 )]
 fn emit_exact_candidates_v8(
     template: &mut Template,
@@ -1722,6 +1731,13 @@ fn emit_exact_candidates_v8(
         template.load_byte(11, 8, offset);
         template.dup_byte16(7, 11);
     }
+    if sve_confirmation {
+        template.sve_ptrue_bytes_vl16(0);
+        template.sve_load_bytes(31, 0, 8);
+    }
+    if !filters_cover_zero {
+        template.mov_imm64(11, u64::from(literal[0]));
+    }
     template.mov_imm64(14, 0x1111_1111_1111_1111);
     template.add_reg(15, 9, 5);
     if primary_offset != 0 {
@@ -1737,13 +1753,11 @@ fn emit_exact_candidates_v8(
     template.sub_imm(7, 6, 63);
 
     template.bind(wide)?;
-    template.load_vector128(0, 15, 0);
+    template.load_vector_pair128(0, 2, 15, 0);
+    template.load_vector_pair128(4, 6, 15, 32);
     template.compare_equal_bytes16(0, 0, 1);
-    template.load_vector128(2, 15, 16);
     template.compare_equal_bytes16(2, 2, 1);
-    template.load_vector128(4, 15, 32);
     template.compare_equal_bytes16(4, 4, 1);
-    template.load_vector128(6, 15, 48);
     template.compare_equal_bytes16(6, 6, 1);
     emit_four_block_presence_v8(template);
     if let Some(wide_second_filter) = wide_second_filter {
@@ -1768,16 +1782,14 @@ fn emit_exact_candidates_v8(
         } else {
             template.sub_imm(10, 15, delta);
         }
-        template.load_vector128(18, 10, 0);
+        template.load_vector_pair128(18, 19, 10, 0);
+        template.load_vector_pair128(20, 21, 10, 32);
         template.compare_equal_bytes16(18, 18, 3);
         template.and_bytes16(0, 0, 18);
-        template.load_vector128(19, 10, 16);
         template.compare_equal_bytes16(19, 19, 3);
         template.and_bytes16(2, 2, 19);
-        template.load_vector128(20, 10, 32);
         template.compare_equal_bytes16(20, 20, 3);
         template.and_bytes16(4, 4, 20);
-        template.load_vector128(21, 10, 48);
         template.compare_equal_bytes16(21, 21, 3);
         template.and_bytes16(6, 6, 21);
         emit_four_block_presence_v8(template);
@@ -1801,26 +1813,22 @@ fn emit_exact_candidates_v8(
         } else {
             template.sub_imm(10, 15, delta);
         }
-        template.load_vector128(0, 10, 0);
+        template.load_vector_pair128(0, 2, 10, 0);
+        template.load_vector_pair128(4, 6, 10, 32);
         template.compare_equal_bytes16(0, 0, 3);
-        template.load_vector128(2, 10, 16);
         template.compare_equal_bytes16(2, 2, 3);
-        template.load_vector128(4, 10, 32);
         template.compare_equal_bytes16(4, 4, 3);
-        template.load_vector128(6, 10, 48);
         template.compare_equal_bytes16(6, 6, 3);
         emit_four_block_presence_v8(template);
         template.compare_branch_zero(10, false, secondary_only_advance);
-        template.load_vector128(18, 15, 0);
+        template.load_vector_pair128(18, 19, 15, 0);
+        template.load_vector_pair128(20, 21, 15, 32);
         template.compare_equal_bytes16(18, 18, 1);
         template.and_bytes16(0, 0, 18);
-        template.load_vector128(19, 15, 16);
         template.compare_equal_bytes16(19, 19, 1);
         template.and_bytes16(2, 2, 19);
-        template.load_vector128(20, 15, 32);
         template.compare_equal_bytes16(20, 20, 1);
         template.and_bytes16(4, 4, 20);
-        template.load_vector128(21, 15, 48);
         template.compare_equal_bytes16(21, 21, 1);
         template.and_bytes16(6, 6, 21);
         emit_four_block_presence_v8(template);
@@ -1914,10 +1922,6 @@ fn emit_exact_candidates_v8(
     }
 
     template.bind(recover)?;
-    if sve_confirmation {
-        template.sve_ptrue_bytes_vl16(0);
-        template.sve_load_bytes(31, 0, 8);
-    }
     template.mov_reg(7, 5);
     template.bind(lane_loop)?;
     template.rbit(10, 0);
@@ -1926,7 +1930,6 @@ fn emit_exact_candidates_v8(
     template.add_reg(5, 7, 10);
     if !filters_cover_zero {
         template.load_byte_reg(10, 9, 5);
-        template.load_byte(11, 8, 0);
         template.cmp_reg32(10, 11);
         template.branch_cond(Condition::NotEqual, candidate_miss);
     }
@@ -1951,12 +1954,22 @@ fn emit_exact_candidates_v8(
                 candidate_miss,
                 16,
                 17,
+                13,
             )?;
         }
     } else if literal.len() == 16 {
         emit_literal_equality_16_with_vectors(template, 15, 8, candidate_miss, 16, 17);
     } else {
-        emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 16, 17)?;
+        emit_literal_equality_with_vectors(
+            template,
+            15,
+            8,
+            literal.len(),
+            candidate_miss,
+            16,
+            17,
+            13,
+        )?;
     }
     template.mov_reg(13, 5);
     template.add_reg(14, 5, 12);
@@ -2477,7 +2490,7 @@ fn emit_literal_equality_16_with_vectors(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "independent equality construction exposes both vector temporaries and every pointer"
+    reason = "independent equality construction exposes vector/scalar temporaries and every pointer"
 )]
 fn emit_literal_equality_with_vectors(
     template: &mut Template,
@@ -2487,6 +2500,7 @@ fn emit_literal_equality_with_vectors(
     mismatch: Label,
     left_vector: u8,
     right_vector: u8,
+    scalar_needle_byte: u8,
 ) -> Result<(), AuditError> {
     let scalar = template.new_label(LabelKind::Internal);
     let scalar_loop = template.new_label(LabelKind::Loop);
@@ -2520,8 +2534,8 @@ fn emit_literal_equality_with_vectors(
     template.compare_branch_zero(17, false, equal);
     template.bind(scalar_loop)?;
     template.load_byte(10, 15, 0);
-    template.load_byte(11, 16, 0);
-    template.cmp_reg32(10, 11);
+    template.load_byte(scalar_needle_byte, 16, 0);
+    template.cmp_reg32(10, scalar_needle_byte);
     template.branch_cond(Condition::NotEqual, mismatch);
     template.add_imm(15, 15, 1);
     template.add_imm(16, 16, 1);
@@ -2545,6 +2559,7 @@ fn emit_literal_equality(
         mismatch,
         0,
         1,
+        11,
     )
 }
 
@@ -2793,7 +2808,16 @@ fn emit_suffix_first_class(
         template.branch_cond(Condition::NotEqual, candidate_reject);
     }
     if sve {
-        emit_literal_equality_with_vectors(template, 15, 7, suffix.len(), candidate_reject, 0, 2)?;
+        emit_literal_equality_with_vectors(
+            template,
+            15,
+            7,
+            suffix.len(),
+            candidate_reject,
+            0,
+            2,
+            11,
+        )?;
     } else {
         emit_literal_equality(template, 15, 7, suffix.len(), candidate_reject)?;
     }
