@@ -13,23 +13,26 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
 use bstr::ByteSlice;
+#[cfg(test)]
+use fre::PortableRegex;
 use fre::{
     AggregateBuildAccounting, AggregateBuildReport, AggregateBuilder, AggregateManyBuildReport,
     AggregateManyBuilder, AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits,
     AggregateManyPlanKind, AggregatePlanIdentity, AggregatePlanKind, BOUNDED_AFFIX_PLAN_ID,
-    PlanKind, PortableGrepBuildError, PortableGrepSession, PortableRegex, PortableSearchSession,
-    SearchLimits, SearchSessionLimits, SimdDispatchContext, simd_dispatch_profile,
+    PlanKind, SearchLimits, SimdDispatchContext, simd_dispatch_profile,
 };
 use rebar_compare::{
     AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
     CurrentFreAdapter, CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
-    CurrentFreAggregateOperationLifecycle, CurrentFreHotByteOperationLifecycle, InputReceipt,
-    REPORT_SCHEMA, RunLimits, current_fre_rebar_aggregate_builder,
-    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
-    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
-    current_fre_rebar_capture_lifecycle, current_fre_rebar_compile_run_limits,
-    current_fre_rebar_count_run_limits, current_fre_rebar_hot_byte_operation_lifecycle,
+    CurrentFreAggregateOperationLifecycle, CurrentFreGrepSession,
+    CurrentFreHotByteOperationLifecycle, InputReceipt, REPORT_SCHEMA, RunLimits,
+    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
+    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
+    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_capture_lifecycle,
+    current_fre_rebar_compile_run_limits, current_fre_rebar_count_run_limits,
+    current_fre_rebar_grep_session, current_fre_rebar_hot_byte_operation_lifecycle,
     current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
     current_fre_rebar_span_sum_run_limits, current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
@@ -1302,7 +1305,7 @@ where
     require_grep_runtime_plan(&selected_runtime, regex.build_report().plan)?;
     identity.candidate_runtime = Some(selected_runtime.clone());
     let limits = current_fre_rebar_search_limits();
-    let mut session = build_grep_session(&regex, limits)?;
+    let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())?;
     require_performance_runtime(&selected_runtime, session.runtime_implementation_id())?;
     let steady = identity.boundary == "steady-public-operation";
     produce_performance_candidate_observation(&identity, || {
@@ -1320,86 +1323,12 @@ where
     .map_err(Into::into)
 }
 
-#[allow(
-    clippy::large_enum_variant,
-    reason = "the runner keeps the admitted reusable session inline instead of adding an unaccounted box allocation"
-)]
-enum CurrentFreGrepSession<'r> {
-    Stream(PortableGrepSession<'r>),
-    SearchFallback(PortableSearchSession<'r>),
-}
-
-impl CurrentFreGrepSession<'_> {
-    const fn runtime_implementation_id(&self) -> &'static str {
-        match self {
-            Self::Stream(session) => session.runtime_implementation_id(),
-            Self::SearchFallback(session) => session.runtime_implementation_id(),
-        }
-    }
-}
-
-fn build_grep_session(
-    regex: &PortableRegex,
-    limits: SearchLimits,
-) -> Result<CurrentFreGrepSession<'_>, CompareError> {
-    if regex.build_report().plan == PlanKind::K0 {
-        return build_grep_search_fallback(regex, limits);
-    }
-    match regex.grep_stream_session() {
-        Ok(session) => Ok(CurrentFreGrepSession::Stream(session)),
-        Err(PortableGrepBuildError::UnsupportedRuntime { .. }) => {
-            build_grep_search_fallback(regex, limits)
-        }
-        Err(error) => Err(CompareError::new(format!(
-            "FRE whole-input grep session build: {error}"
-        ))),
-    }
-}
-
-fn build_grep_search_fallback(
-    regex: &PortableRegex,
-    limits: SearchLimits,
-) -> Result<CurrentFreGrepSession<'_>, CompareError> {
-    regex
-        .search_session(SearchSessionLimits {
-            max_setup_work: limits.max_work,
-            max_scratch_bytes: limits.max_scratch_bytes,
-        })
-        .map(CurrentFreGrepSession::SearchFallback)
-        .map_err(|error| CompareError::new(format!("FRE grep fallback session build: {error}")))
-}
-
 fn execute_grep_session(
     session: &mut CurrentFreGrepSession<'_>,
     haystack: &[u8],
-    limits: SearchLimits,
+    _limits: SearchLimits,
 ) -> Result<u64, CompareError> {
-    match session {
-        CurrentFreGrepSession::Stream(session) => {
-            let result = session.count(haystack).map_err(|error| {
-                CompareError::new(format!("FRE whole-input grep lifecycle: {error}"))
-            })?;
-            if !result.receipt.closes() {
-                return Err(CompareError::new(
-                    "FRE whole-input grep lifecycle returned an open receipt",
-                ));
-            }
-            Ok(result.count())
-        }
-        CurrentFreGrepSession::SearchFallback(session) => {
-            let mut count = 0_u64;
-            for line in haystack.lines() {
-                if session.is_match_value(line, limits).map_err(|error| {
-                    CompareError::new(format!("FRE grep fallback lifecycle search: {error}"))
-                })? {
-                    count = count.checked_add(1).ok_or_else(|| {
-                        CompareError::new("FRE grep fallback lifecycle count overflow")
-                    })?;
-                }
-            }
-            Ok(count)
-        }
-    }
+    session.execute(haystack)
 }
 
 fn require_performance_plan(expected: &str, actual: &str) -> Result<(), CompareError> {
@@ -1570,7 +1499,7 @@ fn model_grep(benchmark: &Benchmark, expectations: &Expectations) -> Result<Vec<
     require_grep_runtime_plan(regex.runtime_implementation_id(), regex.build_report().plan)?;
     let haystack = benchmark.haystack.as_slice();
     let limits = current_fre_rebar_search_limits();
-    let mut session = build_grep_session(&regex, limits)?;
+    let mut session = current_fre_rebar_grep_session(&regex, haystack.len())?;
     run(
         benchmark,
         || execute_grep_session(&mut session, haystack, limits).map_err(Into::into),
@@ -2564,26 +2493,26 @@ mod tests {
         let limits = current_fre_rebar_search_limits();
 
         let literal = PortableRegex::new("ab").expect("exact literal");
-        let mut literal_session =
-            build_grep_session(&literal, limits).expect("whole-input literal session");
-        assert!(matches!(&literal_session, CurrentFreGrepSession::Stream(_)));
+        let literal_source = b"xxab\r\nmiss\nab";
+        let mut literal_session = current_fre_rebar_grep_session(&literal, literal_source.len())
+            .expect("whole-input literal session");
+        assert!(!literal_session.has_reusable_k0_workspace());
+        assert!(!literal_session.has_required_literal_prefilter());
         assert_eq!(
-            execute_grep_session(&mut literal_session, b"xxab\r\nmiss\nab", limits)
+            execute_grep_session(&mut literal_session, literal_source, limits)
                 .expect("whole-input literal count"),
             2
         );
 
         let k0 = PortableRegex::new("a.*b").expect("K0 regex");
         assert_eq!(k0.build_report().plan, PlanKind::K0);
-        let mut k0_session =
-            build_grep_session(&k0, limits).expect("retained per-line K0 search session");
-        let CurrentFreGrepSession::SearchFallback(k0_search) = &k0_session else {
-            panic!("K0 selected the whole-input stream");
-        };
-        assert!(k0_search.workspace_setup_accounting().is_some());
+        let k0_source = b"axb\r\nmiss\nab";
+        let mut k0_session = current_fre_rebar_grep_session(&k0, k0_source.len())
+            .expect("retained per-line K0 search session");
+        assert!(k0_session.has_reusable_k0_workspace());
+        assert!(!k0_session.has_required_literal_prefilter());
         assert_eq!(
-            execute_grep_session(&mut k0_session, b"axb\r\nmiss\nab", limits)
-                .expect("per-line K0 count"),
+            execute_grep_session(&mut k0_session, k0_source, limits).expect("per-line K0 count"),
             2
         );
 
@@ -2592,14 +2521,13 @@ mod tests {
             finite.build_report().plan,
             PlanKind::PackedLiteralSet | PlanKind::LiteralSetDfa
         ));
-        let mut fallback =
-            build_grep_session(&finite, limits).expect("pre-source fallback session");
-        assert!(matches!(
-            &fallback,
-            CurrentFreGrepSession::SearchFallback(_)
-        ));
+        let finite_source = b"ab\nmiss\na";
+        let mut fallback = current_fre_rebar_grep_session(&finite, finite_source.len())
+            .expect("pre-source fallback session");
+        assert!(!fallback.has_reusable_k0_workspace());
+        assert!(!fallback.has_required_literal_prefilter());
         assert_eq!(
-            execute_grep_session(&mut fallback, b"ab\nmiss\na", limits).expect("fallback count"),
+            execute_grep_session(&mut fallback, finite_source, limits).expect("fallback count"),
             2
         );
     }
@@ -2719,12 +2647,9 @@ mod tests {
             assert_eq!(regex.build_report().plan, PlanKind::K0);
             assert_eq!(regex.runtime_implementation_id(), "k0");
             let limits = current_fre_rebar_search_limits();
-            let mut session =
-                build_grep_session(&regex, limits).expect("retained per-line K0 search session");
-            let CurrentFreGrepSession::SearchFallback(search) = &session else {
-                panic!("exact K0 Grep point selected the whole-input stream");
-            };
-            assert!(search.workspace_setup_accounting().is_some());
+            let mut session = current_fre_rebar_grep_session(&regex, benchmark.haystack.len())
+                .expect("retained per-line K0 search session");
+            assert!(session.has_reusable_k0_workspace());
 
             let repeated = benchmark
                 .haystack

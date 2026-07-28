@@ -156,6 +156,63 @@ fn required_ascii_class_prefilter_does_not_bypass_aggregate_result_limits() {
     ));
 }
 
+#[test]
+fn required_literal_sidecar_build_avoids_the_capture_executor() {
+    let limits = CaptureBuildLimits {
+        required_literal: Some(CaptureRequiredLiteralBuildLimits::default()),
+        ..CaptureBuildLimits::default()
+    };
+    let pattern = r"(?:alpha[0-9]+|beta[A-Z]+)";
+    let sidecar = CaptureBuilder::new(pattern)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .limits(limits)
+        .build_required_literal_plan()
+        .expect("lightweight required-literal build")
+        .expect("distinct effective required literals");
+    let full = CaptureBuilder::new(pattern)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .limits(limits)
+        .build()
+        .expect("full capture build");
+    let full_sidecar = full
+        .required_literal_plan()
+        .expect("full build required-literal sidecar");
+    assert_eq!(sidecar.build_report(), full_sidecar.build_report());
+    for haystack in [
+        b"miss".as_slice(),
+        b"alpha7",
+        b"xxbetaZyy",
+        b"alpha\n7",
+        b"\xFFbetaQ",
+    ] {
+        let run_limits = CaptureRequiredLiteralRunLimits::default();
+        assert_eq!(
+            sidecar
+                .is_candidate(haystack, run_limits)
+                .expect("lightweight candidate"),
+            full_sidecar
+                .is_candidate(haystack, run_limits)
+                .expect("full candidate")
+        );
+    }
+
+    let refused = CaptureBuilder::new(pattern)
+        .profile(fre::RustProfile::rebar_1_12_4())
+        .unicode(false)
+        .limits(CaptureBuildLimits {
+            required_literal: Some(CaptureRequiredLiteralBuildLimits {
+                max_planner_work: 0,
+                ..CaptureRequiredLiteralBuildLimits::default()
+            }),
+            ..CaptureBuildLimits::default()
+        })
+        .build_required_literal_plan()
+        .expect("optional sidecar resource refusal");
+    assert!(refused.is_none());
+}
+
 fn assert_count(pattern: &str, haystack: &[u8]) {
     let regex = CaptureBuilder::new(pattern)
         .unicode(false)

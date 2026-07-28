@@ -74,7 +74,8 @@ use fre::{
     OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PortableBuilder,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
+    PortableGrepBuildError, PortableGrepSession, PortableRegex, PortableSearchSession,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, REVERSE_INNER_COUNT_OPERATION_ID,
@@ -2254,6 +2255,598 @@ pub fn current_fre_rebar_portable_builder(
     Ok(PortableBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(unicode))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CurrentFreGrepLimits {
+    search: SearchLimits,
+    reducer_steps: u64,
+    operation_work: usize,
+    sequential_bytes: usize,
+    prefilter_build: CaptureRequiredLiteralBuildLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CurrentFreRequiredLiteralScan {
+    run_limits: CaptureRequiredLiteralRunLimits,
+    transitions_upper_bound: usize,
+    match_events_upper_bound: usize,
+    searched_bytes: usize,
+}
+
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the exact caller-owned K0 workspace stays inline and construction remains outside the operation boundary"
+)]
+enum CurrentFreGrepRoute<'r> {
+    Stream(PortableGrepSession<'r>),
+    Search {
+        search: PortableSearchSession<'r>,
+        prefilter: Option<CaptureRequiredLiteralPlan>,
+        required_literal_scan: Option<CurrentFreRequiredLiteralScan>,
+        scan_admission: CurrentFreGrepScanAdmission,
+    },
+}
+
+/// One already-built plain-grep artifact at the first/steady public-operation
+/// boundary used by the authenticated current-FRE Rebar adapter.
+///
+/// A K0 route may own a conservative required-literal sidecar compiled from
+/// the same source/profile as the immutable semantic matcher. Both that
+/// sidecar and the reusable K0 workspace are built before the first call to
+/// [`Self::execute`]. Each operation then performs either one admitted
+/// whole-input literal scan plus K0 searches for surviving LF/CRLF domains, or
+/// the unchanged per-line semantic search. Route selection never observes
+/// source bytes.
+#[derive(Debug)]
+pub struct CurrentFreGrepSession<'r> {
+    route: CurrentFreGrepRoute<'r>,
+    runtime_implementation_id: &'static str,
+    haystack_len: usize,
+    limits: CurrentFreGrepLimits,
+}
+
+impl CurrentFreGrepSession<'_> {
+    /// Stable runtime identity inherited from the immutable semantic matcher.
+    #[must_use]
+    pub const fn runtime_implementation_id(&self) -> &'static str {
+        self.runtime_implementation_id
+    }
+
+    /// Whether construction published the generic required-literal sidecar.
+    ///
+    /// A published sidecar can still retain its construction-proved
+    /// delimiter-sensitive per-line fallback for this route.
+    #[must_use]
+    pub const fn has_required_literal_prefilter(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::Search {
+                prefilter: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Whether this haystack length admitted the consolidated whole-input
+    /// required-literal scan.
+    #[must_use]
+    pub const fn uses_required_literal_prefilter(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::Search {
+                required_literal_scan: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Whether construction retained a reusable K0 workspace for candidate
+    /// line searches.
+    #[must_use]
+    pub const fn has_reusable_k0_workspace(&self) -> bool {
+        match &self.route {
+            CurrentFreGrepRoute::Search { search, .. } => {
+                search.workspace_setup_accounting().is_some()
+            }
+            CurrentFreGrepRoute::Stream(_) => false,
+        }
+    }
+
+    /// Execute one complete Rebar LF/CRLF plain-grep operation.
+    ///
+    /// The first call is the first-operation boundary and later calls on the
+    /// same value are steady operations. No cache or workspace is allocated
+    /// lazily by this adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a source-length mismatch, source-independent
+    /// operation preflight refusal, a typed semantic-search refusal, or an
+    /// authenticated engine/adapter invariant failure. No post-source route
+    /// fallback is permitted.
+    pub fn execute(&mut self, haystack: &[u8]) -> Result<u64, CompareError> {
+        self.execute_inner(haystack)
+            .map_err(|error| CompareError::new(error.message))
+    }
+
+    fn execute_inner(&mut self, haystack: &[u8]) -> Result<u64, ExecutionError> {
+        if haystack.len() != self.haystack_len {
+            return Err(ExecutionError::fault(format!(
+                "grep lifecycle haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        match &mut self.route {
+            CurrentFreGrepRoute::Stream(session) => {
+                let result = session.count(haystack).map_err(|error| {
+                    ExecutionError::fault(format!(
+                        "FRE whole-input grep lifecycle refused execution: {error}"
+                    ))
+                })?;
+                if !result.receipt.closes() {
+                    return Err(ExecutionError::fault(
+                        "FRE whole-input grep lifecycle returned an open receipt",
+                    ));
+                }
+                Ok(result.count())
+            }
+            CurrentFreGrepRoute::Search {
+                search,
+                prefilter,
+                required_literal_scan,
+                scan_admission,
+            } => execute_current_fre_search_grep(
+                search,
+                prefilter.as_ref(),
+                *required_literal_scan,
+                *scan_admission,
+                haystack,
+                self.limits,
+            ),
+        }
+    }
+}
+
+/// Construct the default authenticated current-FRE plain-grep lifecycle.
+///
+/// Construction, optional required-literal proof publication, and reusable
+/// workspace allocation all occur before the first public operation.
+///
+/// # Errors
+///
+/// Returns an error for a source-independent construction refusal or an
+/// impossible profile/plan binding. Optional required-literal capability and
+/// resource refusals retain the already-built semantic search route.
+pub fn current_fre_rebar_grep_session(
+    regex: &PortableRegex,
+    haystack_len: usize,
+) -> Result<CurrentFreGrepSession<'_>, CompareError> {
+    current_fre_rebar_grep_session_with_limits(regex, haystack_len, &RunLimits::default())
+}
+
+/// Construct the authenticated plain-grep lifecycle under explicit adapter
+/// limits.
+///
+/// This is the limit-controlled counterpart to
+/// [`current_fre_rebar_grep_session`].
+///
+/// # Errors
+///
+/// Returns the same failures as [`current_fre_rebar_grep_session`].
+pub fn current_fre_rebar_grep_session_with_limits<'r>(
+    regex: &'r PortableRegex,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<CurrentFreGrepSession<'r>, CompareError> {
+    let search_limits = SearchLimits {
+        max_work: limits.fre_search_work,
+        max_scratch_bytes: limits.fre_scratch_bytes,
+    };
+    let prefilter_build = capture_required_literal_build_limits(limits);
+    let runtime_implementation_id = regex.runtime_implementation_id();
+    let grep_limits = CurrentFreGrepLimits {
+        search: search_limits,
+        reducer_steps: limits.reducer_steps,
+        operation_work: limits.fre_aggregate_operation_work,
+        sequential_bytes: limits.fre_aggregate_sequential_bytes,
+        prefilter_build,
+    };
+    let route = if regex.build_report().plan == PlanKind::K0 {
+        let profile = match regex.profile() {
+            CompatibilityProfile::RustBytes(profile) => profile.clone(),
+            CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
+                return Err(CompareError::new(
+                    "portable grep retained a non-Rust-bytes compatibility profile",
+                ));
+            }
+        };
+        let mut build_limits = capture_build_limits(limits);
+        build_limits.required_literal = Some(prefilter_build);
+        let prefilter = CaptureBuilder::new(regex.as_str())
+            .profile(profile)
+            .limits(build_limits)
+            .build_required_literal_plan()
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE grep required-literal sidecar build failed: {error}"
+                ))
+            })?;
+        let search = regex
+            .search_session(SearchSessionLimits {
+                max_setup_work: search_limits.max_work,
+                max_scratch_bytes: search_limits.max_scratch_bytes,
+            })
+            .map_err(|error| {
+                CompareError::new(format!("FRE grep search-session build failed: {error}"))
+            })?;
+        let (prefilter, required_literal_scan, scan_admission) =
+            prepare_current_fre_grep_prefilter(
+                prefilter,
+                haystack_len,
+                limits.fre_literal_linear_terms,
+                grep_limits,
+            )?;
+        CurrentFreGrepRoute::Search {
+            search,
+            prefilter,
+            required_literal_scan,
+            scan_admission,
+        }
+    } else {
+        match regex.grep_stream_session() {
+            Ok(session) => CurrentFreGrepRoute::Stream(session),
+            Err(PortableGrepBuildError::UnsupportedRuntime { .. }) => {
+                let search = regex
+                    .search_session(SearchSessionLimits {
+                        max_setup_work: search_limits.max_work,
+                        max_scratch_bytes: search_limits.max_scratch_bytes,
+                    })
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE grep fallback search-session build failed: {error}"
+                        ))
+                    })?;
+                CurrentFreGrepRoute::Search {
+                    search,
+                    prefilter: None,
+                    required_literal_scan: None,
+                    scan_admission: CurrentFreGrepScanAdmission::line_scan(
+                        haystack_len,
+                        grep_limits,
+                    )
+                    .map_err(|error| CompareError::new(error.message))?,
+                }
+            }
+            Err(error) => {
+                return Err(CompareError::new(format!(
+                    "FRE whole-input grep session build failed: {error}"
+                )));
+            }
+        }
+    };
+    Ok(CurrentFreGrepSession {
+        route,
+        runtime_implementation_id,
+        haystack_len,
+        limits: grep_limits,
+    })
+}
+
+fn prepare_current_fre_grep_prefilter(
+    prefilter: Option<CaptureRequiredLiteralPlan>,
+    haystack_len: usize,
+    max_prefilter_transitions: usize,
+    limits: CurrentFreGrepLimits,
+) -> Result<
+    (
+        Option<CaptureRequiredLiteralPlan>,
+        Option<CurrentFreRequiredLiteralScan>,
+        CurrentFreGrepScanAdmission,
+    ),
+    CompareError,
+> {
+    let line_scan = CurrentFreGrepScanAdmission::line_scan(haystack_len, limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    let Some(prefilter) = prefilter else {
+        return Ok((None, None, line_scan));
+    };
+    let Some(prospective) =
+        prefilter
+            .line_partition_prospective(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE grep required-literal prospective failed: {error}"
+                ))
+            })?
+    else {
+        return Ok((Some(prefilter), None, line_scan));
+    };
+    if prospective.transitions_upper_bound > max_prefilter_transitions {
+        return Ok((Some(prefilter), None, line_scan));
+    }
+    let scan_admission = match CurrentFreGrepScanAdmission::line_and_required_literal(
+        haystack_len,
+        prospective.transitions_upper_bound,
+        prospective.match_events_upper_bound,
+        limits,
+    ) {
+        Ok(admission) => admission,
+        Err(error) if error.status == Status::Unsupported => {
+            return Ok((Some(prefilter), None, line_scan));
+        }
+        Err(error) => return Err(CompareError::new(error.message)),
+    };
+    let required_literal_scan = CurrentFreRequiredLiteralScan {
+        run_limits: CaptureRequiredLiteralRunLimits {
+            max_transitions: max_prefilter_transitions,
+        },
+        transitions_upper_bound: prospective.transitions_upper_bound,
+        match_events_upper_bound: prospective.match_events_upper_bound,
+        searched_bytes: prospective.searched_bytes,
+    };
+    Ok((Some(prefilter), Some(required_literal_scan), scan_admission))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CurrentFreGrepScanAdmission {
+    work: usize,
+    sequential_bytes: usize,
+}
+
+impl CurrentFreGrepScanAdmission {
+    fn line_scan(
+        haystack_len: usize,
+        limits: CurrentFreGrepLimits,
+    ) -> Result<Self, ExecutionError> {
+        Self::check(haystack_len, haystack_len, limits)
+    }
+
+    fn line_and_required_literal(
+        haystack_len: usize,
+        prefilter_transitions: usize,
+        prefilter_match_events: usize,
+        limits: CurrentFreGrepLimits,
+    ) -> Result<Self, ExecutionError> {
+        let scan_work = checked_aggregate_add(
+            haystack_len,
+            prefilter_transitions,
+            "plain-grep LF and required-literal work",
+        )?;
+        let work = checked_aggregate_add(
+            scan_work,
+            prefilter_match_events,
+            "plain-grep required-literal match-event work",
+        )?;
+        let sequential_bytes = checked_aggregate_mul(
+            haystack_len,
+            2,
+            "plain-grep LF and required-literal sequential bytes",
+        )?;
+        Self::check(work, sequential_bytes, limits)
+    }
+
+    fn check(
+        work: usize,
+        sequential_bytes: usize,
+        limits: CurrentFreGrepLimits,
+    ) -> Result<Self, ExecutionError> {
+        if work > limits.operation_work {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE plain-grep prefilter requires {work} work, limit is {}",
+                limits.operation_work
+            )));
+        }
+        if sequential_bytes > limits.sequential_bytes {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE plain-grep prefilter requires {sequential_bytes} sequential bytes, limit is {}",
+                limits.sequential_bytes
+            )));
+        }
+        Ok(Self {
+            work,
+            sequential_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CurrentFreSearchGrepReport {
+    count: u64,
+    line_domains: usize,
+    candidate_domains: usize,
+    search_executions: usize,
+    consolidated_prefilter: bool,
+    prefilter_transitions: usize,
+    prefilter_match_events: usize,
+    prefilter_match_events_upper_bound: usize,
+    prefilter_sequential_bytes: usize,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "source-free scan admission, exact line alignment, K0 authority, and final accounting authentication remain one auditable transaction"
+)]
+fn execute_current_fre_search_grep(
+    search: &mut PortableSearchSession<'_>,
+    prefilter: Option<&CaptureRequiredLiteralPlan>,
+    required_literal_scan: Option<CurrentFreRequiredLiteralScan>,
+    scan_admission: CurrentFreGrepScanAdmission,
+    haystack: &[u8],
+    limits: CurrentFreGrepLimits,
+) -> Result<u64, ExecutionError> {
+    let consolidated_prefilter = required_literal_scan.is_some();
+    let prefilter_transition_bound =
+        required_literal_scan.map_or(0, |scan| scan.transitions_upper_bound);
+    let prefilter_match_events_upper_bound =
+        required_literal_scan.map_or(0, |scan| scan.match_events_upper_bound);
+    let prefilter_sequential_bytes = required_literal_scan.map_or(0, |scan| scan.searched_bytes);
+    let mut line_matches = if let Some(prepared) = required_literal_scan {
+        let prefilter = prefilter.ok_or_else(|| {
+            ExecutionError::fault(
+                "FRE plain-grep admitted a required-literal scan without its immutable plan",
+            )
+        })?;
+        let scan = prefilter
+            .line_partition_matches(haystack, prepared.run_limits)
+            .map_err(|error| {
+                ExecutionError::fault(format!(
+                    "FRE plain-grep required-literal scan violated preflight: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ExecutionError::fault(
+                    "FRE plain-grep required-literal delimiter proof changed after admission",
+                )
+            })?;
+        if scan.identity().plan != prefilter.build_report().identity
+            || scan.identity().build_limits != limits.prefilter_build
+            || scan.identity().operation
+                != CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1
+            || scan.identity().run_limits != prepared.run_limits
+            || scan.accounting().transitions_upper_bound != prepared.transitions_upper_bound
+            || scan.accounting().match_events_upper_bound != prepared.match_events_upper_bound
+            || scan.accounting().searched_bytes != prepared.searched_bytes
+        {
+            return Err(ExecutionError::fault(
+                "FRE plain-grep required-literal scan failed identity/P/A authentication",
+            ));
+        }
+        Some(scan.peekable())
+    } else {
+        None
+    };
+
+    let mut report = CurrentFreSearchGrepReport {
+        consolidated_prefilter,
+        prefilter_transitions: prefilter_transition_bound,
+        prefilter_match_events_upper_bound,
+        prefilter_sequential_bytes,
+        ..CurrentFreSearchGrepReport::default()
+    };
+    let mut reducer_events = 0_u64;
+    let mut raw_cursor = 0_usize;
+    for raw_line in haystack.lines_with_terminator() {
+        let line_start = raw_cursor;
+        raw_cursor = raw_cursor
+            .checked_add(raw_line.len())
+            .ok_or_else(|| ExecutionError::fault("FRE plain-grep raw line cursor overflow"))?;
+        let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+            without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+        } else {
+            raw_line
+        };
+        let line_end = line_start
+            .checked_add(line.len())
+            .ok_or_else(|| ExecutionError::fault("FRE plain-grep semantic line end overflow"))?;
+        report.line_domains =
+            checked_aggregate_add(report.line_domains, 1, "plain-grep line domains")?;
+        charge(
+            &mut reducer_events,
+            1,
+            limits.reducer_steps,
+            "FRE plain-grep line events",
+        )?;
+        let candidate = if let Some(matches) = line_matches.as_mut() {
+            let mut candidate = false;
+            while matches.peek().is_some_and(|&(start, _)| start < raw_cursor) {
+                let (start, end) = matches.next().ok_or_else(|| {
+                    ExecutionError::fault("peeked plain-grep literal match disappeared")
+                })?;
+                report.prefilter_match_events = checked_aggregate_add(
+                    report.prefilter_match_events,
+                    1,
+                    "plain-grep required-literal match events",
+                )?;
+                if start < line_start || start >= end || end > line_end {
+                    return Err(ExecutionError::fault(
+                        "FRE plain-grep required-literal match escaped its semantic line",
+                    ));
+                }
+                candidate = true;
+            }
+            candidate
+        } else {
+            true
+        };
+        if !candidate {
+            continue;
+        }
+        report.candidate_domains =
+            checked_aggregate_add(report.candidate_domains, 1, "plain-grep candidate domains")?;
+        report.search_executions =
+            checked_aggregate_add(report.search_executions, 1, "plain-grep search executions")?;
+        if search
+            .is_match_value(line, limits.search)
+            .map_err(|error| {
+                ExecutionError::unsupported(format!(
+                    "FRE plain-grep semantic search refused: {error}"
+                ))
+            })?
+        {
+            report.count = report
+                .count
+                .checked_add(1)
+                .ok_or_else(|| ExecutionError::fault("FRE plain-grep count overflow"))?;
+        }
+    }
+    if raw_cursor != haystack.len() {
+        return Err(ExecutionError::fault(
+            "FRE plain-grep line iterator did not consume the complete source",
+        ));
+    }
+    if let Some(matches) = line_matches.as_mut()
+        && matches.next().is_some()
+    {
+        return Err(ExecutionError::fault(
+            "FRE plain-grep required-literal match was not assigned to a semantic line",
+        ));
+    }
+    if report.prefilter_transitions > prefilter_transition_bound
+        || report.prefilter_match_events > report.prefilter_match_events_upper_bound
+        || report.prefilter_sequential_bytes > haystack.len()
+    {
+        return Err(ExecutionError::fault(
+            "FRE plain-grep required-literal scan exceeded its prospective",
+        ));
+    }
+    if report.search_executions != report.candidate_domains
+        || report.candidate_domains > report.line_domains
+    {
+        return Err(ExecutionError::fault(
+            "FRE plain-grep search/domain cardinality invariant failed",
+        ));
+    }
+    if consolidated_prefilter {
+        if scan_admission.work
+            != haystack
+                .len()
+                .checked_add(prefilter_transition_bound)
+                .and_then(|work| work.checked_add(prefilter_match_events_upper_bound))
+                .ok_or_else(|| {
+                    ExecutionError::fault("FRE plain-grep admitted work overflowed on closure")
+                })?
+            || scan_admission.sequential_bytes
+                != haystack.len().checked_mul(2).ok_or_else(|| {
+                    ExecutionError::fault(
+                        "FRE plain-grep admitted sequential bytes overflowed on closure",
+                    )
+                })?
+        {
+            return Err(ExecutionError::fault(
+                "FRE plain-grep prefilter admission failed to close",
+            ));
+        }
+    } else if scan_admission.work != haystack.len()
+        || scan_admission.sequential_bytes != haystack.len()
+    {
+        return Err(ExecutionError::fault(
+            "FRE plain-grep line-scan admission failed to close",
+        ));
+    }
+    Ok(report.count)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13494,31 +14087,12 @@ fn fre_grep(
         .map_err(|error| {
             ExecutionError::unsupported(format!("FRE build refused input: {error}"))
         })?;
-    let search_limits = SearchLimits {
-        max_work: limits.fre_search_work,
-        max_scratch_bytes: limits.fre_scratch_bytes,
-    };
-    let mut session = regex
-        .search_session(SearchSessionLimits {
-            max_setup_work: limits.fre_search_work,
-            max_scratch_bytes: limits.fre_scratch_bytes,
-        })
-        .map_err(|error| {
-            ExecutionError::unsupported(format!("FRE search session refused: {error}"))
-        })?;
-    let mut count = 0u64;
-    let mut events = 0u64;
-    for line in request.haystack.lines() {
-        charge(&mut events, 1, limits.reducer_steps, "FRE grep line events")?;
-        let (matched, _) = session
-            .is_match(line, search_limits)
-            .map_err(|error| ExecutionError::unsupported(format!("FRE search refused: {error}")))?;
-        if matched {
-            count = count
-                .checked_add(1)
-                .ok_or_else(|| ExecutionError::fault("FRE grep reducer overflow"))?;
-        }
-    }
+    let mut session =
+        current_fre_rebar_grep_session_with_limits(&regex, request.haystack.len(), limits)
+            .map_err(|error| {
+                ExecutionError::unsupported(format!("FRE grep session refused: {error}"))
+            })?;
+    let count = session.execute_inner(request.haystack)?;
     Ok(FreReduction {
         actual: count,
         plan: "portable-single-search",
@@ -20801,6 +21375,130 @@ mod tests {
             ),
             1,
             "portable-single-search",
+        );
+    }
+
+    #[test]
+    fn plain_grep_required_literal_sidecar_preserves_lines_and_reuses_k0() {
+        const PATTERN: &str = r"(?:ABC.*Z\z|XY.+Q)";
+        let regex = current_fre_rebar_portable_builder(PATTERN, false, false)
+            .expect("portable builder")
+            .build()
+            .expect("portable K0");
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        let search_limits = current_fre_rebar_search_limits();
+        let cases: &[&[u8]] = &[
+            b"",
+            b"\n",
+            b"miss\nABCZ\nXYxQ",
+            b"ABCZ\r\nmiss\nXY\xFFQ\n",
+            b"AB\nCZ\nX\nYxQ",
+            b"ABCZ\n\nXYxQ\n",
+            b"ABCZ\r",
+        ];
+        for &haystack in cases {
+            let expected = haystack
+                .lines()
+                .map(|line| {
+                    regex
+                        .is_match_value(line, search_limits)
+                        .expect("line reference")
+                })
+                .filter(|matched| *matched)
+                .count();
+            let expected = u64::try_from(expected).expect("line count");
+            let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
+                .expect("required-literal grep session");
+            assert!(session.has_reusable_k0_workspace());
+            assert!(session.has_required_literal_prefilter());
+            assert!(session.uses_required_literal_prefilter());
+            assert_eq!(session.execute(haystack).expect("first"), expected);
+            assert_eq!(session.execute(haystack).expect("steady"), expected);
+        }
+    }
+
+    #[test]
+    fn plain_grep_required_literal_admission_is_exact_and_delimiters_fall_back() {
+        const SAFE: &str = r"(?:ABC.*Z|XY.+Q)";
+        let haystack = b"miss\nABCZ\r\nXYxQ\n";
+        let defaults = RunLimits::default();
+        let regex = current_fre_rebar_portable_builder(SAFE, false, false)
+            .expect("portable builder")
+            .build()
+            .expect("portable K0");
+        let profile = match regex.profile() {
+            CompatibilityProfile::RustBytes(profile) => profile.clone(),
+            CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
+                panic!("portable bytes profile")
+            }
+        };
+        let prefilter_build = capture_required_literal_build_limits(&defaults);
+        let mut capture_limits = capture_build_limits(&defaults);
+        capture_limits.required_literal = Some(prefilter_build);
+        let prefilter = CaptureBuilder::new(SAFE)
+            .profile(profile)
+            .limits(capture_limits)
+            .build_required_literal_plan()
+            .expect("sidecar build")
+            .expect("sidecar plan");
+        let prospective = prefilter
+            .line_partition_prospective(haystack.len())
+            .expect("line prospective")
+            .expect("delimiter-safe proof");
+        let exact_work = haystack
+            .len()
+            .checked_add(prospective.transitions_upper_bound)
+            .and_then(|work| work.checked_add(prospective.match_events_upper_bound))
+            .expect("exact prefilter work");
+        let exact_sequential = haystack.len().checked_mul(2).expect("exact sequential");
+        let exact = RunLimits {
+            fre_aggregate_operation_work: exact_work,
+            fre_aggregate_sequential_bytes: exact_sequential,
+            ..defaults.clone()
+        };
+        let mut exact_session =
+            current_fre_rebar_grep_session_with_limits(&regex, haystack.len(), &exact)
+                .expect("exact session");
+        assert!(exact_session.uses_required_literal_prefilter());
+        assert_eq!(exact_session.execute(haystack).expect("exact operation"), 2);
+
+        let one_below = RunLimits {
+            fre_aggregate_operation_work: exact_work - 1,
+            ..exact
+        };
+        let mut refused =
+            current_fre_rebar_grep_session_with_limits(&regex, haystack.len(), &one_below)
+                .expect("one-below construction");
+        assert!(refused.has_required_literal_prefilter());
+        assert!(!refused.uses_required_literal_prefilter());
+        assert_eq!(refused.execute(haystack).expect("one-below fallback"), 2);
+
+        const DELIMITER: &str = r"(?:AB\r.*Z|XY.+Q)";
+        let delimiter_regex = current_fre_rebar_portable_builder(DELIMITER, false, false)
+            .expect("delimiter builder")
+            .build()
+            .expect("delimiter K0");
+        assert_eq!(delimiter_regex.build_report().plan, PlanKind::K0);
+        let delimiter_source = b"AB\r\nZ\nXYxQ";
+        let expected = delimiter_source
+            .lines()
+            .map(|line| {
+                delimiter_regex
+                    .is_match_value(line, current_fre_rebar_search_limits())
+                    .expect("delimiter line reference")
+            })
+            .filter(|matched| *matched)
+            .count();
+        let mut delimiter_session =
+            current_fre_rebar_grep_session(&delimiter_regex, delimiter_source.len())
+                .expect("delimiter-sensitive session");
+        assert!(delimiter_session.has_required_literal_prefilter());
+        assert!(!delimiter_session.uses_required_literal_prefilter());
+        assert_eq!(
+            delimiter_session
+                .execute(delimiter_source)
+                .expect("delimiter fallback"),
+            u64::try_from(expected).expect("delimiter line count")
         );
     }
 

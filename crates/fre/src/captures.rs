@@ -1993,6 +1993,60 @@ impl CaptureBuilder {
         self
     }
 
+    /// Build only the conservative required-literal sidecar.
+    ///
+    /// This performs the same pinned parse and bounded any-required-literal
+    /// proof used by [`Self::build`], but it does not lower or allocate the
+    /// capture selector, tagged-history program, or capture-operation seals.
+    /// `Ok(None)` means either that no sound effective literal antichain
+    /// exists or that the optional sidecar refused a caller resource limit;
+    /// the caller may select its already-built semantic authority before
+    /// source access. Arithmetic and invariant failures remain terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a syntax error for an invalid pattern, or a terminal
+    /// required-literal/invariant failure. Optional construction-resource
+    /// refusals are reported as `Ok(None)`.
+    pub fn build_required_literal_plan(
+        self,
+    ) -> Result<Option<CaptureRequiredLiteralPlan>, CaptureBuildError> {
+        let limits = self.limits;
+        let Some(mut required_limits) = limits.required_literal else {
+            return Ok(None);
+        };
+        let profile = CompatibilityProfile::RustBytes(self.profile);
+        let parsed = fre_syntax::parse(
+            fre_syntax::ParseRequest::rust(self.pattern, profile)
+                .with_admission(limits.admission)
+                .with_safety_envelope(limits.syntax_safety),
+        )
+        .map_err(CaptureBuildError::Syntax)?;
+        let syntax_key = Arc::new(parsed.key);
+        let syntax = parsed.summary;
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            return Err(CaptureBuildError::InternalInvariant(
+                "Rust byte request produced non-Rust syntax",
+            ));
+        };
+        let explicit_captures = usize::try_from(syntax.captures).map_err(|_| {
+            CaptureBuildError::InternalInvariant("syntax capture count does not fit usize")
+        })?;
+        if explicit_captures != rust.hir.properties().explicit_captures_len() {
+            return Err(CaptureBuildError::InternalInvariant(
+                "syntax capture count differs from HIR properties",
+            ));
+        }
+        required_limits.max_planner_work =
+            required_limits.max_planner_work.min(limits.max_hir_work);
+        required_limits.max_hir_depth = required_limits.max_hir_depth.min(limits.max_hir_depth);
+        match capture_required_literal::build_from_hir(&rust.hir, syntax_key, required_limits) {
+            Ok(outcome) => Ok(outcome.plan),
+            Err(failure) if optional_required_literal_refusal(&failure.source) => Ok(None),
+            Err(failure) => Err(CaptureBuildError::RequiredLiteral(failure.source)),
+        }
+    }
+
     /// Compile a capture-participation reducer for non-empty matches.
     #[allow(
         clippy::too_many_lines,
