@@ -15797,141 +15797,249 @@ impl AggregatePlan {
         Ok(AggregateSpanSumExecution::Continuation { admitted, value })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the exhaustive scalar dispatch avoids the large audited enum while keeping fixed/residual P/A checks in one audit boundary"
-    )]
+    // Keep the receipt-heavy fixed/residual path out of the scalar dispatcher.
+    // Its large attempt and accounting values otherwise determine the stack
+    // frame paid by every count-value plan, including small direct plans.
+    #[inline(never)]
+    fn execute_fixed_absolute_count_value(
+        &self,
+        engine: &AggregateFixedAbsoluteDomainEngine,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let guard = engine
+            .guard
+            .count(haystack, limits.fixed_absolute)
+            .map_err(|source| {
+                self.fixed_execution_error(
+                    limits,
+                    AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                )
+            })?;
+        match guard.outcome {
+            FixedAbsoluteDomainCountOutcome::Complete { count } => Ok(count),
+            FixedAbsoluteDomainCountOutcome::PrepublishedContinuation => {
+                let residual = engine.residual.as_ref().ok_or_else(|| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed-domain value branch lacks its eager residual",
+                        ),
+                    )
+                })?;
+                let strategy = self.report.continuation_strategy.ok_or_else(|| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed-domain value branch lacks its strategy",
+                        ),
+                    )
+                })?;
+                let persistent_bytes = self.fixed_residual_persistent_bytes(limits)?;
+                let residual_allocation_limit = limits
+                    .fixed_absolute_residual
+                    .max_allocations
+                    .saturating_sub(guard.accounting.prospective.allocations);
+                let mut published_prospective = None;
+                let result = residual.count_value_with_receipt_observer(
+                    haystack,
+                    Self::full_range(haystack),
+                    strategy,
+                    limits.continuation,
+                    residual_allocation_limit,
+                    |continuation| {
+                        let prospective = compose_fixed_residual_prospective(
+                            guard.accounting.prospective,
+                            continuation,
+                            persistent_bytes,
+                        )?;
+                        published_prospective = Some(prospective);
+                        enforce_fixed_residual_prospective(prospective, limits)
+                    },
+                );
+                let attempt = match result {
+                    Ok(attempt) => attempt,
+                    Err(continuation) => {
+                        let Some(prospective) = published_prospective else {
+                            return Err(self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed residual value failed before publishing composite P",
+                                ),
+                            ));
+                        };
+                        let composite = fixed_residual_composite(
+                            guard.accounting,
+                            &continuation.receipt,
+                            prospective,
+                            persistent_bytes,
+                        )
+                        .map_err(|_| {
+                            self.execution_error(
+                                limits,
+                                AggregateExecutionSource::InternalInvariant(
+                                    "fixed residual value failure composite overflowed",
+                                ),
+                            )
+                        })?;
+                        return Err(self.fixed_execution_error(
+                            limits,
+                            AggregateFixedAbsoluteDomainAttemptFailure::Residual {
+                                continuation,
+                                composite,
+                            },
+                        ));
+                    }
+                };
+                let prospective = published_prospective.ok_or_else(|| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed residual value succeeded without publishing composite P",
+                        ),
+                    )
+                })?;
+                let composite = fixed_residual_composite(
+                    guard.accounting,
+                    &attempt.receipt,
+                    prospective,
+                    persistent_bytes,
+                )
+                .map_err(|_| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed residual value success composite overflowed",
+                        ),
+                    )
+                })?;
+                if !composite.contains_success_actual_with(&attempt.receipt) {
+                    return Err(self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed residual value success escaped its composite P",
+                        ),
+                    ));
+                }
+                u64::try_from(attempt.value).map_err(|_| {
+                    self.execution_error(
+                        limits,
+                        AggregateExecutionSource::InternalInvariant(
+                            "fixed-domain residual count does not fit u64",
+                        ),
+                    )
+                })
+            }
+        }
+    }
+
+    // As above, keep the large continuation attempt and error receipts local
+    // to plans that actually execute the continuation engine.
+    #[inline(never)]
+    fn execute_continuation_count_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation count plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = engine
+            .count_value_attempt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
+            )
+        })
+    }
+
+    #[inline(never)]
+    fn execute_unicode_scalar_count_value(
+        &self,
+        engine: &UnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .count(haystack, limits.unicode_scalar)
+            .map(|result| result.count)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
+    #[inline(never)]
+    fn execute_dispatched_unicode_scalar_count_value(
+        &self,
+        engine: &DispatchedUnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .count(haystack, limits.unicode_scalar)
+            .map(|result| result.count)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
+    // Keep the entry dispatcher as a small route selector. In particular,
+    // direct Unicode count plans should not inherit stack probes or code
+    // placement from receipt-heavy fallback routes.
+    #[inline(never)]
     fn execute_count_value(
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        if let AggregateEngine::FixedAbsoluteDomain(engine) = &self.engine {
-            let guard = engine
-                .guard
-                .count(haystack, limits.fixed_absolute)
-                .map_err(|source| {
-                    self.fixed_execution_error(
-                        limits,
-                        AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
-                    )
-                })?;
-            return match guard.outcome {
-                FixedAbsoluteDomainCountOutcome::Complete { count } => Ok(count),
-                FixedAbsoluteDomainCountOutcome::PrepublishedContinuation => {
-                    let residual = engine.residual.as_ref().ok_or_else(|| {
-                        self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed-domain value branch lacks its eager residual",
-                            ),
-                        )
-                    })?;
-                    let strategy = self.report.continuation_strategy.ok_or_else(|| {
-                        self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed-domain value branch lacks its strategy",
-                            ),
-                        )
-                    })?;
-                    let persistent_bytes = self.fixed_residual_persistent_bytes(limits)?;
-                    let residual_allocation_limit = limits
-                        .fixed_absolute_residual
-                        .max_allocations
-                        .saturating_sub(guard.accounting.prospective.allocations);
-                    let mut published_prospective = None;
-                    let result = residual.count_value_with_receipt_observer(
-                        haystack,
-                        Self::full_range(haystack),
-                        strategy,
-                        limits.continuation,
-                        residual_allocation_limit,
-                        |continuation| {
-                            let prospective = compose_fixed_residual_prospective(
-                                guard.accounting.prospective,
-                                continuation,
-                                persistent_bytes,
-                            )?;
-                            published_prospective = Some(prospective);
-                            enforce_fixed_residual_prospective(prospective, limits)
-                        },
-                    );
-                    let attempt = match result {
-                        Ok(attempt) => attempt,
-                        Err(continuation) => {
-                            let Some(prospective) = published_prospective else {
-                                return Err(self.execution_error(
-                                    limits,
-                                    AggregateExecutionSource::InternalInvariant(
-                                        "fixed residual value failed before publishing composite P",
-                                    ),
-                                ));
-                            };
-                            let composite = fixed_residual_composite(
-                                guard.accounting,
-                                &continuation.receipt,
-                                prospective,
-                                persistent_bytes,
-                            )
-                            .map_err(|_| {
-                                self.execution_error(
-                                    limits,
-                                    AggregateExecutionSource::InternalInvariant(
-                                        "fixed residual value failure composite overflowed",
-                                    ),
-                                )
-                            })?;
-                            return Err(self.fixed_execution_error(
-                                limits,
-                                AggregateFixedAbsoluteDomainAttemptFailure::Residual {
-                                    continuation,
-                                    composite,
-                                },
-                            ));
-                        }
-                    };
-                    let prospective = published_prospective.ok_or_else(|| {
-                        self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed residual value succeeded without publishing composite P",
-                            ),
-                        )
-                    })?;
-                    let composite = fixed_residual_composite(
-                        guard.accounting,
-                        &attempt.receipt,
-                        prospective,
-                        persistent_bytes,
-                    )
-                    .map_err(|_| {
-                        self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed residual value success composite overflowed",
-                            ),
-                        )
-                    })?;
-                    if !composite.contains_success_actual_with(&attempt.receipt) {
-                        return Err(self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed residual value success escaped its composite P",
-                            ),
-                        ));
-                    }
-                    u64::try_from(attempt.value).map_err(|_| {
-                        self.execution_error(
-                            limits,
-                            AggregateExecutionSource::InternalInvariant(
-                                "fixed-domain residual count does not fit u64",
-                            ),
-                        )
-                    })
-                }
-            };
+        match &self.engine {
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                self.execute_fixed_absolute_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::UnicodeScalar(engine) => {
+                self.execute_unicode_scalar_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                self.execute_dispatched_unicode_scalar_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::Continuation(engine) => {
+                self.execute_continuation_count_value(engine, haystack, limits)
+            }
+            _ => self.execute_count_value_fallback(haystack, limits),
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive scalar dispatch avoids constructing the large audited result enum"
+    )]
+    #[inline(never)]
+    fn execute_count_value_fallback(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
                 match engine.count_attempt(haystack, limits.exact_literal) {
@@ -15953,26 +16061,12 @@ impl AggregatePlan {
                     }
                 }
             }
-            AggregateEngine::UnicodeScalar(engine) => engine
-                .count(haystack, limits.unicode_scalar)
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::UnicodeScalar(source),
-                    )
-                }),
-            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
-                .count(haystack, limits.unicode_scalar)
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::UnicodeScalar(source),
-                    )
-                }),
+            AggregateEngine::UnicodeScalar(engine) => {
+                self.execute_unicode_scalar_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                self.execute_dispatched_unicode_scalar_count_value(engine, haystack, limits)
+            }
             AggregateEngine::WordRun(engine) => engine
                 .aggregate_count(haystack, limits.word_run)
                 .map(|result| result.count)
@@ -16113,12 +16207,9 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedContext(source),
                     )
                 }),
-            AggregateEngine::FixedAbsoluteDomain(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "fixed-domain count value route escaped its specialized branch",
-                ),
-            )),
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                self.execute_fixed_absolute_count_value(engine, haystack, limits)
+            }
             AggregateEngine::PackedFiniteCount(engine) => engine
                 .count(haystack, packed_finite_reduce_limits(limits.finite_literal))
                 .map(|result| result.count)
@@ -16207,31 +16298,7 @@ impl AggregatePlan {
                     )
                 }),
             AggregateEngine::Continuation(engine) => {
-                let strategy = self.report.continuation_strategy.ok_or_else(|| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation count plan lacks storage strategy",
-                        ),
-                    )
-                })?;
-                let attempt = engine
-                    .count_value_attempt(
-                        haystack,
-                        Self::full_range(haystack),
-                        strategy,
-                        limits.continuation,
-                    )
-                    .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-                match u64::try_from(attempt.value) {
-                    Ok(value) => Ok(value),
-                    Err(_) => Err(self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation count does not fit u64",
-                        ),
-                    )),
-                }
+                self.execute_continuation_count_value(engine, haystack, limits)
             }
         }
     }

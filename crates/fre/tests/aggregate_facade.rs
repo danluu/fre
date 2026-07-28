@@ -1914,6 +1914,33 @@ fn unicode_singleton_case_folds_use_byte_stable_finite_dfa() {
 }
 
 #[test]
+fn unicode_scalar_count_value_matches_audited_count_for_short_input() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-count-value-short-input".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let regex = aggregate_builder(r"\pL").build_count().unwrap();
+            let haystack = "Δ".as_bytes();
+            assert_eq!(
+                regex.build_report().plan,
+                AggregatePlanKind::UnicodeScalarClass
+            );
+            assert_eq!(
+                regex
+                    .count_value(haystack, AggregateRunLimits::default())
+                    .unwrap(),
+                regex
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap()
+                    .value()
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify() {
     let cases: [(&str, &[u8], bool); 8] = [
         (".", b"a\n\xFF\xE9\x9B\xAA\x80", false),
