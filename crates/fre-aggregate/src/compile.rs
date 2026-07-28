@@ -1541,17 +1541,12 @@ fn build_state_byte_span_sum_plan(
     budget.charge(1)?;
     let mut proof = None;
     let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
-    if parts.len() == 3
-        && let Some((first_min, first)) = state_byte_unbounded_class(&parts[0], budget)?
-        && let Some(literal) = state_byte_literal(&parts[1], budget)?
+    if let Some((first, literal, second)) = state_byte_greedy_prefix_literal_suffix(parts, budget)?
         && !literal.is_empty()
         && literal.len() <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
-        && let Some((second_min, second)) = state_byte_unbounded_class(&parts[2], budget)?
     {
         budget.charge(add(literal.len(), 4, Resource::CompileWork)?)?;
-        if first_min == 0
-            && second_min == 0
-            && literal.iter().copied().all(|byte| first.contains(byte))
+        if literal.iter().copied().all(|byte| first.contains(byte))
             && first
                 .0
                 .iter()
@@ -1678,6 +1673,52 @@ fn build_state_byte_span_sum_plan(
             "state-byte SpanSum build work underflow",
         ))?;
     Ok(Some(plan))
+}
+
+/// Recognize `C* ... C* L D*`, where there is at least one `C*` and every
+/// adjacent prefix repetition has the same byte language.
+///
+/// Repeating an identical greedy star does not change whole-match spans once
+/// captures are erased: `C*C*` and `C*` select the same leftmost start and
+/// the same endpoint around the required literal. Accepting the normalized
+/// shape here avoids sending generated or defensive regexes with redundant
+/// stars through the general continuation interpreter.
+type StateByteGreedyPrefixLiteralSuffix<'a> = (ByteSet, &'a [u8], ByteSet);
+
+fn state_byte_greedy_prefix_literal_suffix<'a>(
+    parts: &'a [Hir],
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteGreedyPrefixLiteralSuffix<'a>>, Error> {
+    if parts.len() < 3 {
+        return Ok(None);
+    }
+    let literal_index = parts.len().checked_sub(2).ok_or(Error::InternalInvariant(
+        "state-byte prefix/literal/suffix shape underflow",
+    ))?;
+    let suffix_index = literal_index
+        .checked_add(1)
+        .ok_or(Error::InternalInvariant("state-byte suffix index overflow"))?;
+    let Some(literal) = state_byte_literal(&parts[literal_index], budget)? else {
+        return Ok(None);
+    };
+    let Some((0, suffix)) = state_byte_unbounded_class(&parts[suffix_index], budget)? else {
+        return Ok(None);
+    };
+    let mut prefix: Option<ByteSet> = None;
+    for part in &parts[..literal_index] {
+        let Some((0, candidate)) = state_byte_unbounded_class(part, budget)? else {
+            return Ok(None);
+        };
+        if let Some(expected) = prefix {
+            budget.charge(expected.0.len())?;
+            if candidate != expected {
+                return Ok(None);
+            }
+        } else {
+            prefix = Some(candidate);
+        }
+    }
+    Ok(prefix.map(|prefix| (prefix, literal, suffix)))
 }
 
 fn state_byte_literal_anchor_offset(

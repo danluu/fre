@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::accounting::ExecutionAccounting;
 use crate::candidate;
 use crate::compile::{
-    CompiledRegex, PlanId, RequiredSuffixes, StateByteSpanSumPlan, StateByteSpanSumTopology,
-    TerminalFrontierSeed,
+    CompiledRegex, PlanId, RequiredLiteralSets, RequiredSuffixes, StateByteSpanSumPlan,
+    StateByteSpanSumTopology, TerminalFrontierSeed,
 };
 use crate::error::{add, enforce, mul};
 use crate::program::{
@@ -278,12 +278,12 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 1;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 2;
 
 /// Version of the continuation prospective/actual accounting schema.
-pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 5;
+pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 6;
 
-/// Maximum allocation count representable by every route in accounting v5.
+/// Maximum allocation count representable by every route in accounting v6.
 ///
 /// Terminal-frontier execution owns at most eight nonempty operation-local
 /// buffers; a receipt-bearing Spans result can add one exact output buffer.
@@ -798,7 +798,7 @@ impl OperationCounterValue {
 /// attempt.
 ///
 /// Fields that are not present in the capture-free continuation executor are
-/// explicitly zero rather than omitted. In particular, accounting v5 has no
+/// explicitly zero rather than omitted. In particular, accounting v6 has no
 /// DFA cache, line-domain, persistent-history, or reusable-scratch-clear
 /// facility. This makes a zero an auditable statement about the selected
 /// implementation rather than an absent measurement.
@@ -870,7 +870,7 @@ impl OperationStructuralCounters {
 /// created only after that receipt has authenticated a successful terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v5.
+    /// Schema for the structural projection, independent from accounting v6.
     pub schema_version: u8,
     /// Sealed route, invocation, prospective bounds, and actual accounting.
     pub attempt: OperationAttemptReceipt,
@@ -959,7 +959,7 @@ fn attempt_counter_components_close(
 /// operation already produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationHotCounterReceipt {
-    /// Schema for the structural projection, independent from accounting v5.
+    /// Schema for the structural projection, independent from accounting v6.
     pub schema_version: u8,
     /// Exact route certificate emitted by the ordinary value-only operation.
     pub certificate: OperationCertificate,
@@ -2734,7 +2734,7 @@ impl CompiledRegex {
             && strategy == Strategy::ReverseSequentialRows
             && !self.required_literals.is_empty();
         let required_literal_scan = if required_literal_scan_enabled {
-            RequiredLiteralScan::prospective(local.len(), self.required_literals.len())?
+            RequiredLiteralScan::prospective(local.len(), self.required_literals)?
         } else {
             RequiredLiteralScan::default()
         };
@@ -4038,6 +4038,95 @@ fn reduce_greedy_prefix_literal_suffix(
     work_limit: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(usize, usize), Error> {
+    // On short inputs the scalar pass avoids constructing a substring
+    // searcher. Larger inputs use the mandatory literal as the source
+    // iterator, then visit only the adjacent proved class runs. This keeps
+    // cold-start work in the measured operation while letting the native
+    // memchr/memmem implementation skip non-candidates in vector-width
+    // chunks.
+    if haystack.len() >= 256 {
+        return reduce_greedy_prefix_literal_suffix_anchored(
+            plan, haystack, work_limit, accounting,
+        );
+    }
+    reduce_greedy_prefix_literal_suffix_scalar(plan, haystack, work_limit, accounting)
+}
+
+fn reduce_greedy_prefix_literal_suffix_anchored(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
+    let prefix = plan.first();
+    let suffix = plan.second();
+    let literal = plan.literal();
+    let mut cursor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while cursor < haystack.len() {
+        let Some(literal_start) =
+            state_byte_find_literal(literal, haystack, cursor, work_limit, accounting)?
+        else {
+            break;
+        };
+        let literal_end = add(literal_start, literal.len(), Resource::Boundaries)?;
+
+        let mut start = literal_start;
+        while start > cursor {
+            let previous = start.checked_sub(1).ok_or(Error::InternalInvariant(
+                "positive state-byte prefix cursor lost its predecessor",
+            ))?;
+            if !state_byte_classify(
+                prefix,
+                haystack,
+                previous,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+            {
+                break;
+            }
+            start = previous;
+        }
+
+        let mut end = literal_end;
+        while end < haystack.len()
+            && state_byte_classify(
+                suffix,
+                haystack,
+                end,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+        {
+            end = add(end, 1, Resource::Boundaries)?;
+        }
+
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            end.checked_sub(start).ok_or(Error::InternalInvariant(
+                "state-byte anchored reducer selected a reversed span",
+            ))?,
+            Resource::SpanSum,
+        )?;
+        cursor = end;
+    }
+    Ok((matches, span_sum))
+}
+
+fn reduce_greedy_prefix_literal_suffix_scalar(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<(usize, usize), Error> {
     let prefix = plan.first();
     let suffix = plan.second();
     let literal = plan.literal();
@@ -4542,6 +4631,48 @@ fn state_byte_find_anchor(
         ));
     }
     Ok(None)
+}
+
+fn state_byte_find_literal(
+    literal: &[u8],
+    haystack: &[u8],
+    start: usize,
+    work_limit: usize,
+    accounting: &mut ExecutionAccounting,
+) -> Result<Option<usize>, Error> {
+    let [anchor] = literal else {
+        let remaining = haystack.get(start..).ok_or(Error::InternalInvariant(
+            "state-byte literal search start exceeds admitted source",
+        ))?;
+        let available_work = work_limit.saturating_sub(accounting.work);
+        let admitted_len = remaining.len().min(available_work);
+        let admitted = &remaining[..admitted_len];
+        let relative = memchr::memmem::find(admitted, literal);
+        let scanned = match relative {
+            Some(offset) => add(offset, literal.len(), Resource::SequentialBytes)?,
+            None => admitted_len,
+        };
+        accounting.sequential_bytes_read = add(
+            accounting.sequential_bytes_read,
+            scanned,
+            Resource::SequentialBytes,
+        )?;
+        accounting.root_probes = add(accounting.root_probes, scanned, Resource::ExecutionWork)?;
+        accounting.work = add(accounting.work, scanned, Resource::ExecutionWork)?;
+        enforce(accounting.work, work_limit, Resource::ExecutionWork)?;
+        if let Some(relative) = relative {
+            return add(start, relative, Resource::Boundaries).map(Some);
+        }
+        if admitted_len < remaining.len() {
+            let required = add(accounting.work, 1, Resource::ExecutionWork)?;
+            enforce(required, work_limit, Resource::ExecutionWork)?;
+            return Err(Error::InternalInvariant(
+                "state-byte literal work refusal unexpectedly admitted progress",
+            ));
+        }
+        return Ok(None);
+    };
+    state_byte_find_anchor(*anchor, haystack, start, work_limit, accounting)
 }
 
 fn state_byte_literal_matches_at(
@@ -5315,10 +5446,17 @@ struct RequiredLiteralScan {
 }
 
 impl RequiredLiteralScan {
-    fn prospective(source_bytes: usize, sets: usize) -> Result<Self, Error> {
+    fn prospective(source_bytes: usize, sets: RequiredLiteralSets) -> Result<Self, Error> {
+        let set_count = sets.len();
+        let small_services = sets.iter().all(|set| (1..=3).contains(&set.count_ones()));
+        let service_bytes = if small_services {
+            mul(source_bytes, set_count, Resource::SequentialBytes)?
+        } else {
+            source_bytes
+        };
         Ok(Self {
-            source_bytes,
-            comparisons: mul(source_bytes, sets, Resource::ExecutionWork)?,
+            source_bytes: service_bytes,
+            comparisons: mul(source_bytes, set_count, Resource::ExecutionWork)?,
             all_present: false,
         })
     }
@@ -5340,6 +5478,31 @@ fn scan_required_literals(
             ..RequiredLiteralScan::default()
         });
     }
+    if compiled
+        .required_literals
+        .iter()
+        .all(|set| (1..=3).contains(&set.count_ones()))
+    {
+        let mut source_bytes = 0_usize;
+        let mut comparisons = 0_usize;
+        let mut all_present = true;
+        for set in compiled.required_literals.iter() {
+            let (present, scanned) = scan_small_required_literal_set(set, haystack)?;
+            source_bytes = add(source_bytes, scanned, Resource::SequentialBytes)?;
+            comparisons = add(comparisons, scanned, Resource::ExecutionWork)?;
+            if !present {
+                all_present = false;
+                break;
+            }
+        }
+        let observed = RequiredLiteralScan {
+            source_bytes,
+            comparisons,
+            all_present,
+        };
+        record_required_literal_scan(accounting, observed)?;
+        return Ok(observed);
+    }
     let all_seen = (1_u8 << set_count).wrapping_sub(1);
     let mut seen = 0_u8;
     let mut source_bytes = 0_usize;
@@ -5356,28 +5519,68 @@ fn scan_required_literals(
             break;
         }
     }
-    let work = add(source_bytes, comparisons, Resource::ExecutionWork)?;
+    let observed = RequiredLiteralScan {
+        source_bytes,
+        comparisons,
+        all_present: seen == all_seen,
+    };
+    record_required_literal_scan(accounting, observed)?;
+    Ok(observed)
+}
+
+fn scan_small_required_literal_set(set: u128, haystack: &[u8]) -> Result<(bool, usize), Error> {
+    let mut remaining = set;
+    let mut bytes = [0_u8; 3];
+    let mut len = 0_usize;
+    while remaining != 0 {
+        let byte = u8::try_from(remaining.trailing_zeros())
+            .map_err(|_| Error::InternalInvariant("ASCII required literal exceeds one byte"))?;
+        let slot = bytes.get_mut(len).ok_or(Error::InternalInvariant(
+            "small required-literal set exceeded three bytes",
+        ))?;
+        *slot = byte;
+        len = add(len, 1, Resource::ExecutionWork)?;
+        remaining &= remaining.saturating_sub(1);
+    }
+    let position = match bytes[..len] {
+        [first] => memchr::memchr(first, haystack),
+        [first, second] => memchr::memchr2(first, second, haystack),
+        [first, second, third] => memchr::memchr3(first, second, third, haystack),
+        _ => {
+            return Err(Error::InternalInvariant(
+                "small required-literal set is empty or oversized",
+            ));
+        }
+    };
+    let scanned = match position {
+        Some(position) => add(position, 1, Resource::SequentialBytes)?,
+        None => haystack.len(),
+    };
+    Ok((position.is_some(), scanned))
+}
+
+fn record_required_literal_scan(
+    accounting: &mut ExecutionAccounting,
+    observed: RequiredLiteralScan,
+) -> Result<(), Error> {
+    let work = observed.work()?;
     accounting.required_literal_source_bytes = add(
         accounting.required_literal_source_bytes,
-        source_bytes,
+        observed.source_bytes,
         Resource::ExecutionWork,
     )?;
     accounting.required_literal_comparisons = add(
         accounting.required_literal_comparisons,
-        comparisons,
+        observed.comparisons,
         Resource::ExecutionWork,
     )?;
     accounting.sequential_bytes_read = add(
         accounting.sequential_bytes_read,
-        source_bytes,
+        observed.source_bytes,
         Resource::SequentialBytes,
     )?;
     accounting.work = add(accounting.work, work, Resource::ExecutionWork)?;
-    Ok(RequiredLiteralScan {
-        source_bytes,
-        comparisons,
-        all_present: seen == all_seen,
-    })
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9749,11 +9952,12 @@ mod tests {
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
         OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
-        Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumTopology, UNCACHED_FRONTIER,
-        allocation_fault, cached_boundary_symbol, cached_compute_row, cached_frontier_words,
-        cached_program_assertion_mask, compact_operation_allocation_count, decode,
-        dense_reduction_work_floor, encoded_width, exact_filled, fixed_continuation_beats_dense,
-        operation_identity, read_encoded, write_encoded,
+        RequiredLiteralScan, Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumPlan,
+        StateByteSpanSumTopology, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol,
+        cached_compute_row, cached_frontier_words, cached_program_assertion_mask,
+        compact_operation_allocation_count, decode, dense_reduction_work_floor, encoded_width,
+        exact_filled, fixed_continuation_beats_dense, operation_identity, read_encoded,
+        scan_required_literals, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -10342,6 +10546,63 @@ mod tests {
                     .authenticates_source(&sequential_one_below.source)
             );
         }
+    }
+
+    #[test]
+    fn small_required_literal_sets_use_bounded_native_services() {
+        let pattern = r"(.*?,){13}z";
+        let compiled = required_literal_regex(pattern);
+        assert_eq!(compiled.required_literals.len(), 2);
+        assert!(compiled.required_literals.iter().all(u128::is_power_of_two));
+        let haystack = b"a,".repeat(2048);
+        let prospective =
+            RequiredLiteralScan::prospective(haystack.len(), compiled.required_literals).unwrap();
+        assert_eq!(
+            prospective.source_bytes,
+            haystack.len().checked_mul(2).unwrap()
+        );
+        assert_eq!(prospective.comparisons, prospective.source_bytes);
+
+        let mut accounting = ExecutionAccounting::default();
+        let observed = scan_required_literals(&compiled, &haystack, &mut accounting).unwrap();
+        assert!(!observed.all_present);
+        assert_eq!(observed.source_bytes, haystack.len() + 2);
+        assert_eq!(observed.comparisons, observed.source_bytes);
+        assert_eq!(
+            accounting.required_literal_source_bytes,
+            observed.source_bytes
+        );
+        assert_eq!(
+            accounting.required_literal_comparisons,
+            observed.comparisons
+        );
+        assert_eq!(accounting.sequential_bytes_read, observed.source_bytes);
+        assert_eq!(accounting.work, observed.work().unwrap());
+        assert!(prospective.source_bytes >= observed.source_bytes);
+        assert!(prospective.comparisons >= observed.comparisons);
+
+        let admitted = compiled
+            .span_sum_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(admitted.value, 0);
+        assert_eq!(admitted.receipt.actual.state_evaluations, 0);
+        assert_eq!(
+            admitted.receipt.actual.required_literal_source_bytes,
+            observed.source_bytes
+        );
+        assert!(admitted.receipt.authenticates_success());
+        assert!(
+            admitted
+                .receipt
+                .prospective
+                .unwrap()
+                .contains(admitted.receipt.actual)
+        );
     }
 
     #[test]
@@ -11109,7 +11370,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v5_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
+    fn accounting_v6_terminal_frontier_reaches_nine_p_and_retains_smaller_no_match_a() {
         let compiled = terminal_frontier_count();
         let haystack = b"no terminal prefix here";
         let limits = OperationLimits::default();
@@ -11211,7 +11472,7 @@ mod tests {
     }
 
     #[test]
-    fn accounting_v5_allocation_encoding_is_checked_at_its_route_maximum() {
+    fn accounting_v6_allocation_encoding_is_checked_at_its_route_maximum() {
         for allocations in 0..=usize::from(CONTINUATION_OPERATION_MAX_ALLOCATIONS) {
             assert_eq!(
                 compact_operation_allocation_count(allocations).unwrap(),
@@ -14532,6 +14793,73 @@ mod tests {
                 "{pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn state_byte_redundant_stars_and_large_literal_anchor_match_upstream() {
+        for pattern in [r".*.*=.*", r"[ -~]*[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ.*"] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::GreedyPrefixLiteralSuffix),
+                "{pattern:?}"
+            );
+            for length in [255_usize, 256, 4096] {
+                let mut haystack = vec![b'x'; length];
+                if pattern == r".*.*=.*" {
+                    haystack[length / 3] = b'=';
+                    haystack[(length * 2) / 3] = b'\n';
+                    haystack[length - 2] = b'=';
+                } else {
+                    let literal = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                    let offset = length / 2;
+                    haystack[offset..offset + literal.len()].copy_from_slice(literal);
+                    haystack[offset - 3] = b'\t';
+                    haystack[length - 2] = b'\n';
+                }
+                let sum = compiled
+                    .span_sum_value_with_receipt(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap_or_else(|error| panic!("{pattern:?}, {length}: {error:?}"));
+                assert_eq!(
+                    sum.value,
+                    upstream_span_sum(pattern, &haystack),
+                    "{pattern:?}, {length}"
+                );
+                assert_eq!(
+                    sum.receipt.identity.physical_route,
+                    Some(OperationPhysicalRoute::StateByteSpanSum)
+                );
+                assert!(sum.receipt.authenticates_success());
+                let count = compiled
+                    .count_value_attempt(
+                        &haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits {
+                            max_span_sum: 0,
+                            ..OperationLimits::default()
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("{pattern:?}, {length}: {error:?}"));
+                assert_eq!(
+                    count.value,
+                    upstream_count(pattern, &haystack),
+                    "{pattern:?}, {length}"
+                );
+                assert!(count.receipt.authenticates_success());
+            }
+        }
+
+        let near_miss = state_byte_span_sum_fixture(r"[ab]*[bc]*a[abc]*");
+        assert!(near_miss.state_byte_span_sum.is_none());
     }
 
     #[test]
