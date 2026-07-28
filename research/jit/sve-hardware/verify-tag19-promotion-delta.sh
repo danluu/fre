@@ -200,7 +200,7 @@ FACADE_SCENARIOS = ("absent", "late", "homogeneous", "near-miss")
 FACADE_STAGES = ("build", "search", "cold", "full")
 CANDIDATE_ATOM_BLOB = "44609addd5e2ada9bd003614352bda0bdc5c2316"
 ABI2_SOURCE_CLOSURE_SHA256 = (
-    "4cce1ac0b5a87c04dcc1268344f8d13db0e205bcf168ed9a1b9cf6d1431793fd"
+    "274c7a6afa4d5db214e65a0211b43176ebcd8906ab0a773cf3fedd242ef02b17"
 )
 MAX_GIT_OUTPUT = 4 * 1024 * 1024
 MAX_ENTRIES = 16_384
@@ -229,6 +229,14 @@ ABI2_SOURCE_PATHS = (
     "crates/fre-jit-aarch64/src/lib.rs",
     "crates/fre-jit-aarch64/src/search_template.rs",
     "crates/fre-jit-aarch64/src/selected_end_v2.rs",
+    "crates/fre-jit-aarch64/src/tests_selected_end_v2.rs",
+    "crates/fre-jit-cache/Cargo.toml",
+    "crates/fre-jit-cache/src/cache.rs",
+    "crates/fre-jit-cache/src/error.rs",
+    "crates/fre-jit-cache/src/lib.rs",
+    "crates/fre-jit-cache/src/policy.rs",
+    "crates/fre-jit-cache/src/stats.rs",
+    "crates/fre-jit-cache/src/tests.rs",
     "crates/fre-jit-runtime/Cargo.toml",
     "crates/fre-jit-runtime/examples/tag19_selected_end_register_v2_qualification.rs",
     "crates/fre-jit-runtime/src/error.rs",
@@ -1500,6 +1508,7 @@ def reject_source_marker(
 def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     abi = "crates/fre-jit-aarch64/src/abi.rs"
     selected = "crates/fre-jit-aarch64/src/selected_end_v2.rs"
+    selected_tests = "crates/fre-jit-aarch64/src/tests_selected_end_v2.rs"
     audit = "crates/fre-jit-aarch64/src/audit.rs"
     runtime_manifest = "crates/fre-jit-runtime/Cargo.toml"
     producer = (
@@ -1509,6 +1518,9 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     platform = "crates/fre-jit-runtime/src/platform/aarch64.rs"
     linux_platform = "crates/fre-jit-runtime/src/platform/linux_aarch64.rs"
     runtime = "crates/fre-jit-runtime/src/selected_end_register_v2.rs"
+    cache_manifest = "crates/fre-jit-cache/Cargo.toml"
+    cache = "crates/fre-jit-cache/src/cache.rs"
+    cache_tests = "crates/fre-jit-cache/src/tests.rs"
     target_features = "crates/fre-target-features/src/lib.rs"
     kernels = "crates/fre-kernels/src/lib.rs"
     facade = "crates/fre/src/qualified_exact_search.rs"
@@ -1529,6 +1541,22 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
         selected,
         b"Sve16V6Tag19Vl16 => BackendVersion::SEARCH_SVE16_V6",
     )
+    for marker in (
+        b"pub const fn selected_end_register_target_v2(",
+        b"if (anchors.start || anchors.end) && literal_bytes < 16",
+        b"features: CpuFeatures::NONE",
+        b"TargetSpec::AARCH64_AAPCS64_SVE16",
+        b"TargetSpec::AARCH64_AAPCS64_SVE2_16",
+    ):
+        require_source_marker(raw_by_path, selected, marker)
+    for marker in (
+        b"selected_end_register_v2_v8_authenticates_every_exact_anchor_shape",
+        b"assert_eq!(image.anchors(), anchors);",
+        b"selected_end_register_target_v2(SelectedEndRegisterBackendV2::AsimdV8, anchors, 6)",
+        b"CpuFeatures::NONE",
+        b"CpuFeatures::ASIMD",
+    ):
+        require_source_marker(raw_by_path, selected_tests, marker)
     require_source_marker(
         raw_by_path,
         audit,
@@ -1560,7 +1588,7 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
         b"SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16",
         b"CpuFeatures::ASIMD_SVE",
         b"LiteralIdentityMismatch",
-        b"preflight.was_issued_by(plan)",
+        b"preflight.was_issued_by(literal_plan)",
         b"qualification_validated_thread_sve_vector_bytes",
         b"qualification_preserves_abi2_vector_callee_saved_lanes",
     ):
@@ -1572,6 +1600,33 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
     ):
         require_source_marker(raw_by_path, runtime_manifest, marker)
     require_source_marker(raw_by_path, kernels, b"pub fn was_issued_by(")
+    for marker in (
+        b"fre-jit-aarch64 = { path = \"../fre-jit-aarch64\" }",
+        b"fre-jit-runtime = { path = \"../fre-jit-runtime\" }",
+        b"fre-kernel-ir = { path = \"../fre-kernel-ir\" }",
+    ):
+        require_source_marker(raw_by_path, cache_manifest, marker)
+    for marker in (
+        b"pub struct SelectedEndRegisterCacheV2",
+        b"pub struct SelectedEndRegisterLeaseV2",
+        b"pub fn kernel(&self) -> &PublishedSelectedEndRegisterV2",
+        b"pub fn get_or_compile_exact_literal(",
+        b"SelectedEndRegisterCompileRequestV2::new(",
+        b"compile_selected_end_register_request_v2(request, publication_limits)",
+        b"build_exact_literal::<SelectedEnd>(",
+        b"emit_selected_end_register_v2(&program, request.backend",
+        b"publish_selected_end_register_v2(&image, publication_limits)",
+        b"drop(publication);",
+        b"state.remove_live(identity, self.token, accounting);",
+    ):
+        require_source_marker(raw_by_path, cache, marker)
+    for marker in (
+        b"tracked_drop_unmaps_before_releasing_accounting_or_waiters",
+        b"aggregate_refusal_unmaps_before_releasing_flight_or_waiters",
+        b"assert!(unmap < release);",
+        b"assert!(release < wake);",
+    ):
+        require_source_marker(raw_by_path, cache_tests, marker)
     for marker in (
         b"implementer: 0x41,",
         b"part: 0x0d84,",
@@ -1593,6 +1648,21 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
         facade,
         b"QualifiedExactSearchBackendPolicy::Sve2Fixed16\n    )",
     )
+    for marker in (
+        b"static DEFAULT_SELECTED_END_REGISTER_CACHE_V2: OnceLock<",
+        b"if publication_limits == PublicationLimits::default()",
+        b"cache.get_or_compile_exact_literal(",
+        b"QualifiedExactSearchRegisterV2Owner::Cached(lease)",
+        b"Self::Cached(lease) => lease.kernel()",
+        b"QualifiedExactSearchNativeStatus::CacheUnavailable(",
+        b"fn with_portable_plan_backend_qualification_and_cache(",
+        b"selected_end_register_cache: Option<&SelectedEndRegisterCacheV2>",
+        b"Some(cache) => Ok(cache)",
+        b"fn from_builder_with_fresh_cache_for_qualification(",
+        b"assert!(host_gate < cache_lookup);",
+        b"assert!(cache_lookup < direct_kernel_ir);",
+    ):
+        require_source_marker(raw_by_path, facade, marker)
     for marker in (
         PRODUCER_RECEIPT_SCHEMA.encode("ascii"),
         b"const RANDOM_CASES: usize = 4096;",
@@ -1616,6 +1686,16 @@ def validate_source_contract(raw_by_path: dict[str, bytes]) -> None:
         b'fs::read_to_string("/proc/thread-self/status")',
         b"sole_thread_affinity_cpu()",
         b"tag19 facade timing-thread affinity changed during measurement",
+        b"fn build_fresh_cache_facade(",
+        b"SelectedEndRegisterCacheV2::new(CacheLimits::default(), PublicationLimits::default())",
+        b"QualifiedExactSearchFacade::from_builder_with_fresh_cache_for_qualification(",
+        b"let (cache, facade) = build_fresh_cache_facade(subject, case, size);",
+        b"let (cache, cold) = build_fresh_cache_facade(subject, case, size);",
+        b"assert!(full_elapsed < full_session_scope_end);",
+        b"assert!(full_session_scope_end < full_facade_drop);",
+        b"assert!(full_facade_drop < full_cache_drop);",
+        b'assert!(build.contains("drop(cold);"));',
+        b'assert!(build.contains("drop(cache);"));',
     ):
         require_source_marker(raw_by_path, facade_producer, marker)
     for forbidden in (

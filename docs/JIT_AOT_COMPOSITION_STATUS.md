@@ -3,22 +3,29 @@
 Last updated: 2026-07-28 (America/Vancouver)
 
 This document describes implementation source sealed at
-`0bd0f5d085d01d2b21d06845af9b461d01c963d3`, tree
-`f23cebd1ca60a960978e495be7914d447e93f8ca`. Its immediately relevant
+`abc88e880167b166425c61f6fa37d191aca604f4`, tree
+`7f71ec7f5bffd69012fe86a3cccb69f13c616d4d`. Its immediately relevant
 succession is:
 
 ```text
-d8be7786  SVE tag 19 moved to SelectedEnd register ABI2
-  -> 0bd0f5d0  source-bound tag-19 ABI2 qualification producers
+db0ae3df  source-bound tag-19 ABI2 verifier baseline
+  -> bbc631ba  plan-bound ABI2 JIT session
+  -> 880c7bea  generated nominal AOT adopter
+  -> b5e29ef0  complete ABI2 pre-emission cache
+  -> 3221c17d  cache refusal-retirement ordering fix
+  -> 7bb6fadb  bounded default-policy facade cache adoption
+  -> 5c5577ec  fresh-cache facade qualification timing
+  -> abc88e88  lexically scoped timed-session retirement
 ```
 
-Protocol/docs child
-`63225a1dbf812159449cd4420386ff236f1197f7` adds a Candidate-rooted
-executable verifier and documentation, but no runtime/compiler implementation
-or dynamic evidence. Git content cannot embed the identity of its own
-containing commit; the verifier therefore authenticates the externally
-supplied exact final Candidate commit and tree at run time. Review or evidence
-from an ancestor does not authorize that composed tree.
+This verifier/docs child expands the Candidate-rooted executable verifier's
+exact source closure to include the cache crate and the facade's
+gates-before-lookup, lease-owner, and lookup-free-session boundaries. It adds
+no runtime/compiler implementation or dynamic evidence. Git content cannot
+embed the identity of its own containing commit; the verifier therefore
+authenticates the externally supplied exact final Candidate commit and tree at
+run time. Review or evidence from an ancestor does not authorize that composed
+tree.
 
 ## Compiler boundary
 
@@ -70,6 +77,15 @@ errors, publication errors retain the existing unavailable status, and
 nondefault publication limits retain the direct owned-publication path. This
 source checkpoint has not been built or benchmarked under the active admission
 fence.
+
+The tag-19 facade qualification harness keeps the process-wide cache only for
+the prebuilt hot-search subject. Every timed facade build, cold, and
+full-workload operation creates its own default-policy cache after its timer
+starts and retains that cache through facade/session use, so those stages
+cannot silently become process-cache hits. Build timing includes facade/cache
+retirement. Cold and full-workload timing captures elapsed time before
+retirement, preserving their preceding lifecycle boundary while still
+retaining compilation and session creation.
 
 When independently authorized, automatic selection prefers tag 21 on an
 admitted Arm `0x41/0xd84` ASIMD+SVE+SVE2 host, then considers tag 10, tag 19,

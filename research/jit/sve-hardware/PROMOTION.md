@@ -17,6 +17,21 @@ session requires the calling thread's SVE VL to be exactly 16 bytes.
 All four checked-in JIT qualification atoms remain `Candidate`. Source,
 producer, parser, or local test success is not qualification.
 
+For default publication limits, the facade now reaches one bounded
+process-local ABI2 pre-emission cache only after literal-width, workload,
+qualification, ABI, and host gates. The matcher retains the cache lease and
+its plan-bound session borrows the publication, so repeated timed searches do
+not perform a cache lookup, lock, or lease clone. Nondefault publication
+limits retain direct mapping ownership. The verifier's exact source closure
+includes the cache crate, facade ownership/routing source, and lifecycle
+source seals; none of that substitutes for the post-GO dynamic campaign.
+The prebuilt hot-search subject uses the real process-wide cache. Each timed
+facade build, cold, and full-workload operation instead constructs a fresh
+default-policy cache after its timer begins and retains it through facade and
+session use, so compilation cannot be hidden by a prior cell-local lookup.
+Build includes facade/cache retirement; cold and full capture elapsed time
+before retirement, preserving their existing lifecycle boundary.
+
 ## Admission and run boundary
 
 Do not build or time this campaign while a coordinator cutover fence is
@@ -112,6 +127,11 @@ Each process emits exactly eight rows in portable/facade order for `build`,
 discard rows. The producer records and rechecks `/proc/thread-self/status`
 affinity around the timed region. All rows share the correctness producer's
 run, instance, resource-coordinator, cutover, and profile identity.
+The facade `search` row uses the prebuilt process-cache-backed facade and a
+pre-opened session. Each facade `build`, `cold`, and `full` measurement uses a
+new default-policy cache created inside that measurement and retained through
+its use; those rows therefore retain compilation rather than measuring a
+prewarmed global-cache hit.
 
 The verifier reconstructs the complete matrix and rejects a cell assembled
 from multiple PIDs or a PID reused for multiple cells. It independently
