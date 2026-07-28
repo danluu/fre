@@ -5288,7 +5288,7 @@ fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() 
     // Independent exact-limit witness: N=9 and
     // Q=(2+2 prefix bytes)+(1+1 class ranges)=6, so
     // W=16*N+8*Q+64=16*9+8*6+64=256. Complete spans: 0..4, 6..9.
-    // The distinct fixed-16 SVE owner reserves its worst-case 15*N physical
+    // The distinct fixed-16 SVE owner reserves its worst-case 16*N physical
     // classification recovery overhead as part of its own receipt.
     let witness = aggregate_builder(r"ab[a-z]+|xy[0-9]+")
         .unicode(false)
@@ -5299,7 +5299,7 @@ fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() 
         AggregatePlanIdentity::PrefixClassAlternation(identity)
             if identity.kernel.plan_id == DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
     ) {
-        256 + 9 * 15
+        256 + 9 * 16
     } else {
         256
     };
