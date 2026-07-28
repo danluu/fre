@@ -27,8 +27,6 @@ const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_TOTAL_PATTERN_BYTES;
 const CLASSIFIER_BUILD_WORK: usize = 128;
-const FIXED_WORK_PER_POSITION: usize = 64;
-const FIXED_FINAL_WORK: usize = 64;
 const SIMD_BLOCK_BYTES: usize = 32;
 
 /// Smallest admitted ordered set. Singletons already have a stronger direct
@@ -52,7 +50,7 @@ pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.packed-fi
 /// Version of the success-or-failure construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
 /// Version of the partial-actual construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
 
 /// Boundary contract owned by this byte-string kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +93,52 @@ pub struct CacheIdentity<'a> {
     pub certified_max_pattern_bytes: usize,
     pub certified_max_total_pattern_bytes: usize,
     pub encoded_patterns: &'a [u8],
+}
+
+/// Copyable operation and native-classifier identity. Pattern bytes remain in
+/// [`CacheIdentity`] and may be authenticated separately by an owning facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationIdentity {
+    pub algorithm_id: &'static str,
+    pub plan_id: &'static str,
+    pub operation: Operation,
+    pub cache_format_version: u32,
+    pub implementation_kind: &'static str,
+    pub identity_scope: &'static str,
+    pub target_arch: &'static str,
+    pub runtime_minimum_haystack_bytes: usize,
+    pub semantics: Semantics,
+    pub classifier_selection: AsciiSelection,
+    pub certified_min_patterns: usize,
+    pub certified_max_patterns: usize,
+    pub certified_min_pattern_bytes: usize,
+    pub certified_max_pattern_bytes: usize,
+    pub certified_max_total_pattern_bytes: usize,
+}
+
+impl CacheIdentity<'_> {
+    /// Drop only the borrowed pattern encoding while preserving the complete
+    /// operation and native-classifier identity.
+    #[must_use]
+    pub const fn operation_identity(self) -> OperationIdentity {
+        OperationIdentity {
+            algorithm_id: self.algorithm_id,
+            plan_id: self.plan_id,
+            operation: self.operation,
+            cache_format_version: self.cache_format_version,
+            implementation_kind: self.implementation_kind,
+            identity_scope: self.identity_scope,
+            target_arch: self.target_arch,
+            runtime_minimum_haystack_bytes: self.runtime_minimum_haystack_bytes,
+            semantics: self.semantics,
+            classifier_selection: self.classifier_selection,
+            certified_min_patterns: self.certified_min_patterns,
+            certified_max_patterns: self.certified_max_patterns,
+            certified_min_pattern_bytes: self.certified_min_pattern_bytes,
+            certified_max_pattern_bytes: self.certified_max_pattern_bytes,
+            certified_max_total_pattern_bytes: self.certified_max_total_pattern_bytes,
+        }
+    }
 }
 
 /// Caller limits for one packed construction.
@@ -145,6 +189,8 @@ pub struct BuildAccounting {
     pub pattern_bytes: usize,
     pub max_pattern_bytes: usize,
     pub min_pattern_bytes: usize,
+    pub max_first_byte_bucket_patterns: usize,
+    pub max_first_byte_bucket_pattern_bytes: usize,
     pub identity_bytes: usize,
     pub identity_capacity_bytes: usize,
     pub build_work_upper_bound: u64,
@@ -654,7 +700,16 @@ impl SpanSumBuildAttempt {
 
 impl PackedOrderedLiteralCountPlan {
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        Self::build_attempt(patterns, limits)
+        Self::build_with_dispatch(SimdDispatchContext::capture(), patterns, limits)
+    }
+
+    /// Build from one caller-captured capability snapshot.
+    pub fn build_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_attempt_with_dispatch(dispatch, patterns, limits)
             .map(CountBuildAttempt::into_plan)
             .map_err(BuildAttemptError::into_source)
     }
@@ -667,8 +722,21 @@ impl PackedOrderedLiteralCountPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<CountBuildAttempt, BuildAttemptError> {
+        Self::build_attempt_with_dispatch(SimdDispatchContext::capture(), patterns, limits)
+    }
+
+    /// Build with one caller-captured capability snapshot and retain the
+    /// complete success-or-failure receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<CountBuildAttempt, BuildAttemptError> {
         let identity = build_attempt_identity(Operation::Count, limits);
-        let dispatch = SimdDispatchContext::capture();
         PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
             |(core, receipt)| CountBuildAttempt {
                 plan: Self { core },
@@ -693,7 +761,7 @@ impl PackedOrderedLiteralCountPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<CountResult<'a>, ReduceError> {
-        let outcome = self.core.reduce(haystack, false, limits)?;
+        let outcome = self.core.reduce::<false>(haystack, limits)?;
         Ok(CountResult {
             count: outcome.count,
             accounting: ReduceAccounting {
@@ -707,7 +775,16 @@ impl PackedOrderedLiteralCountPlan {
 
 impl PackedOrderedLiteralSpanSumPlan {
     pub fn build<P: AsRef<[u8]>>(patterns: &[P], limits: BuildLimits) -> Result<Self, BuildError> {
-        Self::build_attempt(patterns, limits)
+        Self::build_with_dispatch(SimdDispatchContext::capture(), patterns, limits)
+    }
+
+    /// Build from one caller-captured capability snapshot.
+    pub fn build_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_attempt_with_dispatch(dispatch, patterns, limits)
             .map(SpanSumBuildAttempt::into_plan)
             .map_err(BuildAttemptError::into_source)
     }
@@ -720,8 +797,21 @@ impl PackedOrderedLiteralSpanSumPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
+        Self::build_attempt_with_dispatch(SimdDispatchContext::capture(), patterns, limits)
+    }
+
+    /// Build with one caller-captured capability snapshot and retain the
+    /// complete success-or-failure receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        limits: BuildLimits,
+    ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
         let identity = build_attempt_identity(Operation::SpanSum, limits);
-        let dispatch = SimdDispatchContext::capture();
         PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
             |(core, receipt)| SpanSumBuildAttempt {
                 plan: Self { core },
@@ -746,7 +836,7 @@ impl PackedOrderedLiteralSpanSumPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult<'a>, ReduceError> {
-        let outcome = self.core.reduce(haystack, true, limits)?;
+        let outcome = self.core.reduce::<true>(haystack, limits)?;
         Ok(SpanSumResult {
             span_sum: outcome.span_sum,
             accounting: ReduceAccounting {
@@ -815,6 +905,9 @@ impl PlanCore {
         let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
         let mut pattern_meta = [PatternMeta::EMPTY; CERTIFIED_MAX_PATTERNS];
         let mut first_byte_patterns = [0_u16; 256];
+        let mut first_byte_pattern_bytes = [0_usize; 256];
+        let mut max_first_byte_bucket_patterns = 0_usize;
+        let mut max_first_byte_bucket_pattern_bytes = 0_usize;
         let mut has_non_ascii_first_byte = false;
         let count = u64::try_from(patterns.len()).map_err(|_| {
             attempt_error(
@@ -900,6 +993,24 @@ impl PlanCore {
                     )
                 })?;
             first_byte_patterns[usize::from(first)] |= bit;
+            max_first_byte_bucket_patterns = max_first_byte_bucket_patterns.max(
+                usize::try_from(first_byte_patterns[usize::from(first)].count_ones())
+                    .expect("u16 population count always fits a supported usize"),
+            );
+            first_byte_pattern_bytes[usize::from(first)] = first_byte_pattern_bytes
+                [usize::from(first)]
+            .checked_add(bytes.len())
+            .ok_or_else(|| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "first-byte bucket pattern bytes",
+                    },
+                    identity,
+                    actual,
+                )
+            })?;
+            max_first_byte_bucket_pattern_bytes = max_first_byte_bucket_pattern_bytes
+                .max(first_byte_pattern_bytes[usize::from(first)]);
             if first < 128 {
                 let word = usize::from(first / 64);
                 let shift = u32::from(first % 64);
@@ -919,7 +1030,7 @@ impl PlanCore {
             ));
         }
         actual.work = preflight.build_work;
-        actual.copied_bytes = preflight.pattern_bytes;
+        actual.copied_bytes = preflight.identity_bytes;
         actual.initialized_bytes = size_of::<PackedOwner>();
         let classifier = dispatch
             .ascii_byte_set_classifier(AsciiByteSet::from_words(ascii_words), DispatchPolicy::Auto)
@@ -970,6 +1081,8 @@ impl PlanCore {
             pattern_bytes: preflight.pattern_bytes,
             max_pattern_bytes: preflight.max_pattern_bytes,
             min_pattern_bytes: preflight.min_pattern_bytes,
+            max_first_byte_bucket_patterns,
+            max_first_byte_bucket_pattern_bytes,
             identity_bytes: preflight.identity_bytes,
             identity_capacity_bytes: IDENTITY_CAPACITY_BYTES,
             build_work_upper_bound: preflight.build_work,
@@ -996,10 +1109,9 @@ impl PlanCore {
         Ok((core, receipt))
     }
 
-    fn preflight_reduce(
+    fn preflight_reduce<const SPAN_SUM: bool>(
         &self,
         haystack_len: usize,
-        check_span: bool,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
         let candidate_positions = if haystack_len < self.build.min_pattern_bytes {
@@ -1012,32 +1124,39 @@ impl PlanCore {
                     computation: "candidate positions",
                 })?
         };
-        let pattern_checks = candidate_positions.checked_mul(self.build.patterns).ok_or(
-            ReduceError::ArithmeticOverflow {
+        let pattern_checks = candidate_positions
+            .checked_mul(self.build.max_first_byte_bucket_patterns)
+            .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "pattern checks",
-            },
-        )?;
+            })?;
         let verification_reads = candidate_positions
-            .checked_mul(self.build.pattern_bytes)
+            .checked_mul(self.build.max_first_byte_bucket_pattern_bytes)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "verification source reads",
             })?;
-        let source_byte_reads = candidate_positions.checked_add(verification_reads).ok_or(
-            ReduceError::ArithmeticOverflow {
+        let fixed_source_reads_per_position = 2_usize
+            .checked_add(usize::from(self.owner.has_non_ascii_first_byte))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed source reads per position",
+            })?;
+        let source_byte_reads = candidate_positions
+            .checked_mul(fixed_source_reads_per_position)
+            .and_then(|reads| reads.checked_add(verification_reads))
+            .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "source byte reads",
-            },
-        )?;
+            })?;
         let work_per_position = self
             .build
-            .pattern_bytes
-            .checked_add(self.build.patterns)
-            .and_then(|work| work.checked_add(FIXED_WORK_PER_POSITION))
+            .max_first_byte_bucket_pattern_bytes
+            .checked_add(self.build.max_first_byte_bucket_patterns)
+            .and_then(|work| work.checked_add(4))
+            .and_then(|work| work.checked_add(fixed_source_reads_per_position))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "work per position",
             })?;
         let work_usize = candidate_positions
             .checked_mul(work_per_position)
-            .and_then(|work| work.checked_add(FIXED_FINAL_WORK))
+            .and_then(|work| work.checked_add(1))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "packed operation work",
             })?;
@@ -1080,7 +1199,7 @@ impl PlanCore {
             persistent_bytes: self.build.persistent_bytes,
             peak_bytes: self.build.persistent_bytes,
         };
-        check_reduce(upper, check_span, limits)?;
+        check_reduce(upper, SPAN_SUM, limits)?;
         Ok(upper)
     }
 
@@ -1088,13 +1207,12 @@ impl PlanCore {
         clippy::too_many_lines,
         reason = "the monotone block/tail traversal and its exact counters remain in one auditable operation"
     )]
-    fn reduce(
+    fn reduce<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
-        check_span: bool,
         limits: ReduceLimits,
     ) -> Result<ReduceOutcome, ReduceError> {
-        let upper = self.preflight_reduce(haystack.len(), check_span, limits)?;
+        let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
         let candidate_positions = upper.candidate_positions;
         let mut block_start = 0_usize;
         let mut consumed_through = 0_usize;
@@ -1133,7 +1251,7 @@ impl PlanCore {
                     }
                 }
             }
-            self.consume_candidate_mask(
+            self.consume_candidate_mask::<SPAN_SUM>(
                 haystack,
                 block_start,
                 candidates,
@@ -1154,7 +1272,7 @@ impl PlanCore {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual candidate events",
                         })?;
-                self.consume_candidate(
+                self.consume_candidate::<SPAN_SUM>(
                     haystack,
                     block_start,
                     &mut consumed_through,
@@ -1177,16 +1295,34 @@ impl PlanCore {
                     computation: "candidate stream calls",
                 })?;
         let count = match_events;
+        let candidate_control_work =
+            candidate_events
+                .checked_mul(2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual candidate control work",
+                })?;
+        let actual_work_usize = candidate_positions
+            .checked_add(upper.source_byte_reads)
+            .and_then(|work| work.checked_add(pattern_checks))
+            .and_then(|work| work.checked_add(candidate_control_work))
+            .and_then(|work| work.checked_add(iterator_next_calls))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual packed operation work",
+            })?;
+        let actual_work =
+            u64::try_from(actual_work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual packed operation work as u64",
+            })?;
         let actual = ReduceActualCounters {
             match_events,
             iterator_next_calls,
             count: Some(count),
-            span_sum: check_span.then_some(span_sum),
+            span_sum: SPAN_SUM.then_some(span_sum),
             classified_positions: candidate_positions,
             candidate_events,
             pattern_checks,
             source_byte_reads: upper.source_byte_reads,
-            work: upper.work,
+            work: actual_work,
             scratch_bytes: 0,
             peak_bytes: self.build.persistent_bytes,
         };
@@ -1206,7 +1342,7 @@ impl PlanCore {
         clippy::too_many_arguments,
         reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
     )]
-    fn consume_candidate_mask(
+    fn consume_candidate_mask<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         block_start: usize,
@@ -1235,7 +1371,7 @@ impl PlanCore {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "actual candidate events",
                     })?;
-            self.consume_candidate(
+            self.consume_candidate::<SPAN_SUM>(
                 haystack,
                 start,
                 consumed_through,
@@ -1247,7 +1383,7 @@ impl PlanCore {
         Ok(())
     }
 
-    fn consume_candidate(
+    fn consume_candidate<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         start: usize,
@@ -1285,15 +1421,17 @@ impl PlanCore {
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual match events",
                         })?;
-                *span_sum = span_sum
-                    .checked_add(u64::try_from(pattern.len()).map_err(|_| {
-                        ReduceError::ArithmeticOverflow {
-                            computation: "matched width as u64",
-                        }
-                    })?)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual span sum",
-                    })?;
+                if SPAN_SUM {
+                    *span_sum = span_sum
+                        .checked_add(u64::try_from(pattern.len()).map_err(|_| {
+                            ReduceError::ArithmeticOverflow {
+                                computation: "matched width as u64",
+                            }
+                        })?)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual span sum",
+                        })?;
+                }
                 *consumed_through = end;
                 break;
             }
@@ -1328,6 +1466,16 @@ fn preflight<P: AsRef<[u8]>>(
     inline_bytes: usize,
 ) -> Result<(BuildPreflight, BuildAttemptActual), PreflightFailure> {
     let mut actual = BuildAttemptActual::default();
+    if limits.max_build_work == 0 {
+        return Err(PreflightFailure {
+            source: BuildError::WorkLimit {
+                needed: 1,
+                limit: limits.max_build_work,
+            },
+            actual,
+        });
+    }
+    actual.work = 1;
     if patterns.is_empty() {
         return Err(PreflightFailure {
             source: BuildError::EmptyPatternSet,
@@ -1363,10 +1511,16 @@ fn preflight<P: AsRef<[u8]>>(
             actual,
         });
     }
-    if patterns.len() > limits.max_build_work {
+    let census_work = patterns.len().checked_add(1).ok_or(PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "set proof and pattern length census work",
+        },
+        actual,
+    })?;
+    if census_work > limits.max_build_work {
         return Err(PreflightFailure {
             source: BuildError::WorkLimit {
-                needed: patterns.len(),
+                needed: census_work,
                 limit: limits.max_build_work,
             },
             actual,
@@ -1477,9 +1631,9 @@ fn preflight<P: AsRef<[u8]>>(
     }
     let build_work_usize = patterns
         .len()
-        .checked_add(size_of::<PackedOwner>())
-        .and_then(|work| work.checked_add(pattern_bytes))
-        .and_then(|work| work.checked_add(patterns.len()))
+        .checked_add(1)
+        .and_then(|work| work.checked_add(size_of::<PackedOwner>()))
+        .and_then(|work| work.checked_add(identity_bytes))
         .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
         .ok_or(PreflightFailure {
             source: BuildError::ArithmeticOverflow {
@@ -1987,7 +2141,7 @@ mod tests {
         let actual = failure.receipt().actual();
         assert_eq!(actual.allocations, 0);
         assert_eq!(actual.allocated_bytes, 0);
-        assert_eq!(actual.copied_bytes, 4);
+        assert_eq!(actual.copied_bytes, 28);
         assert_eq!(actual.live_persistent_bytes, 0);
         assert_eq!(actual.peak_bytes, 0);
     }
@@ -2040,10 +2194,48 @@ mod tests {
     }
 
     #[test]
+    fn set_shape_refusals_and_zero_work_limits_have_closed_receipts() {
+        let too_many = vec![b"aa".as_slice(); super::CERTIFIED_MAX_PATTERNS + 1];
+        let shape_failure =
+            PackedOrderedLiteralCountPlan::build_attempt(&too_many, BuildLimits::unlimited())
+                .unwrap_err();
+        assert!(matches!(
+            shape_failure.source(),
+            BuildError::ProofRefused {
+                fact: "pattern count",
+                ..
+            }
+        ));
+        assert!(shape_failure.closes());
+        assert_eq!(shape_failure.receipt().actual().work, 1);
+
+        let zero_work_failure = PackedOrderedLiteralCountPlan::build_attempt(
+            &[b"ab".as_slice(), b"cd".as_slice()],
+            BuildLimits {
+                max_build_work: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            zero_work_failure.source(),
+            BuildError::WorkLimit {
+                needed: 1,
+                limit: 0
+            }
+        ));
+        assert!(zero_work_failure.closes());
+        assert_eq!(zero_work_failure.receipt().actual().work, 0);
+    }
+
+    #[test]
     fn operation_receipt_is_bounded_and_allocation_free() {
         let patterns = [b"Sherlock".as_slice(), b"Holmes".as_slice()];
         let plan =
             PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let build = plan.build_accounting();
+        assert_eq!(build.max_first_byte_bucket_patterns, 1);
+        assert_eq!(build.max_first_byte_bucket_pattern_bytes, b"Sherlock".len());
         let result = plan
             .count(
                 b"Sherlock and Holmes and Sherlock",
@@ -2054,12 +2246,21 @@ mod tests {
         let actual = result.accounting.actual;
         assert_eq!(result.count, 3);
         assert_eq!(actual.scratch_bytes, 0);
+        assert_eq!(actual.span_sum, None);
         assert_eq!(upper.scratch_bytes, 0);
+        assert_eq!(upper.pattern_checks, upper.candidate_positions);
+        assert_eq!(
+            upper.source_byte_reads,
+            upper
+                .candidate_positions
+                .checked_mul(b"Sherlock".len() + 2)
+                .unwrap()
+        );
         assert_eq!(actual.classified_positions, upper.candidate_positions);
         assert!(actual.candidate_events <= upper.candidate_positions);
         assert!(actual.pattern_checks <= upper.pattern_checks);
         assert_eq!(actual.source_byte_reads, upper.source_byte_reads);
-        assert_eq!(actual.work, upper.work);
+        assert!(actual.work <= upper.work);
         assert_eq!(upper.restart_tail_positions, 0);
         assert_eq!(upper.iterator_setup_work, 0);
     }

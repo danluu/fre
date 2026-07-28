@@ -602,6 +602,7 @@ fn continuation_details(
         | AggregateExecutionDetails::BoundedContext(_)
         | AggregateExecutionDetails::BoundedContextSpanSum(_)
         | AggregateExecutionDetails::FixedAbsoluteDomain(_)
+        | AggregateExecutionDetails::PackedFiniteLiteral { .. }
         | AggregateExecutionDetails::FiniteLiteral { .. }
         | AggregateExecutionDetails::SparseFiniteLiteral { .. }
         | AggregateExecutionDetails::GuardedAsciiWord(_)

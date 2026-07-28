@@ -26,14 +26,14 @@ use fre::{
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCaptureSemantics,
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
     AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
-    AggregateExecutionSource, AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
-    AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
-    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
-    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
-    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
-    AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
-    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
-    AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateExecutionReport, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
+    AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
+    AggregateGraphemeScalarDfaSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
+    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
+    AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics,
+    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
+    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
+    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
     AggregateOperationCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateStrategy, AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError,
@@ -4555,10 +4555,11 @@ fn charge_composite_build(
 
 fn charge_count_execution(
     accounting: &mut CompositeAccounting,
-    details: &AggregateExecutionDetails,
+    report: &AggregateExecutionReport,
     value: u64,
     limits: CompositeLimits,
 ) -> Result<(), ExecutionError> {
+    let details = report.details();
     let (work, events, peak) = match details {
         AggregateExecutionDetails::FiniteLiteral {
             upper_bounds,
@@ -4579,10 +4580,17 @@ fn charge_count_execution(
             )
         }
         AggregateExecutionDetails::PackedFiniteLiteral {
+            operation_identity,
             upper_bounds,
             actual,
         } => {
-            if actual.work > upper_bounds.work
+            let build_identity_matches = matches!(
+                report.identity().plan_identity,
+                AggregatePlanIdentity::FiniteLiteral(identity)
+                    if identity.packed_operation_identity == Some(*operation_identity)
+            );
+            if !build_identity_matches
+                || actual.work > upper_bounds.work
                 || actual.match_events
                     > composite_u64(upper_bounds.match_events, "packed match events")?
                 || actual.iterator_next_calls > upper_bounds.reducer_steps
@@ -4995,7 +5003,7 @@ fn execute_composite_count_stage(
     *slot = true;
     charge_count_execution(
         &mut state.accounting,
-        result.report().details(),
+        result.report(),
         result.value(),
         limits,
     )
@@ -9858,11 +9866,17 @@ fn finite_plan_identity_matches(
         AggregateFiniteLiteralSemantics::UnicodeOffByteBoundaries
     };
     let representation_matches = (identity.algorithm == ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-        && identity.operation == dense_finite_operation)
+        && identity.operation == dense_finite_operation
+        && identity.packed_operation_identity.is_none())
         || (identity.algorithm == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-            && identity.operation == packed_finite_operation)
+            && identity.operation == packed_finite_operation
+            && identity.packed_operation_identity.is_some_and(|native| {
+                native.algorithm_id == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    && native.plan_id == packed_finite_operation
+            }))
         || (identity.algorithm == SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
-            && identity.operation == sparse_finite_operation);
+            && identity.operation == sparse_finite_operation
+            && identity.packed_operation_identity.is_none());
     identity.semantics == expected_semantics && representation_matches
 }
 
@@ -19894,12 +19908,21 @@ mod tests {
             .expect("packed finite count");
         assert_eq!(counted.value(), 2);
         let AggregateExecutionDetails::PackedFiniteLiteral {
+            operation_identity,
             upper_bounds,
             actual,
         } = counted.report().details()
         else {
             panic!("packed finite count lost packed execution details");
         };
+        let AggregatePlanIdentity::FiniteLiteral(count_identity) = count_report.plan_identity
+        else {
+            panic!("packed finite count lost finite build identity");
+        };
+        assert_eq!(
+            count_identity.packed_operation_identity,
+            Some(*operation_identity)
+        );
         assert_eq!(upper_bounds.candidate_positions, 8);
         assert_eq!(upper_bounds.reducer_steps, 9);
         assert_eq!(actual.classified_positions, 8);
@@ -22631,6 +22654,7 @@ mod tests {
             semantics: AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words,
             algorithm,
             operation,
+            packed_operation_identity: None,
         };
         assert!(finite_plan_identity_matches(
             identity(
@@ -22648,19 +22672,29 @@ mod tests {
             true,
             LiteralAggregateOperation::Count,
         ));
+        let packed_count = current_fre_rebar_aggregate_builder("ab|cd", true, false)
+            .build_count()
+            .expect("packed count identity fixture");
+        let AggregatePlanIdentity::FiniteLiteral(packed_count_identity) =
+            packed_count.build_report().plan_identity
+        else {
+            panic!("packed count identity fixture selected another plan");
+        };
         assert!(finite_plan_identity_matches(
-            identity(
-                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-                fre::PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-            ),
+            packed_count_identity,
             true,
             LiteralAggregateOperation::Count,
         ));
+        let packed_span_sum = current_fre_rebar_aggregate_builder("ab|cd", true, false)
+            .build_span_sum()
+            .expect("packed span-sum identity fixture");
+        let AggregatePlanIdentity::FiniteLiteral(packed_span_sum_identity) =
+            packed_span_sum.build_report().plan_identity
+        else {
+            panic!("packed span-sum identity fixture selected another plan");
+        };
         assert!(finite_plan_identity_matches(
-            identity(
-                fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-                fre::PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-            ),
+            packed_span_sum_identity,
             true,
             LiteralAggregateOperation::SpanSum,
         ));

@@ -74,7 +74,7 @@ fn unicode_finite_dfa_matches_upstream_on_nonempty_utf8_words_and_malformed_inpu
         let count = unicode_builder(pattern).build_count().unwrap();
         assert_eq!(
             count.build_report().plan,
-            AggregatePlanKind::FiniteLiteralDfa
+            AggregatePlanKind::PackedFiniteLiteral
         );
         assert!(matches!(
             count.build_report().plan_identity,
@@ -90,7 +90,10 @@ fn unicode_finite_dfa_matches_upstream_on_nonempty_utf8_words_and_malformed_inpu
             "count pattern={pattern:?} haystack={haystack:?}"
         );
         let sum = unicode_builder(pattern).build_span_sum().unwrap();
-        assert_eq!(sum.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
+        assert_eq!(
+            sum.build_report().plan,
+            AggregatePlanKind::PackedFiniteLiteral
+        );
         assert_eq!(
             sum.span_sum_value(haystack, AggregateRunLimits::default())
                 .unwrap(),
@@ -115,20 +118,29 @@ fn unicode_finite_dfa_rejects_empty_and_locally_raw_byte_languages() {
 
 #[test]
 fn finite_dfa_preserves_order_empty_progress_captures_and_arbitrary_bytes() {
-    let cases: [(&str, &[u8]); 5] = [
-        (r"(?:ab|a|)", b"aba"),
-        (r"(?:|a)", b"aaa"),
-        (r"(?P<whole>(?:\xFFa|\xFF|b))", &[0xFF, b'a', 0xFF, b'b']),
-        (r"(?i:(?:sherlock|holmes))", b"SHERLOCK x Holmes"),
-        (r"(?:early|late)", b"early---late"),
+    let cases: [(&str, &[u8], AggregatePlanKind); 5] = [
+        (r"(?:ab|a|)", b"aba", AggregatePlanKind::FiniteLiteralDfa),
+        (r"(?:|a)", b"aaa", AggregatePlanKind::FiniteLiteralDfa),
+        (
+            r"(?P<whole>(?:\xFFa|\xFF|b))",
+            &[0xFF, b'a', 0xFF, b'b'],
+            AggregatePlanKind::FiniteLiteralDfa,
+        ),
+        (
+            r"(?i:(?:sherlock|holmes))",
+            b"SHERLOCK x Holmes",
+            AggregatePlanKind::FiniteLiteralDfa,
+        ),
+        (
+            r"(?:early|late)",
+            b"early---late",
+            AggregatePlanKind::PackedFiniteLiteral,
+        ),
     ];
-    for (pattern, haystack) in cases {
+    for (pattern, haystack, expected_plan) in cases {
         let expected = oracle(pattern, haystack);
         let count = builder(pattern).build_count().unwrap();
-        assert_eq!(
-            count.build_report().plan,
-            AggregatePlanKind::FiniteLiteralDfa
-        );
+        assert_eq!(count.build_report().plan, expected_plan);
         assert_eq!(count.build_report().continuation_strategy, None);
         assert_eq!(
             count
@@ -137,7 +149,7 @@ fn finite_dfa_preserves_order_empty_progress_captures_and_arbitrary_bytes() {
             expected.0
         );
         let sum = builder(pattern).build_span_sum().unwrap();
-        assert_eq!(sum.build_report().plan, AggregatePlanKind::FiniteLiteralDfa);
+        assert_eq!(sum.build_report().plan, expected_plan);
         assert_eq!(
             sum.span_sum_value(haystack, AggregateRunLimits::default())
                 .unwrap(),
@@ -158,8 +170,8 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
         compiled.build_report().plan,
         AggregatePlanKind::FiniteLiteralDfa
     );
-    assert_eq!(compiled.build_report().schema_version, 38);
-    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 38);
+    assert_eq!(compiled.build_report().schema_version, 39);
+    assert_eq!(AGGREGATE_EXPLAIN_SCHEMA_VERSION, 39);
     assert_eq!(compiled.build_report().captures_erased, 1);
     assert!(compiled.build_report().finite_planner_work > 0);
     let haystack = b"cat xx dog";
@@ -212,7 +224,9 @@ fn finite_dfa_planner_limit_fails_with_typed_ownership() {
 
 #[test]
 fn finite_dfa_auto_falls_back_on_count_and_span_sum_kernel_limits() {
-    let pattern = r"(?P<word>cat|dog|mouse)";
+    // The one-byte alternative deliberately declines the packed route so this
+    // test continues to exercise dense-construction fallback ownership.
+    let pattern = r"(?P<word>a|cat|dog|mouse)";
     let haystack = b"cat mouse dog cat";
     let expected = oracle(pattern, haystack);
 
@@ -400,9 +414,11 @@ fn counters(patterns: usize, input: usize) -> (usize, usize, usize) {
 #[test]
 fn finite_dfa_n_2n_and_query_scaling_rejects_input_times_alternatives() {
     let n = 8_192;
-    let small_at_n = counters(16, n);
+    // Seventeen alternatives are just beyond the packed theorem and retain
+    // this test's dense-DFA scaling target.
+    let small_at_n = counters(17, n);
     let large_at_n = counters(64, n);
-    let small_at_double_n = counters(16, 2 * n);
+    let small_at_double_n = counters(17, 2 * n);
     let large_at_double_n = counters(64, 2 * n);
 
     assert_eq!(small_at_n.0, n);

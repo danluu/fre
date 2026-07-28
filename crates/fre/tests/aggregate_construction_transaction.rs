@@ -597,6 +597,13 @@ fn direct_route_families_publish_one_exact_selected_success_effect() {
             r"(?P<word>cat|dog|mouse)",
             false,
             false,
+            AggregatePlanKind::PackedFiniteLiteral,
+            AggregateConstructionStage::PackedFinite,
+        ),
+        (
+            r"(?P<word>a|cat|dog|mouse)",
+            false,
+            false,
             AggregatePlanKind::FiniteLiteralDfa,
             AggregateConstructionStage::DenseFinite,
         ),
@@ -837,6 +844,16 @@ fn post_p_refusals_preserve_partial_a_and_prefail_the_next_effect() {
     reason = "one fallback matrix keeps every typed edge and its cumulative abandoned effects adjacent"
 )]
 fn typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals() {
+    std::thread::Builder::new()
+        .name("typed-fallback-ledger-matrix".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals_inner)
+        .expect("spawn typed fallback ledger matrix")
+        .join()
+        .expect("typed fallback ledger matrix");
+}
+
+fn typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals_inner() {
     let fixed_optional_limits = AggregateBuildLimits {
         max_fixed_absolute_planner_work: 1,
         ..AggregateBuildLimits::default()
@@ -855,7 +872,7 @@ fn typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals() {
 
     let mut dense_limits = AggregateBuildLimits::default();
     dense_limits.finite_literal.max_trie_states = 1;
-    let dense_off = builder(r"(?P<word>cat|dog|mouse)")
+    let dense_off = builder(r"(?P<word>a|cat|dog|mouse)")
         .unicode(false)
         .limits(dense_limits)
         .build_count_attempt()
@@ -866,7 +883,7 @@ fn typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals() {
         AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToFixedPredicateWord64,
         AggregateConstructionTransition::DenseFiniteToFixedPredicateWord64,
     );
-    let dense_on = builder(r"(?P<word>cat|dog|mouse)")
+    let dense_on = builder(r"(?P<word>a|cat|dog|mouse)")
         .unicode(true)
         .limits(dense_limits)
         .build_count_attempt()
@@ -1013,7 +1030,7 @@ fn typed_fallbacks_preserve_distinct_edges_and_abandoned_actuals() {
 
 #[test]
 fn dense_publication_accounts_for_release_before_selected_owner_retention() {
-    let regex = builder(r"(?P<word>cat|dog|mouse)")
+    let regex = builder(r"(?P<word>a|cat|dog|mouse)")
         .unicode(false)
         .build_count_attempt()
         .expect("dense finite success");
