@@ -1,22 +1,15 @@
-//! Sparse whole-operation reduction for `W+ S+ L S+ W+`.
+//! One-pass whole-operation reduction for `W+ S+ L S+ W+`.
 //!
 //! Admission proves byte-mode complete ASCII word and whitespace classes,
-//! greedy nonempty repetitions, and one nonempty all-word literal. This owner
-//! retains an owned [`memchr::memmem::Finder`] for that literal and traverses
-//! its non-overlapping occurrence stream once. An occurrence can be semantic
-//! only when the literal is a complete maximal word token, so immediate ASCII
-//! space borders reject every occurrence hidden inside a larger word token.
-//! Existing generic forward/backward ASCII run scanners then recover the four
-//! adjacent maximal runs without classifying unrelated source bytes.
+//! greedy nonempty repetitions, and one nonempty all-word literal. The reducer
+//! classifies each source byte exactly once and drives a maximal-token DFA.
+//! Literal equality work is gated by the DFA: word bytes are compared only
+//! while the middle literal token is expected, and the byte already loaded for
+//! classification is reused for that comparison.
 //!
-//! Literal occurrences are monotone, but successive phrases can overlap in the
-//! intervening word token: `a Holmes b Holmes c` must produce only the first
-//! match. A semantic restart floor therefore rejects any later candidate whose
-//! recovered left word starts before the previous match end.
-//!
-//! Finder accounting uses its conservative `needle bytes + haystack bytes`
-//! linear contract. Run accounting uses the exact physical examination count
-//! returned by each selected scanner leaf, including any failed-block recovery.
+//! A completed right word resets the DFA instead of reusing that word as the
+//! next left token. This preserves non-overlapping restart semantics for
+//! `a Holmes b Holmes c` while retaining leftmost-first greedy spans.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -26,31 +19,21 @@
 use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
-use fre_simd_kernels::{
-    ASCII_NARROW_BYTES, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner,
-};
-use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
-pub const PLAN_ID: &str = "token-phrase.literal-anchored-maximal-ascii-runs.v2";
-pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v2";
-pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v2";
+pub const PLAN_ID: &str = "token-phrase.literal-gated-maximal-ascii-stream.v3";
+pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v3";
+pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v3";
 
 const FIXED_BUILD_WORK: usize = 8;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 2;
-const RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
-const RUN_SCANNERS: usize = 2;
 const FIXED_REDUCE_WORK: usize = 8;
 const CLASSIFICATION_WORK: usize = 2;
-const FINDER_TERM_WORK: usize = 1;
-const CANDIDATE_WORK: usize = 3;
+const LITERAL_COMPARISON_WORK: usize = 1;
+const TOKEN_EVENT_WORK: usize = 3;
 const MATCH_WORK: usize = 4;
 const MINIMUM_NON_LITERAL_BYTES: usize = 4;
-
-const ASCII_WORD_SET: AsciiByteSet =
-    AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
-const ASCII_SPACE_SET: AsciiByteSet = AsciiByteSet::from_words([0x0000_0001_0000_3e00, 0]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Topology {
@@ -175,14 +158,14 @@ impl Default for ReduceLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceUpperBounds {
     pub input_bytes: usize,
-    /// Conservative Finder linear terms plus physical run classifications.
+    /// One physical classification load per source byte.
     pub source_reads: usize,
     pub work: usize,
-    /// Direct border probes plus exact physical scanner examinations.
+    /// One complete ASCII classification stream.
     pub classifications: usize,
-    /// Conservative `haystack + literal` Finder service terms.
+    /// At most one in-register literal comparison per source byte.
     pub literal_comparisons: usize,
-    /// Maximum non-overlapping literal occurrences visited as candidates.
+    /// Maximum maximal-token events.
     pub token_events: usize,
     pub match_events: usize,
     pub count: u64,
@@ -194,14 +177,14 @@ pub struct ReduceUpperBounds {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
-    /// Conservative Finder service plus exact physical run/border reads.
+    /// Exact source bytes loaded by the one-pass classifier.
     pub source_reads: usize,
     pub work: usize,
-    /// Exact border probes and scanner-reported physical examinations.
+    /// Exact bytes classified.
     pub classifications: usize,
-    /// Exact conservative Finder linear-service charge for this invocation.
+    /// Exact in-register comparisons made while a literal token was expected.
     pub literal_comparisons: usize,
-    /// Literal occurrences returned by the retained non-overlapping iterator.
+    /// Exact maximal tokens consumed by the DFA.
     pub tokens: usize,
     pub matches: usize,
     pub count: u64,
@@ -321,9 +304,7 @@ impl std::error::Error for ReduceError {}
 
 #[derive(Debug)]
 pub struct TokenPhrasePlan {
-    finder: Finder<'static>,
-    word_scanner: AsciiByteSetRunScanner,
-    space_scanner: AsciiByteSetRunScanner,
+    literal: Box<[u8]>,
     outer_word_assertions: bool,
     build: BuildAccounting,
 }
@@ -340,10 +321,6 @@ impl TokenPhrasePlan {
     }
 
     /// Build while retaining exact successful or partial terminal effects.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the construction transaction keeps proof validation, exact literal allocation, scanner initialization, and partial effects in one auditable boundary"
-    )]
     pub fn build_attempt(
         literal: &[u8],
         outer_word_assertions: bool,
@@ -359,16 +336,10 @@ impl TokenPhrasePlan {
                 limits.max_literal_bytes,
                 BuildResource::LiteralBytes,
             )?;
-            let scanner_work = RUN_SCANNER_BUILD_WORK.checked_mul(RUN_SCANNERS).ok_or(
-                BuildError::ArithmeticOverflow {
-                    computation: "run-scanner build work",
-                },
-            )?;
             let work_upper_bound = literal
                 .len()
                 .checked_mul(LITERAL_BUILD_WORK_PER_BYTE)
                 .and_then(|work| work.checked_add(FIXED_BUILD_WORK))
-                .and_then(|work| work.checked_add(scanner_work))
                 .ok_or(BuildError::ArithmeticOverflow {
                     computation: "complete literal build work",
                 })?;
@@ -412,7 +383,7 @@ impl TokenPhrasePlan {
                 }
             }
 
-            let owned = fre_exact_alloc::copy_exact(literal)
+            let literal = fre_exact_alloc::copy_exact(literal)
                 .map(Vec::into_boxed_slice)
                 .map_err(|error| match error {
                     CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
@@ -422,19 +393,6 @@ impl TokenPhrasePlan {
                         bytes: literal.len(),
                     },
                 })?;
-            let finder = FinderBuilder::new().build_forward_owned(owned);
-            let word_scanner = AsciiByteSetRunScanner::new(ASCII_WORD_SET);
-            let space_scanner = AsciiByteSetRunScanner::new(ASCII_SPACE_SET);
-            actual.work = actual
-                .work
-                .checked_add(u64::try_from(scanner_work).map_err(|_| {
-                    BuildError::ArithmeticOverflow {
-                        computation: "run-scanner build work conversion",
-                    }
-                })?)
-                .ok_or(BuildError::ArithmeticOverflow {
-                    computation: "complete actual build work",
-                })?;
             debug_assert_eq!(usize::try_from(actual.work), Ok(work_upper_bound));
             actual.allocations = 1;
             actual.allocated_bytes = literal.len();
@@ -443,12 +401,10 @@ impl TokenPhrasePlan {
             actual.live_persistent_bytes = persistent_bytes;
             actual.peak_bytes = persistent_bytes;
             Ok(Self {
-                finder,
-                word_scanner,
-                space_scanner,
+                literal,
                 outer_word_assertions,
                 build: BuildAccounting {
-                    literal_bytes: literal.len(),
+                    literal_bytes: persistent_bytes - size_of::<Self>(),
                     work_upper_bound,
                     scratch_bytes,
                     persistent_bytes,
@@ -535,87 +491,22 @@ impl TokenPhrasePlan {
         Ok(upper)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the source-free derivation keeps each Finder, run, result, and retained-byte bound adjacent"
-    )]
     fn derive_upper_bounds(
         &self,
         input_bytes: usize,
         operation: Operation,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let literal_bytes = self.finder.needle().len();
-        let literal_comparisons =
-            input_bytes
-                .checked_add(literal_bytes)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "Finder linear service terms",
-                })?;
-        let token_events =
-            input_bytes
-                .checked_div(literal_bytes)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "literal candidate divisor",
-                })?;
-
-        // A candidate that reaches the run scanners is an exact literal token
-        // with at least one space on each side. Adjacent such tokens can share
-        // one separating space, hence at most (N - 1) / (L + 1).
-        let bordered_minimum =
-            literal_bytes
-                .checked_add(2)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bordered literal minimum width",
-                })?;
-        let bordered_stride =
-            literal_bytes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bordered literal minimum stride",
-                })?;
-        let bordered_candidates = if input_bytes < bordered_minimum {
-            0
-        } else {
-            input_bytes
-                .checked_sub(1)
-                .and_then(|remaining| remaining.checked_div(bordered_stride))
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bordered literal candidate bound",
-                })?
-        };
-
-        // Across monotone exact-token candidates, every member byte can occur
-        // in at most two adjacent run confirmations. Each candidate has two
-        // direct border probes and at most four scanner calls; every scanner
-        // call contributes one logical terminating probe and at most the
-        // generic scanner continuation's fixed failed-block recovery overhead.
-        let classifications = input_bytes
-            .checked_mul(2)
-            .and_then(|value| {
-                token_events
-                    .checked_mul(2)
-                    .and_then(|probes| value.checked_add(probes))
-            })
-            .and_then(|value| {
-                ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
-                    .checked_add(1)
-                    .and_then(|per_run| per_run.checked_mul(4))
-                    .and_then(|per_candidate| per_candidate.checked_mul(bordered_candidates))
-                    .and_then(|runs| value.checked_add(runs))
-            })
+        let classifications = input_bytes;
+        let literal_comparisons = input_bytes;
+        let source_reads = input_bytes;
+        let token_events = input_bytes;
+        let minimum_match_bytes = self
+            .literal
+            .len()
+            .checked_add(MINIMUM_NON_LITERAL_BYTES)
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "complete physical classification bound",
-            })?;
-        let source_reads = literal_comparisons.checked_add(classifications).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "Finder and run source-read bound",
-            },
-        )?;
-        let minimum_match_bytes = literal_bytes.checked_add(MINIMUM_NON_LITERAL_BYTES).ok_or(
-            ReduceError::ArithmeticOverflow {
                 computation: "minimum token-phrase match width",
-            },
-        )?;
+            })?;
         let match_events = input_bytes.checked_div(minimum_match_bytes).ok_or(
             ReduceError::ArithmeticOverflow {
                 computation: "match-event bound divisor",
@@ -636,13 +527,13 @@ impl TokenPhrasePlan {
             .checked_mul(CLASSIFICATION_WORK)
             .and_then(|value| {
                 literal_comparisons
-                    .checked_mul(FINDER_TERM_WORK)
-                    .and_then(|finder| value.checked_add(finder))
+                    .checked_mul(LITERAL_COMPARISON_WORK)
+                    .and_then(|comparisons| value.checked_add(comparisons))
             })
             .and_then(|value| {
                 token_events
-                    .checked_mul(CANDIDATE_WORK)
-                    .and_then(|candidates| value.checked_add(candidates))
+                    .checked_mul(TOKEN_EVENT_WORK)
+                    .and_then(|tokens| value.checked_add(tokens))
             })
             .and_then(|value| {
                 match_events
@@ -678,93 +569,145 @@ impl TokenPhrasePlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
-        let finder_terms = upper.literal_comparisons;
-        let finder_work =
-            finder_terms
-                .checked_mul(FINDER_TERM_WORK)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual Finder service work",
-                })?;
         let mut actual = ReduceActualCounters {
-            source_reads: finder_terms,
-            work: FIXED_REDUCE_WORK.checked_add(finder_work).ok_or(
-                ReduceError::ArithmeticOverflow {
-                    computation: "initial reduction work",
-                },
-            )?,
-            classifications: 0,
-            literal_comparisons: finder_terms,
+            source_reads: haystack.len(),
+            work: FIXED_REDUCE_WORK,
+            classifications: haystack.len(),
+            literal_comparisons: 0,
             tokens: 0,
             matches: 0,
             count: 0,
             span_sum: 0,
             scratch_bytes: 0,
         };
-        let literal_bytes = self.finder.needle().len();
-        let mut restart = 0_usize;
+        let mut state = PhraseState::SeekingWord;
+        let mut token_kind = None;
+        let mut token_start = 0_usize;
+        let mut literal_offset = 0_usize;
+        let mut literal_equal = false;
+        let mut compare_literal = false;
 
-        for anchor_start in self.finder.find_iter(haystack) {
-            charge_candidate(&mut actual)?;
-            let anchor_end =
-                anchor_start
-                    .checked_add(literal_bytes)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "literal anchor end",
-                    })?;
-            if !has_space_borders(haystack, anchor_start, anchor_end, &mut actual)? {
-                continue;
+        for (position, &byte) in haystack.iter().enumerate() {
+            let kind = classify(byte);
+            if token_kind.is_some_and(|current| current != kind) {
+                let current = token_kind.ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "current token kind",
+                })?;
+                self.consume_token(
+                    Token {
+                        kind: current,
+                        start: token_start,
+                        end: position,
+                        literal_equal,
+                    },
+                    operation,
+                    &mut state,
+                    &mut actual,
+                )?;
+                token_start = position;
+                literal_offset = 0;
+                compare_literal =
+                    kind == TokenKind::Word && matches!(state, PhraseState::NeedLiteral { .. });
+                literal_equal = compare_literal;
+            } else if token_kind.is_none() {
+                compare_literal =
+                    kind == TokenKind::Word && matches!(state, PhraseState::NeedLiteral { .. });
+                literal_equal = compare_literal;
             }
+            token_kind = Some(kind);
 
-            let Some(left_space_start) = scan_backward(
-                &self.space_scanner,
-                haystack,
-                anchor_start,
-                &mut actual,
-                "left space run",
-            )?
-            else {
-                continue;
-            };
-            let Some(match_start) = scan_backward(
-                &self.word_scanner,
-                haystack,
-                left_space_start,
-                &mut actual,
-                "left word run",
-            )?
-            else {
-                continue;
-            };
-            if match_start < restart {
-                continue;
+            if compare_literal {
+                if literal_equal {
+                    let Some(&expected) = self.literal.get(literal_offset) else {
+                        literal_equal = false;
+                        literal_offset += 1;
+                        continue;
+                    };
+                    literal_equal &= expected == byte;
+                    // At most one comparison is charged for each source byte.
+                    actual.literal_comparisons += 1;
+                }
+                // This offset is bounded by the current source position.
+                literal_offset += 1;
             }
-
-            let Some(right_space_end) = scan_forward(
-                &self.space_scanner,
-                haystack,
-                anchor_end,
+        }
+        if let Some(kind) = token_kind {
+            self.consume_token(
+                Token {
+                    kind,
+                    start: token_start,
+                    end: haystack.len(),
+                    literal_equal,
+                },
+                operation,
+                &mut state,
                 &mut actual,
-                "right space run",
-            )?
-            else {
-                continue;
-            };
-            let Some(match_end) = scan_forward(
-                &self.word_scanner,
-                haystack,
-                right_space_end,
-                &mut actual,
-                "right word run",
-            )?
-            else {
-                continue;
-            };
-            record_match(&mut actual, operation, match_start, match_end)?;
-            restart = match_end;
+            )?;
         }
 
+        actual.work = actual
+            .classifications
+            .checked_mul(CLASSIFICATION_WORK)
+            .and_then(|work| {
+                actual
+                    .literal_comparisons
+                    .checked_mul(LITERAL_COMPARISON_WORK)
+                    .and_then(|comparisons| work.checked_add(comparisons))
+            })
+            .and_then(|work| {
+                actual
+                    .tokens
+                    .checked_mul(TOKEN_EVENT_WORK)
+                    .and_then(|tokens| work.checked_add(tokens))
+            })
+            .and_then(|work| {
+                actual
+                    .matches
+                    .checked_mul(MATCH_WORK)
+                    .and_then(|matches| work.checked_add(matches))
+            })
+            .and_then(|work| work.checked_add(FIXED_REDUCE_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual reduction work",
+            })?;
         verify_actual(actual, upper)?;
         Ok(actual)
+    }
+
+    fn consume_token(
+        &self,
+        token: Token,
+        operation: Operation,
+        state: &mut PhraseState,
+        actual: &mut ReduceActualCounters,
+    ) -> Result<(), ReduceError> {
+        actual.tokens = checked_add(actual.tokens, 1, "token events")?;
+        let exact_literal = token.literal_equal
+            && token
+                .end
+                .checked_sub(token.start)
+                .is_some_and(|width| width == self.literal.len());
+        *state = match (*state, token.kind) {
+            (PhraseState::NeedLeftSpace { start }, TokenKind::Space) => {
+                PhraseState::NeedLiteral { start }
+            }
+            (PhraseState::NeedLiteral { start }, TokenKind::Word) if exact_literal => {
+                PhraseState::NeedRightSpace { start }
+            }
+            (PhraseState::SeekingWord | PhraseState::NeedLiteral { .. }, TokenKind::Word) => {
+                PhraseState::NeedLeftSpace { start: token.start }
+            }
+            (PhraseState::NeedRightSpace { start }, TokenKind::Space) => {
+                PhraseState::NeedFinalWord { start }
+            }
+            (PhraseState::NeedFinalWord { start }, TokenKind::Word) => {
+                record_match(actual, operation, start, token.end)?;
+                PhraseState::SeekingWord
+            }
+            (_, TokenKind::Word) => PhraseState::NeedLeftSpace { start: token.start },
+            _ => PhraseState::SeekingWord,
+        };
+        Ok(())
     }
 }
 
@@ -774,156 +717,46 @@ enum Operation {
     SpanSum,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenKind {
+    Word,
+    Space,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Token {
+    kind: TokenKind,
+    start: usize,
+    end: usize,
+    literal_equal: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhraseState {
+    SeekingWord,
+    NeedLeftSpace { start: usize },
+    NeedLiteral { start: usize },
+    NeedRightSpace { start: usize },
+    NeedFinalWord { start: usize },
+}
+
+const fn classify(byte: u8) -> TokenKind {
+    if is_ascii_word(byte) {
+        TokenKind::Word
+    } else if is_ascii_space(byte) {
+        TokenKind::Space
+    } else {
+        TokenKind::Other
+    }
+}
+
 const fn is_ascii_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn has_space_borders(
-    haystack: &[u8],
-    start: usize,
-    end: usize,
-    actual: &mut ReduceActualCounters,
-) -> Result<bool, ReduceError> {
-    if start == 0 || end == haystack.len() {
-        return Ok(false);
-    }
-    let previous = start
-        .checked_sub(1)
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "literal predecessor",
-        })?;
-    let left = read_classified(haystack, previous, actual)?;
-    if !ASCII_SPACE_SET.contains(left) {
-        return Ok(false);
-    }
-    let right = read_classified(haystack, end, actual)?;
-    Ok(ASCII_SPACE_SET.contains(right))
-}
-
-fn scan_backward(
-    scanner: &AsciiByteSetRunScanner,
-    haystack: &[u8],
-    end: usize,
-    actual: &mut ReduceActualCounters,
-    computation: &'static str,
-) -> Result<Option<usize>, ReduceError> {
-    let source = haystack
-        .get(..end)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let mut scalar_run = 0_usize;
-    for &byte in source.iter().rev().take(ASCII_NARROW_BYTES) {
-        charge_classifications(actual, 1)?;
-        if !scanner.set().contains(byte) {
-            return end
-                .checked_sub(scalar_run)
-                .map(|start| (scalar_run != 0).then_some(start))
-                .ok_or(ReduceError::ArithmeticOverflow { computation });
-        }
-        scalar_run = scalar_run
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    }
-    if scalar_run == source.len() {
-        return end
-            .checked_sub(scalar_run)
-            .map(|start| (scalar_run != 0).then_some(start))
-            .ok_or(ReduceError::ArithmeticOverflow { computation });
-    }
-    let continuation_end = end
-        .checked_sub(scalar_run)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let continuation = haystack
-        .get(..continuation_end)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let result = scanner.scan_backward(continuation);
-    charge_classifications(actual, result.examined_bytes())?;
-    let run = scalar_run
-        .checked_add(result.member_run_len())
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    end.checked_sub(run)
-        .map(Some)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })
-}
-
-fn scan_forward(
-    scanner: &AsciiByteSetRunScanner,
-    haystack: &[u8],
-    start: usize,
-    actual: &mut ReduceActualCounters,
-    computation: &'static str,
-) -> Result<Option<usize>, ReduceError> {
-    let source = haystack
-        .get(start..)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let mut scalar_run = 0_usize;
-    for &byte in source.iter().take(ASCII_NARROW_BYTES) {
-        charge_classifications(actual, 1)?;
-        if !scanner.set().contains(byte) {
-            return start
-                .checked_add(scalar_run)
-                .map(|end| (scalar_run != 0).then_some(end))
-                .ok_or(ReduceError::ArithmeticOverflow { computation });
-        }
-        scalar_run = scalar_run
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    }
-    if scalar_run == source.len() {
-        return start
-            .checked_add(scalar_run)
-            .map(|end| (scalar_run != 0).then_some(end))
-            .ok_or(ReduceError::ArithmeticOverflow { computation });
-    }
-    let continuation_start = start
-        .checked_add(scalar_run)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let continuation = haystack
-        .get(continuation_start..)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    let result = scanner.scan_forward(continuation);
-    charge_classifications(actual, result.examined_bytes())?;
-    let run = scalar_run
-        .checked_add(result.member_run_len())
-        .ok_or(ReduceError::ArithmeticOverflow { computation })?;
-    start
-        .checked_add(run)
-        .map(Some)
-        .ok_or(ReduceError::ArithmeticOverflow { computation })
-}
-
-fn read_classified(
-    haystack: &[u8],
-    position: usize,
-    actual: &mut ReduceActualCounters,
-) -> Result<u8, ReduceError> {
-    charge_classifications(actual, 1)?;
-    haystack
-        .get(position)
-        .copied()
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "classified border byte",
-        })
-}
-
-fn charge_classifications(
-    actual: &mut ReduceActualCounters,
-    count: usize,
-) -> Result<(), ReduceError> {
-    actual.source_reads = checked_add(actual.source_reads, count, "classification source reads")?;
-    actual.classifications = checked_add(actual.classifications, count, "classifications")?;
-    let work = count
-        .checked_mul(CLASSIFICATION_WORK)
-        .ok_or(ReduceError::ArithmeticOverflow {
-            computation: "classification block work",
-        })?;
-    actual.work = checked_add(actual.work, work, "classification work")?;
-    Ok(())
-}
-
-fn charge_candidate(actual: &mut ReduceActualCounters) -> Result<(), ReduceError> {
-    actual.tokens = checked_add(actual.tokens, 1, "literal candidate events")?;
-    actual.work = checked_add(actual.work, CANDIDATE_WORK, "literal candidate work")?;
-    Ok(())
+const fn is_ascii_space(byte: u8) -> bool {
+    matches!(byte, b'\t'..=b'\r' | b' ')
 }
 
 fn record_match(
@@ -977,11 +810,11 @@ fn verify_actual(
         upper.classifications,
     )?;
     verify(
-        "Finder linear terms",
+        "literal comparisons",
         actual.literal_comparisons,
         upper.literal_comparisons,
     )?;
-    verify("literal candidates", actual.tokens, upper.token_events)?;
+    verify("token events", actual.tokens, upper.token_events)?;
     verify("matches", actual.matches, upper.match_events)?;
     verify("count", actual.count, upper.count)?;
     verify("span sum", actual.span_sum, upper.span_sum)?;
@@ -1289,37 +1122,27 @@ mod tests {
     }
 
     #[test]
-    fn retained_finder_and_run_accounting_is_exact_and_conservative() {
+    fn one_pass_literal_gating_and_accounting_are_exact_and_conservative() {
         let plan = plan(b"Holmes", true);
-        assert_eq!(plan.finder.needle(), b"Holmes");
-        assert_eq!(plan.word_scanner.set(), ASCII_WORD_SET);
-        assert_eq!(plan.space_scanner.set(), ASCII_SPACE_SET);
-        assert_eq!(
-            plan.word_scanner.selection().policy,
-            fre_simd_kernels::DispatchPolicy::Auto
-        );
-        assert_eq!(
-            plan.space_scanner.selection().policy,
-            fre_simd_kernels::DispatchPolicy::Auto
-        );
+        assert_eq!(&*plan.literal, b"Holmes");
 
         let haystack = b"noise noise--Sherlock  Holmes \t watson--a Holmes b Holmes c--notHolmes";
         let count = plan
             .count(haystack, ReduceLimits::unlimited())
-            .expect("sparse count");
+            .expect("one-pass count");
         let spans = plan
             .span_sum(haystack, ReduceLimits::unlimited())
-            .expect("sparse span sum");
+            .expect("one-pass span sum");
         let actual = count.accounting.actual;
-        let finder_terms = haystack.len() + plan.finder.needle().len();
-        assert_eq!(actual.literal_comparisons, finder_terms);
-        assert_eq!(actual.source_reads, finder_terms + actual.classifications);
+        assert_eq!(actual.source_reads, haystack.len());
+        assert_eq!(actual.classifications, haystack.len());
+        assert!(actual.literal_comparisons < haystack.len());
         assert_eq!(
             actual.work,
             FIXED_REDUCE_WORK
-                + finder_terms * FINDER_TERM_WORK
                 + actual.classifications * CLASSIFICATION_WORK
-                + actual.tokens * CANDIDATE_WORK
+                + actual.literal_comparisons * LITERAL_COMPARISON_WORK
+                + actual.tokens * TOKEN_EVENT_WORK
                 + actual.matches * MATCH_WORK
         );
         assert_eq!(
@@ -1328,7 +1151,11 @@ mod tests {
         );
         assert_eq!(spans.accounting.actual.source_reads, actual.source_reads);
         assert_eq!(spans.accounting.actual.work, actual.work);
-        assert!(count.accounting.upper_bounds.classifications < haystack.len() * 16);
+        assert_eq!(
+            count.accounting.upper_bounds.classifications,
+            haystack.len()
+        );
+        assert_eq!(count.accounting.upper_bounds.source_reads, haystack.len());
         assert!(count.accounting.upper_bounds.source_reads >= actual.source_reads);
     }
 
@@ -1398,7 +1225,7 @@ mod tests {
             .upper_bounds;
         let exact = exact_limits(upper);
         plan.span_sum(haystack, exact)
-            .expect("every exact sparse limit succeeds");
+            .expect("every exact one-pass limit succeeds");
         let cases = [
             ReduceLimits {
                 max_input_bytes: upper.input_bytes - 1,

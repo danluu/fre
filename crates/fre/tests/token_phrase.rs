@@ -96,7 +96,7 @@ fn asserted_and_unasserted_shapes_select_operation_owned_leaf() {
 }
 
 #[test]
-fn facade_uses_sparse_literal_candidates_and_enforces_phrase_restart() {
+fn facade_uses_one_pass_literal_gating_and_enforces_phrase_restart() {
     let mut haystack = vec![b'x'; 4_096];
     haystack.extend_from_slice(b"--a Holmes b Holmes c--");
     haystack.extend_from_slice(&[b'y'; 4_096]);
@@ -113,16 +113,10 @@ fn facade_uses_sparse_literal_candidates_and_enforces_phrase_restart() {
         let AggregateExecutionDetails::TokenPhrase(accounting) = result.report().details() else {
             panic!("token phrase count executed another family");
         };
-        assert_eq!(
-            accounting.actual.literal_comparisons,
-            haystack.len() + b"Holmes".len()
-        );
-        assert_eq!(accounting.actual.tokens, 2);
+        assert_eq!(accounting.actual.source_reads, haystack.len());
+        assert_eq!(accounting.actual.classifications, haystack.len());
+        assert!(accounting.actual.literal_comparisons < haystack.len());
         assert_eq!(accounting.actual.matches, 1);
-        assert_eq!(
-            accounting.actual.source_reads,
-            accounting.actual.literal_comparisons + accounting.actual.classifications
-        );
 
         let span_sum = builder(pattern).build_span_sum().unwrap();
         assert_eq!(
