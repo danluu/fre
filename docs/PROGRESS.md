@@ -93,14 +93,18 @@ an open P0 row.
   use zero dynamic scratch, and preserve forced continuation and neighboring
   routes.
 - [x] `fre-jit-runtime`: strict-W^X AArch64 publication now has a separate
-  `SelectedEnd` register-return ABI2 type for V8 plus SVE tag 19 and SVE2 tag
-  21. Publication exposes no direct call; invocation is session-only. V8 opens
-  a session without an SVE syscall, while Linux tags 19 and 21 observe the
-  calling thread's SVE vector length once at session creation and require
-  VL16. The explicit
+  `SelectedEnd` register-return ABI2 type used by the qualified facade for V8
+  plus SVE tag 19 and SVE2 tag 21. Publication exposes no direct call;
+  invocation is session-only. V8 opens a session without an SVE syscall, while
+  Linux facade tags 19 and 21 observe the calling thread's SVE vector length
+  once at session creation and require VL16. Versioned low-level Search-v1
+  APIs remain separate research/compatibility contracts. The explicit
   16-byte `QualifiedExactSearch` large-window/reuse leaf remains a Candidate:
   all four current qualification atoms are `Candidate`, legacy V7 is hard
-  `Candidate`, and no current Search JIT leaf is performance-qualified.
+  `Candidate`, and no current Search JIT leaf is performance-qualified. The
+  tag-19 ABI2 correctness producer, V5 fresh-process public-facade campaign,
+  and composed-only verifier are implemented source but have no retained run
+  under the current admission fence.
 - [x] `fre-jit-cache`: bounded typed single-flight publication, deterministic
   eviction, exact live mapping/code/data accounting across leases, forced
   retirement-race recovery, and O(1) allocation-free image identity access;
@@ -146,15 +150,16 @@ reducers without repeated suffix searches; count and span-sum are exposed by
 operation-typed facade plans and the exact Rebar semantic adapter. General
 match-sequence exposure remains separate. Pattern-specialized AArch64 code can
 be published under a strict audited W^X lifecycle through the explicit
-qualified-search API, but every V8/tag-21 ABI2 call requires a same-thread
-session and no default portable facade selects it. There is still no capture
-API, general Unicode execution, qualified `SelectedEnd` AOT authority, or
-compatibility-qualified embedding surface. The P2b source-first AOT compiler
-and deterministic object/glue/receipt bundle are implemented as inert source;
-they provide neither a post-link observation nor a runtime adopter. The
-retained Search V1 adopter/default-off binding is a different ABI and cannot
-authorize P2b. A small implemented C11/C++17 surface exists for the current
-portable subset and reports `UPSTREAM_ORACLE_PENDING` in every plan record.
+qualified-search API, but every facade V8/tag-19/tag-21 ABI2 call requires a
+same-thread session and no default portable facade selects it. There is still
+no capture API, general Unicode execution, qualified `SelectedEnd` AOT
+authority, or compatibility-qualified embedding surface. The P2b source-first
+AOT compiler and deterministic object/glue/receipt bundle are implemented as
+inert source; they provide neither a post-link observation nor a runtime
+adopter. The retained Search V1 adopter/default-off binding is a different ABI
+and cannot authorize P2b. A small implemented C11/C++17 surface exists for the
+current portable subset and reports `UPSTREAM_ORACLE_PENDING` in every plan
+record.
 
 Seven-process diagnostic medians put exact literals and packed literal
 alternation at parity within noise; the retained literal-set DFA cross-check is
@@ -273,9 +278,11 @@ tree: legacy V7 is hard `Candidate`, all four current qualification atoms are
 The current native tracks remain direct machine code, not LLVM regex
 compilation. FRE's typed KIR and custom AArch64 emitters produce the regex
 payloads; LLVM may only support `rustc`/host tooling, and the system linker can
-only package already-emitted bytes. V8 plus SVE tag 19 and SVE2 tag 21 now
-share the `SelectedEnd` register-return ABI2 in JIT; tag-21 P2b AOT retains the
-same sealed image in a deterministic ELF/direct-hidden-glue bundle. P2b still has
+only package already-emitted bytes. The qualified facade routes V8 plus SVE
+tag 19 and SVE2 tag 21 through the `SelectedEnd` register-return ABI2 in JIT;
+the versioned low-level Search-v1 APIs remain separate, and tag-21 P2b AOT
+retains the same sealed ABI2 image in a deterministic
+ELF/direct-hidden-glue bundle. P2b still has
 `RuntimeAuthority::Absent`, no completed post-link observation, and no
 callable adopter.
 

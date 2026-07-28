@@ -22,8 +22,9 @@ evidence from an ancestor does not authorize this exact composed tree.
 LLVM is not, and cannot become through these paths, the regex compiler. FRE's
 typed Kernel IR feeds custom direct machine-code emitters:
 
-- Search JIT and Search AOT use `fre-jit-aarch64`. The current V8/tag-21
-  `SelectedEnd` ABI2 paths consume the same sealed typed image contract. JIT
+- Search JIT and Search AOT use `fre-jit-aarch64`. The qualified facade's
+  V8/tag-19/tag-21 `SelectedEnd` ABI2 paths consume the same sealed typed image
+  contract. JIT
   gives that image to `fre-jit-runtime` for strict-W^X publication; AOT
   revalidates and packages the already-emitted tag-21 payload as deterministic
   ELF bytes.
@@ -43,13 +44,16 @@ V8, tag 10, tag 19, and tag 21. All four production qualification atoms in
 Candidate is not authorization: with no qualified atom the facade reports an
 unqualified native status before host probing, emission, or publication.
 
-V8, SVE tag 19, and SVE2 tag 21 use the sealed four-argument `SelectedEnd`
-register-return ABI2. The haystack and half-open window occupy `x0` through
-`x3`; `x0` returns zero for no match or the absolute exclusive match end.
-ABI2 has no `x4` result pointer and no caller-owned result slot. The strict-W^X
-publication handle has no direct call method: every generated-code call must
-pass through its neither-`Send`-nor-`Sync` current-thread session. Sessionless
-facade calls use the retained portable owner.
+The qualified exact-search facade routes V8, SVE tag 19, and SVE2 tag 21
+through the sealed four-argument `SelectedEnd` register-return ABI2. The
+haystack and half-open window occupy `x0` through `x3`; `x0` returns zero for
+no match or the absolute exclusive match end. ABI2 has no `x4` result pointer
+and no caller-owned result slot. The strict-W^X publication handle has no
+direct call method: every generated-code call must pass through its
+neither-`Send`-nor-`Sync` current-thread session. Sessionless facade calls use
+the retained portable owner. Versioned low-level Search-v1 tag-19 emit/publish
+APIs remain distinct research/compatibility surfaces; their result-slot
+evidence cannot authorize this facade ABI2 route.
 
 When independently authorized, automatic selection prefers tag 21 on an
 admitted Arm `0x41/0xd84` ASIMD+SVE+SVE2 host, then considers tag 10, tag 19,
@@ -105,6 +109,15 @@ the evidence identity, and rejects rows whose self-reported artifact and
 evidence hashes were rewritten together. Historical V2 rows retain their
 legacy Span identity rules. This is implemented harness/verifier source, not
 a claim that a V3 run passed or produced performance evidence.
+
+Tag 19 now has separate source-bound ABI2 evidence producers: a low-level
+correctness executable for the exact four-argument image/session boundary and
+a V5 fresh-process facade campaign that compares public portable and
+Candidate-guarded NativeJit routes. Its Candidate-extracted verifier parses
+the retained raw rows, reconstructs correctness and performance summaries,
+and permits tag-19 authority only beside an independently verified V8
+fallback. No producer has been run at this checkpoint, so this is not
+qualification or a speed result.
 
 The existing checked-in Linux three-engine harness still measures the retained
 Search V1 Span adoption/raw-Span-JIT contract. A replacement that exercises
