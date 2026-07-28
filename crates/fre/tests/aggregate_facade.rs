@@ -15,9 +15,9 @@ use fre::{
     LITERAL_AGGREGATE_ALGORITHM_VERSION, LiteralAggregateActualCounters,
     LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateDeclaredFallback,
     LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceError,
-    PlanKind, PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
-    SimdDispatchContext, SimdFeature, UnicodeScalarAggregateOperation,
-    UnicodeScalarAggregateReduceError, guarded_ascii_word,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
+    PrefixClassAlternationReduceError, RustProfile, SearchLimits, SimdDispatchContext, SimdFeature,
+    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -5354,4 +5354,64 @@ fn rebar_row_imported_leipzig_huck_saw_prefix_class_complete_spans_and_limits() 
             "count for {pattern:?}"
         );
     }
+}
+
+#[test]
+fn rebar_row_name_alt4_prefix_class_span_sum_and_limits() {
+    // rebar-row:imported/sherlock/name-alt4@rust/regex
+    let pattern = r"Sher[a-z]+|Hol[a-z]+";
+    let haystack = b"Sherlock Holmes! Holdup--Sher";
+    let expected = upstream(pattern, haystack, false);
+    let expected_span_sum = expected.iter().fold(0_u64, |sum, &(start, end)| {
+        sum.checked_add(u64::try_from(end - start).unwrap())
+            .unwrap()
+    });
+    let span_sum = aggregate_builder(pattern)
+        .unicode(false)
+        .build_span_sum()
+        .unwrap();
+    assert_eq!(
+        AggregatePlanKind::PrefixClassAlternation,
+        span_sum.build_report().plan
+    );
+    assert!(matches!(
+        span_sum.build_report().plan_identity,
+        AggregatePlanIdentity::PrefixClassAlternation(identity)
+            if identity.kernel.operation_id
+                == PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID
+    ));
+    assert_eq!(
+        expected_span_sum,
+        span_sum
+            .span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap()
+    );
+    let rich = span_sum
+        .span_sum(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(expected_span_sum, rich.value());
+    assert!(matches!(
+        rich.report().details(),
+        AggregateExecutionDetails::PrefixClassAlternation(accounting)
+            if accounting.identity.operation_id
+                == PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID
+                && accounting.actual.span_sum == expected_span_sum
+    ));
+
+    let upper = span_sum
+        .retained_full_window_upper_bounds(haystack.len())
+        .unwrap()
+        .expect("prefix/class span-sum publishes retained bounds");
+    let fre::AggregateRetainedFullWindowUpperBounds::PrefixClassAlternation(upper) = upper else {
+        panic!("prefix/class span-sum retained another bounds family")
+    };
+    assert_eq!(u64::try_from(haystack.len()).unwrap(), upper.span_sum);
+    let mut one_below = AggregateRunLimits::default();
+    one_below.prefix_class_alternation.max_span_sum = upper.span_sum - 1;
+    assert!(matches!(
+        span_sum.span_sum_value(haystack, one_below).unwrap_err().source,
+        AggregateExecutionSource::PrefixClassAlternation(
+            PrefixClassAlternationReduceError::SpanSumLimit { needed, limit }
+        ) if needed == upper.span_sum && limit == upper.span_sum - 1
+    ));
 }

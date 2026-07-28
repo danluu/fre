@@ -90,16 +90,17 @@ use fre_kernels::{
     OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
     PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
-    PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
-    PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
-    PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
-    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
-    PackedOrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
-    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
-    PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
-    PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
-    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PackedOrderedLiteralAggregateActualCounters,
+    PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
+    PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
+    PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
+    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateUpperBounds,
+    PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
+    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
+    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
+    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, PrefixClassAlternationSpanSumResult,
     PrefixClassAlternationUpperBounds, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
     SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
     SimdDispatchContext, SparseOrderedLiteralAggregateActualCounters,
@@ -200,7 +201,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 41;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 42;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -228,7 +229,7 @@ pub enum AggregateOperation {
 pub enum AggregateRetainedFullWindowUpperBounds {
     /// Established or dispatched Unicode scalar reducer.
     UnicodeScalar(UnicodeScalarAggregateUpperBounds),
-    /// Established or dispatched two-branch prefix/class count reducer.
+    /// Established or dispatched two-branch prefix/class count/span-sum reducer.
     PrefixClassAlternation(PrefixClassAlternationUpperBounds),
     /// Literal/class-run/literal count or span-sum reducer.
     LiteralClassRunLiteral(LiteralClassRunLiteralUpperBounds),
@@ -341,7 +342,7 @@ pub enum AggregatePlanIdentity {
     BoundedClassSequence(BoundedClassSequenceOperationIdentity),
     /// Unicode-off bounded separated-field proof plus count identity.
     BoundedSeparatedFields(AggregateBoundedSeparatedFieldsIdentity),
-    /// Unicode-off two-branch prefix/class proof and native count identity.
+    /// Unicode-off two-branch prefix/class proof and native reduction identity.
     PrefixClassAlternation(AggregatePrefixClassAlternationIdentity),
     /// Unicode-off literal/class-run/literal proof and operation identity.
     LiteralClassRunLiteral(AggregateLiteralClassRunLiteralIdentity),
@@ -1405,7 +1406,7 @@ pub struct AggregateRunLimits {
     pub bounded_class_sequence: BoundedClassSequenceReduceLimits,
     /// Direct bounded separated-field count limits.
     pub bounded_separated_fields: BoundedSeparatedFieldsReduceLimits,
-    /// Direct two-branch prefix/class count limits.
+    /// Direct two-branch prefix/class count/span-sum limits.
     pub prefix_class_alternation: PrefixClassAlternationReduceLimits,
     /// Direct literal/class-run/literal reduction limits.
     pub literal_class_run_literal: LiteralClassRunLiteralReduceLimits,
@@ -3886,7 +3887,7 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
             cache.operation,
             identity.kernel.operation_id,
             PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-            None,
+            Some(PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID),
         ),
         AggregatePlanIdentity::LiteralClassRunLiteral(identity) => direct_operation_id_closes(
             cache.operation,
@@ -4118,7 +4119,7 @@ fn direct_details_close_cache(
                     cache.operation,
                     identity.kernel.operation_id,
                     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-                    None,
+                    Some(PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID),
                 )
         }
         (
@@ -9668,7 +9669,9 @@ impl AggregateBuilder {
             && selection == AggregatePlanSelection::Auto
             && matches!(
                 operation,
-                AggregateOperation::Compile | AggregateOperation::Count
+                AggregateOperation::Compile
+                    | AggregateOperation::Count
+                    | AggregateOperation::SpanSum
             )
             && prefix_class_selection_bound
                 .is_some_and(|work| work <= limits.max_prefix_class_alternation_planner_work)
@@ -9759,7 +9762,15 @@ impl AggregateBuilder {
                         })?;
                     let (dispatched, actual) = attempt.into_parts();
                     let build = dispatched.build_accounting();
-                    let identity = dispatched.count_identity();
+                    let identity = match operation {
+                        AggregateOperation::Compile | AggregateOperation::Count => {
+                            dispatched.count_identity()
+                        }
+                        AggregateOperation::SpanSum => dispatched.span_sum_identity(),
+                        AggregateOperation::Spans => unreachable!(
+                            "prefix/class alternation selection excludes materialized spans"
+                        ),
+                    };
                     (
                         AggregatePrefixClassAlternationEngine::Dispatched(dispatched),
                         build,
@@ -9794,7 +9805,15 @@ impl AggregateBuilder {
                     })?;
                     let (established, actual) = attempt.into_parts();
                     let build = established.build_accounting();
-                    let identity = established.count_identity();
+                    let identity = match operation {
+                        AggregateOperation::Compile | AggregateOperation::Count => {
+                            established.count_identity()
+                        }
+                        AggregateOperation::SpanSum => established.span_sum_identity(),
+                        AggregateOperation::Spans => unreachable!(
+                            "prefix/class alternation selection excludes materialized spans"
+                        ),
+                    };
                     (
                         AggregatePrefixClassAlternationEngine::Established(established),
                         build,
@@ -13030,6 +13049,13 @@ impl AggregatePrefixClassAlternationEngine {
         }
     }
 
+    fn span_sum_identity(&self) -> PrefixClassAlternationOperationIdentity {
+        match self {
+            Self::Established(engine) => engine.span_sum_identity(),
+            Self::Dispatched(engine) => engine.span_sum_identity(),
+        }
+    }
+
     fn count_upper_bounds(
         &self,
         haystack_len: usize,
@@ -13037,6 +13063,16 @@ impl AggregatePrefixClassAlternationEngine {
         match self {
             Self::Established(engine) => engine.count_upper_bounds(haystack_len),
             Self::Dispatched(engine) => engine.count_upper_bounds(haystack_len),
+        }
+    }
+
+    fn span_sum_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<PrefixClassAlternationUpperBounds, PrefixClassAlternationReduceError> {
+        match self {
+            Self::Established(engine) => engine.span_sum_upper_bounds(haystack_len),
+            Self::Dispatched(engine) => engine.span_sum_upper_bounds(haystack_len),
         }
     }
 
@@ -13048,6 +13084,17 @@ impl AggregatePrefixClassAlternationEngine {
         match self {
             Self::Established(engine) => engine.count(haystack, limits),
             Self::Dispatched(engine) => engine.count(haystack, limits),
+        }
+    }
+
+    fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: PrefixClassAlternationReduceLimits,
+    ) -> Result<PrefixClassAlternationSpanSumResult, PrefixClassAlternationReduceError> {
+        match self {
+            Self::Established(engine) => engine.span_sum(haystack, limits),
+            Self::Dispatched(engine) => engine.span_sum(haystack, limits),
         }
     }
 }
@@ -13546,14 +13593,17 @@ impl AggregatePlan {
                     .map_err(AggregateExecutionSource::UnicodeScalar)
             }
             AggregateEngine::PrefixClassAlternation(engine) => {
-                if !matches!(
-                    self.operation(),
-                    AggregateOperation::Compile | AggregateOperation::Count
-                ) {
-                    return Err(AggregateExecutionSource::InternalInvariant(
-                        "retained prefix/class owner has an unsupported operation",
-                    ));
-                }
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained prefix/class owner has an unsupported operation",
+                        ));
+                    }
+                };
                 let (
                     AggregatePlanIdentity::PrefixClassAlternation(identity),
                     AggregateBuildAccounting::PrefixClassAlternation(build),
@@ -13564,15 +13614,23 @@ impl AggregatePlan {
                     ));
                 };
                 if !self.retained_bounds_report_closes(AggregatePlanKind::PrefixClassAlternation)
-                    || identity.kernel != engine.count_identity()
+                    || identity.kernel != expected_identity
                     || build != engine.build_accounting()
                 {
                     return Err(AggregateExecutionSource::InternalInvariant(
                         "retained prefix/class owner does not authenticate its published report",
                     ));
                 }
-                engine
-                    .count_upper_bounds(input_bytes)
+                let upper = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_upper_bounds(input_bytes)
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_upper_bounds(input_bytes),
+                    AggregateOperation::Spans => {
+                        unreachable!("prefix/class retained-owner span rejection returned above")
+                    }
+                };
+                upper
                     .map(AggregateRetainedFullWindowUpperBounds::PrefixClassAlternation)
                     .map(Some)
                     .map_err(AggregateExecutionSource::PrefixClassAlternation)
@@ -14670,12 +14728,16 @@ impl AggregatePlan {
                     "span-sum operation retained a bounded separated-field count plan",
                 ),
             )),
-            AggregateEngine::PrefixClassAlternation(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span-sum operation retained a count-only prefix/class plan",
-                ),
-            )),
+            AggregateEngine::PrefixClassAlternation(engine) => engine
+                .span_sum(haystack, limits.prefix_class_alternation)
+                .map(AggregateSpanSumExecution::PrefixClassAlternation)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PrefixClassAlternation(source),
+                    )
+                }),
             AggregateEngine::LiteralClassRunLiteral(engine) => engine
                 .span_sum(haystack, limits.literal_class_run_literal)
                 .map(AggregateSpanSumExecution::LiteralClassRunLiteral)
@@ -15451,12 +15513,16 @@ impl AggregatePlan {
                     "span-sum operation retained a bounded separated-field count plan",
                 ),
             )),
-            AggregateEngine::PrefixClassAlternation(_) => Err(self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "span-sum operation retained a count-only prefix/class plan",
-                ),
-            )),
+            AggregateEngine::PrefixClassAlternation(engine) => engine
+                .span_sum(haystack, limits.prefix_class_alternation)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PrefixClassAlternation(source),
+                    )
+                }),
             AggregateEngine::LiteralClassRunLiteral(engine) => engine
                 .span_sum(haystack, limits.literal_class_run_literal)
                 .map(|result| result.span_sum)
@@ -15869,6 +15935,7 @@ enum AggregateSpanSumExecution {
     BlockingDelimiter(BlockingDelimiterSpanSumResult),
     TokenPhrase(TokenPhraseSpanSumResult),
     FixedClassSandwich(FixedClassSandwichSpanSumResult),
+    PrefixClassAlternation(PrefixClassAlternationSpanSumResult),
     FixedAbsoluteDomain(FixedAbsoluteDomainSpanSumResult),
     LiteralClassRunLiteral(LiteralClassRunLiteralSpanSumResult),
     BoundedLiteralPair(BoundedLiteralPairSpanSumResult),
@@ -15906,6 +15973,7 @@ impl AggregateSpanSumExecution {
             Self::BlockingDelimiter(result) => result.span_sum,
             Self::TokenPhrase(result) => result.span_sum,
             Self::FixedClassSandwich(result) => result.span_sum,
+            Self::PrefixClassAlternation(result) => result.span_sum,
             Self::FixedAbsoluteDomain(result) => result.span_sum,
             Self::LiteralClassRunLiteral(result) => result.span_sum,
             Self::BoundedLiteralPair(result) => result.span_sum,
@@ -15936,6 +16004,9 @@ impl AggregateSpanSumExecution {
             Self::TokenPhrase(result) => AggregateExecutionDetails::TokenPhrase(result.accounting),
             Self::FixedClassSandwich(result) => {
                 AggregateExecutionDetails::FixedClassSandwich(result.accounting)
+            }
+            Self::PrefixClassAlternation(result) => {
+                AggregateExecutionDetails::PrefixClassAlternation(result.accounting)
             }
             Self::FixedAbsoluteDomain(result) => AggregateExecutionDetails::FixedAbsoluteDomain(
                 AggregateFixedAbsoluteDomainExecutionDetails::Direct {
@@ -18530,7 +18601,7 @@ mod tests {
             2_400
         );
         assert_eq!(core::mem::size_of::<AggregateExecutionDetails>(), 736);
-        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
+        assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_360);
     }
 
     #[test]

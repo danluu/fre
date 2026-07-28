@@ -29,7 +29,9 @@
 //! Execution admits `16N + 8Q + 64`, `N` match events, and `N` count before
 //! iterator creation or haystack inspection; this covers both monotone
 //! searches, every candidate read/branch/start comparison, membership
-//! comparison, counter/cursor write, and count conversion. Execution
+//! comparison, counter/cursor write, count conversion, and checked logical
+//! match-width accumulation. Span sum additionally reserves `N` matched bytes:
+//! positive non-overlapping spans cannot exceed the haystack length. Execution
 //! allocation, initialization, reserve, copy, deduplication, UTF-8/boundary
 //! preprocessing, and growing stack/queue storage are zero; its two iterators,
 //! two next-candidate slots, and scalar counters form an `O(1)` fixed frame.
@@ -77,6 +79,7 @@ pub const PLAN_ID: &str = "prefix-class-alternation.two-monotone-literal-streams
 pub const DISPATCHED_PLAN_ID: &str =
     "prefix-class-alternation.two-monotone-literal-streams.sve-run16.v1";
 pub const COUNT_OPERATION_ID: &str = "prefix-class-alternation.count.unicode-off.v1";
+pub const SPAN_SUM_OPERATION_ID: &str = "prefix-class-alternation.span-sum.unicode-off.v1";
 pub const UNIFORM_PARTICIPATION_PLAN_ID: &str =
     "prefix-class-alternation.uniform-participation.two-finder.v1";
 pub const DISPATCHED_UNIFORM_PARTICIPATION_PLAN_ID: &str =
@@ -109,6 +112,12 @@ enum ReduceImplementation {
     Scalar,
     /// One retained directional SIMD run scanner per alternative.
     DispatchedRunScanners,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Operation {
+    Count,
+    SpanSum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,6 +306,7 @@ pub struct ReduceLimits {
     pub max_work: usize,
     pub max_match_events: usize,
     pub max_count: u64,
+    pub max_span_sum: u64,
     pub max_scratch_bytes: usize,
     pub max_peak_bytes: usize,
 }
@@ -308,6 +318,7 @@ impl ReduceLimits {
             max_work: usize::MAX,
             max_match_events: usize::MAX,
             max_count: u64::MAX,
+            max_span_sum: u64::MAX,
             max_scratch_bytes: usize::MAX,
             max_peak_bytes: usize::MAX,
         }
@@ -320,6 +331,7 @@ impl Default for ReduceLimits {
             max_work: 512 * 1024 * 1024,
             max_match_events: 64 * 1024 * 1024,
             max_count: 64 * 1024 * 1024,
+            max_span_sum: u64::MAX,
             max_scratch_bytes: 0,
             max_peak_bytes: 32 * 1024 * 1024,
         }
@@ -333,6 +345,7 @@ pub struct ReduceUpperBounds {
     pub work: usize,
     pub match_events: usize,
     pub count: u64,
+    pub span_sum: u64,
     pub scratch_bytes: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
@@ -344,6 +357,7 @@ pub struct ReduceActualCounters {
     pub class_bytes: usize,
     pub matches: usize,
     pub count: u64,
+    pub span_sum: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,11 +373,18 @@ pub struct CountResult {
     pub accounting: ReduceAccounting,
 }
 
-/// Derive the complete source-free count envelope for a retained implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpanSumResult {
+    pub span_sum: u64,
+    pub accounting: ReduceAccounting,
+}
+
+/// Derive the complete source-free reduction envelope for a retained implementation.
 fn derive_reduce_upper_bounds(
     build: BuildAccounting,
     haystack_len: usize,
     implementation: ReduceImplementation,
+    operation: Operation,
 ) -> Result<ReduceUpperBounds, ReduceError> {
     let match_events = haystack_len;
     let scanner_overhead = match implementation {
@@ -390,12 +411,21 @@ fn derive_reduce_upper_bounds(
     let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
         computation: "match event bound as u64",
     })?;
+    let span_sum = match operation {
+        Operation::Count => 0,
+        Operation::SpanSum => {
+            u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "haystack length as span-sum bound",
+            })?
+        }
+    };
     Ok(ReduceUpperBounds {
         haystack_bytes: haystack_len,
         shape_units: build.shape_units,
         work,
         match_events,
         count,
+        span_sum,
         scratch_bytes: 0,
         persistent_bytes: build.persistent_bytes,
         peak_bytes: build.persistent_bytes,
@@ -780,6 +810,7 @@ pub enum ReduceError {
     WorkLimit { needed: usize, limit: usize },
     MatchEventsLimit { needed: usize, limit: usize },
     CountLimit { needed: u64, limit: u64 },
+    SpanSumLimit { needed: u64, limit: u64 },
     ScratchLimit { needed: usize, limit: usize },
     PeakLimit { needed: usize, limit: usize },
     ArithmeticOverflow { computation: &'static str },
@@ -1160,6 +1191,17 @@ impl PrefixClassAlternationPlan {
         }
     }
 
+    #[must_use]
+    pub const fn span_sum_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: PLAN_ID,
+            operation_id: SPAN_SUM_OPERATION_ID,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
     /// Publish the scalar plan's exact source-free full-window count envelope.
     pub fn count_upper_bounds(
         &self,
@@ -1169,6 +1211,20 @@ impl PrefixClassAlternationPlan {
             self.build_accounting(),
             haystack_len,
             ReduceImplementation::Scalar,
+            Operation::Count,
+        )
+    }
+
+    /// Publish the scalar plan's exact source-free full-window span-sum envelope.
+    pub fn span_sum_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(
+            self.build_accounting(),
+            haystack_len,
+            ReduceImplementation::Scalar,
+            Operation::SpanSum,
         )
     }
 
@@ -1183,11 +1239,59 @@ impl PrefixClassAlternationPlan {
         identity: OperationIdentity,
         run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
     ) -> Result<CountResult, ReduceError> {
-        let upper_bounds =
-            self.preflight_with_run_scanners(haystack.len(), limits, run_scanners[0].is_some())?;
-        let actual = self.scan_with_run_scanners(haystack, upper_bounds, run_scanners, |_| {})?;
+        let upper_bounds = self.preflight_with_run_scanners(
+            haystack.len(),
+            Operation::Count,
+            limits,
+            run_scanners[0].is_some(),
+        )?;
+        let actual = self.scan_with_run_scanners(
+            haystack,
+            Operation::Count,
+            upper_bounds,
+            run_scanners,
+            |_| {},
+        )?;
         Ok(CountResult {
             count: actual.count,
+            accounting: ReduceAccounting {
+                identity,
+                upper_bounds,
+                actual,
+            },
+        })
+    }
+
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        self.span_sum_with_run_scanners(haystack, limits, self.span_sum_identity(), [None, None])
+    }
+
+    fn span_sum_with_run_scanners(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        identity: OperationIdentity,
+        run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+    ) -> Result<SpanSumResult, ReduceError> {
+        let upper_bounds = self.preflight_with_run_scanners(
+            haystack.len(),
+            Operation::SpanSum,
+            limits,
+            run_scanners[0].is_some(),
+        )?;
+        let actual = self.scan_with_run_scanners(
+            haystack,
+            Operation::SpanSum,
+            upper_bounds,
+            run_scanners,
+            |_| {},
+        )?;
+        Ok(SpanSumResult {
+            span_sum: actual.span_sum,
             accounting: ReduceAccounting {
                 identity,
                 upper_bounds,
@@ -1763,12 +1867,13 @@ impl PrefixClassAlternationPlan {
         haystack_len: usize,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        self.preflight_with_run_scanners(haystack_len, limits, false)
+        self.preflight_with_run_scanners(haystack_len, Operation::Count, limits, false)
     }
 
     fn preflight_with_run_scanners(
         &self,
         haystack_len: usize,
+        operation: Operation,
         limits: ReduceLimits,
         run_scanners: bool,
     ) -> Result<ReduceUpperBounds, ReduceError> {
@@ -1777,8 +1882,12 @@ impl PrefixClassAlternationPlan {
         } else {
             ReduceImplementation::Scalar
         };
-        let upper =
-            derive_reduce_upper_bounds(self.build_accounting(), haystack_len, implementation)?;
+        let upper = derive_reduce_upper_bounds(
+            self.build_accounting(),
+            haystack_len,
+            implementation,
+            operation,
+        )?;
         enforce_reduce(upper.work, limits.max_work, ReduceResource::Work)?;
         enforce_reduce(
             upper.match_events,
@@ -1789,6 +1898,12 @@ impl PrefixClassAlternationPlan {
             return Err(ReduceError::CountLimit {
                 needed: upper.count,
                 limit: limits.max_count,
+            });
+        }
+        if upper.span_sum > limits.max_span_sum {
+            return Err(ReduceError::SpanSumLimit {
+                needed: upper.span_sum,
+                limit: limits.max_span_sum,
             });
         }
         enforce_reduce(
@@ -1815,7 +1930,7 @@ impl PrefixClassAlternationPlan {
         upper: ReduceUpperBounds,
         emit: impl FnMut(Range<usize>),
     ) -> Result<ReduceActualCounters, ReduceError> {
-        self.scan_with_run_scanners(haystack, upper, [None, None], emit)
+        self.scan_with_run_scanners(haystack, Operation::Count, upper, [None, None], emit)
     }
 
     #[allow(
@@ -1825,6 +1940,7 @@ impl PrefixClassAlternationPlan {
     fn scan_with_run_scanners(
         &self,
         haystack: &[u8],
+        operation: Operation,
         upper: ReduceUpperBounds,
         run_scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
         mut emit: impl FnMut(Range<usize>),
@@ -1838,6 +1954,7 @@ impl PrefixClassAlternationPlan {
         let mut prefix_candidates = 0_usize;
         let mut class_bytes = 0_usize;
         let mut matches = 0_usize;
+        let mut span_sum = 0_u64;
         loop {
             for alternative in 0..2 {
                 while next[alternative].is_some_and(|start| start < cursor) {
@@ -1898,6 +2015,22 @@ impl PrefixClassAlternationPlan {
                 })?;
             let end = extension.end;
             emit(start..end);
+            if operation == Operation::SpanSum {
+                let width = end
+                    .checked_sub(start)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual match width",
+                    })?;
+                span_sum = span_sum
+                    .checked_add(u64::try_from(width).map_err(|_| {
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual match width as u64",
+                        }
+                    })?)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual span sum",
+                    })?;
+            }
             matches = matches
                 .checked_add(1)
                 .ok_or(ReduceError::ArithmeticOverflow {
@@ -1914,6 +2047,7 @@ impl PrefixClassAlternationPlan {
             class_bytes,
             matches,
             count,
+            span_sum,
         })
     }
 }
@@ -2154,6 +2288,17 @@ impl DispatchedPrefixClassAlternationPlan {
         }
     }
 
+    #[must_use]
+    pub const fn span_sum_identity(&self) -> OperationIdentity {
+        OperationIdentity {
+            plan_id: DISPATCHED_PLAN_ID,
+            operation_id: SPAN_SUM_OPERATION_ID,
+            alternatives: 2,
+            unicode: false,
+            non_overlapping: true,
+        }
+    }
+
     /// Publish the dispatched plan's exact source-free full-window count
     /// envelope, including retained run-scanner classifications.
     pub fn count_upper_bounds(
@@ -2164,6 +2309,21 @@ impl DispatchedPrefixClassAlternationPlan {
             self.build_accounting(),
             haystack_len,
             ReduceImplementation::DispatchedRunScanners,
+            Operation::Count,
+        )
+    }
+
+    /// Publish the dispatched plan's exact source-free full-window span-sum
+    /// envelope, including retained run-scanner classifications.
+    pub fn span_sum_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(
+            self.build_accounting(),
+            haystack_len,
+            ReduceImplementation::DispatchedRunScanners,
+            Operation::SpanSum,
         )
     }
 
@@ -2172,6 +2332,19 @@ impl DispatchedPrefixClassAlternationPlan {
             haystack,
             limits,
             self.count_identity(),
+            self.scanner_refs(),
+        )
+    }
+
+    pub fn span_sum(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<SpanSumResult, ReduceError> {
+        self.plan().span_sum_with_run_scanners(
+            haystack,
+            limits,
+            self.span_sum_identity(),
             self.scanner_refs(),
         )
     }
@@ -3872,6 +4045,33 @@ mod tests {
     }
 
     #[test]
+    fn rebar_row_imported_leipzig_huck_saw_span_sum_and_one_below() {
+        // rebar-row:imported/leipzig/huck-saw@rust/regex
+        let plan = plan();
+        let haystack = b"abcz--xy7";
+        let result = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+        assert_eq!(7, result.span_sum);
+        assert_eq!(7, result.accounting.actual.span_sum);
+        assert_eq!(9, result.accounting.upper_bounds.span_sum);
+        assert_eq!(
+            SPAN_SUM_OPERATION_ID,
+            result.accounting.identity.operation_id
+        );
+
+        let one_below = ReduceLimits {
+            max_span_sum: 8,
+            ..ReduceLimits::unlimited()
+        };
+        assert_eq!(
+            Err(ReduceError::SpanSumLimit {
+                needed: 9,
+                limit: 8,
+            }),
+            plan.span_sum(haystack, one_below)
+        );
+    }
+
+    #[test]
     fn rebar_row_imported_leipzig_huck_saw_complete_span_differential_boundaries() {
         // rebar-row:imported/leipzig/huck-saw@rust/regex
         let plan = plan();
@@ -3883,10 +4083,23 @@ mod tests {
             b"ababzxy77",
             b"\xFFabq\x80xy0",
         ] {
+            let expected = reference_spans(r"ab[a-z]+|xy[0-9]+", haystack);
             assert_eq!(
-                reference_spans(r"ab[a-z]+|xy[0-9]+", haystack),
+                expected,
                 sut_spans(&plan, haystack),
                 "haystack={haystack:?}"
+            );
+            let expected_span_sum = expected.iter().try_fold(0_u64, |sum, span| {
+                sum.checked_add(u64::try_from(span.len()).ok()?)
+            });
+            assert_eq!(
+                expected_span_sum,
+                Some(
+                    plan.span_sum(haystack, ReduceLimits::unlimited())
+                        .unwrap()
+                        .span_sum
+                ),
+                "span sum for haystack={haystack:?}"
             );
         }
     }

@@ -69,7 +69,7 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     );
     assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_312);
     assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 9_096);
-    assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_352);
+    assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_360);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_560);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 9_952);
     assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 392);

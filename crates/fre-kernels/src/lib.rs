@@ -435,6 +435,8 @@ pub use prefix_class_alternation::{
     ReduceLimits as PrefixClassAlternationReduceLimits,
     ReduceUpperBounds as PrefixClassAlternationUpperBounds,
     RunScannerBuildAccounting as PrefixClassAlternationRunScannerBuildAccounting,
+    SPAN_SUM_OPERATION_ID as PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    SpanSumResult as PrefixClassAlternationSpanSumResult,
     UNIFORM_PARTICIPATION_ACCOUNTING_VERSION as PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
     UNIFORM_PARTICIPATION_ALGORITHM_VERSION as PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
     UNIFORM_PARTICIPATION_OPERATION_ID as PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID,

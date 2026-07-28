@@ -73,7 +73,8 @@ use fre::{
     OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
     OperationSessionValue, OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID, PortableBuilder,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PortableBuilder,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
     PrefixClassUniformParticipationBuildLimits, RustProfile, SHEBANG_CAPTURE_PATTERN,
@@ -8624,6 +8625,7 @@ fn prefix_class_alternation_operation_limits(
         max_work: upper.work.min(limits.fre_aggregate_operation_work),
         max_match_events: upper.match_events.min(reducer_limit),
         max_count: upper.count.min(limits.reducer_steps),
+        max_span_sum: upper.span_sum.min(limits.reducer_steps),
         max_scratch_bytes: upper.scratch_bytes,
         max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
     })
@@ -11018,12 +11020,16 @@ fn require_unicode_plan_identity(
             )));
         }
         if let AggregatePlanIdentity::PrefixClassAlternation(identity) = report.plan_identity {
-            if operation == LiteralAggregateOperation::Count
-                && matches!(
-                    identity.kernel.plan_id,
-                    PREFIX_CLASS_ALTERNATION_PLAN_ID | DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
-                )
-                && identity.kernel.operation_id == PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID
+            let operation_id = match operation {
+                LiteralAggregateOperation::Count => PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+                LiteralAggregateOperation::SpanSum => {
+                    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID
+                }
+            };
+            if matches!(
+                identity.kernel.plan_id,
+                PREFIX_CLASS_ALTERNATION_PLAN_ID | DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID
+            ) && identity.kernel.operation_id == operation_id
                 && !identity.kernel.unicode
                 && identity.kernel.alternatives == 2
                 && identity.kernel.non_overlapping
@@ -11515,6 +11521,7 @@ fn prefix_class_reduce_error(
         PrefixClassAlternationReduceError::WorkLimit { .. }
         | PrefixClassAlternationReduceError::MatchEventsLimit { .. }
         | PrefixClassAlternationReduceError::CountLimit { .. }
+        | PrefixClassAlternationReduceError::SpanSumLimit { .. }
         | PrefixClassAlternationReduceError::ScratchLimit { .. }
         | PrefixClassAlternationReduceError::PeakLimit { .. } => {
             ExecutionError::unsupported(message)
@@ -18038,6 +18045,23 @@ mod tests {
                 actual: expected,
                 plan: plan.to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn current_fre_name_alt4_span_sum_uses_prefix_class_route() {
+        let patterns = vec![r"Sher[a-z]+|Hol[a-z]+".to_string()];
+        assert_current_fre_execution(
+            current_fre(
+                "count-spans",
+                &patterns,
+                b"Sherlock Holmes! Holdup--Sher",
+                false,
+                false,
+                &RunLimits::default(),
+            ),
+            20,
+            "aggregate-prefix-class-alternation",
         );
     }
 
