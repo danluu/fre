@@ -82,6 +82,27 @@ fn selected_end_register_v2_feature_admission_is_backend_exact_and_vl_free() {
         ),
         Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
     );
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            features(false, true, true),
+        ),
+        Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
+    );
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            features(true, false, true),
+        ),
+        Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+    );
+    assert_eq!(
+        validate_selected_end_register_host_features_v2(
+            SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            features(true, true, false),
+        ),
+        Ok(())
+    );
     for (available, missing) in [
         (features(false, true, true), "asimd"),
         (features(true, false, true), "sve"),
@@ -381,6 +402,7 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     );
     assert!(platform.contains("self.sve_vector_bytes_at_publication.is_none()"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD"));
+    assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE"));
     assert!(platform.contains("self.target.features == CpuFeatures::ASIMD_SVE2"));
 }
 

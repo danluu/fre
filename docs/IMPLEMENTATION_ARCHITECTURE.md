@@ -80,7 +80,7 @@ emitter.
 | `fre-kernel-ir` | proven fast-plan shape | validated structured kernel plus portable oracle result | deterministic identity, CFG/bounds validation, 728,420 differential/malformed cases, and normative ISA contract |
 | `fre-jit-aarch64` | validated Kernel IR plus AAPCS64 target stamp | immutable code/rodata/relocation image and address-free AOT artifact | 455,916 decoded-machine differentials, independent authenticity audit, exact limits; executable publication remains separate |
 | `fre-jit-x86_64` | validated Kernel IR plus SysV target stamp | immutable code/data/relocation image and address-free AOT artifact | 276,309 scalar/SSE external instruction executions, independent audit, exact limits; AVX2 and production publication remain open |
-| `fre-jit-runtime` | audited AArch64 native image plus typed output/ABI contract | immutable reference-counted publication plus same-thread callable session | strict `PROT_NONE` to RW to RX lifecycle with guards and exact accounting; V8 and tag 21 use the four-argument `SelectedEnd` register-return ABI2, expose no direct call on the publication handle, and invoke only through a current-thread session; tag 21 checks VL16 once when that session opens |
+| `fre-jit-runtime` | audited AArch64 native image plus typed output/ABI contract | immutable reference-counted publication plus same-thread callable session | strict `PROT_NONE` to RW to RX lifecycle with guards and exact accounting; V8 plus SVE tag 19 and SVE2 tag 21 use the four-argument `SelectedEnd` register-return ABI2, expose no direct call on the publication handle, and invoke only through a current-thread session; tags 19 and 21 check VL16 once when that session opens |
 | `fre-jit-cache` | immutable AArch64 image, typed output contract, fixed publication/cache limits | callable lease plus exact current/peak/event snapshot | same-key single-flight, different-key concurrency, deterministic LRU, unique-token retirement, outstanding-lease accounting, O(1) precomputed full-AOT identity, forced races/failures, and 14 cache tests; process-local only and no speed claim |
 | `fre-aot-macho` / `fre-aot-elf` | audited AArch64 native image plus an external planner binding | deterministic relocatable object, metadata, identity-derived symbols, and object receipts | independently reparse and validate emitted bytes; the Linux tag-21 V2 object preserves the sealed `SelectedEnd` ABI2 image and declares only hidden identity-suffixed four-argument symbols; object creation is inert |
 | `fre-aot-compiler` | authenticated facade source/plan plus sealed Count or Search manifest | deterministic machine-code object plus source/KIR/native/object receipts and inert glue material | the Linux `SelectedEnd` P2b slice retains the same sealed tag-21 image used by JIT, emits deterministic ELF plus exact hidden direct-`bl` glue/declarations/receipts, and explicitly grants no runtime authority or completed post-link observation |
@@ -140,18 +140,19 @@ K0. A native loop over regex bytecode is not accepted as JIT specialization.
 The current default AArch64 exact-search emitter contract is `SEARCH_V8`
 (`SearchBackendPolicy::AsimdV8`). It uses lazy 64-candidate screening with the
 V7 staged-recovery fallback, while the historical backend encodings remain
-versioned and byte-stable. V8 and Linux SVE2 tag 21 now use the sealed
-`SelectedEnd` register-return ABI2: `x0` through `x3` carry the haystack and
-half-open window, and `x0` returns zero for no match or the absolute exclusive
-match end. There is no `x4` result pointer or caller-owned result slot.
+versioned and byte-stable. V8, Linux SVE tag 19, and Linux SVE2 tag 21 now use
+the sealed `SelectedEnd` register-return ABI2: `x0` through `x3` carry the
+haystack and half-open window, and `x0` returns zero for no match or the
+absolute exclusive match end. There is no `x4` result pointer or caller-owned
+result slot.
 Strict-W^X publication does not expose a direct call method; generated code is
 reachable only through a same-thread invocation session. V8 session creation
-does not query SVE state. Tag 21 admits the process-wide ASIMD+SVE+SVE2/tuning
-contract separately and observes the calling thread's SVE vector length once,
-requiring VL16 when the invocation session opens. Search calls perform no VL
-query. This emitter support is not facade authorization: the V8, tag-10,
-tag-19, and tag-21 qualification atoms are all `Candidate`, and legacy V7
-remains hard `Candidate`.
+does not query SVE state. Tag 19 admits the process-wide ASIMD+SVE/tuning
+contract and tag 21 admits ASIMD+SVE+SVE2/tuning. Each observes the calling
+thread's SVE vector length once, requiring VL16 when the invocation session
+opens. Search calls perform no VL query. This emitter support is not facade
+authorization: the V8, tag-10, tag-19, and tag-21 qualification atoms are all
+`Candidate`, and legacy V7 remains hard `Candidate`.
 
 AOT adds no LLVM or other second regex optimizer. The Linux `SelectedEnd`
 P2b path packages the same sealed tag-21 ABI2 image as deterministic ELF,

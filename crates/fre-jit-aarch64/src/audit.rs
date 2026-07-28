@@ -229,7 +229,9 @@ fn audit_selected_end_register_image_v2(image: &NativeImage) -> Result<AuditRepo
         || image.output() != OutputKind::SelectedEnd
         || !matches!(
             image.backend_version(),
-            BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+            BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         )
     {
         return Err(AuditError::InvalidImageContract);

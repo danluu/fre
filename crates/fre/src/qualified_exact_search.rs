@@ -430,9 +430,9 @@ pub enum QualifiedExactSearchRoute {
 /// Generated-code call ABI retained by one published native route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualifiedExactSearchNativeAbi {
-    /// Sealed Search-v1 out-pointer ABI retained only for tag10/tag19 fallback.
+    /// Sealed Search-v1 out-pointer ABI retained only for tag10 fallback.
     LegacySelectedEndV1,
-    /// Register-return ABI2 used by V8 and tag21.
+    /// Register-return ABI2 used by V8, tag19, and tag21.
     SelectedEndRegisterV2,
 }
 
@@ -455,7 +455,7 @@ pub struct QualifiedExactSearchNativeIdentity {
     pub sve_vector_bytes_at_publication: Option<u16>,
     /// SVE vector length required when opening an invocation session.
     ///
-    /// Register-return tag21 reports `Some(16)` here and `None` for
+    /// Register-return tags 19 and 21 report `Some(16)` here and `None` for
     /// `sve_vector_bytes_at_publication`, because ABI2 performs its sole VL
     /// observation at session construction.
     pub required_thread_sve_vector_bytes: Option<u16>,
@@ -629,8 +629,8 @@ impl From<SelectedEndRegisterCallErrorV2> for QualifiedExactSearchError {
 /// Every other width/window/workload, and every unavailable native host,
 /// remains on the portable plan. Every generated-code invocation goes through
 /// [`Self::begin_current_thread_session`]. Sessionless calls deliberately
-/// retain the portable owner, including V8; tag10/tag19 use the sealed legacy
-/// ABI only as fallback, while V8/tag21 use the register-return ABI2.
+/// retain the portable owner, including V8; tag10 uses the sealed legacy ABI
+/// only as fallback, while V8/tag19/tag21 use the register-return ABI2.
 #[derive(Debug)]
 pub struct QualifiedExactSearch {
     portable: LiteralPlan,
@@ -717,20 +717,22 @@ const fn selected_end_register_backend_v2(
 ) -> Option<SelectedEndRegisterBackendV2> {
     match backend_policy {
         QualifiedExactSearchBackendPolicy::AsimdV8 => Some(SelectedEndRegisterBackendV2::AsimdV8),
+        QualifiedExactSearchBackendPolicy::Sve16V6 => {
+            Some(SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16)
+        }
         QualifiedExactSearchBackendPolicy::Sve2Fixed16V2 => {
             Some(SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16)
         }
         QualifiedExactSearchBackendPolicy::AsimdV7
         | QualifiedExactSearchBackendPolicy::Sve16
-        | QualifiedExactSearchBackendPolicy::Sve2Fixed16
-        | QualifiedExactSearchBackendPolicy::Sve16V6 => None,
+        | QualifiedExactSearchBackendPolicy::Sve2Fixed16 => None,
     }
 }
 
 const fn legacy_selected_end_v1_backend(backend_policy: QualifiedExactSearchBackendPolicy) -> bool {
     matches!(
         backend_policy,
-        QualifiedExactSearchBackendPolicy::Sve2Fixed16 | QualifiedExactSearchBackendPolicy::Sve16V6
+        QualifiedExactSearchBackendPolicy::Sve2Fixed16
     )
 }
 
@@ -905,8 +907,8 @@ impl QualifiedExactSearch {
                 )
             },
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve16V6.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
                 )
             },
         )
@@ -1528,8 +1530,8 @@ enum QualifiedExactSearchFacadePlan {
 ///
 /// All generated-code calls require [`Self::begin_current_thread_session`].
 /// Sessionless calls use the retained portable owner. V8 session construction
-/// performs no SVE syscall; tag21 checks VL16 once there, while legacy
-/// tag10/tag19 retain their sealed fixed-VL session contract.
+/// performs no SVE syscall; ABI2 tag19/tag21 check VL16 once there, while
+/// legacy tag10 retains its sealed fixed-VL session contract.
 #[derive(Debug)]
 pub struct QualifiedExactSearchFacade {
     plan: QualifiedExactSearchFacadePlan,
@@ -1687,8 +1689,8 @@ impl QualifiedExactSearchFacade {
                 )
             },
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve16V6.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
                 )
             },
         )
@@ -2202,13 +2204,17 @@ mod tests {
             selected_end_register_backend_v2(QualifiedExactSearchBackendPolicy::Sve2Fixed16V2),
             Some(SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16)
         );
-        for policy in [
-            QualifiedExactSearchBackendPolicy::Sve2Fixed16,
-            QualifiedExactSearchBackendPolicy::Sve16V6,
-        ] {
-            assert_eq!(selected_end_register_backend_v2(policy), None);
-            assert!(legacy_selected_end_v1_backend(policy));
-        }
+        assert_eq!(
+            selected_end_register_backend_v2(QualifiedExactSearchBackendPolicy::Sve16V6),
+            Some(SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16)
+        );
+        assert_eq!(
+            selected_end_register_backend_v2(QualifiedExactSearchBackendPolicy::Sve2Fixed16),
+            None
+        );
+        assert!(legacy_selected_end_v1_backend(
+            QualifiedExactSearchBackendPolicy::Sve2Fixed16
+        ));
         for policy in [
             QualifiedExactSearchBackendPolicy::AsimdV7,
             QualifiedExactSearchBackendPolicy::Sve16,
@@ -3636,8 +3642,8 @@ mod tests {
             },
             || Err(PublishError::CpuFeatureUnavailable { feature: "sve2" }),
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve16V6.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
                 )
             },
         )
@@ -3658,18 +3664,19 @@ mod tests {
             QualifiedExactSearchBackendPolicy::Sve16V6
         );
         assert_eq!(tag19_identity.backend, BackendVersion::SEARCH_SVE16_V6);
+        assert_eq!(tag19_identity.target.features.bits(), 3);
         assert_eq!(tag19_identity.qualification, tag19_qualified);
         assert_eq!(
             tag19_identity.abi,
-            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
         );
         assert_eq!(
             *tag19_abi,
-            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
         );
-        assert_eq!(tag19_identity.sve_vector_bytes_at_publication, Some(16));
+        assert_eq!(tag19_identity.sve_vector_bytes_at_publication, None);
         assert_eq!(tag19_identity.required_thread_sve_vector_bytes, Some(16));
-        assert_eq!(*tag19_publication_vl, Some(16));
+        assert_eq!(*tag19_publication_vl, None);
         assert_eq!(*tag19_session_vl, Some(16));
         assert_eq!(
             *tag19_publication_vl,
@@ -3699,7 +3706,7 @@ mod tests {
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
         println!(
-            "fre-jit-auto-facade-v4\tcase=tag19_fallback\tpolicy=Sve16V6\tbackend=19\tabi=LegacySelectedEndV1\tqualification=TestQualified\tpublication_vl=16\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
+            "fre-jit-auto-facade-v5\tcase=tag19_fallback\tpolicy=Sve16V6\tbackend=19\tabi=SelectedEndRegisterV2\tqualification=TestQualified\tpublication_vl=none\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(tag19_identity.artifact_sha256)
         );
 

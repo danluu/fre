@@ -93,10 +93,11 @@ an open P0 row.
   use zero dynamic scratch, and preserve forced continuation and neighboring
   routes.
 - [x] `fre-jit-runtime`: strict-W^X AArch64 publication now has a separate
-  `SelectedEnd` register-return ABI2 type for V8 and tag 21. Publication
-  exposes no direct call; invocation is session-only. V8 opens a session
-  without an SVE syscall, while Linux tag 21 observes the calling thread's SVE
-  vector length once at session creation and requires VL16. The explicit
+  `SelectedEnd` register-return ABI2 type for V8 plus SVE tag 19 and SVE2 tag
+  21. Publication exposes no direct call; invocation is session-only. V8 opens
+  a session without an SVE syscall, while Linux tags 19 and 21 observe the
+  calling thread's SVE vector length once at session creation and require
+  VL16. The explicit
   16-byte `QualifiedExactSearch` large-window/reuse leaf remains a Candidate:
   all four current qualification atoms are `Candidate`, legacy V7 is hard
   `Candidate`, and no current Search JIT leaf is performance-qualified.
@@ -272,9 +273,9 @@ tree: legacy V7 is hard `Candidate`, all four current qualification atoms are
 The current native tracks remain direct machine code, not LLVM regex
 compilation. FRE's typed KIR and custom AArch64 emitters produce the regex
 payloads; LLVM may only support `rustc`/host tooling, and the system linker can
-only package already-emitted bytes. V8 and tag 21 now share the `SelectedEnd`
-register-return ABI2 in JIT; tag-21 P2b AOT retains the same sealed image in a
-deterministic ELF/direct-hidden-glue bundle. P2b still has
+only package already-emitted bytes. V8 plus SVE tag 19 and SVE2 tag 21 now
+share the `SelectedEnd` register-return ABI2 in JIT; tag-21 P2b AOT retains the
+same sealed image in a deterministic ELF/direct-hidden-glue bundle. P2b still has
 `RuntimeAuthority::Absent`, no completed post-link observation, and no
 callable adopter.
 

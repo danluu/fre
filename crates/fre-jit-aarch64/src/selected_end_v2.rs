@@ -27,7 +27,7 @@ pub(crate) const SELECTED_END_REGISTER_ARTIFACT_IDENTITY_DOMAIN_V2: &[u8] =
 
 /// Explicit backend choices admitted by the register-return v2 slice.
 ///
-/// Algorithm tags 8 and 21 remain unchanged. The call ABI and artifact
+/// Algorithm tags 8, 19, and 21 remain unchanged. The call ABI and artifact
 /// identity domain, rather than a relabeled scan algorithm, distinguish these
 /// images from Search v1.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,6 +35,8 @@ pub enum SelectedEndRegisterBackendV2 {
     /// Advanced SIMD Search V8.
     #[default]
     AsimdV8,
+    /// V8-screening plus fixed-VL16 SVE confirmation, Search tag 19.
+    Sve16V6Tag19Vl16,
     /// Fixed-VL16 ASIMD+SVE+SVE2 Search tag 21.
     Sve2Fixed16Tag21Vl16,
 }
@@ -45,6 +47,7 @@ impl SelectedEndRegisterBackendV2 {
     pub const fn backend_version(self) -> BackendVersion {
         match self {
             Self::AsimdV8 => BackendVersion::SEARCH_V8,
+            Self::Sve16V6Tag19Vl16 => BackendVersion::SEARCH_SVE16_V6,
             Self::Sve2Fixed16Tag21Vl16 => BackendVersion::SEARCH_SVE2_FIXED16_V2,
         }
     }
@@ -54,7 +57,7 @@ impl SelectedEndRegisterBackendV2 {
     pub const fn fixed_active_vector_bytes(self) -> u16 {
         match self {
             Self::AsimdV8 => 0,
-            Self::Sve2Fixed16Tag21Vl16 => 16,
+            Self::Sve16V6Tag19Vl16 | Self::Sve2Fixed16Tag21Vl16 => 16,
         }
     }
 }
@@ -132,7 +135,9 @@ impl AuditedSelectedEndRegisterImageV2 {
             || manifest.literal_bytes == 0
             || !matches!(
                 inner.backend_version(),
-                BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+                BackendVersion::SEARCH_V8
+                    | BackendVersion::SEARCH_SVE16_V6
+                    | BackendVersion::SEARCH_SVE2_FIXED16_V2
             )
         {
             return Err(EmitError::InternalInvariant);
@@ -160,6 +165,7 @@ impl AuditedSelectedEndRegisterImageV2 {
     pub const fn backend(&self) -> SelectedEndRegisterBackendV2 {
         match self.inner.backend_version() {
             BackendVersion::SEARCH_V8 => SelectedEndRegisterBackendV2::AsimdV8,
+            BackendVersion::SEARCH_SVE16_V6 => SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
             BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
                 SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
             }

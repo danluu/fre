@@ -43,21 +43,23 @@ V8, tag 10, tag 19, and tag 21. All four production qualification atoms in
 Candidate is not authorization: with no qualified atom the facade reports an
 unqualified native status before host probing, emission, or publication.
 
-V8 and tag 21 use the sealed four-argument `SelectedEnd` register-return ABI2.
-The haystack and half-open window occupy `x0` through `x3`; `x0` returns zero
-for no match or the absolute exclusive match end. ABI2 has no `x4` result
-pointer and no caller-owned result slot. The strict-W^X publication handle has
-no direct call method: every generated-code call must pass through its
-neither-`Send`-nor-`Sync` current-thread session. Sessionless facade calls use
-the retained portable owner.
+V8, SVE tag 19, and SVE2 tag 21 use the sealed four-argument `SelectedEnd`
+register-return ABI2. The haystack and half-open window occupy `x0` through
+`x3`; `x0` returns zero for no match or the absolute exclusive match end.
+ABI2 has no `x4` result pointer and no caller-owned result slot. The strict-W^X
+publication handle has no direct call method: every generated-code call must
+pass through its neither-`Send`-nor-`Sync` current-thread session. Sessionless
+facade calls use the retained portable owner.
 
 When independently authorized, automatic selection prefers tag 21 on an
 admitted Arm `0x41/0xd84` ASIMD+SVE+SVE2 host, then considers tag 10, tag 19,
-and V8 under their own authority. Tag 21 does not pin or query VL at
-publication. It observes the calling thread's SVE vector length exactly once
+and V8 under their own authority. Tags 19 and 21 do not pin or query VL at
+publication. Each observes the calling thread's SVE vector length exactly once
 when the callable session opens and requires VL16; calls inside that session
-perform no VL query. V8 session creation performs no SVE syscall. An atom for
-one backend cannot authorize another.
+perform no VL query. Tag 19 requires ASIMD+SVE, tag 21 requires
+ASIMD+SVE+SVE2, and both retain the exact Arm `0x41/0xd84` tuning envelope.
+V8 session creation performs no SVE syscall. An atom for one backend cannot
+authorize another.
 
 Private scoped Candidate execution exists for tests and qualification source.
 It does not manufacture a production `Qualified` atom or expose a

@@ -22,7 +22,7 @@ fn selected_end_register_abi2_mapping_is_exact() {
 }
 
 #[test]
-fn selected_end_register_v2_v8_and_tag21_have_exact_store_free_returns() {
+fn selected_end_register_v2_v8_tag19_and_tag21_have_exact_store_free_returns() {
     for (backend, policy, literal, version, features, v1_magic) in [
         (
             SelectedEndRegisterBackendV2::AsimdV8,
@@ -31,6 +31,14 @@ fn selected_end_register_v2_v8_and_tag21_have_exact_store_free_returns() {
             BackendVersion::SEARCH_V8,
             CpuFeatures::ASIMD,
             b"FREA64\0\x08".as_slice(),
+        ),
+        (
+            SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            SearchBackendPolicy::Sve16V6,
+            b"0123456789abcdef".as_slice(),
+            BackendVersion::SEARCH_SVE16_V6,
+            CpuFeatures::ASIMD_SVE,
+            b"FREA64\0\x13".as_slice(),
         ),
         (
             SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
@@ -59,10 +67,10 @@ fn selected_end_register_v2_v8_and_tag21_have_exact_store_free_returns() {
         assert_eq!(image.required_features(), features);
         assert_eq!(
             image.backend().fixed_active_vector_bytes(),
-            if version == BackendVersion::SEARCH_SVE2_FIXED16_V2 {
-                16
-            } else {
+            if version == BackendVersion::SEARCH_V8 {
                 0
+            } else {
+                16
             }
         );
 
@@ -252,6 +260,32 @@ fn selected_end_register_v2_literal_boundaries_are_explicit() {
                 reason: UnsupportedReason::KernelShape,
             })
         );
+    }
+
+    for (width, expected) in [
+        (
+            15_usize,
+            Err(EmitError::Unsupported {
+                reason: UnsupportedReason::KernelShape,
+            }),
+        ),
+        (16, Ok(())),
+        (17, Ok(())),
+    ] {
+        let literal = vec![b'x'; width];
+        let program = build_exact_literal::<SelectedEnd>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("near-tag19 exact SelectedEnd");
+        let observed = emit_selected_end_register_v2(
+            &program,
+            SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16,
+            EmitLimits::default(),
+        )
+        .map(|_| ());
+        assert_eq!(observed, expected);
     }
 }
 

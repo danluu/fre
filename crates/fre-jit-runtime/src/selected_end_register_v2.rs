@@ -76,8 +76,9 @@ impl From<LiteralError> for SelectedEndRegisterCallErrorV2 {
 /// Immutable strict-W^X publication of one register-return ABI2 image.
 ///
 /// The handle intentionally has no direct call method. Every invocation goes
-/// through [`PublishedSelectedEndRegisterThreadSessionV2`], so tag21 cannot
-/// inherit Search-v1's backward-compatible unchecked-thread assumption.
+/// through [`PublishedSelectedEndRegisterThreadSessionV2`], so tag19 and
+/// tag21 cannot inherit Search-v1's backward-compatible unchecked-thread
+/// assumption.
 pub struct PublishedSelectedEndRegisterV2 {
     pub(crate) mapping: Arc<ExecutableMapping>,
     entry: SelectedEndRegisterEntryV2,
@@ -91,9 +92,9 @@ pub struct PublishedSelectedEndRegisterV2 {
 
 /// Current-thread invocation token for one register-return ABI2 publication.
 ///
-/// V8 construction is syscall-free. Tag21 observes the calling thread's SVE
-/// vector length exactly once during construction and requires VL16. Search
-/// calls perform no host query or `prctl`.
+/// V8 construction is syscall-free. Tag19 and tag21 observe the calling
+/// thread's SVE vector length exactly once during construction and require
+/// VL16. Search calls perform no host query or `prctl`.
 ///
 /// ```compile_fail,E0277
 /// use fre_jit_runtime::PublishedSelectedEndRegisterThreadSessionV2;
@@ -157,8 +158,9 @@ impl fmt::Debug for PublishedSelectedEndRegisterThreadSessionV2<'_> {
 impl PublishedSelectedEndRegisterV2 {
     /// Establish the only callable boundary for this ABI2 publication.
     ///
-    /// V8 returns a token without querying SVE state. Tag21 performs one
-    /// current-thread vector-length query and requires exactly sixteen bytes.
+    /// V8 returns a token without querying SVE state. Tag19 and tag21 perform
+    /// one current-thread vector-length query and require exactly sixteen
+    /// bytes.
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'_>, KernelThreadContractError> {
@@ -333,9 +335,10 @@ pub fn publish_selected_end_register_v2(
 /// Check process-wide host admission for one register-return ABI2 backend.
 ///
 /// This deliberately does not inspect the calling thread's SVE vector length.
-/// V8 needs no SVE thread contract, while tag21 performs its one VL16 check
-/// only when [`PublishedSelectedEndRegisterV2::begin_current_thread_session`]
-/// creates the session that may invoke generated code.
+/// V8 needs no SVE thread contract, while tag19 and tag21 perform their one
+/// VL16 check only when
+/// [`PublishedSelectedEndRegisterV2::begin_current_thread_session`] creates
+/// the session that may invoke generated code.
 pub fn native_selected_end_register_backend_support_v2(
     backend: SelectedEndRegisterBackendV2,
 ) -> Result<(), PublishError> {
@@ -348,7 +351,11 @@ pub fn native_selected_end_register_backend_support_v2(
             sve2: platform::has_sve2(),
         },
     )?;
-    if backend == SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 {
+    if matches!(
+        backend,
+        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16
+            | SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
+    ) {
         crate::validate_search_backend_tuning(
             backend.backend_version(),
             fre_target_features::host().tuning(),
@@ -441,13 +448,16 @@ fn validate_selected_end_register_target_v2(
     }
     let expected_features = match image.backend() {
         SelectedEndRegisterBackendV2::AsimdV8 => CpuFeatures::ASIMD,
+        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16 => CpuFeatures::ASIMD_SVE,
         SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
     };
     if target.features != expected_features
         || image.output() != OutputKind::SelectedEnd
         || !matches!(
             image.backend_version(),
-            BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+            BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         )
     {
         return Err(PublishError::PublicationIdentityMismatch);
@@ -469,7 +479,12 @@ pub(crate) fn validate_selected_end_register_host_features_v2(
     if !features.asimd {
         return Err(PublishError::CpuFeatureUnavailable { feature: "asimd" });
     }
-    if backend == SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 && !features.sve {
+    if matches!(
+        backend,
+        SelectedEndRegisterBackendV2::Sve16V6Tag19Vl16
+            | SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16
+    ) && !features.sve
+    {
         return Err(PublishError::CpuFeatureUnavailable { feature: "sve" });
     }
     if backend == SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 && !features.sve2 {
