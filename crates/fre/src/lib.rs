@@ -266,7 +266,7 @@ pub use captures::{
     CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation,
     CaptureParticipationQuotientFallback, CaptureParticipationQuotientProof, CapturePlanIdentity,
     CapturePlanKind, CapturePrefixClassParticipationIdentity, CaptureRegex, CaptureRunLimits,
-    CaptureStreamSession, CaptureUnsupported, OrderedRootCaptureManyProof,
+    CaptureStreamSession, CaptureUnsupported, OrderedRootCaptureManyProof, OrderedRootUnitCover,
     PortableTextCaptureBuildError, PortableTextCaptureBuildReport, PortableTextCaptureBuilder,
     PortableTextCaptureIterationError, PortableTextCaptureMatch, PortableTextCaptureRegex,
     PortableTextCaptureSearchError, PortableTextCaptures,

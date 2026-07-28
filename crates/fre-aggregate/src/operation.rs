@@ -77,6 +77,7 @@ enum OperationKind {
 /// these variants bypass every specialized Count fast path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericCountRoute {
+    CachedFrontier,
     Dense,
     StartDomain,
     TerminalFrontier,
@@ -1943,6 +1944,46 @@ impl CompiledRegex {
         })
     }
 
+    /// Observed-work generic continuation count forced onto the bounded
+    /// cached-frontier representation. The caller must own a construction
+    /// proof that selects this physical route before source access.
+    #[doc(hidden)]
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public failure deliberately retains the complete fixed-layout P/A receipt"
+    )]
+    pub fn admit_count_observed_with_cached_frontier_receipt_observer(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+        allocation_limit: usize,
+        mut observer: impl FnMut(OperationProspective) -> Result<(), Error>,
+    ) -> Result<AdmittedCountAttempt, OperationAttemptError> {
+        let (result, receipt) = self.execute_with_receipt::<true>(
+            haystack,
+            range,
+            strategy,
+            OperationKind::Count,
+            Some(GenericCountRoute::CachedFrontier),
+            limits,
+            allocation_limit,
+            Some(&mut observer),
+        )?;
+        Ok(AdmittedCountAttempt {
+            admitted: AdmittedCount {
+                value: result.summary.matches,
+                common: Common {
+                    certificate: result.certificate,
+                    accounting: result.accounting,
+                    marker: PhantomData,
+                },
+            },
+            receipt,
+        })
+    }
+
     /// Observed-work terminal-frontier Count with a complete admitted result,
     /// P/A receipt, and outer pre-source observer.
     #[doc(hidden)]
@@ -2520,6 +2561,13 @@ impl CompiledRegex {
                     "terminal-frontier Count requires reverse sequential rows",
                 ));
             }
+            Some(GenericCountRoute::CachedFrontier)
+                if !OBSERVED_WORK || strategy != Strategy::ReverseSequentialRows =>
+            {
+                return Err(Error::InternalInvariant(
+                    "cached-frontier Count requires observed reverse sequential rows",
+                ));
+            }
             Some(GenericCountRoute::TerminalFrontier) if self.terminal_frontier.is_empty() => {
                 return Err(Error::InternalInvariant(
                     "terminal-frontier Count requires its compiled HIR proof",
@@ -2808,7 +2856,8 @@ impl CompiledRegex {
                 Some(SparseSeed::TerminalFrontier(&self.terminal_frontier))
             }
             Some(
-                GenericCountRoute::Dense
+                GenericCountRoute::CachedFrontier
+                | GenericCountRoute::Dense
                 | GenericCountRoute::StartDomain
                 | GenericCountRoute::OrderedRoot
                 | GenericCountRoute::RequiredSuffix
@@ -2848,8 +2897,13 @@ impl CompiledRegex {
             )
         };
         let (requirements, sparse_seed) = if forced_generic_count_route
-            == Some(GenericCountRoute::OrderedRoot)
+            == Some(GenericCountRoute::CachedFrontier)
         {
+            (
+                Requirements::new_forced_cached(&self.program, boundaries, passes, engine_limits)?,
+                None,
+            )
+        } else if forced_generic_count_route == Some(GenericCountRoute::OrderedRoot) {
             (
                 Requirements::new_ordered_root::<OBSERVED_WORK>(
                     &self.program,
@@ -6230,6 +6284,37 @@ impl Requirements {
             return Ok(requirements);
         }
         Self::new::<OBSERVED_WORK>(program, boundaries, strategy, passes, limits)
+    }
+
+    fn new_forced_cached(
+        program: &Program,
+        boundaries: usize,
+        passes: usize,
+        limits: OperationLimits,
+    ) -> Result<Self, Error> {
+        let cache = CachedFrontierRequirements::new(program.insts.len(), boundaries, passes)?;
+        cache.enforce(limits)?;
+        enforce(
+            cache.initialization_work()?,
+            limits.max_work,
+            Resource::ExecutionWork,
+        )?;
+        Ok(Self {
+            table_cells: 0,
+            row_storage: None,
+            record_bytes: cache.record_bytes,
+            requested_log_bytes: cache.log_bytes,
+            random_access_bound: cache.random_bytes,
+            scratch_bound: cache.scratch_bytes,
+            peak_bound: cache.peak_bytes,
+            sequential_bound: cache.sequential_bound,
+            allocations: cache.allocations(),
+            work_bound: limits.max_work,
+            terminal_frontier: false,
+            frontier: None,
+            cached_frontier: Some(cache),
+            cache_attempt_work: 1,
+        })
     }
 
     fn new_cached_after_refusal(

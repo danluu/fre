@@ -167,6 +167,18 @@ pub struct CaptureHirAccounting {
 
 /// Construction proof for the ordered-root capture-many Count route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedRootUnitCover {
+    /// The terminal class plus earlier unconditional witnesses cover every
+    /// possible byte.
+    Bytes,
+    /// The terminal class plus earlier unconditional witnesses cover every
+    /// Unicode scalar. Invalid UTF-8 remains outside the scalar language and
+    /// is handled by the ordinary byte-haystack search semantics.
+    UnicodeScalars,
+}
+
+/// Construction proof for the ordered-root capture-many Count route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderedRootCaptureManyProof {
     /// Source-ordered root alternatives and explicit capture slots.
     pub root_arms: usize,
@@ -174,6 +186,10 @@ pub struct OrderedRootCaptureManyProof {
     pub participating_captures: usize,
     /// Participating groups including group zero.
     pub groups_per_match: usize,
+    /// Optional source-independent proof that every byte/scalar boundary has
+    /// a nonempty ordered arm. This permits an anchored token representation
+    /// without changing the selected leftmost-first language.
+    pub unit_cover: Option<OrderedRootUnitCover>,
     /// Exact work charged while classifying the canonical capture HIR.
     pub proof_work: usize,
 }
@@ -2122,10 +2138,12 @@ impl CaptureBuilder {
         let ordered_root_capture_many = ordered_root_capture_many_proof(
             &rust.hir,
             explicit_captures,
+            unicode,
             &limits,
             &mut accounting,
         )?;
-        let selector = if ordered_root_capture_many.is_some() {
+        let selector = if ordered_root_capture_many.is_some_and(|proof| proof.unit_cover.is_none())
+        {
             SelectorRegex::from_hir_erasing_captures_for_ordered_root_count(
                 &rust.hir,
                 selector_profile,
@@ -2287,7 +2305,13 @@ impl CaptureBuilder {
                     selector_route: CaptureCountSelectorRoute {
                         physical_route: match plan_identity.plan {
                             CapturePlanKind::OrderedRootCaptureManyCount => {
-                                fre_aggregate::OperationPhysicalRoute::OrderedRootRows
+                                if ordered_root_capture_many
+                                    .is_some_and(|proof| proof.unit_cover.is_some())
+                                {
+                                    fre_aggregate::OperationPhysicalRoute::CachedFrontier
+                                } else {
+                                    fre_aggregate::OperationPhysicalRoute::OrderedRootRows
+                                }
                             }
                             CapturePlanKind::LinearSelectorUniformParticipation => {
                                 selector.uniform_capture_count_route()
@@ -4502,6 +4526,7 @@ impl CaptureRegex {
                     count_receipt: None,
                 })?;
         let ordered_root = identity.plan.plan == CapturePlanKind::OrderedRootCaptureManyCount;
+        let mut ordered_root_unit_cover = false;
         if ordered_root {
             let Some(proof) = identity.plan.ordered_root_capture_many else {
                 return Err(CaptureExecutionError {
@@ -4529,6 +4554,7 @@ impl CaptureRegex {
                     count_receipt: None,
                 });
             }
+            ordered_root_unit_cover = proof.unit_cover.is_some();
         }
         let sealed_route = identity.count_seal.as_ref().map(|seal| {
             let route = seal.route_identity();
@@ -4574,7 +4600,9 @@ impl CaptureRegex {
         }
         let terminal_frontier =
             selector_route == fre_aggregate::OperationPhysicalRoute::TerminalFrontierRows;
-        let route_is_coherent = if ordered_root {
+        let route_is_coherent = if ordered_root_unit_cover {
+            selector_route == fre_aggregate::OperationPhysicalRoute::CachedFrontier
+        } else if ordered_root {
             selector_route == fre_aggregate::OperationPhysicalRoute::OrderedRootRows
         } else {
             matches!(
@@ -4627,6 +4655,17 @@ impl CaptureRegex {
                 }
             };
         let attempt = match selector_route {
+            fre_aggregate::OperationPhysicalRoute::CachedFrontier if ordered_root_unit_cover => {
+                self.selector
+                    .admit_count_observed_with_cached_frontier_receipt_observer(
+                        haystack,
+                        0..haystack.len(),
+                        SelectorStrategy::ReverseSequentialRows,
+                        selector_limits,
+                        usize::MAX,
+                        &mut observer,
+                    )
+            }
             fre_aggregate::OperationPhysicalRoute::OrderedRootRows if ordered_root => self
                 .selector
                 .admit_ordered_root_count_observed_with_receipt_observer(
@@ -5211,6 +5250,7 @@ impl CaptureParticipation {
 fn ordered_root_capture_many_proof(
     hir: &Hir,
     explicit_captures: usize,
+    unicode: bool,
     limits: &CaptureBuildLimits,
     accounting: &mut CaptureHirAccounting,
 ) -> Result<Option<OrderedRootCaptureManyProof>, CaptureBuildError> {
@@ -5246,6 +5286,7 @@ fn ordered_root_capture_many_proof(
             return Ok(None);
         }
     }
+    let unit_cover = ordered_root_unit_cover(children, unicode, limits, accounting)?;
     let proof_work =
         accounting
             .work
@@ -5257,8 +5298,286 @@ fn ordered_root_capture_many_proof(
         root_arms: children.len(),
         participating_captures: 1,
         groups_per_match: 2,
+        unit_cover,
         proof_work,
     }))
+}
+
+const MAX_ORDERED_ROOT_UNIT_COVER_GAPS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct ZeroOneUnitLanguage {
+    empty: bool,
+    target: bool,
+}
+
+fn ordered_root_unit_cover(
+    children: &[Hir],
+    unicode: bool,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Option<OrderedRootUnitCover>, CaptureBuildError> {
+    let Some(HirKind::Capture(terminal)) = children.last().map(Hir::kind) else {
+        return Ok(None);
+    };
+    let mut gaps = [0_u32; MAX_ORDERED_ROOT_UNIT_COVER_GAPS];
+    let Some(gap_count) = terminal_class_gaps(
+        terminal.sub.as_ref(),
+        unicode,
+        &mut gaps,
+        limits,
+        accounting,
+    )?
+    else {
+        return Ok(None);
+    };
+    for &unit in &gaps[..gap_count] {
+        let mut witnessed = false;
+        for child in &children[..children.len().saturating_sub(1)] {
+            let HirKind::Capture(capture) = child.kind() else {
+                return Ok(None);
+            };
+            let Some(language) =
+                zero_one_unit_language(capture.sub.as_ref(), unit, unicode, limits, accounting)?
+            else {
+                continue;
+            };
+            if language.target {
+                witnessed = true;
+                break;
+            }
+        }
+        if !witnessed {
+            return Ok(None);
+        }
+    }
+    Ok(Some(if unicode {
+        OrderedRootUnitCover::UnicodeScalars
+    } else {
+        OrderedRootUnitCover::Bytes
+    }))
+}
+
+fn terminal_class_gaps(
+    hir: &Hir,
+    unicode: bool,
+    gaps: &mut [u32; MAX_ORDERED_ROOT_UNIT_COVER_GAPS],
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Option<usize>, CaptureBuildError> {
+    charge_hir(accounting, 1, limits.max_hir_work)?;
+    match (unicode, hir.kind()) {
+        (false, HirKind::Class(Class::Bytes(class))) => {
+            let mut gap_count = 0_usize;
+            for byte in u8::MIN..=u8::MAX {
+                charge_hir(accounting, 1, limits.max_hir_work)?;
+                if class
+                    .ranges()
+                    .iter()
+                    .any(|range| range.start() <= byte && byte <= range.end())
+                {
+                    continue;
+                }
+                let Some(slot) = gaps.get_mut(gap_count) else {
+                    return Ok(None);
+                };
+                *slot = u32::from(byte);
+                gap_count =
+                    gap_count
+                        .checked_add(1)
+                        .ok_or(CaptureBuildError::InternalInvariant(
+                            "ordered-root byte-cover gap count overflowed usize",
+                        ))?;
+            }
+            Ok(Some(gap_count))
+        }
+        (true, HirKind::Class(Class::Unicode(class))) => {
+            let mut gap_count = 0_usize;
+            for (domain_start, domain_end) in [(0_u32, 0xD7FF_u32), (0xE000, 0x0010_FFFF)] {
+                let mut cursor = domain_start;
+                for range in class.ranges() {
+                    charge_hir(accounting, 1, limits.max_hir_work)?;
+                    let start = u32::from(range.start()).max(domain_start);
+                    let end = u32::from(range.end()).min(domain_end);
+                    if start > end || end < cursor {
+                        continue;
+                    }
+                    if start > cursor {
+                        let gap_end =
+                            start
+                                .checked_sub(1)
+                                .ok_or(CaptureBuildError::InternalInvariant(
+                                    "ordered-root scalar gap underflowed",
+                                ))?;
+                        if !append_ordered_root_gaps(cursor, gap_end, gaps, &mut gap_count) {
+                            return Ok(None);
+                        }
+                    }
+                    cursor = cursor.max(end.saturating_add(1));
+                    if cursor > domain_end {
+                        break;
+                    }
+                }
+                if cursor <= domain_end
+                    && !append_ordered_root_gaps(cursor, domain_end, gaps, &mut gap_count)
+                {
+                    return Ok(None);
+                }
+            }
+            charge_hir(accounting, gap_count, limits.max_hir_work)?;
+            Ok(Some(gap_count))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn append_ordered_root_gaps(
+    start: u32,
+    end: u32,
+    gaps: &mut [u32; MAX_ORDERED_ROOT_UNIT_COVER_GAPS],
+    gap_count: &mut usize,
+) -> bool {
+    let Some(width) = end
+        .checked_sub(start)
+        .and_then(|value| value.checked_add(1))
+    else {
+        return false;
+    };
+    let Ok(width) = usize::try_from(width) else {
+        return false;
+    };
+    let Some(required) = gap_count.checked_add(width) else {
+        return false;
+    };
+    if required > gaps.len() {
+        return false;
+    }
+    for unit in start..=end {
+        gaps[*gap_count] = unit;
+        let Some(next) = gap_count.checked_add(1) else {
+            return false;
+        };
+        *gap_count = next;
+    }
+    true
+}
+
+fn zero_one_unit_language(
+    hir: &Hir,
+    target: u32,
+    unicode: bool,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Option<ZeroOneUnitLanguage>, CaptureBuildError> {
+    charge_hir(accounting, 1, limits.max_hir_work)?;
+    match hir.kind() {
+        HirKind::Empty => Ok(Some(ZeroOneUnitLanguage {
+            empty: true,
+            target: false,
+        })),
+        HirKind::Literal(literal) => {
+            let target_matches = if unicode {
+                char::from_u32(target).is_some_and(|scalar| {
+                    let mut bytes = [0_u8; 4];
+                    literal.0.as_ref() == scalar.encode_utf8(&mut bytes).as_bytes()
+                })
+            } else {
+                u8::try_from(target)
+                    .ok()
+                    .is_some_and(|byte| literal.0.as_ref() == [byte])
+            };
+            Ok(Some(ZeroOneUnitLanguage {
+                empty: literal.0.is_empty(),
+                target: target_matches,
+            }))
+        }
+        HirKind::Class(Class::Bytes(class)) if !unicode => {
+            let Some(target) = u8::try_from(target).ok() else {
+                return Ok(Some(ZeroOneUnitLanguage {
+                    empty: false,
+                    target: false,
+                }));
+            };
+            charge_hir(accounting, class.ranges().len(), limits.max_hir_work)?;
+            Ok(Some(ZeroOneUnitLanguage {
+                empty: false,
+                target: class
+                    .ranges()
+                    .iter()
+                    .any(|range| range.start() <= target && target <= range.end()),
+            }))
+        }
+        HirKind::Class(Class::Unicode(class)) if unicode => {
+            let Some(target) = char::from_u32(target) else {
+                return Ok(Some(ZeroOneUnitLanguage {
+                    empty: false,
+                    target: false,
+                }));
+            };
+            charge_hir(accounting, class.ranges().len(), limits.max_hir_work)?;
+            Ok(Some(ZeroOneUnitLanguage {
+                empty: false,
+                target: class
+                    .ranges()
+                    .iter()
+                    .any(|range| range.start() <= target && target <= range.end()),
+            }))
+        }
+        HirKind::Class(_) | HirKind::Look(_) => Ok(None),
+        HirKind::Capture(capture) => {
+            zero_one_unit_language(capture.sub.as_ref(), target, unicode, limits, accounting)
+        }
+        HirKind::Repetition(repetition) => {
+            let Some(child) = zero_one_unit_language(
+                repetition.sub.as_ref(),
+                target,
+                unicode,
+                limits,
+                accounting,
+            )?
+            else {
+                return Ok(None);
+            };
+            let can_repeat = repetition.max != Some(0);
+            Ok(Some(ZeroOneUnitLanguage {
+                empty: repetition.min == 0 || child.empty,
+                target: can_repeat && child.target && (repetition.min <= 1 || child.empty),
+            }))
+        }
+        HirKind::Concat(children) => {
+            let mut combined = ZeroOneUnitLanguage {
+                empty: true,
+                target: false,
+            };
+            for child in children {
+                let Some(right) =
+                    zero_one_unit_language(child, target, unicode, limits, accounting)?
+                else {
+                    return Ok(None);
+                };
+                combined = ZeroOneUnitLanguage {
+                    empty: combined.empty && right.empty,
+                    target: (combined.target && right.empty) || (combined.empty && right.target),
+                };
+            }
+            Ok(Some(combined))
+        }
+        HirKind::Alternation(children) => {
+            let mut combined = ZeroOneUnitLanguage {
+                empty: false,
+                target: false,
+            };
+            for child in children {
+                if let Some(branch) =
+                    zero_one_unit_language(child, target, unicode, limits, accounting)?
+                {
+                    combined.empty |= branch.empty;
+                    combined.target |= branch.target;
+                }
+            }
+            Ok(Some(combined))
+        }
+    }
 }
 
 /// Prove only the cardinality needed by the reducer while charging this

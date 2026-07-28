@@ -488,7 +488,8 @@ impl CaptureCountAttemptReceipt {
                 (route.plan.plan, route.selector_route.physical_route),
                 (
                     CapturePlanKind::OrderedRootCaptureManyCount,
-                    SelectorOperationPhysicalRoute::OrderedRootRows,
+                    SelectorOperationPhysicalRoute::OrderedRootRows
+                        | SelectorOperationPhysicalRoute::CachedFrontier,
                 ) | (
                     CapturePlanKind::LinearSelectorUniformParticipation,
                     SelectorOperationPhysicalRoute::DenseRows
@@ -507,6 +508,16 @@ impl CaptureCountAttemptReceipt {
                         || proof.participating_captures.checked_add(1)
                             != Some(route.participating_captures_per_match)
                         || proof.groups_per_match != route.participating_captures_per_match
+                        || match proof.unit_cover {
+                            Some(_) => {
+                                route.selector_route.physical_route
+                                    != SelectorOperationPhysicalRoute::CachedFrontier
+                            }
+                            None => {
+                                route.selector_route.physical_route
+                                    != SelectorOperationPhysicalRoute::OrderedRootRows
+                            }
+                        }
                 }
                 (CapturePlanKind::OrderedRootCaptureManyCount, None) | (_, Some(_)) => true,
                 (_, None) => false,

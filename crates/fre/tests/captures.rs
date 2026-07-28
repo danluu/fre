@@ -11,13 +11,14 @@ use fre::{
     CaptureSearchError, CaptureSearchKind, CaptureSearchLimits, CaptureStreamDomains,
     CaptureWindow, LineCaptureBuildError, LineCaptureBuildLimits, LineCaptureBuildResource,
     LineCaptureBuilder, LineCaptureConfiguration, LineCapturePlanKind, LineCaptureResource,
-    LineCaptureRunError, LineCaptureRunLimits, PortableTextCaptureBuilder, SHEBANG_CAPTURE_PATTERN,
-    SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID, SPACE_AROUND_OPERATOR_CAPTURE_PATTERN,
-    SPACE_AROUND_OPERATOR_INSPECTION_WORK, STRING_QUOTE_PREFIX_CAPTURE_PATTERN,
-    STRING_QUOTE_PREFIX_INSPECTION_WORK, STRING_QUOTE_PREFIX_OPERATION_ID,
-    WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN, WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
-    WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
+    LineCaptureRunError, LineCaptureRunLimits, OrderedRootUnitCover, PortableTextCaptureBuilder,
+    SHEBANG_CAPTURE_PATTERN, SHEBANG_INSPECTION_WORK, SHEBANG_OPERATION_ID,
+    SPACE_AROUND_OPERATOR_CAPTURE_PATTERN, SPACE_AROUND_OPERATOR_INSPECTION_WORK,
+    STRING_QUOTE_PREFIX_CAPTURE_PATTERN, STRING_QUOTE_PREFIX_INSPECTION_WORK,
+    STRING_QUOTE_PREFIX_OPERATION_ID, WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
+    WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK, WHITESPACE_AROUND_KEYWORDS_OPERATION_ID,
 };
+use fre_aggregate::OperationPhysicalRoute;
 use regex::RegexBuilder as TextRegexBuilder;
 use regex::bytes::RegexBuilder;
 
@@ -2690,6 +2691,96 @@ fn ordered_uniform_participation_count_preserves_leftmost_first_match_cardinalit
                 .as_ref()
                 .and_then(|receipt| receipt.prospective)
                 .is_some_and(|prospective| !prospective.terminal_frontier)
+        );
+    }
+}
+
+#[test]
+fn terminal_unit_cover_selects_cached_capture_count_and_refuses_nearby_shapes() {
+    let bytes_pattern = r"(\r\n|\r|\n)|([\t ]+)|(.)";
+    let bytes = CaptureBuilder::new(bytes_pattern)
+        .unicode(false)
+        .build()
+        .expect("covered byte lexer");
+    let bytes_proof = bytes
+        .build_report()
+        .ordered_root_capture_many
+        .expect("covered ordered-root proof");
+    assert_eq!(bytes_proof.unit_cover, Some(OrderedRootUnitCover::Bytes));
+    let bytes_haystack = b"a \r\n\xff";
+    let bytes_result = bytes
+        .count_captures(bytes_haystack, CaptureRunLimits::default())
+        .expect("covered byte Count");
+    assert_eq!(
+        bytes_result.accounting.count,
+        reference_count(bytes_pattern, bytes_haystack)
+    );
+    assert_eq!(
+        bytes_result
+            .selector_receipt
+            .as_ref()
+            .expect("covered byte selector receipt")
+            .identity
+            .physical_route,
+        Some(OperationPhysicalRoute::CachedFrontier)
+    );
+
+    let unicode_pattern = r"(\r\n|\r|\n)|([\t ]+)|(.)";
+    let unicode = CaptureBuilder::new(unicode_pattern)
+        .unicode(true)
+        .build()
+        .expect("covered Unicode lexer");
+    let unicode_proof = unicode
+        .build_report()
+        .ordered_root_capture_many
+        .expect("covered Unicode ordered-root proof");
+    assert_eq!(
+        unicode_proof.unit_cover,
+        Some(OrderedRootUnitCover::UnicodeScalars)
+    );
+    let unicode_haystack = "a \r\nβ".as_bytes();
+    let unicode_result = unicode
+        .count_captures(unicode_haystack, CaptureRunLimits::default())
+        .expect("covered Unicode Count");
+    let unicode_reference = RegexBuilder::new(unicode_pattern)
+        .unicode(true)
+        .build()
+        .expect("Unicode reference");
+    let unicode_reference_count: usize = unicode_reference
+        .captures_iter(unicode_haystack)
+        .map(|captures| captures.iter().flatten().count())
+        .sum();
+    assert_eq!(unicode_result.accounting.count, unicode_reference_count);
+    assert_eq!(
+        unicode_result
+            .selector_receipt
+            .as_ref()
+            .expect("covered Unicode selector receipt")
+            .identity
+            .physical_route,
+        Some(OperationPhysicalRoute::CachedFrontier)
+    );
+
+    for (pattern, reason) in [
+        (r"([\t ]+)|(.)", "the terminal dot leaves LF uncovered"),
+        (
+            r"(\bfoo\b)|(.)",
+            "a conditional look cannot witness the missing LF",
+        ),
+        (r"(a)|(b)", "the terminal class is not a near-total cover"),
+    ] {
+        let control = CaptureBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect(reason);
+        assert_eq!(
+            control
+                .build_report()
+                .ordered_root_capture_many
+                .expect("control ordered-root proof")
+                .unit_cover,
+            None,
+            "{reason}"
         );
     }
 }
