@@ -46,13 +46,13 @@ impl<E> AggregateInspectionAttemptError<E> {
 }
 
 /// Version of the aggregate construction transaction algorithm.
-pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 1;
+pub const AGGREGATE_CONSTRUCTION_ALGORITHM_VERSION: u32 = 2;
 
 /// Version of the aggregate construction prospective/actual accounting.
 pub const AGGREGATE_CONSTRUCTION_ACCOUNTING_VERSION: u32 = 1;
 
 /// Exact maximum number of selector stages in the construction transaction.
-pub const AGGREGATE_CONSTRUCTION_LEDGER_CAPACITY: usize = 23;
+pub const AGGREGATE_CONSTRUCTION_LEDGER_CAPACITY: usize = 24;
 
 /// Exact request inputs bound by one construction owner.
 ///
@@ -243,12 +243,14 @@ pub enum AggregateConstructionStage {
     SparseFiniteRoot = 18,
     /// General finite extraction, including guarded finite construction.
     GeneralFiniteExtraction = 19,
+    /// Packed finite-language construction.
+    PackedFinite = 20,
     /// Dense finite-language construction.
-    DenseFinite = 20,
+    DenseFinite = 21,
     /// Fixed-predicate Word64 construction after an admitted finite refusal.
-    FixedPredicateWord64 = 21,
+    FixedPredicateWord64 = 22,
     /// Final continuation compilation.
-    Continuation = 22,
+    Continuation = 23,
 }
 
 impl AggregateConstructionStage {
@@ -274,6 +276,7 @@ impl AggregateConstructionStage {
         Self::FixedAbsolute,
         Self::SparseFiniteRoot,
         Self::GeneralFiniteExtraction,
+        Self::PackedFinite,
         Self::DenseFinite,
         Self::FixedPredicateWord64,
         Self::Continuation,
@@ -346,6 +349,8 @@ pub enum AggregateConstructionPrepublicationFallback {
     GuardedFiniteDictionaryResource,
     /// Guarded outer construction scratch/peak refusal.
     GuardedFiniteConstructionResource,
+    /// Packed finite resource refusal followed by dense finite construction.
+    PackedFiniteBuildResourceToDenseFinite,
     /// Dense finite resource refusal followed by `FixedPredicateWord64`.
     DenseFiniteBuildResourceToFixedPredicateWord64,
     /// Dense finite resource refusal followed by continuation.
@@ -373,6 +378,9 @@ impl AggregateConstructionPrepublicationFallback {
             }
             Self::GuardedFiniteDictionaryResource | Self::GuardedFiniteConstructionResource => {
                 Some(AggregateConstructionTransition::GuardedFiniteToContinuation)
+            }
+            Self::PackedFiniteBuildResourceToDenseFinite => {
+                Some(AggregateConstructionTransition::PackedFiniteToDenseFinite)
             }
             Self::DenseFiniteBuildResourceToFixedPredicateWord64 => {
                 Some(AggregateConstructionTransition::DenseFiniteToFixedPredicateWord64)
@@ -406,6 +414,9 @@ impl AggregateConstructionPrepublicationFallback {
             | Self::TooLargeFixedSequenceToFixedPredicateWord64 => {
                 Some(AggregateConstructionStage::GeneralFiniteExtraction)
             }
+            Self::PackedFiniteBuildResourceToDenseFinite => {
+                Some(AggregateConstructionStage::PackedFinite)
+            }
             Self::DenseFiniteBuildResourceToFixedPredicateWord64
             | Self::DenseFiniteBuildResourceToContinuation => {
                 Some(AggregateConstructionStage::DenseFinite)
@@ -430,6 +441,8 @@ pub enum AggregateConstructionTransition {
     SparseFiniteToContinuation,
     /// Guarded finite resource refusal directly to continuation.
     GuardedFiniteToContinuation,
+    /// Packed finite resource refusal to dense finite construction.
+    PackedFiniteToDenseFinite,
     /// Dense finite resource refusal to `FixedPredicateWord64`.
     DenseFiniteToFixedPredicateWord64,
     /// Dense finite resource refusal directly to continuation.
@@ -451,6 +464,7 @@ impl AggregateConstructionTransition {
             Self::FixedAbsoluteToSparseFiniteRoot => {
                 Some(AggregateConstructionStage::SparseFiniteRoot)
             }
+            Self::PackedFiniteToDenseFinite => Some(AggregateConstructionStage::DenseFinite),
             Self::SparseFiniteToContinuation
             | Self::GuardedFiniteToContinuation
             | Self::DenseFiniteToContinuation
@@ -1840,6 +1854,26 @@ mod tests {
         );
         assert_eq!(
             finite.transition,
+            AggregateConstructionTransition::Advance(AggregateConstructionStage::PackedFinite)
+        );
+        assert_eq!(
+            attempt.expected_stage,
+            Some(AggregateConstructionStage::PackedFinite)
+        );
+
+        attempt
+            .record_semantic_ineligible(
+                AggregateConstructionStage::PackedFinite,
+                effect(2, 0, 0, 0, 0),
+            )
+            .unwrap();
+        let packed = attempt.ledger().get(attempt.ledger().len() - 1).unwrap();
+        assert_eq!(
+            packed.disposition,
+            AggregateConstructionStageDisposition::SemanticIneligible
+        );
+        assert_eq!(
+            packed.transition,
             AggregateConstructionTransition::Advance(AggregateConstructionStage::DenseFinite)
         );
         assert_eq!(
@@ -2048,6 +2082,101 @@ mod tests {
             attempt.expected_stage,
             Some(AggregateConstructionStage::Continuation)
         );
+    }
+
+    #[test]
+    fn packed_finite_refusal_is_typed_and_receipt_closes_exactly() {
+        let attempt_identity = identity("packed-refusal");
+        let mut attempt: Attempt = AggregateConstructionAttempt::new(attempt_identity.clone());
+        attempt.publish_prospective(prospective()).unwrap();
+        advance_to(&mut attempt, AggregateConstructionStage::PackedFinite);
+        attempt
+            .select_stage(AggregateConstructionStage::PackedFinite)
+            .unwrap();
+
+        assert_eq!(
+            attempt.resolve_selected_soft_refusal(
+                effect(6, 1, 40, 12, 30),
+                AggregateConstructionAbandonment {
+                    work: 6,
+                    allocations: 1,
+                    bytes: 40,
+                    released_persistent_bytes: 12,
+                },
+                AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToContinuation,
+            ),
+            Err(AggregateConstructionStateError::InvalidTransition)
+        );
+        assert_eq!(
+            attempt.selected_stage(),
+            Some(AggregateConstructionStage::PackedFinite)
+        );
+
+        attempt
+            .resolve_selected_soft_refusal(
+                effect(6, 1, 40, 12, 30),
+                AggregateConstructionAbandonment {
+                    work: 6,
+                    allocations: 1,
+                    bytes: 40,
+                    released_persistent_bytes: 12,
+                },
+                AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite,
+            )
+            .unwrap();
+        let packed = attempt.ledger().get(attempt.ledger().len() - 1).unwrap();
+        assert_eq!(packed.stage, AggregateConstructionStage::PackedFinite);
+        assert_eq!(
+            packed.disposition,
+            AggregateConstructionStageDisposition::SoftResourceRefused
+        );
+        assert_eq!(
+            packed.fallback,
+            AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite
+        );
+        assert_eq!(
+            packed.transition,
+            AggregateConstructionTransition::PackedFiniteToDenseFinite
+        );
+        assert_eq!(packed.actual.work, 6);
+        assert_eq!(packed.actual.abandoned_work, 6);
+        assert_eq!(packed.actual.allocations, 1);
+        assert_eq!(packed.actual.abandoned_allocations, 1);
+        assert_eq!(packed.actual.allocated_bytes, 40);
+        assert_eq!(packed.actual.abandoned_bytes, 40);
+        assert_eq!(packed.actual.live_persistent_bytes, 0);
+        assert_eq!(packed.actual.high_water_bytes, 30);
+        assert_eq!(
+            attempt.expected_stage(),
+            Some(AggregateConstructionStage::DenseFinite)
+        );
+
+        attempt
+            .select_stage(AggregateConstructionStage::DenseFinite)
+            .unwrap();
+        let plan = PlanSeal::from_owned(
+            AggregateConstructionStage::DenseFinite,
+            "dense-after-packed",
+        );
+        attempt
+            .publish_selected(effect(4, 1, 32, 16, 32), plan.clone())
+            .unwrap();
+        let receipt = attempt.finish_success().unwrap();
+        assert!(receipt.closes(&attempt_identity, Some(&plan)));
+
+        let mut fallback_splice = receipt.clone();
+        fallback_splice.ledger.entries[AggregateConstructionStage::PackedFinite.ordinal()]
+            .as_mut()
+            .unwrap()
+            .fallback = AggregateConstructionPrepublicationFallback::None;
+        assert!(!fallback_splice.closes(&attempt_identity, Some(&plan)));
+
+        let mut transition_splice = receipt.clone();
+        transition_splice.ledger.entries[AggregateConstructionStage::PackedFinite.ordinal()]
+            .as_mut()
+            .unwrap()
+            .transition = AggregateConstructionTransition::DenseFiniteToContinuation;
+        assert!(!transition_splice.closes(&attempt_identity, Some(&plan)));
     }
 
     #[test]
