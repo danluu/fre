@@ -26,6 +26,7 @@ fre-kernel-ir = { path = "../fre-kernel-ir" }
 fre-kernels = { path = "../fre-kernels" }
 fre-lower = { path = "../fre-lower" }
 fre-syntax = { path = "../fre-syntax" }
+memchr = "=2.8.3"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["std", "unicode"] }
 
 [dev-dependencies]

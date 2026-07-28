@@ -107,6 +107,7 @@ dependencies = [
  "fre-kernels",
  "fre-lower",
  "fre-syntax",
+ "memchr",
  "regex",
  "regex-automata",
  "regex-syntax",

@@ -39,7 +39,9 @@ use fre::{
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateStrategy, AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError,
     AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder, AnchoredLineCapturePlan,
-    AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, BlockingDelimiterBuildAccounting,
+    AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredWordCaptureBuildError,
+    AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder, AnchoredWordCapturePlan,
+    AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, BlockingDelimiterBuildAccounting,
     BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterReduceError,
     BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
     BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
@@ -169,6 +171,9 @@ pub const CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN: &str =
     fre::ANCHORED_LINE_CAPTURE_COUNT_OPERATION_ID;
 /// Stable plan label for generic bounded captured whole-word alternatives.
 pub const CURRENT_FRE_CAPTURE_WORD_RUN_PLAN: &str = fre::CAPTURE_WORD_RUN_COUNT_OPERATION_ID;
+/// Stable plan label for generic anchored captured word fields and boundaries.
+pub const CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN: &str =
+    fre::ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID;
 
 fn is_current_fre_capture_plan(plan: &str) -> bool {
     matches!(
@@ -189,6 +194,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
             | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
             | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
             | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
+            | CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
             | fre::NOQA_ASCII_LEADING_PLAN_ID
             | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
             | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -210,6 +216,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
                 | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
                 | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
                 | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
+                | CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
                 | fre::NOQA_ASCII_LEADING_PLAN_ID
                 | fre::NOQA_ASCII_NO_LEADING_PLAN_ID
                 | fre::NOQA_UNICODE_LEADING_PLAN_ID
@@ -221,7 +228,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v45-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v46-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -612,6 +619,18 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; grep-captures admits bounded absolute-start literal/byte-class/greedy-single-byte-repeat sequences whose variable boundaries are disjoint, with mandatory positive-width root captures and zero execution allocation/scratch/output",
+        );
+        identity.identity.push_str(
+            "; capture-word-run-v1 derives bounded captured same-subclass whole-word alternatives from canonical HIR and counts their fixed mandatory participation while preserving full ASCII or Unicode word context",
+        );
+        identity.availability.push_str(
+            "; grep-captures admits bounded positive exact-width captured class alternatives enclosed by complete word boundaries, with inline matcher state and no execution allocation/scratch/output",
+        );
+        identity.identity.push_str(
+            "; anchored-word-capture-v1 derives absolute-start canonical word fields or fixed same-class units followed by a word boundary and counts mandatory captures in one LF/CRLF pass",
+        );
+        identity.availability.push_str(
+            "; grep-captures admits Unicode or byte-mode anchored positive word fields separated by literal spaces and bounded fixed class captures ending in the selected word boundary, with malformed bytes retaining Rust-bytes semantics",
         );
         identity.identity.push_str(
             "; bounded-affix-span-sum-v1 extends the HIR-derived LEFT MIDDLE{0,max} LITERAL RIGHT reducer with checked non-overlapping match-width accumulation",
@@ -3234,6 +3253,7 @@ enum CurrentFreCapturePreparation {
     RuffGrep(Box<LineCaptureRunLimits>),
     AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
     WordRunGrep(Box<CaptureWordRunRunLimits>),
+    AnchoredWordGrep(Box<AnchoredWordCaptureRunLimits>),
 }
 
 #[derive(Clone, Debug)]
@@ -3243,6 +3263,7 @@ enum CurrentFreCaptureRegex {
     Ruff(Box<LineCapturePlan>),
     AnchoredLine(Box<AnchoredLineCapturePlan>),
     WordRun(Box<CaptureWordRunPlan>),
+    AnchoredWord(Box<AnchoredWordCapturePlan>),
 }
 
 impl CurrentFreCaptureModel {
@@ -3316,6 +3337,9 @@ impl CurrentFreCaptureLifecycle {
             CurrentFreCaptureRegex::WordRun(plan) => {
                 plan.build_report().identity.operation.operation_id
             }
+            CurrentFreCaptureRegex::AnchoredWord(plan) => {
+                plan.build_report().identity.operation.operation_id
+            }
         }
     }
 
@@ -3383,6 +3407,10 @@ impl CurrentFreCaptureLifecycle {
                 CurrentFreCaptureRegex::WordRun(plan),
                 CurrentFreCapturePreparation::WordRunGrep(run_limits),
             ) => execute_capture_word_run_with_limits(plan, haystack, **run_limits),
+            (
+                CurrentFreCaptureRegex::AnchoredWord(plan),
+                CurrentFreCapturePreparation::AnchoredWordGrep(run_limits),
+            ) => execute_anchored_word_capture_with_limits(plan, haystack, **run_limits),
             (CurrentFreCaptureRegex::Noqa(_), CurrentFreCapturePreparation::Count(_)) => {
                 return Err(CompareError::new(
                     "noqa grep-only artifact reached count-captures lifecycle",
@@ -3403,6 +3431,11 @@ impl CurrentFreCaptureLifecycle {
                     "word-run grep-only artifact reached an incompatible capture lifecycle",
                 ));
             }
+            (CurrentFreCaptureRegex::AnchoredWord(_), _) => {
+                return Err(CompareError::new(
+                    "anchored-word grep-only artifact reached an incompatible capture lifecycle",
+                ));
+            }
             (_, CurrentFreCapturePreparation::RuffGrep(_)) => {
                 return Err(CompareError::new(
                     "Ruff grep preparation reached an incompatible capture artifact",
@@ -3416,6 +3449,11 @@ impl CurrentFreCaptureLifecycle {
             (_, CurrentFreCapturePreparation::WordRunGrep(_)) => {
                 return Err(CompareError::new(
                     "word-run grep preparation reached an incompatible capture artifact",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::AnchoredWordGrep(_)) => {
+                return Err(CompareError::new(
+                    "anchored-word grep preparation reached an incompatible capture artifact",
                 ));
             }
             (_, CurrentFreCapturePreparation::Stream(_)) => {
@@ -3501,6 +3539,16 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                 (
                     CurrentFreCaptureRegex::AnchoredLine(Box::new(plan)),
                     CurrentFreCapturePreparation::AnchoredLineGrep(Box::new(run_limits)),
+                )
+            } else if let Some(plan) =
+                anchored_word_capture_plan_one(pattern, unicode, case_insensitive, &limits)
+                    .map_err(|error| CompareError::new(error.message))?
+            {
+                let run_limits = anchored_word_capture_run_limits(&plan, haystack_len, &limits)
+                    .map_err(|error| CompareError::new(error.message))?;
+                (
+                    CurrentFreCaptureRegex::AnchoredWord(Box::new(plan)),
+                    CurrentFreCapturePreparation::AnchoredWordGrep(Box::new(run_limits)),
                 )
             } else if let Some(plan) =
                 capture_word_run_plan_one(pattern, unicode, case_insensitive, &limits)
@@ -7056,6 +7104,9 @@ fn fre_grep_captures(
     if let Some(reduction) = anchored_line_capture_reduction(request, limits)? {
         return Ok(reduction);
     }
+    if let Some(reduction) = anchored_word_capture_reduction(request, limits)? {
+        return Ok(reduction);
+    }
     if let Some(reduction) = capture_word_run_reduction(request, limits)? {
         return Ok(reduction);
     }
@@ -7674,6 +7725,241 @@ fn anchored_line_capture_reduction(
     Ok(Some(FreReduction {
         actual,
         plan: CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN,
+    }))
+}
+
+fn anchored_word_capture_plan_one(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    limits: &RunLimits,
+) -> Result<Option<AnchoredWordCapturePlan>, ExecutionError> {
+    if case_insensitive {
+        return Ok(None);
+    }
+    let defaults = AnchoredWordCaptureBuildLimits::default();
+    let plan = AnchoredWordCaptureBuilder::new(pattern)
+        .profile(rebar_profile())
+        .unicode(unicode)
+        .case_insensitive(false)
+        .limits(AnchoredWordCaptureBuildLimits {
+            max_inspection_work: limits.fre_capture_scalar_planner_work,
+            max_hir_nodes: limits.fre_aggregate_hir_nodes,
+            max_class_ranges: limits.fre_aggregate_hir_nodes,
+            max_captures: limits.patterns_per_job,
+            max_fixed_units: limits.fre_aggregate_repeat_bound,
+            max_persistent_bytes: limits.fre_aggregate_program_bytes,
+            max_peak_bytes: limits.fre_aggregate_peak_bytes,
+            ..defaults
+        })
+        .build();
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(
+            AnchoredWordCaptureBuildError::Syntax(_)
+            | AnchoredWordCaptureBuildError::Unsupported(_),
+        ) => return Ok(None),
+        Err(error @ AnchoredWordCaptureBuildError::Resource { .. }) => {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE anchored word-capture build refused execution: {error}"
+            )));
+        }
+        Err(
+            error @ (AnchoredWordCaptureBuildError::ArithmeticOverflow(_)
+            | AnchoredWordCaptureBuildError::InternalInvariant(_)),
+        ) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE anchored word-capture build faulted: {error}"
+            )));
+        }
+        Err(error) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE anchored word-capture build returned an unknown failure: {error}"
+            )));
+        }
+    };
+    authenticate_anchored_word_capture_plan(&plan, unicode)?;
+    Ok(Some(plan))
+}
+
+fn authenticate_anchored_word_capture_plan(
+    plan: &AnchoredWordCapturePlan,
+    unicode: bool,
+) -> Result<(), ExecutionError> {
+    let report = plan.build_report();
+    let operation = report.identity.operation;
+    let mut expected_profile = rebar_profile();
+    expected_profile.options.unicode = unicode;
+    expected_profile.options.case_insensitive = false;
+    let shape_closes = match operation.kind {
+        fre::AnchoredWordCaptureKind::WordFields => {
+            operation.word_fields == operation.explicit_captures
+                && operation.word_fields != 0
+                && operation.fixed_units == 0
+        }
+        fre::AnchoredWordCaptureKind::FixedClassWordBoundary => {
+            operation.word_fields == 0 && operation.fixed_units != 0
+        }
+    };
+    if report.identity.profile != expected_profile
+        || report.identity.algorithm_version != fre::ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION
+        || report.identity.accounting_version != fre::ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION
+        || operation.plan_id != fre::ANCHORED_WORD_CAPTURE_PLAN_ID
+        || operation.operation_id != fre::ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID
+        || operation.mode
+            != if unicode {
+                fre::AnchoredWordCaptureMode::Unicode
+            } else {
+                fre::AnchoredWordCaptureMode::Ascii
+            }
+        || operation.explicit_captures == 0
+        || operation.groups_per_match != operation.explicit_captures.saturating_add(1)
+        || operation.class_ranges == 0
+        || !operation.absolute_start_per_line
+        || !operation.crlf_stripped
+        || !operation.invalid_bytes_are_non_word
+        || !operation.uniform_participation
+        || !operation.non_overlapping_per_line
+        || !shape_closes
+        || report.hir.hir_nodes == 0
+        || report.hir.captures != operation.explicit_captures
+        || report.hir.class_ranges != operation.class_ranges
+        || report.hir.inspection_work < report.hir.hir_nodes
+        || report.persistent_bytes != core::mem::size_of::<AnchoredWordCapturePlan>()
+        || report.peak_bytes != report.persistent_bytes
+    {
+        return Err(ExecutionError::fault(
+            "FRE anchored word-capture plan identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn anchored_word_capture_run_limits(
+    plan: &AnchoredWordCapturePlan,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<AnchoredWordCaptureRunLimits, ExecutionError> {
+    let unicode = matches!(
+        plan.build_report().identity.operation.mode,
+        fre::AnchoredWordCaptureMode::Unicode
+    );
+    authenticate_anchored_word_capture_plan(plan, unicode)?;
+    let upper = plan.run_upper_bounds(haystack_len).map_err(|error| {
+        ExecutionError::fault(format!(
+            "FRE anchored word-capture preflight faulted: {error}"
+        ))
+    })?;
+    let reducer_limit = usize::try_from(limits.reducer_steps).map_err(|_| {
+        ExecutionError::fault("anchored word-capture reducer limit does not fit usize")
+    })?;
+    for (resource, needed, limit) in [
+        ("ExecutionWork", upper.work, limits.fre_aggregate_operation_work),
+        (
+            "SequentialBytes",
+            upper.sequential_bytes,
+            limits.fre_aggregate_sequential_bytes,
+        ),
+        ("Lines", upper.lines, reducer_limit),
+        ("Matches", upper.matches, reducer_limit),
+        ("CaptureCount", upper.capture_count, reducer_limit),
+        (
+            "PeakBytes",
+            upper.peak_bytes,
+            limits.fre_aggregate_peak_bytes,
+        ),
+    ] {
+        if needed > limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE anchored word-capture lifecycle resource {resource} requires {needed}, limit is {limit}"
+            )));
+        }
+    }
+    Ok(AnchoredWordCaptureRunLimits {
+        max_input_bytes: upper.input_bytes,
+        max_source_reads: upper.source_reads,
+        max_decoded_units: upper.decoded_units,
+        max_class_comparisons: upper.class_comparisons,
+        max_word_probes: upper.word_probes,
+        max_lines: upper.lines,
+        max_matches: upper.matches,
+        max_capture_count: upper.capture_count,
+        max_work: upper.work,
+        max_sequential_bytes: upper.sequential_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    })
+}
+
+fn execute_anchored_word_capture_with_limits(
+    plan: &AnchoredWordCapturePlan,
+    haystack: &[u8],
+    run_limits: AnchoredWordCaptureRunLimits,
+) -> Result<u64, ExecutionError> {
+    let result = plan
+        .grep_capture_count(haystack, run_limits)
+        .map_err(|error| match error {
+            AnchoredWordCaptureRunError::Resource { .. } => ExecutionError::unsupported(format!(
+                "FRE anchored word-capture reducer refused execution: {error}"
+            )),
+            AnchoredWordCaptureRunError::ArithmeticOverflow { .. }
+            | AnchoredWordCaptureRunError::AccountingInvariant { .. } => ExecutionError::fault(
+                format!("FRE anchored word-capture reducer faulted: {error}"),
+            ),
+            error => ExecutionError::fault(format!(
+                "FRE anchored word-capture reducer returned an unknown failure: {error}"
+            )),
+        })?;
+    let report = plan.build_report();
+    if result.identity != report.identity.operation
+        || result.capture_count != result.actual.capture_count
+        || result.upper_bounds.input_bytes != haystack.len()
+        || result.upper_bounds.peak_bytes != report.persistent_bytes
+        || result.actual.delimiter_reads != haystack.len()
+        || result.actual.source_reads
+            != result
+                .actual
+                .delimiter_reads
+                .saturating_add(result.actual.matcher_reads)
+        || result.actual.sequential_bytes != result.actual.source_reads
+        || result.actual.lines > result.upper_bounds.lines
+        || result.actual.matches > result.upper_bounds.matches
+        || result.actual.capture_count > result.upper_bounds.capture_count
+        || result.actual.work > result.upper_bounds.work
+        || result.actual.capture_count
+            != result
+                .actual
+                .matches
+                .saturating_mul(report.identity.operation.groups_per_match)
+    {
+        return Err(ExecutionError::fault(
+            "FRE anchored word-capture execution identity or accounting mismatch",
+        ));
+    }
+    u64::try_from(result.capture_count)
+        .map_err(|_| ExecutionError::fault("FRE anchored word-capture count does not fit u64"))
+}
+
+fn anchored_word_capture_reduction(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
+    if request.patterns.len() != 1 {
+        return Ok(None);
+    }
+    let Some(plan) = anchored_word_capture_plan_one(
+        request.patterns[0].as_str(),
+        request.unicode,
+        request.case_insensitive,
+        limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    let run_limits = anchored_word_capture_run_limits(&plan, request.haystack.len(), limits)?;
+    let actual = execute_anchored_word_capture_with_limits(&plan, request.haystack, run_limits)?;
+    Ok(Some(FreReduction {
+        actual,
+        plan: CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN,
     }))
 }
 
@@ -18376,6 +18662,108 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generic_anchored_word_capture_routes_target_shapes_and_preserves_controls() {
+        let unicode_fields =
+            "раз два три\n один  два три четыре\r\nраз два\n\u{80} раз два три";
+        let mut fields = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"^ *(\w+) +(\w+) +(\w+)",
+            true,
+            false,
+            unicode_fields.len(),
+        )
+        .expect("Unicode anchored word-field lifecycle");
+        assert_eq!(fields.plan(), CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN);
+        assert_eq!(
+            fields
+                .execute(unicode_fields.as_bytes())
+                .expect("first Unicode word-field execution"),
+            8
+        );
+        assert_eq!(
+            fields
+                .execute(unicode_fields.as_bytes())
+                .expect("steady Unicode word-field execution"),
+            8
+        );
+
+        let fixed_ascii =
+            b"abcdefghx\nabcdefgh \nabcdefghxZ\n123456789\r\nshort\nabcdefg\xffx\n";
+        let mut ascii_boundary = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"^(\S{8})(\S)\b",
+            false,
+            false,
+            fixed_ascii.len(),
+        )
+        .expect("ASCII anchored word-boundary lifecycle");
+        assert_eq!(
+            ascii_boundary.plan(),
+            CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
+        );
+        assert_eq!(
+            ascii_boundary
+                .execute(fixed_ascii)
+                .expect("ASCII word-boundary execution"),
+            9
+        );
+
+        let fixed_unicode = "абвгдежзи\nабвгдежз \nabcdefghi_\r\nабвгдежзи7\n";
+        let mut unicode_boundary = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"^(\S{8})(\S)\b",
+            true,
+            false,
+            fixed_unicode.len(),
+        )
+        .expect("Unicode anchored word-boundary lifecycle");
+        assert_eq!(
+            unicode_boundary.plan(),
+            CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN
+        );
+        assert_eq!(
+            unicode_boundary
+                .execute(fixed_unicode.as_bytes())
+                .expect("Unicode word-boundary execution"),
+            3
+        );
+
+        let ascii_fields = current_fre_rebar_capture_lifecycle(
+            "grep-captures",
+            r"^ *(\w+) +(\w+) +(\w+)",
+            false,
+            false,
+            32,
+        )
+        .expect("incumbent ASCII anchored-line lifecycle");
+        assert_eq!(
+            ascii_fields.plan(),
+            CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
+        );
+
+        for (pattern, unicode) in [
+            (r"^ *(\w*) +(\w+) +(\w+)", true),
+            (r"^ *(\w+) +(\w+)\s+(\w+)", true),
+            (r"^(\S{8})(\w)\b", true),
+            (r"^(\S{8})(\S)", true),
+        ] {
+            let lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                pattern,
+                unicode,
+                false,
+                32,
+            )
+            .expect("nearby shape retains incumbent lifecycle");
+            assert_ne!(
+                lifecycle.plan(),
+                CURRENT_FRE_CAPTURE_ANCHORED_WORD_PLAN,
+                "{pattern}"
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct RuffRealRow {
         id: &'static str,
@@ -21472,7 +21860,14 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v45-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v46-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+        );
+        assert!(identity.identity.contains("capture-word-run-v1"));
+        assert!(identity.identity.contains("anchored-word-capture-v1"));
+        assert!(
+            identity
+                .availability
+                .contains("fixed class captures ending in the selected word boundary")
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
