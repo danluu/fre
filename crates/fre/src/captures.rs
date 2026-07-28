@@ -2727,11 +2727,8 @@ impl CaptureRegex {
         &self,
         span: EngineSpan,
     ) -> Result<Option<ParticipationSearchProspective>, EngineSearchError> {
-        if matches!(
-            self.report.plan_identity.plan,
-            CapturePlanKind::LinearSelectorParticipationQuotientV1
-                | CapturePlanKind::FusedCaptureStreamParticipationV1
-        ) {
+        if self.report.plan_identity.plan == CapturePlanKind::LinearSelectorParticipationQuotientV1
+        {
             self.engine.participation_exact_prospective(span).map(Some)
         } else {
             Ok(None)
@@ -3764,7 +3761,6 @@ impl CaptureRegex {
             peak_threads: 0,
         };
         let mut capture_events = 0_usize;
-        let mut participation_session = None;
         let all_groups =
             self.report
                 .engine
@@ -3827,52 +3823,10 @@ impl CaptureRegex {
             };
             let (participation_mask, capture_groups, replay_report) = if use_participation_quotient
             {
-                let admitted = self
+                let replay = self
                     .engine
-                    .admit_participation_exact(span, per_search)
+                    .captures_participation_exact(haystack, window, span, per_search)
                     .map_err(|source| Self::history_error(&identity, source))?;
-                if participation_session.is_none() {
-                    let session = self
-                        .engine
-                        .prepare_participation_exact_session()
-                        .map_err(|source| Self::history_error(&identity, source))?;
-                    if session.scratch_bytes() != admitted.scratch_bytes {
-                        return Err(CaptureExecutionError {
-                            identity,
-                            source: CaptureExecutionSource::InternalInvariant(
-                                "reusable quotient scratch diverged from exact-span admission",
-                            ),
-                            selector_receipt: None,
-                            prefix_class_participation_receipt: None,
-                            count_receipt: None,
-                        });
-                    }
-                    participation_session = Some(session);
-                }
-                let replay = participation_session
-                    .as_mut()
-                    .ok_or_else(|| CaptureExecutionError {
-                        identity: identity.clone(),
-                        source: CaptureExecutionSource::InternalInvariant(
-                            "reusable quotient session was not constructed",
-                        ),
-                        selector_receipt: None,
-                        prefix_class_participation_receipt: None,
-                        count_receipt: None,
-                    })?
-                    .captures_exact(haystack, window, span, per_search)
-                    .map_err(|source| Self::history_error(&identity, source))?;
-                if replay.prospective != admitted {
-                    return Err(CaptureExecutionError {
-                        identity,
-                        source: CaptureExecutionSource::InternalInvariant(
-                            "reusable quotient replay diverged from pre-source admission",
-                        ),
-                        selector_receipt: None,
-                        prefix_class_participation_receipt: None,
-                        count_receipt: None,
-                    });
-                }
                 if !replay.prospective.closes_report(&replay.report) {
                     return Err(CaptureExecutionError {
                         identity,

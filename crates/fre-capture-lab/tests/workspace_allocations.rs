@@ -3,9 +3,9 @@
 use std::{alloc::System, sync::Arc};
 
 use fre_capture_lab::{
-    Ast, BuildLimits, CaptureStream, CaptureStreamDomains, CaptureStreamLimits, HistoryRegex,
-    LineMode, LineScanLimits, LineScanner, SearchLimits, Span, TagAction, TagRunLimits,
-    TagWorkspace, TagWorkspaceLimits, TagWorkspaceProspective, Window,
+    Ast, BuildLimits, CaptureStream, CaptureStreamDomains, CaptureStreamLimits, LineMode,
+    LineScanLimits, LineScanner, TagAction, TagRunLimits, TagWorkspace, TagWorkspaceLimits,
+    TagWorkspaceProspective,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -269,64 +269,6 @@ fn assert_exact_capture_replay_census() {
     }
 }
 
-fn assert_participation_session_census() {
-    let regex = HistoryRegex::compile(
-        &Ast::alt([
-            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'b')]).capture(1),
-            Ast::concat([Ast::Byte(b'a'), Ast::Byte(b'c')]).capture(2),
-        ]),
-        BuildLimits::default(),
-    )
-    .expect("history regex");
-    let (mut session, construction) = census(|| {
-        regex
-            .prepare_participation_exact_session()
-            .expect("session")
-    });
-    assert_eq!(construction.allocations, 4);
-    assert_eq!(construction.reallocations, 0);
-    assert_eq!(construction.deallocations, 0);
-    assert_eq!(construction.bytes_reallocated, 0);
-    let headers = 4_usize
-        .checked_mul(core::mem::size_of::<Vec<usize>>())
-        .expect("test header bytes");
-    assert_eq!(
-        construction
-            .bytes_allocated
-            .checked_add(headers)
-            .expect("test scratch bytes"),
-        session.scratch_bytes()
-    );
-
-    let haystack = b"ac ab ac";
-    for span in [
-        Span { start: 0, end: 2 },
-        Span { start: 3, end: 5 },
-        Span { start: 6, end: 8 },
-    ] {
-        let (reused, stats) = census(|| {
-            session
-                .captures_exact(
-                    haystack,
-                    Window::all(haystack),
-                    span,
-                    SearchLimits::default(),
-                )
-                .expect("reused projection")
-        });
-        let one_shot = regex
-            .captures_participation_exact(
-                haystack,
-                Window::all(haystack),
-                span,
-                SearchLimits::default(),
-            )
-            .expect("one-shot projection");
-        assert_eq!(reused, one_shot);
-        assert_eq!(stats, Stats::default());
-    }
-}
-
 #[test]
 fn exact_storage_and_reused_execution_match_the_allocator_census() {
     assert_construction_census();
@@ -334,5 +276,4 @@ fn exact_storage_and_reused_execution_match_the_allocator_census() {
     assert_line_census();
     assert_capture_stream_census();
     assert_exact_capture_replay_census();
-    assert_participation_session_census();
 }

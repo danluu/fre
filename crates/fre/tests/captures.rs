@@ -2968,62 +2968,6 @@ fn operation_wide_selector_removes_quadratic_restart_work() {
 }
 
 #[test]
-fn selector_first_quotient_reuses_one_exact_frontier_across_priority_adversaries() {
-    let cases: &[(&str, &[u8])] = &[
-        (r"(?:(a())|(a))", b"aaaa"),
-        (r"(?:(ab(c)?)|(a(b)?))", b"abcababa"),
-        (r"((a)|(b))+", b"abba baab"),
-        (r"(a)?b", b"b ab b"),
-    ];
-    for &(pattern, haystack) in cases {
-        let regex = CaptureBuilder::new(pattern)
-            .unicode(false)
-            .build()
-            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
-        assert_eq!(
-            regex.build_report().plan_identity.plan,
-            fre::CapturePlanKind::FusedCaptureStreamParticipationV1,
-            "pattern={pattern:?}"
-        );
-        let scratch = regex
-            .participation_quotient_prospective(fre::CaptureSpan { start: 0, end: 0 })
-            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"))
-            .expect("quotient prospective")
-            .scratch_bytes;
-        let result = regex
-            .count_captures(haystack, CaptureRunLimits::default())
-            .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
-        assert_eq!(
-            result.accounting.count,
-            reference_count(pattern, haystack),
-            "pattern={pattern:?}"
-        );
-        assert_eq!(result.accounting.searches, result.accounting.matches);
-        assert_eq!(result.accounting.total_history_nodes, 0);
-        assert_eq!(result.accounting.total_history_walk, 0);
-        assert_eq!(
-            result.capture_events,
-            result.accounting.matches * (regex.build_report().engine.captures + 1)
-        );
-        let selector = result
-            .selector_accounting
-            .as_ref()
-            .expect("selector-first accounting");
-        assert_eq!(
-            result.combined_peak_bytes,
-            selector.peak_bytes.max(
-                selector
-                    .output_bytes
-                    .checked_add(scratch)
-                    .expect("test peak")
-            )
-        );
-        assert!(result.selector_certificate.is_some());
-        assert!(result.capture_stream.is_none());
-    }
-}
-
-#[test]
 fn participation_quotient_preserves_priority_repetition_and_receipts() {
     let cases: &[(&str, &[u8])] = &[
         (r"(?:(a())|(a))", b"a"),
