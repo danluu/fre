@@ -503,27 +503,43 @@ def validate_deployment(
         and f'core::arch::global_asm!(".hidden {proof}");' in source,
         "deployment binding omits its exact symbol namespace",
     )
+    require(
+        'pub(super) const PRODUCTION_AUTHORITY: &str = "absent";' in source
+        and 'pub(super) const RUNTIME_AUTHORITY: &str = "absent";' in source,
+        "deployment binding changed its absent compiler/runtime authority",
+    )
     key_start = source.find(
         "static EXACT_PLAN_BINDING_KEY: "
         "fre_aot_static_runtime::StaticSearchSelectedEndBindingKeyV2"
     )
+    claims_start = source.find(
+        "static EXACT_PRODUCTION_CLAIMS: "
+        "fre_aot_static_runtime::StaticSearchSelectedEndArtifactClaimsV2"
+    )
     nominal_start = source.find(
-        "pub(super) struct ExactLinkedAotSelectedEndPlanSessionV2"
+        "pub struct ExactLinkedAotSelectedEndPlanSessionV2"
     )
     bind_start = source.find(
         "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
     )
     primary_start = source.find(
-        "pub(super) fn search_exact_linked_aot_selected_end_v2"
+        "pub fn search_exact_linked_aot_selected_end_v2"
     )
     diagnostic_start = source.find(
         "pub(super) fn search_exact_linked_aot_selected_end_qualification_wrapper_v2"
     )
     require(
-        0 <= key_start < nominal_start < bind_start < primary_start < diagnostic_start,
-        "deployment binding key/nominal/bind/primary/diagnostic order changed",
+        0
+        <= key_start
+        < claims_start
+        < nominal_start
+        < bind_start
+        < primary_start
+        < diagnostic_start,
+        "deployment binding key/claims/nominal/bind/primary/diagnostic order changed",
     )
-    key_source = source[key_start:nominal_start]
+    key_source = source[key_start:claims_start]
+    claims_source = source[claims_start:nominal_start]
     nominal_source = source[nominal_start:bind_start]
     bind_source = source[bind_start:primary_start]
     primary_source = source[primary_start:diagnostic_start]
@@ -549,14 +565,44 @@ def validate_deployment(
     require(
         (
             "StaticSearchSelectedEndBindingKeyV2::"
-            "qualification_private(COMPILE_IDENTITY)"
+            "compiler_generated(COMPILE_IDENTITY)"
         )
         in key_source,
         "deployment binding key is not tied to COMPILE_IDENTITY",
     )
+    generated_claims = (
+        "MANIFEST_IDENTITY",
+        "SOURCE_IDENTITY",
+        "SEMANTIC_BINDING_IDENTITY",
+        "LITERAL_IDENTITY",
+        "KIR_IDENTITY",
+        "ARTIFACT_IDENTITY",
+        "BINDING_IDENTITY",
+        "COMPILE_IDENTITY",
+        "IMPLEMENTATION_OBJECT_IDENTITY",
+        "COMPILER_RECEIPT_IDENTITY",
+        "EXPECTATION_IDENTITY",
+        "FULL_PAYLOAD_IDENTITY",
+        "GLUE_SOURCE_IDENTITY",
+        "DIRECT_HEADER_IDENTITY",
+        "GLUE_CODE_IDENTITY",
+        "GLUE_OBJECT_IDENTITY",
+        "BUNDLE_IDENTITY",
+        "FULL_PAYLOAD_BYTES",
+        "EXACT_LITERAL",
+    )
+    expected_claims = (
+        "StaticSearchSelectedEndArtifactClaimsV2::compiler_generated(\n"
+        + "".join(f"    {claim},\n" for claim in generated_claims)
+        + ");"
+    )
+    require(
+        expected_claims in claims_source,
+        "deployment public lookup omits or reorders generated identity claims",
+    )
     require(
         (
-            "pub(super) struct "
+            "pub struct "
             "ExactLinkedAotSelectedEndPlanSessionV2<'owner, 'plan>"
         )
         in nominal_source
@@ -569,6 +615,19 @@ def validate_deployment(
         and "pub(crate) inner:" not in nominal_source
         and "pub inner:" not in nominal_source,
         "deployment binding does not keep its owning session nominal field private",
+    )
+    require(
+        "pub enum ExactLinkedAotSelectedEndAdoptionV2<'plan>" in source
+        and "ExactLinkedAotSelectedEndPortableFallbackV2" in source
+        and "ExactLinkedAotSelectedEndFacadeV2" in source
+        and "adopt_compiler_generated_static_search_selected_end_v2("
+        in source
+        and "let thread = self.production.begin_current_thread_session()?;"
+        in source
+        and "from_address" not in source
+        and "from_symbol" not in source
+        and "set_authority" not in source,
+        "deployment public adopter/fallback seam is incomplete or caller-forgeable",
     )
     require(
         (

@@ -11,7 +11,10 @@ three execution routes on a little-endian Linux/AArch64 Arm `0x41/0xd84` host:
 
 It is diagnostic scaffolding, not promotion or deployment authority. The run
 metadata and every result row say `promotion_authority=absent`, and the
-deterministic P2b bundle itself says `runtime_authority=absent`.
+deterministic P2b bundle itself says `runtime_authority=absent`. The generated
+binding also contains the public lookup/fallback facade, but the runtime's
+literal production table is empty; this benchmark deliberately uses the
+separate qualification-private owner.
 
 ## Static AOT construction
 
@@ -67,7 +70,7 @@ returned static-runtime token is neither `Send` nor `Sync`, checks
 features/tuning, and observes `PR_SVE_GET_VL == 16` once on the calling thread.
 The compiler-generated bind function consumes that token, validates the exact
 literal once, and records the generated module's hardcoded private
-compile-identity key in a module-private nominal session that borrows only the
+compile-identity key in a field-private nominal session that borrows only the
 external portable plan and qualification owner. Nominal construction
 discharges artifact identity; there is no runtime key comparison in the hot
 path. This owning shape is storable without a self-reference. Repeated calls

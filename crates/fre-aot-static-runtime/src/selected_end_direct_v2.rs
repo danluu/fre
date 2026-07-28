@@ -1,10 +1,12 @@
-//! Qualification-private thread and scalar-call contracts for the Linux
-//! tag21 `SelectedEnd` register-return ABI2.
+//! Identity-gated thread and scalar-call contracts for the Linux tag21
+//! `SelectedEnd` register-return ABI2.
 //!
 //! This module deliberately owns no address, function pointer, symbol lookup,
-//! object adopter, or authority row. The exact identity-suffixed `extern`
-//! declaration and call must remain in compiler-generated consumer source so
-//! a final-image checker can prove that the linker retained a direct `bl`.
+//! or object adopter. Its production authority atom is a literal,
+//! source-reviewed table that begins empty. The exact identity-suffixed
+//! `extern` declaration and call must remain in compiler-generated consumer
+//! source so a final-image checker can prove that the linker retained a direct
+//! `bl`.
 
 use core::{fmt, marker::PhantomData};
 use std::rc::Rc;
@@ -14,14 +16,356 @@ use fre_kernels::{LiteralAccounting, LiteralPlan, LiteralSearchPreflight};
 
 const SELECTED_END_LITERAL_BYTES_V2: usize = 16;
 const SELECTED_END_FIXED_VECTOR_BYTES_V2: u16 = 16;
+const HARD_MAX_STATIC_SEARCH_SELECTED_END_PRODUCTION_ROWS_V2: usize = 256;
 
-/// Explicit absence of production authority.
+mod production_rows;
+use production_rows::PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2;
+
+/// Complete lookup-only identity claims emitted into one exact generated ABI2
+/// binding.
 ///
-/// Enabling the qualification-private feature does not add a production row
-/// or turn compiler output into an authorized production deployment.
+/// These values are not authority. The constructor accepts no address,
+/// function pointer, symbol spelling, selector, or authority input. A
+/// downstream caller can copy claims, but cannot create the private
+/// source-reviewed row required for adoption. The generated Rust binding
+/// cannot embed its own source hash or deployment-receipt identity without a
+/// circular digest; source review and final-image qualification must establish
+/// those external identities separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the repeated identity suffix keeps all seventeen security domains explicit"
+)]
+pub struct StaticSearchSelectedEndArtifactClaimsV2 {
+    manifest_identity: [u8; 32],
+    source_identity: [u8; 32],
+    semantic_binding_identity: [u8; 32],
+    literal_identity: [u8; 32],
+    kir_identity: [u8; 32],
+    artifact_identity: [u8; 32],
+    binding_identity: [u8; 32],
+    compile_identity: [u8; 32],
+    implementation_object_identity: [u8; 32],
+    compiler_receipt_identity: [u8; 32],
+    expectation_identity: [u8; 32],
+    full_payload_identity: [u8; 32],
+    glue_source_identity: [u8; 32],
+    direct_header_identity: [u8; 32],
+    glue_code_identity: [u8; 32],
+    glue_object_identity: [u8; 32],
+    bundle_identity: [u8; 32],
+    full_payload_bytes: u32,
+    literal: [u8; SELECTED_END_LITERAL_BYTES_V2],
+}
+
+impl StaticSearchSelectedEndArtifactClaimsV2 {
+    /// Construct the lookup claims embedded by `fre-aot-compiler`.
+    ///
+    /// This constructor grants no authority. Every field is compared with one
+    /// complete private production row before an opaque production owner can
+    /// exist.
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "generated code must name every independently reviewed identity domain"
+    )]
+    pub const fn compiler_generated(
+        manifest_identity: [u8; 32],
+        source_identity: [u8; 32],
+        semantic_binding_identity: [u8; 32],
+        literal_identity: [u8; 32],
+        kir_identity: [u8; 32],
+        artifact_identity: [u8; 32],
+        binding_identity: [u8; 32],
+        compile_identity: [u8; 32],
+        implementation_object_identity: [u8; 32],
+        compiler_receipt_identity: [u8; 32],
+        expectation_identity: [u8; 32],
+        full_payload_identity: [u8; 32],
+        glue_source_identity: [u8; 32],
+        direct_header_identity: [u8; 32],
+        glue_code_identity: [u8; 32],
+        glue_object_identity: [u8; 32],
+        bundle_identity: [u8; 32],
+        full_payload_bytes: u32,
+        literal: [u8; SELECTED_END_LITERAL_BYTES_V2],
+    ) -> Self {
+        Self {
+            manifest_identity,
+            source_identity,
+            semantic_binding_identity,
+            literal_identity,
+            kir_identity,
+            artifact_identity,
+            binding_identity,
+            compile_identity,
+            implementation_object_identity,
+            compiler_receipt_identity,
+            expectation_identity,
+            full_payload_identity,
+            glue_source_identity,
+            direct_header_identity,
+            glue_code_identity,
+            glue_object_identity,
+            bundle_identity,
+            full_payload_bytes,
+            literal,
+        }
+    }
+}
+
+macro_rules! source_qualified_identity_v2 {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct $name([u8; 32]);
+
+        impl $name {
+            const fn as_bytes(&self) -> &[u8; 32] {
+                &self.0
+            }
+        }
+    };
+}
+
+source_qualified_identity_v2!(SourceQualifiedManifestIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedSourceIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedSemanticBindingIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedLiteralIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedKirIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedArtifactIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedBindingIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedCompileIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedImplementationObjectIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedCompilerReceiptIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedExpectationIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedFullPayloadIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedGlueSourceIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedDirectHeaderIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedGlueCodeIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedGlueObjectIdentityV2);
+source_qualified_identity_v2!(SourceQualifiedBundleIdentityV2);
+
+/// One exact, source-reviewed final-image ABI2 decision.
+///
+/// Construction exists only in the private production authority child
+/// module. Compiler output, build scripts, features, environment variables,
+/// and downstream callers cannot manufacture this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the repeated identity suffix keeps all seventeen security domains explicit"
+)]
+struct SourceQualifiedStaticSearchSelectedEndRowV2 {
+    manifest_identity: SourceQualifiedManifestIdentityV2,
+    source_identity: SourceQualifiedSourceIdentityV2,
+    semantic_binding_identity: SourceQualifiedSemanticBindingIdentityV2,
+    literal_identity: SourceQualifiedLiteralIdentityV2,
+    kir_identity: SourceQualifiedKirIdentityV2,
+    artifact_identity: SourceQualifiedArtifactIdentityV2,
+    binding_identity: SourceQualifiedBindingIdentityV2,
+    compile_identity: SourceQualifiedCompileIdentityV2,
+    implementation_object_identity: SourceQualifiedImplementationObjectIdentityV2,
+    compiler_receipt_identity: SourceQualifiedCompilerReceiptIdentityV2,
+    expectation_identity: SourceQualifiedExpectationIdentityV2,
+    full_payload_identity: SourceQualifiedFullPayloadIdentityV2,
+    glue_source_identity: SourceQualifiedGlueSourceIdentityV2,
+    direct_header_identity: SourceQualifiedDirectHeaderIdentityV2,
+    glue_code_identity: SourceQualifiedGlueCodeIdentityV2,
+    glue_object_identity: SourceQualifiedGlueObjectIdentityV2,
+    bundle_identity: SourceQualifiedBundleIdentityV2,
+    full_payload_bytes: u32,
+    literal: [u8; SELECTED_END_LITERAL_BYTES_V2],
+}
+
+impl SourceQualifiedStaticSearchSelectedEndRowV2 {
+    fn matches(&self, claims: &StaticSearchSelectedEndArtifactClaimsV2) -> bool {
+        self.manifest_identity.as_bytes() == &claims.manifest_identity
+            && self.source_identity.as_bytes() == &claims.source_identity
+            && self.semantic_binding_identity.as_bytes() == &claims.semantic_binding_identity
+            && self.literal_identity.as_bytes() == &claims.literal_identity
+            && self.kir_identity.as_bytes() == &claims.kir_identity
+            && self.artifact_identity.as_bytes() == &claims.artifact_identity
+            && self.binding_identity.as_bytes() == &claims.binding_identity
+            && self.compile_identity.as_bytes() == &claims.compile_identity
+            && self.implementation_object_identity.as_bytes()
+                == &claims.implementation_object_identity
+            && self.compiler_receipt_identity.as_bytes() == &claims.compiler_receipt_identity
+            && self.expectation_identity.as_bytes() == &claims.expectation_identity
+            && self.full_payload_identity.as_bytes() == &claims.full_payload_identity
+            && self.glue_source_identity.as_bytes() == &claims.glue_source_identity
+            && self.direct_header_identity.as_bytes() == &claims.direct_header_identity
+            && self.glue_code_identity.as_bytes() == &claims.glue_code_identity
+            && self.glue_object_identity.as_bytes() == &claims.glue_object_identity
+            && self.bundle_identity.as_bytes() == &claims.bundle_identity
+            && self.full_payload_bytes == claims.full_payload_bytes
+            && self.literal == claims.literal
+    }
+
+    const fn compile_identity(&self) -> [u8; 32] {
+        self.compile_identity.0
+    }
+}
+
+const fn identity_is_strictly_less_v2(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut index = 0_usize;
+    while index < left.len() {
+        if left[index] < right[index] {
+            return true;
+        }
+        if left[index] > right[index] {
+            return false;
+        }
+        let Some(next) = index.checked_add(1) else {
+            return false;
+        };
+        index = next;
+    }
+    false
+}
+
+const fn production_rows_are_canonical_v2(
+    rows: &[SourceQualifiedStaticSearchSelectedEndRowV2],
+) -> bool {
+    if rows.len() > HARD_MAX_STATIC_SEARCH_SELECTED_END_PRODUCTION_ROWS_V2 {
+        return false;
+    }
+    let mut index = 1_usize;
+    while index < rows.len() {
+        let Some(previous) = index.checked_sub(1) else {
+            return false;
+        };
+        if !identity_is_strictly_less_v2(
+            rows[previous].compile_identity.as_bytes(),
+            rows[index].compile_identity.as_bytes(),
+        ) {
+            return false;
+        }
+        let Some(next) = index.checked_add(1) else {
+            return false;
+        };
+        index = next;
+    }
+    true
+}
+
+/// Source qualification attached to one lookup result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticSearchSelectedEndSourceQualificationV2 {
+    /// Exact compiler output is only a candidate and grants no runtime route.
+    Candidate,
+    /// A complete source-reviewed production row matched every identity.
+    SourceQualified { compile_identity: [u8; 32] },
+}
+
+/// Production authority attached to an opaque ABI2 owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticSearchSelectedEndProductionAuthorityV2 {
     Absent,
+    SourceQualified { compile_identity: [u8; 32] },
+}
+
+/// Typed portable-fallback reason returned before host probing or native work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticSearchSelectedEndFallbackStatusV2 {
+    /// This source revision contains no production rows.
+    ProductionAuthorityAbsent {
+        qualification: StaticSearchSelectedEndSourceQualificationV2,
+    },
+    /// Production rows exist, but none match all generated identity claims.
+    ArtifactUnqualified {
+        qualification: StaticSearchSelectedEndSourceQualificationV2,
+    },
+}
+
+impl StaticSearchSelectedEndFallbackStatusV2 {
+    #[must_use]
+    pub const fn production_authority(&self) -> StaticSearchSelectedEndProductionAuthorityV2 {
+        StaticSearchSelectedEndProductionAuthorityV2::Absent
+    }
+
+    #[must_use]
+    pub const fn qualification(&self) -> StaticSearchSelectedEndSourceQualificationV2 {
+        match self {
+            Self::ProductionAuthorityAbsent { qualification }
+            | Self::ArtifactUnqualified { qualification } => *qualification,
+        }
+    }
+}
+
+/// Opaque owner produced only by a complete source-reviewed row match.
+///
+/// It contains no address, symbol, callback, or callable pointer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticSearchSelectedEndProductionV2 {
+    compile_identity: [u8; 32],
+}
+
+impl StaticSearchSelectedEndProductionV2 {
+    #[must_use]
+    pub const fn production_authority(&self) -> StaticSearchSelectedEndProductionAuthorityV2 {
+        StaticSearchSelectedEndProductionAuthorityV2::SourceQualified {
+            compile_identity: self.compile_identity,
+        }
+    }
+
+    #[must_use]
+    pub const fn qualification(&self) -> StaticSearchSelectedEndSourceQualificationV2 {
+        StaticSearchSelectedEndSourceQualificationV2::SourceQualified {
+            compile_identity: self.compile_identity,
+        }
+    }
+
+    /// Observe the calling thread's tag21 host contract and SVE VL exactly
+    /// once.
+    pub fn begin_current_thread_session(
+        &self,
+    ) -> Result<
+        StaticSearchSelectedEndThreadSessionV2<'_>,
+        StaticSearchSelectedEndThreadContractErrorV2,
+    > {
+        begin_current_thread_session_for_owner_v2(self)
+    }
+}
+
+/// Result of matching compiler-generated claims against production authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticSearchSelectedEndAdoptionV2 {
+    Fallback(StaticSearchSelectedEndFallbackStatusV2),
+    Adopted(StaticSearchSelectedEndProductionV2),
+}
+
+/// Match one generated binding's complete identity tuple against the private
+/// production authority table.
+///
+/// No address, symbol, callback, selector, or authority value is accepted.
+/// The current empty table returns a typed portable fallback before host
+/// probing or native work.
+#[must_use]
+pub fn adopt_compiler_generated_static_search_selected_end_v2(
+    claims: &StaticSearchSelectedEndArtifactClaimsV2,
+) -> StaticSearchSelectedEndAdoptionV2 {
+    let candidate = StaticSearchSelectedEndSourceQualificationV2::Candidate;
+    if PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2.is_empty() {
+        return StaticSearchSelectedEndAdoptionV2::Fallback(
+            StaticSearchSelectedEndFallbackStatusV2::ProductionAuthorityAbsent {
+                qualification: candidate,
+            },
+        );
+    }
+    let Some(row) = PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2
+        .iter()
+        .find(|row| row.matches(claims))
+    else {
+        return StaticSearchSelectedEndAdoptionV2::Fallback(
+            StaticSearchSelectedEndFallbackStatusV2::ArtifactUnqualified {
+                qualification: candidate,
+            },
+        );
+    };
+    StaticSearchSelectedEndAdoptionV2::Adopted(StaticSearchSelectedEndProductionV2 {
+        compile_identity: row.compile_identity(),
+    })
 }
 
 /// Failure while opening one same-thread tag21 ABI2 session.
@@ -46,7 +390,7 @@ impl fmt::Display for StaticSearchSelectedEndThreadContractErrorV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "SelectedEnd ABI2 qualification thread contract failed: {self:?}"
+            "SelectedEnd ABI2 thread contract failed: {self:?}"
         )
     }
 }
@@ -136,10 +480,7 @@ pub enum StaticSearchSelectedEndCallErrorV2 {
 
 impl fmt::Display for StaticSearchSelectedEndCallErrorV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "SelectedEnd ABI2 qualification call failed: {self:?}"
-        )
+        write!(formatter, "SelectedEnd ABI2 call failed: {self:?}")
     }
 }
 
@@ -160,10 +501,20 @@ pub struct StaticSearchSelectedEndBindingKeyV2 {
 }
 
 impl StaticSearchSelectedEndBindingKeyV2 {
-    /// Construct one qualification-private generated-module binding key.
+    /// Construct one generated-module binding key.
+    ///
+    /// This key authenticates module identity inside an already-authorized
+    /// plan session; it is not an authority grant.
+    #[must_use]
+    pub const fn compiler_generated(identity: [u8; 32]) -> Self {
+        Self { identity }
+    }
+
+    /// Compatibility constructor for the qualification-private consumer.
+    #[doc(hidden)]
     #[must_use]
     pub const fn qualification_private(identity: [u8; 32]) -> Self {
-        Self { identity }
+        Self::compiler_generated(identity)
     }
 
     /// Compile identity carried by this generated-module key.
@@ -178,11 +529,13 @@ impl StaticSearchSelectedEndBindingKeyV2 {
 /// This zero-sized value grants no production authority and has no call
 /// method. A call requires both a current-thread session and a generated exact
 /// identity-suffixed binding.
+#[cfg(feature = "selected-end-qualification-private-v2")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StaticSearchSelectedEndQualificationV2 {
     _private: (),
 }
 
+#[cfg(feature = "selected-end-qualification-private-v2")]
 impl StaticSearchSelectedEndQualificationV2 {
     /// Construct the feature-gated qualification-only owner.
     #[must_use]
@@ -204,12 +557,21 @@ impl StaticSearchSelectedEndQualificationV2 {
         StaticSearchSelectedEndThreadSessionV2<'_>,
         StaticSearchSelectedEndThreadContractErrorV2,
     > {
-        platform::admit_current_thread_v2()?;
-        Ok(StaticSearchSelectedEndThreadSessionV2 {
-            _owner: self,
-            _thread_bound: PhantomData,
-        })
+        begin_current_thread_session_for_owner_v2(self)
     }
+}
+
+fn begin_current_thread_session_for_owner_v2<'owner, Owner>(
+    _owner: &'owner Owner,
+) -> Result<
+    StaticSearchSelectedEndThreadSessionV2<'owner>,
+    StaticSearchSelectedEndThreadContractErrorV2,
+> {
+    platform::admit_current_thread_v2()?;
+    Ok(StaticSearchSelectedEndThreadSessionV2 {
+        _owner: PhantomData,
+        _thread_bound: PhantomData,
+    })
 }
 
 /// Same-thread invocation capability for a generated exact ABI2 binding.
@@ -231,7 +593,7 @@ impl StaticSearchSelectedEndQualificationV2 {
 /// ```
 #[derive(Debug)]
 pub struct StaticSearchSelectedEndThreadSessionV2<'owner> {
-    _owner: &'owner StaticSearchSelectedEndQualificationV2,
+    _owner: PhantomData<&'owner ()>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -387,16 +749,16 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
         self.prepare_plan_bound(preflight)
     }
 
-    /// Consume one authoritative preflight after a generated private wrapper
-    /// has structurally fixed this session's artifact key.
+    /// Consume one authoritative preflight after a generated field-private
+    /// wrapper has structurally fixed this session's artifact key.
     ///
-    /// This qualification-private primitive performs only the plan-identity
-    /// check. It does not itself authorize any native call: generated source
-    /// encloses the session in a module-private nominal type that can be
-    /// constructed only by that artifact's exact bind function. Keeping the
-    /// artifact proof in the nominal type removes the second pointer check
-    /// from repeated calls without allowing one generated module's session to
-    /// enter another module's safe call boundary.
+    /// This primitive performs only the plan-identity check. It does not itself
+    /// authorize any native call: generated source encloses the session in a
+    /// nominal type with a private field that can be constructed only by that
+    /// artifact's exact bind function. Keeping the artifact proof in the
+    /// nominal type removes the second pointer check from repeated calls
+    /// without allowing one generated module's session to enter another
+    /// module's safe call boundary.
     #[doc(hidden)]
     #[inline(always)]
     pub fn prepare_plan_bound<'haystack>(
@@ -659,11 +1021,38 @@ mod tests {
     use fre_kernel_ir::CheckedSearchWindow;
     use fre_kernels::{LiteralBuildLimits, LiteralPlan, LiteralSearchLimits};
 
+    #[cfg(feature = "selected-end-qualification-private-v2")]
     #[test]
     fn authority_is_always_absent() {
         let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
         assert_eq!(
             owner.production_authority(),
+            StaticSearchSelectedEndProductionAuthorityV2::Absent
+        );
+    }
+
+    fn zero_claims() -> StaticSearchSelectedEndArtifactClaimsV2 {
+        StaticSearchSelectedEndArtifactClaimsV2::compiler_generated(
+            [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32],
+            [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], [0; 32], 0, [0; 16],
+        )
+    }
+
+    #[test]
+    fn public_adoption_is_absent_candidate_without_a_production_row() {
+        assert!(PRODUCTION_SOURCE_QUALIFIED_STATIC_SEARCH_SELECTED_END_ROWS_V2.is_empty());
+        let adoption = adopt_compiler_generated_static_search_selected_end_v2(&zero_claims());
+        let StaticSearchSelectedEndAdoptionV2::Fallback(status) = adoption else {
+            panic!("an empty production table must not adopt")
+        };
+        assert_eq!(
+            status,
+            StaticSearchSelectedEndFallbackStatusV2::ProductionAuthorityAbsent {
+                qualification: StaticSearchSelectedEndSourceQualificationV2::Candidate,
+            }
+        );
+        assert_eq!(
+            status.production_authority(),
             StaticSearchSelectedEndProductionAuthorityV2::Absent
         );
     }
@@ -773,9 +1162,8 @@ mod tests {
 
     #[test]
     fn preflight_is_bound_to_the_exact_literal_not_only_its_width() {
-        let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
         let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: &owner,
+            _owner: PhantomData,
             _thread_bound: PhantomData,
         };
         let haystack = b"before-0123456789abcdef-after";
@@ -805,9 +1193,8 @@ mod tests {
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x19; 32]);
         static OTHER_BINDING: StaticSearchSelectedEndBindingKeyV2 =
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x21; 32]);
-        let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
         let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: &owner,
+            _owner: PhantomData,
             _thread_bound: PhantomData,
         };
         let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();
@@ -874,9 +1261,8 @@ mod tests {
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x19; 32]);
         static OTHER_BINDING: StaticSearchSelectedEndBindingKeyV2 =
             StaticSearchSelectedEndBindingKeyV2::qualification_private([0x21; 32]);
-        let owner = StaticSearchSelectedEndQualificationV2::qualification_private();
         let session = StaticSearchSelectedEndThreadSessionV2 {
-            _owner: &owner,
+            _owner: PhantomData,
             _thread_bound: PhantomData,
         };
         let exact = LiteralPlan::new(b"0123456789abcdef", LiteralBuildLimits::default()).unwrap();

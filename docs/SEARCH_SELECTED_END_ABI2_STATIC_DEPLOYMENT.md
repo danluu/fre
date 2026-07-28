@@ -1,11 +1,12 @@
-# SelectedEnd ABI2 qualification-private static-link candidate
+# SelectedEnd ABI2 public adopter and static-link candidate
 
 The Linux tag21 `SelectedEnd` P2b implementation object and direct-glue object
 are the real AOT boundary. They contain the custom-emitted machine-code payload
 and one hidden identity-suffixed `R_AARCH64_CALL26` wrapper. LLVM is not the
 regex compiler, and a runtime address adopter is not part of this ABI2 route.
 
-The reusable qualification-private source candidate is split deliberately:
+The reusable public-adopter and qualification source candidate is split
+deliberately:
 
 - `fre-aot-compiler` deterministically emits a Rust module with literal
   identity-suffixed `extern` names for the exact entry and diagnostic wrapper.
@@ -18,18 +19,37 @@ The reusable qualification-private source candidate is split deliberately:
   The binding exposes its exact hidden identity-suffixed proof-callsite symbol
   so a qualification build can retain it explicitly for post-link inspection;
   the hot safe route bypasses that proof copy and calls the exact entry.
-- `fre-aot-static-runtime` exposes no ABI2 production row, address, callable
-  pointer, registry, or generic adopter. Its default-off
-  `selected-end-qualification-private-v2` feature provides only a
-  neither-`Send`-nor-`Sync` current-thread token, exact-literal scalar
-  preflight, and strict `x0` end-or-zero decoding. The generated binding
+- `fre-aot-static-runtime` exposes no ABI2 address, callable pointer, symbol
+  lookup, or registry. Its default-off `linked-search-selected-end-v2`
+  feature exposes a lookup-only adopter whose input is the complete set of 17
+  non-circular compiler/bundle/payload identities, the exact payload extent,
+  and the embedded literal. The sole production authority atom is a private
+  child module containing a literal, source-reviewed table. That table is
+  empty and compile-time constrained to remain empty in this source revision.
+  Empty authority returns typed `ProductionAuthorityAbsent` plus
+  `Candidate`; a nonmatching artifact in a future nonempty table returns typed
+  `ArtifactUnqualified`. The generated seam turns either status into an
+  executable portable `LiteralPlan` fallback and performs no host probe or
+  native work. The separate `selected-end-qualification-private-v2` feature
+  depends on the public feature but grants no production row.
+- The generated module owns the safe public facade. Its adopter accepts only
+  the exact `LiteralPlan`; it accepts no address, function pointer, symbol,
+  selector, callback, or authority setter. A production match yields only an
+  opaque owner. That owner must admit the current thread and then pass through
+  the generated module's private exact-plan bind to construct its public but
+  field-private nominal session. Thus a future row cannot bypass the
+  identity-suffixed direct-symbol declaration or mint a nominal session for a
+  different generated artifact.
+- The shared runtime boundary supplies a neither-`Send`-nor-`Sync`
+  current-thread token, exact-literal scalar preflight, and strict `x0`
+  end-or-zero decoding. The generated binding
   compares its embedded 16-byte literal with the portable `LiteralPlan` once,
   records its hardcoded private compile-identity key, and consumes the
   current-thread token into an owning plan-bound session. The generated module
-  encloses that value in a private nominal type, structurally fixing the key
-  without claiming a separate runtime key comparison. The type borrows only
-  the external owner and plan, so a consumer can store it without a
-  self-reference. Repeated hot calls then
+  encloses that value in a nominal type with a private field, structurally
+  fixing the key without claiming a separate runtime key comparison. The type
+  borrows only the external owner and plan, so a consumer can store it without
+  a self-reference. Repeated hot calls then
   authenticate the private preflight token with only plan identity. Equal bytes
   owned by another plan are rejected, while the distinct generated type
   prevents a plan session bound by another module from entering the call.
@@ -46,10 +66,19 @@ Calling that value necessarily introduces an indirect call boundary (normally
 porting it would therefore defeat the ABI2 requirements of four arguments,
 `x0` return, no result slot, and a post-link-provable direct call.
 
-All generated values report runtime authority `Absent`; the static-runtime
-feature is qualification-private and default-off, and there is no production
-authority table for ABI2. A signer-free receipt detects mismatch but grants no
-authority.
+All generated values continue to report compiler/runtime authority `Absent`.
+The source qualification remains `Candidate`, and the public runtime feature
+is default-off. Enabling either feature cannot populate the empty production
+table. A signer-free receipt detects mismatch but grants no authority.
+
+The generated binding cannot contain its own SHA-256 or deployment-receipt
+identity without a circular source hash. The production row therefore pins
+every non-circular identity embedded by the compiler, including the complete
+payload identity and extent and the bundle identity. Review of the generated
+Rust-binding source identity, that binding's SHA-256 identity, and the
+deployment-receipt identity remains an external source-review and final-image
+qualification obligation; runtime lookup does not pretend to establish a
+self-hash.
 
 After build/timing admission reopens, each exact consumer must still retain the
 implementation payload and metadata symbols and run an independent final-image

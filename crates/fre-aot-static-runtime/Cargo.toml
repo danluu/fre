@@ -1,7 +1,7 @@
 [package]
 name = "fre-aot-static-runtime"
 version.workspace = true
-description = "Authenticated static-link boundaries for FRE Count-v2, Search-v1 Span, and qualification-private SelectedEnd-v2 AOT objects"
+description = "Authenticated static-link boundaries for FRE Count-v2, Search-v1 Span, and SelectedEnd-v2 AOT objects"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,7 +14,8 @@ linked-hardware-matrix-v2 = ["linked-count-v2"]
 c5-qualification-private-v2 = ["linked-count-v2"]
 linked-search-span-v1 = []
 search-span-qualification-private-v1 = ["linked-search-span-v1"]
-selected-end-qualification-private-v2 = []
+linked-search-selected-end-v2 = []
+selected-end-qualification-private-v2 = ["linked-search-selected-end-v2"]
 
 [dependencies]
 fre-aot-aarch64 = { path = "../fre-aot-aarch64" }

@@ -13,15 +13,15 @@
 //! Compiler `RuntimeAuthority::Absent` remains conceptually separate from this
 //! runtime's source-qualified private or production authority.
 //!
-//! The default-off Linux tag21 `SelectedEnd` ABI2 qualification boundary is
-//! intentionally narrower. It owns no address adopter or function pointer:
+//! The default-off Linux tag21 `SelectedEnd` ABI2 boundary is intentionally
+//! narrower. It owns no address adopter or function pointer:
 //! compiler-generated identity-suffixed source retains the direct call. This
-//! crate supplies only exact-literal scalar preflight/result decoding and a
+//! crate supplies an identity-only lookup against a source-reviewed production
+//! table, exact-literal scalar preflight/result decoding, and a
 //! neither-`Send`-nor-`Sync` current-thread token whose construction performs
-//! the sole VL16 observation. A consuming exact-plan bind lets generated
-//! modules own that token inside an artifact-private nominal session while
-//! borrowing only the external owner and plan. There is no ABI2 production
-//! row.
+//! the sole VL16 observation. The production table begins empty and is
+//! compile-time constrained to remain empty in this source atom. The separate
+//! qualification-private feature grants no production authority.
 
 #![deny(unsafe_code, unsafe_op_in_unsafe_fn)]
 
@@ -35,7 +35,7 @@ mod search_linked;
 mod search_support;
 #[cfg(test)]
 mod search_test_fixture;
-#[cfg(feature = "selected-end-qualification-private-v2")]
+#[cfg(feature = "linked-search-selected-end-v2")]
 mod selected_end_direct_v2;
 mod support;
 #[cfg(test)]
@@ -83,10 +83,14 @@ pub use search_linked::{
 };
 #[cfg(feature = "selected-end-qualification-private-v2")]
 #[doc(hidden)]
+pub use selected_end_direct_v2::StaticSearchSelectedEndQualificationV2;
+#[cfg(feature = "linked-search-selected-end-v2")]
 pub use selected_end_direct_v2::{
+    StaticSearchSelectedEndAdoptionV2, StaticSearchSelectedEndArtifactClaimsV2,
     StaticSearchSelectedEndBindingKeyV2, StaticSearchSelectedEndCallErrorV2,
-    StaticSearchSelectedEndOwnedPlanSessionV2, StaticSearchSelectedEndPlanSessionV2,
-    StaticSearchSelectedEndPreparedCallV2, StaticSearchSelectedEndProductionAuthorityV2,
-    StaticSearchSelectedEndQualificationV2, StaticSearchSelectedEndThreadContractErrorV2,
-    StaticSearchSelectedEndThreadSessionV2,
+    StaticSearchSelectedEndFallbackStatusV2, StaticSearchSelectedEndOwnedPlanSessionV2,
+    StaticSearchSelectedEndPlanSessionV2, StaticSearchSelectedEndPreparedCallV2,
+    StaticSearchSelectedEndProductionAuthorityV2, StaticSearchSelectedEndProductionV2,
+    StaticSearchSelectedEndSourceQualificationV2, StaticSearchSelectedEndThreadContractErrorV2,
+    StaticSearchSelectedEndThreadSessionV2, adopt_compiler_generated_static_search_selected_end_v2,
 };
