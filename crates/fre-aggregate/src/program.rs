@@ -806,6 +806,12 @@ pub(crate) struct Program {
     pub(crate) has_scalar_transition: bool,
     pub(crate) has_assertion: bool,
     pub(crate) max_scalar_search_checks: usize,
+    /// Compiler-certified maximum number of non-accepting source bytes that
+    /// can remain live after an ordered accepting transition. `None` means no
+    /// finite byte-only certificate was published, either because the
+    /// non-accepting consume graph contains a cycle or because the program
+    /// contains scalar/assertion instructions outside the sweep domain.
+    pub(crate) continuation_nonaccepting_run: Option<usize>,
     pub(crate) has_unicode_word_boundary: bool,
     /// Construction-proved match-start domain. Kept beside the compact
     /// program flags so this optional execution hint occupies existing
@@ -860,5 +866,9 @@ impl Program {
 
     pub(crate) const fn max_scalar_search_checks(&self) -> usize {
         self.max_scalar_search_checks
+    }
+
+    pub(crate) const fn continuation_nonaccepting_run(&self) -> Option<usize> {
+        self.continuation_nonaccepting_run
     }
 }

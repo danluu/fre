@@ -524,6 +524,11 @@ impl P128FoundationAggregateCounterObservation {
                     "P128 point requires a continuation receipt, but the completed route was direct",
                 ));
             }
+            CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep => {
+                return Err(CompareError::new(
+                    "P128 point requires physical sweep evidence, but the diagnostic only published an incumbent counter projection",
+                ));
+            }
             CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt => {
                 return Err(CompareError::new(
                     "P128 point requires a native multi-pattern receipt that Foundation does not fabricate",
@@ -916,6 +921,26 @@ mod tests {
             result.receipt_status(),
             CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
         ));
+    }
+
+    #[test]
+    fn incumbent_projection_cannot_close_a_p128_sweep_point() {
+        let observation = P128FoundationAggregateCounterObservation {
+            boundary: P128FoundationOperationBoundary::First,
+            session_id: 7,
+            sequence: 1,
+            result: Box::new(CurrentFreAggregateOperationCounterResult {
+                value: 2,
+                receipt_status:
+                    CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep,
+            }),
+        };
+        let error = observation.into_continuation_receipt().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("diagnostic only published an incumbent counter projection")
+        );
     }
 
     #[test]

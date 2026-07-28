@@ -20270,9 +20270,10 @@ impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 /// Caller-owned scratch for repeated value-only count operations.
 ///
 /// Dense finite-literal plans retain their DP allocation here. Eligible
-/// byte-only continuation plans retain a complete ordered transition cache.
-/// Other selected plans ignore the workspace and keep their existing
-/// operation boundary.
+/// byte-only continuation plans retain observed ordered transitions in a
+/// fixed arena. A saturated cache completes the current operation inline and
+/// becomes a compact disabled marker; resource-ineligible calls select the
+/// incumbent before source access. Other selected plans ignore the workspace.
 #[derive(Debug, Default)]
 pub struct AggregateCountWorkspace {
     dense_finite: OrderedLiteralCountWorkspace,
@@ -20439,9 +20440,10 @@ impl AggregateCountRegex {
     /// dense finite-literal scratch in a caller-owned workspace.
     ///
     /// The first dense call performs the same allocation and initialization
-    /// as [`Self::count_value`]. Later calls reuse that allocation. This method
-    /// does not alter route selection, and non-dense plans execute exactly as
-    /// [`Self::count_value`] does.
+    /// as [`Self::count_value`]. Eligible byte-only continuation plans may
+    /// instead select a persistent ordered transition sweep after complete
+    /// source-free resource admission. A refusal uses [`Self::count_value`]'s
+    /// incumbent route; saturation completes inline without source replay.
     pub fn count_value_with_workspace(
         &self,
         haystack: &[u8],
@@ -20615,7 +20617,9 @@ impl AggregateSpanSumRegex {
     }
 
     /// Sum spans through the selected value-only plan while retaining eligible
-    /// dense finite-literal scratch in a caller-owned workspace.
+    /// dense finite-literal scratch or observed byte-continuation transitions
+    /// in a caller-owned workspace. Continuation admission is source-free; a
+    /// refusal uses the incumbent and saturation completes inline.
     pub fn span_sum_value_with_workspace(
         &self,
         haystack: &[u8],

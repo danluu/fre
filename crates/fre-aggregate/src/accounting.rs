@@ -89,6 +89,18 @@ pub struct CompileAccounting {
     /// The `Option<usize>` representation preserves the empty-language,
     /// nullable, and positive-width distinction used by operation admission.
     pub minimum_match_bytes_proof_bytes: usize,
+    /// Exact whole-match minimum width authenticated by the canonical HIR.
+    ///
+    /// This repeats the retained proof value in compile accounting so
+    /// downstream resource adapters can bind match-count-dependent envelopes
+    /// without trusting an independently supplied width.
+    pub minimum_match_bytes: Option<usize>,
+    /// Bytes in the retained maximum-nonaccepting-run proof.
+    ///
+    /// The inline `Option<usize>` distinguishes a finite compiler certificate
+    /// from an unbounded or unsupported continuation graph without retaining
+    /// certification scratch.
+    pub continuation_nonaccepting_run_proof_bytes: usize,
     /// Bytes in the retained mandatory-start-domain proof.
     ///
     /// The inline enum distinguishes unrestricted starts, absolute text start,
@@ -113,6 +125,14 @@ pub struct CompileAccounting {
     /// Exact work to evaluate every state once at one input boundary,
     /// including each state's worst-case transition checks.
     pub execution_state_work: usize,
+    /// Exact compiler certificate for the longest finite run that can keep a
+    /// higher-priority continuation live after a lower-priority acceptance.
+    ///
+    /// `None` is an authenticated unbounded/uncertified result, not an absent
+    /// accounting field. Rebar binds this value to any retained continuation
+    /// sweep envelope so an equal-state envelope from another program cannot
+    /// understate replay work.
+    pub continuation_max_nonaccepting_run: Option<usize>,
     /// Exact raw successor edges retained by the continuation program.
     pub predecessor_edges: usize,
     /// Whether row construction decodes one candidate scalar per boundary.

@@ -242,7 +242,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -675,6 +675,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; Unicode-off bounded-affix count/span-sum scans maximal middle-byte runs once, verifies only suffix literals at disjoint right endpoints, and uses zero execution scratch",
+        );
+        identity.identity.push_str(
+            "; persistent-continuation-sweep-v1 binds caller-owned fixed forward/reverse DFA arenas to one authenticated plan, an exact compile-certified maximum-nonaccepting-run and positive-minimum-match-width runtime envelope, source-free all-or-nothing fixed and mandatory admission, bounded speculative transition learning with current-frontier inline handoff and no replay, and a plan-bound sticky-disabled marker after refusal or saturation",
+        );
+        identity.availability.push_str(
+            "; eligible nonnullable assertion-free Unicode-off ordinary one-pattern continuation Count and SpanSum operations may reuse the persistent sweep; nullable or zero-width, Unicode or scalar, assertion, sparse-start, internal-anchor, small-program, policy- or allocation-refused, and other operations retain the incumbent continuation route without execution-time replay",
         );
         identity.identity.push_str(
             "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary ASCII/Unicode word repetitions or bare greedy unbounded ASCII word repetitions, with the source topology retained in its operation identity and reduction under independent pre-source prospective limits with checked actual counters",
@@ -1841,6 +1847,11 @@ pub enum CurrentFreAggregateCounterReceiptStatus {
     Continuation(Box<AggregateOperationHotCounterReceipt>),
     /// A single-pattern direct route completed without a continuation receipt.
     DirectSelectedPlan,
+    /// The retained value operation may use the persistent continuation
+    /// sweep, but this out-of-band diagnostic ran the incumbent
+    /// counter-producing path. Its projection is not physical evidence for a
+    /// sweep execution.
+    IncumbentProjectionForUnreceiptedSweep,
     /// A multi-pattern route completed before its native counter receipt is
     /// implemented. This is deliberately not represented as zero counters.
     MissingMultiPlanReceipt,
@@ -1867,6 +1878,7 @@ impl CurrentFreAggregateOperationCounterResult {
         match &self.receipt_status {
             CurrentFreAggregateCounterReceiptStatus::Continuation(receipt) => Some(receipt),
             CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+            | CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep
             | CurrentFreAggregateCounterReceiptStatus::MissingMultiPlanReceipt => None,
         }
     }
@@ -1968,13 +1980,16 @@ impl CurrentFreAggregateOperationLifecycle {
         }
     }
 
-    /// Execute the same retained value-only operation as [`Self::execute`]
-    /// and publish an optional continuation counter receipt after completion.
+    /// Execute an out-of-band value operation and publish its native evidence
+    /// status.
     ///
-    /// This is deliberately an out-of-timed-boundary diagnostic seam. It
-    /// reuses the same prebuilt artifact and exact derived limits, but is not
-    /// called by the benchmark runner. It cannot steer construction or route
-    /// selection because it receives no benchmark or fixture metadata.
+    /// This diagnostic is not called by the benchmark runner. It reuses the
+    /// same prebuilt artifact and exact derived limits, and receives no
+    /// benchmark or fixture metadata. When [`Self::execute`] can select the
+    /// persistent continuation sweep, this method deliberately invokes the
+    /// incumbent counter-producing path and reports
+    /// [`CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep`].
+    /// That projection is not a receipt for the sweep-executed operation.
     ///
     /// # Errors
     ///
@@ -2013,8 +2028,7 @@ impl CurrentFreAggregateOperationLifecycle {
                 .map_err(|error| {
                     CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
                 }),
-            CurrentFreAggregateOperationInner::CountSingle(regex, limits)
-            | CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, _) => regex
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
                     value: result.value(),
@@ -2029,6 +2043,37 @@ impl CurrentFreAggregateOperationLifecycle {
                     let message = format!("FRE count lifecycle: {error}");
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 }),
+            CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, _) => {
+                let projects_unreceipted_sweep = regex
+                    .continuation_sweep_upper_bounds()
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE count lifecycle continuation-sweep diagnostic preflight: {error}"
+                        ))
+                    })?
+                    .is_some();
+                regex
+                    .count_value_with_counters(haystack, limits)
+                    .map(|result| CurrentFreAggregateOperationCounterResult {
+                        value: result.value(),
+                        receipt_status: if projects_unreceipted_sweep {
+                            CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep
+                        } else {
+                            result.continuation_receipt().cloned().map_or(
+                                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                                |receipt| {
+                                    CurrentFreAggregateCounterReceiptStatus::Continuation(
+                                        Box::new(receipt),
+                                    )
+                                },
+                            )
+                        },
+                    })
+                    .map_err(|error| {
+                        let message = format!("FRE count lifecycle: {error}");
+                        CompareError::new(aggregate_attempt_error(&error, message).message)
+                    })
+            }
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map(|value| CurrentFreAggregateOperationCounterResult {
@@ -2046,8 +2091,7 @@ impl CurrentFreAggregateOperationLifecycle {
                 .map_err(|error| {
                     CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
                 }),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits)
-            | CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, _) => regex
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
                 .span_sum_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
                     value: result.value(),
@@ -2062,6 +2106,37 @@ impl CurrentFreAggregateOperationLifecycle {
                     let message = format!("FRE span-sum lifecycle: {error}");
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 }),
+            CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, _) => {
+                let projects_unreceipted_sweep = regex
+                    .continuation_sweep_upper_bounds()
+                    .map_err(|error| {
+                        CompareError::new(format!(
+                            "FRE span-sum lifecycle continuation-sweep diagnostic preflight: {error}"
+                        ))
+                    })?
+                    .is_some();
+                regex
+                    .span_sum_value_with_counters(haystack, limits)
+                    .map(|result| CurrentFreAggregateOperationCounterResult {
+                        value: result.value(),
+                        receipt_status: if projects_unreceipted_sweep {
+                            CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep
+                        } else {
+                            result.continuation_receipt().cloned().map_or(
+                                CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                                |receipt| {
+                                    CurrentFreAggregateCounterReceiptStatus::Continuation(
+                                        Box::new(receipt),
+                                    )
+                                },
+                            )
+                        },
+                    })
+                    .map_err(|error| {
+                        let message = format!("FRE span-sum lifecycle: {error}");
+                        CompareError::new(aggregate_attempt_error(&error, message).message)
+                    })
+            }
             CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => regex
                 .span_sum_value(haystack, *limits)
                 .map(|value| CurrentFreAggregateOperationCounterResult {
@@ -9631,6 +9706,8 @@ struct ContinuationProgramShape {
     required_literal_sets: usize,
     required_literal_source_passes: usize,
     execution_state_work: usize,
+    continuation_max_nonaccepting_run: Option<usize>,
+    minimum_match_bytes: Option<usize>,
     has_scalar_transitions: bool,
     max_scalar_search_checks: usize,
     requires_utf8_validation: bool,
@@ -9650,6 +9727,8 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
             required_literal_sets: accounting.required_literal_sets,
             required_literal_source_passes: accounting.required_literal_source_passes,
             execution_state_work: accounting.execution_state_work,
+            continuation_max_nonaccepting_run: accounting.continuation_max_nonaccepting_run,
+            minimum_match_bytes: accounting.minimum_match_bytes,
             has_scalar_transitions: accounting.has_scalar_transitions,
             max_scalar_search_checks: accounting.max_scalar_search_checks,
             requires_utf8_validation: accounting.requires_utf8_validation,
@@ -9673,6 +9752,8 @@ fn inactive_continuation_shape() -> ContinuationProgramShape {
         required_literal_source_passes: 0,
         // One Match state is evaluated once and has no outgoing transition.
         execution_state_work: 1,
+        continuation_max_nonaccepting_run: Some(0),
+        minimum_match_bytes: None,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
         requires_utf8_validation: false,
@@ -9700,6 +9781,8 @@ fn conservative_continuation_shape(
         required_literal_sets: 0,
         required_literal_source_passes: 0,
         execution_state_work,
+        continuation_max_nonaccepting_run: None,
+        minimum_match_bytes: None,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
         requires_utf8_validation: false,
@@ -10031,13 +10114,20 @@ fn continuation_operation_limits(
     shape: ContinuationProgramShape,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
-    continuation_operation_limits_with_sweep(haystack_len, shape, None, limits)
+    continuation_operation_limits_with_sweep(
+        haystack_len,
+        shape,
+        None,
+        AggregateOperation::SpanSum,
+        limits,
+    )
 }
 
 fn continuation_operation_limits_with_sweep(
     haystack_len: usize,
     shape: ContinuationProgramShape,
     sweep: Option<fre::ContinuationSweepUpperBounds>,
+    operation: AggregateOperation,
     limits: &RunLimits,
 ) -> Result<AggregateOperationLimits, ExecutionError> {
     let program_states = shape.states;
@@ -10046,7 +10136,41 @@ fn continuation_operation_limits_with_sweep(
             "FRE aggregate compiler reported a zero-state program",
         ));
     }
+    if let Some(published) = sweep {
+        if !matches!(
+            operation,
+            AggregateOperation::Count | AggregateOperation::SpanSum
+        ) {
+            return Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is attached to a non-value route",
+            ));
+        }
+        if shape.has_scalar_transitions || shape.requires_utf8_validation {
+            return Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is attached to a scalar continuation route",
+            ));
+        }
+        let expected = fre::continuation_sweep_upper_bounds(program_states).map_err(|error| {
+            ExecutionError::fault(format!("FRE continuation sweep bounds: {error}"))
+        })?;
+        if published.table_cells != expected.table_cells
+            || published.workspace_bytes != expected.workspace_bytes
+            || published.preparation_work != expected.preparation_work
+            || published.learning_work != expected.learning_work
+            || published.max_nonaccepting_run != shape.continuation_max_nonaccepting_run
+            || published.minimum_match_bytes != shape.minimum_match_bytes
+        {
+            return Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is absent or transplanted",
+            ));
+        }
+    }
     if shape.required_internal_anchors == 1 {
+        if sweep.is_some() {
+            return Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is attached to an internal-anchor route",
+            ));
+        }
         return required_internal_anchor_operation_limits(haystack_len, shape, limits);
     }
     if shape.required_internal_anchors != 0 {
@@ -10110,30 +10234,80 @@ fn continuation_operation_limits_with_sweep(
         prefix.work,
         "operation work with prefixes",
     )?;
-    if let Some(sweep) = sweep {
-        let expected = fre::continuation_sweep_upper_bounds(program_states).map_err(|error| {
-            ExecutionError::fault(format!("FRE continuation sweep bounds: {error}"))
-        })?;
-        if sweep != expected {
-            return Err(ExecutionError::fault(
-                "FRE continuation sweep envelope is absent or transplanted",
-            ));
-        }
-    }
     let sweep_workspace_bytes = sweep.map_or(0, |bounds| bounds.workspace_bytes);
-    let sweep_table_cells = sweep.map_or(0, |bounds| bounds.table_cells);
-    let sweep_storage_eligible = sweep.is_some()
+    let sweep_runtime = match sweep
+        .map(|bounds| {
+            fre::continuation_sweep_run_upper_bounds(
+                bounds,
+                haystack_len,
+                shape.execution_state_work,
+            )
+        })
+        .transpose()
+    {
+        Ok(runtime) => runtime,
+        Err(fre::AggregateEngineError::ArithmeticOverflow { .. }) => None,
+        Err(error) => {
+            return Err(ExecutionError::fault(format!(
+                "FRE continuation sweep runtime bounds: {error}"
+            )));
+        }
+    };
+    let sweep_required_work = sweep
+        .zip(sweep_runtime)
+        .map(|(bounds, runtime)| {
+            let mandatory_work = match operation {
+                AggregateOperation::Count => runtime.count_work,
+                AggregateOperation::SpanSum => runtime.span_sum_work,
+                AggregateOperation::Compile | AggregateOperation::Spans => {
+                    return Err(ExecutionError::fault(
+                        "FRE continuation sweep envelope is attached to a non-value route",
+                    ));
+                }
+            };
+            checked_aggregate_add(
+                checked_aggregate_add(
+                    bounds.preparation_work,
+                    mandatory_work,
+                    "continuation sweep preparation plus mandatory work",
+                )?,
+                bounds.learning_work,
+                "continuation sweep total work",
+            )
+        })
+        .transpose()?;
+    let sweep_required_sequential = sweep_runtime
+        .map(|runtime| match operation {
+            AggregateOperation::Count => Ok(runtime.count_sequential_bytes),
+            AggregateOperation::SpanSum => Ok(runtime.span_sum_sequential_bytes),
+            AggregateOperation::Compile | AggregateOperation::Spans => Err(ExecutionError::fault(
+                "FRE continuation sweep envelope is attached to a non-value route",
+            )),
+        })
+        .transpose()?;
+    let sweep_enabled = sweep.is_some()
+        && sweep_runtime.is_some()
         && sweep_workspace_bytes <= limits.fre_aggregate_random_access_bytes
         && sweep_workspace_bytes <= limits.fre_aggregate_scratch_bytes
-        && sweep_workspace_bytes <= limits.fre_aggregate_peak_bytes;
-    let route_work_upper = if sweep_storage_eligible {
-        checked_aggregate_add(
-            work_upper,
-            sweep.map_or(0, |bounds| bounds.preparation_work),
-            "operation work with continuation sweep preparation",
-        )?
+        && sweep_workspace_bytes <= limits.fre_aggregate_peak_bytes
+        && sweep_required_work
+            .is_some_and(|required| required <= limits.fre_aggregate_operation_work)
+        && sweep_required_sequential
+            .is_some_and(|required| required <= limits.fre_aggregate_sequential_bytes);
+    let sweep_table_cells = if sweep_enabled {
+        sweep.map_or(0, |bounds| bounds.table_cells)
+    } else {
+        0
+    };
+    let route_work_upper = if sweep_enabled {
+        work_upper.max(sweep_required_work.unwrap_or_default())
     } else {
         work_upper
+    };
+    let route_sequential_upper = if sweep_enabled {
+        sequential_upper.max(sweep_required_sequential.unwrap_or_default())
+    } else {
+        sequential_upper
     };
     let incumbent_available_work = work_upper.min(limits.fre_aggregate_operation_work);
     let available_work = route_work_upper.min(limits.fre_aggregate_operation_work);
@@ -10157,15 +10331,24 @@ fn continuation_operation_limits_with_sweep(
         max_table_cells: sweep_table_cells,
         max_random_access_bytes: storage
             .random
-            .max(sweep_workspace_bytes)
+            .max(if sweep_enabled {
+                sweep_workspace_bytes
+            } else {
+                0
+            })
             .min(limits.fre_aggregate_random_access_bytes),
         max_scratch_bytes: storage
             .scratch
-            .max(sweep_workspace_bytes)
+            .max(if sweep_enabled {
+                sweep_workspace_bytes
+            } else {
+                0
+            })
             .min(limits.fre_aggregate_scratch_bytes),
         max_log_bytes: storage.log.min(limits.fre_aggregate_log_bytes),
         max_sequential_bytes: storage
             .sequential
+            .max(route_sequential_upper)
             .min(limits.fre_aggregate_sequential_bytes),
         max_match_events: event_upper.min(reducer_event_limit),
         max_output_matches: boundaries.min(reducer_matches),
@@ -10173,7 +10356,11 @@ fn continuation_operation_limits_with_sweep(
         max_span_sum: haystack_len,
         max_peak_bytes: storage
             .peak
-            .max(sweep_workspace_bytes)
+            .max(if sweep_enabled {
+                sweep_workspace_bytes
+            } else {
+                0
+            })
             .min(limits.fre_aggregate_peak_bytes),
         max_work: available_work,
     })
@@ -12381,6 +12568,7 @@ fn aggregate_run_limits_with_fixed_absolute(
                     haystack_len,
                     shape,
                     continuation_sweep,
+                    report.operation,
                     limits,
                 )?,
             })
@@ -23153,9 +23341,24 @@ mod tests {
     #[test]
     fn current_fre_adapter_identity_describes_every_composed_route() {
         let identity = CurrentFreAdapter.identity();
+        assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v1-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+        );
+        assert!(
+            identity
+                .identity
+                .contains("persistent-continuation-sweep-v1 binds caller-owned fixed")
+        );
+        assert!(
+            current_fre_adapter_id().contains("-persistent-continuation-sweep-v1-"),
+            "runner/schedule adapter key must version the persistent physical route"
+        );
+        assert!(
+            identity
+                .availability
+                .contains("ordinary one-pattern continuation Count and SpanSum")
         );
         assert!(identity.adapter.contains("-continuation-accounting-v9-"));
         assert!(!identity.adapter.contains("-continuation-accounting-v8-"));
@@ -25943,9 +26146,9 @@ mod tests {
         // composed report supplies the final instruction count; every
         // instruction owns two `usize` certificate entries. Fixed storage is
         // rederived below from the
-        // terminal-frontier seed, minimum-width proof, start-domain proof,
-        // root-assertion proof, required-literal proof, and both complete
-        // inline theorem slots.
+        // terminal-frontier seed, minimum-width proof, maximum-nonaccepting-run
+        // proof, start-domain proof, root-assertion proof, required-literal
+        // proof, and both complete inline theorem slots.
         const ALTERNATIVES: usize = 10;
         const SCALAR_RANGES_PER_CLASS: usize = 677;
         const SCALAR_STATES: usize = (5 + 14) * ALTERNATIVES / 2;
@@ -25955,6 +26158,7 @@ mod tests {
         const CERTIFICATE_ENTRIES_PER_STATE: usize = 2;
         const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
         const MINIMUM_MATCH_PROOF_BYTES: usize = core::mem::size_of::<Option<usize>>();
+        const CONTINUATION_NONACCEPTING_PROOF_BYTES: usize = core::mem::size_of::<Option<usize>>();
         const START_DOMAIN_PROOF_BYTES: usize = 1;
         const ROOT_ASSERTION_PROOF_BYTES: usize = 1;
         const COMPLETE_REQUIRED_LITERAL_PROOF_BYTES: usize = 80;
@@ -25967,6 +26171,7 @@ mod tests {
             SCALAR_STATES * SCALAR_RANGES_PER_CLASS * SCALAR_RANGE_BYTES;
         const FIXED_PROOF_BYTES: usize = TERMINAL_FRONTIER_SEED_BYTES
             + MINIMUM_MATCH_PROOF_BYTES
+            + CONTINUATION_NONACCEPTING_PROOF_BYTES
             + START_DOMAIN_PROOF_BYTES
             + ROOT_ASSERTION_PROOF_BYTES;
 
@@ -26079,7 +26284,7 @@ mod tests {
         assert_eq!(SCALAR_RANGE_BYTES, 8);
         assert_eq!(ONE_STATE_ENVELOPE_BYTES, 72);
         assert_eq!(SCALAR_STORAGE_BYTES, 514_520);
-        assert_eq!(FIXED_PROOF_BYTES, 74);
+        assert_eq!(FIXED_PROOF_BYTES, 90);
 
         let default_fallback =
             capture_regex_one(overlapping, true, false, &RunLimits::default()).unwrap();
@@ -26113,6 +26318,12 @@ mod tests {
             MINIMUM_MATCH_PROOF_BYTES
         );
         assert_eq!(
+            default_report
+                .selector
+                .continuation_nonaccepting_run_proof_bytes,
+            CONTINUATION_NONACCEPTING_PROOF_BYTES
+        );
+        assert_eq!(
             usize::from(default_report.selector.start_domain_proof_bytes),
             START_DOMAIN_PROOF_BYTES
         );
@@ -26140,9 +26351,9 @@ mod tests {
         let incremental_program_bytes = full_program_bytes - ONE_STATE_ENVELOPE_BYTES;
         let incremental_one_below = incremental_program_bytes - 1;
         let full_one_below = full_program_bytes - 1;
-        assert_eq!(retained_components, 506);
-        assert_eq!(incremental_program_bytes, 543_034);
-        assert_eq!(full_program_bytes, 543_106);
+        assert_eq!(retained_components, 522);
+        assert_eq!(incremental_program_bytes, 543_050);
+        assert_eq!(full_program_bytes, 543_122);
         assert_eq!(default_report.selector.program_bytes, full_program_bytes);
 
         let limits_at = |max_program_bytes| RunLimits {
@@ -26694,9 +26905,36 @@ mod tests {
             10,
             conservative_continuation_shape(5).unwrap(),
             Some(sweep),
+            AggregateOperation::SpanSum,
             &run,
         )
         .unwrap();
+        let runtime = fre::continuation_sweep_run_upper_bounds(sweep, 10, 15).unwrap();
+        let count_policy = RunLimits {
+            fre_aggregate_sequential_bytes: runtime.count_sequential_bytes,
+            fre_aggregate_operation_work: sweep.preparation_work
+                + runtime.count_work
+                + sweep.learning_work,
+            ..RunLimits::default()
+        };
+        let count_specific = continuation_operation_limits_with_sweep(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
+            AggregateOperation::Count,
+            &count_policy,
+        )
+        .unwrap();
+        assert_eq!(count_specific.max_table_cells, sweep.table_cells);
+        let span_under_count_policy = continuation_operation_limits_with_sweep(
+            10,
+            conservative_continuation_shape(5).unwrap(),
+            Some(sweep),
+            AggregateOperation::SpanSum,
+            &count_policy,
+        )
+        .unwrap();
+        assert_eq!(span_under_count_policy.max_table_cells, 0);
         let cached_frontier = cached_frontier_limits(5, 11, 1).unwrap();
         assert_eq!(cached_frontier.random, 2_162_704);
         assert_eq!(cached_frontier.scratch, 2_162_704);
@@ -26709,64 +26947,74 @@ mod tests {
         assert_eq!(derived.max_random_access_bytes, sweep.workspace_bytes);
         assert_eq!(derived.max_scratch_bytes, sweep.workspace_bytes);
         assert_eq!(derived.max_log_bytes, 11);
-        assert_eq!(derived.max_sequential_bytes, 22);
+        assert_eq!(
+            derived.max_sequential_bytes,
+            runtime.span_sum_sequential_bytes
+        );
         assert_eq!(derived.max_match_events, 22);
         assert_eq!(derived.max_output_matches, 11);
         assert_eq!(derived.max_output_bytes, 0);
         assert_eq!(derived.max_span_sum, 10);
         assert_eq!(derived.max_peak_bytes, sweep.workspace_bytes);
-        assert_eq!(derived.max_work, 429 + sweep.preparation_work);
+        assert_eq!(
+            derived.max_work,
+            sweep.preparation_work + runtime.span_sum_work + sweep.learning_work
+        );
 
-        let unicode = continuation_operation_limits_with_sweep(
-            10,
-            ContinuationProgramShape {
-                requires_utf8_validation: true,
-                ..conservative_continuation_shape(5).unwrap()
-            },
-            Some(sweep),
-            &run,
-        )
-        .unwrap();
-        assert_eq!(unicode.max_sequential_bytes, 32);
+        assert!(
+            continuation_operation_limits_with_sweep(
+                10,
+                ContinuationProgramShape {
+                    requires_utf8_validation: true,
+                    ..conservative_continuation_shape(5).unwrap()
+                },
+                Some(sweep),
+                AggregateOperation::SpanSum,
+                &run,
+            )
+            .is_err()
+        );
 
-        let one_below = continuation_operation_limits_with_sweep(
-            10,
-            conservative_continuation_shape(5).unwrap(),
-            Some(sweep),
-            &RunLimits {
+        let one_below_policies = [
+            RunLimits {
                 fre_aggregate_sequential_bytes: derived.max_sequential_bytes - 1,
+                ..RunLimits::default()
+            },
+            RunLimits {
                 fre_aggregate_operation_work: derived.max_work - 1,
                 ..RunLimits::default()
             },
-        )
-        .unwrap();
-        assert_eq!(
-            one_below.max_sequential_bytes,
-            derived.max_sequential_bytes - 1
-        );
-        assert_eq!(one_below.max_work, derived.max_work - 1);
-
-        let row_one_below = continuation_operation_limits_with_sweep(
-            10,
-            conservative_continuation_shape(5).unwrap(),
-            Some(sweep),
-            &RunLimits {
+            RunLimits {
                 fre_aggregate_random_access_bytes: derived.max_random_access_bytes - 1,
+                ..RunLimits::default()
+            },
+            RunLimits {
                 fre_aggregate_scratch_bytes: derived.max_scratch_bytes - 1,
+                ..RunLimits::default()
+            },
+            RunLimits {
                 fre_aggregate_peak_bytes: derived.max_peak_bytes - 1,
                 ..RunLimits::default()
             },
-        )
-        .unwrap();
-        assert_eq!(
-            row_one_below.max_random_access_bytes,
-            derived.max_random_access_bytes - 1
-        );
-        assert_eq!(
-            row_one_below.max_scratch_bytes,
-            derived.max_scratch_bytes - 1
-        );
-        assert_eq!(row_one_below.max_peak_bytes, derived.max_peak_bytes - 1);
+        ];
+        for policy in one_below_policies {
+            let one_below = continuation_operation_limits_with_sweep(
+                10,
+                conservative_continuation_shape(5).unwrap(),
+                Some(sweep),
+                AggregateOperation::SpanSum,
+                &policy,
+            )
+            .unwrap();
+            let incumbent_under_policy = continuation_operation_limits(
+                10,
+                conservative_continuation_shape(5).unwrap(),
+                &policy,
+            )
+            .unwrap();
+            assert_eq!(one_below.max_table_cells, 0);
+            assert_eq!(one_below, incumbent_under_policy);
+        }
 
         run.fre_aggregate_random_access_bytes = 7;
         run.fre_aggregate_scratch_bytes = 6;
@@ -26778,6 +27026,7 @@ mod tests {
             10,
             conservative_continuation_shape(5).unwrap(),
             Some(sweep),
+            AggregateOperation::SpanSum,
             &run,
         )
         .unwrap();
@@ -26792,7 +27041,7 @@ mod tests {
     #[test]
     fn retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes() {
         let policy = RunLimits::default();
-        let eligible = AggregateBuilder::new(r"(?:abcdefghijklmnopqa+b|abcdefghijklmnopqa)")
+        let eligible = AggregateBuilder::new(r"Tom.{10,25}river|river.{10,25}Tom")
             .profile(rebar_profile())
             .unicode(false)
             .limits(aggregate_build_limits(&policy))
@@ -26804,6 +27053,7 @@ mod tests {
             .continuation_sweep_upper_bounds()
             .unwrap()
             .expect("large byte continuation must publish its sweep envelope");
+        assert_eq!(sweep.minimum_match_bytes, Some(18));
         let retained = count_run_limits_with_policy(4_096, &eligible, &policy).unwrap();
         assert_eq!(retained.continuation.max_table_cells, sweep.table_cells);
         assert_eq!(
@@ -26817,7 +27067,6 @@ mod tests {
             report_only.continuation.max_random_access_bytes
                 < retained.continuation.max_random_access_bytes
         );
-
         let small = AggregateBuilder::new(r"a+")
             .profile(rebar_profile())
             .unicode(false)
@@ -26841,9 +27090,178 @@ mod tests {
         });
         let transplanted = fre::continuation_sweep_upper_bounds(shape.states + 1).unwrap();
         assert!(
-            continuation_operation_limits_with_sweep(4_096, shape, Some(transplanted), &policy,)
-                .is_err()
+            continuation_operation_limits_with_sweep(
+                4_096,
+                shape,
+                Some(transplanted),
+                AggregateOperation::Count,
+                &policy,
+            )
+            .is_err()
         );
+        let equal_state_width_underbound = fre::ContinuationSweepUpperBounds {
+            minimum_match_bytes: Some(usize::MAX),
+            ..sweep
+        };
+        assert!(
+            continuation_operation_limits_with_sweep(
+                4_096,
+                shape,
+                Some(equal_state_width_underbound),
+                AggregateOperation::Count,
+                &policy,
+            )
+            .is_err()
+        );
+        let equal_state_underbound = fre::ContinuationSweepUpperBounds {
+            max_nonaccepting_run: Some(0),
+            ..sweep
+        };
+        assert_ne!(
+            equal_state_underbound.max_nonaccepting_run,
+            shape.continuation_max_nonaccepting_run
+        );
+        assert!(
+            continuation_operation_limits_with_sweep(
+                4_096,
+                shape,
+                Some(equal_state_underbound),
+                AggregateOperation::Count,
+                &policy,
+            )
+            .is_err()
+        );
+        for operation in [AggregateOperation::Compile, AggregateOperation::Spans] {
+            assert!(
+                continuation_operation_limits_with_sweep(
+                    4_096,
+                    shape,
+                    Some(sweep),
+                    operation,
+                    &policy,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            continuation_operation_limits_with_sweep(
+                4_096,
+                ContinuationProgramShape {
+                    required_internal_anchors: 1,
+                    required_internal_anchor_bytes: 4,
+                    required_internal_anchor_optional_stages: 1,
+                    required_internal_anchor_persistent_bytes: 64,
+                    ..shape
+                },
+                Some(sweep),
+                AggregateOperation::Count,
+                &policy,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_sweep_diagnostics_are_explicit_incumbent_projections() {
+        let pattern = r"Tom.{10,25}river|river.{10,25}Tom";
+        let mut haystack = b"Tom0123456789river".to_vec();
+        haystack.extend([b'-'; 30]);
+        haystack.extend_from_slice(b"river0123456789Tom");
+        let policy = RunLimits::default();
+
+        let count_regex = AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&policy))
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .unwrap();
+        assert!(
+            count_regex
+                .continuation_sweep_upper_bounds()
+                .unwrap()
+                .is_some()
+        );
+        let count_limits =
+            count_run_limits_with_policy(haystack.len(), &count_regex, &policy).unwrap();
+        let count = CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::Count,
+            plan: "test-persistent-continuation-sweep",
+            haystack_len: haystack.len(),
+            inner: CurrentFreAggregateOperationInner::CountSingleDense(
+                count_regex,
+                count_limits,
+                RefCell::new(AggregateCountWorkspace::new()),
+            ),
+        };
+        let CurrentFreAggregateOperationInner::CountSingleDense(_, _, count_workspace) =
+            &count.inner
+        else {
+            unreachable!()
+        };
+        assert_eq!(count_workspace.borrow().retained_continuation_bytes(), None);
+        assert_eq!(count.execute(&haystack).unwrap(), 2);
+        assert!(
+            count_workspace
+                .borrow()
+                .retained_continuation_bytes()
+                .is_some_and(|bytes| bytes > 0)
+        );
+        let count_projection = count.execute_with_counters(&haystack).unwrap();
+        assert_eq!(count_projection.value(), 2);
+        assert!(matches!(
+            count_projection.receipt_status(),
+            CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep
+        ));
+        assert_eq!(count_projection.continuation_receipt(), None);
+
+        let span_regex = AggregateBuilder::new(pattern)
+            .profile(rebar_profile())
+            .unicode(false)
+            .limits(aggregate_build_limits(&policy))
+            .plan_selection(AggregatePlanSelection::ForceContinuation)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_span_sum()
+            .unwrap();
+        assert!(
+            span_regex
+                .continuation_sweep_upper_bounds()
+                .unwrap()
+                .is_some()
+        );
+        let span_limits =
+            span_sum_run_limits_with_policy(haystack.len(), &span_regex, &policy).unwrap();
+        let span = CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::SpanSum,
+            plan: "test-persistent-continuation-sweep",
+            haystack_len: haystack.len(),
+            inner: CurrentFreAggregateOperationInner::SpanSumSingleDense(
+                span_regex,
+                span_limits,
+                RefCell::new(AggregateSpanSumWorkspace::new()),
+            ),
+        };
+        let CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, span_workspace) =
+            &span.inner
+        else {
+            unreachable!()
+        };
+        assert_eq!(span_workspace.borrow().retained_continuation_bytes(), None);
+        assert_eq!(span.execute(&haystack).unwrap(), 36);
+        assert!(
+            span_workspace
+                .borrow()
+                .retained_continuation_bytes()
+                .is_some_and(|bytes| bytes > 0)
+        );
+        let span_projection = span.execute_with_counters(&haystack).unwrap();
+        assert_eq!(span_projection.value(), 36);
+        assert!(matches!(
+            span_projection.receipt_status(),
+            CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep
+        ));
+        assert_eq!(span_projection.continuation_receipt(), None);
     }
 
     #[test]
@@ -27001,6 +27419,8 @@ mod tests {
             required_literal_sets: 0,
             required_literal_source_passes: 0,
             execution_state_work: 27,
+            continuation_max_nonaccepting_run: None,
+            minimum_match_bytes: None,
             has_scalar_transitions: false,
             max_scalar_search_checks: 0,
             requires_utf8_validation: false,
@@ -27185,6 +27605,8 @@ mod tests {
             required_literal_sets: 0,
             required_literal_source_passes: 0,
             execution_state_work: 11,
+            continuation_max_nonaccepting_run: None,
+            minimum_match_bytes: None,
             has_scalar_transitions: true,
             max_scalar_search_checks: 10,
             requires_utf8_validation: false,

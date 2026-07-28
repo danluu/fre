@@ -148,32 +148,176 @@ fn late_priority_adversary_preserves_value_without_restart_body() {
 }
 
 #[test]
-fn admitted_workspace_terminal_is_not_replayed_through_the_incumbent() {
+fn incumbent_valid_work_limit_remains_valid_with_cold_or_warm_workspace() {
     std::thread::Builder::new()
-        .name("continuation-sweep-terminal".to_owned())
+        .name("continuation-sweep-work-monotone".to_owned())
         .stack_size(16 * 1024 * 1024)
-        .spawn(admitted_workspace_terminal_is_not_replayed_through_the_incumbent_body)
+        .spawn(incumbent_valid_work_limit_remains_valid_with_cold_or_warm_workspace_body)
         .unwrap()
         .join()
         .unwrap();
 }
 
-fn admitted_workspace_terminal_is_not_replayed_through_the_incumbent_body() {
+fn incumbent_valid_work_limit_remains_valid_with_cold_or_warm_workspace_body() {
     let pattern = r"(?:abcdefghijklmnopqa+b|abcdefghijklmnopqa)";
     let haystack = b"abcdefghijklmnopqaaab";
     let count = builder(pattern).build_count().unwrap();
-    let mut workspace = AggregateCountWorkspace::new();
     let limits = AggregateRunLimits::default();
+    let expected = count.count_value(haystack, limits).unwrap();
+    let mut lower = 0_usize;
+    let mut upper = limits.continuation.max_work;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        let mut probe = limits;
+        probe.continuation.max_work = middle;
+        if count.count_value(haystack, probe).is_ok() {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    let mut incumbent_exact = limits;
+    incumbent_exact.continuation.max_work = lower;
+    assert_eq!(
+        count.count_value(haystack, incumbent_exact).unwrap(),
+        expected
+    );
+
+    let mut workspace = AggregateCountWorkspace::new();
     count
         .count_value_with_workspace(haystack, limits, &mut workspace)
         .unwrap();
     assert!(workspace.retained_continuation_bytes().is_some());
+    assert_eq!(
+        count
+            .count_value_with_workspace(haystack, incumbent_exact, &mut workspace)
+            .unwrap(),
+        expected
+    );
 
-    let mut one_below = limits;
-    one_below.continuation.max_work = 0;
-    let error = count
-        .count_value_with_workspace(haystack, one_below, &mut workspace)
-        .unwrap_err();
-    assert!(error.continuation_receipt().is_none());
-    assert!(error.to_string().contains("ExecutionWork"));
+    let mut cold = AggregateCountWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(haystack, incumbent_exact, &mut cold)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(cold.retained_continuation_bytes(), None);
+}
+
+#[test]
+fn late_priority_quadratic_sweep_refuses_before_an_incumbent_valid_source_read() {
+    std::thread::Builder::new()
+        .name("continuation-sweep-sequential-monotone".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(late_priority_quadratic_sweep_refuses_before_an_incumbent_valid_source_read_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn late_priority_quadratic_sweep_refuses_before_an_incumbent_valid_source_read_body() {
+    let pattern = r"(?s:a.*z|a|[\x00-\xFF]bcdefghijklmnop)";
+    let haystack = vec![b'a'; 256];
+    let count = builder(pattern).build_count().unwrap();
+    let limits = AggregateRunLimits::default();
+    let expected = count.count_value(&haystack, limits).unwrap();
+    let mut lower = 0_usize;
+    let mut upper = limits.continuation.max_sequential_bytes;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        let mut probe = limits;
+        probe.continuation.max_sequential_bytes = middle;
+        if count.count_value(&haystack, probe).is_ok() {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    let mut incumbent_exact = limits;
+    incumbent_exact.continuation.max_sequential_bytes = lower;
+    assert_eq!(
+        count.count_value(&haystack, incumbent_exact).unwrap(),
+        expected
+    );
+    let mut workspace = AggregateCountWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(&haystack, incumbent_exact, &mut workspace)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(workspace.retained_continuation_bytes(), None);
+}
+
+#[test]
+fn lazy_only_table_and_memory_limits_preserve_the_incumbent_result() {
+    std::thread::Builder::new()
+        .name("continuation-sweep-storage-monotone".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(lazy_only_table_and_memory_limits_preserve_the_incumbent_result_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn lazy_only_table_and_memory_limits_preserve_the_incumbent_result_body() {
+    let pattern = r"Tom.{10,25}river|river.{10,25}Tom";
+    let haystack = b"Tom  went down to the river; river then met Tom";
+    let count = builder(pattern).build_count().unwrap();
+    let limits = AggregateRunLimits::default();
+    let expected = count.count_value(haystack, limits).unwrap();
+    let sweep = count
+        .continuation_sweep_upper_bounds()
+        .unwrap()
+        .expect("bounded rewind continuation must publish its sweep");
+
+    let mut no_table = limits;
+    no_table.continuation.max_table_cells = 0;
+    assert_eq!(count.count_value(haystack, no_table).unwrap(), expected);
+    let mut table_workspace = AggregateCountWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(haystack, no_table, &mut table_workspace)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(table_workspace.retained_continuation_bytes(), Some(0));
+
+    for resource in 0..3 {
+        let mut one_below = limits;
+        match resource {
+            0 => one_below.continuation.max_random_access_bytes = sweep.workspace_bytes - 1,
+            1 => one_below.continuation.max_scratch_bytes = sweep.workspace_bytes - 1,
+            2 => one_below.continuation.max_peak_bytes = sweep.workspace_bytes - 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(count.count_value(haystack, one_below).unwrap(), expected);
+        let mut workspace = AggregateCountWorkspace::new();
+        assert_eq!(
+            count
+                .count_value_with_workspace(haystack, one_below, &mut workspace)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(workspace.retained_continuation_bytes(), Some(0));
+    }
+
+    let mut warmed = AggregateCountWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(haystack, limits, &mut warmed)
+            .unwrap(),
+        expected
+    );
+    assert!(warmed.retained_continuation_bytes().unwrap_or_default() > 0);
+    let mut low_warm = limits;
+    low_warm.continuation.max_table_cells = sweep.table_cells - 1;
+    assert_eq!(
+        count
+            .count_value_with_workspace(haystack, low_warm, &mut warmed)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(warmed.retained_continuation_bytes(), Some(0));
 }

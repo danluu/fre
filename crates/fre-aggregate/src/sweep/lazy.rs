@@ -26,7 +26,10 @@ use crate::error::{add, enforce, mul};
 use crate::program::{ByteSet, Inst, Program};
 use crate::{Error, OperationLimits, Resource};
 
-use super::{ContinuationSweepUpperBounds, SweepKind, SweepMeter, SweepOutcome, SweepValue};
+use super::{
+    ContinuationSweepRunUpperBounds, ContinuationSweepUpperBounds, SweepKind, SweepMeter,
+    SweepOutcome, SweepValue,
+};
 
 const BYTE_ALPHABET: usize = 256;
 const MAX_DFA_STATES: usize = 1_024;
@@ -35,6 +38,77 @@ const CELL_ACCEPT: u32 = 1 << 31;
 const CELL_STATE_MASK: u32 = CELL_ACCEPT - 1;
 const CELL_UNFILLED: u32 = u32::MAX;
 const NO_STATE: u32 = u32::MAX;
+#[cfg(test)]
+const FIXED_ARENA_ALLOCATIONS: usize = 20;
+
+#[cfg(test)]
+pub(super) mod test_fault {
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static FAIL_FIXED_ALLOCATION_AFTER: Cell<usize> = const { Cell::new(0) };
+        static SOURCE_BYTES: Cell<usize> = const { Cell::new(0) };
+        static WORK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct AllocationFailureGuard;
+
+    impl Drop for AllocationFailureGuard {
+        fn drop(&mut self) {
+            FAIL_FIXED_ALLOCATION_AFTER.with(|remaining| remaining.set(0));
+            SOURCE_BYTES.with(|bytes| bytes.set(0));
+            WORK.with(|work| work.set(0));
+        }
+    }
+
+    pub(super) fn fail_fixed_allocation_at(ordinal: usize) -> AllocationFailureGuard {
+        assert!(ordinal > 0, "allocation fault ordinal must be positive");
+        FAIL_FIXED_ALLOCATION_AFTER.with(|remaining| {
+            assert_eq!(
+                remaining.replace(ordinal),
+                0,
+                "allocation fault already armed"
+            );
+        });
+        SOURCE_BYTES.with(|bytes| bytes.set(0));
+        WORK.with(|work| work.set(0));
+        AllocationFailureGuard
+    }
+
+    pub(super) fn take_fixed_allocation_failure() -> bool {
+        FAIL_FIXED_ALLOCATION_AFTER.with(|remaining| match remaining.get() {
+            0 => false,
+            1 => {
+                remaining.set(0);
+                true
+            }
+            count => {
+                remaining.set(count - 1);
+                false
+            }
+        })
+    }
+
+    pub(super) fn fixed_allocation_failure_is_armed() -> bool {
+        FAIL_FIXED_ALLOCATION_AFTER.with(|remaining| remaining.get() != 0)
+    }
+
+    pub(in crate::sweep) fn record_work(amount: usize) {
+        WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    }
+
+    pub(in crate::sweep) fn record_source_bytes(amount: usize) {
+        SOURCE_BYTES.with(|bytes| bytes.set(bytes.get().saturating_add(amount)));
+    }
+
+    pub(super) fn source_bytes() -> usize {
+        SOURCE_BYTES.with(Cell::get)
+    }
+
+    pub(super) fn work() -> usize {
+        WORK.with(Cell::get)
+    }
+}
 
 #[derive(Debug, Default)]
 struct LazyCache {
@@ -62,23 +136,36 @@ impl LazyCache {
         }
     }
 
-    fn allocated(
+    fn reserved(
         state_capacity: usize,
         item_capacity: usize,
         total_bytes: usize,
-        meter: &mut SweepMeter,
     ) -> Result<Self, Error> {
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
         Ok(Self {
-            rows: allocated_slots(row_cells, CELL_UNFILLED, total_bytes, meter)?,
-            offsets: allocated_slots(state_capacity, 0_usize, total_bytes, meter)?,
-            lengths: allocated_slots(state_capacity, 0_u32, total_bytes, meter)?,
-            modes: allocated_slots(state_capacity, 0_u8, total_bytes, meter)?,
-            items: allocated_slots(item_capacity, 0_u32, total_bytes, meter)?,
+            rows: reserved_slots(row_cells, total_bytes)?,
+            offsets: reserved_slots(state_capacity, total_bytes)?,
+            lengths: reserved_slots(state_capacity, total_bytes)?,
+            modes: reserved_slots(state_capacity, total_bytes)?,
+            items: reserved_slots(item_capacity, total_bytes)?,
             state_len: 0,
             item_len: 0,
             initial: NO_STATE,
         })
+    }
+
+    fn initialize_storage(
+        &mut self,
+        state_capacity: usize,
+        item_capacity: usize,
+        meter: &mut SweepMeter,
+    ) -> Result<(), Error> {
+        let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        initialize_slots(&mut self.rows, row_cells, CELL_UNFILLED, meter)?;
+        initialize_slots(&mut self.offsets, state_capacity, 0_usize, meter)?;
+        initialize_slots(&mut self.lengths, state_capacity, 0_u32, meter)?;
+        initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
+        initialize_slots(&mut self.items, item_capacity, 0_u32, meter)
     }
 
     #[inline]
@@ -210,6 +297,65 @@ impl LazyCache {
         })?))
     }
 
+    /// Attempt to retain one runtime transition state using only the
+    /// operation's speculative learning allowance. Failure never mutates the
+    /// cache and hands the just-computed ordered frontier to inline execution.
+    fn intern_speculative(
+        &mut self,
+        items: &[u32],
+        mode: bool,
+        meter: &mut SweepMeter,
+    ) -> Result<Interned, Error> {
+        for state in 0..self.state_len {
+            if !meter.charge_cache_work(1)? {
+                return Ok(Interned::WorkFull);
+            }
+            if self.modes[state] != u8::from(mode) {
+                continue;
+            }
+            let offset = self.offsets[state];
+            let length = usize::try_from(self.lengths[state]).map_err(|_| {
+                Error::InternalInvariant("lazy DFA state length does not fit usize")
+            })?;
+            if length != items.len() {
+                continue;
+            }
+            let end = add(offset, length, Resource::ScratchBytes)?;
+            let retained = self.items.get(offset..end).ok_or(Error::InternalInvariant(
+                "lazy DFA candidate state outside item arena",
+            ))?;
+            if !meter.charge_cache_work(items.len())? {
+                return Ok(Interned::WorkFull);
+            }
+            if retained == items {
+                return Ok(Interned::State(u32::try_from(state).map_err(|_| {
+                    Error::InternalInvariant("lazy DFA state ID does not fit u32")
+                })?));
+            }
+        }
+        if self.state_len == self.offsets.len() {
+            return Ok(Interned::Full);
+        }
+        let end = add(self.item_len, items.len(), Resource::ScratchBytes)?;
+        if end > self.items.len() {
+            return Ok(Interned::Full);
+        }
+        if !meter.charge_cache_work(items.len())? {
+            return Ok(Interned::WorkFull);
+        }
+        let state = self.state_len;
+        self.items[self.item_len..end].copy_from_slice(items);
+        self.offsets[state] = self.item_len;
+        self.lengths[state] = u32::try_from(items.len())
+            .map_err(|_| Error::InternalInvariant("lazy DFA state length does not fit u32"))?;
+        self.modes[state] = u8::from(mode);
+        self.item_len = end;
+        self.state_len = add(self.state_len, 1, Resource::ScratchBytes)?;
+        Ok(Interned::State(u32::try_from(state).map_err(|_| {
+            Error::InternalInvariant("lazy DFA state ID does not fit u32")
+        })?))
+    }
+
     fn retained_bytes(&self) -> Result<usize, Error> {
         let rows = mul(
             self.rows.capacity(),
@@ -248,6 +394,7 @@ impl LazyCache {
 enum Interned {
     State(u32),
     Full,
+    WorkFull,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,7 +485,13 @@ impl Workspace {
         state_capacity: usize,
         max_items: usize,
     ) -> Result<(bool, usize), Error> {
-        let upper = prospective_upper_bounds(program.insts.len(), state_capacity, max_items)?;
+        let upper = prospective_upper_bounds_with_run(
+            program.insts.len(),
+            state_capacity,
+            max_items,
+            program.continuation_nonaccepting_run(),
+            None,
+        )?;
         if self.plan_id == Some(plan_id) {
             // A warmed cache is still selected under the current invocation's
             // complete source-free policy. Recheck the same fixed-table and
@@ -373,6 +526,10 @@ impl Workspace {
         })();
         let (replacement, work) = match built {
             Ok(result) => result,
+            Err(Error::AllocationFailed { .. }) => {
+                *self = Self::disabled(plan_id);
+                return Ok((false, 0));
+            }
             Err(error) => {
                 *self = Self::new();
                 return Err(error);
@@ -408,30 +565,13 @@ impl Workspace {
                 resource: Resource::ProgramStates,
             });
         }
-        let mut epsilon_edges = 0_usize;
-        let mut consume_edges = 0_usize;
-        for inst in &program.insts {
-            meter.charge_work(1)?;
-            match inst {
-                Inst::Split { .. } | Inst::RootSplit { .. } => {
-                    epsilon_edges = add(epsilon_edges, 2, Resource::ScratchBytes)?;
-                }
-                Inst::Consume { .. } => {
-                    consume_edges = add(consume_edges, 1, Resource::ScratchBytes)?;
-                }
-                Inst::Unfilled => {
-                    return Err(Error::InternalInvariant(
-                        "lazy continuation reached an unfilled program state",
-                    ));
-                }
-                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
-                    return Err(Error::InternalInvariant(
-                        "lazy continuation admitted an unsupported instruction",
-                    ));
-                }
-                Inst::Fail | Inst::Match => {}
-            }
-        }
+        // Reserve the complete source-independent graph envelope so every
+        // fallible fixed-arena allocation happens before initialization,
+        // program census, or any other charged work. An allocator refusal at
+        // any ordinal can therefore select the incumbent with zero abandoned
+        // optional work.
+        let epsilon_edges = mul(states, 2, Resource::ScratchBytes)?;
+        let consume_edges = states;
         let item_capacity = mul(states, state_capacity, Resource::ScratchBytes)?
             .min(max_items)
             .max(states);
@@ -453,42 +593,97 @@ impl Workspace {
         let mut output = Self {
             plan_id: Some(plan_id),
             admitted: false,
-            seen: allocated_slots(states, 0_u64, logical_bytes, meter)?,
+            seen: reserved_slots(states, logical_bytes)?,
             generation: 0,
-            scratch: allocated_slots(states, 0_u32, logical_bytes, meter)?,
+            scratch: reserved_slots(states, logical_bytes)?,
             scratch_len: 0,
-            frontier: allocated_slots(states, 0_u32, logical_bytes, meter)?,
+            frontier: reserved_slots(states, logical_bytes)?,
             frontier_len: 0,
-            stack: allocated_slots(stack_slots, 0_u32, logical_bytes, meter)?,
+            stack: reserved_slots(stack_slots, logical_bytes)?,
             stack_len: 0,
-            cursors: allocated_slots(states, 0_usize, logical_bytes, meter)?,
-            reverse_epsilon_offsets: allocated_slots(
+            cursors: reserved_slots(states, logical_bytes)?,
+            reverse_epsilon_offsets: reserved_slots(
                 add(states, 1, Resource::ScratchBytes)?,
-                0_usize,
                 logical_bytes,
-                meter,
             )?,
-            reverse_epsilon_sources: allocated_slots(epsilon_edges, 0_u32, logical_bytes, meter)?,
-            reverse_consume_offsets: allocated_slots(
+            reverse_epsilon_sources: reserved_slots(epsilon_edges, logical_bytes)?,
+            reverse_consume_offsets: reserved_slots(
                 add(states, 1, Resource::ScratchBytes)?,
-                0_usize,
                 logical_bytes,
-                meter,
             )?,
-            reverse_consume_sources: allocated_slots(consume_edges, 0_u32, logical_bytes, meter)?,
-            reverse_consume_bytes: allocated_slots(
-                consume_edges,
-                ByteSet::empty(),
-                logical_bytes,
-                meter,
-            )?,
-            forward: LazyCache::allocated(state_capacity, item_capacity, logical_bytes, meter)?,
-            reverse: LazyCache::allocated(state_capacity, item_capacity, logical_bytes, meter)?,
+            reverse_consume_sources: reserved_slots(consume_edges, logical_bytes)?,
+            reverse_consume_bytes: reserved_slots(consume_edges, logical_bytes)?,
+            forward: LazyCache::reserved(state_capacity, item_capacity, logical_bytes)?,
+            reverse: LazyCache::reserved(state_capacity, item_capacity, logical_bytes)?,
             saturated: false,
             retained_bytes: 0,
         };
+        output.initialize_storage(
+            states,
+            stack_slots,
+            epsilon_edges,
+            consume_edges,
+            state_capacity,
+            item_capacity,
+            meter,
+        )?;
         output.build_reverse_graph(program, meter)?;
         Ok(output)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fixed arena dimensions are authenticated together before initialization"
+    )]
+    fn initialize_storage(
+        &mut self,
+        states: usize,
+        stack_slots: usize,
+        epsilon_edges: usize,
+        consume_edges: usize,
+        state_capacity: usize,
+        item_capacity: usize,
+        meter: &mut SweepMeter,
+    ) -> Result<(), Error> {
+        initialize_slots(&mut self.seen, states, 0_u64, meter)?;
+        initialize_slots(&mut self.scratch, states, 0_u32, meter)?;
+        initialize_slots(&mut self.frontier, states, 0_u32, meter)?;
+        initialize_slots(&mut self.stack, stack_slots, 0_u32, meter)?;
+        initialize_slots(&mut self.cursors, states, 0_usize, meter)?;
+        initialize_slots(
+            &mut self.reverse_epsilon_offsets,
+            add(states, 1, Resource::ScratchBytes)?,
+            0_usize,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.reverse_epsilon_sources,
+            epsilon_edges,
+            0_u32,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.reverse_consume_offsets,
+            add(states, 1, Resource::ScratchBytes)?,
+            0_usize,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.reverse_consume_sources,
+            consume_edges,
+            0_u32,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.reverse_consume_bytes,
+            consume_edges,
+            ByteSet::empty(),
+            meter,
+        )?;
+        self.forward
+            .initialize_storage(state_capacity, item_capacity, meter)?;
+        self.reverse
+            .initialize_storage(state_capacity, item_capacity, meter)
     }
 
     fn build_reverse_graph(
@@ -516,11 +711,17 @@ impl Workspace {
                     meter.charge_work(1)?;
                     increment_edge_count(&mut self.reverse_consume_offsets, *next, states)?;
                 }
-                Inst::Unfilled
-                | Inst::Fail
-                | Inst::Match
-                | Inst::ConsumeScalar { .. }
-                | Inst::Assert { .. } => {}
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "lazy continuation reached an unfilled program state",
+                    ));
+                }
+                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                    return Err(Error::InternalInvariant(
+                        "lazy continuation admitted an unsupported instruction",
+                    ));
+                }
+                Inst::Fail | Inst::Match => {}
             }
         }
         prefix_counts(&mut self.reverse_epsilon_offsets, meter)?;
@@ -615,6 +816,11 @@ impl Workspace {
                     "lazy forward cache cannot retain its initial state",
                 ));
             }
+            Interned::WorkFull => {
+                return Err(Error::InternalInvariant(
+                    "lazy forward preparation used speculative cache work",
+                ));
+            }
         };
         self.forward.initial = initial;
 
@@ -640,6 +846,11 @@ impl Workspace {
                 Interned::Full => {
                     return Err(Error::InternalInvariant(
                         "lazy reverse cache cannot retain its initial state",
+                    ));
+                }
+                Interned::WorkFull => {
+                    return Err(Error::InternalInvariant(
+                        "lazy reverse preparation used speculative cache work",
                     ));
                 }
             };
@@ -900,18 +1111,19 @@ impl Workspace {
 
 /// Run the persistent lazy-DFA route.
 ///
-/// Structural refusal is completed before the workspace inspects source
-/// bytes and before preparation charges work. Preparation allocates exact
-/// fixed arenas and its work is carried into execution. Cache saturation
-/// switches to the inline frontier at the already-advanced position. The
-/// current operation completes without replay; the saturated cache is then
-/// replaced with a compact sticky-disabled marker.
+/// Structural and complete mandatory-resource refusal is completed before the
+/// workspace inspects source bytes. Preparation allocates exact fixed arenas
+/// and its work is carried into execution. Cache capacity or speculative-work
+/// saturation switches to the inline frontier at the already-advanced
+/// position. The current operation completes without replay; the saturated
+/// cache is then replaced with a compact sticky-disabled marker.
 pub(super) fn reduce(
     plan_id: PlanId,
     program: &Program,
     haystack: &[u8],
     range: Range<usize>,
     kind: SweepKind,
+    minimum_match_bytes: Option<usize>,
     limits: OperationLimits,
     workspace: &mut Workspace,
 ) -> Result<Option<SweepOutcome>, Error> {
@@ -922,6 +1134,9 @@ pub(super) fn reduce(
     {
         return Ok(None);
     }
+    let Some(minimum_match_bytes) = minimum_match_bytes.filter(|minimum| *minimum > 0) else {
+        return Ok(None);
+    };
     if range.start > range.end || range.end > haystack.len() {
         return Err(Error::InvalidRange {
             start: range.start,
@@ -932,12 +1147,76 @@ pub(super) fn reduce(
     let local_len = range.end - range.start;
     let boundaries = add(local_len, 1, Resource::Boundaries)?;
     enforce(boundaries, limits.max_boundaries, Resource::Boundaries)?;
+    if workspace.plan_id == Some(plan_id) && !workspace.admitted {
+        return Ok(None);
+    }
+    let fixed = match prospective_upper_bounds_with_run(
+        program.insts.len(),
+        MAX_DFA_STATES,
+        MAX_DFA_ITEMS,
+        program.continuation_nonaccepting_run(),
+        Some(minimum_match_bytes),
+    ) {
+        Ok(fixed) => fixed,
+        Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let runtime = match run_upper_bounds(
+        local_len,
+        program.execution_state_work(),
+        fixed.max_nonaccepting_run,
+        minimum_match_bytes,
+    ) {
+        Ok(runtime) => runtime,
+        // An optional accelerator without a representable complete bound is
+        // source-free ineligible; arithmetic must not replace an incumbent
+        // operation that can still fit its own limits.
+        Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let runtime_work = match kind {
+        SweepKind::Count => runtime.count_work,
+        SweepKind::SpanSum => runtime.span_sum_work,
+    };
+    let runtime_sequential = match kind {
+        SweepKind::Count => runtime.count_sequential_bytes,
+        SweepKind::SpanSum => runtime.span_sum_sequential_bytes,
+    };
+    if runtime_sequential > limits.max_sequential_bytes {
+        return Ok(None);
+    }
+    let preparation_upper = if workspace.plan_id == Some(plan_id) {
+        0
+    } else {
+        fixed.preparation_work
+    };
+    let mandatory_work = match add(preparation_upper, runtime_work, Resource::ExecutionWork) {
+        Ok(work) => work,
+        Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if mandatory_work > limits.max_work {
+        return Ok(None);
+    }
     let (admitted, preparation_work) = workspace.prepare(plan_id, program, limits)?;
     if !admitted {
         return Ok(None);
     }
     let local = &haystack[range];
-    let mut meter = SweepMeter::new(limits);
+    let residual_work = limits
+        .max_work
+        .checked_sub(
+            add(preparation_work, runtime_work, Resource::ExecutionWork).map_err(|_| {
+                Error::ArithmeticOverflow {
+                    resource: Resource::ExecutionWork,
+                }
+            })?,
+        )
+        .ok_or(Error::InternalInvariant(
+            "continuation preflight lost mandatory work reservation",
+        ))?;
+    let cache_work = residual_work.min(fixed.learning_work);
+    let mut meter = SweepMeter::with_cache_budget(limits, cache_work);
     meter.charge_work(preparation_work)?;
     let result = execute_prepared(program, local, kind, workspace, &mut meter);
     if workspace.saturated {
@@ -1099,7 +1378,7 @@ fn build_forward_transition(
     let encoded = if workspace.scratch_len == 0 {
         0
     } else {
-        match workspace.forward.intern(
+        match workspace.forward.intern_speculative(
             &workspace.scratch[..workspace.scratch_len],
             next_pending,
             meter,
@@ -1107,7 +1386,7 @@ fn build_forward_transition(
             Interned::State(next) => next.checked_add(1).ok_or(Error::InternalInvariant(
                 "lazy DFA encoded state ID overflowed",
             ))?,
-            Interned::Full => {
+            Interned::Full | Interned::WorkFull => {
                 workspace.saturated = true;
                 workspace.retain_scratch_as_frontier();
                 return Ok(Transition::Inline {
@@ -1330,19 +1609,27 @@ fn build_reverse_transition(
             }
         }
     }
-    sort_exact(&mut workspace.scratch[..workspace.scratch_len], meter)?;
-    let accepts = binary_search_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
+    let accepts = contains_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
+    if !sort_speculative(&mut workspace.scratch[..workspace.scratch_len], meter)? {
+        workspace.saturated = true;
+        workspace.retain_scratch_as_frontier();
+        return Ok(Transition::Inline {
+            accepted: accepts,
+            pending: false,
+        });
+    }
     let encoded = if workspace.scratch_len == 0 {
         0
     } else {
-        match workspace
-            .reverse
-            .intern(&workspace.scratch[..workspace.scratch_len], false, meter)?
-        {
+        match workspace.reverse.intern_speculative(
+            &workspace.scratch[..workspace.scratch_len],
+            false,
+            meter,
+        )? {
             Interned::State(next) => next.checked_add(1).ok_or(Error::InternalInvariant(
                 "lazy reverse encoded state ID overflowed",
             ))?,
-            Interned::Full => {
+            Interned::Full | Interned::WorkFull => {
                 workspace.saturated = true;
                 workspace.retain_scratch_as_frontier();
                 return Ok(Transition::Inline {
@@ -1404,8 +1691,7 @@ fn build_inline_reverse_transition(
             }
         }
     }
-    sort_exact(&mut workspace.scratch[..workspace.scratch_len], meter)?;
-    let accepts = binary_search_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
+    let accepts = contains_exact(&workspace.scratch[..workspace.scratch_len], entry, meter)?;
     if workspace.scratch_len == 0 {
         workspace.clear_frontier();
         let cell = if accepts { CELL_ACCEPT } else { 0 };
@@ -1444,19 +1730,71 @@ fn sort_exact(values: &mut [u32], meter: &mut SweepMeter) -> Result<(), Error> {
     Ok(())
 }
 
-fn binary_search_exact(values: &[u32], needle: u32, meter: &mut SweepMeter) -> Result<bool, Error> {
-    let mut left = 0_usize;
-    let mut right = values.len();
-    while left < right {
-        let middle = left + (right - left) / 2;
+fn contains_exact(values: &[u32], needle: u32, meter: &mut SweepMeter) -> Result<bool, Error> {
+    for &value in values {
         meter.charge_work(1)?;
-        match values[middle].cmp(&needle) {
-            core::cmp::Ordering::Less => left = middle + 1,
-            core::cmp::Ordering::Greater => right = middle,
-            core::cmp::Ordering::Equal => return Ok(true),
+        if value == needle {
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Sort a runtime reverse frontier only when its complete materialization fits
+/// the speculative learning allowance. Charging the conservative heapsort
+/// upper atomically ensures a refusal cannot leave a partially sorted
+/// frontier; the unmetered implementation performs no work outside that
+/// already charged envelope.
+fn sort_speculative(values: &mut [u32], meter: &mut SweepMeter) -> Result<bool, Error> {
+    if values.len() < 2 {
+        return Ok(true);
+    }
+    let levels = usize::try_from(usize::BITS - values.len().leading_zeros()).map_err(|_| {
+        Error::ArithmeticOverflow {
+            resource: Resource::ExecutionWork,
+        }
+    })?;
+    let upper = mul(
+        mul(
+            values.len(),
+            add(levels, 1, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+        4,
+        Resource::ExecutionWork,
+    )?;
+    if !meter.charge_cache_work(upper)? {
+        return Ok(false);
+    }
+    for root in (0..values.len() / 2).rev() {
+        sift_down_unmetered(values, root, values.len())?;
+    }
+    for end in (1..values.len()).rev() {
+        values.swap(0, end);
+        sift_down_unmetered(values, 0, end)?;
+    }
+    Ok(true)
+}
+
+fn sift_down_unmetered(values: &mut [u32], mut root: usize, end: usize) -> Result<(), Error> {
+    loop {
+        let Some(mut child) = root.checked_mul(2).and_then(|value| value.checked_add(1)) else {
+            return Err(Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork,
+            });
+        };
+        if child >= end {
+            return Ok(());
+        }
+        if child + 1 < end && values[child] < values[child + 1] {
+            child += 1;
+        }
+        if values[root] >= values[child] {
+            return Ok(());
+        }
+        values.swap(root, child);
+        root = child;
+    }
 }
 
 fn sift_down(
@@ -1527,14 +1865,35 @@ fn fill_source(
     Ok(())
 }
 
-pub(super) fn upper_bounds(program_states: usize) -> Result<ContinuationSweepUpperBounds, Error> {
-    prospective_upper_bounds(program_states, MAX_DFA_STATES, MAX_DFA_ITEMS)
+pub(super) fn upper_bounds(
+    program_states: usize,
+    max_nonaccepting_run: Option<usize>,
+    minimum_match_bytes: Option<usize>,
+) -> Result<ContinuationSweepUpperBounds, Error> {
+    prospective_upper_bounds_with_run(
+        program_states,
+        MAX_DFA_STATES,
+        MAX_DFA_ITEMS,
+        max_nonaccepting_run,
+        minimum_match_bytes,
+    )
 }
 
+#[cfg(test)]
 fn prospective_upper_bounds(
     states: usize,
     state_capacity: usize,
     max_items: usize,
+) -> Result<ContinuationSweepUpperBounds, Error> {
+    prospective_upper_bounds_with_run(states, state_capacity, max_items, None, None)
+}
+
+fn prospective_upper_bounds_with_run(
+    states: usize,
+    state_capacity: usize,
+    max_items: usize,
+    max_nonaccepting_run: Option<usize>,
+    minimum_match_bytes: Option<usize>,
 ) -> Result<ContinuationSweepUpperBounds, Error> {
     if states == 0 {
         return Err(Error::InternalInvariant(
@@ -1605,6 +1964,105 @@ fn prospective_upper_bounds(
         table_cells,
         workspace_bytes,
         preparation_work,
+        learning_work: preparation_work,
+        max_nonaccepting_run,
+        minimum_match_bytes,
+    })
+}
+
+pub(super) fn run_upper_bounds(
+    input_bytes: usize,
+    execution_state_work: usize,
+    max_nonaccepting_run: Option<usize>,
+    minimum_match_bytes: usize,
+) -> Result<ContinuationSweepRunUpperBounds, Error> {
+    if execution_state_work == 0 || minimum_match_bytes == 0 {
+        return Err(Error::InternalInvariant(
+            "continuation sweep requires nonzero execution-state work and match width",
+        ));
+    }
+    let match_upper = input_bytes / minimum_match_bytes;
+    let forward_visits = if let Some(nonaccepting) = max_nonaccepting_run {
+        // One complete source pass plus at most `nonaccepting + 1` replayed
+        // bytes per non-empty selected match (the extra byte is the
+        // transition that kills the higher-priority frontier).
+        let replay_per_match = add(nonaccepting, 1, Resource::SequentialBytes)?;
+        add(
+            input_bytes,
+            mul(match_upper, replay_per_match, Resource::SequentialBytes)?,
+            Resource::SequentialBytes,
+        )?
+    } else {
+        // Without the acyclic certificate, every selected nonempty match
+        // still advances the cursor by at least the authenticated minimum
+        // width. Sum the worst complete suffix walks:
+        // N + (N-W) + ... + (N-QW), Q=floor(N/W).
+        let terms = add(match_upper, 1, Resource::SequentialBytes)?;
+        let consumed = mul(match_upper, minimum_match_bytes, Resource::SequentialBytes)?;
+        let last = input_bytes
+            .checked_sub(consumed)
+            .ok_or(Error::InternalInvariant(
+                "continuation match-width quotient exceeded the input",
+            ))?;
+        if terms.is_multiple_of(2) {
+            mul(
+                terms / 2,
+                add(input_bytes, last, Resource::SequentialBytes)?,
+                Resource::SequentialBytes,
+            )?
+        } else {
+            // An odd number of terms means `match_upper` is even, so the
+            // endpoints have equal parity and can be halved without overflow.
+            let half_endpoints = add(
+                add(input_bytes / 2, last / 2, Resource::SequentialBytes)?,
+                input_bytes % 2,
+                Resource::SequentialBytes,
+            )?;
+            mul(terms, half_endpoints, Resource::SequentialBytes)?
+        }
+    };
+    let span_sum_sequential_bytes = add(forward_visits, input_bytes, Resource::SequentialBytes)?;
+    let forward_step = add(execution_state_work, 2, Resource::ExecutionWork)?;
+    // Inline reverse closure plus its linear acceptance probe is bounded by
+    // twice the certified complete-program state work and one source unit.
+    let reverse_step = add(
+        mul(execution_state_work, 2, Resource::ExecutionWork)?,
+        1,
+        Resource::ExecutionWork,
+    )?;
+    let count_match = add(execution_state_work, 1, Resource::ExecutionWork)?;
+    let span_match = reverse_step;
+    // At most one generation wrap can occur in one representable operation;
+    // execution-state work is at least the program-state count.
+    let generation_reset = execution_state_work;
+    let forward_work = mul(forward_visits, forward_step, Resource::ExecutionWork)?;
+    let count_work = add(
+        add(
+            forward_work,
+            mul(match_upper, count_match, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+        generation_reset,
+        Resource::ExecutionWork,
+    )?;
+    let span_sum_work = add(
+        add(
+            add(
+                forward_work,
+                mul(input_bytes, reverse_step, Resource::ExecutionWork)?,
+                Resource::ExecutionWork,
+            )?,
+            mul(match_upper, span_match, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+        generation_reset,
+        Resource::ExecutionWork,
+    )?;
+    Ok(ContinuationSweepRunUpperBounds {
+        count_work,
+        span_sum_work,
+        count_sequential_bytes: forward_visits,
+        span_sum_sequential_bytes,
     })
 }
 
@@ -1705,14 +2163,15 @@ fn enforce_sweep_upper_bounds(
     enforce_workspace_bytes(upper.workspace_bytes, limits)
 }
 
-fn allocated_slots<T: Copy>(
-    length: usize,
-    value: T,
-    total_bytes: usize,
-    meter: &mut SweepMeter,
-) -> Result<ExactVec<T>, Error> {
-    meter.charge_work(length)?;
-    let mut output = ExactVec::try_with_capacity(length).map_err(|error| match error {
+fn reserved_slots<T>(length: usize, total_bytes: usize) -> Result<ExactVec<T>, Error> {
+    #[cfg(test)]
+    if test_fault::take_fixed_allocation_failure() {
+        return Err(Error::AllocationFailed {
+            resource: Resource::ScratchBytes,
+            items: total_bytes,
+        });
+    }
+    ExactVec::try_with_capacity(length).map_err(|error| match error {
         CopyError::LayoutOverflow => Error::ArithmeticOverflow {
             resource: Resource::ScratchBytes,
         },
@@ -1720,12 +2179,38 @@ fn allocated_slots<T: Copy>(
             resource: Resource::ScratchBytes,
             items: total_bytes,
         },
-    })?;
+    })
+}
+
+fn initialize_slots<T: Copy>(
+    output: &mut ExactVec<T>,
+    length: usize,
+    value: T,
+    meter: &mut SweepMeter,
+) -> Result<(), Error> {
+    if !output.is_empty() || output.capacity() != length {
+        return Err(Error::InternalInvariant(
+            "reserved lazy workspace has an unexpected shape",
+        ));
+    }
+    meter.charge_work(length)?;
     for _ in 0..length {
         output
             .try_push(value)
             .map_err(|_| Error::InternalInvariant("exact lazy workspace changed capacity"))?;
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn allocated_slots<T: Copy>(
+    length: usize,
+    value: T,
+    total_bytes: usize,
+    meter: &mut SweepMeter,
+) -> Result<ExactVec<T>, Error> {
+    let mut output = reserved_slots(length, total_bytes)?;
+    initialize_slots(&mut output, length, value, meter)?;
     Ok(output)
 }
 
@@ -1736,8 +2221,9 @@ mod tests {
     use regex_syntax::ParserBuilder;
 
     use super::{
-        BYTE_ALPHABET, CELL_UNFILLED, MAX_DFA_ITEMS, MAX_DFA_STATES, Workspace, allocated_slots,
-        execute_prepared, prospective_upper_bounds, reduce,
+        BYTE_ALPHABET, CELL_UNFILLED, FIXED_ARENA_ALLOCATIONS, MAX_DFA_ITEMS, MAX_DFA_STATES,
+        Workspace, allocated_slots, execute_prepared, prospective_upper_bounds,
+        prospective_upper_bounds_with_run, reduce, run_upper_bounds,
     };
     use crate::sweep::{SweepKind, SweepMeter, SweepOutcome, SweepValue};
     use crate::{
@@ -1793,6 +2279,7 @@ mod tests {
             haystack,
             range,
             kind,
+            regex.minimum_match_bytes,
             OperationLimits::default(),
             workspace,
         )
@@ -1819,11 +2306,40 @@ mod tests {
             )
             .unwrap();
         assert!(admitted);
-        let mut meter = SweepMeter::new(OperationLimits::default());
+        let limits = OperationLimits::default();
+        let mut meter =
+            SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
         meter.charge_work(preparation_work).unwrap();
         let SweepOutcome::Complete(value) =
             execute_prepared(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
         (value, meter.sequential, workspace.saturated)
+    }
+
+    fn complete_inline_accounted(
+        regex: &CompiledRegex,
+        haystack: &[u8],
+        kind: SweepKind,
+        workspace: &mut Workspace,
+    ) -> (SweepValue, usize, usize) {
+        let (admitted, preparation_work) = workspace
+            .prepare_bounded(
+                regex.plan_id(),
+                &regex.program,
+                OperationLimits::default(),
+                MAX_DFA_STATES,
+                MAX_DFA_ITEMS,
+            )
+            .unwrap();
+        assert!(admitted);
+        let mut meter = SweepMeter::with_cache_budget(OperationLimits::default(), 0);
+        meter.charge_work(preparation_work).unwrap();
+        let SweepOutcome::Complete(value) =
+            execute_prepared(&regex.program, haystack, kind, workspace, &mut meter).unwrap();
+        (
+            value,
+            meter.work.checked_sub(preparation_work).unwrap(),
+            meter.sequential,
+        )
     }
 
     #[test]
@@ -1875,6 +2391,70 @@ mod tests {
                 "span-sum pattern={pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_rewind_certificate_and_generic_adversary_bound_are_exact() {
+        let regex = compiled("(?:a.*z|a)");
+        assert_eq!(regex.program.continuation_nonaccepting_run(), None);
+        assert_eq!(
+            compiled("a+").program.continuation_nonaccepting_run(),
+            Some(0)
+        );
+        assert_eq!(
+            compiled("(?:a+b|a)")
+                .program
+                .continuation_nonaccepting_run(),
+            None
+        );
+        assert_eq!(
+            compiled("Tom.{10,25}river|river.{10,25}Tom")
+                .program
+                .continuation_nonaccepting_run(),
+            Some(32)
+        );
+        assert_eq!(
+            compiled("abcdefghijklmnopq")
+                .program
+                .continuation_nonaccepting_run(),
+            Some(16)
+        );
+        for length in [4_usize, 8, 16, 32, 64] {
+            let haystack = vec![b'a'; length];
+            let mut workspace = Workspace::new();
+            let (_, sequential, _) = complete_bounded(
+                &regex,
+                &haystack,
+                SweepKind::SpanSum,
+                MAX_DFA_STATES,
+                &mut workspace,
+            );
+            let triangular = length * (length + 1) / 2;
+            assert_eq!(sequential, triangular + length);
+            let upper = run_upper_bounds(
+                length,
+                regex.program.execution_state_work(),
+                regex.program.continuation_nonaccepting_run(),
+                regex.minimum_match_bytes.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sequential, upper.span_sum_sequential_bytes);
+        }
+    }
+
+    #[test]
+    fn authenticated_minimum_width_tightens_match_and_suffix_walk_bounds() {
+        let one_byte = run_upper_bounds(100, 15, Some(3), 1).unwrap();
+        let ten_bytes = run_upper_bounds(100, 15, Some(3), 10).unwrap();
+        assert_eq!(one_byte.count_sequential_bytes, 500);
+        assert_eq!(ten_bytes.count_sequential_bytes, 140);
+        assert!(ten_bytes.count_work < one_byte.count_work);
+
+        let generic_one_byte = run_upper_bounds(100, 15, None, 1).unwrap();
+        let generic_ten_bytes = run_upper_bounds(100, 15, None, 10).unwrap();
+        assert_eq!(generic_one_byte.count_sequential_bytes, 5_050);
+        assert_eq!(generic_ten_bytes.count_sequential_bytes, 550);
+        assert!(generic_ten_bytes.span_sum_work < generic_one_byte.span_sum_work);
     }
 
     #[test]
@@ -1964,6 +2544,61 @@ mod tests {
             }
         }
         assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn mandatory_inline_bounds_cover_exhaustive_small_program_runs() {
+        let patterns = [
+            "abcdefghijklmnopq",
+            "Tom.{1,3}river|river.{1,3}Tom",
+            "(?:a+b|a)",
+            "(?:a.*z|a)",
+        ];
+        let alphabet = [b'a', b'b', b'z'];
+        let mut haystack = Vec::new();
+        for pattern in patterns {
+            let regex = compiled(pattern);
+            let mut count_workspace = Workspace::new();
+            let mut sum_workspace = Workspace::new();
+            for encoded in 0_usize..243 {
+                haystack.clear();
+                let mut value = encoded;
+                let length = encoded % 6;
+                for _ in 0..length {
+                    haystack.push(alphabet[value % alphabet.len()]);
+                    value /= alphabet.len();
+                }
+                let upper = run_upper_bounds(
+                    haystack.len(),
+                    regex.program.execution_state_work(),
+                    regex.program.continuation_nonaccepting_run(),
+                    regex.minimum_match_bytes.unwrap(),
+                )
+                .unwrap();
+                let (_, count_work, count_sequential) = complete_inline_accounted(
+                    &regex,
+                    &haystack,
+                    SweepKind::Count,
+                    &mut count_workspace,
+                );
+                assert!(count_work <= upper.count_work, "pattern={pattern:?}");
+                assert!(
+                    count_sequential <= upper.count_sequential_bytes,
+                    "pattern={pattern:?}"
+                );
+                let (_, sum_work, sum_sequential) = complete_inline_accounted(
+                    &regex,
+                    &haystack,
+                    SweepKind::SpanSum,
+                    &mut sum_workspace,
+                );
+                assert!(sum_work <= upper.span_sum_work, "pattern={pattern:?}");
+                assert!(
+                    sum_sequential <= upper.span_sum_sequential_bytes,
+                    "pattern={pattern:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2062,6 +2697,112 @@ mod tests {
     }
 
     #[test]
+    fn speculative_work_full_preserves_priority_and_reverse_frontiers() {
+        let regex = compiled("(?:a+b|a)");
+        let haystack = vec![b'a'; 128];
+        let want = expected(&regex, &haystack, 0..haystack.len());
+        for cache_work in [0_usize, 1] {
+            let mut workspace = Workspace::new();
+            let (admitted, preparation_work) = workspace
+                .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
+                .unwrap();
+            assert!(admitted);
+            let mut meter = SweepMeter::with_cache_budget(OperationLimits::default(), cache_work);
+            meter.charge_work(preparation_work).unwrap();
+            let SweepOutcome::Complete(value) = execute_prepared(
+                &regex.program,
+                &haystack,
+                SweepKind::Count,
+                &mut workspace,
+                &mut meter,
+            )
+            .unwrap();
+            assert_eq!(value.count, want.count);
+            assert!(workspace.saturated);
+            assert_eq!(workspace.plan_id, Some(regex.plan_id()));
+        }
+
+        let reverse_regex = compiled("abcdefghijklmnopq");
+        let reverse_haystack = b"xxabcdefghijklmnopqyyabcdefghijklmnopq";
+        let reverse_want = expected(&reverse_regex, reverse_haystack, 0..reverse_haystack.len());
+        let mut workspace = Workspace::new();
+        let (admitted, preparation_work) = workspace
+            .prepare(
+                reverse_regex.plan_id(),
+                &reverse_regex.program,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert!(admitted);
+        let limits = OperationLimits::default();
+        let mut populate =
+            SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
+        populate.charge_work(preparation_work).unwrap();
+        let SweepOutcome::Complete(count) = execute_prepared(
+            &reverse_regex.program,
+            reverse_haystack,
+            SweepKind::Count,
+            &mut workspace,
+            &mut populate,
+        )
+        .unwrap();
+        assert_eq!(count.count, reverse_want.count);
+        assert!(!workspace.saturated);
+        assert_eq!(workspace.reverse.state_len, 1);
+
+        let mut no_reverse_learning = SweepMeter::with_cache_budget(OperationLimits::default(), 0);
+        let SweepOutcome::Complete(sum) = execute_prepared(
+            &reverse_regex.program,
+            reverse_haystack,
+            SweepKind::SpanSum,
+            &mut workspace,
+            &mut no_reverse_learning,
+        )
+        .unwrap();
+        assert_eq!(sum.span_sum, reverse_want.span_sum);
+        assert!(workspace.saturated);
+    }
+
+    #[test]
+    fn item_arena_saturation_hands_off_before_state_capacity() {
+        let alternatives = (b'a'..=b'z')
+            .map(|suffix| format!("abcdefghijklmnopq{}", char::from(suffix)))
+            .collect::<Vec<_>>();
+        let pattern = format!("(?:{})", alternatives.join("|"));
+        let regex = compiled(&pattern);
+        let haystack = alternatives.join("--").into_bytes();
+        let want = expected(&regex, &haystack, 0..haystack.len());
+        let mut workspace = Workspace::new();
+        let max_items = regex.program.insts.len();
+        let (admitted, preparation_work) = workspace
+            .prepare_bounded(
+                regex.plan_id(),
+                &regex.program,
+                OperationLimits::default(),
+                MAX_DFA_STATES,
+                max_items,
+            )
+            .unwrap();
+        assert!(admitted);
+        let limits = OperationLimits::default();
+        let mut meter =
+            SweepMeter::with_cache_budget(limits, limits.max_work.saturating_sub(preparation_work));
+        meter.charge_work(preparation_work).unwrap();
+        let SweepOutcome::Complete(value) = execute_prepared(
+            &regex.program,
+            &haystack,
+            SweepKind::Count,
+            &mut workspace,
+            &mut meter,
+        )
+        .unwrap();
+        assert_eq!(value.count, want.count);
+        assert!(workspace.saturated);
+        assert!(workspace.forward.state_len < MAX_DFA_STATES);
+        assert!(workspace.forward.item_len <= max_items);
+    }
+
+    #[test]
     fn saturation_preserves_a_pending_endpoint_through_late_priority_death() {
         let regex = compiled("(?:abcdefghijklmnopqa+b|abcdefghijklmnopqa)");
         let mut haystack = b"abcdefghijklmnopq".to_vec();
@@ -2088,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_runtime_limits_are_hard_and_one_below_fails_closed() {
+    fn runtime_one_below_refuses_source_free_instead_of_replacing_incumbent() {
         let pattern = "abcdefghijklmnopq";
         let regex = compiled(pattern);
         let haystack = pattern.as_bytes();
@@ -2109,8 +2850,16 @@ mod tests {
             &mut sum_workspace,
         );
 
+        let runtime = run_upper_bounds(
+            haystack.len(),
+            regex.program.execution_state_work(),
+            regex.program.continuation_nonaccepting_run(),
+            regex.minimum_match_bytes.unwrap(),
+        )
+        .unwrap();
         let mut exact_count = OperationLimits::default();
-        exact_count.max_work = haystack.len() + 1;
+        exact_count.max_work = runtime.count_work;
+        exact_count.max_sequential_bytes = runtime.count_sequential_bytes;
         assert!(matches!(
             reduce(
                 regex.plan_id(),
@@ -2118,6 +2867,7 @@ mod tests {
                 haystack,
                 0..haystack.len(),
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 exact_count,
                 &mut count_workspace,
             )
@@ -2125,24 +2875,24 @@ mod tests {
             Some(SweepOutcome::Complete(_))
         ));
         exact_count.max_work -= 1;
-        assert!(matches!(
+        assert_eq!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
                 haystack,
                 0..haystack.len(),
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 exact_count,
                 &mut count_workspace,
-            ),
-            Err(Error::ResourceLimit {
-                resource: Resource::ExecutionWork,
-                ..
-            })
-        ));
+            )
+            .unwrap(),
+            None
+        );
 
         let mut exact_sum = OperationLimits::default();
-        exact_sum.max_sequential_bytes = haystack.len() * 2;
+        exact_sum.max_work = runtime.span_sum_work;
+        exact_sum.max_sequential_bytes = runtime.span_sum_sequential_bytes;
         assert!(matches!(
             reduce(
                 regex.plan_id(),
@@ -2150,6 +2900,7 @@ mod tests {
                 haystack,
                 0..haystack.len(),
                 SweepKind::SpanSum,
+                regex.minimum_match_bytes,
                 exact_sum,
                 &mut sum_workspace,
             )
@@ -2157,51 +2908,47 @@ mod tests {
             Some(SweepOutcome::Complete(_))
         ));
         exact_sum.max_sequential_bytes -= 1;
-        assert!(matches!(
+        assert_eq!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
                 haystack,
                 0..haystack.len(),
                 SweepKind::SpanSum,
+                regex.minimum_match_bytes,
                 exact_sum,
                 &mut sum_workspace,
-            ),
-            Err(Error::ResourceLimit {
-                resource: Resource::SequentialBytes,
-                ..
-            })
-        ));
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn cold_preparation_and_runtime_share_exact_work_limit() {
+    fn cold_preparation_and_mandatory_runtime_are_preflighted_together() {
         let pattern = "abcdefghijklmnopq";
         let regex = compiled(pattern);
         let haystack = pattern.as_bytes();
-        let mut probe = Workspace::new();
-        let (admitted, preparation_work) = probe
-            .prepare(regex.plan_id(), &regex.program, OperationLimits::default())
-            .unwrap();
-        assert!(admitted);
-        assert!(preparation_work > 0);
-        let mut probe_meter = SweepMeter::new(OperationLimits::default());
-        probe_meter.charge_work(preparation_work).unwrap();
-        assert!(matches!(
-            execute_prepared(
-                &regex.program,
-                haystack,
-                SweepKind::Count,
-                &mut probe,
-                &mut probe_meter,
-            )
-            .unwrap(),
-            SweepOutcome::Complete(_)
-        ));
-        let exact_work = probe_meter.work;
+        let fixed = prospective_upper_bounds_with_run(
+            regex.program.insts.len(),
+            MAX_DFA_STATES,
+            MAX_DFA_ITEMS,
+            regex.program.continuation_nonaccepting_run(),
+            regex.minimum_match_bytes,
+        )
+        .unwrap();
+        let runtime = run_upper_bounds(
+            haystack.len(),
+            regex.program.execution_state_work(),
+            fixed.max_nonaccepting_run,
+            regex.minimum_match_bytes.unwrap(),
+        )
+        .unwrap();
+        let exact_work = fixed.preparation_work + runtime.count_work;
 
         let mut exact = OperationLimits::default();
         exact.max_work = exact_work;
+        exact.max_sequential_bytes = runtime.count_sequential_bytes;
         let mut exact_workspace = Workspace::new();
         assert!(matches!(
             reduce(
@@ -2210,6 +2957,7 @@ mod tests {
                 haystack,
                 0..haystack.len(),
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 exact,
                 &mut exact_workspace,
             )
@@ -2220,22 +2968,90 @@ mod tests {
         let mut one_below = exact;
         one_below.max_work -= 1;
         let mut one_below_workspace = Workspace::new();
-        assert!(matches!(
+        assert_eq!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
                 haystack,
                 0..haystack.len(),
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 one_below,
                 &mut one_below_workspace,
-            ),
-            Err(Error::ResourceLimit {
-                resource: Resource::ExecutionWork,
-                required,
-                limit,
-            }) if required == exact_work && limit == exact_work - 1
-        ));
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(one_below_workspace.plan_id, None);
+    }
+
+    #[test]
+    fn cold_allocation_failures_are_work_and_source_free_and_preserve_the_incumbent() {
+        let pattern = "abcdefghijklmnopq";
+        let regex = compiled(pattern);
+        let haystack = b"xxabcdefghijklmnopqyyabcdefghijklmnopq";
+        let expected = regex
+            .count_value(
+                haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+
+        for ordinal in [1, FIXED_ARENA_ALLOCATIONS] {
+            let mut workspace = Workspace::new();
+            {
+                let _fault = super::test_fault::fail_fixed_allocation_at(ordinal);
+                assert_eq!(
+                    reduce(
+                        regex.plan_id(),
+                        &regex.program,
+                        haystack,
+                        0..haystack.len(),
+                        SweepKind::Count,
+                        regex.minimum_match_bytes,
+                        OperationLimits::default(),
+                        &mut workspace,
+                    )
+                    .unwrap(),
+                    None
+                );
+                assert!(!super::test_fault::fixed_allocation_failure_is_armed());
+                assert_eq!(super::test_fault::work(), 0);
+                assert_eq!(super::test_fault::source_bytes(), 0);
+            }
+            assert_eq!(workspace.plan_id, Some(regex.plan_id()));
+            assert!(!workspace.admitted);
+            assert_eq!(workspace.retained_bytes, 0);
+            assert_eq!(
+                regex
+                    .count_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                expected,
+                "allocator refusal ordinal={ordinal}"
+            );
+            assert_eq!(
+                reduce(
+                    regex.plan_id(),
+                    &regex.program,
+                    haystack,
+                    0..haystack.len(),
+                    SweepKind::Count,
+                    regex.minimum_match_bytes,
+                    OperationLimits::default(),
+                    &mut workspace,
+                )
+                .unwrap(),
+                None,
+                "sticky refusal ordinal={ordinal}"
+            );
+        }
     }
 
     #[test]
@@ -2282,7 +3098,7 @@ mod tests {
             .unwrap();
         assert!(admitted);
         assert!(actual_work <= upper.preparation_work);
-        assert!(workspace.retained_bytes <= upper.workspace_bytes);
+        assert_eq!(workspace.retained_bytes, upper.workspace_bytes);
 
         let mut table_one_below = Workspace::new();
         let mut low_table = OperationLimits::default();
@@ -2349,6 +3165,7 @@ mod tests {
                 b"source-must-remain-uninspected",
                 0..2,
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 OperationLimits::default(),
                 &mut capped_count,
             )
@@ -2441,22 +3258,20 @@ mod tests {
         let mut work_limited = Workspace::new();
         let mut no_preparation_work = OperationLimits::default();
         no_preparation_work.max_work = 0;
-        assert!(matches!(
+        assert_eq!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
                 b"\xFF\x00source-must-remain-uninspected",
                 0..2,
                 SweepKind::Count,
+                regex.minimum_match_bytes,
                 no_preparation_work,
                 &mut work_limited,
-            ),
-            Err(Error::ResourceLimit {
-                resource: Resource::ExecutionWork,
-                required: 1,
-                limit: 0,
-            })
-        ));
+            )
+            .unwrap(),
+            None
+        );
         assert_eq!(work_limited.retained_bytes, 0);
     }
 
@@ -2531,6 +3346,7 @@ mod tests {
                 haystack,
                 0..haystack.len(),
                 SweepKind::SpanSum,
+                regex.minimum_match_bytes,
                 OperationLimits::default(),
                 &mut workspace,
             )

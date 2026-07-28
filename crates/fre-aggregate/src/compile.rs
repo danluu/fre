@@ -1205,6 +1205,7 @@ impl CompiledRegex {
     ) -> Result<Self, Error> {
         validate_hir(hir, profile, capture_policy, budget)?;
         let minimum_match_bytes = hir.properties().minimum_len();
+        budget.accounting.minimum_match_bytes = minimum_match_bytes;
         let url_aggregate = if ordered_root {
             None
         } else {
@@ -1347,6 +1348,8 @@ impl CompiledRegex {
         budget.accounting.program_states = insts.len();
         budget.accounting.program_bytes = program_bytes;
         budget.accounting.execution_state_work = certificate.execution_state_work;
+        budget.accounting.continuation_max_nonaccepting_run =
+            certificate.continuation_nonaccepting_run;
         budget.accounting.predecessor_edges = certificate.predecessor_edges;
         budget.accounting.has_scalar_transitions = certificate.has_scalar_transition;
         budget.accounting.max_scalar_search_checks = certificate.max_scalar_search_checks;
@@ -1363,6 +1366,7 @@ impl CompiledRegex {
             has_scalar_transition: certificate.has_scalar_transition,
             has_assertion: certificate.has_assertion,
             max_scalar_search_checks: certificate.max_scalar_search_checks,
+            continuation_nonaccepting_run: certificate.continuation_nonaccepting_run,
             has_unicode_word_boundary: false,
             start_domain: StartDomain::AnyBoundary,
             root_assertion: None,
@@ -4138,6 +4142,14 @@ fn build_retained_components(
         budget.acquire_checked_construction_bytes(minimum_match_bytes_proof_bytes)?;
     }
     budget.record_initialization(minimum_match_bytes_proof_bytes, false)?;
+    let continuation_nonaccepting_run_proof_bytes = core::mem::size_of::<Option<usize>>();
+    budget.accounting.continuation_nonaccepting_run_proof_bytes =
+        continuation_nonaccepting_run_proof_bytes;
+    if budget.receipt_scope {
+        budget.preflight_receipt_construction_bytes(continuation_nonaccepting_run_proof_bytes)?;
+        budget.acquire_checked_construction_bytes(continuation_nonaccepting_run_proof_bytes)?;
+    }
+    budget.record_initialization(continuation_nonaccepting_run_proof_bytes, false)?;
     budget.charge(1)?;
     if budget.receipt_scope {
         budget.preflight_receipt_construction_bytes(RequiredLiteralSets::retained_bytes())?;
@@ -4177,7 +4189,11 @@ fn build_retained_components(
             Resource::ProgramBytes,
         )?,
         add(
-            minimum_match_bytes_proof_bytes,
+            add(
+                minimum_match_bytes_proof_bytes,
+                continuation_nonaccepting_run_proof_bytes,
+                Resource::ProgramBytes,
+            )?,
             add(
                 root_assertion_proof_bytes,
                 add(
@@ -4523,6 +4539,8 @@ impl CompileBudget {
                 candidate_entries: 0,
                 candidate_bytes: 0,
                 minimum_match_bytes_proof_bytes: 0,
+                minimum_match_bytes: None,
+                continuation_nonaccepting_run_proof_bytes: 0,
                 start_domain_proof_bytes: 0,
                 root_assertion_proof_bytes: 0,
                 program_states: 0,
@@ -4530,6 +4548,7 @@ impl CompileBudget {
                 program_bytes: 0,
                 construction_peak_bytes: 0,
                 execution_state_work: 0,
+                continuation_max_nonaccepting_run: None,
                 predecessor_edges: 0,
                 has_scalar_transitions: false,
                 max_scalar_search_checks: 0,
@@ -6653,6 +6672,7 @@ struct ProgramCertificate {
     has_scalar_transition: bool,
     has_assertion: bool,
     max_scalar_search_checks: usize,
+    continuation_nonaccepting_run: Option<usize>,
 }
 
 struct EpsilonParentIndex {
@@ -6868,8 +6888,11 @@ fn certify_program_admitted(
     if order.len() != states {
         return Err(Error::SameBoundaryCycle);
     }
-    // A successful topological drain leaves every outgoing count dead. Reuse
-    // the exact state-width allocation as the persistent split-rank table.
+    // A successful topological drain leaves every outgoing count dead. Before
+    // reusing that allocation as the persistent split-rank table, derive the
+    // ordered-sweep rewind certificate in the already-retained scratch.
+    let continuation_nonaccepting_run =
+        certify_continuation_nonaccepting_run(insts, &order, &mut outgoing, &mut queue, budget)?;
     let mut split_rank = outgoing;
     let metadata = certify_execution_metadata(&mut split_rank, insts, budget)?;
     drop(offsets);
@@ -6886,7 +6909,157 @@ fn certify_program_admitted(
         has_scalar_transition: metadata.has_scalar_transition,
         has_assertion: metadata.has_assertion,
         max_scalar_search_checks: metadata.max_scalar_search_checks,
+        continuation_nonaccepting_run,
     })
+}
+
+/// Certify a finite run of source bytes that can remain live after a lower
+/// priority acceptance without refreshing that acceptance.
+///
+/// Epsilon reachability is acyclic and `order` is child-first. A consuming
+/// instruction whose successor epsilon-accepts refreshes the selected end on
+/// that byte, so its consume edge is cut. A cycle in the remaining graph is
+/// exactly the conservative case where ordered lookahead can remain live for
+/// an unbounded number of bytes. The existing certification state vector and
+/// queue are dead scratch here, so computing the certificate adds no scratch
+/// allocation. Its value is retained in the separately charged inline proof
+/// slot.
+fn certify_continuation_nonaccepting_run(
+    insts: &[Inst],
+    order: &[usize],
+    scratch: &mut [usize],
+    stack: &mut VecDeque<usize>,
+    budget: &mut CompileBudget,
+) -> Result<Option<usize>, Error> {
+    let mut unsupported = false;
+    for inst in insts {
+        budget.charge(1)?;
+        unsupported |= matches!(inst, Inst::ConsumeScalar { .. } | Inst::Assert { .. });
+    }
+    if unsupported {
+        // These programs cannot select the byte-only sweep. Avoid publishing
+        // a proof for an execution domain that the proof does not model.
+        return Ok(None);
+    }
+    const ACCEPTS: usize = 1_usize << (usize::BITS - 1);
+    const VISITING: usize = 1_usize << (usize::BITS - 2);
+    const DONE: usize = 1_usize << (usize::BITS - 3);
+    const DISTANCE_MASK: usize = DONE - 1;
+    if insts.len() > DISTANCE_MASK {
+        return Ok(None);
+    }
+
+    for &pc in order {
+        budget.charge(1)?;
+        let accepts = match insts
+            .get(pc)
+            .ok_or(Error::InternalInvariant("rewind proof PC outside program"))?
+        {
+            Inst::Match => true,
+            Inst::Split {
+                preferred,
+                fallback,
+            }
+            | Inst::RootSplit {
+                preferred,
+                fallback,
+            } => {
+                scratch
+                    .get(*preferred)
+                    .is_some_and(|value| value & ACCEPTS != 0)
+                    || scratch
+                        .get(*fallback)
+                        .is_some_and(|value| value & ACCEPTS != 0)
+            }
+            Inst::Unfilled => {
+                return Err(Error::InternalInvariant(
+                    "rewind proof reached an unfilled instruction",
+                ));
+            }
+            Inst::Fail | Inst::Consume { .. } => false,
+            Inst::ConsumeScalar { .. } | Inst::Assert { .. } => unreachable!(),
+        };
+        *scratch.get_mut(pc).ok_or(Error::InternalInvariant(
+            "rewind proof scratch outside program",
+        ))? = if accepts { ACCEPTS } else { 0 };
+    }
+
+    stack.clear();
+    let mut maximum = 0_usize;
+    for root in 0..insts.len() {
+        if scratch[root] & DONE != 0 {
+            continue;
+        }
+        stack.push_back(root);
+        budget.record_items::<usize>(1, false)?;
+        while let Some(&pc) = stack.back() {
+            let retained = *scratch
+                .get(pc)
+                .ok_or(Error::InternalInvariant("rewind DFS PC outside scratch"))?;
+            if retained & VISITING == 0 {
+                scratch[pc] = retained | VISITING;
+                budget.charge(1)?;
+            }
+            let successors = match insts
+                .get(pc)
+                .ok_or(Error::InternalInvariant("rewind DFS PC outside program"))?
+            {
+                Inst::Split {
+                    preferred,
+                    fallback,
+                }
+                | Inst::RootSplit {
+                    preferred,
+                    fallback,
+                } => [Some((*preferred, 0_usize)), Some((*fallback, 0_usize))],
+                Inst::Consume { next, .. } => {
+                    let accepts = scratch.get(*next).ok_or(Error::InternalInvariant(
+                        "rewind DFS consume successor outside scratch",
+                    ))? & ACCEPTS
+                        != 0;
+                    if accepts {
+                        [None, None]
+                    } else {
+                        [Some((*next, 1_usize)), None]
+                    }
+                }
+                Inst::Unfilled => {
+                    return Err(Error::InternalInvariant(
+                        "rewind DFS reached an unfilled instruction",
+                    ));
+                }
+                Inst::Fail | Inst::Match => [None, None],
+                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => unreachable!(),
+            };
+            let mut pending = None;
+            let mut distance = 0_usize;
+            for successor in successors.into_iter().flatten() {
+                budget.charge(1)?;
+                let (next, weight) = successor;
+                let state = *scratch.get(next).ok_or(Error::InternalInvariant(
+                    "rewind DFS successor outside scratch",
+                ))?;
+                if state & VISITING != 0 && state & DONE == 0 {
+                    return Ok(None);
+                }
+                if state & DONE == 0 {
+                    pending = Some(next);
+                    break;
+                }
+                let candidate = add(state & DISTANCE_MASK, weight, Resource::ProgramStates)?;
+                distance = distance.max(candidate);
+            }
+            if let Some(next) = pending {
+                stack.push_back(next);
+                budget.record_items::<usize>(1, false)?;
+                continue;
+            }
+            scratch[pc] = (retained & ACCEPTS) | DONE | distance;
+            maximum = maximum.max(distance);
+            stack.pop_back();
+        }
+    }
+    Ok(Some(maximum))
 }
 
 fn preflight_certification_program_bytes(
@@ -8292,6 +8465,7 @@ mod tests {
         .unwrap();
         let accounting = baseline.compile_accounting();
         assert_eq!(baseline.minimum_match_bytes, Some(4));
+        assert_eq!(accounting.minimum_match_bytes, Some(4));
         assert_eq!(
             accounting.minimum_match_bytes_proof_bytes,
             core::mem::size_of::<Option<usize>>()
@@ -8359,6 +8533,93 @@ mod tests {
                 .receipt
                 .actual
                 .minimum_match_bytes_proof_bytes,
+            core::mem::size_of::<Option<usize>>()
+        );
+        assert!(receipt_failure.receipt.contains_actual());
+    }
+
+    #[test]
+    fn continuation_nonaccepting_run_proof_is_retained_and_receipt_bounded() {
+        let hir = parse_bytes("abcdefghijklmnopq");
+        let baseline = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let accounting = baseline.compile_accounting();
+        assert_eq!(baseline.program.continuation_nonaccepting_run(), Some(16));
+        assert_eq!(accounting.continuation_max_nonaccepting_run, Some(16));
+        assert_eq!(
+            accounting.continuation_nonaccepting_run_proof_bytes,
+            core::mem::size_of::<Option<usize>>()
+        );
+
+        let exact = CompileLimits {
+            max_program_bytes: accounting.program_bytes,
+            ..CompileLimits::default()
+        };
+        assert_eq!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                exact,
+            )
+            .unwrap()
+            .compile_accounting(),
+            accounting
+        );
+        assert_eq!(
+            CompiledRegex::from_hir_erasing_captures_for_whole_match(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_program_bytes: accounting.program_bytes - 1,
+                    ..exact
+                },
+            )
+            .unwrap_err(),
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: accounting.program_bytes,
+                limit: accounting.program_bytes - 1,
+            }
+        );
+
+        let receipt_exact = CompileLimits {
+            max_program_bytes: accounting.construction_peak_bytes,
+            ..CompileLimits::default()
+        };
+        let receipt_replay = CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            receipt_exact,
+        )
+        .unwrap();
+        assert_eq!(receipt_replay.compile_accounting(), accounting);
+        let receipt_failure =
+            CompiledRegex::from_hir_erasing_captures_for_whole_match_with_receipt(
+                &hir,
+                RustByteProfile::PINNED_1_12_4,
+                CompileLimits {
+                    max_program_bytes: accounting.construction_peak_bytes - 1,
+                    ..receipt_exact
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            receipt_failure.source,
+            Error::ResourceLimit {
+                resource: Resource::ProgramBytes,
+                required: accounting.construction_peak_bytes,
+                limit: accounting.construction_peak_bytes - 1,
+            }
+        );
+        assert_eq!(
+            receipt_failure
+                .receipt
+                .actual
+                .continuation_nonaccepting_run_proof_bytes,
             core::mem::size_of::<Option<usize>>()
         );
         assert!(receipt_failure.receipt.contains_actual());

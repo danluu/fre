@@ -1858,6 +1858,7 @@ impl CompiledRegex {
             haystack,
             range,
             SweepKind::Count,
+            self.minimum_match_bytes,
             limits,
             workspace,
         )?;
@@ -2343,6 +2344,7 @@ impl CompiledRegex {
             haystack,
             range,
             SweepKind::SpanSum,
+            self.minimum_match_bytes,
             limits,
             workspace,
         )?;
@@ -2356,10 +2358,13 @@ impl CompiledRegex {
     /// Publish the fixed workspace envelope only when this compiled artifact
     /// can actually select the value-only continuation sweep.
     ///
+    /// An arithmetic overflow in the optional fixed-arena calculation returns
+    /// `Ok(None)` so an otherwise valid incumbent operation remains selectable.
+    ///
     /// # Errors
     ///
-    /// Returns an arithmetic error when the authenticated program dimensions
-    /// cannot be represented by the fixed-arena upper-bound calculation.
+    /// Returns a non-arithmetic internal error if the authenticated program
+    /// dimensions cannot be projected.
     #[doc(hidden)]
     pub fn continuation_sweep_upper_bounds(
         &self,
@@ -2368,7 +2373,15 @@ impl CompiledRegex {
         if !self.sweep_value_route_eligible(strategy) {
             return Ok(None);
         }
-        crate::sweep::continuation_sweep_upper_bounds(self.program.insts.len()).map(Some)
+        match crate::sweep::continuation_sweep_upper_bounds_with_run(
+            self.program.insts.len(),
+            self.program.continuation_nonaccepting_run(),
+            self.minimum_match_bytes,
+        ) {
+            Ok(bounds) => Ok(Some(bounds)),
+            Err(Error::ArithmeticOverflow { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn sweep_value_route_eligible(&self, strategy: Strategy) -> bool {
@@ -2381,6 +2394,7 @@ impl CompiledRegex {
             || self.program.contains_assertion()
             || self.program.contains_unicode_word_boundary()
             || self.program.start_domain.is_sparse()
+            || self.required_internal_anchor.is_some()
             // The incumbent two-row byte kernel is already dense and cheap
             // for very small programs. Avoid a persistent DFA workspace and
             // its first-call determinization until the program is large

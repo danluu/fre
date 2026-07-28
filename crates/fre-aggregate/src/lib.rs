@@ -73,5 +73,6 @@ pub use operation::{
     SpanSumValueCounterAttempt, Strategy,
 };
 pub use sweep::{
-    ContinuationSweepUpperBounds, ContinuationSweepWorkspace, continuation_sweep_upper_bounds,
+    ContinuationSweepRunUpperBounds, ContinuationSweepUpperBounds, ContinuationSweepWorkspace,
+    continuation_sweep_run_upper_bounds, continuation_sweep_upper_bounds,
 };

@@ -3015,6 +3015,7 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
     let retained_components = required_suffix_storage
         + TERMINAL_FRONTIER_SEED_BYTES
         + report.selector.minimum_match_bytes_proof_bytes
+        + report.selector.continuation_nonaccepting_run_proof_bytes
         + usize::from(report.selector.start_domain_proof_bytes)
         + report.selector.root_assertion_proof_bytes()
         + report.selector.required_literal_proof_bytes
@@ -3027,8 +3028,8 @@ fn overlapping_unicode_word_captures_fit_the_bounded_selector_default() {
         + SCALAR_STORAGE_BYTES
         + retained_components;
     assert_eq!(report.selector.root_assertion_proof_bytes(), 1);
-    assert_eq!(retained_components, 506);
-    assert_eq!(expected_program_bytes, 543_106);
+    assert_eq!(retained_components, 522);
+    assert_eq!(expected_program_bytes, 543_122);
     assert_eq!(report.selector.program_bytes, expected_program_bytes);
     assert!(report.selector.work >= 126_986);
 
