@@ -10,13 +10,14 @@ use core::fmt::Write as _;
 mod literal;
 mod word;
 
+pub use crate::line_total_grep::Error as PortableGrepLineTotalError;
 pub use literal::Error as PortableGrepLiteralError;
 pub use word::Error as PortableGrepWordError;
 
 use fre_automata::p16_grep_stream::{self as k0_grep, GrepStreamProspective as K0Prospective};
 
 use crate::{
-    PortablePlan, PortableRegex,
+    PortablePlan, PortableRegex, line_total_grep,
     operation_session::{
         OperationSession, OperationSessionAdmission, OperationSessionAttemptError,
         OperationSessionAttemptReceipt, OperationSessionConstructionLimits,
@@ -99,6 +100,7 @@ impl PortableGrepProspective {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EngineProspective {
+    LineTotal(line_total_grep::Prospective),
     Literal(literal::Prospective),
     K0(K0Prospective),
     Word(word::Prospective),
@@ -167,6 +169,8 @@ pub enum PortableGrepError {
     Attempt(OperationSessionAttemptError),
     /// The K0 line-state engine refused or found an internal invariant error.
     K0(k0_grep::GrepStreamError),
+    /// The construction-certified line-total reducer refused.
+    LineTotal(PortableGrepLineTotalError),
     /// The native word line-state engine refused or found an invariant error.
     Word(PortableGrepWordError),
     /// The shared exact-literal line adapter refused before begin.
@@ -191,6 +195,8 @@ pub enum PortableGrepError {
 pub enum PortableGrepExecutionError {
     /// The generic portable automaton engine failed.
     K0(k0_grep::GrepStreamError),
+    /// The construction-certified line-total reducer failed.
+    LineTotal(PortableGrepLineTotalError),
     /// The native ASCII/Unicode word-run engine failed.
     Word(PortableGrepWordError),
     /// The shared exact-literal adapter failed.
@@ -221,6 +227,12 @@ impl From<k0_grep::GrepStreamError> for PortableGrepError {
     }
 }
 
+impl From<line_total_grep::Error> for PortableGrepError {
+    fn from(error: line_total_grep::Error) -> Self {
+        Self::LineTotal(error)
+    }
+}
+
 impl From<word::Error> for PortableGrepError {
     fn from(error: word::Error) -> Self {
         Self::Word(error)
@@ -242,6 +254,13 @@ pub struct PortableGrepSession<'r> {
 }
 
 impl PortableRegex {
+    /// Whether construction retained a proof that this expression greedily
+    /// selects every byte of every LF/CRLF plain-grep line.
+    #[must_use]
+    pub const fn has_line_total_grep_plan(&self) -> bool {
+        self.line_total_grep_plan.is_some()
+    }
+
     /// Construct one reusable whole-input plain-grep session.
     ///
     /// Construction occurs outside the public operation and allocates only
@@ -258,31 +277,30 @@ impl PortableRegex {
 
 impl<'r> PortableGrepSession<'r> {
     fn new(regex: &'r PortableRegex) -> Result<Self, PortableGrepBuildError> {
-        let grep = match &regex.plan {
-            PortablePlan::ExactLiteral(_) => SlotAdmission {
-                line_state_cells: 0,
-                generation_cells: 0,
-                candidate_cells: 0,
-                cache_cells: 0,
-                history_cells: 0,
-            },
-            PortablePlan::K0(automaton) => AutomatonSlotLayout::for_automaton(
-                automaton.stats().states(),
-                automaton.stats().edges(),
-                automaton.stats().zero_width_edges(),
-            )?
-            .admission(),
-            PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => SlotAdmission {
-                line_state_cells: 0,
-                generation_cells: 0,
-                candidate_cells: 0,
-                cache_cells: 0,
-                history_cells: 0,
-            },
-            _ => {
-                return Err(PortableGrepBuildError::UnsupportedRuntime {
-                    runtime: regex.runtime_implementation_id(),
-                });
+        let empty_slot = SlotAdmission {
+            line_state_cells: 0,
+            generation_cells: 0,
+            candidate_cells: 0,
+            cache_cells: 0,
+            history_cells: 0,
+        };
+        let grep = if regex.has_line_total_grep_plan() {
+            empty_slot
+        } else {
+            match &regex.plan {
+                PortablePlan::ExactLiteral(_) => empty_slot,
+                PortablePlan::K0(automaton) => AutomatonSlotLayout::for_automaton(
+                    automaton.stats().states(),
+                    automaton.stats().edges(),
+                    automaton.stats().zero_width_edges(),
+                )?
+                .admission(),
+                PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => empty_slot,
+                _ => {
+                    return Err(PortableGrepBuildError::UnsupportedRuntime {
+                        runtime: regex.runtime_implementation_id(),
+                    });
+                }
             }
         };
         let admission = OperationSessionAdmission {
@@ -330,6 +348,13 @@ impl<'r> PortableGrepSession<'r> {
         self.regex.runtime_implementation_id()
     }
 
+    /// Whether this session owns the construction-certified direct line-total
+    /// reducer instead of a generic semantic engine workspace.
+    #[must_use]
+    pub const fn is_line_total(&self) -> bool {
+        self.regex.has_line_total_grep_plan()
+    }
+
     /// Closed exact fixed-session construction receipt.
     #[must_use]
     pub const fn construction_receipt(&self) -> &OperationSessionConstructionReceipt {
@@ -349,20 +374,24 @@ impl<'r> PortableGrepSession<'r> {
         &self,
         haystack_len: usize,
     ) -> Result<PortableGrepProspective, PortableGrepError> {
-        let engine = match &self.regex.plan {
-            PortablePlan::ExactLiteral(plan) => {
-                EngineProspective::Literal(literal::prospective(plan, haystack_len)?)
-            }
-            PortablePlan::K0(automaton) => {
-                EngineProspective::K0(k0_grep::prospective(automaton, haystack_len)?)
-            }
-            PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => {
-                EngineProspective::Word(word::prospective(*plan, haystack_len)?)
-            }
-            _ => {
-                return Err(PortableGrepError::InternalInvariant {
-                    detail: "constructed grep session changed runtime class",
-                });
+        let engine = if let Some(plan) = self.regex.line_total_grep_plan {
+            EngineProspective::LineTotal(line_total_grep::prospective(plan, haystack_len)?)
+        } else {
+            match &self.regex.plan {
+                PortablePlan::ExactLiteral(plan) => {
+                    EngineProspective::Literal(literal::prospective(plan, haystack_len)?)
+                }
+                PortablePlan::K0(automaton) => {
+                    EngineProspective::K0(k0_grep::prospective(automaton, haystack_len)?)
+                }
+                PortablePlan::UnicodeWordRun(plan) if word::supports(*plan) => {
+                    EngineProspective::Word(word::prospective(*plan, haystack_len)?)
+                }
+                _ => {
+                    return Err(PortableGrepError::InternalInvariant {
+                        detail: "constructed grep session changed runtime class",
+                    });
+                }
             }
         };
         let (execution, required_generations) = operation_prospective(engine);
@@ -420,6 +449,20 @@ impl<'r> PortableGrepSession<'r> {
         if admitted != required {
             return Err(PortableGrepError::AdmissionMismatch { required, admitted });
         }
+        if let (Some(plan), EngineProspective::LineTotal(engine)) =
+            (self.regex.line_total_grep_plan, required.engine)
+        {
+            return Self::execute_line_total(
+                &mut self.operation,
+                self.compiled_plan_id,
+                plan,
+                haystack,
+                engine,
+                required,
+                reset_limits,
+                run_limits,
+            );
+        }
         match (&self.regex.plan, required.engine) {
             (PortablePlan::ExactLiteral(plan), EngineProspective::Literal(engine)) => {
                 Self::execute_literal(
@@ -475,6 +518,78 @@ impl<'r> PortableGrepSession<'r> {
         let prospective = self.prospective(haystack.len())?;
         let (reset, run) = self.exact_limits(prospective)?;
         self.count_matching_lines(haystack, prospective, reset, run)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::result_large_err,
+        reason = "engine admission and common limits are separate authenticated inputs"
+    )]
+    fn execute_line_total(
+        operation: &mut OperationSession,
+        compiled_plan_id: [u8; 16],
+        plan: line_total_grep::Plan,
+        haystack: &[u8],
+        engine: line_total_grep::Prospective,
+        common: PortableGrepProspective,
+        reset_limits: OperationSessionResetLimits,
+        run_limits: OperationSessionRunLimits,
+    ) -> Result<PortableGrepResult, PortableGrepError> {
+        let invocation = OperationSessionInvocation {
+            haystack_len: haystack.len(),
+            range: 0..haystack.len(),
+            required_generations: common.required_generations,
+        };
+        let mut forced = operation.forced_grep();
+        let attempt = forced
+            .begin_stream_count(
+                compiled_plan_id,
+                invocation,
+                common.execution,
+                reset_limits,
+                run_limits,
+            )
+            .map_err(map_begin_error)?;
+        let mut order = attempt.stream_order_verifier();
+        let result = line_total_grep::count_matching_lines_with_observer(
+            plan,
+            haystack,
+            engine,
+            |matched| order.observe(common_match(line_total_match(matched))),
+        );
+        let report = match result {
+            Ok(report) => report,
+            Err(line_total_grep::ObservedError::Execution { error, partial }) => {
+                return Err(close_execution(
+                    attempt,
+                    line_total_actual(partial),
+                    order.finish(),
+                    GrepStreamFailure::Engine,
+                    PortableGrepExecutionError::LineTotal(error),
+                ));
+            }
+            Err(line_total_grep::ObservedError::Observer { error, partial }) => {
+                return Err(close_execution(
+                    attempt,
+                    line_total_actual(partial),
+                    order.finish(),
+                    GrepStreamFailure::Observer,
+                    observer_execution_error(error),
+                ));
+            }
+        };
+        if report.prospective() != engine {
+            return Err(close_execution(
+                attempt,
+                line_total_actual(report.actual()),
+                order.finish(),
+                GrepStreamFailure::Protocol,
+                PortableGrepExecutionError::Protocol {
+                    detail: "line-total engine report changed its admitted prospective",
+                },
+            ));
+        }
+        finish_line_total(attempt, report, order.finish())
     }
 
     #[allow(
@@ -732,6 +847,14 @@ impl<'r> PortableGrepSession<'r> {
 fn operation_prospective(engine: EngineProspective) -> (OperationSessionExecutionProspective, u64) {
     let (work, source_accesses, transitions, candidates, line_domains, required_generations) =
         match engine {
+            EngineProspective::LineTotal(value) => (
+                value.work(),
+                value.source_accesses(),
+                value.transitions(),
+                value.candidates(),
+                value.line_domains(),
+                0,
+            ),
             EngineProspective::Literal(value) => (
                 value.work(),
                 value.source_accesses(),
@@ -773,6 +896,39 @@ fn operation_prospective(engine: EngineProspective) -> (OperationSessionExecutio
         },
         required_generations,
     )
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "typed common-session refusals retain their closed allocation-free receipt by value"
+)]
+fn finish_line_total(
+    attempt: crate::operation_session::OperationSessionAttempt<
+        '_,
+        crate::operation_session::grep::Slot,
+    >,
+    report: line_total_grep::Report,
+    order: GrepStreamOrderProof,
+) -> Result<PortableGrepResult, PortableGrepError> {
+    let actual = report.actual();
+    let first_match = report.first_match().map(line_total_match);
+    let last_match = report.last_match().map(line_total_match);
+    let common_report = GrepStreamExecutionReport {
+        source_line_domains: actual.domains_examined(),
+        actual: line_total_actual(actual),
+        first_match: first_match.map(common_match),
+        last_match: last_match.map(common_match),
+    };
+    let receipt = attempt
+        .finish_stream_count(common_report, order)
+        .map_err(map_commit_error)?;
+    Ok(PortableGrepResult {
+        count: actual.matching_lines(),
+        source_line_domains: common_report.source_line_domains,
+        first_match,
+        last_match,
+        receipt,
+    })
 }
 
 #[allow(
@@ -910,6 +1066,17 @@ fn finish_word(
     })
 }
 
+fn line_total_match(value: line_total_grep::MatchedLine) -> PortableGrepMatch {
+    PortableGrepMatch {
+        line_ordinal: value.ordinal(),
+        line_start: value.line_start(),
+        line_content_end: value.content_end(),
+        line_source_end: value.source_end(),
+        match_start: value.line_start(),
+        match_end: value.content_end(),
+    }
+}
+
 fn literal_match(value: literal::MatchedLine) -> PortableGrepMatch {
     PortableGrepMatch {
         line_ordinal: value.ordinal(),
@@ -941,6 +1108,22 @@ fn word_match(value: word::MatchedLine) -> PortableGrepMatch {
         line_source_end: value.source_end(),
         match_start: value.match_start(),
         match_end: value.match_end(),
+    }
+}
+
+fn line_total_actual(value: line_total_grep::Actual) -> OperationSessionExecutionActual {
+    OperationSessionExecutionActual {
+        work: value.work(),
+        source_accesses: value.source_accesses(),
+        transitions: value.transitions(),
+        candidates: value.candidates(),
+        cache_misses: 0,
+        history_nodes: 0,
+        line_domains: value.matching_lines(),
+        output_events: value.matching_lines(),
+        selected_span_bytes: 0,
+        participation_entries: 0,
+        allocations: 0,
     }
 }
 
@@ -1073,6 +1256,9 @@ fn compiled_plan_id(regex: &PortableRegex) -> [u8; 16] {
         regex.profile, regex.limits, regex.selection, regex.report.plan
     )
     .expect("compiled-plan identity writer is infallible");
+    if let Some(plan) = regex.line_total_grep_plan {
+        digest.tagged_bytes(0x12, &plan.identity());
+    }
     match &regex.plan {
         PortablePlan::ExactLiteral(plan) => {
             digest.tagged_bytes(0x0f, plan.needle());
@@ -1289,6 +1475,96 @@ mod tests {
     }
 
     #[test]
+    fn construction_certifies_only_greedy_total_byte_line_hir() {
+        let unicode = PortableRegex::new(r"(?m)^.*$").expect("Unicode byte-regex profile");
+        assert!(!unicode.has_line_total_grep_plan());
+
+        for pattern in [
+            r"^.*$",
+            r"(?m)^.*$",
+            r"(?ms)^.*$",
+            r"(?msR)^.*$",
+            r"(?m)^[\x00-\x09\x0B-\xFF]*$",
+        ] {
+            let regex = crate::PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("line-total regex");
+            assert!(regex.has_line_total_grep_plan(), "{pattern}");
+            let session = regex.grep_stream_session().expect("line-total session");
+            assert!(session.is_line_total(), "{pattern}");
+        }
+
+        for pattern in [
+            r"(?m)^.*?$",
+            r"(?m)^.+$",
+            r"(?mR)^.*$",
+            r"(?m)^.*z$",
+            r"(?m)^[^\r\n]*$",
+            r"(?m)^.*",
+            r"(?m).*$",
+            r"(?m)^(.*)$",
+        ] {
+            let regex = crate::PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .expect("non-line-total regex");
+            assert!(!regex.has_line_total_grep_plan(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn line_total_reducer_preserves_empty_lf_crlf_malformed_and_lone_cr_lines() {
+        let regex = crate::PortableBuilder::new(r"(?m)^.*$")
+            .unicode(false)
+            .build()
+            .expect("line-total regex");
+        assert_eq!(regex.build_report().plan, crate::PlanKind::K0);
+        for source in [
+            b"".as_slice(),
+            b"\n".as_slice(),
+            b"\r\n".as_slice(),
+            b"\n\n".as_slice(),
+            b"a\r\n\xff\rz\nlast\r".as_slice(),
+        ] {
+            assert_matches_repeated(&regex, source);
+        }
+
+        let source = b"a\r\n\xff\rz\nlast\r";
+        let mut session = regex.grep_stream_session().expect("line-total session");
+        let result = execute(&mut session, source);
+        assert_eq!(result.count(), 3);
+        assert_eq!(result.source_line_domains, 3);
+        assert_eq!(
+            result.first_match,
+            Some(PortableGrepMatch {
+                line_ordinal: 0,
+                line_start: 0,
+                line_content_end: 1,
+                line_source_end: 3,
+                match_start: 0,
+                match_end: 1,
+            })
+        );
+        assert_eq!(
+            result.last_match,
+            Some(PortableGrepMatch {
+                line_ordinal: 2,
+                line_start: 7,
+                line_content_end: 12,
+                line_source_end: 12,
+                match_start: 7,
+                match_end: 12,
+            })
+        );
+        assert_eq!(result.receipt.actual.transitions, 0);
+        assert_eq!(result.receipt.actual.candidates, 3);
+        assert_eq!(result.receipt.actual.line_domains, 3);
+        assert_eq!(result.receipt.actual.output_events, 3);
+        assert_eq!(result.receipt.actual.allocations, 0);
+    }
+
+    #[test]
     fn native_word_facade_matches_current_plan_on_unicode_and_malformed_bytes() {
         let regex = PortableRegex::new(r"\b\w{2,}\b").expect("portable regex");
         assert_eq!(
@@ -1371,6 +1647,54 @@ mod tests {
                 );
                 assert_eq!(receipt.actual, OperationSessionExecutionActual::default());
             }
+        }
+    }
+
+    #[test]
+    fn line_total_positive_dimensions_refuse_one_below_before_source_access() {
+        let regex = crate::PortableBuilder::new(r"(?m)^.*$")
+            .unicode(false)
+            .build()
+            .expect("line-total regex");
+        let source = b"a\r\n\nz";
+        let mut session = regex.grep_stream_session().expect("grep session");
+        let prospective = session.prospective(source.len()).expect("prospective");
+        let (reset_limits, exact) = session.exact_limits(prospective).expect("exact limits");
+        assert_eq!(exact.max_transitions, 0);
+        for resource in [
+            OperationSessionResource::ExecutionWork,
+            OperationSessionResource::SourceAccesses,
+            OperationSessionResource::Candidates,
+            OperationSessionResource::LineDomains,
+            OperationSessionResource::OutputEvents,
+        ] {
+            let mut one_below = exact;
+            let limit = match resource {
+                OperationSessionResource::ExecutionWork => &mut one_below.max_work,
+                OperationSessionResource::SourceAccesses => &mut one_below.max_source_accesses,
+                OperationSessionResource::Candidates => &mut one_below.max_candidates,
+                OperationSessionResource::LineDomains => &mut one_below.max_line_domains,
+                OperationSessionResource::OutputEvents => &mut one_below.max_output_events,
+                _ => unreachable!("fixed positive-dimension matrix"),
+            };
+            assert!(*limit > 0);
+            *limit -= 1;
+            let error = session
+                .count_matching_lines(source, prospective, reset_limits, one_below)
+                .expect_err("one-below limit must refuse");
+            let receipt = match error {
+                PortableGrepError::Attempt(
+                    OperationSessionAttemptError::Refused(receipt)
+                    | OperationSessionAttemptError::ReceiptNotClosed(receipt),
+                ) => receipt,
+                other => panic!("unexpected one-below error: {other:?}"),
+            };
+            assert!(receipt.closes());
+            assert_eq!(
+                receipt.terminal,
+                OperationSessionTerminal::Refused(resource)
+            );
+            assert_eq!(receipt.actual, OperationSessionExecutionActual::default());
         }
     }
 

@@ -52,6 +52,7 @@ mod grapheme_scalar;
 pub mod guarded_ascii_word;
 pub mod guarded_unicode_word;
 mod line_capture;
+mod line_total_grep;
 mod literal_assertions;
 mod literal_class_run_literal;
 pub mod operation_session;
@@ -87,6 +88,7 @@ pub use unicode_folded_literal::{
     UnicodeFoldedLiteralRunUpperBounds, UnicodeFoldedLiteralSpanSumRegex,
 };
 
+pub use aggregate::PortableGrepLineTotalError;
 pub use aggregate::{
     AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
@@ -1861,6 +1863,7 @@ impl PortableBuilder {
             storage_bytes: capture_name_storage_bytes,
         } = capture_name_metadata(&rust.hir, explicit_captures, syntax.hir_nodes)?;
         let minimum_match_bytes = rust.hir.properties().minimum_len();
+        let line_total_grep_plan = line_total_grep::prove(&rust.hir);
         if self.utf8_start_guarded
             && !matches!(self.selection, PlanSelection::Auto | PlanSelection::ForceK0)
         {
@@ -1886,6 +1889,7 @@ impl PortableBuilder {
             return Ok(PortableRegex {
                 source,
                 capture_names,
+                line_total_grep_plan,
                 plan: PortablePlan::K0(automaton),
                 profile: profile.clone(),
                 limits: self.limits,
@@ -1929,6 +1933,7 @@ impl PortableBuilder {
             return Ok(PortableRegex {
                 source,
                 capture_names,
+                line_total_grep_plan,
                 plan: if plan.is_ascii_word() {
                     PortablePlan::AsciiWordRun(
                         unicode_word_run::AsciiPlan::build_auto(plan).map_err(
@@ -1996,6 +2001,7 @@ impl PortableBuilder {
                     return Ok(PortableRegex {
                         source,
                         capture_names,
+                        line_total_grep_plan,
                         plan: PortablePlan::ForwardEndFixed(plan),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -2054,6 +2060,7 @@ impl PortableBuilder {
                         return Ok(PortableRegex {
                             source,
                             capture_names,
+                            line_total_grep_plan,
                             plan,
                             profile: profile.clone(),
                             limits: self.limits,
@@ -2130,6 +2137,7 @@ impl PortableBuilder {
                         return Ok(PortableRegex {
                             source,
                             capture_names,
+                            line_total_grep_plan,
                             plan,
                             profile: profile.clone(),
                             limits: self.limits,
@@ -2183,6 +2191,7 @@ impl PortableBuilder {
                 return Ok(PortableRegex {
                     source,
                     capture_names,
+                    line_total_grep_plan,
                     plan: PortablePlan::ExactLiteral(literal),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -2218,6 +2227,7 @@ impl PortableBuilder {
                     return Ok(PortableRegex {
                         source,
                         capture_names,
+                        line_total_grep_plan,
                         plan: PortablePlan::PackedLiteralSet(packed),
                         profile: profile.clone(),
                         limits: self.limits,
@@ -2250,6 +2260,7 @@ impl PortableBuilder {
                 return Ok(PortableRegex {
                     source,
                     capture_names,
+                    line_total_grep_plan,
                     plan: PortablePlan::LiteralSetDfa(literal_set),
                     profile: profile.clone(),
                     limits: self.limits,
@@ -2288,6 +2299,7 @@ impl PortableBuilder {
         Ok(PortableRegex {
             source,
             capture_names,
+            line_total_grep_plan,
             plan: PortablePlan::K0(automaton),
             profile: profile.clone(),
             limits: self.limits,
@@ -2321,6 +2333,7 @@ impl PortableBuilder {
 pub struct PortableRegex {
     source: Box<str>,
     capture_names: Box<[Option<Box<str>>]>,
+    line_total_grep_plan: Option<line_total_grep::Plan>,
     plan: PortablePlan,
     profile: CompatibilityProfile,
     limits: BuildLimits,

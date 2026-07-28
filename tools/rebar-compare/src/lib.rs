@@ -2815,6 +2815,15 @@ impl CurrentFreGrepSession<'_> {
         }
     }
 
+    /// Whether construction selected the certified direct line-total stream.
+    #[must_use]
+    pub const fn uses_line_total_stream(&self) -> bool {
+        matches!(
+            &self.route,
+            CurrentFreGrepRoute::Stream(session) if session.is_line_total()
+        )
+    }
+
     /// Execute one complete Rebar LF/CRLF plain-grep operation.
     ///
     /// The first call is the first-operation boundary and later calls on the
@@ -2915,7 +2924,17 @@ pub fn current_fre_rebar_grep_session_with_limits<'r>(
         sequential_bytes: limits.fre_aggregate_sequential_bytes,
         prefilter_build,
     };
-    let route = if regex.build_report().plan == PlanKind::K0 {
+    let route = if regex.has_line_total_grep_plan() {
+        let session = regex.grep_stream_session().map_err(|error| {
+            CompareError::new(format!("FRE line-total grep session build failed: {error}"))
+        })?;
+        if !session.is_line_total() {
+            return Err(CompareError::new(
+                "FRE line-total construction proof was not retained by its grep session",
+            ));
+        }
+        CurrentFreGrepRoute::Stream(session)
+    } else if regex.build_report().plan == PlanKind::K0 {
         let profile = match regex.profile() {
             CompatibilityProfile::RustBytes(profile) => profile.clone(),
             CompatibilityProfile::RustText(_) | CompatibilityProfile::Re2(_) => {
@@ -24233,6 +24252,25 @@ mod tests {
             );
             assert_eq!(boundary_session.execute(&boundary).expect("boundary"), 0);
         }
+    }
+
+    #[test]
+    fn plain_grep_line_total_hir_uses_direct_stream_without_k0_workspace() {
+        let regex = current_fre_rebar_portable_builder(r"(?m)^.*$", false, false)
+            .expect("portable builder")
+            .build()
+            .expect("portable line-total K0");
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        assert!(regex.has_line_total_grep_plan());
+        let source = b"\r\nalpha\n\xff\rz\nlast\r";
+        let mut session =
+            current_fre_rebar_grep_session(&regex, source.len()).expect("line-total grep session");
+        assert!(session.uses_line_total_stream());
+        assert!(!session.has_reusable_k0_workspace());
+        assert!(!session.has_required_literal_prefilter());
+        assert!(!session.uses_required_literal_prefilter());
+        assert_eq!(session.execute(source).expect("first"), 4);
+        assert_eq!(session.execute(source).expect("steady"), 4);
     }
 
     #[test]
