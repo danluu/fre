@@ -1528,6 +1528,234 @@ mod tests {
         assert_eq!(error.actual().peak_bytes, 0);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
+    #[test]
+    #[ignore = "native c9g qualification benchmark; requires OS-usable SVE and SVE2 with inherited VL=16"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the parseable qualification receipt keeps authentic dispatch, correctness, alternating samples, and accounting rows together"
+    )]
+    fn benchmark_token_phrase_block_mask_against_rust_regex() {
+        use std::{env, hint::black_box, time::Instant};
+
+        #[derive(Clone, Copy)]
+        enum Backend<'a> {
+            Fre(&'a TokenPhrasePlan),
+            Rust(&'a regex::bytes::Regex),
+        }
+
+        fn env_usize(name: &str, default: usize) -> usize {
+            env::var(name).map_or(default, |value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|error| panic!("invalid {name}={value:?}: {error}"))
+            })
+        }
+
+        fn corpus(pattern: &[u8], bytes: usize, alignment: usize) -> Vec<u8> {
+            assert!(!pattern.is_empty());
+            let mut haystack = vec![0_u8; alignment];
+            haystack.reserve(bytes);
+            while haystack.len() - alignment < bytes {
+                let remaining = bytes - (haystack.len() - alignment);
+                let take = remaining.min(pattern.len());
+                haystack.extend_from_slice(&pattern[..take]);
+            }
+            haystack
+        }
+
+        fn execute(backend: Backend<'_>, haystack: &[u8]) -> u64 {
+            match backend {
+                Backend::Fre(plan) => {
+                    plan.count(haystack, ReduceLimits::unlimited())
+                        .expect("FRE block-mask count")
+                        .count
+                }
+                Backend::Rust(regex) => {
+                    u64::try_from(regex.find_iter(haystack).count()).expect("regex count fits u64")
+                }
+            }
+        }
+
+        fn measure(backend: Backend<'_>, haystack: &[u8], iterations: usize) -> (u128, u64) {
+            for _ in 0..8 {
+                black_box(execute(backend, black_box(haystack)));
+            }
+            let started = Instant::now();
+            let mut checksum = 0_u64;
+            for _ in 0..iterations {
+                checksum = checksum.wrapping_add(black_box(execute(backend, black_box(haystack))));
+            }
+            (started.elapsed().as_nanos(), checksum)
+        }
+
+        fn median(samples: &mut [u128]) -> u128 {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "each parseable benchmark column is passed explicitly at the single reporting boundary"
+        )]
+        fn report(
+            workload: &str,
+            backend: &str,
+            haystack: &[u8],
+            iterations: usize,
+            median_total_ns: u128,
+            checksum: u64,
+            result: u64,
+            accounting: Option<ReduceActualCounters>,
+            variant: &str,
+        ) {
+            let iteration_count = u128::try_from(iterations).expect("iterations fit u128");
+            let ns_per_iter = median_total_ns / iteration_count;
+            let bytes_per_second = u128::try_from(haystack.len())
+                .expect("length fits u128")
+                .checked_mul(iteration_count)
+                .and_then(|bytes| bytes.checked_mul(1_000_000_000))
+                .expect("bounded benchmark rate")
+                / median_total_ns.max(1);
+            let actual = accounting.unwrap_or(ReduceActualCounters {
+                source_reads: 0,
+                work: 0,
+                classifications: 0,
+                literal_comparisons: 0,
+                tokens: 0,
+                matches: 0,
+                count: result,
+                span_sum: 0,
+                scratch_bytes: 0,
+            });
+            println!(
+                "fre-token-phrase-block-mask-v4,{workload},{backend},{},{},{iterations},{median_total_ns},{ns_per_iter},{bytes_per_second},{checksum},{result},{},{},{},{variant}",
+                haystack.len(),
+                haystack.as_ptr().addr() & 15,
+                actual.source_reads,
+                actual.work,
+                actual.literal_comparisons,
+            );
+        }
+
+        let required = fre_simd_kernels::FeatureSet::EMPTY
+            .with(fre_simd_kernels::Feature::ArmSve)
+            .with(fre_simd_kernels::Feature::ArmSve2);
+        let bytes = env_usize("FRE_TOKEN_PHRASE_BLOCK_MASK_BENCH_BYTES", 1 << 20);
+        let iterations = env_usize("FRE_TOKEN_PHRASE_BLOCK_MASK_BENCH_ITERS", 100);
+        let samples = env_usize("FRE_TOKEN_PHRASE_BLOCK_MASK_BENCH_SAMPLES", 7);
+        let alignment = env_usize("FRE_TOKEN_PHRASE_BLOCK_MASK_BENCH_ALIGNMENT", 0);
+        assert!(
+            bytes >= ASCII_WIDE_BYTES
+                && iterations > 0
+                && samples > 0
+                && alignment < ASCII_NARROW_BYTES
+        );
+
+        let plan = plan(b"Holmes", true);
+        let selection = plan.classifier.selection();
+        assert_eq!(
+            selection.variant_id,
+            "ascii-word-space.mask16x32.sve2-vl16.v1"
+        );
+        assert!(selection.required.contains_all(required));
+        let regex = RegexBuilder::new(r"\b\w+\s+Holmes\s+\w+\b")
+            .unicode(false)
+            .build()
+            .expect("pinned Rust regex");
+        let workloads = [
+            (
+                "long_tokens",
+                corpus(
+                    b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Holmes \t bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb--",
+                    bytes,
+                    alignment,
+                ),
+            ),
+            (
+                "short_tokens",
+                corpus(b"a Holmes b-", bytes, alignment),
+            ),
+            (
+                "literal_mismatch",
+                corpus(
+                    b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb--",
+                    bytes,
+                    alignment,
+                ),
+            ),
+        ];
+        println!(
+            "schema,workload,backend,haystack_bytes,alignment_mod16,iterations,median_total_ns,ns_per_iter,bytes_per_second,checksum,result,source_reads,work,literal_comparisons,variant"
+        );
+
+        for (workload, storage) in workloads {
+            let haystack = &storage[alignment..];
+            let fre_result = plan
+                .count(haystack, ReduceLimits::unlimited())
+                .expect("FRE qualification result");
+            let rust_result = execute(Backend::Rust(&regex), haystack);
+            assert_eq!(fre_result.count, rust_result);
+
+            let mut fre_samples = Vec::with_capacity(samples);
+            let mut rust_samples = Vec::with_capacity(samples);
+            let mut fre_checksum = 0_u64;
+            let mut rust_checksum = 0_u64;
+            for sample in 0..samples {
+                let (first, second) = if sample % 2 == 0 {
+                    (Backend::Fre(&plan), Backend::Rust(&regex))
+                } else {
+                    (Backend::Rust(&regex), Backend::Fre(&plan))
+                };
+                let measured = measure(first, haystack, iterations);
+                match first {
+                    Backend::Fre(_) => {
+                        fre_samples.push(measured.0);
+                        fre_checksum = measured.1;
+                    }
+                    Backend::Rust(_) => {
+                        rust_samples.push(measured.0);
+                        rust_checksum = measured.1;
+                    }
+                }
+                let measured = measure(second, haystack, iterations);
+                match second {
+                    Backend::Fre(_) => {
+                        fre_samples.push(measured.0);
+                        fre_checksum = measured.1;
+                    }
+                    Backend::Rust(_) => {
+                        rust_samples.push(measured.0);
+                        rust_checksum = measured.1;
+                    }
+                }
+            }
+            assert_eq!(fre_checksum, rust_checksum);
+            report(
+                workload,
+                "fre-block-mask",
+                haystack,
+                iterations,
+                median(&mut fre_samples),
+                fre_checksum,
+                fre_result.count,
+                Some(fre_result.accounting.actual),
+                selection.variant_id,
+            );
+            report(
+                workload,
+                "rust-regex",
+                haystack,
+                iterations,
+                median(&mut rust_samples),
+                rust_checksum,
+                rust_result,
+                None,
+                "regex-bytes-1.12.4",
+            );
+        }
+    }
+
     fn exact_limits(upper: ReduceUpperBounds) -> ReduceLimits {
         ReduceLimits {
             max_input_bytes: upper.input_bytes,
