@@ -26,6 +26,12 @@ pub struct CompileAccounting {
     pub required_suffix_bytes: usize,
     /// Canonical HIR-derived ASCII byte sets that every match must intersect.
     pub required_literal_sets: usize,
+    /// Full-source sequential passes prospectively charged by the selected
+    /// required-literal scan services.
+    ///
+    /// Small retained sets use one bounded native service per set. Any wider
+    /// set selects the single fused scalar pass instead.
+    pub required_literal_source_passes: usize,
     /// Complete fixed inline storage retained for the required-literal proof.
     pub required_literal_proof_bytes: usize,
     /// Structurally derived internal-anchor candidate stream retained for a

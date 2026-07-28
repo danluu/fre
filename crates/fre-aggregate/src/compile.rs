@@ -761,6 +761,20 @@ impl RequiredLiteralSets {
         self.sets.into_iter().take(self.len())
     }
 
+    pub(crate) fn source_passes(self) -> usize {
+        if self.is_empty() {
+            0
+        } else if self.uses_bounded_native_services() {
+            self.len()
+        } else {
+            1
+        }
+    }
+
+    pub(crate) fn uses_bounded_native_services(self) -> bool {
+        !self.is_empty() && self.iter().all(|set| (1..=3).contains(&set.count_ones()))
+    }
+
     fn push(&mut self, set: u128) {
         if set == 0 || self.iter().any(|existing| existing == set) {
             return;
@@ -4107,6 +4121,7 @@ fn build_retained_components(
     budget.accounting.required_suffixes = required_suffixes.ends.len();
     budget.accounting.required_suffix_bytes = required_suffixes.bytes.len();
     budget.accounting.required_literal_sets = required_literals.len();
+    budget.accounting.required_literal_source_passes = required_literals.source_passes();
     budget.accounting.required_literal_proof_bytes = RequiredLiteralSets::retained_bytes();
     budget.accounting.terminal_frontier_prefix_bytes = terminal_frontier.prefix_len;
     budget.accounting.terminal_frontier_bytes = terminal_frontier.terminals.len;
@@ -4461,6 +4476,7 @@ impl CompileBudget {
                 required_suffixes: 0,
                 required_suffix_bytes: 0,
                 required_literal_sets: 0,
+                required_literal_source_passes: 0,
                 required_literal_proof_bytes: 0,
                 required_internal_anchors: 0,
                 required_internal_anchor_bytes: 0,
@@ -7976,6 +7992,8 @@ mod tests {
         let mut census = suffix_budget(CompileLimits::default().max_work);
         let proof = analyze_required_literal_sets(&hir, &mut census).unwrap();
         assert_eq!(proof.len(), 3);
+        assert_eq!(proof.source_passes(), 1);
+        assert!(!proof.uses_bounded_native_services());
         let sets = proof.iter().collect::<Vec<_>>();
         assert!(sets[0] & (1_u128 << b'A') != 0);
         assert!(sets[0] & (1_u128 << b'Z') != 0);
@@ -8007,6 +8025,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let native_service_hir = parse_bytes(r"a.*b");
+        let mut native_service_budget = suffix_budget(CompileLimits::default().max_work);
+        let native_service_proof =
+            analyze_required_literal_sets(&native_service_hir, &mut native_service_budget).unwrap();
+        assert_eq!(native_service_proof.len(), 2);
+        assert_eq!(native_service_proof.source_passes(), 2);
+        assert!(native_service_proof.uses_bounded_native_services());
     }
 
     struct TestUrlTlds<'a>(&'a [&'a [u8]]);

@@ -5600,12 +5600,11 @@ struct RequiredLiteralScan {
 impl RequiredLiteralScan {
     fn prospective(source_bytes: usize, sets: RequiredLiteralSets) -> Result<Self, Error> {
         let set_count = sets.len();
-        let small_services = sets.iter().all(|set| (1..=3).contains(&set.count_ones()));
-        let service_bytes = if small_services {
-            mul(source_bytes, set_count, Resource::SequentialBytes)?
-        } else {
-            source_bytes
-        };
+        let service_bytes = mul(
+            source_bytes,
+            sets.source_passes(),
+            Resource::SequentialBytes,
+        )?;
         Ok(Self {
             source_bytes: service_bytes,
             comparisons: mul(source_bytes, set_count, Resource::ExecutionWork)?,
@@ -5630,11 +5629,7 @@ fn scan_required_literals(
             ..RequiredLiteralScan::default()
         });
     }
-    if compiled
-        .required_literals
-        .iter()
-        .all(|set| (1..=3).contains(&set.count_ones()))
-    {
+    if compiled.required_literals.uses_bounded_native_services() {
         let mut source_bytes = 0_usize;
         let mut comparisons = 0_usize;
         let mut all_present = true;
@@ -10613,6 +10608,10 @@ mod tests {
         let haystack = b"bcdefghijklmnopq".repeat(500);
         for pattern in [r".[A-Z][a-z]+efghijklmnopq", r".[a-z]+[A-Z]efghijklmnopq"] {
             let compiled = required_literal_regex(pattern);
+            assert_eq!(
+                compiled.compile_accounting().required_literal_source_passes,
+                1
+            );
             let admitted = compiled
                 .span_sum_value_with_receipt(
                     &haystack,
@@ -10707,6 +10706,10 @@ mod tests {
         let pattern = r"(.*?,){13}z+";
         let compiled = required_literal_regex(pattern);
         assert_eq!(compiled.required_literals.len(), 2);
+        assert_eq!(
+            compiled.compile_accounting().required_literal_source_passes,
+            2
+        );
         assert!(compiled.required_literals.iter().all(u128::is_power_of_two));
         let haystack = b"a,".repeat(2048);
         let prospective =

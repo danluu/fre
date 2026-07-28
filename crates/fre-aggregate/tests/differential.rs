@@ -1188,6 +1188,7 @@ fn required_literal_census_composes_with_unicode_casefold_suffix_domains() {
     // The ASCII Q/q domain and the intervening ASCII space remain two
     // independent theorems in canonical source order.
     assert_eq!(regex.compile_accounting().required_literal_sets, 2);
+    assert_eq!(regex.compile_accounting().required_literal_source_passes, 2);
     assert_eq!(
         (
             regex.compile_accounting().required_suffixes,
@@ -1220,7 +1221,7 @@ fn required_literal_census_composes_with_unicode_casefold_suffix_domains() {
     );
     assert_eq!(
         missing.receipt.actual.required_literal_comparisons,
-        missing_required_literal.len() * 2
+        missing_required_literal.len()
     );
     assert_eq!(missing.receipt.actual.state_evaluations, 0);
     assert_eq!(missing.receipt.actual_allocations, 0);
@@ -1255,13 +1256,14 @@ fn required_literal_census_composes_with_unicode_casefold_suffix_domains() {
         OperationPrepublicationFallback::None
     );
     let required_prefix = matching.iter().position(|&byte| byte == b' ').unwrap() + 1;
+    let required_service_bytes = required_prefix + 1;
     assert_eq!(
         hit.receipt.actual.required_literal_source_bytes,
-        required_prefix
+        required_service_bytes
     );
     assert_eq!(
         hit.receipt.actual.required_literal_comparisons,
-        required_prefix * 2
+        required_service_bytes
     );
     assert!(hit.receipt.actual.state_evaluations > 0);
     assert!(hit.receipt.authenticates_success());

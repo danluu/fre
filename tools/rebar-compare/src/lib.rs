@@ -210,7 +210,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -8035,6 +8035,7 @@ struct ContinuationProgramShape {
     terminal_frontier_prefix_bytes: usize,
     terminal_frontier_bytes: usize,
     required_literal_sets: usize,
+    required_literal_source_passes: usize,
     execution_state_work: usize,
     has_scalar_transitions: bool,
     max_scalar_search_checks: usize,
@@ -8053,6 +8054,7 @@ impl From<fre::AggregateCompileAccounting> for ContinuationProgramShape {
             terminal_frontier_prefix_bytes: accounting.terminal_frontier_prefix_bytes,
             terminal_frontier_bytes: accounting.terminal_frontier_bytes,
             required_literal_sets: accounting.required_literal_sets,
+            required_literal_source_passes: accounting.required_literal_source_passes,
             execution_state_work: accounting.execution_state_work,
             has_scalar_transitions: accounting.has_scalar_transitions,
             max_scalar_search_checks: accounting.max_scalar_search_checks,
@@ -8074,6 +8076,7 @@ fn inactive_continuation_shape() -> ContinuationProgramShape {
         terminal_frontier_prefix_bytes: 0,
         terminal_frontier_bytes: 0,
         required_literal_sets: 0,
+        required_literal_source_passes: 0,
         // One Match state is evaluated once and has no outgoing transition.
         execution_state_work: 1,
         has_scalar_transitions: false,
@@ -8101,6 +8104,7 @@ fn conservative_continuation_shape(
         terminal_frontier_prefix_bytes: 0,
         terminal_frontier_bytes: 0,
         required_literal_sets: 0,
+        required_literal_source_passes: 0,
         execution_state_work,
         has_scalar_transitions: false,
         max_scalar_search_checks: 0,
@@ -8387,18 +8391,25 @@ fn continuation_prefix_limits(
     haystack_len: usize,
     shape: ContinuationProgramShape,
 ) -> Result<ContinuationPrefixLimits, ExecutionError> {
+    if (shape.required_literal_sets == 0) != (shape.required_literal_source_passes == 0)
+        || shape.required_literal_source_passes > shape.required_literal_sets
+    {
+        return Err(ExecutionError::fault(
+            "FRE required-literal compile accounting is incomplete",
+        ));
+    }
     let prevalidation = if shape.requires_utf8_validation {
         haystack_len
     } else {
         0
     };
-    let required_literal_source = if shape.required_literal_sets == 0 {
-        0
-    } else {
-        haystack_len
-    };
+    let required_literal_source = checked_aggregate_mul(
+        haystack_len,
+        shape.required_literal_source_passes,
+        "required-literal source passes",
+    )?;
     let required_literal_comparisons = checked_aggregate_mul(
-        required_literal_source,
+        haystack_len,
         shape.required_literal_sets,
         "required-literal comparisons",
     )?;
@@ -15592,6 +15603,34 @@ mod tests {
             .minimum_match_bytes()
             .expect("authenticated nonzero minimum");
         assert_eq!(minimum, 4);
+        let AggregateBuildAccounting::Continuation(compile) = build.build_report().build else {
+            panic!("replacement selector must retain continuation accounting");
+        };
+        assert_eq!(compile.required_literal_sets, 2);
+        assert_eq!(compile.required_literal_source_passes, 2);
+
+        let million_byte_component = composite_replacement_component_limits(
+            1_000_000,
+            build.build_report(),
+            minimum,
+            &RunLimits::default(),
+        )
+        .expect("million-byte replacement component limits");
+        assert_eq!(
+            million_byte_component.continuation.max_sequential_bytes,
+            5_000_003
+        );
+        let legacy_one_pass = continuation_spans_operation_limits(
+            1_000_000,
+            ContinuationProgramShape {
+                required_literal_source_passes: 1,
+                ..compile.into()
+            },
+            minimum,
+            &RunLimits::default(),
+        )
+        .expect("legacy one-pass comparison");
+        assert_eq!(legacy_one_pass.max_sequential_bytes, 4_000_003);
 
         for (bytes, matches) in [(3_usize, 0_usize), (4, 1), (8, 2)] {
             let component = composite_replacement_component_limits(
@@ -20620,7 +20659,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v6-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -23813,30 +23852,62 @@ mod tests {
     fn continuation_required_literal_prefix_limits_are_fully_derived() {
         let run = RunLimits::default();
         let baseline_shape = conservative_continuation_shape(5).unwrap();
-        let required_literal_shape = ContinuationProgramShape {
+        let native_service_shape = ContinuationProgramShape {
             required_literal_sets: 2,
+            required_literal_source_passes: 2,
             ..baseline_shape
         };
         let baseline = continuation_operation_limits(10, baseline_shape, &run).unwrap();
-        let required = continuation_operation_limits(10, required_literal_shape, &run).unwrap();
-        // The pre-engine proof reads the source once and compares every byte
-        // against both retained sets: N sequential units and N * (sets + 1)
-        // work units, independently of the incumbent continuation envelope.
+        let native_service = continuation_operation_limits(10, native_service_shape, &run).unwrap();
+        // Two bounded native services each read the complete source. Their
+        // membership comparison charge remains one per source byte per set.
         assert_eq!(
-            required.max_sequential_bytes,
-            baseline.max_sequential_bytes + 10
+            native_service.max_sequential_bytes,
+            baseline.max_sequential_bytes + 20
         );
-        assert_eq!(required.max_work, baseline.max_work + 30);
+        assert_eq!(native_service.max_work, baseline.max_work + 40);
 
         let span_baseline =
             continuation_spans_operation_limits(10, baseline_shape, 1, &run).unwrap();
-        let span_required =
-            continuation_spans_operation_limits(10, required_literal_shape, 1, &run).unwrap();
+        let span_native_service =
+            continuation_spans_operation_limits(10, native_service_shape, 1, &run).unwrap();
         assert_eq!(
-            span_required.max_sequential_bytes,
-            span_baseline.max_sequential_bytes + 10
+            span_native_service.max_sequential_bytes,
+            span_baseline.max_sequential_bytes + 20
         );
-        assert_eq!(span_required.max_work, span_baseline.max_work + 30);
+        assert_eq!(span_native_service.max_work, span_baseline.max_work + 40);
+
+        let fused_shape = ContinuationProgramShape {
+            required_literal_source_passes: 1,
+            ..native_service_shape
+        };
+        let fused = continuation_operation_limits(10, fused_shape, &run).unwrap();
+        assert_eq!(
+            fused.max_sequential_bytes,
+            baseline.max_sequential_bytes + 10
+        );
+        assert_eq!(fused.max_work, baseline.max_work + 30);
+
+        for incomplete in [
+            ContinuationProgramShape {
+                required_literal_sets: 0,
+                required_literal_source_passes: 1,
+                ..baseline_shape
+            },
+            ContinuationProgramShape {
+                required_literal_sets: 2,
+                required_literal_source_passes: 0,
+                ..baseline_shape
+            },
+            ContinuationProgramShape {
+                required_literal_sets: 2,
+                required_literal_source_passes: 3,
+                ..baseline_shape
+            },
+        ] {
+            assert!(continuation_operation_limits(10, incomplete, &run).is_err());
+            assert!(continuation_spans_operation_limits(10, incomplete, 1, &run).is_err());
+        }
     }
 
     #[test]
@@ -23930,6 +24001,7 @@ mod tests {
             terminal_frontier_prefix_bytes: 0,
             terminal_frontier_bytes: 0,
             required_literal_sets: 0,
+            required_literal_source_passes: 0,
             execution_state_work: 27,
             has_scalar_transitions: false,
             max_scalar_search_checks: 0,
@@ -24113,6 +24185,7 @@ mod tests {
             terminal_frontier_prefix_bytes: 0,
             terminal_frontier_bytes: 0,
             required_literal_sets: 0,
+            required_literal_source_passes: 0,
             execution_state_work: 11,
             has_scalar_transitions: true,
             max_scalar_search_checks: 10,
