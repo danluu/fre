@@ -44,6 +44,38 @@ fn tracked_drop_unmaps_before_releasing_accounting_or_waiters() {
 }
 
 #[test]
+fn aggregate_refusal_unmaps_before_releasing_flight_or_waiters() {
+    let source = include_str!("cache.rs");
+    let start = source
+        .find("                let error = state.refusal(")
+        .expect("aggregate-refusal implementation");
+    let length = source[start..]
+        .find("                return Err(error);")
+        .expect("aggregate-refusal implementation end");
+    let end = start.checked_add(length).expect("bounded source position");
+    let refusal = &source[start..end];
+    let unlock = refusal
+        .find("drop(state);")
+        .expect("unlock before synchronous unmap");
+    let unmap = refusal
+        .find("drop(tracked);")
+        .expect("synchronous rejected-publication drop");
+    let relock = refusal
+        .find("let mut state = self.lock();")
+        .expect("relock after synchronous unmap");
+    let release = refusal
+        .find("state.remove_flight(identity, generation)?;")
+        .expect("single-flight release");
+    let wake = refusal
+        .find("self.inner.wake.notify_all();")
+        .expect("single-flight wake");
+    assert!(unlock < unmap);
+    assert!(unmap < relock);
+    assert!(relock < release);
+    assert!(release < wake);
+}
+
+#[test]
 fn bookkeeping_reservation_accepts_exact_and_rejects_one_below() {
     let (base, entry, flight, live) = bookkeeping_structural_sizes_for_test::<Span>();
     assert!(u64::try_from(base).expect("u64") <= BASE_BOOKKEEPING_BYTES);

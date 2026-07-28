@@ -1121,9 +1121,11 @@ impl<C: CacheContract> CacheCore<C> {
                     failure.current,
                     failure.required,
                 )?;
-                state.remove_flight(identity, generation)?;
                 drop(state);
                 drop(tracked);
+                let mut state = self.lock();
+                state.remove_flight(identity, generation)?;
+                drop(state);
                 self.inner.wake.notify_all();
                 return Err(error);
             }
