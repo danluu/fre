@@ -1,11 +1,11 @@
-//! Ranked-anchor reducers for finite ASCII words with Unicode boundaries.
+//! Maximal-run reducers for finite ASCII words with Unicode boundaries.
 //!
 //! The HIR-side finite proof owns syntax expansion, source order, captures and
-//! the exact guarded dictionary. This module adds one FRE-owned ranked anchor
-//! over that dictionary. Candidate starts are emitted monotonically, source
-//! IDs are verified in original order and accepted matches advance by their
-//! full width. Every byte body is a nonempty ASCII word, so a full Unicode
-//! word boundary is exactly the absence of an adjacent Unicode word scalar.
+//! the exact guarded dictionary. This module classifies maximal ASCII-word
+//! runs, rejects almost every unrelated word through exact length and
+//! two-byte prefix masks, then verifies surviving source IDs in original
+//! order. Every body is a nonempty ASCII word, so a full Unicode word boundary
+//! is exactly the absence of an adjacent Unicode word scalar.
 
 #![allow(
     clippy::result_large_err,
@@ -14,25 +14,30 @@
 
 use core::{fmt, mem::size_of};
 
-use fre_exact_alloc::{CopyError, try_box_preserve};
+use fre_exact_alloc::{CopyError, ExactVec, try_box_preserve};
 use fre_kernels::{
     AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy, SimdDispatchContext,
-    packed_ordered_literal_byte_frequency_rank,
 };
 
 use crate::guarded_ascii_word::{Dictionary, Guard};
 
-pub const PLAN_ID: &str = "guarded-unicode-word.ranked-anchor-set128.v1";
+pub const PLAN_ID: &str = "guarded-unicode-word.maximal-ascii-run-prefix2-set128.v2";
 pub const ANCHOR_ALGORITHM_ID: &str =
-    "ordered-literal-aggregate.packed-ranked-anchor-stream.set128.v1";
-pub const COUNT_OPERATION_ID: &str = "guarded-unicode-word.ranked-anchor-count.v1";
-pub const SPAN_SUM_OPERATION_ID: &str = "guarded-unicode-word.ranked-anchor-span-sum.v1";
+    "ordered-literal-aggregate.maximal-ascii-run-prefix2.set128.v2";
+pub const COUNT_OPERATION_ID: &str = "guarded-unicode-word.maximal-run-count.v2";
+pub const SPAN_SUM_OPERATION_ID: &str = "guarded-unicode-word.maximal-run-span-sum.v2";
 
 pub const CERTIFIED_MAX_PATTERNS: usize = 128;
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
 const SIMD_BLOCK_BYTES: usize = 32;
+const ASCII_MASK_SLOTS: usize = 128;
+const FIRST_BYTE_MASK_OFFSET: usize = 0;
+const SECOND_BYTE_MASK_OFFSET: usize = ASCII_MASK_SLOTS;
+const LENGTH_MASK_OFFSET: usize = ASCII_MASK_SLOTS * 2;
 const CLASSIFIER_BUILD_WORK: u64 = 128;
 const FIXED_BUILD_WORK: u64 = 1;
+const ASCII_WORD_SET: AsciiByteSet =
+    AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BuildLimits {
@@ -66,7 +71,7 @@ impl Default for BuildLimits {
             max_patterns: CERTIFIED_MAX_PATTERNS,
             max_pattern_bytes: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
             max_build_work: 16 << 20,
-            max_allocations: 1,
+            max_allocations: 2,
             max_initialized_bytes: 1 << 20,
             max_persistent_bytes: 1 << 20,
             max_peak_bytes: 1 << 20,
@@ -80,10 +85,10 @@ pub struct BuildProspective {
     pub pattern_bytes: usize,
     pub min_pattern_bytes: usize,
     pub max_pattern_bytes: usize,
-    pub anchor_offset: usize,
-    pub anchor_selection_work: u64,
-    pub max_anchor_byte_bucket_patterns: usize,
-    pub max_anchor_byte_bucket_pattern_bytes: usize,
+    pub prefix_bytes: usize,
+    pub prefix_selection_work: u64,
+    pub max_signature_bucket_patterns: usize,
+    pub max_signature_bucket_pattern_bytes: usize,
     pub build_work: u64,
     pub allocations: usize,
     pub initialized_bytes: usize,
@@ -152,7 +157,7 @@ impl fmt::Display for BuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "guarded Unicode-word ranked-anchor build failed: {:?}",
+            "guarded Unicode-word maximal-run build failed: {:?}",
             self.kind
         )
     }
@@ -165,7 +170,7 @@ pub struct OperationIdentity {
     pub plan_id: &'static str,
     pub anchor_algorithm_id: &'static str,
     pub operation_id: &'static str,
-    pub anchor_offset: usize,
+    pub prefix_bytes: usize,
     pub classifier_selection: AsciiSelection,
     pub certified_max_patterns: usize,
     pub certified_max_total_pattern_bytes: usize,
@@ -174,13 +179,30 @@ pub struct OperationIdentity {
 #[derive(Debug)]
 struct AnchorOwner {
     classifier: AsciiByteSetClassifier,
-    anchor_byte_patterns: [u128; 256],
+    signature_masks: ExactVec<u128>,
 }
 
 #[derive(Debug)]
 struct AnchorPlan {
     owner: Box<AnchorOwner>,
     build: BuildAccounting,
+}
+
+impl AnchorOwner {
+    #[inline]
+    fn first_byte_patterns(&self, byte: u8) -> u128 {
+        self.signature_masks[FIRST_BYTE_MASK_OFFSET + usize::from(byte)]
+    }
+
+    #[inline]
+    fn second_byte_patterns(&self, byte: u8) -> u128 {
+        self.signature_masks[SECOND_BYTE_MASK_OFFSET + usize::from(byte)]
+    }
+
+    #[inline]
+    fn length_patterns(&self, width: usize) -> u128 {
+        self.signature_masks[LENGTH_MASK_OFFSET.saturating_add(width)]
+    }
 }
 
 #[derive(Debug)]
@@ -223,7 +245,7 @@ impl Plan {
             plan_id: PLAN_ID,
             anchor_algorithm_id: ANCHOR_ALGORITHM_ID,
             operation_id,
-            anchor_offset: self.anchor.build.prospective.anchor_offset,
+            prefix_bytes: self.anchor.build.prospective.prefix_bytes,
             classifier_selection: self.anchor.owner.classifier.selection(),
             certified_max_patterns: CERTIFIED_MAX_PATTERNS,
             certified_max_total_pattern_bytes: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
@@ -258,78 +280,111 @@ impl Plan {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single scan keeps maximal-run state and its exact accounting in one auditable loop"
+    )]
     fn reduce<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<Reduction, ReduceError> {
         let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
-        let anchor_offset = self.anchor.build.prospective.anchor_offset;
-        let candidate_positions = upper.candidate_positions;
         let mut actual = ReduceActual {
-            classified_positions: candidate_positions,
+            classified_positions: haystack.len(),
             ..ReduceActual::default()
         };
         let mut block_start = 0_usize;
-        let mut consumed_through = 0_usize;
+        let mut word_start = None;
 
         while block_start
             .checked_add(SIMD_BLOCK_BYTES)
-            .is_some_and(|end| end <= candidate_positions)
+            .is_some_and(|end| end <= haystack.len())
         {
             let block_end = block_start
                 .checked_add(SIMD_BLOCK_BYTES)
                 .ok_or_else(|| reduce_overflow(actual, "Unicode guarded SIMD block end"))?;
-            let anchor_start = block_start
-                .checked_add(anchor_offset)
-                .ok_or_else(|| reduce_overflow(actual, "Unicode guarded SIMD anchor start"))?;
-            let anchor_end = anchor_start
-                .checked_add(SIMD_BLOCK_BYTES)
-                .ok_or_else(|| reduce_overflow(actual, "Unicode guarded SIMD anchor end"))?;
             let block: &[u8; SIMD_BLOCK_BYTES] =
-                haystack[anchor_start..anchor_end].try_into().map_err(|_| {
+                haystack[block_start..block_end].try_into().map_err(|_| {
                     reduce_invariant(actual, "complete Unicode guarded block lost its extent")
                 })?;
-            let mut candidates = self
+            let members = self
                 .anchor
                 .owner
                 .classifier
                 .classify_32(block)
                 .member_mask();
-            while candidates != 0 {
-                let lane = candidates.trailing_zeros();
-                candidates &= candidates.wrapping_sub(1);
-                let start = block_start
-                    .checked_add(
-                        usize::try_from(lane).map_err(|_| {
-                            reduce_overflow(actual, "Unicode guarded candidate lane")
-                        })?,
-                    )
-                    .ok_or_else(|| reduce_overflow(actual, "Unicode guarded candidate start"))?;
-                self.consume_candidate::<SPAN_SUM>(
-                    haystack,
-                    start,
-                    &mut consumed_through,
-                    &mut actual,
-                )?;
+            let mut lane = 0_u32;
+
+            if let Some(start) = word_start {
+                let nonmembers = !members;
+                if nonmembers == 0 {
+                    block_start = block_end;
+                    continue;
+                }
+                let end_lane = nonmembers.trailing_zeros();
+                let end =
+                    block_start
+                        .checked_add(usize::try_from(end_lane).map_err(|_| {
+                            reduce_overflow(actual, "Unicode guarded word-end lane")
+                        })?)
+                        .ok_or_else(|| reduce_overflow(actual, "Unicode guarded word end"))?;
+                self.consume_word::<SPAN_SUM>(haystack, start, end, &mut actual)?;
+                word_start = None;
+                lane = end_lane
+                    .checked_add(1)
+                    .ok_or_else(|| reduce_overflow(actual, "Unicode guarded next lane"))?;
+            }
+
+            while lane < u32::BITS {
+                let remaining = u32::MAX.checked_shl(lane).unwrap_or(0);
+                let member_lanes = members & remaining;
+                if member_lanes == 0 {
+                    break;
+                }
+                let start_lane = member_lanes.trailing_zeros();
+                let start =
+                    block_start
+                        .checked_add(usize::try_from(start_lane).map_err(|_| {
+                            reduce_overflow(actual, "Unicode guarded word-start lane")
+                        })?)
+                        .ok_or_else(|| reduce_overflow(actual, "Unicode guarded word start"))?;
+                let after_start = start_lane.checked_add(1).ok_or_else(|| {
+                    reduce_overflow(actual, "Unicode guarded word-start successor")
+                })?;
+                let following = u32::MAX.checked_shl(after_start).unwrap_or(0);
+                let nonmember_lanes = !members & following;
+                if nonmember_lanes == 0 {
+                    word_start = Some(start);
+                    break;
+                }
+                let end_lane = nonmember_lanes.trailing_zeros();
+                let end =
+                    block_start
+                        .checked_add(usize::try_from(end_lane).map_err(|_| {
+                            reduce_overflow(actual, "Unicode guarded word-end lane")
+                        })?)
+                        .ok_or_else(|| reduce_overflow(actual, "Unicode guarded word end"))?;
+                self.consume_word::<SPAN_SUM>(haystack, start, end, &mut actual)?;
+                lane = end_lane
+                    .checked_add(1)
+                    .ok_or_else(|| reduce_overflow(actual, "Unicode guarded next lane"))?;
             }
             block_start = block_end;
         }
-        while block_start < candidate_positions {
-            let anchor_position = block_start
-                .checked_add(anchor_offset)
-                .ok_or_else(|| reduce_overflow(actual, "Unicode guarded scalar anchor position"))?;
-            if self.anchor.owner.anchor_byte_patterns[usize::from(haystack[anchor_position])] != 0 {
-                self.consume_candidate::<SPAN_SUM>(
-                    haystack,
-                    block_start,
-                    &mut consumed_through,
-                    &mut actual,
-                )?;
+
+        while block_start < haystack.len() {
+            if is_ascii_word(haystack[block_start]) {
+                word_start.get_or_insert(block_start);
+            } else if let Some(start) = word_start.take() {
+                self.consume_word::<SPAN_SUM>(haystack, start, block_start, &mut actual)?;
             }
-            block_start = block_start.checked_add(1).ok_or_else(|| {
-                reduce_overflow(actual, "Unicode guarded scalar candidate cursor")
-            })?;
+            block_start = block_start
+                .checked_add(1)
+                .ok_or_else(|| reduce_overflow(actual, "Unicode guarded scalar word cursor"))?;
+        }
+        if let Some(start) = word_start {
+            self.consume_word::<SPAN_SUM>(haystack, start, haystack.len(), &mut actual)?;
         }
         actual.iterator_next_calls = actual
             .candidate_events
@@ -350,11 +405,11 @@ impl Plan {
         Ok(Reduction { upper, actual })
     }
 
-    fn consume_candidate<const SPAN_SUM: bool>(
+    fn consume_word<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         start: usize,
-        consumed_through: &mut usize,
+        end: usize,
         actual: &mut ReduceActual,
     ) -> Result<(), ReduceError> {
         let prior = *actual;
@@ -363,14 +418,21 @@ impl Plan {
             prior,
             "Unicode guarded candidate events",
         )?;
-        if start < *consumed_through {
+        let width = end
+            .checked_sub(start)
+            .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded word width"))?;
+        let build = self.anchor.build.prospective;
+        if width < build.min_pattern_bytes || width > build.max_pattern_bytes {
             return Ok(());
         }
-        let anchor_position = start
-            .checked_add(self.anchor.build.prospective.anchor_offset)
-            .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded candidate anchor"))?;
-        let mut pattern_bits =
-            self.anchor.owner.anchor_byte_patterns[usize::from(haystack[anchor_position])];
+        let mut pattern_bits = self.anchor.owner.length_patterns(width)
+            & self.anchor.owner.first_byte_patterns(haystack[start]);
+        if build.prefix_bytes == 2 {
+            let second = start
+                .checked_add(1)
+                .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded second prefix byte"))?;
+            pattern_bits &= self.anchor.owner.second_byte_patterns(haystack[second]);
+        }
         while pattern_bits != 0 {
             let source_index = pattern_bits.trailing_zeros();
             pattern_bits &= pattern_bits.wrapping_sub(1);
@@ -385,18 +447,13 @@ impl Plan {
             let word = self.dictionary.source_word(source_index).ok_or_else(|| {
                 reduce_invariant(*actual, "Unicode guarded source word disappeared")
             })?;
-            let end = start
-                .checked_add(word.bytes.len())
-                .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded match end"))?;
             let prior = *actual;
-            if end > haystack.len()
-                || !equal_counted(
-                    &haystack[start..end],
-                    word.bytes,
-                    &mut actual.verification_source_reads,
-                    prior,
-                )?
-            {
+            if !equal_counted(
+                &haystack[start..end],
+                word.bytes,
+                &mut actual.verification_source_reads,
+                prior,
+            )? {
                 continue;
             }
             let prior = *actual;
@@ -405,7 +462,10 @@ impl Plan {
                 prior,
                 "Unicode guarded left boundary checks",
             )?;
-            if unicode_word_before(haystack, start, actual)? {
+            if start > 0
+                && !haystack[start.saturating_sub(1)].is_ascii()
+                && unicode_word_before(haystack, start, actual)?
+            {
                 continue;
             }
             let prior = *actual;
@@ -414,7 +474,10 @@ impl Plan {
                 prior,
                 "Unicode guarded right boundary checks",
             )?;
-            if unicode_word_after(haystack, end, actual)? {
+            if end < haystack.len()
+                && !haystack[end].is_ascii()
+                && unicode_word_after(haystack, end, actual)?
+            {
                 continue;
             }
             actual.match_events = actual
@@ -430,7 +493,6 @@ impl Plan {
                         })?)
                         .ok_or_else(|| reduce_overflow(*actual, "Unicode guarded span sum"))?;
             }
-            *consumed_through = end;
             break;
         }
         Ok(())
@@ -442,19 +504,15 @@ impl Plan {
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
         let build = self.anchor.build.prospective;
-        let candidate_positions = if haystack_bytes < build.min_pattern_bytes {
-            0
-        } else {
-            haystack_bytes
-                .checked_sub(build.min_pattern_bytes)
-                .and_then(|remaining| remaining.checked_add(1))
-                .ok_or_else(|| reduce_preflight_overflow("Unicode guarded candidate positions"))?
-        };
+        // There can be at most one maximal ASCII-word run beginning at each
+        // source byte. Using the full haystack extent also covers short runs
+        // that are rejected before signature lookup.
+        let candidate_positions = haystack_bytes;
         let pattern_checks = candidate_positions
-            .checked_mul(build.max_anchor_byte_bucket_patterns)
+            .checked_mul(build.max_signature_bucket_patterns)
             .ok_or_else(|| reduce_preflight_overflow("Unicode guarded pattern checks"))?;
         let verification_source_reads = candidate_positions
-            .checked_mul(build.max_anchor_byte_bucket_pattern_bytes)
+            .checked_mul(build.max_signature_bucket_pattern_bytes)
             .ok_or_else(|| {
                 reduce_preflight_overflow("Unicode guarded verification source reads")
             })?;
@@ -511,14 +569,56 @@ impl Plan {
 }
 
 impl AnchorPlan {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed transaction initializes the exact signature masks and publishes their owner"
+    )]
     fn build(
         dispatch: SimdDispatchContext,
         dictionary: &Dictionary,
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
         let (prospective, mut actual) = preflight_build(dictionary, limits)?;
-        let mut anchor_byte_patterns = [0_u128; 256];
-        let mut ascii_words = [0_u64; 2];
+        let mask_slots = signature_mask_slots(prospective.max_pattern_bytes).ok_or_else(|| {
+            build_overflow(
+                Some(prospective),
+                actual,
+                "Unicode guarded signature mask slots",
+            )
+        })?;
+        let mask_bytes = mask_slots.checked_mul(size_of::<u128>()).ok_or_else(|| {
+            build_overflow(
+                Some(prospective),
+                actual,
+                "Unicode guarded signature mask bytes",
+            )
+        })?;
+        let mut signature_masks =
+            ExactVec::try_with_capacity(mask_slots).map_err(|source| BuildError {
+                kind: match source {
+                    CopyError::LayoutOverflow => BuildErrorKind::ArithmeticOverflow {
+                        computation: "Unicode guarded signature-mask layout",
+                    },
+                    CopyError::AllocationFailed => {
+                        BuildErrorKind::AllocationFailed { bytes: mask_bytes }
+                    }
+                },
+                prospective: Some(prospective),
+                actual,
+            })?;
+        for _ in 0..mask_slots {
+            signature_masks.try_push(0).map_err(|_| {
+                build_invariant(
+                    Some(prospective),
+                    actual,
+                    "exact Unicode guarded signature-mask capacity changed",
+                )
+            })?;
+        }
+        actual.allocations = 1;
+        actual.allocated_bytes = mask_bytes;
+        actual.initialized_bytes = mask_bytes;
+        actual.peak_bytes = mask_bytes;
         for source_index in 0..prospective.patterns {
             let word = dictionary.source_word(source_index).ok_or_else(|| {
                 build_invariant(
@@ -527,20 +627,29 @@ impl AnchorPlan {
                     "Unicode guarded source word disappeared after preflight",
                 )
             })?;
-            let anchor = word.bytes[prospective.anchor_offset];
             let shift = u32::try_from(source_index).map_err(|_| {
-                build_overflow(Some(prospective), actual, "Unicode guarded anchor bit")
+                build_overflow(Some(prospective), actual, "Unicode guarded source bit")
             })?;
             let bit = 1_u128.checked_shl(shift).ok_or_else(|| {
-                build_overflow(Some(prospective), actual, "Unicode guarded anchor bit")
+                build_overflow(Some(prospective), actual, "Unicode guarded source bit")
             })?;
-            anchor_byte_patterns[usize::from(anchor)] |= bit;
-            let set_word = usize::from(anchor / 64);
-            let set_shift = u32::from(anchor % 64);
-            ascii_words[set_word] |= 1_u64 << set_shift;
+            signature_masks[FIRST_BYTE_MASK_OFFSET + usize::from(word.bytes[0])] |= bit;
+            if prospective.prefix_bytes == 2 {
+                signature_masks[SECOND_BYTE_MASK_OFFSET + usize::from(word.bytes[1])] |= bit;
+            }
+            let length_mask = LENGTH_MASK_OFFSET
+                .checked_add(word.bytes.len())
+                .ok_or_else(|| {
+                    build_overflow(
+                        Some(prospective),
+                        actual,
+                        "Unicode guarded length-mask index",
+                    )
+                })?;
+            signature_masks[length_mask] |= bit;
         }
         let classifier = dispatch
-            .ascii_byte_set_classifier(AsciiByteSet::from_words(ascii_words), DispatchPolicy::Auto)
+            .ascii_byte_set_classifier(ASCII_WORD_SET, DispatchPolicy::Auto)
             .map_err(|_| BuildError {
                 kind: BuildErrorKind::InternalInvariant {
                     detail: "automatic ASCII classifier lost its scalar fallback",
@@ -549,11 +658,9 @@ impl AnchorPlan {
                 actual,
             })?;
         actual.work = prospective.build_work;
-        actual.initialized_bytes = size_of::<AnchorOwner>();
-        actual.peak_bytes = size_of::<AnchorOwner>();
         let owner = AnchorOwner {
             classifier,
-            anchor_byte_patterns,
+            signature_masks,
         };
         let owner = try_box_preserve(owner).map_err(|(source, _)| BuildError {
             kind: match source {
@@ -567,8 +674,13 @@ impl AnchorPlan {
             prospective: Some(prospective),
             actual,
         })?;
-        actual.allocations = 1;
-        actual.allocated_bytes = size_of::<AnchorOwner>();
+        actual.allocations = 2;
+        actual.allocated_bytes = actual
+            .allocated_bytes
+            .checked_add(size_of::<AnchorOwner>())
+            .ok_or_else(|| {
+                build_overflow(Some(prospective), actual, "Unicode guarded allocated bytes")
+            })?;
         actual.initialized_bytes = prospective.initialized_bytes;
         actual.live_persistent_bytes = prospective.persistent_bytes;
         actual.peak_bytes = prospective.peak_bytes;
@@ -598,7 +710,7 @@ fn preflight_build(
     if patterns == 0 || patterns > CERTIFIED_MAX_PATTERNS {
         return Err(BuildError {
             kind: BuildErrorKind::UnsupportedShape {
-                detail: "Unicode guarded ranked anchors require 1..=128 source words",
+                detail: "Unicode guarded maximal runs require 1..=128 source words",
             },
             prospective: None,
             actual,
@@ -607,7 +719,7 @@ fn preflight_build(
     if identity.packed_bytes.len() > CERTIFIED_MAX_TOTAL_PATTERN_BYTES {
         return Err(BuildError {
             kind: BuildErrorKind::UnsupportedShape {
-                detail: "Unicode guarded ranked anchors require at most 512 source bytes",
+                detail: "Unicode guarded maximal runs require at most 512 source bytes",
             },
             prospective: None,
             actual,
@@ -633,7 +745,7 @@ fn preflight_build(
         if word.left != Guard::LeftBoundary || word.right != Guard::RightBoundary {
             return Err(BuildError {
                 kind: BuildErrorKind::UnsupportedShape {
-                    detail: "Unicode guarded ranked anchors require two full boundaries",
+                    detail: "Unicode guarded maximal runs require two full boundaries",
                 },
                 prospective: None,
                 actual,
@@ -648,7 +760,7 @@ fn preflight_build(
         {
             return Err(BuildError {
                 kind: BuildErrorKind::UnsupportedShape {
-                    detail: "Unicode guarded ranked anchors require nonempty ASCII words",
+                    detail: "Unicode guarded maximal runs require nonempty ASCII words",
                 },
                 prospective: None,
                 actual,
@@ -657,58 +769,82 @@ fn preflight_build(
         min_pattern_bytes = min_pattern_bytes.min(word.bytes.len());
         max_pattern_bytes = max_pattern_bytes.max(word.bytes.len());
     }
-    let (anchor_offset, anchor_selection_work) =
-        select_anchor_offset(dictionary, patterns, min_pattern_bytes)?;
-    actual.work = actual
-        .work
-        .checked_add(anchor_selection_work)
-        .ok_or_else(|| build_overflow(None, actual, "Unicode guarded anchor-selection work"))?;
-    let mut bucket_patterns = [0_usize; 256];
-    let mut bucket_bytes = [0_usize; 256];
-    let mut max_anchor_byte_bucket_patterns = 0_usize;
-    let mut max_anchor_byte_bucket_pattern_bytes = 0_usize;
+    let prefix_bytes = min_pattern_bytes.min(2);
+    let mut prefix_selection_work = 0_u64;
+    let mut max_signature_bucket_patterns = 0_usize;
+    let mut max_signature_bucket_pattern_bytes = 0_usize;
     for source_index in 0..patterns {
-        let word = dictionary.source_word(source_index).ok_or_else(|| {
+        let source = dictionary.source_word(source_index).ok_or_else(|| {
             build_invariant(None, actual, "Unicode guarded source word disappeared")
         })?;
-        let bucket = usize::from(word.bytes[anchor_offset]);
-        bucket_patterns[bucket] = bucket_patterns[bucket]
-            .checked_add(1)
-            .ok_or_else(|| build_overflow(None, actual, "Unicode guarded bucket patterns"))?;
-        bucket_bytes[bucket] = bucket_bytes[bucket]
-            .checked_add(word.bytes.len())
-            .ok_or_else(|| build_overflow(None, actual, "Unicode guarded bucket bytes"))?;
-        max_anchor_byte_bucket_patterns =
-            max_anchor_byte_bucket_patterns.max(bucket_patterns[bucket]);
-        max_anchor_byte_bucket_pattern_bytes =
-            max_anchor_byte_bucket_pattern_bytes.max(bucket_bytes[bucket]);
+        let mut bucket_patterns = 0_usize;
+        let mut bucket_pattern_bytes = 0_usize;
+        for candidate_index in 0..patterns {
+            let candidate = dictionary.source_word(candidate_index).ok_or_else(|| {
+                build_invariant(None, actual, "Unicode guarded bucket word disappeared")
+            })?;
+            prefix_selection_work = prefix_selection_work.checked_add(1).ok_or_else(|| {
+                build_overflow(None, actual, "Unicode guarded signature comparisons")
+            })?;
+            if candidate.bytes.len() == source.bytes.len()
+                && candidate.bytes[0] == source.bytes[0]
+                && (prefix_bytes == 1 || candidate.bytes[1] == source.bytes[1])
+            {
+                bucket_patterns = bucket_patterns.checked_add(1).ok_or_else(|| {
+                    build_overflow(None, actual, "Unicode guarded signature bucket patterns")
+                })?;
+                bucket_pattern_bytes = bucket_pattern_bytes
+                    .checked_add(candidate.bytes.len())
+                    .ok_or_else(|| {
+                        build_overflow(None, actual, "Unicode guarded signature bucket bytes")
+                    })?;
+            }
+        }
+        max_signature_bucket_patterns = max_signature_bucket_patterns.max(bucket_patterns);
+        max_signature_bucket_pattern_bytes =
+            max_signature_bucket_pattern_bytes.max(bucket_pattern_bytes);
     }
+    actual.work = actual
+        .work
+        .checked_add(prefix_selection_work)
+        .ok_or_else(|| build_overflow(None, actual, "Unicode guarded prefix-selection work"))?;
+    let pattern_map_work =
+        patterns
+            .checked_mul(prefix_bytes.checked_add(1).ok_or_else(|| {
+                build_overflow(None, actual, "Unicode guarded pattern-map fields")
+            })?)
+            .ok_or_else(|| build_overflow(None, actual, "Unicode guarded pattern-map work"))?;
+    let mask_slots = signature_mask_slots(max_pattern_bytes)
+        .ok_or_else(|| build_overflow(None, actual, "Unicode guarded signature mask slots"))?;
     let build_work = actual
         .work
         .checked_add(
-            u64::try_from(patterns)
+            u64::try_from(pattern_map_work)
                 .map_err(|_| build_overflow(None, actual, "Unicode guarded pattern-map work"))?,
         )
         .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
+        .and_then(|work| work.checked_add(u64::try_from(mask_slots).ok()?))
         .ok_or_else(|| build_overflow(None, actual, "Unicode guarded build work"))?;
+    let mask_bytes = mask_slots
+        .checked_mul(size_of::<u128>())
+        .ok_or_else(|| build_overflow(None, actual, "Unicode guarded signature mask bytes"))?;
     let persistent_bytes = size_of::<AnchorOwner>()
         .checked_add(size_of::<AnchorPlan>())
+        .and_then(|bytes| bytes.checked_add(mask_bytes))
         .ok_or_else(|| build_overflow(None, actual, "Unicode guarded persistent bytes"))?;
     let initialized_bytes = persistent_bytes;
-    let peak_bytes = size_of::<AnchorOwner>()
-        .checked_add(persistent_bytes)
-        .ok_or_else(|| build_overflow(None, actual, "Unicode guarded build peak"))?;
+    let peak_bytes = persistent_bytes;
     let prospective = BuildProspective {
         patterns,
         pattern_bytes: identity.packed_bytes.len(),
         min_pattern_bytes,
         max_pattern_bytes,
-        anchor_offset,
-        anchor_selection_work,
-        max_anchor_byte_bucket_patterns,
-        max_anchor_byte_bucket_pattern_bytes,
+        prefix_bytes,
+        prefix_selection_work,
+        max_signature_bucket_patterns,
+        max_signature_bucket_pattern_bytes,
         build_work,
-        allocations: 1,
+        allocations: 2,
         initialized_bytes,
         persistent_bytes,
         peak_bytes,
@@ -717,77 +853,10 @@ fn preflight_build(
     Ok((prospective, actual))
 }
 
-fn select_anchor_offset(
-    dictionary: &Dictionary,
-    patterns: usize,
-    min_pattern_bytes: usize,
-) -> Result<(usize, u64), BuildError> {
-    let actual = BuildActual::default();
-    let mut selected_offset = 0_usize;
-    let mut selected_score = u64::MAX;
-    let mut work = 0_u64;
-    for offset in 0..min_pattern_bytes {
-        let mut score = 0_u64;
-        for source_index in 0..patterns {
-            let source = dictionary.source_word(source_index).ok_or_else(|| {
-                build_invariant(None, actual, "Unicode guarded source word disappeared")
-            })?;
-            let anchor = source.bytes[offset];
-            let mut seen = false;
-            for prior_index in 0..source_index {
-                let prior = dictionary.source_word(prior_index).ok_or_else(|| {
-                    build_invariant(None, actual, "Unicode guarded prior word disappeared")
-                })?;
-                seen |= prior.bytes[offset] == anchor;
-                work = work.checked_add(1).ok_or_else(|| {
-                    build_overflow(None, actual, "Unicode guarded prior-anchor comparisons")
-                })?;
-            }
-            let mut bucket_patterns = 0_u64;
-            let mut bucket_pattern_bytes = 0_u64;
-            for candidate_index in 0..patterns {
-                let candidate = dictionary.source_word(candidate_index).ok_or_else(|| {
-                    build_invariant(None, actual, "Unicode guarded bucket word disappeared")
-                })?;
-                work = work.checked_add(1).ok_or_else(|| {
-                    build_overflow(None, actual, "Unicode guarded bucket comparisons")
-                })?;
-                if candidate.bytes[offset] == anchor {
-                    bucket_patterns = bucket_patterns.checked_add(1).ok_or_else(|| {
-                        build_overflow(None, actual, "Unicode guarded bucket pattern count")
-                    })?;
-                    bucket_pattern_bytes = bucket_pattern_bytes
-                        .checked_add(u64::try_from(candidate.bytes.len()).map_err(|_| {
-                            build_overflow(None, actual, "Unicode guarded bucket pattern bytes")
-                        })?)
-                        .ok_or_else(|| {
-                            build_overflow(None, actual, "Unicode guarded bucket pattern bytes")
-                        })?;
-                }
-            }
-            if !seen {
-                let frequency_weight =
-                    u64::from(packed_ordered_literal_byte_frequency_rank(anchor))
-                        .checked_add(1)
-                        .ok_or_else(|| {
-                            build_overflow(None, actual, "Unicode guarded frequency weight")
-                        })?;
-                let bucket_cost = bucket_patterns
-                    .checked_add(bucket_pattern_bytes)
-                    .ok_or_else(|| build_overflow(None, actual, "Unicode guarded bucket cost"))?;
-                score = score
-                    .checked_add(frequency_weight.checked_mul(bucket_cost).ok_or_else(|| {
-                        build_overflow(None, actual, "Unicode guarded weighted bucket cost")
-                    })?)
-                    .ok_or_else(|| build_overflow(None, actual, "Unicode guarded anchor score"))?;
-            }
-        }
-        if score < selected_score {
-            selected_score = score;
-            selected_offset = offset;
-        }
-    }
-    Ok((selected_offset, work))
+fn signature_mask_slots(max_pattern_bytes: usize) -> Option<usize> {
+    LENGTH_MASK_OFFSET
+        .checked_add(max_pattern_bytes)
+        .and_then(|slots| slots.checked_add(1))
 }
 
 fn enforce_build_limits(
@@ -1037,7 +1106,7 @@ impl fmt::Display for ReduceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "guarded Unicode-word ranked-anchor reduction failed: {:?}",
+            "guarded Unicode-word maximal-run reduction failed: {:?}",
             self.kind
         )
     }
@@ -1269,6 +1338,10 @@ fn is_unicode_word(scalar: char) -> bool {
         .expect("fre enables regex-syntax's Unicode Perl tables")
 }
 
+const fn is_ascii_word(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
 fn increment(
     value: &mut usize,
     actual: ReduceActual,
@@ -1387,14 +1460,48 @@ mod tests {
     }
 
     #[test]
-    fn source_order_duplicates_and_ranked_anchor_identity_are_retained() {
+    fn maximal_runs_cross_simd_blocks_and_match_rust_bytes() {
+        let patterns = [b"as".as_slice(), b"break", b"const", b"Self"];
+        let plan = plan(&patterns);
+        let oracle = regex::bytes::RegexBuilder::new(r"\b(?:as|break|const|Self)\b")
+            .unicode(true)
+            .build()
+            .unwrap();
+        let mut cases = Vec::new();
+        for padding in [0, 1, 30, 31, 32, 33, 62, 63, 64, 65] {
+            let mut haystack = vec![b' '; padding];
+            haystack.extend_from_slice(b"break as_const const Self ");
+            haystack.extend(core::iter::repeat_n(b'a', 70));
+            haystack.extend_from_slice(" βas asβ as ".as_bytes());
+            cases.push(haystack);
+        }
+        for haystack in cases {
+            let expected = oracle.find_iter(&haystack).collect::<Vec<_>>();
+            let expected_count = u64::try_from(expected.len()).unwrap();
+            let expected_span_sum = expected.iter().try_fold(0_u64, |sum, matched| {
+                sum.checked_add(u64::try_from(matched.len()).ok()?)
+            });
+            let count = plan.count(&haystack, ReduceLimits::unlimited()).unwrap();
+            let span_sum = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(count.count, expected_count, "haystack={haystack:?}");
+            assert_eq!(
+                span_sum.span_sum,
+                expected_span_sum.unwrap(),
+                "haystack={haystack:?}"
+            );
+            assert_eq!(count.accounting.actual.classified_positions, haystack.len());
+        }
+    }
+
+    #[test]
+    fn source_order_duplicates_and_prefix_identity_are_retained() {
         let plan = plan(&[b"break", b"const", b"break", b"Self"]);
         let build = plan.build_accounting();
         assert_eq!(build.prospective.patterns, 4);
-        assert!(build.prospective.anchor_offset < 4);
+        assert_eq!(build.prospective.prefix_bytes, 2);
         assert_eq!(
-            plan.count_identity().anchor_offset,
-            build.prospective.anchor_offset
+            plan.count_identity().prefix_bytes,
+            build.prospective.prefix_bytes
         );
         assert_eq!(
             plan.count(b"break const Self", ReduceLimits::unlimited())

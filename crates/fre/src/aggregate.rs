@@ -320,7 +320,7 @@ pub enum AggregatePlanKind {
     /// to an eager exact dictionary and allocation-free maximal-word scan.
     GuardedAsciiWordDictionary,
     /// Finite ASCII-word alternatives with full Unicode word boundaries,
-    /// lowered to one ranked-anchor literal-set reducer.
+    /// lowered to one maximal ASCII-word-run literal-set reducer.
     GuardedUnicodeWordLiteralSet,
     /// One fixed-width sequence of ASCII-byte predicates lowered to an inline
     /// 64-bit Shift-And state and byte-to-position masks.
@@ -376,7 +376,7 @@ pub enum AggregatePlanIdentity {
     /// Guarded ASCII-word dictionary and operation identity. The syntax key
     /// retains exact HIR order, captures, duplicates, and profile inputs.
     GuardedAsciiWord(AggregateGuardedAsciiWordIdentity),
-    /// Guarded Unicode-word ranked-anchor identity.
+    /// Guarded Unicode-word maximal-run identity.
     GuardedUnicodeWord(AggregateGuardedUnicodeWordIdentity),
     /// Fixed ASCII-byte-predicate Shift-And operation identity.
     FixedPredicateWord64(FixedPredicateWord64OperationIdentity),
@@ -1162,7 +1162,7 @@ pub struct AggregateGuardedAsciiWordBuildAccounting {
 }
 
 /// Complete construction accounting for the retained guarded dictionary plus
-/// its ranked-anchor owner.
+/// its maximal-run owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateGuardedUnicodeWordBuildAccounting {
     pub dictionary: guarded_ascii_word::PublishedBuildAccounting,
@@ -1220,7 +1220,7 @@ pub enum AggregateBuildAccounting {
     SparseFiniteLiteral(SparseOrderedLiteralAggregateBuildAccounting),
     /// Temporary finite-source closure plus persistent guarded dictionary.
     GuardedAsciiWord(AggregateGuardedAsciiWordBuildAccounting),
-    /// Guarded dictionary plus ranked-anchor literal-set construction.
+    /// Guarded dictionary plus maximal-run literal-set construction.
     GuardedUnicodeWord(AggregateGuardedUnicodeWordBuildAccounting),
     /// Inline fixed ASCII-byte-predicate construction certificate.
     FixedPredicateWord64(FixedPredicateWord64BuildAccounting),
@@ -5444,7 +5444,7 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: guarded_ascii_word::BuildError,
     },
-    /// Guarded Unicode-word ranked-anchor construction failed after semantic
+    /// Guarded Unicode-word maximal-run construction failed after semantic
     /// selection.
     GuardedUnicodeWordBuild {
         operation: AggregateOperation,
@@ -6604,7 +6604,7 @@ pub enum AggregateExecutionSource {
     /// allocation-free; facade packaging boxes its complete P/A receipt so a
     /// newly selected route does not inflate every public execution result.
     GuardedAsciiWord(Box<guarded_ascii_word::ReduceError>),
-    /// Guarded Unicode-word ranked-anchor refusal. Facade packaging boxes the
+    /// Guarded Unicode-word maximal-run refusal. Facade packaging boxes the
     /// complete P/A receipt so this route does not inflate every public
     /// execution result.
     GuardedUnicodeWord(Box<guarded_unicode_word::ReduceError>),

@@ -53,15 +53,6 @@ const BYTE_FREQUENCY_RANK: [u8; 256] = [
     255,
 ];
 
-/// Frozen general-purpose byte-frequency rank used by ranked literal anchors.
-///
-/// Lower values are rarer. Other FRE-owned literal reducers may reuse this
-/// policy while retaining their own construction and execution receipts.
-#[must_use]
-pub fn byte_frequency_rank(byte: u8) -> u8 {
-    BYTE_FREQUENCY_RANK[usize::from(byte)]
-}
-
 /// Smallest admitted ordered set. Singletons already have a stronger direct
 /// literal implementation.
 pub const CERTIFIED_MIN_PATTERNS: usize = 2;
