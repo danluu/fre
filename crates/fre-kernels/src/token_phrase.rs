@@ -1,12 +1,10 @@
-//! Block-mask whole-operation reduction for `W+ S+ L S+ W+`.
+//! Literal-anchored whole-operation reduction for `W+ S+ L S+ W+`.
 //!
 //! Admission proves byte-mode complete ASCII word and whitespace classes,
 //! greedy nonempty repetitions, and one nonempty all-word literal. The reducer
-//! loads each source block exactly once, classifies its bytes into disjoint
-//! word/space masks through one retained immutable classifier, and drives a
-//! maximal-token DFA from contiguous mask runs. Literal equality work is gated
-//! by the DFA: local block bytes are compared only while the middle literal
-//! token is expected.
+//! uses the proved literal as a sparse anchor on inputs large enough to
+//! amortize finder setup, then verifies the four adjacent maximal token runs.
+//! Short inputs retain the fixed block-mask classifier and maximal-token DFA.
 //!
 //! A completed right word resets the DFA instead of reusing that word as the
 //! next left token. This preserves non-overlapping restart semantics for
@@ -23,12 +21,13 @@ use fre_exact_alloc::CopyError;
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiWordSpaceClassifier, DispatchPolicy,
 };
+use memchr::memmem::Finder;
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
-pub const PLAN_ID: &str = "token-phrase.block-mask-maximal-ascii-stream.v4";
-pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v4";
-pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v4";
+pub const PLAN_ID: &str = "token-phrase.literal-anchor-maximal-ascii-stream.v5";
+pub const COUNT_OPERATION_ID: &str = "token-phrase.count.unicode-off.v5";
+pub const SPAN_SUM_OPERATION_ID: &str = "token-phrase.span-sum.unicode-off.v5";
 
 const FIXED_BUILD_WORK: usize = 8;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 2;
@@ -39,6 +38,9 @@ const LITERAL_COMPARISON_WORK: usize = 1;
 const TOKEN_EVENT_WORK: usize = 3;
 const MATCH_WORK: usize = 4;
 const MINIMUM_NON_LITERAL_BYTES: usize = 4;
+// Four full classifier blocks amortize construction of one borrowed
+// multi-byte finder. Smaller inputs retain the existing block-mask path.
+const CANDIDATE_MIN_INPUT_BYTES: usize = ASCII_WIDE_BYTES * 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Topology {
@@ -182,10 +184,10 @@ pub struct ReduceUpperBounds {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
-    /// Exact source bytes loaded by the one-pass classifier.
+    /// Conservative source-byte charge for the selected complete-input scan.
     pub source_reads: usize,
     pub work: usize,
-    /// Exact bytes classified.
+    /// Classifier-equivalent input positions charged for admission parity.
     pub classifications: usize,
     /// Exact in-register comparisons made while a literal token was expected.
     pub literal_comparisons: usize,
@@ -597,6 +599,22 @@ impl TokenPhrasePlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        if haystack.len() >= CANDIDATE_MIN_INPUT_BYTES {
+            return self.scan_literal_anchors(haystack, operation, upper);
+        }
+        self.scan_block_masks(haystack, operation, upper)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-pass fixed 32/16/tail schedule and exact final accounting remain together for source-read review"
+    )]
+    fn scan_block_masks(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
         let mut actual = ReduceActualCounters {
             source_reads: haystack.len(),
             work: FIXED_REDUCE_WORK,
@@ -714,6 +732,115 @@ impl TokenPhrasePlan {
             })?;
         verify_actual(actual, upper)?;
         Ok(actual)
+    }
+
+    fn scan_literal_anchors(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        // Preserve the incumbent conservative logical input charges. The
+        // candidate route changes execution, not caller admission.
+        let mut actual = ReduceActualCounters {
+            source_reads: haystack.len(),
+            work: FIXED_REDUCE_WORK,
+            classifications: haystack.len(),
+            literal_comparisons: 0,
+            tokens: 0,
+            matches: 0,
+            count: 0,
+            span_sum: 0,
+            scratch_bytes: 0,
+        };
+        let finder = Finder::new(&self.literal);
+        let mut consumed_through = 0_usize;
+        for literal_start in finder.find_iter(haystack) {
+            if literal_start < consumed_through {
+                continue;
+            }
+            let Some((match_start, match_end)) =
+                self.literal_anchor_match_span(haystack, literal_start)?
+            else {
+                continue;
+            };
+            if match_start < consumed_through {
+                continue;
+            }
+            record_match(&mut actual, operation, match_start, match_end)?;
+            consumed_through = match_end;
+        }
+        actual.work = actual
+            .classifications
+            .checked_mul(CLASSIFICATION_WORK)
+            .and_then(|work| {
+                actual
+                    .literal_comparisons
+                    .checked_mul(LITERAL_COMPARISON_WORK)
+                    .and_then(|comparisons| work.checked_add(comparisons))
+            })
+            .and_then(|work| {
+                actual
+                    .tokens
+                    .checked_mul(TOKEN_EVENT_WORK)
+                    .and_then(|tokens| work.checked_add(tokens))
+            })
+            .and_then(|work| {
+                actual
+                    .matches
+                    .checked_mul(MATCH_WORK)
+                    .and_then(|matches| work.checked_add(matches))
+            })
+            .and_then(|work| work.checked_add(FIXED_REDUCE_WORK))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual literal-anchor reduction work",
+            })?;
+        verify_actual(actual, upper)?;
+        Ok(actual)
+    }
+
+    fn literal_anchor_match_span(
+        &self,
+        haystack: &[u8],
+        literal_start: usize,
+    ) -> Result<Option<(usize, usize)>, ReduceError> {
+        let literal_end = literal_start.checked_add(self.literal.len()).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "literal anchor end",
+            },
+        )?;
+        if literal_start == 0
+            || literal_end >= haystack.len()
+            || !is_ascii_space(haystack[literal_start - 1])
+            || !is_ascii_space(haystack[literal_end])
+        {
+            return Ok(None);
+        }
+
+        let mut left_space_start = literal_start;
+        while left_space_start > 0 && is_ascii_space(haystack[left_space_start - 1]) {
+            left_space_start -= 1;
+        }
+        if left_space_start == 0 || !is_ascii_word(haystack[left_space_start - 1]) {
+            return Ok(None);
+        }
+        let mut match_start = left_space_start;
+        while match_start > 0 && is_ascii_word(haystack[match_start - 1]) {
+            match_start -= 1;
+        }
+
+        let mut right_word_start = literal_end;
+        while right_word_start < haystack.len() && is_ascii_space(haystack[right_word_start]) {
+            right_word_start += 1;
+        }
+        if right_word_start == haystack.len() || !is_ascii_word(haystack[right_word_start]) {
+            return Ok(None);
+        }
+        let mut match_end = right_word_start;
+        while match_end < haystack.len() && is_ascii_word(haystack[match_end]) {
+            match_end += 1;
+        }
+        Ok(Some((match_start, match_end)))
     }
 
     #[allow(
