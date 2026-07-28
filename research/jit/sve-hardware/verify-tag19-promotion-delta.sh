@@ -200,7 +200,7 @@ FACADE_SCENARIOS = ("absent", "late", "homogeneous", "near-miss")
 FACADE_STAGES = ("build", "search", "cold", "full")
 CANDIDATE_ATOM_BLOB = "44609addd5e2ada9bd003614352bda0bdc5c2316"
 ABI2_SOURCE_CLOSURE_SHA256 = (
-    "9097e3ffc23d7d4dd6d55f7bc19f275b436d3d04ae0d0a021f8041f98d1db805"
+    "a94b82c4421bc2b130498e22e4575bc62be8c85f120339bc90911986e31e0082"
 )
 MAX_GIT_OUTPUT = 4 * 1024 * 1024
 MAX_ENTRIES = 16_384
