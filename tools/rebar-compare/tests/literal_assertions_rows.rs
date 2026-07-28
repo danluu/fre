@@ -71,7 +71,7 @@ fn exact_sherlock_line_boundary_row_uses_literal_assertions() {
         regex.build_report().plan,
         AggregatePlanKind::LiteralAssertions
     );
-    assert_eq!(regex.build_report().schema_version, 39);
+    assert_eq!(regex.build_report().schema_version, 40);
     assert!(matches!(
         regex.build_report().plan_identity,
         AggregatePlanIdentity::LiteralAssertions(_)

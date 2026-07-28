@@ -2,7 +2,9 @@
 //!
 //! The retained owner is entirely FRE controlled. It contains one
 //! length-prefixed copy of the ordered patterns, fixed metadata, a fixed
-//! first-byte-to-pattern map and one already-dispatched ASCII classifier.
+//! fixed-anchor-byte-to-pattern map and one already-dispatched ASCII
+//! classifier. Construction ranks common in-pattern offsets using a frozen
+//! byte-frequency policy and complete bucket cost.
 //! Construction publishes that owner through one exact fallible allocation.
 //! The operation walks candidate starts monotonically, verifies pattern IDs in
 //! source order and never allocates.
@@ -22,13 +24,34 @@ use fre_simd_kernels::{
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 3;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_TOTAL_PATTERN_BYTES;
 const CLASSIFIER_BUILD_WORK: usize = 128;
 const SIMD_BLOCK_BYTES: usize = 32;
+
+// Frozen memchr 2.8.3 packed-pair frequency order, shared conceptually with
+// the authenticated AArch64 literal backend. Lower ranks are rarer and
+// therefore better fixed anchors. Keeping this local avoids coupling the
+// portable kernel crate to one JIT backend.
+const BYTE_FREQUENCY_RANK: [u8; 256] = [
+    55, 52, 51, 50, 49, 48, 47, 46, 45, 103, 242, 66, 67, 229, 44, 43, 42, 41, 40, 39, 38, 37, 36,
+    35, 34, 33, 56, 32, 31, 30, 29, 28, 255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122,
+    232, 202, 215, 224, 208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174,
+    126, 120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167, 186, 112,
+    175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223, 151, 249, 216, 238, 236,
+    253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244, 231, 139, 245, 243, 251, 235, 201, 196,
+    240, 214, 152, 182, 205, 181, 127, 27, 212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105,
+    80, 98, 96, 97, 81, 207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111, 82,
+    108, 118, 141, 113, 129, 119, 125, 165, 117, 92, 106, 83, 72, 99, 93, 65, 79, 166, 237, 163,
+    199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255,
+];
 
 /// Smallest admitted ordered set. Singletons already have a stronger direct
 /// literal implementation.
@@ -43,15 +66,16 @@ pub const CERTIFIED_MAX_PATTERN_BYTES: usize = 32;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
 /// Stable FRE-owned strategy identity.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-first-byte-stream.v2";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-ranked-anchor-stream.v3";
 /// Stable count-plan identity.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-first-byte-stream.v2";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-ranked-anchor-stream.v3";
 /// Stable span-sum-plan identity.
-pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.packed-first-byte-stream.v2";
+pub const SPAN_SUM_PLAN_ID: &str =
+    "ordered-literal-aggregate.span-sum.packed-ranked-anchor-stream.v3";
 /// Version of the success-or-failure construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
 /// Version of the partial-actual construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 2;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 3;
 
 /// Boundary contract owned by this byte-string kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +111,8 @@ pub struct CacheIdentity<'a> {
     pub target_arch: &'static str,
     pub runtime_minimum_haystack_bytes: usize,
     pub semantics: Semantics,
+    pub anchor_offset: usize,
+    pub anchor_has_non_ascii: bool,
     pub classifier_selection: AsciiSelection,
     pub certified_min_patterns: usize,
     pub certified_max_patterns: usize,
@@ -112,6 +138,8 @@ pub struct OperationIdentity {
     pub wide_policy_usable: FeatureSet,
     pub wide_required: FeatureSet,
     pub wide_minimum_input_bytes: usize,
+    pub anchor_offset: usize,
+    pub anchor_has_non_ascii: bool,
 }
 
 impl CacheIdentity<'_> {
@@ -131,6 +159,8 @@ impl CacheIdentity<'_> {
             wide_policy_usable: wide.policy_usable,
             wide_required: wide.required,
             wide_minimum_input_bytes: wide.minimum_input_bytes,
+            anchor_offset: self.anchor_offset,
+            anchor_has_non_ascii: self.anchor_has_non_ascii,
         }
     }
 }
@@ -183,8 +213,11 @@ pub struct BuildAccounting {
     pub pattern_bytes: usize,
     pub max_pattern_bytes: usize,
     pub min_pattern_bytes: usize,
-    pub max_first_byte_bucket_patterns: usize,
-    pub max_first_byte_bucket_pattern_bytes: usize,
+    pub anchor_offset: usize,
+    pub anchor_has_non_ascii: bool,
+    pub anchor_selection_work: u64,
+    pub max_anchor_byte_bucket_patterns: usize,
+    pub max_anchor_byte_bucket_pattern_bytes: usize,
     pub identity_bytes: usize,
     pub identity_capacity_bytes: usize,
     pub build_work_upper_bound: u64,
@@ -581,8 +614,9 @@ impl PatternMeta {
 #[derive(Debug)]
 struct PackedOwner {
     classifier: AsciiByteSetClassifier,
-    has_non_ascii_first_byte: bool,
-    first_byte_patterns: [u16; 256],
+    anchor_offset: u8,
+    has_non_ascii_anchor_byte: bool,
+    anchor_byte_patterns: [u16; 256],
     patterns: [PatternMeta; CERTIFIED_MAX_PATTERNS],
     encoded_patterns: [u8; IDENTITY_CAPACITY_BYTES],
     encoded_len: u16,
@@ -866,11 +900,13 @@ impl PlanCore {
             },
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            implementation_kind: "FRE-owned monotone first-byte SIMD candidate stream with ordered verification",
+            implementation_kind: "FRE-owned monotone fixed-anchor SIMD candidate stream with ordered verification",
             identity_scope: "process-local semantic identity with authenticated classifier receipt",
             target_arch: std::env::consts::ARCH,
             runtime_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
             semantics: SEMANTICS,
+            anchor_offset: usize::from(self.owner.anchor_offset),
+            anchor_has_non_ascii: self.owner.has_non_ascii_anchor_byte,
             classifier_selection: self.owner.classifier.selection(),
             certified_min_patterns: CERTIFIED_MIN_PATTERNS,
             certified_max_patterns: CERTIFIED_MAX_PATTERNS,
@@ -896,13 +932,14 @@ impl PlanCore {
         let (preflight, mut actual) = preflight(patterns, limits, inline_bytes)
             .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
 
+        let anchor_offset = select_anchor_offset(patterns, preflight.min_pattern_bytes);
         let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
         let mut pattern_meta = [PatternMeta::EMPTY; CERTIFIED_MAX_PATTERNS];
-        let mut first_byte_patterns = [0_u16; 256];
-        let mut first_byte_pattern_bytes = [0_usize; 256];
-        let mut max_first_byte_bucket_patterns = 0_usize;
-        let mut max_first_byte_bucket_pattern_bytes = 0_usize;
-        let mut has_non_ascii_first_byte = false;
+        let mut anchor_byte_patterns = [0_u16; 256];
+        let mut anchor_byte_pattern_bytes = [0_usize; 256];
+        let mut max_anchor_byte_bucket_patterns = 0_usize;
+        let mut max_anchor_byte_bucket_pattern_bytes = 0_usize;
+        let mut has_non_ascii_anchor_byte = false;
         let count = u64::try_from(patterns.len()).map_err(|_| {
             attempt_error(
                 BuildError::ArithmeticOverflow {
@@ -966,7 +1003,7 @@ impl PlanCore {
                     )
                 })?,
             };
-            let first = bytes[0];
+            let anchor = bytes[anchor_offset];
             let bit = 1_u16
                 .checked_shl(u32::try_from(index).map_err(|_| {
                     attempt_error(
@@ -986,31 +1023,31 @@ impl PlanCore {
                         actual,
                     )
                 })?;
-            first_byte_patterns[usize::from(first)] |= bit;
-            max_first_byte_bucket_patterns = max_first_byte_bucket_patterns.max(
-                usize::try_from(first_byte_patterns[usize::from(first)].count_ones())
+            anchor_byte_patterns[usize::from(anchor)] |= bit;
+            max_anchor_byte_bucket_patterns = max_anchor_byte_bucket_patterns.max(
+                usize::try_from(anchor_byte_patterns[usize::from(anchor)].count_ones())
                     .expect("u16 population count always fits a supported usize"),
             );
-            first_byte_pattern_bytes[usize::from(first)] = first_byte_pattern_bytes
-                [usize::from(first)]
+            anchor_byte_pattern_bytes[usize::from(anchor)] = anchor_byte_pattern_bytes
+                [usize::from(anchor)]
             .checked_add(bytes.len())
             .ok_or_else(|| {
                 attempt_error(
                     BuildError::ArithmeticOverflow {
-                        computation: "first-byte bucket pattern bytes",
+                        computation: "anchor-byte bucket pattern bytes",
                     },
                     identity,
                     actual,
                 )
             })?;
-            max_first_byte_bucket_pattern_bytes = max_first_byte_bucket_pattern_bytes
-                .max(first_byte_pattern_bytes[usize::from(first)]);
-            if first < 128 {
-                let word = usize::from(first / 64);
-                let shift = u32::from(first % 64);
+            max_anchor_byte_bucket_pattern_bytes = max_anchor_byte_bucket_pattern_bytes
+                .max(anchor_byte_pattern_bytes[usize::from(anchor)]);
+            if anchor < 128 {
+                let word = usize::from(anchor / 64);
+                let shift = u32::from(anchor % 64);
                 ascii_words[word] |= 1_u64 << shift;
             } else {
-                has_non_ascii_first_byte = true;
+                has_non_ascii_anchor_byte = true;
             }
             cursor = bytes_end;
         }
@@ -1031,8 +1068,17 @@ impl PlanCore {
             .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
         let owner = PackedOwner {
             classifier,
-            has_non_ascii_first_byte,
-            first_byte_patterns,
+            anchor_offset: u8::try_from(anchor_offset).map_err(|_| {
+                attempt_error(
+                    BuildError::ArithmeticOverflow {
+                        computation: "anchor offset metadata",
+                    },
+                    identity,
+                    actual,
+                )
+            })?,
+            has_non_ascii_anchor_byte,
+            anchor_byte_patterns,
             patterns: pattern_meta,
             encoded_patterns,
             encoded_len: u16::try_from(cursor).map_err(|_| {
@@ -1075,8 +1121,11 @@ impl PlanCore {
             pattern_bytes: preflight.pattern_bytes,
             max_pattern_bytes: preflight.max_pattern_bytes,
             min_pattern_bytes: preflight.min_pattern_bytes,
-            max_first_byte_bucket_patterns,
-            max_first_byte_bucket_pattern_bytes,
+            anchor_offset,
+            anchor_has_non_ascii: has_non_ascii_anchor_byte,
+            anchor_selection_work: preflight.anchor_selection_work,
+            max_anchor_byte_bucket_patterns,
+            max_anchor_byte_bucket_pattern_bytes,
             identity_bytes: preflight.identity_bytes,
             identity_capacity_bytes: IDENTITY_CAPACITY_BYTES,
             build_work_upper_bound: preflight.build_work,
@@ -1119,17 +1168,17 @@ impl PlanCore {
                 })?
         };
         let pattern_checks = candidate_positions
-            .checked_mul(self.build.max_first_byte_bucket_patterns)
+            .checked_mul(self.build.max_anchor_byte_bucket_patterns)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "pattern checks",
             })?;
         let verification_reads = candidate_positions
-            .checked_mul(self.build.max_first_byte_bucket_pattern_bytes)
+            .checked_mul(self.build.max_anchor_byte_bucket_pattern_bytes)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "verification source reads",
             })?;
         let fixed_source_reads_per_position = 2_usize
-            .checked_add(usize::from(self.owner.has_non_ascii_first_byte))
+            .checked_add(usize::from(self.owner.has_non_ascii_anchor_byte))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "fixed source reads per position",
             })?;
@@ -1141,8 +1190,8 @@ impl PlanCore {
             })?;
         let work_per_position = self
             .build
-            .max_first_byte_bucket_pattern_bytes
-            .checked_add(self.build.max_first_byte_bucket_patterns)
+            .max_anchor_byte_bucket_pattern_bytes
+            .checked_add(self.build.max_anchor_byte_bucket_patterns)
             .and_then(|work| work.checked_add(4))
             .and_then(|work| work.checked_add(fixed_source_reads_per_position))
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -1208,6 +1257,7 @@ impl PlanCore {
     ) -> Result<ReduceOutcome, ReduceError> {
         let upper = self.preflight_reduce::<SPAN_SUM>(haystack.len(), limits)?;
         let candidate_positions = upper.candidate_positions;
+        let anchor_offset = usize::from(self.owner.anchor_offset);
         let mut block_start = 0_usize;
         let mut consumed_through = 0_usize;
         let mut candidate_events = 0_usize;
@@ -1224,14 +1274,25 @@ impl PlanCore {
                     computation: "SIMD block end",
                 },
             )?;
-            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[block_start..block_end]
+            let anchor_block_start =
+                block_start
+                    .checked_add(anchor_offset)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "SIMD anchor block start",
+                    })?;
+            let anchor_block_end = anchor_block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "SIMD anchor block end",
+                },
+            )?;
+            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[anchor_block_start..anchor_block_end]
                 .try_into()
                 .map_err(|_| ReduceError::InternalInvariant {
-                    detail: "complete candidate block lost its fixed extent",
+                    detail: "complete anchor block lost its fixed extent",
                 })?;
             let classified = self.owner.classifier.classify_32(block);
             let mut candidates = classified.member_mask();
-            if self.owner.has_non_ascii_first_byte {
+            if self.owner.has_non_ascii_anchor_byte {
                 let mut non_ascii = !classified.ascii_mask();
                 while non_ascii != 0 {
                     let lane = non_ascii.trailing_zeros();
@@ -1240,7 +1301,7 @@ impl PlanCore {
                         usize::try_from(lane).map_err(|_| ReduceError::ArithmeticOverflow {
                             computation: "non-ASCII candidate lane",
                         })?;
-                    if self.owner.first_byte_patterns[usize::from(block[lane_usize])] != 0 {
+                    if self.owner.anchor_byte_patterns[usize::from(block[lane_usize])] != 0 {
                         candidates |= 1_u32 << lane;
                     }
                 }
@@ -1258,8 +1319,14 @@ impl PlanCore {
             block_start = block_end;
         }
         while block_start < candidate_positions {
-            let byte = haystack[block_start];
-            if self.owner.first_byte_patterns[usize::from(byte)] != 0 {
+            let anchor_position =
+                block_start
+                    .checked_add(anchor_offset)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "scalar anchor position",
+                    })?;
+            let byte = haystack[anchor_position];
+            if self.owner.anchor_byte_patterns[usize::from(byte)] != 0 {
                 candidate_events =
                     candidate_events
                         .checked_add(1)
@@ -1389,7 +1456,13 @@ impl PlanCore {
         if start < *consumed_through {
             return Ok(());
         }
-        let mut pattern_bits = self.owner.first_byte_patterns[usize::from(haystack[start])];
+        let anchor_position = start
+            .checked_add(usize::from(self.owner.anchor_offset))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "candidate anchor position",
+            })?;
+        let mut pattern_bits =
+            self.owner.anchor_byte_patterns[usize::from(haystack[anchor_position])];
         while pattern_bits != 0 {
             let id = pattern_bits.trailing_zeros();
             pattern_bits &= pattern_bits.wrapping_sub(1);
@@ -1434,11 +1507,67 @@ impl PlanCore {
     }
 }
 
+/// Choose the lowest-cost common byte offset using a frozen general-purpose
+/// byte-frequency rank and the complete pattern fan-out behind each distinct
+/// anchor. Every prior-ID and bucket comparison is performed, including after
+/// a duplicate is known, so construction work is exact and source-independent.
+fn select_anchor_offset<P: AsRef<[u8]>>(patterns: &[P], min_pattern_bytes: usize) -> usize {
+    debug_assert!(!patterns.is_empty());
+    debug_assert!(min_pattern_bytes != 0);
+    let mut selected_offset = 0_usize;
+    let mut selected_score = u64::MAX;
+    for offset in 0..min_pattern_bytes {
+        let mut score = 0_u64;
+        for (index, pattern) in patterns.iter().enumerate() {
+            let anchor = pattern.as_ref()[offset];
+            let mut seen = false;
+            for prior in &patterns[..index] {
+                seen |= prior.as_ref()[offset] == anchor;
+            }
+            let mut bucket_patterns = 0_u64;
+            let mut bucket_pattern_bytes = 0_u64;
+            for candidate in patterns {
+                if candidate.as_ref()[offset] == anchor {
+                    bucket_patterns = bucket_patterns
+                        .checked_add(1)
+                        .expect("a certified pattern count fits in u64");
+                    bucket_pattern_bytes = bucket_pattern_bytes
+                        .checked_add(
+                            u64::try_from(candidate.as_ref().len())
+                                .expect("a certified pattern width fits in u64"),
+                        )
+                        .expect("certified total pattern bytes fit in u64");
+                }
+            }
+            if !seen {
+                let frequency_weight = u64::from(BYTE_FREQUENCY_RANK[usize::from(anchor)])
+                    .checked_add(1)
+                    .expect("a byte-frequency rank plus one fits in u64");
+                let bucket_cost = bucket_patterns
+                    .checked_add(bucket_pattern_bytes)
+                    .expect("certified bucket cost fits in u64");
+                let weighted_cost = frequency_weight
+                    .checked_mul(bucket_cost)
+                    .expect("certified weighted bucket cost fits in u64");
+                score = score
+                    .checked_add(weighted_cost)
+                    .expect("certified anchor score fits in u64");
+            }
+        }
+        if score < selected_score {
+            selected_offset = offset;
+            selected_score = score;
+        }
+    }
+    selected_offset
+}
+
 #[derive(Clone, Copy)]
 struct BuildPreflight {
     pattern_bytes: usize,
     max_pattern_bytes: usize,
     min_pattern_bytes: usize,
+    anchor_selection_work: u64,
     identity_bytes: usize,
     build_work: u64,
     persistent_bytes: usize,
@@ -1623,9 +1752,39 @@ fn preflight<P: AsRef<[u8]>>(
             actual,
         });
     }
+    let prior_anchor_comparisons = patterns
+        .len()
+        .checked_mul(patterns.len().saturating_sub(1))
+        .map(|work| work / 2)
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "fixed-anchor prior-ID comparisons",
+            },
+            actual,
+        })?;
+    let bucket_anchor_comparisons =
+        patterns
+            .len()
+            .checked_mul(patterns.len())
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "fixed-anchor bucket comparisons",
+                },
+                actual,
+            })?;
+    let anchor_selection_work = prior_anchor_comparisons
+        .checked_add(bucket_anchor_comparisons)
+        .and_then(|work| work.checked_mul(min_pattern_bytes))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "fixed-anchor selection work",
+            },
+            actual,
+        })?;
     let build_work_usize = patterns
         .len()
         .checked_add(1)
+        .and_then(|work| work.checked_add(anchor_selection_work))
         .and_then(|work| work.checked_add(size_of::<PackedOwner>()))
         .and_then(|work| work.checked_add(identity_bytes))
         .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
@@ -1678,11 +1837,19 @@ fn preflight<P: AsRef<[u8]>>(
         },
         actual,
     })?;
+    let anchor_selection_work =
+        u64::try_from(anchor_selection_work).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "fixed-anchor selection work as u64",
+            },
+            actual,
+        })?;
     Ok((
         BuildPreflight {
             pattern_bytes,
             max_pattern_bytes,
             min_pattern_bytes,
+            anchor_selection_work,
             identity_bytes,
             build_work,
             persistent_bytes,
@@ -2228,8 +2395,12 @@ mod tests {
         let plan =
             PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
         let build = plan.build_accounting();
-        assert_eq!(build.max_first_byte_bucket_patterns, 1);
-        assert_eq!(build.max_first_byte_bucket_pattern_bytes, b"Sherlock".len());
+        assert_eq!(build.anchor_offset, 0);
+        assert_eq!(build.max_anchor_byte_bucket_patterns, 1);
+        assert_eq!(
+            build.max_anchor_byte_bucket_pattern_bytes,
+            b"Sherlock".len()
+        );
         let result = plan
             .count(
                 b"Sherlock and Holmes and Sherlock",
@@ -2257,5 +2428,59 @@ mod tests {
         assert!(actual.work <= upper.work);
         assert_eq!(upper.restart_tail_positions, 0);
         assert_eq!(upper.iterator_setup_work, 0);
+    }
+
+    #[test]
+    fn ranked_fixed_anchor_preserves_order_and_selects_rare_columns() {
+        let split = PackedOrderedLiteralCountPlan::build(&[b"ab", b"ac"], BuildLimits::unlimited())
+            .unwrap();
+        let split_build = split.build_accounting();
+        assert_eq!(split_build.anchor_offset, 1);
+        assert_eq!(split_build.max_anchor_byte_bucket_patterns, 1);
+        assert_eq!(
+            split
+                .count(b"abac xx ac", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            3
+        );
+
+        let english = PackedOrderedLiteralCountPlan::build(
+            &[
+                b"Sherlock Holmes".as_slice(),
+                b"John Watson".as_slice(),
+                b"Irene Adler".as_slice(),
+                b"Inspector Lestrade".as_slice(),
+                b"Professor Moriarty".as_slice(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(english.build_accounting().anchor_offset, 0);
+
+        let chinese = PackedOrderedLiteralCountPlan::build(
+            &[
+                "夏洛克·福尔摩斯".as_bytes(),
+                "约翰华生".as_bytes(),
+                "阿德勒".as_bytes(),
+                "雷斯垂德".as_bytes(),
+                "莫里亚蒂教授".as_bytes(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let chinese_build = chinese.build_accounting();
+        assert_eq!(chinese_build.anchor_offset, 8);
+        assert!(chinese_build.anchor_has_non_ascii);
+        assert_eq!(
+            chinese
+                .count(
+                    "莫里亚蒂教授和夏洛克·福尔摩斯以及阿德勒".as_bytes(),
+                    ReduceLimits::unlimited()
+                )
+                .unwrap()
+                .count,
+            3
+        );
     }
 }

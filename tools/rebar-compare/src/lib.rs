@@ -206,7 +206,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v41-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v1-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v42-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -552,7 +552,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             runtime_sha256,
         };
         identity.identity.push_str(
-            "; finite-packed-v1 selects a bounded packed literal scanner as a distinct physical finite-language plan before dense construction",
+            "; finite-packed-v2 selects a ranked-anchor packed literal scanner as a distinct physical finite-language plan before dense construction",
         );
         identity.availability.push_str(
             "; eligible small nonempty finite literal languages use the bounded packed scanner under the existing finite build and run envelope",
@@ -2179,7 +2179,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-finite-literal-dfa"
         }
         ("compile", AggregatePlanKind::PackedFiniteLiteral, _) => {
-            "compile-aggregate-finite-literal-packed-v1"
+            "compile-aggregate-finite-literal-packed-v2"
         }
         ("compile", AggregatePlanKind::GuardedAsciiWordDictionary, _) => {
             "compile-aggregate-guarded-ascii-word"
@@ -2209,7 +2209,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::BoundedLiteralPair, _) => "aggregate-bounded-literal-pair-v1",
         (_, AggregatePlanKind::FiniteLiteralDfa, true) => "aggregate-finite-literal-sparse",
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
-        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v1",
+        (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v2",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
@@ -19442,7 +19442,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v41-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v1-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v42-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -19456,7 +19456,7 @@ mod tests {
                 .contains("canonical terminal-scalar encodings")
         );
         assert!(identity.identity.contains("fixed class-sandwich"));
-        assert!(identity.identity.contains("finite-packed-v1"));
+        assert!(identity.identity.contains("finite-packed-v2"));
         assert!(identity.availability.contains("bounded packed scanner"));
         assert!(
             identity
@@ -19827,7 +19827,7 @@ mod tests {
                 &limits,
             ),
             2,
-            "aggregate-finite-literal-packed-v1",
+            "aggregate-finite-literal-packed-v2",
         );
         assert_current_fre_execution(
             current_fre(
@@ -19839,7 +19839,7 @@ mod tests {
                 &limits,
             ),
             6,
-            "aggregate-finite-literal-packed-v1",
+            "aggregate-finite-literal-packed-v2",
         );
 
         assert_current_fre_execution(
@@ -19874,7 +19874,7 @@ mod tests {
             .expect("packed finite count identity");
         assert_eq!(
             aggregate_single_plan_label("count", count_report),
-            "aggregate-finite-literal-packed-v1"
+            "aggregate-finite-literal-packed-v2"
         );
 
         let count_limits = current_fre_rebar_aggregate_run_limits(haystack.len(), count_report)
@@ -19942,7 +19942,7 @@ mod tests {
         .expect("packed finite span-sum identity");
         assert_eq!(
             aggregate_single_plan_label("count-spans", span_sum.build_report()),
-            "aggregate-finite-literal-packed-v1"
+            "aggregate-finite-literal-packed-v2"
         );
         let span_limits = current_fre_rebar_span_sum_run_limits(haystack.len(), &span_sum)
             .expect("packed finite span-sum limits");
@@ -19962,7 +19962,7 @@ mod tests {
             .expect("packed finite compile identity");
         assert_eq!(
             aggregate_single_plan_label("compile", compile.build_report()),
-            "compile-aggregate-finite-literal-packed-v1"
+            "compile-aggregate-finite-literal-packed-v2"
         );
 
         let mut forged = count_report.clone();
@@ -20061,7 +20061,7 @@ mod tests {
                 &limits,
             ),
             3,
-            "aggregate-finite-literal-packed-v1",
+            "aggregate-finite-literal-packed-v2",
         );
         assert_current_fre_execution(
             current_fre(
@@ -20073,7 +20073,7 @@ mod tests {
                 &limits,
             ),
             9,
-            "aggregate-finite-literal-packed-v1",
+            "aggregate-finite-literal-packed-v2",
         );
     }
 
@@ -20846,7 +20846,7 @@ mod tests {
             true,
             &limits,
         );
-        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-packed-v1");
+        assert_current_fre_execution(folded, 1, "aggregate-finite-literal-packed-v2");
         assert_current_fre_execution(
             current_fre(
                 "count",
