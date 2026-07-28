@@ -93,9 +93,10 @@ an open P0 row.
   routes.
 - [x] `fre-jit-runtime`: audited macOS/AArch64 strict-W^X publication with
   inaccessible guards, copy verification, rollback and concurrent-lifetime
-  tests, plus 663,084 actual-hardware/oracle comparisons. The explicit
-  16-byte `QualifiedExactSearch` large-window/reuse leaf is performance
-  qualified; default planner selection and every broader shape remain open.
+  tests, plus 663,084 retained actual-hardware/oracle comparisons. The explicit
+  16-byte `QualifiedExactSearch` large-window/reuse leaf remains a Candidate:
+  all four current qualification atoms are `Candidate`, legacy V7 is hard
+  `Candidate`, and no current Search JIT leaf is performance-qualified.
 - [x] `fre-jit-cache`: bounded typed single-flight publication, deterministic
   eviction, exact live mapping/code/data accounting across leases, forced
   retirement-race recovery, and O(1) allocation-free image identity access;
@@ -251,20 +252,18 @@ All 107 reference-relative losses are retained. Repeated naive confirmation
 remains capped at 32 bytes; larger shapes require a proved-linear Two-Way or
 automaton plan.
 
-Search V7 now has one deliberately narrow promotion. Exact Q commit
-`88e9c22c4ac382531bc1026ca0e25587905f5206` passed a fresh complete 90-cell
-main run, the 54-cell alternating adversarial run, the targeted 30-process
-retry, frozen semantic replay, and independent execution/evidence review.
-All 60 facade gates beat the portable kernel, with maximum ratio
-`0.939701493`; all 18 adversarial gates passed at maximum `0.152542373`, and
-the targeted gate passed at `0.971576447`. The direct-child promotion binds
+Historical Search V7 evidence from exact Q commit
+`88e9c22c4ac382531bc1026ca0e25587905f5206` retained a complete 90-cell main
+run, the 54-cell alternating adversarial run, the targeted 30-process retry,
+frozen semantic replay, and independent execution/evidence review. That
+historical source recorded 60/60 facade gates below the portable kernel
+(maximum ratio `0.939701493`), all 18 adversarial gates at maximum
+`0.152542373`, and the targeted gate at `0.971576447`. Its direct child bound
 external canonical bundle SHA-256
-`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`
-and changes only the isolated qualification atom in production source. This
-authorizes only explicit 16-byte searches declaring at least 1,024 calls over
-64 KiB windows or at least 64 calls over 1 MiB windows. It does not select a
-default route or qualify class-plus-suffix, Sherlock/aggregate, other widths,
-x86-64, or AOT.
+`de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
+Those results and that historical atom are non-authoritative for this composed
+tree: legacy V7 is hard `Candidate`, all four current qualification atoms are
+`Candidate`, and no Search JIT execution or speed promotion is current.
 
 The separate AOT track is direct machine code, not LLVM regex compilation.
 FRE's custom AArch64 emitters produce the regex payloads; the AOT compiler

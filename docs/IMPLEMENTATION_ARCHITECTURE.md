@@ -136,11 +136,12 @@ Native JIT code also requires a verified relocation/branch target model,
 W^X publication lifecycle, instruction-cache synchronization, target-feature
 checks, bounded code-cache behavior, and parity tests against the Kernel IR and
 K0. A native loop over regex bytecode is not accepted as JIT specialization.
-The current AArch64 exact-search contract is `SEARCH_V7`: two ranked vector
-columns form the initial mask, and ranked third/fourth columns are loaded only
-while that mask has multiple survivors. Sparse recovery selects lanes in
-ascending order, preserves reusable filter constants across rejected full
-confirmations, and retains byte-identical V1--V6 AOT identities.
+The current default AArch64 exact-search emitter contract is `SEARCH_V8`
+(`SearchBackendPolicy::AsimdV8`). It uses lazy 64-candidate screening with the
+V7 staged-recovery fallback, while the historical backend encodings remain
+versioned and byte-stable. This emitter default is not facade authorization:
+the V8, tag-10, tag-19, and tag-21 qualification atoms are all `Candidate`,
+and legacy V7 remains hard `Candidate`.
 
 AOT adds no LLVM or other second regex optimizer. Search packages the same
 audited native-image contract used by its JIT, while Count-v2 packages its
