@@ -7702,18 +7702,36 @@ fn cached_boundary_symbol(
 ) -> Result<u64, Error> {
     try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
     let mut assertion_mask = 0_u64;
-    for assertion in CACHED_ASSERTIONS {
-        try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
-        let bit = 1_u32 << assertion.identity_tag();
-        if used_assertions & bit == 0 {
-            continue;
+    if used_assertions == 0 {
+        let slots = CACHED_ASSERTIONS.len();
+        let can_bulk_charge = accounting
+            .work
+            .checked_add(slots)
+            .is_some_and(|required| required <= admitted_work_bound)
+            && accounting.frontier_bookkeeping.checked_add(slots).is_some();
+        if can_bulk_charge {
+            try_charge_frontier_amount(accounting, admitted_work_bound, slots)?;
+        } else {
+            // Preserve the established partial receipt at a one-below work
+            // bound or arithmetic edge. The admitted hot path bulk-charges
+            // the same logical slots without dispatching 18 empty cases.
+            for _ in 0..slots {
+                try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+            }
         }
-        try_charge_assertion(accounting, admitted_work_bound)?;
-        if assertion_matches(assertions, assertion, position, accounting, track_source)? {
-            assertion_mask |= 1_u64 << assertion.identity_tag();
+    } else {
+        for assertion in CACHED_ASSERTIONS {
+            try_charge_frontier_amount(accounting, admitted_work_bound, 1)?;
+            let bit = 1_u32 << assertion.identity_tag();
+            if used_assertions & bit == 0 {
+                continue;
+            }
+            try_charge_assertion(accounting, admitted_work_bound)?;
+            if assertion_matches(assertions, assertion, position, accounting, track_source)? {
+                assertion_mask |= 1_u64 << assertion.identity_tag();
+            }
         }
     }
-    let seeded = true;
     let byte = if let Some(byte) = haystack.get(position) {
         accounting.random_access_bytes_read = add(
             accounting.random_access_bytes_read,
@@ -7738,7 +7756,7 @@ fn cached_boundary_symbol(
     };
     Ok(byte
         | (assertion_mask << CACHED_ASSERTION_SHIFT)
-        | (u64::from(seeded) << CACHED_SEED_SHIFT)
+        | (1_u64 << CACHED_SEED_SHIFT)
         | (u64::from(scalar) << CACHED_SCALAR_SHIFT))
 }
 
@@ -13256,6 +13274,60 @@ mod tests {
         let zero_p = zero.receipt.prospective.unwrap();
         assert_eq!(zero_p.work_bound, 0);
         assert!(zero_p.contains(zero.receipt.actual));
+    }
+
+    #[test]
+    fn cached_symbol_without_assertions_retains_exact_logical_charge() {
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse("a")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"a";
+        let assertions = AssertionContext::new(haystack, 0, haystack.len()).unwrap();
+        let mut accounting = ExecutionAccounting::default();
+        let _ = cached_boundary_symbol(
+            &compiled.program,
+            assertions,
+            haystack,
+            0,
+            0,
+            &mut accounting,
+            usize::MAX,
+            false,
+        )
+        .unwrap();
+        assert_eq!(accounting.frontier_bookkeeping, 19);
+        assert_eq!(accounting.work, 19);
+
+        let mut partial = ExecutionAccounting::default();
+        assert_eq!(
+            cached_boundary_symbol(
+                &compiled.program,
+                assertions,
+                haystack,
+                0,
+                0,
+                &mut partial,
+                10,
+                false,
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::ExecutionWork,
+                required: 11,
+                limit: 10,
+            })
+        );
+        assert_eq!(partial.frontier_bookkeeping, 10);
+        assert_eq!(partial.work, 10);
+        assert_eq!(partial.random_access_bytes_read, 0);
     }
 
     #[test]
