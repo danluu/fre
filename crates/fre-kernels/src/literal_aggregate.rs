@@ -1410,6 +1410,12 @@ struct DispatchedLiteralAggregateOwner {
     classifier: AsciiByteSetClassifier,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValueReduction {
+    count: u64,
+    matched_bytes: u64,
+}
+
 impl DispatchedLiteralAggregatePlan {
     /// Exact classifier construction work added to the established literal.
     #[must_use]
@@ -1506,6 +1512,20 @@ impl DispatchedLiteralAggregatePlan {
             .map_err(|error| error.source)
     }
 
+    /// Return only a successfully admitted count without materializing a
+    /// success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::count_attempt`] with the same arguments so the
+    /// refusal retains its complete authenticated P/A receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.value_success(haystack, limits, Operation::Count)
+            .map(|value| value.count)
+    }
+
     /// Count while retaining the complete prospective/actual receipt.
     #[allow(
         clippy::result_large_err,
@@ -1578,6 +1598,20 @@ impl DispatchedLiteralAggregatePlan {
             .map_err(|error| error.source)
     }
 
+    /// Return only a successfully admitted span sum without materializing a
+    /// success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::span_sum_attempt`] with the same arguments so
+    /// the refusal retains its complete authenticated P/A receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.value_success(haystack, limits, Operation::SpanSum)
+            .map(|value| value.matched_bytes)
+    }
+
     /// Span-sum while retaining the complete prospective/actual receipt.
     #[allow(
         clippy::result_large_err,
@@ -1646,6 +1680,24 @@ impl DispatchedLiteralAggregatePlan {
             plan_origin: self.owner().established.plan_origin,
             limits,
         }
+    }
+
+    #[inline]
+    fn value_success(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        operation: Operation,
+    ) -> Option<ValueReduction> {
+        let established = &self.owner().established;
+        let upper = established
+            .value_preflight(haystack.len(), limits, operation)
+            .ok()?;
+        let Some(probe_count) = self.classifier_probe(haystack) else {
+            return established.execute_value(haystack, upper).ok();
+        };
+        let count = self.classifier_count(haystack, probe_count).ok()?;
+        established.checked_value_from_count(count, upper).ok()
     }
 
     fn execute(
@@ -2161,6 +2213,20 @@ impl LiteralAggregatePlan {
             .map_err(|error| error.source)
     }
 
+    /// Return only a successfully admitted count without materializing a
+    /// success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::count_attempt`] with the same arguments so the
+    /// refusal retains its complete authenticated P/A receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.value_success(haystack, limits, Operation::Count)
+            .map(|value| value.count)
+    }
+
     /// Reduce the whole haystack while retaining an authenticated success or
     /// failure receipt.
     ///
@@ -2253,6 +2319,20 @@ impl LiteralAggregatePlan {
         self.span_sum_attempt(haystack, limits)
             .map(|attempt| attempt.result)
             .map_err(|error| error.source)
+    }
+
+    /// Return only a successfully admitted span sum without materializing a
+    /// success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::span_sum_attempt`] with the same arguments so
+    /// the refusal retains its complete authenticated P/A receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.value_success(haystack, limits, Operation::SpanSum)
+            .map(|value| value.matched_bytes)
     }
 
     /// Reduce the whole haystack to a span sum while retaining an authenticated
@@ -2354,49 +2434,94 @@ impl LiteralAggregatePlan {
         receipt.prospective = Some(upper);
         let operation = receipt.identity.operation;
         let limits = receipt.invocation.limits;
-        if upper.linear_terms > limits.max_linear_terms {
-            return Err(ReduceError::LinearTermsLimit {
-                needed: upper.linear_terms,
-                limit: limits.max_linear_terms,
-            });
-        }
-        if upper.match_events > limits.max_match_events {
-            return Err(ReduceError::MatchEventsLimit {
-                needed: upper.match_events,
-                limit: limits.max_match_events,
-            });
-        }
-        if upper.count > limits.max_count {
-            return Err(ReduceError::CountLimit {
-                needed: upper.count,
-                limit: limits.max_count,
-            });
-        }
-        if operation == Operation::SpanSum && upper.span_sum > limits.max_span_sum {
-            return Err(ReduceError::SpanSumLimit {
-                needed: upper.span_sum,
-                limit: limits.max_span_sum,
-            });
-        }
-        if upper.reducer_steps > limits.max_reducer_steps {
-            return Err(ReduceError::ReducerStepsLimit {
-                needed: upper.reducer_steps,
-                limit: limits.max_reducer_steps,
-            });
-        }
-        if upper.scratch_bytes > limits.max_scratch_bytes {
-            return Err(ReduceError::ScratchLimit {
-                needed: upper.scratch_bytes,
-                limit: limits.max_scratch_bytes,
-            });
-        }
-        if upper.peak_bytes > limits.max_peak_bytes {
-            return Err(ReduceError::PeakLimit {
-                needed: upper.peak_bytes,
-                limit: limits.max_peak_bytes,
-            });
-        }
+        enforce_reduce_limits(upper, limits, operation)?;
         Ok(upper)
+    }
+
+    #[inline]
+    fn value_success(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        operation: Operation,
+    ) -> Option<ValueReduction> {
+        let upper = self
+            .value_preflight(haystack.len(), limits, operation)
+            .ok()?;
+        self.execute_value(haystack, upper).ok()
+    }
+
+    #[inline]
+    fn value_preflight(
+        &self,
+        haystack_len: usize,
+        limits: ReduceLimits,
+        operation: Operation,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let upper = compute_upper_bounds(
+            haystack_len,
+            self.needle().len(),
+            self.build.persistent_bytes,
+        )?;
+        enforce_reduce_limits(upper, limits, operation)?;
+        Ok(upper)
+    }
+
+    #[inline]
+    fn execute_value(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+    ) -> Result<ValueReduction, ReduceError> {
+        if self.needle().is_empty() {
+            return Ok(ValueReduction {
+                count: upper.count,
+                matched_bytes: 0,
+            });
+        }
+        let match_events = self.finder.find_iter(haystack).count();
+        let count = u64::try_from(match_events).map_err(|_| ReduceError::ReceiptInvariant {
+            detail: "compact exact-literal traversal escaped its prospective envelope",
+        })?;
+        self.checked_value_from_count(count, upper)
+    }
+
+    #[inline]
+    fn checked_value_from_count(
+        &self,
+        count: u64,
+        upper: ReduceUpperBounds,
+    ) -> Result<ValueReduction, ReduceError> {
+        let match_events = usize::try_from(count).map_err(|_| ReduceError::ReceiptInvariant {
+            detail: "compact exact-literal traversal escaped its prospective envelope",
+        })?;
+        let reducer_steps = match_events
+            .checked_add(1)
+            .ok_or(ReduceError::ReceiptInvariant {
+                detail: "compact exact-literal traversal escaped its prospective envelope",
+            })?;
+        let needle =
+            u64::try_from(self.needle().len()).map_err(|_| ReduceError::ReceiptInvariant {
+                detail: "compact exact-literal traversal escaped its prospective envelope",
+            })?;
+        let matched_bytes = count
+            .checked_mul(needle)
+            .ok_or(ReduceError::ReceiptInvariant {
+                detail: "compact exact-literal traversal escaped its prospective envelope",
+            })?;
+        if match_events > upper.match_events
+            || reducer_steps > upper.reducer_steps
+            || count > upper.count
+            || matched_bytes > upper.span_sum
+        {
+            return Err(ReduceError::ReceiptInvariant {
+                detail: "compact exact-literal traversal escaped its prospective envelope",
+            });
+        }
+        Ok(ValueReduction {
+            count,
+            matched_bytes,
+        })
     }
 
     fn execute(
@@ -2795,6 +2920,57 @@ fn compute_upper_bounds(
     })
 }
 
+#[inline]
+fn enforce_reduce_limits(
+    upper: ReduceUpperBounds,
+    limits: ReduceLimits,
+    operation: Operation,
+) -> Result<(), ReduceError> {
+    if upper.linear_terms > limits.max_linear_terms {
+        return Err(ReduceError::LinearTermsLimit {
+            needed: upper.linear_terms,
+            limit: limits.max_linear_terms,
+        });
+    }
+    if upper.match_events > limits.max_match_events {
+        return Err(ReduceError::MatchEventsLimit {
+            needed: upper.match_events,
+            limit: limits.max_match_events,
+        });
+    }
+    if upper.count > limits.max_count {
+        return Err(ReduceError::CountLimit {
+            needed: upper.count,
+            limit: limits.max_count,
+        });
+    }
+    if operation == Operation::SpanSum && upper.span_sum > limits.max_span_sum {
+        return Err(ReduceError::SpanSumLimit {
+            needed: upper.span_sum,
+            limit: limits.max_span_sum,
+        });
+    }
+    if upper.reducer_steps > limits.max_reducer_steps {
+        return Err(ReduceError::ReducerStepsLimit {
+            needed: upper.reducer_steps,
+            limit: limits.max_reducer_steps,
+        });
+    }
+    if upper.scratch_bytes > limits.max_scratch_bytes {
+        return Err(ReduceError::ScratchLimit {
+            needed: upper.scratch_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+    if upper.peak_bytes > limits.max_peak_bytes {
+        return Err(ReduceError::PeakLimit {
+            needed: upper.peak_bytes,
+            limit: limits.max_peak_bytes,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
@@ -2984,6 +3160,14 @@ mod tests {
                     .unwrap()
                     .span_sum,
                 expected_count.count
+            );
+            assert_eq!(
+                dispatched.count_value_success(haystack, ReduceLimits::unlimited()),
+                Some(expected_count.count)
+            );
+            assert_eq!(
+                dispatched.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+                Some(expected_count.count)
             );
         }
         assert_ne!(
@@ -3596,12 +3780,25 @@ mod tests {
                 }
                 let count = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
                 let span_sum = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+                let count_value = plan.count_value_success(haystack, ReduceLimits::unlimited());
+                let span_sum_value =
+                    plan.span_sum_value_success(haystack, ReduceLimits::unlimited());
                 assert_eq!(
                     count.count, expected_count,
                     "needle={needle:?} hay={haystack:?}"
                 );
                 assert_eq!(
                     span_sum.span_sum, expected_span_sum,
+                    "needle={needle:?} hay={haystack:?}"
+                );
+                assert_eq!(
+                    count_value,
+                    Some(expected_count),
+                    "needle={needle:?} hay={haystack:?}"
+                );
+                assert_eq!(
+                    span_sum_value,
+                    Some(expected_span_sum),
                     "needle={needle:?} hay={haystack:?}"
                 );
                 assert_eq!(count.accounting.actual.count, expected_count);
@@ -3699,6 +3896,7 @@ mod tests {
         assert!(exact_span.closes());
         assert_eq!(exact_span.receipt.prospective, Some(baseline));
         assert!(exact_span.receipt.retains_bounded_actual());
+        assert_eq!(plan.span_sum_value_success(haystack, exact), Some(8));
 
         let cases = [
             (
@@ -3745,6 +3943,7 @@ mod tests {
             ),
         ];
         for (limits, expected) in cases {
+            assert_eq!(plan.span_sum_value_success(haystack, limits), None);
             let error = plan.span_sum_attempt(haystack, limits).unwrap_err();
             let actual = match error.source {
                 ReduceError::LinearTermsLimit { .. } => "linear",
@@ -3778,6 +3977,7 @@ mod tests {
         let count_attempt = plan.count_attempt(haystack, count_only).unwrap();
         assert_eq!(count_attempt.result.count, 4);
         assert!(count_attempt.closes());
+        assert_eq!(plan.count_value_success(haystack, count_only), Some(4));
 
         let count_cases = [
             (
@@ -3817,6 +4017,7 @@ mod tests {
             ),
         ];
         for (limits, expected) in count_cases {
+            assert_eq!(plan.count_value_success(haystack, limits), None);
             let error = plan.count_attempt(haystack, limits).unwrap_err();
             let actual = match error.source {
                 ReduceError::LinearTermsLimit { .. } => "linear",

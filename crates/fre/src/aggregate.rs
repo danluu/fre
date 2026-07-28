@@ -16286,6 +16286,52 @@ impl AggregatePlan {
             })
     }
 
+    #[inline(never)]
+    fn execute_exact_literal_count_value(
+        &self,
+        engine: &LiteralAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.count_value_success(haystack, limits.exact_literal) {
+            return Ok(value);
+        }
+        match engine.count_attempt(haystack, limits.exact_literal) {
+            Err(attempt) => {
+                Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+            }
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact exact-literal count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_dispatched_exact_literal_count_value(
+        &self,
+        engine: &DispatchedLiteralAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.count_value_success(haystack, limits.exact_literal) {
+            return Ok(value);
+        }
+        match engine.count_attempt(haystack, limits.exact_literal) {
+            Err(attempt) => {
+                Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+            }
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dispatched exact-literal count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode count plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16296,6 +16342,12 @@ impl AggregatePlan {
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
+            AggregateEngine::ExactLiteral(engine) => {
+                self.execute_exact_literal_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedExactLiteral(engine) => {
+                self.execute_dispatched_exact_literal_count_value(engine, haystack, limits)
+            }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_count_value(engine, haystack, limits)
             }
@@ -16345,24 +16397,10 @@ impl AggregatePlan {
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
-                match engine.count_attempt(haystack, limits.exact_literal) {
-                    Ok(attempt) => self
-                        .exact_literal_count_success(haystack.len(), limits, attempt)
-                        .map(|(value, _)| value),
-                    Err(attempt) => {
-                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
-                    }
-                }
+                self.execute_exact_literal_count_value(engine, haystack, limits)
             }
             AggregateEngine::DispatchedExactLiteral(engine) => {
-                match engine.count_attempt(haystack, limits.exact_literal) {
-                    Ok(attempt) => self
-                        .exact_literal_count_success(haystack.len(), limits, attempt)
-                        .map(|(value, _)| value),
-                    Err(attempt) => {
-                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
-                    }
-                }
+                self.execute_dispatched_exact_literal_count_value(engine, haystack, limits)
             }
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_count_value(engine, haystack, limits)
@@ -16750,6 +16788,52 @@ impl AggregatePlan {
             })
     }
 
+    #[inline(never)]
+    fn execute_exact_literal_span_sum_value(
+        &self,
+        engine: &LiteralAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.span_sum_value_success(haystack, limits.exact_literal) {
+            return Ok(value);
+        }
+        match engine.span_sum_attempt(haystack, limits.exact_literal) {
+            Err(attempt) => {
+                Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+            }
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact exact-literal span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_dispatched_exact_literal_span_sum_value(
+        &self,
+        engine: &DispatchedLiteralAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.span_sum_value_success(haystack, limits.exact_literal) {
+            return Ok(value);
+        }
+        match engine.span_sum_attempt(haystack, limits.exact_literal) {
+            Err(attempt) => {
+                Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
+            }
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dispatched exact-literal span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode span-sum plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16760,6 +16844,12 @@ impl AggregatePlan {
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
+            AggregateEngine::ExactLiteral(engine) => {
+                self.execute_exact_literal_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedExactLiteral(engine) => {
+                self.execute_dispatched_exact_literal_span_sum_value(engine, haystack, limits)
+            }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_span_sum_value(engine, haystack, limits)
             }
@@ -16809,24 +16899,10 @@ impl AggregatePlan {
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
-                match engine.span_sum_attempt(haystack, limits.exact_literal) {
-                    Ok(attempt) => self
-                        .exact_literal_span_sum_success(haystack.len(), limits, attempt)
-                        .map(|(value, _)| value),
-                    Err(attempt) => {
-                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
-                    }
-                }
+                self.execute_exact_literal_span_sum_value(engine, haystack, limits)
             }
             AggregateEngine::DispatchedExactLiteral(engine) => {
-                match engine.span_sum_attempt(haystack, limits.exact_literal) {
-                    Ok(attempt) => self
-                        .exact_literal_span_sum_success(haystack.len(), limits, attempt)
-                        .map(|(value, _)| value),
-                    Err(attempt) => {
-                        Err(self.direct_exact_execution_error(haystack.len(), limits, attempt))
-                    }
-                }
+                self.execute_dispatched_exact_literal_span_sum_value(engine, haystack, limits)
             }
             AggregateEngine::UnicodeScalar(engine) => {
                 self.execute_unicode_scalar_span_sum_value(engine, haystack, limits)
@@ -21517,6 +21593,12 @@ mod tests {
         let second = second_regex.count(haystack, limits).unwrap_err();
         assert!(first.has_closed_direct_attempt());
         assert!(second.has_closed_direct_attempt());
+        let first_value = first_regex.count_value(haystack, limits).unwrap_err();
+        assert!(first_value.has_closed_direct_attempt());
+        assert_eq!(
+            exact_terminal_source(&first_value).attempt,
+            exact_terminal_source(&first).attempt
+        );
         let first_source = exact_terminal_source(&first);
         let second_source = exact_terminal_source(&second);
         assert_eq!(
@@ -21543,14 +21625,19 @@ mod tests {
         invocation_splice.source = event.source.clone();
         assert!(!invocation_splice.has_closed_direct_attempt());
 
-        let span = AggregateBuilder::new("needle")
+        let span_regex = AggregateBuilder::new("needle")
             .unicode(false)
             .plan_selection(AggregatePlanSelection::ForceExactLiteral)
             .build_span_sum()
-            .unwrap()
-            .span_sum(haystack, limits)
-            .unwrap_err();
+            .unwrap();
+        let span = span_regex.span_sum(haystack, limits).unwrap_err();
         assert!(span.has_closed_direct_attempt());
+        let span_value = span_regex.span_sum_value(haystack, limits).unwrap_err();
+        assert!(span_value.has_closed_direct_attempt());
+        assert_eq!(
+            exact_terminal_source(&span_value).attempt,
+            exact_terminal_source(&span).attempt
+        );
         let mut operation_splice = first.clone();
         exact_terminal_source_mut(&mut operation_splice).attempt =
             exact_terminal_source(&span).attempt.clone();
