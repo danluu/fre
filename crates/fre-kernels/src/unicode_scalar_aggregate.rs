@@ -2206,7 +2206,7 @@ impl UnicodeScalarAggregatePlan {
                 continue;
             }
 
-            let decoded = decode_scalar(&local[position..]);
+            let decoded = decode_scalar_inline(&local[position..]);
             actual.decode_byte_checks = actual
                 .decode_byte_checks
                 .checked_add(decoded.byte_checks)
@@ -2541,7 +2541,19 @@ struct DecodedScalar {
     byte_checks: usize,
 }
 
+#[inline(never)]
 fn decode_scalar(bytes: &[u8]) -> DecodedScalar {
+    decode_scalar_inline(bytes)
+}
+
+// The dispatched exactly-one path is also the small-input path: below one
+// fixed block it reaches the scalar decoder without using the retained SIMD
+// classifier. Keep that decoder in the caller so unrelated ThinLTO
+// monomorphizations or identical-code folding cannot add a cold text-page
+// transition to a two- to four-byte operation. The general repetition path
+// continues through the out-of-line wrapper above.
+#[inline(always)]
+fn decode_scalar_inline(bytes: &[u8]) -> DecodedScalar {
     let Some(&first) = bytes.first() else {
         return DecodedScalar {
             scalar: None,
@@ -2651,16 +2663,84 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, DISPATCHED_PLAN_ID, DispatchedUnicodeScalarAggregatePlan,
-        Operation, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID,
-        REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID, ReduceActualCounters, ReduceError,
-        ReduceLimits, Repetition, SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan,
-        binary_search_comparison_bound,
+        BuildError, BuildLimits, DISPATCHED_PLAN_ID, DecodedScalar,
+        DispatchedUnicodeScalarAggregatePlan, Operation, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID,
+        REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID,
+        ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
+        SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan,
+        binary_search_comparison_bound, decode_scalar, decode_scalar_inline,
     };
     use crate::{
         ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, Feature,
         SimdDispatchContext, Window,
     };
+
+    #[test]
+    fn inline_decoder_matches_general_decoder_at_utf8_boundaries() {
+        let valid = [
+            (
+                b"A".as_slice(),
+                DecodedScalar {
+                    scalar: Some(u32::from('A')),
+                    width: 1,
+                    byte_checks: 1,
+                },
+            ),
+            (
+                "Δ".as_bytes(),
+                DecodedScalar {
+                    scalar: Some(u32::from('Δ')),
+                    width: 2,
+                    byte_checks: 2,
+                },
+            ),
+            (
+                "雪".as_bytes(),
+                DecodedScalar {
+                    scalar: Some(u32::from('雪')),
+                    width: 3,
+                    byte_checks: 3,
+                },
+            ),
+            (
+                "🦀".as_bytes(),
+                DecodedScalar {
+                    scalar: Some(u32::from('🦀')),
+                    width: 4,
+                    byte_checks: 4,
+                },
+            ),
+        ];
+        for (bytes, expected) in valid {
+            assert_eq!(decode_scalar(bytes), expected);
+            assert_eq!(decode_scalar_inline(bytes), expected);
+        }
+
+        let malformed = [
+            (&[][..], 0),
+            (&[0x80][..], 1),
+            (&[0xC2][..], 1),
+            (&[0xC2, b' '][..], 2),
+            (&[0xE0][..], 1),
+            (&[0xE0, 0xA0][..], 2),
+            (&[0xE0, 0x80, 0x80][..], 2),
+            (&[0xED, 0xA0, 0x80][..], 2),
+            (&[0xF0][..], 1),
+            (&[0xF0, 0x90][..], 2),
+            (&[0xF0, 0x90, 0x80][..], 3),
+            (&[0xF4, 0x90, 0x80, 0x80][..], 2),
+            (&[0xF5, 0x80, 0x80, 0x80][..], 1),
+        ];
+        for (bytes, byte_checks) in malformed {
+            let expected = DecodedScalar {
+                scalar: None,
+                width: 1,
+                byte_checks,
+            };
+            assert_eq!(decode_scalar(bytes), expected);
+            assert_eq!(decode_scalar_inline(bytes), expected);
+        }
+    }
 
     #[test]
     #[ignore = "native qualification benchmark; requires Linux/AArch64 with OS-usable SVE2"]
