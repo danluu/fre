@@ -16266,16 +16266,22 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        engine
-            .count(haystack, limits.unicode_scalar)
-            .map(|result| result.count)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::UnicodeScalar(source),
-                )
-            })
+        if let Some(value) = engine.count_value_success(haystack, limits.unicode_scalar) {
+            return Ok(value);
+        }
+        match engine.count(haystack, limits.unicode_scalar) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::UnicodeScalar(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact Unicode-scalar count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
     }
 
     #[inline(never)]
@@ -16285,16 +16291,22 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        engine
-            .count(haystack, limits.unicode_scalar)
-            .map(|result| result.count)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::UnicodeScalar(source),
-                )
-            })
+        if let Some(value) = engine.count_value_success(haystack, limits.unicode_scalar) {
+            return Ok(value);
+        }
+        match engine.count(haystack, limits.unicode_scalar) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::UnicodeScalar(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dispatched Unicode-scalar count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
     }
 
     #[inline(never)]
@@ -16828,16 +16840,22 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        engine
-            .span_sum(haystack, limits.unicode_scalar)
-            .map(|result| result.span_sum)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::UnicodeScalar(source),
-                )
-            })
+        if let Some(value) = engine.span_sum_value_success(haystack, limits.unicode_scalar) {
+            return Ok(value);
+        }
+        match engine.span_sum(haystack, limits.unicode_scalar) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::UnicodeScalar(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact Unicode-scalar span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
     }
 
     #[inline(never)]
@@ -16847,16 +16865,22 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        engine
-            .span_sum(haystack, limits.unicode_scalar)
-            .map(|result| result.span_sum)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::UnicodeScalar(source),
-                )
-            })
+        if let Some(value) = engine.span_sum_value_success(haystack, limits.unicode_scalar) {
+            return Ok(value);
+        }
+        match engine.span_sum(haystack, limits.unicode_scalar) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::UnicodeScalar(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dispatched Unicode-scalar span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
     }
 
     #[inline(never)]

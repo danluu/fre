@@ -334,6 +334,44 @@ pub struct ReduceActualCounters {
     pub scratch_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ValueReduction {
+    count: u64,
+    matched_bytes: u64,
+}
+
+trait ExecutionMeter: Sized {
+    type Output;
+
+    fn new() -> Self;
+
+    fn update(
+        &mut self,
+        update: impl FnOnce(&mut ReduceActualCounters) -> Result<(), ReduceError>,
+    ) -> Result<(), ReduceError>;
+
+    fn finish_scalar(
+        self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError>;
+
+    fn finish_dispatched(
+        self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError>;
+}
+
+struct FullExecutionMeter {
+    actual: ReduceActualCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NoExecutionMeter;
+
 /// Upper bounds and exact counters for one result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceAccounting {
@@ -440,6 +478,190 @@ pub struct CountResult {
 pub struct SpanSumResult {
     pub span_sum: u64,
     pub accounting: ReduceAccounting,
+}
+
+const fn empty_actual_counters() -> ReduceActualCounters {
+    ReduceActualCounters {
+        input_bytes_advanced: 0,
+        ascii_block_classifications: 0,
+        ascii_block_classification_bytes: 0,
+        ascii_block_lookahead_bytes: 0,
+        decode_byte_checks: 0,
+        valid_scalars: 0,
+        invalid_bytes: 0,
+        ascii_run_bytes: 0,
+        ascii_bitmap_tests: 0,
+        non_ascii_membership_tests: 0,
+        range_comparisons: 0,
+        reducer_steps: 0,
+        run_flushes: 0,
+        match_events: 0,
+        count: 0,
+        matched_bytes: 0,
+        work: 0,
+        scratch_bytes: 0,
+    }
+}
+
+impl ExecutionMeter for FullExecutionMeter {
+    type Output = ReduceActualCounters;
+
+    #[inline]
+    fn new() -> Self {
+        Self {
+            actual: empty_actual_counters(),
+        }
+    }
+
+    #[inline]
+    fn update(
+        &mut self,
+        update: impl FnOnce(&mut ReduceActualCounters) -> Result<(), ReduceError>,
+    ) -> Result<(), ReduceError> {
+        update(&mut self.actual)
+    }
+
+    fn finish_scalar(
+        mut self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError> {
+        self.actual.input_bytes_advanced = input_bytes_advanced;
+        self.actual.count = value.count;
+        self.actual.matched_bytes = value.matched_bytes;
+        let membership_tests = self
+            .actual
+            .ascii_bitmap_tests
+            .checked_add(self.actual.non_ascii_membership_tests)
+            .and_then(|tests| tests.checked_add(self.actual.ascii_block_lookahead_bytes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual membership tests",
+            })?;
+        self.actual.work = self
+            .actual
+            .decode_byte_checks
+            .checked_add(membership_tests)
+            .and_then(|work| work.checked_add(self.actual.range_comparisons))
+            .and_then(|work| work.checked_add(self.actual.reducer_steps))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual execution work",
+            })?;
+        debug_assert!(self.actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(self.actual.ascii_block_classifications <= upper.ascii_block_classifications);
+        debug_assert!(
+            self.actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
+        );
+        debug_assert!(self.actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
+        debug_assert!(self.actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert_eq!(self.actual.ascii_run_bytes, self.actual.ascii_bitmap_tests);
+        debug_assert!(membership_tests <= upper.membership_tests);
+        debug_assert!(self.actual.range_comparisons <= upper.range_comparisons);
+        debug_assert!(self.actual.reducer_steps <= upper.reducer_steps);
+        debug_assert!(self.actual.match_events <= upper.match_events);
+        debug_assert_eq!(
+            u64::try_from(self.actual.match_events).ok(),
+            Some(value.count)
+        );
+        debug_assert!(value.count <= upper.count);
+        debug_assert!(value.matched_bytes <= upper.span_sum);
+        debug_assert!(self.actual.work <= upper.work);
+        Ok(self.actual)
+    }
+
+    fn finish_dispatched(
+        mut self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError> {
+        self.actual.input_bytes_advanced = input_bytes_advanced;
+        self.actual.count = value.count;
+        self.actual.matched_bytes = value.matched_bytes;
+        let membership_tests = self
+            .actual
+            .ascii_bitmap_tests
+            .checked_add(self.actual.non_ascii_membership_tests)
+            .and_then(|tests| tests.checked_add(self.actual.ascii_block_lookahead_bytes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual dispatched membership tests",
+            })?;
+        self.actual.work = self
+            .actual
+            .decode_byte_checks
+            .checked_add(membership_tests)
+            .and_then(|work| work.checked_add(self.actual.range_comparisons))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual dispatched execution work",
+            })?;
+        debug_assert!(self.actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(self.actual.ascii_block_classifications <= upper.ascii_block_classifications);
+        debug_assert!(
+            self.actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
+        );
+        debug_assert!(self.actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
+        debug_assert!(self.actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert_eq!(self.actual.ascii_run_bytes, self.actual.ascii_bitmap_tests);
+        debug_assert!(membership_tests <= upper.membership_tests);
+        debug_assert!(self.actual.range_comparisons <= upper.range_comparisons);
+        debug_assert_eq!(self.actual.reducer_steps, 0);
+        debug_assert!(self.actual.match_events <= upper.match_events);
+        debug_assert_eq!(
+            u64::try_from(self.actual.match_events).ok(),
+            Some(value.count)
+        );
+        debug_assert!(value.count <= upper.count);
+        debug_assert!(value.matched_bytes <= upper.span_sum);
+        debug_assert!(self.actual.work <= upper.work);
+        Ok(self.actual)
+    }
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "the zero-sized meter must disappear completely from each value-only specialization"
+)]
+impl ExecutionMeter for NoExecutionMeter {
+    type Output = ValueReduction;
+
+    #[inline(always)]
+    fn new() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    fn update(
+        &mut self,
+        _update: impl FnOnce(&mut ReduceActualCounters) -> Result<(), ReduceError>,
+    ) -> Result<(), ReduceError> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn finish_scalar(
+        self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError> {
+        debug_assert!(input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(value.count <= upper.count);
+        debug_assert!(value.matched_bytes <= upper.span_sum);
+        Ok(value)
+    }
+
+    #[inline(always)]
+    fn finish_dispatched(
+        self,
+        value: ValueReduction,
+        input_bytes_advanced: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<Self::Output, ReduceError> {
+        debug_assert!(input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(value.count <= upper.count);
+        debug_assert!(value.matched_bytes <= upper.span_sum);
+        Ok(value)
+    }
 }
 
 /// Checked construction failure. No partial plan is published.
@@ -1031,6 +1253,35 @@ impl UnicodeScalarAggregatePlan {
         self.count_in(haystack, Window::full(haystack), limits)
     }
 
+    /// Return only a successfully admitted count without constructing complete
+    /// execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.count_value_in_success(haystack, Window::full(haystack), limits)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_in_success(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self
+            .preflight(haystack, window, Operation::Count, limits, false)
+            .ok()?;
+        self.execute_value(haystack, window, upper)
+            .ok()
+            .map(|value| value.count)
+    }
+
     pub fn count_in(
         &self,
         haystack: &[u8],
@@ -1056,6 +1307,35 @@ impl UnicodeScalarAggregatePlan {
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
         self.span_sum_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return only a successfully admitted span sum without constructing
+    /// complete execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::span_sum`] with the same arguments.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.span_sum_value_in_success(haystack, Window::full(haystack), limits)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_in_success(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self
+            .preflight(haystack, window, Operation::SpanSum, limits, false)
+            .ok()?;
+        self.execute_value(haystack, window, upper)
+            .ok()
+            .map(|value| value.matched_bytes)
     }
 
     pub fn span_sum_in(
@@ -1182,21 +1462,45 @@ impl UnicodeScalarAggregatePlan {
         window: Window,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_with_meter::<FullExecutionMeter>(haystack, window, upper)
+    }
+
+    #[inline]
+    fn execute_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+    ) -> Result<ValueReduction, ReduceError> {
+        self.execute_with_meter::<NoExecutionMeter>(haystack, window, upper)
+    }
+
+    #[inline]
+    fn execute_with_meter<M: ExecutionMeter>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+    ) -> Result<M::Output, ReduceError> {
         match self.repetition {
-            Repetition::ExactlyOne => {
-                self.execute_mode::<false, false, false, false>(haystack, window, upper, 1, Some(1))
-            }
+            Repetition::ExactlyOne => self.execute_mode::<M, false, false, false, false>(
+                haystack,
+                window,
+                upper,
+                1,
+                Some(1),
+            ),
             Repetition::OneOrMoreGreedy if self.non_ascii.is_empty() => {
-                self.execute_mode::<true, true, false, false>(haystack, window, upper, 1, None)
+                self.execute_mode::<M, true, true, false, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreGreedy => {
-                self.execute_mode::<true, true, true, false>(haystack, window, upper, 1, None)
+                self.execute_mode::<M, true, true, true, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreLazy if self.non_ascii.is_empty() => {
-                self.execute_mode::<true, false, false, false>(haystack, window, upper, 1, None)
+                self.execute_mode::<M, true, false, false, false>(haystack, window, upper, 1, None)
             }
             Repetition::OneOrMoreLazy => {
-                self.execute_mode::<true, false, true, false>(haystack, window, upper, 1, None)
+                self.execute_mode::<M, true, false, true, false>(haystack, window, upper, 1, None)
             }
             repetition @ (Repetition::RepeatedGreedy { .. } | Repetition::RepeatedLazy { .. }) => {
                 let (minimum, maximum, greedy) = repetition
@@ -1204,20 +1508,20 @@ impl UnicodeScalarAggregatePlan {
                     .expect("repeated variants always have bounds");
                 if greedy {
                     if self.non_ascii.is_empty() {
-                        self.execute_mode::<true, true, false, true>(
+                        self.execute_mode::<M, true, true, false, true>(
                             haystack, window, upper, minimum, maximum,
                         )
                     } else {
-                        self.execute_mode::<true, true, true, true>(
+                        self.execute_mode::<M, true, true, true, true>(
                             haystack, window, upper, minimum, maximum,
                         )
                     }
                 } else if self.non_ascii.is_empty() {
-                    self.execute_mode::<true, false, false, true>(
+                    self.execute_mode::<M, true, false, false, true>(
                         haystack, window, upper, minimum, maximum,
                     )
                 } else {
-                    self.execute_mode::<true, false, true, true>(
+                    self.execute_mode::<M, true, false, true, true>(
                         haystack, window, upper, minimum, maximum,
                     )
                 }
@@ -1231,6 +1535,7 @@ impl UnicodeScalarAggregatePlan {
         reason = "the monomorphized streaming loop keeps UTF-8 progression, reduction and exact structural accounting visibly coupled while removing all repetition-mode branches from execution"
     )]
     fn execute_mode<
+        M: ExecutionMeter,
         const RUN: bool,
         const GREEDY: bool,
         const CACHE_RANGE: bool,
@@ -1242,7 +1547,7 @@ impl UnicodeScalarAggregatePlan {
         upper: ReduceUpperBounds,
         minimum: u32,
         maximum: Option<u32>,
-    ) -> Result<ReduceActualCounters, ReduceError> {
+    ) -> Result<M::Output, ReduceError> {
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
         let mut pending_run_bytes = 0_u64;
@@ -1250,26 +1555,8 @@ impl UnicodeScalarAggregatePlan {
         let mut cached_non_ascii_range = None::<usize>;
         let mut previous_non_ascii_scalar = None::<u32>;
         let mut monotone_range_cursor = true;
-        let mut actual = ReduceActualCounters {
-            input_bytes_advanced: 0,
-            ascii_block_classifications: 0,
-            ascii_block_classification_bytes: 0,
-            ascii_block_lookahead_bytes: 0,
-            decode_byte_checks: 0,
-            valid_scalars: 0,
-            invalid_bytes: 0,
-            ascii_run_bytes: 0,
-            ascii_bitmap_tests: 0,
-            non_ascii_membership_tests: 0,
-            range_comparisons: 0,
-            reducer_steps: 0,
-            run_flushes: 0,
-            match_events: 0,
-            count: 0,
-            matched_bytes: 0,
-            work: 0,
-            scratch_bytes: 0,
-        };
+        let mut value = ValueReduction::default();
+        let mut meter = M::new();
         while position < local.len() {
             // ASCII is both one byte wide and always a valid UTF-8 scalar.
             // Reduce a maximal run without constructing a `DecodedScalar` or
@@ -1289,7 +1576,8 @@ impl UnicodeScalarAggregatePlan {
                     if GENERAL_REPETITION {
                         if matched {
                             reduce_repeated_scalar(
-                                &mut actual,
+                                &mut value,
+                                &mut meter,
                                 &mut pending_run_bytes,
                                 &mut pending_run_scalars,
                                 1,
@@ -1299,7 +1587,8 @@ impl UnicodeScalarAggregatePlan {
                             )?;
                         } else {
                             finish_repeated_run(
-                                &mut actual,
+                                &mut value,
+                                &mut meter,
                                 &mut pending_run_bytes,
                                 &mut pending_run_scalars,
                                 minimum,
@@ -1314,7 +1603,7 @@ impl UnicodeScalarAggregatePlan {
                                 },
                             )?;
                         } else {
-                            flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
+                            flush_greedy_run(&mut value, &mut meter, &mut pending_run_bytes)?;
                         }
                     } else if matched {
                         // At most one match is recorded per byte in this run,
@@ -1326,122 +1615,116 @@ impl UnicodeScalarAggregatePlan {
                     position += 1;
                 }
                 let run_bytes = position - run_start;
-                actual.decode_byte_checks = actual
-                    .decode_byte_checks
-                    .checked_add(run_bytes)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run decode byte checks",
-                    })?;
-                actual.valid_scalars = actual.valid_scalars.checked_add(run_bytes).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run valid scalars",
-                    },
-                )?;
-                actual.ascii_run_bytes = actual.ascii_run_bytes.checked_add(run_bytes).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run bytes",
-                    },
-                )?;
-                actual.ascii_bitmap_tests = actual
-                    .ascii_bitmap_tests
-                    .checked_add(run_bytes)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual ASCII-run bitmap tests",
-                    })?;
-                if RUN {
-                    actual.reducer_steps = actual.reducer_steps.checked_add(run_bytes).ok_or(
+                meter.update(|actual| {
+                    actual.decode_byte_checks = actual
+                        .decode_byte_checks
+                        .checked_add(run_bytes)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run decode byte checks",
+                        })?;
+                    actual.valid_scalars = actual.valid_scalars.checked_add(run_bytes).ok_or(
                         ReduceError::ArithmeticOverflow {
-                            computation: "actual ASCII-run reducer transitions",
+                            computation: "actual ASCII-run valid scalars",
                         },
                     )?;
-                }
+                    actual.ascii_run_bytes = actual.ascii_run_bytes.checked_add(run_bytes).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run bytes",
+                        },
+                    )?;
+                    actual.ascii_bitmap_tests = actual
+                        .ascii_bitmap_tests
+                        .checked_add(run_bytes)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual ASCII-run bitmap tests",
+                        })?;
+                    if RUN {
+                        actual.reducer_steps = actual.reducer_steps.checked_add(run_bytes).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "actual ASCII-run reducer transitions",
+                            },
+                        )?;
+                    }
+                    Ok(())
+                })?;
                 if !GREEDY && !GENERAL_REPETITION {
-                    actual.match_events = actual.match_events.checked_add(run_matches).ok_or(
-                        ReduceError::ArithmeticOverflow {
-                            computation: "actual ASCII-run match events",
-                        },
-                    )?;
-                    let run_matches = u64::try_from(run_matches).map_err(|_| {
-                        ReduceError::ArithmeticOverflow {
-                            computation: "actual ASCII-run matches",
-                        }
-                    })?;
-                    actual.count = actual.count.checked_add(run_matches).ok_or(
-                        ReduceError::ArithmeticOverflow {
-                            computation: "actual ASCII-run count",
-                        },
-                    )?;
-                    actual.matched_bytes = actual.matched_bytes.checked_add(run_matches).ok_or(
-                        ReduceError::ArithmeticOverflow {
-                            computation: "actual ASCII-run matched bytes",
-                        },
-                    )?;
+                    record_ascii_matches(&mut value, &mut meter, run_matches)?;
                 }
                 continue;
             }
             if RUN {
-                actual.reducer_steps =
-                    actual
-                        .reducer_steps
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
+                meter.update(|actual| {
+                    actual.reducer_steps = actual.reducer_steps.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
                             computation: "actual run reducer transitions",
-                        })?;
+                        },
+                    )?;
+                    Ok(())
+                })?;
             }
             let decoded = decode_scalar(&local[position..]);
-            actual.decode_byte_checks = actual
-                .decode_byte_checks
-                .checked_add(decoded.byte_checks)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual decode byte checks",
-                })?;
-            let matched =
-                if let Some(scalar) = decoded.scalar {
+            meter.update(|actual| {
+                actual.decode_byte_checks = actual
+                    .decode_byte_checks
+                    .checked_add(decoded.byte_checks)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual decode byte checks",
+                    })?;
+                Ok(())
+            })?;
+            let matched = if let Some(scalar) = decoded.scalar {
+                meter.update(|actual| {
                     actual.valid_scalars = actual.valid_scalars.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual valid scalars",
                         },
                     )?;
-                    // The maximal ASCII-run branch above proves that every
-                    // successfully decoded scalar here is non-ASCII.
-                    debug_assert!(scalar > 0x7F);
                     actual.non_ascii_membership_tests = actual
                         .non_ascii_membership_tests
                         .checked_add(1)
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual non-ASCII membership tests",
                         })?;
-                    let (contains, comparisons) = if CACHE_RANGE && monotone_range_cursor {
-                        let nondecreasing =
-                            previous_non_ascii_scalar.is_none_or(|previous| scalar >= previous);
-                        previous_non_ascii_scalar = Some(scalar);
-                        if nondecreasing {
-                            self.contains_non_ascii_run(scalar, &mut cached_non_ascii_range)?
-                        } else {
-                            monotone_range_cursor = false;
-                            cached_non_ascii_range = None;
-                            self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range)?
-                        }
-                    } else if CACHE_RANGE {
-                        self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range)?
+                    Ok(())
+                })?;
+                // The maximal ASCII-run branch above proves that every
+                // successfully decoded scalar here is non-ASCII.
+                debug_assert!(scalar > 0x7F);
+                if CACHE_RANGE && monotone_range_cursor {
+                    let nondecreasing =
+                        previous_non_ascii_scalar.is_none_or(|previous| scalar >= previous);
+                    previous_non_ascii_scalar = Some(scalar);
+                    if nondecreasing {
+                        self.contains_non_ascii_run(
+                            scalar,
+                            &mut cached_non_ascii_range,
+                            &mut meter,
+                        )?
                     } else {
-                        self.contains_non_ascii(scalar)?
-                    };
-                    actual.range_comparisons = actual
-                        .range_comparisons
-                        .checked_add(comparisons)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual range comparisons",
-                        })?;
-                    contains
+                        monotone_range_cursor = false;
+                        cached_non_ascii_range = None;
+                        self.contains_non_ascii_cached(
+                            scalar,
+                            &mut cached_non_ascii_range,
+                            &mut meter,
+                        )?
+                    }
+                } else if CACHE_RANGE {
+                    self.contains_non_ascii_cached(scalar, &mut cached_non_ascii_range, &mut meter)?
                 } else {
+                    self.contains_non_ascii(scalar, &mut meter)?
+                }
+            } else {
+                meter.update(|actual| {
                     actual.invalid_bytes = actual.invalid_bytes.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual invalid bytes",
                         },
                     )?;
-                    false
-                };
+                    Ok(())
+                })?;
+                false
+            };
             if matched {
                 let width =
                     u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
@@ -1449,7 +1732,8 @@ impl UnicodeScalarAggregatePlan {
                     })?;
                 if GENERAL_REPETITION {
                     reduce_repeated_scalar(
-                        &mut actual,
+                        &mut value,
+                        &mut meter,
                         &mut pending_run_bytes,
                         &mut pending_run_scalars,
                         width,
@@ -1464,18 +1748,19 @@ impl UnicodeScalarAggregatePlan {
                         },
                     )?;
                 } else {
-                    record_match(&mut actual, width)?;
+                    record_match(&mut value, &mut meter, width)?;
                 }
             } else if GENERAL_REPETITION {
                 finish_repeated_run(
-                    &mut actual,
+                    &mut value,
+                    &mut meter,
                     &mut pending_run_bytes,
                     &mut pending_run_scalars,
                     minimum,
                     GREEDY,
                 )?;
             } else if GREEDY {
-                flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
+                flush_greedy_run(&mut value, &mut meter, &mut pending_run_bytes)?;
             }
             position =
                 position
@@ -1485,69 +1770,46 @@ impl UnicodeScalarAggregatePlan {
                     })?;
         }
         if RUN {
-            actual.reducer_steps =
-                actual
-                    .reducer_steps
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "final run reducer transition",
-                    })?;
+            meter.update(|actual| {
+                actual.reducer_steps =
+                    actual
+                        .reducer_steps
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "final run reducer transition",
+                        })?;
+                Ok(())
+            })?;
         }
         if GENERAL_REPETITION {
             finish_repeated_run(
-                &mut actual,
+                &mut value,
+                &mut meter,
                 &mut pending_run_bytes,
                 &mut pending_run_scalars,
                 minimum,
                 GREEDY,
             )?;
         } else if GREEDY {
-            flush_greedy_run(&mut actual, &mut pending_run_bytes)?;
+            flush_greedy_run(&mut value, &mut meter, &mut pending_run_bytes)?;
         }
-        actual.input_bytes_advanced = position;
-        let membership_tests = actual
-            .ascii_bitmap_tests
-            .checked_add(actual.non_ascii_membership_tests)
-            .and_then(|tests| tests.checked_add(actual.ascii_block_lookahead_bytes))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual membership tests",
-            })?;
-        actual.work = actual
-            .decode_byte_checks
-            .checked_add(membership_tests)
-            .and_then(|value| value.checked_add(actual.range_comparisons))
-            .and_then(|value| value.checked_add(actual.reducer_steps))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual execution work",
-            })?;
-        debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
-        debug_assert!(actual.ascii_block_classifications <= upper.ascii_block_classifications);
-        debug_assert!(
-            actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
-        );
-        debug_assert!(actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
-        debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
-        debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
-        debug_assert!(membership_tests <= upper.membership_tests);
-        debug_assert!(actual.range_comparisons <= upper.range_comparisons);
-        debug_assert!(actual.reducer_steps <= upper.reducer_steps);
-        debug_assert!(actual.match_events <= upper.match_events);
-        debug_assert!(actual.count <= upper.count);
-        debug_assert!(actual.matched_bytes <= upper.span_sum);
-        debug_assert!(actual.work <= upper.work);
-        Ok(actual)
+        meter.finish_scalar(value, position, upper)
     }
 
-    fn contains_non_ascii(&self, scalar: u32) -> Result<(bool, usize), ReduceError> {
+    #[allow(
+        clippy::inline_always,
+        reason = "membership charging must disappear from the value-only scalar loop"
+    )]
+    #[inline(always)]
+    fn contains_non_ascii<M: ExecutionMeter>(
+        &self,
+        scalar: u32,
+        meter: &mut M,
+    ) -> Result<bool, ReduceError> {
         let mut low = 0_usize;
         let mut high = self.non_ascii.len();
-        let mut comparisons = 0_usize;
         while low < high {
-            comparisons = comparisons
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "binary search comparisons",
-                })?;
+            record_range_comparison(meter, "binary search comparisons")?;
             let width = high
                 .checked_sub(low)
                 .ok_or(ReduceError::ArithmeticOverflow {
@@ -1573,26 +1835,31 @@ impl UnicodeScalarAggregatePlan {
                         computation: "binary search lower bound",
                     })?;
             } else {
-                return Ok((true, comparisons));
+                return Ok(true);
             }
         }
-        Ok((false, comparisons))
+        Ok(false)
     }
 
-    fn contains_non_ascii_run(
+    #[allow(
+        clippy::inline_always,
+        reason = "cached membership charging must disappear from the value-only scalar loop"
+    )]
+    #[inline(always)]
+    fn contains_non_ascii_run<M: ExecutionMeter>(
         &self,
         scalar: u32,
         cached_range: &mut Option<usize>,
-    ) -> Result<(bool, usize), ReduceError> {
-        let mut comparisons = 0_usize;
+        meter: &mut M,
+    ) -> Result<bool, ReduceError> {
         if let Some(index) = *cached_range {
             if let Some(range) = self.non_ascii.get(index) {
-                comparisons = 1;
+                record_range_comparison(meter, "cached non-ASCII range comparison")?;
                 if scalar >= range.start && scalar <= range.end {
-                    return Ok((true, comparisons));
+                    return Ok(true);
                 }
                 if scalar < range.start {
-                    return Ok((false, comparisons));
+                    return Ok(false);
                 }
                 let next = index
                     .checked_add(1)
@@ -1601,34 +1868,25 @@ impl UnicodeScalarAggregatePlan {
                     })?;
                 *cached_range = Some(next);
                 if let Some(range) = self.non_ascii.get(next) {
-                    comparisons =
-                        comparisons
-                            .checked_add(1)
-                            .ok_or(ReduceError::ArithmeticOverflow {
-                                computation: "monotone range comparisons",
-                            })?;
+                    record_range_comparison(meter, "monotone range comparisons")?;
                     if scalar < range.start {
-                        return Ok((false, comparisons));
+                        return Ok(false);
                     }
                     if scalar <= range.end {
-                        return Ok((true, comparisons));
+                        return Ok(true);
                     }
                 } else {
-                    return Ok((false, comparisons));
+                    return Ok(false);
                 }
             } else if index == self.non_ascii.len() {
-                return Ok((false, comparisons));
+                return Ok(false);
             }
         }
 
         let mut low = 0_usize;
         let mut high = self.non_ascii.len();
         while low < high {
-            comparisons = comparisons
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "cached binary search comparisons",
-                })?;
+            record_range_comparison(meter, "cached binary search comparisons")?;
             let width = high
                 .checked_sub(low)
                 .ok_or(ReduceError::ArithmeticOverflow {
@@ -1660,17 +1918,22 @@ impl UnicodeScalarAggregatePlan {
             .non_ascii
             .get(low)
             .is_some_and(|range| scalar >= range.start);
-        Ok((contains, comparisons))
+        Ok(contains)
     }
 
-    fn contains_non_ascii_cached(
+    #[allow(
+        clippy::inline_always,
+        reason = "cached membership charging must disappear from the value-only scalar loop"
+    )]
+    #[inline(always)]
+    fn contains_non_ascii_cached<M: ExecutionMeter>(
         &self,
         scalar: u32,
         cached_range: &mut Option<usize>,
-    ) -> Result<(bool, usize), ReduceError> {
-        let mut comparisons = 0_usize;
+        meter: &mut M,
+    ) -> Result<bool, ReduceError> {
         if let Some(index) = *cached_range {
-            comparisons = 1;
+            record_range_comparison(meter, "cached non-ASCII range comparison")?;
             let range = self
                 .non_ascii
                 .get(index)
@@ -1678,7 +1941,7 @@ impl UnicodeScalarAggregatePlan {
                     computation: "cached non-ASCII range access",
                 })?;
             if scalar >= range.start && scalar <= range.end {
-                return Ok((true, comparisons));
+                return Ok(true);
             }
             *cached_range = None;
         }
@@ -1686,11 +1949,7 @@ impl UnicodeScalarAggregatePlan {
         let mut low = 0_usize;
         let mut high = self.non_ascii.len();
         while low < high {
-            comparisons = comparisons
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "cached binary search comparisons",
-                })?;
+            record_range_comparison(meter, "cached binary search comparisons")?;
             let width = high
                 .checked_sub(low)
                 .ok_or(ReduceError::ArithmeticOverflow {
@@ -1717,10 +1976,10 @@ impl UnicodeScalarAggregatePlan {
                     })?;
             } else {
                 *cached_range = Some(middle);
-                return Ok((true, comparisons));
+                return Ok(true);
             }
         }
-        Ok((false, comparisons))
+        Ok(false)
     }
 }
 
@@ -1897,6 +2156,34 @@ impl DispatchedUnicodeScalarAggregatePlan {
         self.count_in(haystack, Window::full(haystack), limits)
     }
 
+    /// Return only a successfully admitted dispatched count without
+    /// constructing complete execution accounting.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.count_value_in_success(haystack, Window::full(haystack), limits)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_in_success(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self
+            .plan()
+            .preflight(haystack, window, Operation::Count, limits, true)
+            .ok()?;
+        self.plan()
+            .execute_exactly_one_value_with_classifier(haystack, window, upper, self.classifier())
+            .ok()
+            .map(|value| value.count)
+    }
+
     pub fn count_in(
         &self,
         haystack: &[u8],
@@ -1929,6 +2216,34 @@ impl DispatchedUnicodeScalarAggregatePlan {
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
         self.span_sum_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return only a successfully admitted dispatched span sum without
+    /// constructing complete execution accounting.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        self.span_sum_value_in_success(haystack, Window::full(haystack), limits)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_in_success(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let upper = self
+            .plan()
+            .preflight(haystack, window, Operation::SpanSum, limits, true)
+            .ok()?;
+        self.plan()
+            .execute_exactly_one_value_with_classifier(haystack, window, upper, self.classifier())
+            .ok()
+            .map(|value| value.matched_bytes)
     }
 
     pub fn span_sum_in(
@@ -2119,31 +2434,43 @@ impl UnicodeScalarAggregatePlan {
         upper: ReduceUpperBounds,
         classifier: &AsciiByteSetClassifier,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        self.execute_exactly_one_with_classifier_meter::<FullExecutionMeter>(
+            haystack, window, upper, classifier,
+        )
+    }
+
+    #[inline]
+    fn execute_exactly_one_value_with_classifier(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+        classifier: &AsciiByteSetClassifier,
+    ) -> Result<ValueReduction, ReduceError> {
+        self.execute_exactly_one_with_classifier_meter::<NoExecutionMeter>(
+            haystack, window, upper, classifier,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::arithmetic_side_effects,
+        reason = "the fixed-block loop keeps mask-prefix consumption, scalar UTF-8 fallback, non-overlapping block scheduling, and exact physical accounting visibly coupled"
+    )]
+    fn execute_exactly_one_with_classifier_meter<M: ExecutionMeter>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ReduceUpperBounds,
+        classifier: &AsciiByteSetClassifier,
+    ) -> Result<M::Output, ReduceError> {
         debug_assert_eq!(self.repetition, Repetition::ExactlyOne);
         let local = &haystack[window.start()..window.end()];
         let mut position = 0_usize;
         let mut scalar_fallback_end = 0_usize;
         let mut ascii_matches = 0_usize;
-        let mut actual = ReduceActualCounters {
-            input_bytes_advanced: 0,
-            ascii_block_classifications: 0,
-            ascii_block_classification_bytes: 0,
-            ascii_block_lookahead_bytes: 0,
-            decode_byte_checks: 0,
-            valid_scalars: 0,
-            invalid_bytes: 0,
-            ascii_run_bytes: 0,
-            ascii_bitmap_tests: 0,
-            non_ascii_membership_tests: 0,
-            range_comparisons: 0,
-            reducer_steps: 0,
-            run_flushes: 0,
-            match_events: 0,
-            count: 0,
-            matched_bytes: 0,
-            work: 0,
-            scratch_bytes: 0,
-        };
+        let mut value = ValueReduction::default();
+        let mut meter = M::new();
         while position < local.len() {
             if position >= scalar_fallback_end && local.len() - position >= ASCII_WIDE_BYTES {
                 let block_end = position + ASCII_WIDE_BYTES;
@@ -2159,13 +2486,16 @@ impl UnicodeScalarAggregatePlan {
                 })?;
                 // Blocks never overlap and every prefix is within its block.
                 // Preflight proved all N- and B-bounded accumulators fit.
-                actual.ascii_block_classifications += 1;
-                actual.ascii_block_classification_bytes += ASCII_WIDE_BYTES;
-                actual.ascii_block_lookahead_bytes += lookahead;
-                actual.decode_byte_checks += ASCII_WIDE_BYTES;
-                actual.valid_scalars += ascii_prefix;
-                actual.ascii_run_bytes += ascii_prefix;
-                actual.ascii_bitmap_tests += ascii_prefix;
+                meter.update(|actual| {
+                    actual.ascii_block_classifications += 1;
+                    actual.ascii_block_classification_bytes += ASCII_WIDE_BYTES;
+                    actual.ascii_block_lookahead_bytes += lookahead;
+                    actual.decode_byte_checks += ASCII_WIDE_BYTES;
+                    actual.valid_scalars += ascii_prefix;
+                    actual.ascii_run_bytes += ascii_prefix;
+                    actual.ascii_bitmap_tests += ascii_prefix;
+                    Ok(())
+                })?;
                 ascii_matches += member_count;
                 position += ascii_prefix;
                 if ascii_prefix == ASCII_WIDE_BYTES {
@@ -2198,54 +2528,59 @@ impl UnicodeScalarAggregatePlan {
                 let run_bytes = position - run_start;
                 // These logical runs partition bytes not consumed by a block
                 // prefix, so the same preflight N-bound covers every sum.
-                actual.decode_byte_checks += run_bytes;
-                actual.valid_scalars += run_bytes;
-                actual.ascii_run_bytes += run_bytes;
-                actual.ascii_bitmap_tests += run_bytes;
+                meter.update(|actual| {
+                    actual.decode_byte_checks += run_bytes;
+                    actual.valid_scalars += run_bytes;
+                    actual.ascii_run_bytes += run_bytes;
+                    actual.ascii_bitmap_tests += run_bytes;
+                    Ok(())
+                })?;
                 ascii_matches += run_matches;
                 continue;
             }
 
             let decoded = decode_scalar_inline(&local[position..]);
-            actual.decode_byte_checks = actual
-                .decode_byte_checks
-                .checked_add(decoded.byte_checks)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual scalar-fallback decode checks",
-                })?;
-            let matched =
-                if let Some(scalar) = decoded.scalar {
+            meter.update(|actual| {
+                actual.decode_byte_checks = actual
+                    .decode_byte_checks
+                    .checked_add(decoded.byte_checks)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual scalar-fallback decode checks",
+                    })?;
+                Ok(())
+            })?;
+            let matched = if let Some(scalar) = decoded.scalar {
+                meter.update(|actual| {
                     actual.valid_scalars = actual.valid_scalars.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual scalar-fallback valid scalars",
                         },
                     )?;
-                    debug_assert!(scalar > 0x7F);
                     actual.non_ascii_membership_tests = actual
                         .non_ascii_membership_tests
                         .checked_add(1)
                         .ok_or(ReduceError::ArithmeticOverflow {
                             computation: "actual scalar-fallback non-ASCII membership tests",
                         })?;
-                    let (contains, comparisons) = self.contains_non_ascii(scalar)?;
-                    actual.range_comparisons = actual
-                        .range_comparisons
-                        .checked_add(comparisons)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual scalar-fallback range comparisons",
-                        })?;
-                    contains
-                } else {
+                    Ok(())
+                })?;
+                debug_assert!(scalar > 0x7F);
+                self.contains_non_ascii(scalar, &mut meter)?
+            } else {
+                meter.update(|actual| {
                     actual.invalid_bytes = actual.invalid_bytes.checked_add(1).ok_or(
                         ReduceError::ArithmeticOverflow {
                             computation: "actual scalar-fallback invalid bytes",
                         },
                     )?;
-                    false
-                };
+                    Ok(())
+                })?;
+                false
+            };
             if matched {
                 record_match(
-                    &mut actual,
+                    &mut value,
+                    &mut meter,
                     u64::try_from(decoded.width).map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "scalar-fallback matched width",
                     })?,
@@ -2253,63 +2588,60 @@ impl UnicodeScalarAggregatePlan {
             }
             position += decoded.width;
         }
-        record_ascii_matches(&mut actual, ascii_matches)?;
-        actual.input_bytes_advanced = position;
-        let membership_tests = actual
-            .ascii_bitmap_tests
-            .checked_add(actual.non_ascii_membership_tests)
-            .and_then(|tests| tests.checked_add(actual.ascii_block_lookahead_bytes))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual dispatched membership tests",
-            })?;
-        actual.work = actual
-            .decode_byte_checks
-            .checked_add(membership_tests)
-            .and_then(|work| work.checked_add(actual.range_comparisons))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual dispatched execution work",
-            })?;
-        debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
-        debug_assert!(actual.ascii_block_classifications <= upper.ascii_block_classifications);
-        debug_assert!(
-            actual.ascii_block_classification_bytes <= upper.ascii_block_classification_bytes
-        );
-        debug_assert!(actual.ascii_block_lookahead_bytes <= upper.ascii_block_lookahead_bytes);
-        debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
-        debug_assert_eq!(actual.ascii_run_bytes, actual.ascii_bitmap_tests);
-        debug_assert!(membership_tests <= upper.membership_tests);
-        debug_assert!(actual.range_comparisons <= upper.range_comparisons);
-        debug_assert_eq!(actual.reducer_steps, 0);
-        debug_assert!(actual.match_events <= upper.match_events);
-        debug_assert!(actual.count <= upper.count);
-        debug_assert!(actual.matched_bytes <= upper.span_sum);
-        debug_assert!(actual.work <= upper.work);
-        Ok(actual)
+        record_ascii_matches(&mut value, &mut meter, ascii_matches)?;
+        meter.finish_dispatched(value, position, upper)
     }
 }
 
-fn record_ascii_matches(
-    actual: &mut ReduceActualCounters,
+#[allow(
+    clippy::inline_always,
+    reason = "the no-op comparison charge must disappear at every value-only range probe"
+)]
+#[inline(always)]
+fn record_range_comparison<M: ExecutionMeter>(
+    meter: &mut M,
+    computation: &'static str,
+) -> Result<(), ReduceError> {
+    meter.update(|actual| {
+        actual.range_comparisons = actual
+            .range_comparisons
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow { computation })?;
+        Ok(())
+    })
+}
+
+#[allow(
+    clippy::inline_always,
+    reason = "value-only ASCII reduction must not retain a structural-meter call"
+)]
+#[inline(always)]
+fn record_ascii_matches<M: ExecutionMeter>(
+    value: &mut ValueReduction,
+    meter: &mut M,
     matches: usize,
 ) -> Result<(), ReduceError> {
-    actual.match_events =
-        actual
-            .match_events
-            .checked_add(matches)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual ASCII block match events",
-            })?;
+    meter.update(|actual| {
+        actual.match_events =
+            actual
+                .match_events
+                .checked_add(matches)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual ASCII block match events",
+                })?;
+        Ok(())
+    })?;
     let matches = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
         computation: "actual ASCII block matches as u64",
     })?;
-    actual.count = actual
+    value.count = value
         .count
         .checked_add(matches)
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual ASCII block count",
         })?;
-    actual.matched_bytes =
-        actual
+    value.matched_bytes =
+        value
             .matched_bytes
             .checked_add(matches)
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -2318,22 +2650,34 @@ fn record_ascii_matches(
     Ok(())
 }
 
-fn record_match(actual: &mut ReduceActualCounters, width: u64) -> Result<(), ReduceError> {
-    actual.match_events =
-        actual
-            .match_events
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual match events",
-            })?;
-    actual.count = actual
+#[allow(
+    clippy::inline_always,
+    reason = "value-only scalar reduction must not retain a structural-meter call"
+)]
+#[inline(always)]
+fn record_match<M: ExecutionMeter>(
+    value: &mut ValueReduction,
+    meter: &mut M,
+    width: u64,
+) -> Result<(), ReduceError> {
+    meter.update(|actual| {
+        actual.match_events =
+            actual
+                .match_events
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual match events",
+                })?;
+        Ok(())
+    })?;
+    value.count = value
         .count
         .checked_add(1)
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "actual count",
         })?;
-    actual.matched_bytes =
-        actual
+    value.matched_bytes =
+        value
             .matched_bytes
             .checked_add(width)
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -2342,27 +2686,43 @@ fn record_match(actual: &mut ReduceActualCounters, width: u64) -> Result<(), Red
     Ok(())
 }
 
-fn flush_greedy_run(
-    actual: &mut ReduceActualCounters,
+#[allow(
+    clippy::inline_always,
+    reason = "the selected run specialization must contain its compact flush directly"
+)]
+#[inline(always)]
+fn flush_greedy_run<M: ExecutionMeter>(
+    value: &mut ValueReduction,
+    meter: &mut M,
     pending_run_bytes: &mut u64,
 ) -> Result<(), ReduceError> {
     if *pending_run_bytes == 0 {
         return Ok(());
     }
-    record_match(actual, *pending_run_bytes)?;
-    actual.run_flushes =
-        actual
-            .run_flushes
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "actual greedy run flushes",
-            })?;
+    record_match(value, meter, *pending_run_bytes)?;
+    meter.update(|actual| {
+        actual.run_flushes =
+            actual
+                .run_flushes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual greedy run flushes",
+                })?;
+        Ok(())
+    })?;
     *pending_run_bytes = 0;
     Ok(())
 }
 
-fn reduce_repeated_scalar(
-    actual: &mut ReduceActualCounters,
+#[allow(
+    clippy::inline_always,
+    clippy::too_many_arguments,
+    reason = "the selected repetition specialization must inline its explicit fixed run state"
+)]
+#[inline(always)]
+fn reduce_repeated_scalar<M: ExecutionMeter>(
+    value: &mut ValueReduction,
+    meter: &mut M,
     pending_bytes: &mut u64,
     pending_scalars: &mut u64,
     width: u64,
@@ -2386,36 +2746,48 @@ fn reduce_repeated_scalar(
         *pending_scalars == u64::from(minimum)
     };
     if complete {
-        record_match(actual, *pending_bytes)?;
-        actual.run_flushes =
-            actual
-                .run_flushes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual repeated-run flushes",
-                })?;
+        record_match(value, meter, *pending_bytes)?;
+        meter.update(|actual| {
+            actual.run_flushes =
+                actual
+                    .run_flushes
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual repeated-run flushes",
+                    })?;
+            Ok(())
+        })?;
         *pending_bytes = 0;
         *pending_scalars = 0;
     }
     Ok(())
 }
 
-fn finish_repeated_run(
-    actual: &mut ReduceActualCounters,
+#[allow(
+    clippy::inline_always,
+    reason = "the selected repetition specialization must contain its terminal flush directly"
+)]
+#[inline(always)]
+fn finish_repeated_run<M: ExecutionMeter>(
+    value: &mut ValueReduction,
+    meter: &mut M,
     pending_bytes: &mut u64,
     pending_scalars: &mut u64,
     minimum: u32,
     greedy: bool,
 ) -> Result<(), ReduceError> {
     if greedy && *pending_scalars >= u64::from(minimum) {
-        record_match(actual, *pending_bytes)?;
-        actual.run_flushes =
-            actual
-                .run_flushes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual repeated-run terminal flushes",
-                })?;
+        record_match(value, meter, *pending_bytes)?;
+        meter.update(|actual| {
+            actual.run_flushes =
+                actual
+                    .run_flushes
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "actual repeated-run terminal flushes",
+                    })?;
+            Ok(())
+        })?;
     }
     *pending_bytes = 0;
     *pending_scalars = 0;
@@ -2664,10 +3036,10 @@ mod tests {
 
     use super::{
         BuildError, BuildLimits, DISPATCHED_PLAN_ID, DecodedScalar,
-        DispatchedUnicodeScalarAggregatePlan, Operation, PLAN_ID, REPEATED_RUN_COUNT_OPERATION_ID,
-        REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID, RUN_PLAN_ID,
-        ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
-        SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan,
+        DispatchedUnicodeScalarAggregatePlan, NoExecutionMeter, Operation, PLAN_ID,
+        REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID,
+        RUN_PLAN_ID, ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
+        SIMD_ASCII_CLASSIFIER_BUILD_WORK, UnicodeScalarAggregatePlan, ValueReduction,
         binary_search_comparison_bound, decode_scalar, decode_scalar_inline,
     };
     use crate::{
@@ -2829,6 +3201,21 @@ mod tests {
         let classifier = AsciiByteSetClassifier::new(AsciiByteSet::from_words(plan.ascii));
         let upper = plan.preflight(haystack, window, operation, limits, true)?;
         plan.execute_exactly_one_with_classifier(haystack, window, upper, &classifier)
+    }
+
+    fn classifier_value(
+        plan: &UnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        window: Window,
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Option<ValueReduction> {
+        let classifier = AsciiByteSetClassifier::new(AsciiByteSet::from_words(plan.ascii));
+        let upper = plan
+            .preflight(haystack, window, operation, limits, true)
+            .ok()?;
+        plan.execute_exactly_one_value_with_classifier(haystack, window, upper, &classifier)
+            .ok()
     }
 
     #[test]
@@ -3039,6 +3426,24 @@ mod tests {
                 block_sum.matched_bytes, scalar_sum.span_sum,
                 "haystack={haystack:?}"
             );
+            let compact_count = classifier_value(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits::unlimited(),
+            )
+            .expect("admitted fixed-block compact count");
+            let compact_sum = classifier_value(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::SpanSum,
+                ReduceLimits::unlimited(),
+            )
+            .expect("admitted fixed-block compact span sum");
+            assert_eq!(compact_count.count, scalar_count.count);
+            assert_eq!(compact_sum.matched_bytes, scalar_sum.span_sum);
             let scalar_upper = scalar_count.accounting.upper_bounds;
             let block_upper = plan
                 .preflight(
@@ -3154,6 +3559,34 @@ mod tests {
                 },
             )
             .is_ok()
+        );
+        assert!(
+            classifier_value(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_decode_byte_checks: upper.decode_byte_checks,
+                    max_membership_tests: upper.membership_tests,
+                    max_work: upper.work,
+                    ..ReduceLimits::unlimited()
+                },
+            )
+            .is_some()
+        );
+        assert_eq!(
+            classifier_value(
+                &plan,
+                haystack,
+                Window::full(haystack),
+                Operation::Count,
+                ReduceLimits {
+                    max_decode_byte_checks: upper.decode_byte_checks - 1,
+                    ..ReduceLimits::unlimited()
+                },
+            ),
+            None
         );
         assert!(matches!(
             classifier_actual(
@@ -3323,6 +3756,16 @@ mod tests {
                     sum.span_sum, expected_sum,
                     "pattern={pattern:?} haystack={haystack:?}"
                 );
+                assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected_count),
+                    "compact count pattern={pattern:?} haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+                    Some(expected_sum),
+                    "compact span sum pattern={pattern:?} haystack={haystack:?}"
+                );
             }
         }
     }
@@ -3352,8 +3795,108 @@ mod tests {
                     .unwrap();
                 assert_eq!(count.count, expected_count, "window={start}..{end}");
                 assert_eq!(sum.span_sum, expected_sum, "window={start}..{end}");
+                let window = Window::new(start, end);
+                assert_eq!(
+                    plan.count_value_in_success(haystack, window, ReduceLimits::unlimited()),
+                    Some(expected_count),
+                    "compact count window={start}..{end}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_in_success(haystack, window, ReduceLimits::unlimited()),
+                    Some(expected_sum),
+                    "compact span sum window={start}..{end}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn compact_values_cover_every_repetition_specialization_on_first_and_steady_calls() {
+        let cases = [
+            (
+                vec![('A', 'Z'), ('a', 'z')],
+                b"ab--cdef\xFFghijk--z".as_slice(),
+            ),
+            (
+                vec![('A', 'Z'), ('a', 'z'), ('α', 'ω'), ('雪', '雪')],
+                b"ab--\xCE\xB1\xCE\xB2\xFF\xE9\x9B\xAA\xE9\x9B\xAAz".as_slice(),
+            ),
+        ];
+        for (ranges, haystack) in cases {
+            let plans = [
+                UnicodeScalarAggregatePlan::build(ranges.clone(), BuildLimits::unlimited())
+                    .unwrap(),
+                UnicodeScalarAggregatePlan::build_one_or_more(
+                    ranges.clone(),
+                    true,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                UnicodeScalarAggregatePlan::build_one_or_more(
+                    ranges.clone(),
+                    false,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                UnicodeScalarAggregatePlan::build_repeated(
+                    ranges.clone(),
+                    2,
+                    Some(4),
+                    true,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                UnicodeScalarAggregatePlan::build_repeated(
+                    ranges.clone(),
+                    2,
+                    Some(4),
+                    false,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                UnicodeScalarAggregatePlan::build_repeated(
+                    ranges.clone(),
+                    3,
+                    None,
+                    true,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+                UnicodeScalarAggregatePlan::build_repeated(
+                    ranges,
+                    3,
+                    None,
+                    false,
+                    BuildLimits::unlimited(),
+                )
+                .unwrap(),
+            ];
+            for plan in plans {
+                let expected_count = plan
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count;
+                let expected_sum = plan
+                    .span_sum(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .span_sum;
+                for _ in 0..2 {
+                    assert_eq!(
+                        plan.count_value_success(haystack, ReduceLimits::unlimited()),
+                        Some(expected_count),
+                        "compact count repetition={:?}",
+                        plan.build_accounting().repetition
+                    );
+                    assert_eq!(
+                        plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+                        Some(expected_sum),
+                        "compact span sum repetition={:?}",
+                        plan.build_accounting().repetition
+                    );
+                }
+            }
+        }
+        assert_eq!(core::mem::size_of::<NoExecutionMeter>(), 0);
     }
 
     #[test]
@@ -3662,15 +4205,20 @@ mod tests {
         }
         let upper = rows[0].upper_bounds;
         assert!(upper.reducer_steps > 0);
-        let error = plan
-            .count(
-                &unit.repeat(8),
-                ReduceLimits {
-                    max_reducer_steps: upper.reducer_steps - 1,
-                    ..ReduceLimits::unlimited()
-                },
-            )
-            .unwrap_err();
+        let exact_limits = ReduceLimits {
+            max_reducer_steps: upper.reducer_steps,
+            ..ReduceLimits::unlimited()
+        };
+        assert_eq!(
+            plan.count_value_success(&unit.repeat(8), exact_limits),
+            Some(rows[0].actual.count)
+        );
+        let one_below = ReduceLimits {
+            max_reducer_steps: upper.reducer_steps - 1,
+            ..ReduceLimits::unlimited()
+        };
+        assert_eq!(plan.count_value_success(&unit.repeat(8), one_below), None);
+        let error = plan.count(&unit.repeat(8), one_below).unwrap_err();
         assert!(matches!(error, ReduceError::ReducerStepsLimit { .. }));
     }
 
@@ -3693,6 +4241,16 @@ mod tests {
             assert_eq!(result.count, 0, "haystack={haystack:?}");
             assert_eq!(result.accounting.actual.valid_scalars, 0);
             assert_eq!(result.accounting.actual.invalid_bytes, haystack.len());
+            assert_eq!(
+                plan.count_value_success(haystack, ReduceLimits::unlimited()),
+                Some(0),
+                "haystack={haystack:?}"
+            );
+            assert_eq!(
+                plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+                Some(0),
+                "haystack={haystack:?}"
+            );
         }
         let mixed = plan
             .count(
@@ -3739,6 +4297,10 @@ mod tests {
             plan.count_in(b"abc", Window::new(0, 4), ReduceLimits::unlimited()),
             Err(ReduceError::InvalidWindow { .. })
         ));
+        assert_eq!(
+            plan.count_value_in_success(b"abc", Window::new(2, 1), ReduceLimits::unlimited()),
+            None
+        );
     }
 
     #[test]
@@ -3824,6 +4386,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the single boundary table checks exact and one-below behavior for every independently limited resource"
+    )]
     fn every_nonzero_reduce_limit_has_an_exact_and_one_below_boundary() {
         let plan = class_plan();
         let haystack = b"Az\xCE\xB1\xE9\x9B\xAA\xFF";
@@ -3845,7 +4411,13 @@ mod tests {
             max_scratch_bytes: baseline.scratch_bytes,
             max_peak_bytes: baseline.peak_bytes,
         };
-        plan.span_sum(haystack, exact).unwrap();
+        let exact_sum = plan.span_sum(haystack, exact).unwrap().span_sum;
+        let exact_count = plan.count(haystack, exact).unwrap().count;
+        assert_eq!(
+            plan.span_sum_value_success(haystack, exact),
+            Some(exact_sum)
+        );
+        assert_eq!(plan.count_value_success(haystack, exact), Some(exact_count));
 
         let cases = [
             (
@@ -3913,6 +4485,24 @@ mod tests {
             ),
         ];
         for (limits, expected) in cases {
+            assert_eq!(
+                plan.span_sum_value_success(haystack, limits),
+                None,
+                "compact span sum accepted one-below {expected}"
+            );
+            if expected == "span" {
+                assert_eq!(
+                    plan.count_value_success(haystack, limits),
+                    Some(exact_count),
+                    "count must not enforce span-sum limits"
+                );
+            } else {
+                assert_eq!(
+                    plan.count_value_success(haystack, limits),
+                    None,
+                    "compact count accepted one-below {expected}"
+                );
+            }
             let error = plan.span_sum(haystack, limits).unwrap_err();
             let actual = reduce_error_dimension(error);
             assert_eq!(actual, expected);

@@ -1942,6 +1942,87 @@ fn unicode_scalar_count_value_matches_audited_count_for_short_input() {
 }
 
 #[test]
+fn unicode_scalar_value_paths_match_reports_and_replayed_errors_across_modes() {
+    std::thread::Builder::new()
+        .name("unicode-scalar-value-paths".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let haystack = b"ab--\xCE\xB1\xCE\xB2\xFF\xE9\x9B\xAA\xE9\x9B\xAAz";
+            for pattern in [
+                r"\pL",
+                r"\pL+",
+                r"\pL+?",
+                r"\pL{2,4}",
+                r"\pL{2,4}?",
+                r"\pL{3,}",
+            ] {
+                let count = aggregate_builder(pattern).build_count().unwrap();
+                let counted = count
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap();
+                let AggregateExecutionDetails::UnicodeScalar(count_accounting) =
+                    counted.report().details()
+                else {
+                    panic!("count {pattern:?} selected another execution family")
+                };
+                let mut exact_count_limits = AggregateRunLimits::default();
+                exact_count_limits.unicode_scalar.max_work = count_accounting.upper_bounds.work;
+                for _ in 0..2 {
+                    assert_eq!(
+                        count.count_value(haystack, exact_count_limits).unwrap(),
+                        counted.value(),
+                        "count {pattern:?}"
+                    );
+                }
+                let mut below_count_limits = exact_count_limits;
+                below_count_limits.unicode_scalar.max_work =
+                    count_accounting.upper_bounds.work.checked_sub(1).unwrap();
+                let audited_count_error = count.count(haystack, below_count_limits).unwrap_err();
+                let value_count_error =
+                    count.count_value(haystack, below_count_limits).unwrap_err();
+                assert_eq!(value_count_error.identity, audited_count_error.identity);
+                assert_eq!(value_count_error.source, audited_count_error.source);
+                assert!(value_count_error.has_closed_direct_attempt());
+
+                let span_sum = aggregate_builder(pattern).build_span_sum().unwrap();
+                let summed = span_sum
+                    .span_sum(haystack, AggregateRunLimits::default())
+                    .unwrap();
+                let AggregateExecutionDetails::UnicodeScalar(span_accounting) =
+                    summed.report().details()
+                else {
+                    panic!("span sum {pattern:?} selected another execution family")
+                };
+                let mut exact_span_limits = AggregateRunLimits::default();
+                exact_span_limits.unicode_scalar.max_work = span_accounting.upper_bounds.work;
+                for _ in 0..2 {
+                    assert_eq!(
+                        span_sum
+                            .span_sum_value(haystack, exact_span_limits)
+                            .unwrap(),
+                        summed.value(),
+                        "span sum {pattern:?}"
+                    );
+                }
+                let mut below_span_limits = exact_span_limits;
+                below_span_limits.unicode_scalar.max_work =
+                    span_accounting.upper_bounds.work.checked_sub(1).unwrap();
+                let audited_span_error =
+                    span_sum.span_sum(haystack, below_span_limits).unwrap_err();
+                let value_span_error = span_sum
+                    .span_sum_value(haystack, below_span_limits)
+                    .unwrap_err();
+                assert_eq!(value_span_error.identity, audited_span_error.identity);
+                assert_eq!(value_span_error.source, audited_span_error.source);
+                assert!(value_span_error.has_closed_direct_attempt());
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn unicode_root_scalar_classes_stream_once_for_count_span_sum_and_compile_verify() {
     let cases: [(&str, &[u8], bool); 8] = [
         (".", b"a\n\xFF\xE9\x9B\xAA\x80", false),
