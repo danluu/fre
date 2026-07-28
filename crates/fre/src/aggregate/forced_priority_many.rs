@@ -120,8 +120,9 @@ pub struct PriorityAggregateManyBuildLimits {
     /// sparse plan is constructed.
     pub preparation: PreparationLimits,
     /// Capture-sidecar and one whole-operation literal-proof construction
-    /// envelope. This is consulted only by [`Self::build_capture_count`]; the
-    /// ordinary Count and `SpanSum` artifacts retain their established receipt.
+    /// envelope. This is consulted only by
+    /// [`PriorityAggregateManyBuilder::build_capture_count`]; the ordinary
+    /// Count and `SpanSum` artifacts retain their established receipt.
     pub capture_build: PriorityAggregateManyCaptureBuildLimits,
 }
 

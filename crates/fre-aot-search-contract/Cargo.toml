@@ -1,0 +1,14 @@
+[package]
+name = "fre-aot-search-contract"
+version.workspace = true
+description = "JIT-neutral claim-side wire contract for static exact-literal Search Span images"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

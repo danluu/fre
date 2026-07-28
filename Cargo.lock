@@ -98,6 +98,7 @@ name = "fre"
 version = "0.1.0"
 dependencies = [
  "fre-aggregate",
+ "fre-aot-static-runtime",
  "fre-automata",
  "fre-capture-lab",
  "fre-exact-alloc",
@@ -110,6 +111,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "sha2",
  "stats_alloc",
 ]
 
@@ -125,6 +127,103 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-aarch64"
+version = "0.1.0"
+dependencies = [
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-compiler"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-elf",
+ "fre-aot-macho",
+ "fre-aot-search-contract",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-count-compiler"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-compiler",
+ "fre-aot-count-contract",
+ "fre-aot-macho",
+ "fre-exact-alloc",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-count-contract"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-aarch64",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-elf"
+version = "0.1.0"
+dependencies = [
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-macho"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-aarch64",
+ "fre-exact-alloc",
+ "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-search-contract"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-static-prelink"
+version = "0.1.0"
+dependencies = [
+ "fre",
+ "fre-aot-aarch64",
+ "fre-aot-compiler",
+ "fre-aot-count-contract",
+ "fre-aot-macho",
+]
+
+[[package]]
+name = "fre-aot-static-runtime"
+version = "0.1.0"
+dependencies = [
+ "fre-aot-aarch64",
+ "fre-aot-count-contract",
+ "fre-aot-search-contract",
+ "fre-kernel-ir",
+ "fre-kernels",
+ "fre-target-features",
+ "libc",
  "sha2",
 ]
 

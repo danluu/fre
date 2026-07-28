@@ -1,0 +1,62 @@
+[workspace]
+
+[package]
+name = "fre-aot-count-qualified-benchmark"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[features]
+default = ["qualification-benchmark"]
+qualification-benchmark = [
+    "dep:fre",
+    "dep:sha2",
+    "fre-aot-static-runtime/c5-qualification-private-v2",
+]
+promotion-correctness = []
+production-linked-count = ["fre-aot-static-runtime/linked-count-v2"]
+production-hardware-matrix = ["fre-aot-static-runtime/linked-hardware-matrix-v2"]
+production-all-runtime = [
+    "fre-aot-static-runtime/c5-qualification-private-v2",
+    "fre-aot-static-runtime/linked-hardware-matrix-v2",
+]
+
+[dependencies]
+fre = { path = "../../../fre", optional = true }
+fre-aot-static-runtime = { path = "../../../fre-aot-static-runtime" }
+fre-kernel-ir = { path = "../../../fre-kernel-ir" }
+sha2 = { version = "=0.10.9", optional = true }
+
+[[bin]]
+name = "fre-aot-count-qualified-benchmark"
+path = "src/main.rs"
+required-features = ["qualification-benchmark"]
+
+[[bin]]
+name = "fre-aot-count-promoted-correctness"
+path = "src/promoted_correctness.rs"
+required-features = ["promotion-correctness"]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

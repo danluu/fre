@@ -1,0 +1,52 @@
+[workspace]
+
+[package]
+name = "fre-search-v8-bakeoff"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0 OR MIT"
+publish = false
+build = "build.rs"
+
+[dependencies]
+fre = { path = "../../../crates/fre", default-features = false }
+fre-aot-compiler = { path = "../../../crates/fre-aot-compiler" }
+fre-aot-macho = { path = "../../../crates/fre-aot-macho" }
+fre-jit-aarch64 = { path = "../../../crates/fre-jit-aarch64" }
+fre-jit-runtime = { path = "../../../crates/fre-jit-runtime" }
+fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
+
+[build-dependencies]
+fre = { path = "../../../crates/fre", default-features = false }
+fre-aot-compiler = { path = "../../../crates/fre-aot-compiler" }
+fre-aot-macho = { path = "../../../crates/fre-aot-macho" }
+fre-jit-aarch64 = { path = "../../../crates/fre-jit-aarch64" }
+fre-kernel-ir = { path = "../../../crates/fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[[bin]]
+name = "fre-search-v8-bakeoff"
+path = "src/main.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unreachable_pub = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

@@ -1,0 +1,20 @@
+[package]
+name = "fre-aot-static-prelink"
+version.workspace = true
+description = "Build-time compiler-authority validation for FRE Count-v2 static objects"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-compiler = { path = "../fre-aot-compiler" }
+fre-aot-count-contract = { path = "../fre-aot-count-contract" }
+fre-aot-macho = { path = "../fre-aot-macho" }
+
+[dev-dependencies]
+fre = { path = "../fre" }
+
+[lints]
+workspace = true

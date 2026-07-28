@@ -1,0 +1,15 @@
+[package]
+name = "fre-aot-count-contract"
+version.workspace = true
+description = "JIT-neutral claim-side wire contract for FRE Count-v2 AOT images"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

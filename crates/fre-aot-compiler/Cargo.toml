@@ -1,0 +1,21 @@
+[package]
+name = "fre-aot-compiler"
+version.workspace = true
+description = "Authenticated bounded macOS AArch64 AOT compiler for FRE exact-literal Count and inert Search artifacts"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre = { path = "../fre", default-features = false }
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-elf = { path = "../fre-aot-elf" }
+fre-aot-macho = { path = "../fre-aot-macho" }
+fre-aot-search-contract = { path = "../fre-aot-search-contract" }
+fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

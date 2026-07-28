@@ -6,6 +6,10 @@
 //! experimental, explicit opt-in 16-byte exact-literal JIT leaf with portable
 //! fallback outside its evidence-gated large-window envelope. No default
 //! facade selects that native route.
+//! The default-off `explicit-search-span-aot` feature adds only a safe binder
+//! from an already-adopted static Search Span handle to the authenticated
+//! portable exact-literal owner. It does not adopt, link, compile, authorize,
+//! or automatically select AOT code.
 //! [`PortableRegexSetBuilder`] and
 //! [`PortableTextRegexSetBuilder`] compose independently admitted matchers
 //! with exact ascending pattern-ID semantics. [`AggregateBuilder`] constructs
@@ -55,6 +59,9 @@ pub mod operation_session;
 mod qualified_exact_search;
 mod replacement;
 mod required_literal;
+mod search_aot;
+#[cfg(feature = "explicit-search-span-aot")]
+mod search_aot_facade;
 mod set;
 mod split;
 #[cfg(all(
@@ -73,6 +80,13 @@ mod token_phrase;
 mod unicode_word_run;
 
 pub use aggregate::{
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_CANDIDATE_IDENTITY_WORK_UPPER_BOUND_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_LITERAL_BYTES_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MAX_SOURCE_BYTES_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_POLICY_VERSION,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_RECEIPT_SCHEMA_VERSION,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_PLANNING_WORK_UPPER_BOUND_V1,
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION,
     AGGREGATE_DIRECT_OWNER_ACCOUNTING_VERSION, AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION,
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBlockingDelimiterIdentity,
     AggregateBlockingDelimiterSemantics, AggregateBoundedContextIdentity,
@@ -80,7 +94,12 @@ pub use aggregate::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuildReport,
     AggregateBuilder, AggregateCacheIdentity, AggregateCaptureSemantics, AggregateCompileRegex,
     AggregateConstructionAttemptError, AggregateConstructionReceipt, AggregateConstructionRequest,
-    AggregateContinuationIdentity, AggregateContinuationSemantics, AggregateCountRegex,
+    AggregateContinuationIdentity, AggregateContinuationSemantics,
+    AggregateCountExactLiteralAotCandidate,
+    AggregateCountExactLiteralAotIdentityProjectionAccounting,
+    AggregateCountExactLiteralAotPlannedCandidate, AggregateCountExactLiteralAotPlanningAccounting,
+    AggregateCountExactLiteralAotPlanningReceiptIdentity,
+    AggregateCountExactLiteralAotSemanticBindingIdentity, AggregateCountRegex,
     AggregateCountResult, AggregateDirectAttemptIdentity, AggregateDirectAttemptReceipt,
     AggregateDirectAttemptTerminal, AggregateDirectDeclaredFallback, AggregateDirectInvocation,
     AggregateDirectOwnerSeal, AggregateDirectRoute, AggregateDirectRouteIdentity,
@@ -254,6 +273,10 @@ pub use fre_aggregate::{
     OperationWorkMode as AggregateOperationWorkMode, PlanId as AggregatePlanId,
     Resource as AggregateResource, RowStorage as AggregateRowStorage, Span as AggregateSpan,
     Unsupported as AggregateUnsupported,
+};
+#[cfg(feature = "explicit-search-span-aot")]
+pub use fre_aot_static_runtime::{
+    StaticSearchSpanCallErrorV1, StaticSearchSpanThreadContractErrorV1, VerifiedStaticSearchSpanV1,
 };
 pub use fre_capture_lab::{
     AggregateLimits as CaptureAggregateLimits, BuildError as CaptureEngineBuildError,
@@ -453,6 +476,15 @@ pub use replacement::{
     LiteralReplacementAccounting, LiteralReplacementError, LiteralReplacementErrorSource,
     LiteralReplacementIdentity, LiteralReplacementLimits, LiteralReplacementReport,
     LiteralReplacementResult, LiteralReplacer, NoExpand,
+};
+pub use search_aot::{
+    SEARCH_EXACT_LITERAL_AOT_FIXED_BUILD_POLICY_VERSION,
+    SEARCH_EXACT_LITERAL_AOT_SEMANTIC_BINDING_SCHEMA_VERSION, SearchExactLiteralAotCandidate,
+    SearchExactLiteralAotSemanticBindingIdentity,
+};
+#[cfg(feature = "explicit-search-span-aot")]
+pub use search_aot_facade::{
+    SearchExactLiteralAotBindErrorV1, SearchExactLiteralAotThreadSessionV1, SearchExactLiteralAotV1,
 };
 pub use set::{
     PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, PortableRegexSet, PortableRegexSetBuildError,

@@ -1,0 +1,23 @@
+[package]
+name = "fre-aot-count-compiler"
+version.workspace = true
+description = "Focused JIT-neutral Count-v2 compiler and deterministic implementation objects"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
+fre-aot-count-contract = { path = "../fre-aot-count-contract" }
+fre-exact-alloc = { path = "../fre-exact-alloc" }
+fre-kernel-ir = { path = "../fre-kernel-ir" }
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+fre = { path = "../fre" }
+fre-aot-compiler = { path = "../fre-aot-compiler" }
+fre-aot-macho = { path = "../fre-aot-macho" }
+
+[lints]
+workspace = true

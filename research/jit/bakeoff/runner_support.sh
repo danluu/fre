@@ -121,6 +121,14 @@ fre_bakeoff_validate_process_output() {
 
 fre_bakeoff_require_holder() {
     fre_bakeoff_expected_holder=$1
+    case "$fre_bakeoff_expected_holder" in
+        build|timing|target-cpu-timing) ;;
+        *)
+            fre_bakeoff_error \
+                "unsupported resource coordinator holder kind"
+            return $?
+            ;;
+    esac
     fre_bakeoff_holder_command="run-$fre_bakeoff_expected_holder"
     if [ "$fre_bakeoff_expected_holder" = timing ]; then
         fre_bakeoff_holder_command=run-timing-wave
@@ -142,6 +150,64 @@ fre_bakeoff_require_holder() {
             return $?
             ;;
     esac
+    if [ "$fre_bakeoff_expected_holder" = target-cpu-timing ]; then
+        fre_bakeoff_target_cpu=${FRE_RESOURCE_TARGET_CPU:-}
+        fre_bakeoff_session_id=${FRE_RESOURCE_TIMING_SESSION_ID:-}
+        fre_bakeoff_session_holder_id=\
+${FRE_RESOURCE_TIMING_SESSION_HOLDER_ID:-}
+        fre_bakeoff_owner_sha256=\
+${FRE_RESOURCE_TIMING_SESSION_OWNER_SHA256:-}
+        fre_bakeoff_admission=\
+${FRE_RESOURCE_TIMING_ADMISSION_RECEIPT:-}
+        fre_bakeoff_admission_sha256=\
+${FRE_RESOURCE_TIMING_ADMISSION_RECEIPT_SHA256:-}
+        fre_bakeoff_coordinator=${FRE_RESOURCE_COORDINATOR_PATH:-}
+        fre_bakeoff_coordinator_sha256=\
+${FRE_RESOURCE_COORDINATOR_SHA256:-}
+        case "$fre_bakeoff_target_cpu" in
+            0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]|\
+[1-3][0-9][0-9][0-9]|4[0][0-8][0-9]|409[0-5]) ;;
+            *)
+                fre_bakeoff_error "malformed target CPU"
+                return $?
+                ;;
+        esac
+        if [ "$fre_bakeoff_session_holder_id" != \
+            "${fre_bakeoff_holder_dir##*/}" ] ||
+            [ "$fre_bakeoff_admission" != \
+            "$fre_bakeoff_holder_dir/admission.tsv" ] ||
+            [ ! -f "$fre_bakeoff_admission" ] ||
+            [ -L "$fre_bakeoff_admission" ] ||
+            [ "${fre_bakeoff_coordinator#/}" = \
+            "$fre_bakeoff_coordinator" ] ||
+            [ ! -f "$fre_bakeoff_coordinator" ] ||
+            [ -L "$fre_bakeoff_coordinator" ]
+        then
+            fre_bakeoff_error \
+                "target-CPU session paths do not match the inherited holder"
+            return $?
+        fi
+        for fre_bakeoff_target_digest in \
+            "$fre_bakeoff_session_id" \
+            "$fre_bakeoff_owner_sha256" \
+            "$fre_bakeoff_admission_sha256" \
+            "$fre_bakeoff_coordinator_sha256"
+        do
+            if [ "${#fre_bakeoff_target_digest}" != 64 ]; then
+                fre_bakeoff_error \
+                    "malformed target-CPU authority digest"
+                return $?
+            fi
+            case "$fre_bakeoff_target_digest" in
+                *[!0-9a-f]*|\
+0000000000000000000000000000000000000000000000000000000000000000)
+                    fre_bakeoff_error \
+                        "malformed target-CPU authority digest"
+                    return $?
+                    ;;
+            esac
+        done
+    fi
 }
 
 fre_bakeoff_canonical_new_external_directory() {
