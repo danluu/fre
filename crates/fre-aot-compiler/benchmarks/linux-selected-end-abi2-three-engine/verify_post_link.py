@@ -826,6 +826,7 @@ def require_symbol(
     defined: bool,
     hidden: bool,
     kind: str,
+    allow_zero_value: bool = False,
 ) -> tuple[int, int]:
     matches = [row for row in rows if row[-1] == symbol]
     require(len(matches) == 1, f"{symbol} does not have one symbol-table row")
@@ -847,8 +848,8 @@ def require_symbol(
         raise Refusal(f"{symbol} has a malformed value or extent") from error
     if defined:
         require(
-            value > 0 and 0 < size <= MAX_OBJECT_BYTES,
-            f"{symbol} has a zero or unbounded defined extent",
+            (allow_zero_value or value > 0) and 0 < size <= MAX_OBJECT_BYTES,
+            f"{symbol} has an invalid value or defined extent",
         )
     return value, size
 
@@ -1291,13 +1292,14 @@ def verify(arguments: argparse.Namespace) -> None:
             defined=True,
             hidden=True,
             kind="FUNC",
+            allow_zero_value=True,
         )
         require_symbol(
             glue_symbols,
             entry,
             defined=False,
             hidden=True,
-            kind="NOTYPE",
+            kind="FUNC",
         )
         require_symbol(
             implementation_symbols,
@@ -1305,6 +1307,7 @@ def verify(arguments: argparse.Namespace) -> None:
             defined=True,
             hidden=True,
             kind="FUNC",
+            allow_zero_value=True,
         )
         require_symbol(
             implementation_symbols,
@@ -1312,6 +1315,7 @@ def verify(arguments: argparse.Namespace) -> None:
             defined=True,
             hidden=True,
             kind="OBJECT",
+            allow_zero_value=True,
         )
         require_symbol(
             implementation_symbols,
@@ -1319,6 +1323,7 @@ def verify(arguments: argparse.Namespace) -> None:
             defined=True,
             hidden=True,
             kind="OBJECT",
+            allow_zero_value=True,
         )
         wrapper_extent = require_symbol(
             binary_symbols,
