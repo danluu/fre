@@ -13,7 +13,7 @@ use fre_syntax::CacheKey;
 use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Versioned algorithm identity for the required-any-literal proof.
-pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v4";
+pub const CAPTURE_REQUIRED_LITERAL_PLAN_ID: &str = "fre.capture.required-any-literal-dfa.v5";
 
 const MAX_INLINE_NEEDLES: usize = 64;
 const NEEDLE_OFFSET_SLOTS: usize = MAX_INLINE_NEEDLES + 1;
@@ -422,7 +422,7 @@ fn build_from_hirs_metered(
     }
     let (retained, effective) = effective_antichain(&raw_needles[..raw_count], meter)?;
     check_metric_limits(effective, limits)?;
-    if effective.needles < 2 {
+    if effective.needles == 0 {
         return Ok(None);
     }
 
@@ -758,6 +758,13 @@ struct Metrics {
     minimum_bytes: usize,
 }
 
+fn prefer_required_literal(candidate: Metrics, current: Metrics) -> bool {
+    candidate.minimum_bytes > current.minimum_bytes
+        || (candidate.minimum_bytes == current.minimum_bytes
+            && (candidate.needles < current.needles
+                || (candidate.needles == current.needles && candidate.bytes > current.bytes)))
+}
+
 struct Meter {
     limits: CaptureRequiredLiteralBuildLimits,
     work: usize,
@@ -817,16 +824,15 @@ fn measure(
             measure(&repetition.sub, next_depth(depth)?, meter)
         }
         HirKind::Concat(children) => {
-            let mut fallback = None;
+            let mut best = None;
             for child in children {
-                if let Some(metrics) = measure(child, next_depth(depth)?, meter)? {
-                    if metrics.minimum_bytes >= 2 {
-                        return Ok(Some(metrics));
-                    }
-                    fallback.get_or_insert(metrics);
+                if let Some(metrics) = measure(child, next_depth(depth)?, meter)?
+                    && best.is_none_or(|current| prefer_required_literal(metrics, current))
+                {
+                    best = Some(metrics);
                 }
             }
-            Ok(fallback)
+            Ok(best)
         }
         HirKind::Alternation(children) if !children.is_empty() => {
             let mut needles = 0_usize;
@@ -1047,19 +1053,20 @@ fn collect_refs<'hir>(
             collect_refs(&repetition.sub, next_depth(depth)?, meter, output, count)
         }
         HirKind::Concat(children) => {
-            let mut fallback = None;
+            let mut best = None;
             for child in children {
-                if let Some(metrics) = measure(child, next_depth(depth)?, meter)? {
-                    if metrics.minimum_bytes >= 2 {
-                        return collect_refs(child, next_depth(depth)?, meter, output, count);
-                    }
-                    fallback.get_or_insert(child);
+                if let Some(metrics) = measure(child, next_depth(depth)?, meter)?
+                    && best.is_none_or(|(_, current)| prefer_required_literal(metrics, current))
+                {
+                    best = Some((child, metrics));
                 }
             }
             collect_refs(
-                fallback.ok_or(CaptureRequiredLiteralBuildError::InternalInvariant(
-                    "proved concat lost its required literal",
-                ))?,
+                best.map(|(child, _)| child).ok_or(
+                    CaptureRequiredLiteralBuildError::InternalInvariant(
+                        "proved concat lost its required literal",
+                    ),
+                )?,
                 next_depth(depth)?,
                 meter,
                 output,
@@ -1278,6 +1285,7 @@ fn next_depth(depth: usize) -> Result<usize, CaptureRequiredLiteralBuildError> {
 mod tests {
     use super::*;
     use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
+    use regex::bytes::RegexBuilder;
 
     const AWS: &str = r#"(('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|").*?(\n^.*?){0,4}(('|")[a-zA-Z0-9+/]{40}('|"))+|('|")[a-zA-Z0-9+/]{40}('|").*?(\n^.*?){0,3}('|")((?:ASIA|AKIA|AROA|AIDA)([A-Z0-7]{16}))('|"))+"#;
 
@@ -1347,6 +1355,48 @@ mod tests {
             .iter()
             .map(<[u8]>::to_vec)
             .collect()
+    }
+
+    fn visit_short_haystacks(
+        alphabet: &[u8],
+        remaining: usize,
+        haystack: &mut Vec<u8>,
+        visitor: &mut impl FnMut(&[u8]),
+    ) {
+        visitor(haystack);
+        if remaining == 0 {
+            return;
+        }
+        let next_remaining = remaining
+            .checked_sub(1)
+            .expect("positive short-haystack depth");
+        for &byte in alphabet {
+            haystack.push(byte);
+            visit_short_haystacks(alphabet, next_remaining, haystack, visitor);
+            haystack.pop();
+        }
+    }
+
+    fn assert_required_literal_never_rejects_match(pattern: &str, alphabet: &[u8], max_len: usize) {
+        let plan = build(pattern, CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("fixture must publish a required-literal plan");
+        let reference = RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("pinned byte-regex reference");
+        visit_short_haystacks(alphabet, max_len, &mut Vec::new(), &mut |haystack| {
+            if reference.is_match(haystack) {
+                assert!(
+                    plan.is_candidate(haystack, CaptureRequiredLiteralRunLimits::default(),)
+                        .unwrap()
+                        .candidate,
+                    "required-literal plan rejected a reference match for \
+                         {pattern:?} on {haystack:?}",
+                );
+            }
+        });
     }
 
     #[test]
@@ -1448,7 +1498,7 @@ mod tests {
     #[test]
     fn small_mandatory_ascii_classes_form_exact_one_byte_alternatives() {
         let plan = build(
-            r"(?:[0-9]x|[A-F]y)+",
+            r"(?:[0-9]x?|[A-F]y?)+",
             CaptureRequiredLiteralBuildLimits::default(),
         )
         .unwrap()
@@ -1544,6 +1594,67 @@ mod tests {
     }
 
     #[test]
+    fn concat_ranking_is_selective_deterministic_and_source_independent() {
+        let longest = build(
+            r"(?:AB|CD)XYZ",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("longer required literal");
+        assert_eq!(owned_needles(&longest), vec![b"XYZ".to_vec()]);
+
+        let narrower = build(r"(?:AB|CD)XY", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("equal-width narrower required literal");
+        assert_eq!(owned_needles(&narrower), vec![b"XY".to_vec()]);
+
+        assert!(prefer_required_literal(
+            Metrics {
+                needles: 2,
+                bytes: 5,
+                minimum_bytes: 2,
+            },
+            Metrics {
+                needles: 2,
+                bytes: 4,
+                minimum_bytes: 2,
+            },
+        ));
+        assert!(!prefer_required_literal(
+            Metrics {
+                needles: 2,
+                bytes: 4,
+                minimum_bytes: 2,
+            },
+            Metrics {
+                needles: 2,
+                bytes: 5,
+                minimum_bytes: 2,
+            },
+        ));
+
+        let uri = build(
+            r"[A-Za-z][A-Za-z0-9+.-]*://[^\r\n]*",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("URI delimiter is mandatory");
+        assert_eq!(owned_needles(&uri), vec![b"://".to_vec()]);
+
+        let date = build(
+            r"[0-9]{4}/[0-9]{2}/[0-9]{2}",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("date delimiter is mandatory");
+        assert_eq!(owned_needles(&date), vec![b"/".to_vec()]);
+    }
+
+    #[test]
     fn unicode_ascii_and_raw_byte_classes_are_malformed_safe() {
         let unicode_ascii = build_detailed_with_unicode(
             r"[A-B]",
@@ -1632,15 +1743,15 @@ mod tests {
     }
 
     #[test]
-    fn effective_antichain_controls_eligibility_and_preserves_first_order() {
+    fn effective_antichain_retains_singletons_and_preserves_first_order() {
         for redundant in ["(?:(AB)|(AB))", "(?:(AB)|(XAB))", "(?:(XAB)|(AB))"] {
-            assert!(
-                build(redundant, CaptureRequiredLiteralBuildLimits::default())
-                    .unwrap()
-                    .plan
-                    .is_none(),
-                "{redundant} must not activate a redundant any-literal set"
-            );
+            let plan = build(redundant, CaptureRequiredLiteralBuildLimits::default())
+                .unwrap()
+                .plan
+                .unwrap_or_else(|| panic!("{redundant} must retain its effective singleton"));
+            assert_eq!(owned_needles(&plan), vec![b"AB".to_vec()], "{redundant}");
+            assert_eq!(plan.build_report().accounting.raw_needles, 2);
+            assert_eq!(plan.build_report().accounting.needles, 1);
         }
 
         let plan = build(
@@ -1655,6 +1766,110 @@ mod tests {
         assert_eq!(accounting.needles, 2);
         assert_eq!(accounting.minimum_needle_bytes, 2);
         assert_eq!(owned_needles(&plan), vec![b"AB".to_vec(), b"CD".to_vec()]);
+    }
+
+    #[test]
+    fn singleton_plan_has_exact_limits_and_line_partition_accounting() {
+        let baseline = build("needle", CaptureRequiredLiteralBuildLimits::default())
+            .unwrap()
+            .plan
+            .expect("one mandatory literal is a complete candidate proof");
+        let accounting = baseline.build_report().accounting;
+        assert_eq!(accounting.raw_needles, 1);
+        assert_eq!(accounting.needles, 1);
+        assert_eq!(accounting.raw_needle_bytes, 6);
+        assert_eq!(accounting.needle_bytes, 6);
+        assert_eq!(accounting.minimum_needle_bytes, 6);
+        assert!(accounting.line_partition_safe);
+        assert_eq!(owned_needles(&baseline), vec![b"needle".to_vec()]);
+
+        for (resource, exact) in [
+            ("planner work", accounting.planner_work),
+            ("needle count", accounting.needles),
+            ("needle bytes", accounting.needle_bytes),
+            ("source bytes", accounting.source_bytes),
+            ("scratch bytes", accounting.scratch_bytes),
+            ("peak bytes", accounting.peak_bytes_upper_bound),
+        ] {
+            let mut admitted = CaptureRequiredLiteralBuildLimits::default();
+            match resource {
+                "planner work" => admitted.max_planner_work = exact,
+                "needle count" => admitted.max_needles = exact,
+                "needle bytes" => admitted.max_needle_bytes = exact,
+                "source bytes" => admitted.max_source_bytes = exact,
+                "scratch bytes" => admitted.max_scratch_bytes = exact,
+                "peak bytes" => admitted.max_peak_bytes = exact,
+                _ => unreachable!(),
+            }
+            exact_allocation_probe::reset();
+            assert!(
+                build("needle", admitted)
+                    .expect("exact singleton resource admission")
+                    .plan
+                    .is_some()
+            );
+            assert_eq!(exact_allocation_probe::calls(), 2);
+
+            let mut refused = admitted;
+            match resource {
+                "planner work" => refused.max_planner_work = exact - 1,
+                "needle count" => refused.max_needles = exact - 1,
+                "needle bytes" => refused.max_needle_bytes = exact - 1,
+                "source bytes" => refused.max_source_bytes = exact - 1,
+                "scratch bytes" => refused.max_scratch_bytes = exact - 1,
+                "peak bytes" => refused.max_peak_bytes = exact - 1,
+                _ => unreachable!(),
+            }
+            exact_allocation_probe::reset();
+            assert!(matches!(
+                build("needle", refused),
+                Err(CaptureRequiredLiteralBuildError::Resource {
+                    resource: actual,
+                    ..
+                }) if actual == resource
+            ));
+            assert_eq!(
+                exact_allocation_probe::calls(),
+                0,
+                "{resource} singleton refusal occurred after exact allocation",
+            );
+        }
+
+        let haystack = b"miss\nneedle here\r\nneed\nneedle";
+        let prospective = baseline
+            .line_partition_prospective(haystack.len())
+            .unwrap()
+            .expect("delimiter-free singleton");
+        let exact_run = CaptureRequiredLiteralRunLimits {
+            max_transitions: prospective.transitions_upper_bound,
+        };
+        let matches = baseline
+            .line_partition_matches(haystack, exact_run)
+            .unwrap()
+            .expect("singleton line partition")
+            .collect::<Vec<_>>();
+        assert_eq!(matches, [(5, 11), (23, 29)]);
+        assert!(matches!(
+            baseline.line_partition_matches(
+                haystack,
+                CaptureRequiredLiteralRunLimits {
+                    max_transitions: prospective.transitions_upper_bound - 1,
+                },
+            ),
+            Err(CaptureRequiredLiteralSearchError {
+                source: LiteralSetError::TransitionLimit { needed, limit },
+                ..
+            }) if needed == prospective.transitions_upper_bound
+                && limit == prospective.transitions_upper_bound - 1
+        ));
+    }
+
+    #[test]
+    fn singleton_and_ranked_candidates_differentially_cover_reference_matches() {
+        assert_required_literal_never_rejects_match("AB", b"ABX", 3);
+        assert_required_literal_never_rejects_match("(?:AB|XAB)", b"ABX", 3);
+        assert_required_literal_never_rejects_match(r"[0-9]+/[0-9]+", b"09/", 4);
+        assert_required_literal_never_rejects_match(r"(?:AB|CD)XYZ", b"ABCDXYZ", 5);
     }
 
     #[test]
@@ -1917,6 +2132,15 @@ mod tests {
                 ..
             })
         ));
+
+        let ranked = build(
+            r"(?:[0-9]x|[A-F]y)+",
+            CaptureRequiredLiteralBuildLimits::default(),
+        )
+        .unwrap()
+        .plan
+        .expect("mandatory branch suffixes");
+        assert_eq!(owned_needles(&ranked), vec![b"x".to_vec(), b"y".to_vec()]);
     }
 
     #[test]

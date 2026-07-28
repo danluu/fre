@@ -215,7 +215,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v45-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -19083,7 +19083,7 @@ mod tests {
     }
 
     #[test]
-    fn required_literal_activation_uses_only_the_effective_antichain() {
+    fn required_literal_activation_includes_effective_singletons() {
         let haystack = b"AB\nXAB\nCD\nmiss";
         for pattern in ["(?:(AB)|(AB))", "(?:(AB)|(XAB))"] {
             let upstream = rust_compile_options(&[pattern.to_string()], false, false)
@@ -19097,10 +19097,10 @@ mod tests {
                 false,
                 haystack.len(),
             )
-            .expect("redundant any-literal set falls back to capture route");
-            assert_ne!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+            .expect("effective singleton required-literal route");
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
             assert_eq!(
-                lifecycle.execute(haystack).expect("fallback execution"),
+                lifecycle.execute(haystack).expect("singleton execution"),
                 expected
             );
         }
@@ -21167,7 +21167,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v44-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1"
+            "fre-current-aggregate-capture-v45-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -22332,8 +22332,63 @@ mod tests {
     }
 
     #[test]
+    fn plain_grep_singleton_and_best_concat_prefilters_match_rust_regex() {
+        let cases = [
+            (
+                r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)",
+                false,
+                b"published 12/31/2026\n".as_slice(),
+            ),
+            (
+                r"([^ @]+)@([^ @]+)",
+                false,
+                b"name@example.com\n".as_slice(),
+            ),
+            (
+                r"([a-zA-Z][a-zA-Z0-9]*)://([^ /]+)(/[^ ]*)?",
+                false,
+                b"visit https://example.com/path\n".as_slice(),
+            ),
+            (
+                r"^[ \t\f]*#.*?coding[:=][ \t]*utf-?8",
+                true,
+                b"# coding: utf-8\n".as_slice(),
+            ),
+        ];
+        for (pattern, unicode, matching_line) in cases {
+            let mut haystack = b"ordinary source line without the delimiter\n".repeat(64);
+            haystack.extend_from_slice(matching_line);
+            haystack.extend_from_slice(b"another ordinary source line\n");
+            assert!(haystack.len() >= CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES);
+
+            let regex = current_fre_rebar_portable_builder(pattern, unicode, false)
+                .expect("portable builder")
+                .build()
+                .expect("portable K0");
+            assert_eq!(regex.build_report().plan, PlanKind::K0, "{pattern}");
+            let mut session = current_fre_rebar_grep_session(&regex, haystack.len())
+                .expect("singleton/best-concat grep session");
+            assert!(session.has_required_literal_prefilter(), "{pattern}");
+            assert!(session.uses_required_literal_prefilter(), "{pattern}");
+
+            let reference = rust_regex_reference_operation_lifecycle(
+                "grep",
+                &[pattern.to_string()],
+                unicode,
+                false,
+                haystack.len(),
+            )
+            .expect("pinned Rust regex reference");
+            let expected = reference.execute(&haystack).expect("Rust regex grep");
+            assert_eq!(session.execute(&haystack).expect("FRE first"), expected);
+            assert_eq!(session.execute(&haystack).expect("FRE steady"), expected);
+        }
+    }
+
+    #[test]
     fn plain_grep_required_literal_admission_is_exact_and_delimiters_fall_back() {
         const SAFE: &str = r"(?:ABC.*Z|XY.+Q)";
+        const DELIMITER: &str = r"(?:AB\r.*Z|XY.+Q)";
         let mut haystack =
             b"miss\n".repeat(CURRENT_FRE_GREP_PREFILTER_MIN_SOURCE_BYTES.div_ceil(b"miss\n".len()));
         haystack.extend_from_slice(b"ABCZ\r\nXYxQ\n");
@@ -22392,7 +22447,6 @@ mod tests {
         assert!(!refused.uses_required_literal_prefilter());
         assert_eq!(refused.execute(&haystack).expect("one-below fallback"), 2);
 
-        const DELIMITER: &str = r"(?:AB\r.*Z|XY.+Q)";
         let delimiter_regex = current_fre_rebar_portable_builder(DELIMITER, false, false)
             .expect("delimiter builder")
             .build()

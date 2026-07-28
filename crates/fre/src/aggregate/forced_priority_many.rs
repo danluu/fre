@@ -2905,7 +2905,7 @@ fn capture_required_literal_build_report_closes(
         && report.identity.needles.byte_len() == accounting.needle_bytes
         && accounting.planner_work <= limits.max_planner_work
         && accounting.hir_depth <= limits.max_hir_depth
-        && accounting.needles >= 2
+        && accounting.needles > 0
         && accounting.needles <= limits.max_needles
         && accounting.needle_bytes <= limits.max_needle_bytes
         && accounting.minimum_needle_bytes > 0
@@ -6411,7 +6411,7 @@ mod receipt_tests {
         bridge.construction.whole_literal_bridge_allocations -= 1;
         assert!(!bridge.build_report().closes());
 
-        let no_proof_values = vec!["(a)".to_owned()];
+        let no_proof_values = vec!["(a?)".to_owned()];
         let mut no_proof = PriorityAggregateManyBuilder::new(&no_proof_values)
             .unicode(false)
             .build_capture_count(ForcedExecution::Sparse, PriorityTarget::portable())
@@ -6489,7 +6489,7 @@ mod receipt_tests {
         let PriorityAggregateManyWholeRequiredLiteralBuildReceipt::NoProof { planner_work, .. } =
             &mut malformed_planner.whole_required_literal_receipt
         else {
-            panic!("single literal fixture must use the explicit NoProof receipt");
+            panic!("nullable fixture must use the explicit NoProof receipt");
         };
         *planner_work = malformed_planner_work;
         malformed_planner.construction.whole_literal_planner_work = malformed_planner_work;
