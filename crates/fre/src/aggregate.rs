@@ -3258,7 +3258,8 @@ impl AggregateBuildReport {
                         fre_kernels::FixedAbsoluteDomainOperation::Count,
                         FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
                             | FixedAbsoluteDomainDescriptorKind::WholeOrderedWords
-                            | FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope,
+                            | FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+                            | FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
                     ) | (
                         AggregateOperation::SpanSum,
                         fre_kernels::FixedAbsoluteDomainOperation::SpanSum,

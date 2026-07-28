@@ -94,6 +94,9 @@ fn classify_candidate_metered(
         AggregateOperation::Count if starts && ends => {
             classify_count_candidate(parts, unicode, meter)
         }
+        AggregateOperation::Count if !unicode && starts && !ends => {
+            Ok(classify_start_mask_candidate(&parts[1..], meter)?.unwrap_or(Candidate::Ineligible))
+        }
         AggregateOperation::SpanSum if !unicode && starts ^ ends => {
             classify_span_sum_candidate(parts, starts, meter)
         }
@@ -1394,9 +1397,30 @@ fn inspect_byte_count<'a>(
     parts: &'a [Hir],
     visitor: &mut Visitor,
 ) -> Result<Option<Shape<'a>>, InspectionError> {
-    let Some(core) = inspect_whole_anchors(parts, visitor)? else {
+    let last_index = parts
+        .len()
+        .checked_sub(1)
+        .ok_or(InspectionError::Overflow)?;
+    let first_start = visitor.probe_look(&parts[0], Look::Start)?;
+    let last_end = visitor.probe_look(&parts[last_index], Look::End)?;
+    if first_start && !last_end {
+        visitor.expect_look(&parts[0], Look::Start)?;
+        let core = &parts[1..];
+        let Some(positions) = visitor.inspect_masks(core)? else {
+            return Ok(None);
+        };
+        return Ok(Some(Shape::MaskSequence(MaskSource {
+            parts: core,
+            positions,
+            start_anchored: true,
+        })));
+    }
+    if !first_start || !last_end {
         return Ok(None);
-    };
+    }
+    visitor.expect_look(&parts[0], Look::Start)?;
+    visitor.expect_look(&parts[last_index], Look::End)?;
+    let core = &parts[1..last_index];
     if core.len() != 1 {
         return Ok(None);
     }

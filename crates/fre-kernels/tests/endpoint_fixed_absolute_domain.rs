@@ -267,10 +267,39 @@ fn start_masks_are_positional_and_start_is_never_rebased_to_a_window() {
         assert_eq!(excluded.accounting.actual.source_accesses, 0);
     }
     assert_every_run_fence(
-        "start-mask-sequence",
+        "start-mask-sequence-span-sum",
         &plan,
         4,
         FixedAbsoluteDomainOperation::SpanSum,
+    );
+    for (haystack, expected) in [
+        (b"abcd-tail".as_slice(), 1),
+        (b"\xffbce-tail".as_slice(), 1),
+        (b"abcf-tail".as_slice(), 0),
+        (b"abc".as_slice(), 0),
+    ] {
+        assert_eq!(
+            plan.count(haystack, FixedAbsoluteDomainReduceLimits::default())
+                .unwrap()
+                .count(),
+            Some(expected)
+        );
+    }
+    assert_eq!(
+        plan.count_in(
+            b"abcd-tail",
+            Window::new(1, 9),
+            FixedAbsoluteDomainReduceLimits::default(),
+        )
+        .unwrap()
+        .count(),
+        Some(0)
+    );
+    assert_every_run_fence(
+        "start-mask-sequence-count",
+        &plan,
+        4,
+        FixedAbsoluteDomainOperation::Count,
     );
 }
 

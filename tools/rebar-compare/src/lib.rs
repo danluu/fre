@@ -13067,7 +13067,8 @@ fn fixed_absolute_plan_identity_matches(
             false,
             LiteralAggregateOperation::Count,
             fre::FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
-                | fre::FixedAbsoluteDomainDescriptorKind::WholeOrderedWords,
+                | fre::FixedAbsoluteDomainDescriptorKind::WholeOrderedWords
+                | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence,
         ) | (
             false,
             LiteralAggregateOperation::SpanSum,
@@ -13871,6 +13872,7 @@ fn fixed_absolute_operation_identity_is_closed(
                     fre::FixedAbsoluteDomainDescriptorKind::WholeByteRepeat
                         | fre::FixedAbsoluteDomainDescriptorKind::WholeOrderedWords
                         | fre::FixedAbsoluteDomainDescriptorKind::WholeScalarEnvelope
+                        | fre::FixedAbsoluteDomainDescriptorKind::StartMaskSequence
                 )
         }
         fre::FixedAbsoluteDomainOperation::SpanSum => {

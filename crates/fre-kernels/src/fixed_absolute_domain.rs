@@ -2204,8 +2204,10 @@ impl FixedAbsoluteDomainPlan {
             DescriptorKind::EndMaskSequence
             | DescriptorKind::EndOneByteMask
             | DescriptorKind::EndGreedyClassLiteral
-            | DescriptorKind::StartOrderedPrefix
-            | DescriptorKind::StartMaskSequence => operation == Operation::SpanSum,
+            | DescriptorKind::StartOrderedPrefix => operation == Operation::SpanSum,
+            DescriptorKind::StartMaskSequence => {
+                matches!(operation, Operation::Count | Operation::SpanSum)
+            }
             DescriptorKind::WholeByteRepeat
             | DescriptorKind::WholeOrderedWords
             | DescriptorKind::WholeScalarEnvelope => operation == Operation::Count,
