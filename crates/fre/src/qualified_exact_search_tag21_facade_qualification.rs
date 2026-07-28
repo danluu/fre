@@ -604,24 +604,26 @@ fn measure_facade_full(
     let mut checksum = 0x6a09_e667_f3bc_c909_u64;
     let started = Instant::now();
     let (cache, facade) = build_fresh_cache_facade(subject, case, size);
-    let _ = black_box(facade_artifact(subject, &facade));
-    let session = facade
-        .begin_current_thread_session()
-        .expect("ABI2 facade current-thread session");
-    for iteration in 0..calls {
-        let value = black_box(facade_value_only(&session, haystack));
-        checksum = checksum.rotate_left(9)
-            ^ value.wrapping_add(
-                u64::try_from(iteration)
-                    .unwrap_or(u64::MAX)
-                    .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-            );
-    }
-    let total_ns = started.elapsed().as_nanos();
-    black_box(checksum);
+    let total_ns = {
+        let _ = black_box(facade_artifact(subject, &facade));
+        let session = facade
+            .begin_current_thread_session()
+            .expect("ABI2 facade current-thread session");
+        for iteration in 0..calls {
+            let value = black_box(facade_value_only(&session, haystack));
+            checksum = checksum.rotate_left(9)
+                ^ value.wrapping_add(
+                    u64::try_from(iteration)
+                        .unwrap_or(u64::MAX)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                );
+        }
+        let total_ns = started.elapsed().as_nanos();
+        black_box(checksum);
+        total_ns
+    };
     // Preserve the pre-cache full-workload boundary: construction and session
     // creation are timed, while facade/cache retirement remains outside it.
-    drop(session);
     drop(facade);
     drop(cache);
     Timed {
@@ -1163,15 +1165,15 @@ fn current_thread_session_timing_boundaries_are_source_sealed() {
     let full_session = position(full, ".begin_current_thread_session()");
     let full_loop = position(full, "for iteration in 0..calls");
     let full_elapsed = position(full, "let total_ns = started.elapsed().as_nanos();");
-    let full_session_drop = position(full, "drop(session);");
+    let full_session_scope_end = position(full, "\n    };\n    // Preserve the pre-cache");
     let full_facade_drop = position(full, "drop(facade);");
     let full_cache_drop = position(full, "drop(cache);");
     assert!(full_timer < full_build);
     assert!(full_build < full_session);
     assert!(full_session < full_loop);
     assert!(full_loop < full_elapsed);
-    assert!(full_elapsed < full_session_drop);
-    assert!(full_session_drop < full_facade_drop);
+    assert!(full_elapsed < full_session_scope_end);
+    assert!(full_session_scope_end < full_facade_drop);
     assert!(full_facade_drop < full_cache_drop);
     let full_loop_body = &full[full_loop..];
     assert!(full_loop_body.contains("facade_value_only(&session, haystack)"));
