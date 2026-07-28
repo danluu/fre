@@ -1190,6 +1190,31 @@ impl OrderedLiteralCountPlan {
         })
     }
 
+    /// Return only a successfully admitted count without constructing the
+    /// complete accounting result.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments so refusal
+    /// reporting retains the incumbent typed error and authenticated facade
+    /// receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let mut upper = self
+            .core
+            .preflight_reduce::<CountState>(haystack.len(), false, None, limits)
+            .ok()?;
+        let mut ring = reserve_ring::<CountState>(upper.ring_entries, "count DP ring").ok()?;
+        self.core
+            .finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<CountState>(), limits)
+            .ok()?;
+        ring.resize(upper.ring_entries, CountState::default());
+        self.core
+            .execute_count_value_dispatched(haystack, &mut ring, upper)
+            .ok()
+    }
+
     /// Count while retaining the DP allocation in caller-owned scratch.
     ///
     /// A newly created workspace has the same allocation and initialization
@@ -1244,6 +1269,58 @@ impl OrderedLiteralCountPlan {
                 actual,
             },
         })
+    }
+
+    /// Whether the caller-owned count workspace already contains every entry
+    /// needed by the compact value path.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_workspace_is_ready(
+        &self,
+        haystack_len: usize,
+        workspace: &OrderedLiteralCountWorkspace,
+    ) -> bool {
+        self.core
+            .ring_entries(haystack_len)
+            .is_ok_and(|needed| workspace.ring.len() >= needed)
+    }
+
+    /// Steady-workspace form of [`Self::count_value_success`].
+    ///
+    /// A workspace that still needs initialization returns `None` without
+    /// mutation. Once [`Self::count_value_workspace_is_ready`] is true, a
+    /// caller that publishes errors must replay [`Self::count_with_workspace`]
+    /// with the same workspace.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_with_workspace_success(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &mut OrderedLiteralCountWorkspace,
+    ) -> Option<u64> {
+        let ring_entries = self.core.ring_entries(haystack.len()).ok()?;
+        if workspace.ring.len() < ring_entries {
+            return None;
+        }
+        let mut upper = self
+            .core
+            .preflight_reduce::<CountState>(haystack.len(), false, Some(0), limits)
+            .ok()?;
+        self.core
+            .finish_scratch_preflight(
+                &mut upper,
+                workspace.ring.capacity(),
+                size_of::<CountState>(),
+                limits,
+            )
+            .ok()?;
+        let active_ring = workspace.ring.get_mut(..upper.ring_entries)?;
+        self.core
+            .execute_count_value_dispatched(haystack, active_ring, upper)
+            .ok()
     }
 }
 
@@ -1324,6 +1401,29 @@ impl OrderedLiteralSpanSumPlan {
         })
     }
 
+    /// Return only a successfully admitted span sum without constructing the
+    /// complete accounting result.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::span_sum`] with the same arguments.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let mut upper = self
+            .core
+            .preflight_reduce::<SpanState>(haystack.len(), true, None, limits)
+            .ok()?;
+        let mut ring = reserve_ring::<SpanState>(upper.ring_entries, "span-sum DP ring").ok()?;
+        self.core
+            .finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<SpanState>(), limits)
+            .ok()?;
+        ring.resize(upper.ring_entries, SpanState::default());
+        self.core
+            .execute_span_value_dispatched(haystack, &mut ring, upper)
+            .ok()
+    }
+
     /// Sum spans while retaining the DP allocation in caller-owned scratch.
     ///
     /// The first/steady allocation and accounting boundary is identical to
@@ -1380,6 +1480,58 @@ impl OrderedLiteralSpanSumPlan {
             },
         })
     }
+
+    /// Whether the caller-owned span-sum workspace is ready for the compact
+    /// steady path.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_workspace_is_ready(
+        &self,
+        haystack_len: usize,
+        workspace: &OrderedLiteralSpanSumWorkspace,
+    ) -> bool {
+        self.core
+            .ring_entries(haystack_len)
+            .is_ok_and(|needed| workspace.ring.len() >= needed)
+    }
+
+    /// Steady-workspace form of [`Self::span_sum_value_success`].
+    ///
+    /// A workspace that still needs initialization returns `None` without
+    /// mutation. Once [`Self::span_sum_value_workspace_is_ready`] is true, a
+    /// caller that publishes errors must replay
+    /// [`Self::span_sum_with_workspace`] with the same workspace.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_with_workspace_success(
+        &self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &mut OrderedLiteralSpanSumWorkspace,
+    ) -> Option<u64> {
+        let ring_entries = self.core.ring_entries(haystack.len()).ok()?;
+        if workspace.ring.len() < ring_entries {
+            return None;
+        }
+        let mut upper = self
+            .core
+            .preflight_reduce::<SpanState>(haystack.len(), true, Some(0), limits)
+            .ok()?;
+        self.core
+            .finish_scratch_preflight(
+                &mut upper,
+                workspace.ring.capacity(),
+                size_of::<SpanState>(),
+                limits,
+            )
+            .ok()?;
+        let active_ring = workspace.ring.get_mut(..upper.ring_entries)?;
+        self.core
+            .execute_span_value_dispatched(haystack, active_ring, upper)
+            .ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1392,6 +1544,12 @@ struct CountState {
 struct SpanState {
     initial_count: u64,
     progressed_count: u64,
+    span_sum: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SpanValue {
+    count: u64,
     span_sum: u64,
 }
 
@@ -1850,6 +2008,23 @@ impl PlanCore {
         }
     }
 
+    #[inline]
+    fn execute_count_value_dispatched(
+        &self,
+        haystack: &[u8],
+        ring: &mut [CountState],
+        upper: ReduceUpperBounds,
+    ) -> Result<u64, ReduceError> {
+        if self.is_nonempty_unit_union() {
+            return self.reduce_unit_union(haystack, ring.len(), upper);
+        }
+        if let Some(root_interest) = self.dfa.accelerated_root_interest() {
+            self.reduce_count::<true>(haystack, ring, upper, Some(root_interest))
+        } else {
+            self.reduce_count::<false>(haystack, ring, upper, None)
+        }
+    }
+
     fn execute_span_dispatched(
         &self,
         haystack: &[u8],
@@ -1867,6 +2042,24 @@ impl PlanCore {
     }
 
     #[inline]
+    fn execute_span_value_dispatched(
+        &self,
+        haystack: &[u8],
+        ring: &mut [SpanState],
+        upper: ReduceUpperBounds,
+    ) -> Result<u64, ReduceError> {
+        if self.is_nonempty_unit_union() {
+            return self.reduce_unit_union(haystack, ring.len(), upper);
+        }
+        let value = if let Some(root_interest) = self.dfa.accelerated_root_interest() {
+            self.reduce_span::<true>(haystack, ring, upper, Some(root_interest))?
+        } else {
+            self.reduce_span::<false>(haystack, ring, upper, None)?
+        };
+        Ok(value.span_sum)
+    }
+
+    #[inline]
     const fn is_nonempty_unit_union(&self) -> bool {
         !self.build.has_empty_pattern
             && self.build.max_pattern_bytes == 1
@@ -1880,17 +2073,7 @@ impl PlanCore {
         upper: ReduceUpperBounds,
         operation: Operation,
     ) -> Result<ReduceActualCounters, ReduceError> {
-        validate_ring(ring_len, upper.ring_entries)?;
-        let members = self.dfa.root_interest();
-        debug_assert_ne!(members.count, 0);
-        let matches = haystack
-            .iter()
-            .map(|&byte| usize::from(members.contains(byte)))
-            .sum::<usize>();
-        let match_events = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "one-byte union match count as u64",
-        })?;
-        debug_assert!(match_events <= upper.count);
+        let match_events = self.reduce_unit_union(haystack, ring_len, upper)?;
         Ok(ReduceActualCounters {
             transitions: haystack.len(),
             reducer_steps: upper.reducer_steps,
@@ -1904,6 +2087,27 @@ impl PlanCore {
         })
     }
 
+    #[inline]
+    fn reduce_unit_union(
+        &self,
+        haystack: &[u8],
+        ring_len: usize,
+        upper: ReduceUpperBounds,
+    ) -> Result<u64, ReduceError> {
+        validate_ring(ring_len, upper.ring_entries)?;
+        let members = self.dfa.root_interest();
+        debug_assert_ne!(members.count, 0);
+        let matches = haystack
+            .iter()
+            .map(|&byte| usize::from(members.contains(byte)))
+            .sum::<usize>();
+        let match_events = u64::try_from(matches).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "one-byte union match count as u64",
+        })?;
+        debug_assert!(match_events <= upper.count);
+        Ok(match_events)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the root-skip proof and count DP recurrence stay adjacent for audit"
@@ -1915,6 +2119,33 @@ impl PlanCore {
         upper: ReduceUpperBounds,
         root_interest: Option<RootInterest<'_>>,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        let match_events =
+            self.reduce_count::<SKIP_ROOT_RUNS>(haystack, ring, upper, root_interest)?;
+        Ok(ReduceActualCounters {
+            transitions: haystack.len(),
+            reducer_steps: upper.reducer_steps,
+            ring_initializations: upper.ring_initializations,
+            total_work: upper.total_work,
+            match_events,
+            count: Some(match_events),
+            span_sum: None,
+            scratch_bytes: upper.scratch_bytes,
+            peak_bytes: upper.peak_bytes,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the root-skip proof and count DP recurrence stay adjacent for audit"
+    )]
+    #[inline]
+    fn reduce_count<const SKIP_ROOT_RUNS: bool>(
+        &self,
+        haystack: &[u8],
+        ring: &mut [CountState],
+        upper: ReduceUpperBounds,
+        root_interest: Option<RootInterest<'_>>,
+    ) -> Result<u64, ReduceError> {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = 0_u64;
@@ -2010,17 +2241,7 @@ impl PlanCore {
             }
         }
         debug_assert!(next_initial <= upper.count);
-        Ok(ReduceActualCounters {
-            transitions: haystack.len(),
-            reducer_steps: upper.reducer_steps,
-            ring_initializations: upper.ring_initializations,
-            total_work: upper.total_work,
-            match_events: next_initial,
-            count: Some(next_initial),
-            span_sum: None,
-            scratch_bytes: upper.scratch_bytes,
-            peak_bytes: upper.peak_bytes,
-        })
+        Ok(next_initial)
     }
 
     #[allow(
@@ -2034,6 +2255,32 @@ impl PlanCore {
         upper: ReduceUpperBounds,
         root_interest: Option<RootInterest<'_>>,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        let value = self.reduce_span::<SKIP_ROOT_RUNS>(haystack, ring, upper, root_interest)?;
+        Ok(ReduceActualCounters {
+            transitions: haystack.len(),
+            reducer_steps: upper.reducer_steps,
+            ring_initializations: upper.ring_initializations,
+            total_work: upper.total_work,
+            match_events: value.count,
+            count: Some(value.count),
+            span_sum: Some(value.span_sum),
+            scratch_bytes: upper.scratch_bytes,
+            peak_bytes: upper.peak_bytes,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the root-skip proof and span DP recurrence stay adjacent for audit"
+    )]
+    #[inline]
+    fn reduce_span<const SKIP_ROOT_RUNS: bool>(
+        &self,
+        haystack: &[u8],
+        ring: &mut [SpanState],
+        upper: ReduceUpperBounds,
+        root_interest: Option<RootInterest<'_>>,
+    ) -> Result<SpanValue, ReduceError> {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = SpanState::default();
@@ -2143,16 +2390,9 @@ impl PlanCore {
         }
         debug_assert!(next_initial.initial_count <= upper.count);
         debug_assert!(next_initial.span_sum <= upper.span_sum);
-        Ok(ReduceActualCounters {
-            transitions: haystack.len(),
-            reducer_steps: upper.reducer_steps,
-            ring_initializations: upper.ring_initializations,
-            total_work: upper.total_work,
-            match_events: next_initial.initial_count,
-            count: Some(next_initial.initial_count),
-            span_sum: Some(next_initial.span_sum),
-            scratch_bytes: upper.scratch_bytes,
-            peak_bytes: upper.peak_bytes,
+        Ok(SpanValue {
+            count: next_initial.initial_count,
+            span_sum: next_initial.span_sum,
         })
     }
 }
@@ -3149,24 +3389,93 @@ mod tests {
         let count = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
         assert!(count.core.is_nonempty_unit_union());
         let mut count_workspace = OrderedLiteralCountWorkspace::new();
+        assert!(!count.count_value_workspace_is_ready(haystack.len(), &count_workspace));
+        assert_eq!(
+            count.count_value_with_workspace_success(
+                haystack,
+                ReduceLimits::unlimited(),
+                &mut count_workspace,
+            ),
+            None
+        );
         let counted = count
             .count_with_workspace(haystack, ReduceLimits::unlimited(), &mut count_workspace)
             .unwrap();
+        assert!(count.count_value_workspace_is_ready(haystack.len(), &count_workspace));
         assert_eq!(counted.count, 4);
         assert_eq!(counted.accounting.actual.match_events, 4);
         assert_eq!(counted.accounting.actual.count, Some(4));
         assert_eq!(counted.accounting.actual.span_sum, None);
+        assert_eq!(
+            count.count_value_success(haystack, ReduceLimits::unlimited()),
+            Some(4)
+        );
+        assert_eq!(
+            count.count_value_with_workspace_success(
+                haystack,
+                ReduceLimits::unlimited(),
+                &mut count_workspace,
+            ),
+            Some(4)
+        );
+        let count_exact = exact_reduce_limits(counted.accounting.upper_bounds, u64::MAX);
+        assert_eq!(count.count_value_success(haystack, count_exact), Some(4));
+        let count_one_below = ReduceLimits {
+            max_transitions: count_exact.max_transitions.checked_sub(1).unwrap(),
+            ..count_exact
+        };
+        assert_eq!(count.count_value_success(haystack, count_one_below), None);
+        assert!(matches!(
+            count.count(haystack, count_one_below),
+            Err(ReduceError::TransitionLimit { .. })
+        ));
 
         let span = OrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
         assert!(span.core.is_nonempty_unit_union());
         let mut span_workspace = OrderedLiteralSpanSumWorkspace::new();
+        assert!(!span.span_sum_value_workspace_is_ready(haystack.len(), &span_workspace));
+        assert_eq!(
+            span.span_sum_value_with_workspace_success(
+                haystack,
+                ReduceLimits::unlimited(),
+                &mut span_workspace,
+            ),
+            None
+        );
         let summed = span
             .span_sum_with_workspace(haystack, ReduceLimits::unlimited(), &mut span_workspace)
             .unwrap();
+        assert!(span.span_sum_value_workspace_is_ready(haystack.len(), &span_workspace));
         assert_eq!(summed.span_sum, 4);
         assert_eq!(summed.accounting.actual.match_events, 4);
         assert_eq!(summed.accounting.actual.count, Some(4));
         assert_eq!(summed.accounting.actual.span_sum, Some(4));
+        assert_eq!(
+            span.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+            Some(4)
+        );
+        assert_eq!(
+            span.span_sum_value_with_workspace_success(
+                haystack,
+                ReduceLimits::unlimited(),
+                &mut span_workspace,
+            ),
+            Some(4)
+        );
+        let span_exact = exact_reduce_limits(
+            summed.accounting.upper_bounds,
+            summed.accounting.upper_bounds.span_sum,
+        );
+        assert_eq!(span.span_sum_value_success(haystack, span_exact), Some(4));
+        let span_one_below = ReduceLimits {
+            max_span_sum: span_exact.max_span_sum.checked_sub(1).unwrap(),
+            ..span_exact
+        };
+        assert_eq!(span.span_sum_value_success(haystack, span_one_below), None);
+        assert!(matches!(
+            span.span_sum(haystack, span_one_below),
+            Err(ReduceError::SpanSumLimit { .. })
+        ));
 
         let with_empty = OrderedLiteralCountPlan::build(
             &[b"".as_slice(), b"a".as_slice()],
@@ -3446,6 +3755,10 @@ mod tests {
                 let span = span_plan
                     .span_sum(haystack, ReduceLimits::unlimited())
                     .unwrap();
+                let compact_count =
+                    count_plan.count_value_success(haystack, ReduceLimits::unlimited());
+                let compact_span =
+                    span_plan.span_sum_value_success(haystack, ReduceLimits::unlimited());
                 let scalar_count = scalar_count_actual(&count_plan, haystack);
                 let scalar_span = scalar_span_actual(&span_plan, haystack);
                 let expected_span = expected
@@ -3460,6 +3773,16 @@ mod tests {
                 assert_eq!(
                     span.span_sum, expected_span,
                     "patterns={patterns:?}, haystack={haystack:?}"
+                );
+                assert_eq!(
+                    compact_count,
+                    Some(count.count),
+                    "compact count: patterns={patterns:?}, haystack={haystack:?}"
+                );
+                assert_eq!(
+                    compact_span,
+                    Some(span.span_sum),
+                    "compact span: patterns={patterns:?}, haystack={haystack:?}"
                 );
                 assert_eq!(span.accounting.actual.match_events, count.count);
                 assert_eq!(
@@ -3820,6 +4143,39 @@ mod tests {
             second_span.accounting.actual.total_work,
             second_haystack.len() + second_haystack.len() + 1
         );
+        assert_eq!(
+            count.count_value_with_workspace_success(
+                second_haystack,
+                steady_limits,
+                &mut count_workspace,
+            ),
+            Some(second_count.count)
+        );
+        assert_eq!(
+            span.span_sum_value_with_workspace_success(
+                second_haystack,
+                steady_limits,
+                &mut span_workspace,
+            ),
+            Some(second_span.span_sum)
+        );
+
+        let one_below = ReduceLimits {
+            max_total_work: steady_limits.max_total_work.checked_sub(1).unwrap(),
+            ..steady_limits
+        };
+        assert_eq!(
+            count.count_value_with_workspace_success(
+                second_haystack,
+                one_below,
+                &mut count_workspace,
+            ),
+            None
+        );
+        assert!(matches!(
+            count.count_with_workspace(second_haystack, one_below, &mut count_workspace),
+            Err(ReduceError::TotalWorkLimit { .. })
+        ));
     }
 
     #[test]
@@ -4003,6 +4359,14 @@ mod tests {
         );
         count_plan.count(haystack, count_exact).unwrap();
         span_plan.span_sum(haystack, span_exact).unwrap();
+        assert_eq!(
+            count_plan.count_value_success(haystack, count_exact),
+            Some(count.count)
+        );
+        assert_eq!(
+            span_plan.span_sum_value_success(haystack, span_exact),
+            Some(span.span_sum)
+        );
 
         assert!(matches!(
             count_plan.count(
@@ -4097,6 +4461,57 @@ mod tests {
             ),
             Err(ReduceError::SpanSumLimit { .. })
         ));
+
+        let count_one_below = [
+            ReduceLimits {
+                max_transitions: count_exact.max_transitions.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_match_events: count_exact.max_match_events.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_count: count_exact.max_count.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_reducer_steps: count_exact.max_reducer_steps.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_ring_initializations: count_exact
+                    .max_ring_initializations
+                    .checked_sub(1)
+                    .unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_total_work: count_exact.max_total_work.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_scratch_bytes: count_exact.max_scratch_bytes.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+            ReduceLimits {
+                max_peak_bytes: count_exact.max_peak_bytes.checked_sub(1).unwrap(),
+                ..count_exact
+            },
+        ];
+        for limits in count_one_below {
+            assert_eq!(count_plan.count_value_success(haystack, limits), None);
+        }
+        assert_eq!(
+            span_plan.span_sum_value_success(
+                haystack,
+                ReduceLimits {
+                    max_span_sum: span_exact.max_span_sum.checked_sub(1).unwrap(),
+                    ..span_exact
+                },
+            ),
+            None
+        );
     }
 
     #[test]

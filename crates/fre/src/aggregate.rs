@@ -16343,6 +16343,71 @@ impl AggregatePlan {
         }
     }
 
+    #[inline(never)]
+    fn execute_dense_finite_count_value(
+        &self,
+        engine: &OrderedLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.count_value_success(haystack, limits.finite_literal) {
+            return Ok(value);
+        }
+        match engine.count(haystack, limits.finite_literal) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dense finite count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_dense_finite_count_value_with_workspace(
+        &self,
+        engine: &OrderedLiteralCountPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        workspace: &mut OrderedLiteralCountWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        if !engine.count_value_workspace_is_ready(haystack.len(), workspace) {
+            return engine
+                .count_with_workspace(haystack, limits.finite_literal, workspace)
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
+                });
+        }
+        if let Some(value) =
+            engine.count_value_with_workspace_success(haystack, limits.finite_literal, workspace)
+        {
+            return Ok(value);
+        }
+        match engine.count_with_workspace(haystack, limits.finite_literal, workspace) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dense finite workspace count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode count plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16358,6 +16423,9 @@ impl AggregatePlan {
             }
             AggregateEngine::DispatchedExactLiteral(engine) => {
                 self.execute_dispatched_exact_literal_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::FiniteCount(engine) => {
+                self.execute_dense_finite_count_value(engine, haystack, limits)
             }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_count_value(engine, haystack, limits)
@@ -16384,16 +16452,7 @@ impl AggregatePlan {
         let AggregateEngine::FiniteCount(engine) = &self.engine else {
             return self.execute_count_value(haystack, limits);
         };
-        engine
-            .count_with_workspace(haystack, limits.finite_literal, workspace)
-            .map(|result| result.count)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::FiniteLiteral(source),
-                )
-            })
+        self.execute_dense_finite_count_value_with_workspace(engine, haystack, limits, workspace)
     }
 
     #[allow(
@@ -16588,16 +16647,9 @@ impl AggregatePlan {
                     "count operation retained a packed finite span-sum plan",
                 ),
             )),
-            AggregateEngine::FiniteCount(engine) => engine
-                .count(haystack, limits.finite_literal)
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::FiniteLiteral(source),
-                    )
-                }),
+            AggregateEngine::FiniteCount(engine) => {
+                self.execute_dense_finite_count_value(engine, haystack, limits)
+            }
             AggregateEngine::FiniteSpanSum(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
@@ -16853,6 +16905,71 @@ impl AggregatePlan {
         }
     }
 
+    #[inline(never)]
+    fn execute_dense_finite_span_sum_value(
+        &self,
+        engine: &OrderedLiteralSpanSumPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.span_sum_value_success(haystack, limits.finite_literal) {
+            return Ok(value);
+        }
+        match engine.span_sum(haystack, limits.finite_literal) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dense finite span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
+    #[inline(never)]
+    fn execute_dense_finite_span_sum_value_with_workspace(
+        &self,
+        engine: &OrderedLiteralSpanSumPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        workspace: &mut OrderedLiteralSpanSumWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        if !engine.span_sum_value_workspace_is_ready(haystack.len(), workspace) {
+            return engine
+                .span_sum_with_workspace(haystack, limits.finite_literal, workspace)
+                .map(|result| result.span_sum)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::FiniteLiteral(source),
+                    )
+                });
+        }
+        if let Some(value) =
+            engine.span_sum_value_with_workspace_success(haystack, limits.finite_literal, workspace)
+        {
+            return Ok(value);
+        }
+        match engine.span_sum_with_workspace(haystack, limits.finite_literal, workspace) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::FiniteLiteral(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact dense finite workspace span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode span-sum plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16868,6 +16985,9 @@ impl AggregatePlan {
             }
             AggregateEngine::DispatchedExactLiteral(engine) => {
                 self.execute_dispatched_exact_literal_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::FiniteSpanSum(engine) => {
+                self.execute_dense_finite_span_sum_value(engine, haystack, limits)
             }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_span_sum_value(engine, haystack, limits)
@@ -16894,16 +17014,7 @@ impl AggregatePlan {
         let AggregateEngine::FiniteSpanSum(engine) = &self.engine else {
             return self.execute_span_sum_value(haystack, limits);
         };
-        engine
-            .span_sum_with_workspace(haystack, limits.finite_literal, workspace)
-            .map(|result| result.span_sum)
-            .map_err(|source| {
-                self.direct_execution_error(
-                    haystack.len(),
-                    limits,
-                    AggregateExecutionSource::FiniteLiteral(source),
-                )
-            })
+        self.execute_dense_finite_span_sum_value_with_workspace(engine, haystack, limits, workspace)
     }
 
     #[allow(
@@ -17080,16 +17191,9 @@ impl AggregatePlan {
                     "span-sum operation retained a packed finite count plan",
                 ),
             )),
-            AggregateEngine::FiniteSpanSum(engine) => engine
-                .span_sum(haystack, limits.finite_literal)
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::FiniteLiteral(source),
-                    )
-                }),
+            AggregateEngine::FiniteSpanSum(engine) => {
+                self.execute_dense_finite_span_sum_value(engine, haystack, limits)
+            }
             AggregateEngine::FiniteCount(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(

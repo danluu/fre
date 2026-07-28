@@ -2,10 +2,12 @@ use std::fmt::Write as _;
 
 use fre::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
-    AggregateBuildLimits, AggregateBuilder, AggregateExecutionDetails, AggregateExecutionSource,
-    AggregateFiniteLiteralSemantics, AggregateOperation, AggregatePlanIdentity, AggregatePlanKind,
-    AggregateRunLimits, AggregateStrategy, OrderedLiteralAggregateReduceError, RustProfile,
-    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SparseOrderedLiteralAggregateReduceError,
+    AggregateBuildLimits, AggregateBuilder, AggregateCountWorkspace, AggregateExecutionDetails,
+    AggregateExecutionSource, AggregateFiniteLiteralSemantics, AggregateOperation,
+    AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits, AggregateSpanSumWorkspace,
+    AggregateStrategy, OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
+    OrderedLiteralAggregateUpperBounds, RustProfile, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SparseOrderedLiteralAggregateReduceError,
 };
 
 fn builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -29,6 +31,22 @@ fn oracle(pattern: &str, haystack: &[u8]) -> (u64, u64) {
             .map(|(start, end)| u64::try_from(end.checked_sub(*start).unwrap()).unwrap())
             .sum(),
     )
+}
+
+fn exact_dense_reduce_limits(
+    upper: OrderedLiteralAggregateUpperBounds,
+) -> OrderedLiteralAggregateReduceLimits {
+    OrderedLiteralAggregateReduceLimits {
+        max_transitions: upper.transitions,
+        max_match_events: upper.match_events,
+        max_count: upper.count,
+        max_span_sum: upper.span_sum,
+        max_reducer_steps: upper.reducer_steps,
+        max_ring_initializations: upper.ring_initializations,
+        max_total_work: upper.total_work,
+        max_scratch_bytes: upper.scratch_bytes,
+        max_peak_bytes: upper.peak_bytes,
+    }
 }
 
 fn unicode_builder(pattern: impl Into<String>) -> AggregateBuilder {
@@ -142,17 +160,67 @@ fn finite_dfa_preserves_order_empty_progress_captures_and_arbitrary_bytes() {
         let count = builder(pattern).build_count().unwrap();
         assert_eq!(count.build_report().plan, expected_plan);
         assert_eq!(count.build_report().continuation_strategy, None);
+        let counted = count
+            .count(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(counted.value(), expected.0);
+        assert!(counted.report().has_closed_direct_attempt());
         assert_eq!(
             count
                 .count_value(haystack, AggregateRunLimits::default())
                 .unwrap(),
             expected.0
         );
+        let mut count_workspace = AggregateCountWorkspace::new();
+        assert_eq!(
+            count
+                .count_value_with_workspace(
+                    haystack,
+                    AggregateRunLimits::default(),
+                    &mut count_workspace,
+                )
+                .unwrap(),
+            expected.0
+        );
+        assert_eq!(
+            count
+                .count_value_with_workspace(
+                    haystack,
+                    AggregateRunLimits::default(),
+                    &mut count_workspace,
+                )
+                .unwrap(),
+            expected.0
+        );
         let sum = builder(pattern).build_span_sum().unwrap();
         assert_eq!(sum.build_report().plan, expected_plan);
+        let summed = sum
+            .span_sum(haystack, AggregateRunLimits::default())
+            .unwrap();
+        assert_eq!(summed.value(), expected.1);
+        assert!(summed.report().has_closed_direct_attempt());
         assert_eq!(
             sum.span_sum_value(haystack, AggregateRunLimits::default())
                 .unwrap(),
+            expected.1
+        );
+        let mut span_workspace = AggregateSpanSumWorkspace::new();
+        assert_eq!(
+            sum.span_sum_value_with_workspace(
+                haystack,
+                AggregateRunLimits::default(),
+                &mut span_workspace,
+            )
+            .unwrap(),
+            expected.1
+        );
+        assert_eq!(
+            sum.span_sum_value_with_workspace(
+                haystack,
+                AggregateRunLimits::default(),
+                &mut span_workspace,
+            )
+            .unwrap(),
             expected.1
         );
     }
@@ -199,6 +267,86 @@ fn finite_dfa_compile_identity_and_exact_debit_are_operation_owned() {
             OrderedLiteralAggregateReduceError::TotalWorkLimit { .. }
         )
     ));
+}
+
+#[test]
+fn dense_value_success_accepts_exact_limits_and_replays_one_below_errors() {
+    std::thread::Builder::new()
+        .name("dense-finite-compact-value-replay".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(dense_value_success_accepts_exact_limits_and_replays_one_below_errors_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn dense_value_success_accepts_exact_limits_and_replays_one_below_errors_body() {
+    let pattern = r"(?:ab|a|)";
+    let haystack = b"ababa\xFFab";
+
+    let count = builder(pattern).build_count().unwrap();
+    assert_eq!(
+        count.build_report().plan,
+        AggregatePlanKind::FiniteLiteralDfa
+    );
+    let counted = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::FiniteLiteral {
+        upper_bounds: count_upper,
+        ..
+    } = counted.report().details()
+    else {
+        panic!("count did not retain dense finite details")
+    };
+    let mut count_exact = AggregateRunLimits::default();
+    count_exact.finite_literal = exact_dense_reduce_limits(*count_upper);
+    assert_eq!(
+        count.count_value(haystack, count_exact).unwrap(),
+        counted.value()
+    );
+    let mut count_one_below = count_exact;
+    count_one_below.finite_literal.max_total_work = count_one_below
+        .finite_literal
+        .max_total_work
+        .checked_sub(1)
+        .unwrap();
+    let count_full_error = count.count(haystack, count_one_below).unwrap_err();
+    let count_value_error = count.count_value(haystack, count_one_below).unwrap_err();
+    assert!(count_full_error.has_closed_direct_attempt());
+    assert_eq!(count_value_error, count_full_error);
+
+    let span = builder(pattern).build_span_sum().unwrap();
+    assert_eq!(
+        span.build_report().plan,
+        AggregatePlanKind::FiniteLiteralDfa
+    );
+    let summed = span
+        .span_sum(haystack, AggregateRunLimits::default())
+        .unwrap();
+    let AggregateExecutionDetails::FiniteLiteral {
+        upper_bounds: span_upper,
+        ..
+    } = summed.report().details()
+    else {
+        panic!("span sum did not retain dense finite details")
+    };
+    let mut span_exact = AggregateRunLimits::default();
+    span_exact.finite_literal = exact_dense_reduce_limits(*span_upper);
+    assert_eq!(
+        span.span_sum_value(haystack, span_exact).unwrap(),
+        summed.value()
+    );
+    let mut span_one_below = span_exact;
+    span_one_below.finite_literal.max_span_sum = span_one_below
+        .finite_literal
+        .max_span_sum
+        .checked_sub(1)
+        .unwrap();
+    let span_full_error = span.span_sum(haystack, span_one_below).unwrap_err();
+    let span_value_error = span.span_sum_value(haystack, span_one_below).unwrap_err();
+    assert!(span_full_error.has_closed_direct_attempt());
+    assert_eq!(span_value_error, span_full_error);
 }
 
 #[test]
