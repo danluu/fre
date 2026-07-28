@@ -761,10 +761,11 @@ impl QualifiedExactSearch {
     /// Build with an explicit `AArch64` backend policy and production limits.
     ///
     /// [`Self::new`] automatically prefers independently qualified tag 21
-    /// when ASIMD, SVE, SVE2, VL16, and tuning admission succeeds. It then
-    /// falls back through independently qualified tag 10, tag 19, and V8.
-    /// This method never substitutes another backend for the caller's explicit
-    /// policy.
+    /// when process-wide ASIMD, SVE, SVE2, and tuning admission succeeds.
+    /// Tag21 checks the calling thread's VL16 contract only when opening its
+    /// invocation session. Construction otherwise falls back through
+    /// independently qualified tag 10, tag 19, and V8. This method never
+    /// substitutes another backend for the caller's explicit policy.
     pub fn new_with_backend(
         literal: &[u8],
         workload: QualifiedExactSearchWorkload,
