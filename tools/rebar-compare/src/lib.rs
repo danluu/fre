@@ -240,7 +240,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v51-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -598,6 +598,12 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; Unicode-on continuation count may use compact canonical terminal-scalar encodings to seed prospectively bounded required-suffix reverse rows, with wide domains retaining the incumbent route",
+        );
+        identity.identity.push_str(
+            "; casefold-canonical-bytes-v2 applies one shared source-only selector before folded-literal and continuation routes, retains the completed canonical mapping plus ordered sparse Count plan outside first/steady operation boundaries, and preserves source-order leftmost-first reduction for alternatives with overlapping initial fold classes",
+        );
+        identity.availability.push_str(
+            "; eligible wide Unicode-on case-insensitive literal alternatives use the same retained canonical Count route and plan identity in semantic and raw operation execution; span-sum retains its incumbent byte-span-preserving route",
         );
         identity.identity.push_str(
             "; unicode-folded-literal-v2 construction-selects a bounded finite canonical case-fold trie from one eligible nonempty literal/class sequence, then count and span-sum reuse one allocation-free ranked fixed-column byte prefilter, a second source-independent fixed-column guard when available, and exact scalar-trie validation under explicit build and run receipts",
@@ -1788,6 +1794,7 @@ pub struct CurrentFreAggregateOperationLifecycle {
 
 #[derive(Debug)]
 enum CurrentFreAggregateOperationInner {
+    CountCanonical(canonical_case_fold::CanonicalCountLifecycle),
     CountFolded(
         UnicodeFoldedLiteralCountRegex,
         UnicodeFoldedLiteralRunLimits,
@@ -1881,6 +1888,14 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => {
+                lifecycle.execute(haystack).map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE canonical case-fold count lifecycle: {}",
+                        error.message
+                    ))
+                })
+            }
             CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
                 .execute(haystack, *limits)
                 .map(|result| result.value)
@@ -1940,6 +1955,18 @@ impl CurrentFreAggregateOperationLifecycle {
             )));
         }
         match &self.inner {
+            CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => lifecycle
+                .execute(haystack)
+                .map(|value| CurrentFreAggregateOperationCounterResult {
+                    value,
+                    receipt_status: CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan,
+                })
+                .map_err(|error| {
+                    CompareError::new(format!(
+                        "FRE canonical case-fold count lifecycle: {}",
+                        error.message
+                    ))
+                }),
             CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
                 .execute(haystack, *limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
@@ -2234,6 +2261,27 @@ fn build_current_fre_count_lifecycle(
     case_insensitive: bool,
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let run_limits = RunLimits::default();
+    if let Some(lifecycle) = canonical_case_fold::try_build_count(
+        patterns,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        &run_limits,
+    )
+    .map_err(|error| {
+        CompareError::new(format!(
+            "FRE canonical case-fold count lifecycle build: {}",
+            error.message
+        ))
+    })? {
+        return Ok(CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::Count,
+            plan: canonical_case_fold::PLAN,
+            haystack_len,
+            inner: CurrentFreAggregateOperationInner::CountCanonical(lifecycle),
+        });
+    }
     if let [pattern] = patterns
         && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle(
             pattern,
@@ -21841,7 +21889,8 @@ mod tests {
                         case.haystack.len(),
                     );
                 }
-                CurrentFreAggregateOperationInner::CountFolded(_, _)
+                CurrentFreAggregateOperationInner::CountCanonical(_)
+                | CurrentFreAggregateOperationInner::CountFolded(_, _)
                 | CurrentFreAggregateOperationInner::SpanSumFolded(_, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
                 | CurrentFreAggregateOperationInner::SpanSumMany(_, _) => {
@@ -22804,7 +22853,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v51-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(identity.identity.contains("capture-word-run-v1"));
         assert!(
@@ -22830,6 +22879,16 @@ mod tests {
             identity
                 .availability
                 .contains("canonical terminal-scalar encodings")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("casefold-canonical-bytes-v2 applies one shared source-only selector")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("same retained canonical Count route and plan identity")
         );
         assert!(
             identity
@@ -24662,6 +24721,102 @@ mod tests {
                 counters.receipt_status(),
                 CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
             ));
+        }
+    }
+
+    #[test]
+    fn canonical_case_fold_count_routes_sherlock_semantic_and_raw_lifecycles_identically() {
+        // rebar-row:curated/02-literal-alternate/sherlock-casei-ru@rust/regex
+        let pattern = "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти";
+        let patterns = [pattern.to_string()];
+        let mut haystack = vec![0xFF, 0x80];
+        haystack.extend_from_slice(
+            "ШЕРЛОК ХОЛМС/джон уотсон/ИРЕН АДЛЕР/инспектор лестрейд/ПРОФЕССОР МОРИАРТИ".as_bytes(),
+        );
+        haystack.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]);
+        let expected = rust_regex_reference_operation_lifecycle(
+            "count",
+            &patterns,
+            true,
+            true,
+            haystack.len(),
+        )
+        .unwrap()
+        .execute(&haystack)
+        .unwrap();
+        assert_eq!(expected, 5);
+        assert_current_fre_execution(
+            current_fre(
+                "count",
+                &patterns,
+                &haystack,
+                true,
+                true,
+                &RunLimits::default(),
+            ),
+            expected,
+            canonical_case_fold::PLAN,
+        );
+
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &patterns,
+            true,
+            true,
+            haystack.len(),
+        )
+        .expect("retained canonical lifecycle");
+        assert_eq!(lifecycle.plan(), canonical_case_fold::PLAN);
+        assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+        assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
+        let counters = lifecycle.execute_with_counters(&haystack).unwrap();
+        assert_eq!(counters.value(), expected);
+        assert!(matches!(
+            counters.receipt_status(),
+            CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
+        ));
+    }
+
+    #[test]
+    fn canonical_case_fold_retained_count_preserves_overlapping_root_priority() {
+        let shorter_first = "ИРЕН|ИРЕНИРЕН|АААААААААА|ББББББББББ".to_string();
+        let longer_first = "ИРЕНИРЕН|ИРЕН|АААААААААА|ББББББББББ".to_string();
+        let haystack = "иренирен".as_bytes();
+        for (pattern, expected) in [(shorter_first, 2), (longer_first, 1)] {
+            let patterns = [pattern];
+            let reference = rust_regex_reference_operation_lifecycle(
+                "count",
+                &patterns,
+                true,
+                true,
+                haystack.len(),
+            )
+            .unwrap()
+            .execute(haystack)
+            .unwrap();
+            assert_eq!(reference, expected);
+            assert_current_fre_execution(
+                current_fre(
+                    "count",
+                    &patterns,
+                    haystack,
+                    true,
+                    true,
+                    &RunLimits::default(),
+                ),
+                reference,
+                canonical_case_fold::PLAN,
+            );
+            let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+                "count",
+                &patterns,
+                true,
+                true,
+                haystack.len(),
+            )
+            .expect("overlapping-root canonical lifecycle");
+            assert_eq!(lifecycle.plan(), canonical_case_fold::PLAN);
+            assert_eq!(lifecycle.execute(haystack).unwrap(), reference);
         }
     }
 

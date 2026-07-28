@@ -51,7 +51,7 @@ use super::{
     sparse_ordered_literal_reduce_error,
 };
 
-const PLAN: &str = "aggregate-casefold-canonical-bytes-sparse";
+pub(super) const PLAN: &str = "aggregate-casefold-canonical-bytes-sparse-v2";
 const MIN_PATTERN_BYTES: usize = 64;
 const MIN_ALTERNATIVES: usize = 4;
 const MIN_SCALAR_ATOMS: usize = 32;
@@ -89,6 +89,24 @@ struct CanonicalPlan {
     accounting: CanonicalBuildAccounting,
 }
 
+/// One construction-selected canonical Count artifact reused by first and
+/// steady public operations.
+#[derive(Debug)]
+pub(super) struct CanonicalCountLifecycle {
+    plan: CanonicalPlan,
+    haystack_len: usize,
+    run: CanonicalCountRunPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CanonicalCountRunPolicy {
+    normalization_work: usize,
+    sparse_work: usize,
+    scratch_bytes: usize,
+    peak_bytes: usize,
+    reducer_steps: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CanonicalBuildAccounting {
     compile_work: usize,
@@ -105,15 +123,36 @@ pub(super) fn try_count(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<Option<FreReduction>, ExecutionError> {
-    if request.patterns.len() != 1
-        || !request.unicode
-        || !request.case_insensitive
-        || request.patterns[0].len() < MIN_PATTERN_BYTES
+    let Some(lifecycle) = try_build_count(
+        request.patterns,
+        request.unicode,
+        request.case_insensitive,
+        request.haystack.len(),
+        limits,
+    )?
+    else {
+        return Ok(None);
+    };
+    let actual = lifecycle.execute(request.haystack)?;
+    Ok(Some(FreReduction { actual, plan: PLAN }))
+}
+
+/// Apply the same source-only canonical Count selector used by one-shot
+/// semantic execution and retain its completed construction for repeated raw
+/// operation execution.
+pub(super) fn try_build_count(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    limits: &RunLimits,
+) -> Result<Option<CanonicalCountLifecycle>, ExecutionError> {
+    if patterns.len() != 1 || !unicode || !case_insensitive || patterns[0].len() < MIN_PATTERN_BYTES
     {
         return Ok(None);
     }
     // rebar-row:curated/02-literal-alternate/sherlock-casei-ru@rust/regex
-    let Some(plan) = CanonicalPlan::build(&request.patterns[0], limits)? else {
+    let Some(plan) = CanonicalPlan::build(&patterns[0], limits)? else {
         return Ok(None);
     };
     if plan.accounting.compile_work > limits.fre_aggregate_compile_work
@@ -123,70 +162,87 @@ pub(super) fn try_count(
             "canonical case-fold plan escaped its compile accounting",
         ));
     }
-    let normalization_work = normalization_work(request.haystack.len())?;
+    let normalization_work = normalization_work(haystack_len)?;
     if normalization_work > limits.fre_aggregate_operation_work {
         return Err(ExecutionError::unsupported(format!(
             "FRE canonical case-fold normalization work requires {normalization_work}, limit is {}",
             limits.fre_aggregate_operation_work
         )));
     }
-    if request.haystack.len() > limits.fre_aggregate_scratch_bytes
-        || request.haystack.len() > limits.fre_aggregate_peak_bytes
+    if haystack_len > limits.fre_aggregate_scratch_bytes
+        || haystack_len > limits.fre_aggregate_peak_bytes
     {
         return Err(ExecutionError::unsupported(format!(
-            "FRE canonical case-fold input buffer requires {} bytes",
-            request.haystack.len()
+            "FRE canonical case-fold input buffer requires {haystack_len} bytes",
         )));
     }
-    let canonical = normalize(
-        request.haystack,
-        &plan.mappings,
-        limits.fre_aggregate_operation_work,
-    )?;
-    let observed_bytes = canonical.capacity();
-    if observed_bytes > limits.fre_aggregate_scratch_bytes
-        || observed_bytes > limits.fre_aggregate_peak_bytes
-    {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE canonical case-fold retained input capacity requires {observed_bytes} bytes"
-        )));
-    }
-    let build = plan.engine.build_accounting();
-    let remaining_work = limits
+    let sparse_work = limits
         .fre_aggregate_operation_work
         .checked_sub(normalization_work)
         .ok_or_else(|| ExecutionError::fault("canonical case-fold work subtraction underflow"))?;
-    let remaining_scratch = limits
-        .fre_aggregate_scratch_bytes
-        .checked_sub(observed_bytes)
-        .ok_or_else(|| {
-            ExecutionError::fault("canonical case-fold scratch subtraction underflow")
-        })?;
-    let remaining_peak = limits
-        .fre_aggregate_peak_bytes
-        .checked_sub(observed_bytes)
-        .ok_or_else(|| ExecutionError::fault("canonical case-fold peak subtraction underflow"))?;
-    let run_limits = sparse_run_limits(
-        canonical.len(),
-        build,
-        remaining_work,
-        remaining_scratch,
-        remaining_peak,
-        limits,
-    )?;
-    let actual = plan
-        .engine
-        .count(&canonical, run_limits)
-        .map_err(|source| {
-            sparse_ordered_literal_reduce_error(
-                &source,
-                format!("FRE canonical case-fold sparse count refused execution: {source}"),
-            )
-        })?;
-    Ok(Some(FreReduction {
-        actual: actual.count,
-        plan: PLAN,
+    Ok(Some(CanonicalCountLifecycle {
+        plan,
+        haystack_len,
+        run: CanonicalCountRunPolicy {
+            normalization_work,
+            sparse_work,
+            scratch_bytes: limits.fre_aggregate_scratch_bytes,
+            peak_bytes: limits.fre_aggregate_peak_bytes,
+            reducer_steps: limits.reducer_steps,
+        },
     }))
+}
+
+impl CanonicalCountLifecycle {
+    pub(super) fn execute(&self, haystack: &[u8]) -> Result<u64, ExecutionError> {
+        if haystack.len() != self.haystack_len {
+            return Err(ExecutionError::fault(format!(
+                "canonical case-fold haystack length {} differs from prepared {}",
+                haystack.len(),
+                self.haystack_len
+            )));
+        }
+        let canonical = normalize(haystack, &self.plan.mappings, self.run.normalization_work)?;
+        let observed_bytes = canonical.capacity();
+        if observed_bytes > self.run.scratch_bytes || observed_bytes > self.run.peak_bytes {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE canonical case-fold retained input capacity requires {observed_bytes} bytes"
+            )));
+        }
+        let build = self.plan.engine.build_accounting();
+        let remaining_scratch = self
+            .run
+            .scratch_bytes
+            .checked_sub(observed_bytes)
+            .ok_or_else(|| {
+                ExecutionError::fault("canonical case-fold scratch subtraction underflow")
+            })?;
+        let remaining_peak = self
+            .run
+            .peak_bytes
+            .checked_sub(observed_bytes)
+            .ok_or_else(|| {
+                ExecutionError::fault("canonical case-fold peak subtraction underflow")
+            })?;
+        let run_limits = sparse_run_limits(
+            canonical.len(),
+            build,
+            self.run.sparse_work,
+            remaining_scratch,
+            remaining_peak,
+            self.run.reducer_steps,
+        )?;
+        self.plan
+            .engine
+            .count(&canonical, run_limits)
+            .map_err(|source| {
+                sparse_ordered_literal_reduce_error(
+                    &source,
+                    format!("FRE canonical case-fold sparse count refused execution: {source}"),
+                )
+            })
+            .map(|actual| actual.count)
+    }
 }
 
 impl CanonicalPlan {
@@ -728,7 +784,7 @@ fn sparse_run_limits(
     work_limit: usize,
     scratch_limit: usize,
     peak_limit: usize,
-    limits: &RunLimits,
+    reducer_steps: u64,
 ) -> Result<SparseOrderedLiteralAggregateReduceLimits, ExecutionError> {
     let boundaries = checked_add(input_bytes, 1, "canonical boundary count")?;
     let minimum = build
@@ -747,7 +803,7 @@ fn sparse_run_limits(
         .ok()
         .and_then(|value| value.checked_mul(u64::try_from(build.max_edge_search_checks).ok()?))
         .ok_or_else(|| ExecutionError::fault("canonical edge comparison overflow"))?;
-    let reducer_limit = usize::try_from(limits.reducer_steps)
+    let reducer_limit = usize::try_from(reducer_steps)
         .map_err(|_| ExecutionError::fault("canonical reducer limit does not fit usize"))?;
     Ok(SparseOrderedLiteralAggregateReduceLimits {
         max_transitions: input_bytes,
@@ -757,7 +813,7 @@ fn sparse_run_limits(
         max_match_events: match_events.min(reducer_limit),
         max_count: u64::try_from(match_events)
             .unwrap_or(u64::MAX)
-            .min(limits.reducer_steps),
+            .min(reducer_steps),
         max_span_sum: u64::try_from(input_bytes).unwrap_or(u64::MAX),
         max_reducer_steps: boundaries.min(reducer_limit),
         max_ring_initializations: ring,
@@ -898,6 +954,48 @@ mod tests {
         let byte_refusal = CanonicalPlan::build(pattern, &bytes_below)
             .expect_err("one-below complete program bytes must refuse");
         assert_eq!(byte_refusal.status, super::super::Status::Unsupported);
+    }
+
+    #[test]
+    fn retained_count_lifecycle_preflights_normalization_and_reuses_the_plan() {
+        let pattern = "АААААААА|ББББББББ|ВВВВВВВВ|ГГГГГГГГ";
+        let patterns = vec![pattern.to_string()];
+        let haystack = "бббббббб".as_bytes();
+        let required_work = normalization_work(haystack.len()).unwrap();
+        let exact = RunLimits {
+            fre_aggregate_operation_work: required_work,
+            ..RunLimits::default()
+        };
+        let lifecycle = try_build_count(&patterns, true, true, haystack.len(), &exact)
+            .unwrap()
+            .expect("exact normalization admission retains the canonical plan");
+        assert_eq!(lifecycle.haystack_len, haystack.len());
+
+        let one_below = RunLimits {
+            fre_aggregate_operation_work: required_work - 1,
+            ..RunLimits::default()
+        };
+        let refusal = try_build_count(&patterns, true, true, haystack.len(), &one_below)
+            .expect_err("one-below normalization work must refuse before publication");
+        assert_eq!(refusal.status, super::super::Status::Unsupported);
+        assert!(refusal.message.contains(&format!(
+            "requires {required_work}, limit is {}",
+            required_work - 1
+        )));
+
+        let lifecycle =
+            try_build_count(&patterns, true, true, haystack.len(), &RunLimits::default())
+                .unwrap()
+                .expect("eligible retained lifecycle");
+        assert_eq!(lifecycle.execute(haystack).unwrap(), 1);
+        assert_eq!(lifecycle.execute(haystack).unwrap(), 1);
+        assert!(
+            lifecycle
+                .execute(&haystack[..haystack.len() - 1])
+                .unwrap_err()
+                .message
+                .contains("differs from prepared")
+        );
     }
 
     #[test]
