@@ -25,11 +25,12 @@ from pathlib import Path
 from typing import Any
 
 
-CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v1"
+CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v2"
 BENCHMARK_SCHEMA = "fre-aot-selected-end-abi2-three-engine-v2"
 ADMISSION_SCHEMA = "fre-aot-selected-end-abi2-retained-admission-v1"
 HEARTBEAT_SCHEMA = "fre-aot-selected-end-abi2-admission-heartbeat-v1"
 POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v3"
+PROGRESS_SCHEMA = "fre-aot-selected-end-abi2-campaign-progress-v1"
 SUMMARY_SCHEMA = "fre-aot-selected-end-abi2-three-engine-summary-v1"
 EVIDENCE_CLASS = "diagnostic-nonpromotion"
 AUTHORITY = "absent"
@@ -72,6 +73,12 @@ MAX_MANIFEST_BYTES = 256 << 20
 MAX_EVIDENCE_BYTES = 16 << 20
 MAX_BINARY_BYTES = 512 << 20
 MAX_CHILD_OUTPUT_BYTES = 4 << 20
+MAX_CAMPAIGN_PROCESSES = 1 + 96 * len(SIZES) * len(SCENARIOS) * 2
+MAX_PROGRESS_EVENTS = 2 * MAX_CAMPAIGN_PROCESSES + 4
+MAX_PROGRESS_EVENT_BYTES = 4096
+MAX_PROGRESS_JOURNAL_BYTES = 8 << 20
+OWNED_CHILD_REAP_SECONDS = 5.0
+PROGRESS_NAME = "progress.v1.ndjson"
 POST_LINK_FIELDS = {
     "source_commit",
     "source_tree",
@@ -181,7 +188,14 @@ def open_directory(raw_path: str) -> tuple[Path, int, int, int]:
     try:
         root_names = set(os.listdir(root_fd))
         require(
-            root_names == {MANIFEST_NAME, MANIFEST_SHA_NAME, "raw", "evidence"},
+            root_names
+            == {
+                MANIFEST_NAME,
+                MANIFEST_SHA_NAME,
+                PROGRESS_NAME,
+                "raw",
+                "evidence",
+            },
             "campaign root is partial or contains unbound files",
         )
         raw_fd = os.open(
@@ -1352,6 +1366,152 @@ def expected_schedule(
     return result
 
 
+def validate_progress_journal(
+    raw: bytes,
+    schedule: list[tuple[str, dict[str, Any], list[str]]],
+    processes: list[dict[str, Any]],
+    started_unix_ns: int,
+    completed_unix_ns: int,
+) -> int:
+    require(
+        0 < len(raw) <= MAX_PROGRESS_JOURNAL_BYTES,
+        "progress journal exceeds its byte bound",
+    )
+    require(raw.endswith(b"\n"), "progress journal is truncated")
+    lines = raw.splitlines(keepends=True)
+    expected_events = 2 * len(schedule) + 2
+    require(
+        expected_events <= MAX_PROGRESS_EVENTS and len(lines) == expected_events,
+        "progress journal event schedule is incomplete",
+    )
+    records: list[dict[str, Any]] = []
+    runner_pid: int | None = None
+    previous_emitted = started_unix_ns
+    exact_fields = {
+        "schema",
+        "event_sequence",
+        "event",
+        "emitted_unix_ns",
+        "runner_pid",
+        "expected_processes",
+        "completed_processes",
+        "child_sequence",
+        "child_command",
+        "child_pid",
+        "coordinate",
+        "resumable",
+        "selective_retry",
+    }
+    for event_sequence, line in enumerate(lines):
+        require(
+            len(line) <= MAX_PROGRESS_EVENT_BYTES,
+            f"progress event {event_sequence} exceeds its byte bound",
+        )
+        record = load_canonical(line, f"progress event {event_sequence}")
+        require(
+            set(record) == exact_fields,
+            f"progress event {event_sequence} field set changed",
+        )
+        require(record["schema"] == PROGRESS_SCHEMA, "progress schema drifted")
+        require(
+            record["event_sequence"] == event_sequence,
+            f"progress event {event_sequence} sequence drifted",
+        )
+        require(
+            record["expected_processes"] == len(schedule),
+            f"progress event {event_sequence} process bound drifted",
+        )
+        require(
+            record["resumable"] is False and record["selective_retry"] is False,
+            f"progress event {event_sequence} claims replay authority",
+        )
+        emitted = integer(
+            record["emitted_unix_ns"],
+            1,
+            (1 << 63) - 1,
+            f"progress event {event_sequence} timestamp",
+        )
+        require(
+            previous_emitted <= emitted <= completed_unix_ns,
+            f"progress event {event_sequence} timestamp moved backward or escaped campaign",
+        )
+        previous_emitted = emitted
+        observed_runner_pid = integer(
+            record["runner_pid"],
+            1,
+            (1 << 31) - 1,
+            f"progress event {event_sequence} runner PID",
+        )
+        if runner_pid is None:
+            runner_pid = observed_runner_pid
+        require(
+            observed_runner_pid == runner_pid,
+            f"progress event {event_sequence} runner PID drifted",
+        )
+        records.append(record)
+
+    for index in (0, len(records) - 1):
+        record = records[index]
+        require(
+            record["child_sequence"] is None
+            and record["child_command"] is None
+            and record["child_pid"] is None
+            and record["coordinate"] is None,
+            f"campaign progress event {index} unexpectedly names a child",
+        )
+    require(
+        records[0]["event"] == "campaign-started"
+        and records[0]["completed_processes"] == 0,
+        "progress journal does not begin at campaign start",
+    )
+    require(
+        records[-1]["event"] == "campaign-finalizing"
+        and records[-1]["completed_processes"] == len(schedule),
+        "progress journal does not end at manifest finalization",
+    )
+
+    for sequence, ((command, coordinate, _), process) in enumerate(
+        zip(schedule, processes)
+    ):
+        started = records[1 + sequence * 2]
+        completed = records[2 + sequence * 2]
+        expected_child = {
+            "child_sequence": sequence,
+            "child_command": command,
+            "coordinate": coordinate,
+        }
+        for key, value in expected_child.items():
+            require(
+                started[key] == value and completed[key] == value,
+                f"progress child {sequence} {key} drifted",
+            )
+        child_pid = integer(
+            started["child_pid"],
+            1,
+            (1 << 31) - 1,
+            f"progress child {sequence} PID",
+        )
+        require(
+            completed["child_pid"] == child_pid,
+            f"progress child {sequence} PID drifted",
+        )
+        require(
+            started["event"] == "child-started"
+            and started["completed_processes"] == sequence
+            and completed["event"] == "child-completed"
+            and completed["completed_processes"] == sequence + 1,
+            f"progress child {sequence} terminal state drifted",
+        )
+        require(
+            process["started_unix_ns"]
+            <= started["emitted_unix_ns"]
+            <= process["completed_unix_ns"]
+            <= completed["emitted_unix_ns"],
+            f"progress child {sequence} timestamps do not enclose execution",
+        )
+    return expected_events
+
+
 def subset_file_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: record[key] for key in ("path", "bytes", "sha256", "mode")}
 
@@ -1476,6 +1636,7 @@ def main() -> int:
                 "identity",
                 "benchmark",
                 "bounds",
+                "progress",
                 "binary",
                 "admission",
                 "post_link",
@@ -1523,7 +1684,27 @@ def main() -> int:
         bounds = manifest["bounds"]
         require(
             type(bounds) is dict
+            and set(bounds)
+            == {
+                "campaign_deadline_seconds",
+                "child_timeout_seconds",
+                "measurement_retries",
+                "resume_supported",
+                "selective_retry_supported",
+                "maximum_repetitions",
+                "maximum_child_output_bytes",
+                "maximum_campaign_processes",
+                "maximum_progress_events",
+                "maximum_progress_event_bytes",
+                "maximum_progress_journal_bytes",
+                "owned_child_reap_seconds",
+                "owned_child_cleanup_scope",
+                "parent_death_signal",
+                "handled_runner_signals",
+            }
             and bounds.get("measurement_retries") == 0
+            and bounds.get("resume_supported") is False
+            and bounds.get("selective_retry_supported") is False
             and bounds.get("maximum_repetitions") == 96
             and bounds.get("maximum_child_output_bytes") == MAX_CHILD_OUTPUT_BYTES,
             "campaign bounds drifted",
@@ -1532,6 +1713,60 @@ def main() -> int:
             bounds.get("campaign_deadline_seconds"), 600, 86400, "campaign deadline"
         )
         integer(bounds.get("child_timeout_seconds"), 10, 3600, "child timeout")
+        require(
+            bounds.get("maximum_campaign_processes") == MAX_CAMPAIGN_PROCESSES
+            and bounds.get("maximum_progress_events") == MAX_PROGRESS_EVENTS
+            and bounds.get("maximum_progress_event_bytes")
+            == MAX_PROGRESS_EVENT_BYTES
+            and bounds.get("maximum_progress_journal_bytes")
+            == MAX_PROGRESS_JOURNAL_BYTES
+            and bounds.get("owned_child_reap_seconds")
+            == OWNED_CHILD_REAP_SECONDS
+            and bounds.get("owned_child_cleanup_scope")
+            == "active-runner-owned-process-group-only"
+            and bounds.get("parent_death_signal") == "SIGKILL"
+            and bounds.get("handled_runner_signals")
+            == ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"],
+            "campaign progress or cleanup bounds drifted",
+        )
+
+        progress = manifest["progress"]
+        require(
+            type(progress) is dict
+            and set(progress)
+            == {
+                "path",
+                "bytes",
+                "sha256",
+                "mode",
+                "schema",
+                "events",
+                "resumable",
+                "selective_retry",
+            },
+            "progress manifest record changed",
+        )
+        require(
+            progress["path"] == PROGRESS_NAME
+            and progress["mode"] == "0444"
+            and progress["schema"] == PROGRESS_SCHEMA
+            and progress["resumable"] is False
+            and progress["selective_retry"] is False,
+            "progress manifest contract drifted",
+        )
+        require_hex(progress["sha256"], 64, "progress journal digest")
+        progress_raw = read_named(
+            root_fd,
+            PROGRESS_NAME,
+            MAX_PROGRESS_JOURNAL_BYTES,
+            0o444,
+            "progress journal",
+        )
+        require(
+            progress["bytes"] == len(progress_raw)
+            and progress["sha256"] == sha256(progress_raw),
+            "progress journal record drifted",
+        )
 
         binary = manifest["binary"]
         require(
@@ -1958,6 +2193,17 @@ def main() -> int:
             else:
                 raise Refusal(f"unexpected process command {command!r}")
 
+        progress_events = validate_progress_journal(
+            progress_raw,
+            schedule,
+            processes,
+            started_unix_ns,
+            completed_unix_ns,
+        )
+        require(
+            progress["events"] == progress_events,
+            "progress manifest event count drifted",
+        )
         require(baseline is not None, "qualification metadata is absent")
         require(
             final_heartbeat["sequence"] >= previous_heartbeat["sequence"]

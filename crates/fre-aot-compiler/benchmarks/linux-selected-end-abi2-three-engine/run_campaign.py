@@ -19,11 +19,13 @@ if (
     raise SystemExit(1)
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import platform
 import re
+import signal
 import stat
 import subprocess
 import time
@@ -31,11 +33,12 @@ from pathlib import Path
 from typing import Any
 
 
-CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v1"
+CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v2"
 BENCHMARK_SCHEMA = "fre-aot-selected-end-abi2-three-engine-v2"
 ADMISSION_SCHEMA = "fre-aot-selected-end-abi2-retained-admission-v1"
 HEARTBEAT_SCHEMA = "fre-aot-selected-end-abi2-admission-heartbeat-v1"
 POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v3"
+PROGRESS_SCHEMA = "fre-aot-selected-end-abi2-campaign-progress-v1"
 EVIDENCE_CLASS = "diagnostic-nonpromotion"
 AUTHORITY = "absent"
 PROFILE = "linux-target-cpu-local-v1"
@@ -62,10 +65,23 @@ SAFE_PROTOCOL = re.compile(r"[A-Za-z0-9_.:/+-]{1,160}\Z")
 MAX_EVIDENCE_BYTES = 16 << 20
 MAX_BINARY_BYTES = 512 << 20
 MAX_CHILD_OUTPUT_BYTES = 4 << 20
+MAX_CAMPAIGN_PROCESSES = 1 + 96 * len(SIZES) * len(SCENARIOS) * 2
+MAX_PROGRESS_EVENTS = 2 * MAX_CAMPAIGN_PROCESSES + 4
+MAX_PROGRESS_EVENT_BYTES = 4096
+MAX_PROGRESS_JOURNAL_BYTES = 8 << 20
+OWNED_CHILD_REAP_SECONDS = 5.0
 RAW_DIRECTORY = "raw"
 EVIDENCE_DIRECTORY = "evidence"
 MANIFEST_NAME = "manifest.v1.json"
 MANIFEST_SHA_NAME = "manifest.v1.json.sha256"
+PROGRESS_NAME = "progress.v1.ndjson"
+PR_SET_PDEATHSIG = 1
+HANDLED_SIGNALS = (
+    signal.SIGHUP,
+    signal.SIGINT,
+    signal.SIGQUIT,
+    signal.SIGTERM,
+)
 POST_LINK_FIELDS = {
     "source_commit",
     "source_tree",
@@ -103,6 +119,14 @@ class Refusal(RuntimeError):
     """Fail-closed campaign refusal."""
 
 
+class RunnerSignal(BaseException):
+    """Signal delivered to the campaign runner."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise Refusal(message)
@@ -123,6 +147,253 @@ def canonical_json(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def write_all_fd(fd: int, value: bytes, label: str) -> None:
+    offset = 0
+    while offset < len(value):
+        try:
+            written = os.write(fd, value[offset:])
+        except OSError as error:
+            raise Refusal(f"{label} write failed: {error}") from error
+        require(written > 0, f"short write for {label}")
+        offset += written
+
+
+class ProgressJournal:
+    """Durable, bounded, append-only operational progress."""
+
+    def __init__(self, root_fd: int, expected_processes: int) -> None:
+        require(
+            1 <= expected_processes <= MAX_CAMPAIGN_PROCESSES,
+            "progress expected-process count is outside its bound",
+        )
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_APPEND
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        self.fd = os.open(PROGRESS_NAME, flags, 0o600, dir_fd=root_fd)
+        try:
+            os.fsync(root_fd)
+        except OSError as error:
+            os.close(self.fd)
+            raise Refusal(
+                f"progress journal directory sync failed: {error}"
+            ) from error
+        status = os.fstat(self.fd)
+        if not (
+            stat.S_ISREG(status.st_mode)
+            and status.st_nlink == 1
+            and status.st_size == 0
+        ):
+            os.close(self.fd)
+            raise Refusal(
+                "progress journal was not created as one empty regular file"
+            )
+        self.expected_processes = expected_processes
+        self.completed_processes = 0
+        self.events = 0
+        self.bytes = 0
+        self.digest = hashlib.sha256()
+        self.sealed = False
+        self.emission_failed = False
+
+    def emit(
+        self,
+        event: str,
+        completed_processes: int,
+        *,
+        child_sequence: int | None = None,
+        child_command: str | None = None,
+        child_pid: int | None = None,
+        coordinate: dict[str, Any] | None = None,
+    ) -> None:
+        require(not self.sealed, "progress journal is already sealed")
+        require(not self.emission_failed, "progress emission previously failed")
+        require(
+            event
+            in {
+                "campaign-started",
+                "child-started",
+                "child-completed",
+                "child-failed",
+                "campaign-finalizing",
+                "campaign-failed",
+                "campaign-interrupted",
+            },
+            "progress event kind is unsupported",
+        )
+        require(
+            self.completed_processes
+            <= completed_processes
+            <= min(self.completed_processes + 1, self.expected_processes),
+            "progress completed-process count is outside its bound",
+        )
+        require(self.events < MAX_PROGRESS_EVENTS, "progress event bound exceeded")
+        record = {
+            "schema": PROGRESS_SCHEMA,
+            "event_sequence": self.events,
+            "event": event,
+            "emitted_unix_ns": time.time_ns(),
+            "runner_pid": os.getpid(),
+            "expected_processes": self.expected_processes,
+            "completed_processes": completed_processes,
+            "child_sequence": child_sequence,
+            "child_command": child_command,
+            "child_pid": child_pid,
+            "coordinate": coordinate,
+            "resumable": False,
+            "selective_retry": False,
+        }
+        raw = canonical_json(record)
+        require(
+            len(raw) <= MAX_PROGRESS_EVENT_BYTES,
+            "progress event exceeds its byte bound",
+        )
+        require(
+            self.bytes + len(raw) <= MAX_PROGRESS_JOURNAL_BYTES,
+            "progress journal exceeds its byte bound",
+        )
+        write_all_fd(self.fd, raw, "progress journal")
+        try:
+            os.fsync(self.fd)
+        except OSError as error:
+            raise Refusal(f"progress journal sync failed: {error}") from error
+        status = os.fstat(self.fd)
+        require(
+            stat.S_ISREG(status.st_mode)
+            and status.st_nlink == 1
+            and status.st_size == self.bytes + len(raw),
+            "progress journal changed outside its append-only descriptor",
+        )
+        self.digest.update(raw)
+        self.bytes += len(raw)
+        self.events += 1
+        self.completed_processes = completed_processes
+        emission = b"PROGRESS\t" + raw
+        require(
+            len(emission) <= MAX_PROGRESS_EVENT_BYTES + len(b"PROGRESS\t"),
+            "progress emission exceeds its byte bound",
+        )
+        try:
+            write_all_fd(sys.stderr.fileno(), emission, "progress emission")
+        except BaseException:
+            self.emission_failed = True
+            raise
+
+    def seal(self) -> dict[str, Any]:
+        require(not self.sealed, "progress journal was sealed twice")
+        try:
+            os.fchmod(self.fd, 0o444)
+            os.fsync(self.fd)
+            status = os.fstat(self.fd)
+            require(
+                stat.S_ISREG(status.st_mode)
+                and status.st_nlink == 1
+                and status.st_size == self.bytes,
+                "progress journal changed before finalization",
+            )
+        except OSError as error:
+            raise Refusal(f"progress journal finalization failed: {error}") from error
+        finally:
+            os.close(self.fd)
+            self.fd = -1
+            self.sealed = True
+        return {
+            "path": PROGRESS_NAME,
+            "bytes": self.bytes,
+            "sha256": self.digest.hexdigest(),
+            "mode": f"{stat.S_IMODE(status.st_mode):04o}",
+            "schema": PROGRESS_SCHEMA,
+            "events": self.events,
+            "resumable": False,
+            "selective_retry": False,
+        }
+
+    def close_partial(self) -> None:
+        if self.sealed:
+            return
+        try:
+            os.fchmod(self.fd, 0o444)
+            os.fsync(self.fd)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+            self.sealed = True
+
+
+def raise_runner_signal(signum: int, _frame: Any) -> None:
+    raise RunnerSignal(signum)
+
+
+def install_runner_signal_handlers() -> dict[int, Any]:
+    previous: dict[int, Any] = {}
+    for signum in HANDLED_SIGNALS:
+        previous[signum] = signal.signal(signum, raise_runner_signal)
+    return previous
+
+
+def restore_runner_signal_handlers(previous: dict[int, Any]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_PRCTL = getattr(_LIBC, "prctl", None)
+if _PRCTL is not None:
+    _PRCTL.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    _PRCTL.restype = ctypes.c_int
+
+
+def configure_owned_child(
+    target_cpu: int,
+    expected_parent_pid: int,
+    inherited_signal_mask: set[signal.Signals],
+) -> None:
+    if _PRCTL is None:
+        raise OSError("Linux prctl is unavailable")
+    ctypes.set_errno(0)
+    if _PRCTL(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(127)
+    os.sched_setaffinity(0, {target_cpu})
+    signal.pthread_sigmask(signal.SIG_SETMASK, inherited_signal_mask)
+
+
+def kill_and_reap_owned_process_group(process: subprocess.Popen[bytes]) -> int:
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+    try:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            return process.wait(timeout=OWNED_CHILD_REAP_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise Refusal(
+                "runner-owned benchmark process group did not reap within its bound"
+            ) from error
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def read_all_fd(fd: int, maximum: int, label: str) -> bytes:
@@ -907,6 +1178,7 @@ def safe_child_environment() -> dict[str, str]:
 def run_child(
     binary_fd: int,
     raw_fd: int,
+    progress: ProgressJournal,
     sequence: int,
     command: str,
     arguments: list[str],
@@ -964,111 +1236,161 @@ def run_child(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     stdout_fd = os.open(stdout_name, flags, 0o600, dir_fd=raw_fd)
-    stderr_fd = os.open(stderr_name, flags, 0o600, dir_fd=raw_fd)
+    try:
+        stderr_fd = os.open(stderr_name, flags, 0o600, dir_fd=raw_fd)
+    except BaseException:
+        os.close(stdout_fd)
+        raise
     started_unix_ns = time.time_ns()
     started_monotonic_ns = time.monotonic_ns()
     child_argv = [f"/proc/self/fd/{binary_fd}", command, *arguments]
-
-    def pin_child() -> None:
-        os.sched_setaffinity(0, {target_cpu})
+    expected_parent_pid = os.getpid()
 
     timed_out = False
-    with os.fdopen(stdout_fd, "wb", closefd=True) as stdout_file, os.fdopen(
-        stderr_fd, "wb", closefd=True
-    ) as stderr_file:
-        process = subprocess.Popen(
-            child_argv,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            cwd="/",
-            env=safe_child_environment(),
-            close_fds=True,
-            pass_fds=(binary_fd,),
-            preexec_fn=pin_child,
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        with os.fdopen(stdout_fd, "wb", closefd=True) as stdout_file, os.fdopen(
+            stderr_fd, "wb", closefd=True
+        ) as stderr_file:
+            launch_signal_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, HANDLED_SIGNALS
+            )
+
+            def prepare_child() -> None:
+                configure_owned_child(
+                    target_cpu,
+                    expected_parent_pid,
+                    launch_signal_mask,
+                )
+
+            try:
+                process = subprocess.Popen(
+                    child_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    cwd="/",
+                    env=safe_child_environment(),
+                    close_fds=True,
+                    pass_fds=(binary_fd,),
+                    preexec_fn=prepare_child,
+                    start_new_session=True,
+                )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, launch_signal_mask)
+            progress.emit(
+                "child-started",
+                sequence,
+                child_sequence=sequence,
+                child_command=command,
+                child_pid=process.pid,
+                coordinate=coordinate,
+            )
+            try:
+                exit_code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                exit_code = kill_and_reap_owned_process_group(process)
+            stdout_file.flush()
+            stderr_file.flush()
+            os.fsync(stdout_file.fileno())
+            os.fsync(stderr_file.fileno())
+            stdout = read_all_fd(
+                stdout_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stdout"
+            )
+            stderr = read_all_fd(
+                stderr_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stderr"
+            )
+            os.fchmod(stdout_file.fileno(), 0o444)
+            os.fchmod(stderr_file.fileno(), 0o444)
+        completed_monotonic_ns = time.monotonic_ns()
+        completed_unix_ns = time.time_ns()
+        require(
+            completed_monotonic_ns <= campaign_deadline_monotonic_ns,
+            "child completed after the bounded campaign deadline",
         )
-        try:
-            exit_code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            exit_code = process.wait()
-        stdout_file.flush()
-        stderr_file.flush()
-        os.fsync(stdout_file.fileno())
-        os.fsync(stderr_file.fileno())
-        stdout = read_all_fd(
-            stdout_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stdout"
+        require(
+            completed_unix_ns < admission["valid_until_unix_ns"],
+            "admission receipt expired before child completion",
         )
-        stderr = read_all_fd(
-            stderr_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stderr"
+        heartbeat_after, heartbeat_after_raw, _ = load_and_validate_heartbeat(
+            admission_heartbeat_path,
+            admission,
+            admission_evidence_sha256,
+            identity,
+            completed_unix_ns,
         )
-        os.fchmod(stdout_file.fileno(), 0o444)
-        os.fchmod(stderr_file.fileno(), 0o444)
-    completed_monotonic_ns = time.monotonic_ns()
-    completed_unix_ns = time.time_ns()
-    require(
-        completed_monotonic_ns <= campaign_deadline_monotonic_ns,
-        "child completed after the bounded campaign deadline",
-    )
-    require(
-        completed_unix_ns < admission["valid_until_unix_ns"],
-        "admission receipt expired before child completion",
-    )
-    heartbeat_after, heartbeat_after_raw, _ = load_and_validate_heartbeat(
-        admission_heartbeat_path,
-        admission,
-        admission_evidence_sha256,
-        identity,
-        completed_unix_ns,
-    )
-    require(
-        heartbeat_after["sequence"] >= heartbeat_before["sequence"]
-        and heartbeat_after["observed_unix_ns"]
-        >= heartbeat_before["observed_unix_ns"],
-        "admission heartbeat moved backward across child execution",
-    )
-    heartbeat_after_record = write_exclusive(
-        raw_fd,
-        f"{stem}.admission-after.json",
-        heartbeat_after_raw,
-        0o444,
-        "post-child admission heartbeat",
-    )
-    heartbeat_after_record["path"] = f"{RAW_DIRECTORY}/{stem}.admission-after.json"
-    require(not timed_out, f"{command} exceeded its {timeout}-second child deadline")
-    require(exit_code == 0, f"{command} exited with status {exit_code}")
-    metadata = validate_process_output(
-        command, stdout, stderr, identity, coordinate, baseline
-    )
-    record = {
-        "sequence": sequence,
-        "command": command,
-        "arguments": arguments,
-        "coordinate": coordinate,
-        "fresh_process": True,
-        "single_thread_environment": True,
-        "target_cpu": target_cpu,
-        "exit_code": exit_code,
-        "started_unix_ns": started_unix_ns,
-        "completed_unix_ns": completed_unix_ns,
-        "runner_elapsed_ns": completed_monotonic_ns - started_monotonic_ns,
-        "admission_before": heartbeat_before_record,
-        "admission_after": heartbeat_after_record,
-        "stdout": {
-            "path": f"{RAW_DIRECTORY}/{stdout_name}",
-            "bytes": len(stdout),
-            "sha256": sha256_bytes(stdout),
-            "mode": "0444",
-        },
-        "stderr": {
-            "path": f"{RAW_DIRECTORY}/{stderr_name}",
-            "bytes": len(stderr),
-            "sha256": sha256_bytes(stderr),
-            "mode": "0444",
-        },
-    }
-    return record, metadata, heartbeat_after
+        require(
+            heartbeat_after["sequence"] >= heartbeat_before["sequence"]
+            and heartbeat_after["observed_unix_ns"]
+            >= heartbeat_before["observed_unix_ns"],
+            "admission heartbeat moved backward across child execution",
+        )
+        heartbeat_after_record = write_exclusive(
+            raw_fd,
+            f"{stem}.admission-after.json",
+            heartbeat_after_raw,
+            0o444,
+            "post-child admission heartbeat",
+        )
+        heartbeat_after_record["path"] = f"{RAW_DIRECTORY}/{stem}.admission-after.json"
+        require(not timed_out, f"{command} exceeded its {timeout}-second child deadline")
+        require(exit_code == 0, f"{command} exited with status {exit_code}")
+        metadata = validate_process_output(
+            command, stdout, stderr, identity, coordinate, baseline
+        )
+        record = {
+            "sequence": sequence,
+            "command": command,
+            "arguments": arguments,
+            "coordinate": coordinate,
+            "fresh_process": True,
+            "single_thread_environment": True,
+            "target_cpu": target_cpu,
+            "exit_code": exit_code,
+            "started_unix_ns": started_unix_ns,
+            "completed_unix_ns": completed_unix_ns,
+            "runner_elapsed_ns": completed_monotonic_ns - started_monotonic_ns,
+            "admission_before": heartbeat_before_record,
+            "admission_after": heartbeat_after_record,
+            "stdout": {
+                "path": f"{RAW_DIRECTORY}/{stdout_name}",
+                "bytes": len(stdout),
+                "sha256": sha256_bytes(stdout),
+                "mode": "0444",
+            },
+            "stderr": {
+                "path": f"{RAW_DIRECTORY}/{stderr_name}",
+                "bytes": len(stderr),
+                "sha256": sha256_bytes(stderr),
+                "mode": "0444",
+            },
+        }
+        progress.emit(
+            "child-completed",
+            sequence + 1,
+            child_sequence=sequence,
+            child_command=command,
+            child_pid=process.pid,
+            coordinate=coordinate,
+        )
+        return record, metadata, heartbeat_after
+    except BaseException:
+        if process is not None:
+            kill_and_reap_owned_process_group(process)
+            if not progress.emission_failed and not progress.sealed:
+                try:
+                    progress.emit(
+                        "child-failed",
+                        sequence,
+                        child_sequence=sequence,
+                        child_command=command,
+                        child_pid=process.pid,
+                        coordinate=coordinate,
+                    )
+                except BaseException:
+                    pass
+        raise
 
 
 def parse_post_link_observation(
@@ -1181,6 +1503,13 @@ def main() -> int:
         6 <= arguments.repetitions <= 96 and arguments.repetitions % 6 == 0,
         "repetitions must be 6..96 and a multiple of six",
     )
+    expected_processes = (
+        1 + arguments.repetitions * len(SIZES) * len(SCENARIOS) * 2
+    )
+    require(
+        expected_processes <= MAX_CAMPAIGN_PROCESSES,
+        "campaign process count exceeds its static bound",
+    )
     require(0 <= arguments.target_cpu < (1 << 20), "target CPU is outside the safe range")
     require(
         600 <= arguments.campaign_deadline_seconds <= 86400,
@@ -1260,10 +1589,14 @@ def main() -> int:
     source_binary_fd, source_binary_path, source_binary_status = open_exact_regular(
         arguments.binary, "benchmark binary", MAX_BINARY_BYTES, executable=True
     )
+    previous_signal_handlers = install_runner_signal_handlers()
     output_path: Path | None = None
     root_fd = raw_fd = evidence_fd = snapshot_binary_fd = -1
+    progress: ProgressJournal | None = None
     try:
         output_path, root_fd, raw_fd, evidence_fd = mkdir_output(arguments.output)
+        progress = ProgressJournal(root_fd, expected_processes)
+        progress.emit("campaign-started", 0)
         binary_record, snapshot_binary_fd = copy_fd_exclusive(
             source_binary_fd,
             evidence_fd,
@@ -1325,6 +1658,7 @@ def main() -> int:
         qualification_record, baseline, last_heartbeat = run_child(
             snapshot_binary_fd,
             raw_fd,
+            progress,
             0,
             "qualification",
             qualification_arguments,
@@ -1374,6 +1708,7 @@ def main() -> int:
                         record, _, last_heartbeat = run_child(
                             snapshot_binary_fd,
                             raw_fd,
+                            progress,
                             sequence,
                             command,
                             cell_arguments,
@@ -1391,7 +1726,6 @@ def main() -> int:
                         processes.append(record)
                         sequence += 1
 
-        expected_processes = 1 + arguments.repetitions * len(SIZES) * len(SCENARIOS) * 2
         require(len(processes) == expected_processes, "campaign process count is incomplete")
         final_heartbeat_boundary_ns = time.time_ns()
         final_heartbeat, final_heartbeat_raw, _ = load_and_validate_heartbeat(
@@ -1400,22 +1734,6 @@ def main() -> int:
             admission_evidence_sha256,
             identity,
             final_heartbeat_boundary_ns,
-        )
-        completed_monotonic_ns = time.monotonic_ns()
-        completed_unix_ns = time.time_ns()
-        require(
-            completed_monotonic_ns <= campaign_deadline_monotonic_ns,
-            "campaign completed after its monotonic deadline",
-        )
-        require(
-            completed_unix_ns < admission_summary["valid_until_unix_ns"],
-            "admission receipt expired before campaign completion",
-        )
-        require(
-            completed_unix_ns < final_heartbeat["valid_until_unix_ns"]
-            and completed_unix_ns - final_heartbeat["observed_unix_ns"]
-            <= admission_summary["maximum_heartbeat_age_ns"],
-            "final admission heartbeat is not valid at campaign completion",
         )
         require(
             final_heartbeat["sequence"] >= last_heartbeat["sequence"]
@@ -1432,6 +1750,24 @@ def main() -> int:
         )
         final_heartbeat_record["path"] = (
             f"{EVIDENCE_DIRECTORY}/admission-final-heartbeat.json"
+        )
+        progress.emit("campaign-finalizing", expected_processes)
+        progress_record = progress.seal()
+        completed_monotonic_ns = time.monotonic_ns()
+        completed_unix_ns = time.time_ns()
+        require(
+            completed_monotonic_ns <= campaign_deadline_monotonic_ns,
+            "campaign completed after its monotonic deadline",
+        )
+        require(
+            completed_unix_ns < admission_summary["valid_until_unix_ns"],
+            "admission receipt expired before campaign completion",
+        )
+        require(
+            completed_unix_ns < final_heartbeat["valid_until_unix_ns"]
+            and completed_unix_ns - final_heartbeat["observed_unix_ns"]
+            <= admission_summary["maximum_heartbeat_age_ns"],
+            "final admission heartbeat is not valid at campaign completion",
         )
         manifest = {
             "schema": CAMPAIGN_SCHEMA,
@@ -1456,9 +1792,27 @@ def main() -> int:
                 "campaign_deadline_seconds": arguments.campaign_deadline_seconds,
                 "child_timeout_seconds": arguments.child_timeout_seconds,
                 "measurement_retries": 0,
+                "resume_supported": False,
+                "selective_retry_supported": False,
                 "maximum_repetitions": 96,
                 "maximum_child_output_bytes": MAX_CHILD_OUTPUT_BYTES,
+                "maximum_campaign_processes": MAX_CAMPAIGN_PROCESSES,
+                "maximum_progress_events": MAX_PROGRESS_EVENTS,
+                "maximum_progress_event_bytes": MAX_PROGRESS_EVENT_BYTES,
+                "maximum_progress_journal_bytes": MAX_PROGRESS_JOURNAL_BYTES,
+                "owned_child_reap_seconds": OWNED_CHILD_REAP_SECONDS,
+                "owned_child_cleanup_scope": (
+                    "active-runner-owned-process-group-only"
+                ),
+                "parent_death_signal": "SIGKILL",
+                "handled_runner_signals": [
+                    "SIGHUP",
+                    "SIGINT",
+                    "SIGQUIT",
+                    "SIGTERM",
+                ],
             },
+            "progress": progress_record,
             "binary": {
                 **binary_record,
                 "source_path": str(source_binary_path),
@@ -1542,6 +1896,8 @@ def main() -> int:
             "\tCOMPLETE"
             f"\tmanifest={output_path / MANIFEST_NAME}"
             f"\tmanifest_sha256={manifest_record['sha256']}"
+            f"\tprogress={output_path / PROGRESS_NAME}"
+            f"\tprogress_sha256={progress_record['sha256']}"
             f"\tprocesses={expected_processes}"
             f"\trepetitions={arguments.repetitions}"
             f"\ttarget_cpu={arguments.target_cpu}"
@@ -1550,15 +1906,41 @@ def main() -> int:
             "\tpromotion_authority=absent"
         )
         return 0
+    except BaseException as error:
+        if progress is not None and not progress.sealed:
+            if not progress.emission_failed:
+                try:
+                    progress.emit(
+                        (
+                            "campaign-interrupted"
+                            if isinstance(error, RunnerSignal)
+                            else "campaign-failed"
+                        ),
+                        progress.completed_processes,
+                    )
+                except BaseException:
+                    pass
+            progress.close_partial()
+        raise
     finally:
-        for fd in (snapshot_binary_fd, evidence_fd, raw_fd, root_fd, source_binary_fd):
-            if fd >= 0:
-                os.close(fd)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+        try:
+            if progress is not None:
+                progress.close_partial()
+            for fd in (snapshot_binary_fd, evidence_fd, raw_fd, root_fd, source_binary_fd):
+                if fd >= 0:
+                    os.close(fd)
+            restore_runner_signal_handlers(previous_signal_handlers)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except RunnerSignal as error:
+        print(f"INTERRUPTED: signal={error.signum}", file=sys.stderr)
+        raise SystemExit(128 + error.signum) from error
     except Refusal as error:
         print(f"REFUSED: {error}", file=sys.stderr)
         raise SystemExit(1) from error

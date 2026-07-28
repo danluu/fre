@@ -258,8 +258,41 @@ The runner snapshots and hashes the heartbeat immediately before and after
 every child and once at campaign completion. It refuses stale, expired,
 backward, replaced-session, or withdrawn-admission transitions. It never waits
 for or retries admission itself, never retries a measurement, and never kills
-unrelated work. A child deadline can terminate only the runner's own benchmark
-child, after which the campaign remains incomplete and has no final manifest.
+unrelated work.
+
+Heartbeat v1 is deliberately insufficient for campaign resume. A later
+heartbeat with the same holder, session, lease epoch, and nondecreasing
+sequence does not carry an irreversible lapse counter or authenticated history
+that proves admission stayed continuously valid while the runner was absent.
+The runner therefore has no resume mode and refuses every pre-existing output
+directory. It also has no selective-cell retry: after any interruption or
+failed child, the retained directory is diagnostic partial output only, never
+gets a final manifest, and cannot be supplied to the campaign verifier.
+Restarting requires a new whole campaign in a new output directory under a
+fresh externally established continuous admission.
+
+Every launched benchmark is the leader of a new runner-owned session and
+process group. Before `exec`, that child sets target affinity and Linux
+`PR_SET_PDEATHSIG=SIGKILL`, then verifies that its parent did not change across
+the setup race. On a child timeout, runner exception, or handled
+`SIGHUP`/`SIGINT`/`SIGQUIT`/`SIGTERM`, cleanup sends `SIGKILL` only to that exact
+active runner-owned process group and bounds direct-child reaping to five
+seconds. It never enumerates or signals unrelated processes. The parent-death
+setting covers an otherwise uncatchable runner exit by killing the direct
+benchmark leader when Linux reports parent death.
+
+The campaign root contains `progress.v1.ndjson`. Each canonical event is at
+most 4096 bytes, is appended through the runner's exclusive open descriptor,
+and is `fsync`ed before the same record is emitted on standard error with a
+`PROGRESS<TAB>` prefix. The journal is bounded to 8 MiB and 9,222 events,
+covering campaign start/finalization plus started and terminal state for every
+possible child. A successful journal ends in `campaign-finalizing`, is made
+read-only, and is digest-bound by campaign manifest schema v2; manifest
+presence remains the only completion claim. A partial journal ends in a
+failure/interruption event and is made read-only when the runner can execute
+cleanup. An uncatchable runner death can instead leave the already-`fsync`ed
+prefix at mode `0600`; it still has no manifest, and every event explicitly
+records `resumable=false` and `selective_retry=false`.
 
 ### Invocation and evidence
 
@@ -288,9 +321,12 @@ python3 -I -B run_campaign.py \
 The runner clears the ambient environment, executes a read-only binary
 snapshot through its already-open file descriptor, pins each child directly
 with `sched_setaffinity`, and sets common thread-pool variables to one. It
-stores read-only raw stdout, stderr, before/after admission heartbeats, the
-binary, host/admission/post-link evidence, a canonical manifest, and a manifest
-digest sidecar. A partial or failed campaign never gets a final manifest.
+stores the bounded progress journal, read-only raw stdout, stderr, before/after
+admission heartbeats, the binary, host/admission/post-link evidence, a
+canonical manifest, and a manifest digest sidecar. A partial or failed
+campaign never gets a final manifest. Operators can follow the durable status
+with `tail -f <campaign-directory>/progress.v1.ndjson`; the emitted stderr
+records provide the same live child boundaries.
 
 Retain the runner-printed manifest digest outside the campaign directory.
 Verify using that digest and the other expected digests supplied independently
