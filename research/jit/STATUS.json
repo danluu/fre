@@ -1,10 +1,26 @@
 {
-  "schema": "fre-jit-status-v1",
-  "updated_utc": "2026-07-27T00:54:15Z",
-  "branch": "work/jit-v7-promotion-20260726-r1",
-  "base_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
-  "qualified_source_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
-  "milestones": [
+  "schema": "fre-jit-status-v2",
+  "updated_utc": "2026-07-28T09:02:08Z",
+  "branch": "codex/jit-aot-offline-docs-compose-r1",
+  "authority_state_basis_revision": "670f97e6e2bbb661c25bb51dc3b5265fee3f8ecb",
+  "authority_state_basis_tree": "f615163ad17903cc68462de118d14bf7426935af",
+  "authority_state_basis_relation": "this documentation-only child leaves every JIT and AOT source-authority atom byte-exact to the named parent basis",
+  "status": "current-search-jit-candidates-unqualified",
+  "current_authority": {
+    "default_emitter_policy": "Search V8",
+    "legacy_v7": "Candidate",
+    "v8": "Candidate",
+    "tag10": "Candidate",
+    "tag19": "Candidate",
+    "tag21": "Candidate",
+    "native_execution_authorized": false,
+    "performance_qualified": false,
+    "historical_receipts_authoritative": false
+  },
+  "historical_v7_branch": "work/jit-v7-promotion-20260726-r1",
+  "historical_v7_base_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+  "historical_v7_qualified_source_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
+  "historical_v7_milestones": [
     {
       "revision": "57314b4a06950b1236174d9e9054afe9428db448",
       "subject": "jit: qualify fast exact-literal search route"
@@ -18,8 +34,7 @@
       "subject": "bench: measure JIT planning separately"
     }
   ],
-  "status": "search_v7_qualified_explicit_opt_in",
-  "route": {
+  "historical_v7_route": {
     "api": "fre::QualifiedExactSearch",
     "literal_bytes": 16,
     "tiers": [
@@ -47,11 +62,12 @@
       "timing result"
     ]
   },
-  "qualification": {
-    "valid": true,
-    "state": "qualified",
+  "historical_v7_qualification": {
+    "historical_validation": "passed-for-exact-historical-source-and-artifact-only",
+    "valid_for_current_source": false,
+    "historical_state": "qualified-at-exact-historical-source-only",
     "backend": "aarch64-search-v7",
-    "scope": "explicit fre::QualifiedExactSearch only; 16-byte literal and declared large-window reuse tiers only; no default facade, class, aggregate, Sherlock, x86-64, or AOT claim",
+    "scope": "historical explicit fre::QualifiedExactSearch only; 16-byte literal and declared large-window reuse tiers only; no authority for the current composed source and no default facade, class, aggregate, Sherlock, x86-64, or AOT claim",
     "subject_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
     "subject_tree": "131e38a4bfe5946bba6e994ee376ad239e1cca97",
     "required_promotion_parent": "88e9c22c4ac382531bc1026ca0e25587905f5206",
@@ -117,7 +133,7 @@
       171
     ]
   },
-  "correctness": {
+  "historical_v7_correctness": {
     "subject_revision": "88e9c22c4ac382531bc1026ca0e25587905f5206",
     "bundle_validation": "complete frozen replay, exact inventory, binary receipts, promotion receipt, independent review, and external manifest hash passed",
     "promotion_validation": "direct Q8 parent, closed source delta, exact qualification atom, and Q8-materialized bundle verifier are required",
@@ -307,7 +323,7 @@
       "disposition": "retained diagnostic only; v5 fixes pair-dense but fails the mandatory triple-dense reference target and is not promotable"
     }
   },
-  "commands": [
+  "historical_v7_reproduction_commands": [
     "cargo fmt --all -- --check",
     "cargo test -p fre --test qualified_exact_search --locked",
     "cargo clippy -p fre --all-targets --locked -- -D warnings",
@@ -317,12 +333,13 @@
     "research/jit/bakeoff/verify_qualified_exact_search_promotion.sh PROMOTION_REVISION /private/tmp/fre-jit-v7-q8-88e9c22c-bundle-r2 REPOSITORY"
   ],
   "blockers": [
-    "no blocker remains for the exact direct-child promotion of the explicit 16-byte QualifiedExactSearch route",
-    "the canonical 34 MiB bundle is currently only an ephemeral local copy; durable content-addressed publication remains an audit-retention follow-up, not a runtime dependency",
-    "class-plus-suffix, the 15-byte Sherlock aggregate, other exact-literal widths, default planner selection, x86-64 publication, and AOT remain outside this qualification"
+    "all current Search JIT qualification atoms are Candidate and no production native Search execution is authorized",
+    "fresh source-bound correctness, resource, lifecycle, and performance qualification for an exact current backend is required before any atom-only promotion",
+    "the historical 34 MiB V7 bundle is only an ephemeral local copy and is non-authoritative for the current composed source",
+    "class-plus-suffix, the 15-byte Sherlock aggregate, other exact-literal widths, default planner selection, x86-64 publication, and AOT remain outside any current qualification"
   ],
-  "next_action": "Integrate only the exact direct-child promotion commit, run its Q8-materialized external-bundle verifier before release, and publish the canonical bundle under a durable content-addressed artifact location before the observed private/tmp copy expires. Do not widen the route or make it a default.",
-  "owned_paths": [
+  "next_action": "Qualify one exact current Candidate backend with fresh source-bound correctness, resource, lifecycle, and performance evidence before considering a separately reviewed atom-only promotion. Historical V7 receipts may be retained but cannot authorize that promotion.",
+  "historical_session_owned_paths": [
     "crates/fre-jit-aarch64",
     "crates/fre-jit-cache",
     "crates/fre-jit-runtime",
@@ -332,7 +349,7 @@
     "research/jit/bakeoff",
     "research/jit/STATUS.json"
   ],
-  "workers": [
+  "historical_session_workers": [
     {
       "name": "jit_diff_review",
       "state": "completed",
@@ -354,7 +371,7 @@
       "heartbeat_utc": "2026-07-26T21:25:17Z"
     }
   ],
-  "resource_coordinator": {
+  "historical_session_resource_coordinator": {
     "heartbeat_utc": "2026-07-26T21:25:17Z",
     "build_slots_active": 0,
     "timing_active": 0,

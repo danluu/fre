@@ -1,20 +1,22 @@
 # AArch64 JIT actual-hardware bakeoff
 
-This directory is reproducible evidence for deliberately narrow native
-backends, not evidence that FRE is the world's fastest regex engine.
+This directory retains reproducible historical evidence for a deliberately
+narrow V7 native backend. It is not evidence that FRE is the world's fastest
+regex engine and is not qualification authority for the current composed
+source.
 
-The current V7 exact-literal leaf is qualified only through the explicit
-opt-in `fre::QualifiedExactSearch`; no default facade selects it. Its accepted
-envelope is limited to 16-byte literals and a caller-declared amortization
-lower bound:
+At the exact historical Q source below, the V7 exact-literal leaf was qualified
+only through the explicit opt-in `fre::QualifiedExactSearch`; no default
+facade selected it. Its accepted historical envelope was limited to 16-byte
+literals and a caller-declared amortization lower bound:
 
 - at least 1,024 qualifying searches with windows of at least 64 KiB; or
 - at least 64 qualifying searches with windows of at least 1 MiB.
 
-The facade retains the portable literal plan and does not emit or publish
-native code for other widths or under-qualified workloads. Calls smaller than
-the declared window also stay portable. Class-plus-suffix, aggregate, and the
-15-byte Sherlock cases remain unqualified.
+That historical facade retained the portable literal plan and did not emit or
+publish native code for other widths or under-qualified workloads. Calls
+smaller than the declared window also stayed portable. Class-plus-suffix,
+aggregate, and the 15-byte Sherlock cases were unqualified.
 
 The measured Q commit is
 `88e9c22c4ac382531bc1026ca0e25587905f5206`, tree
@@ -25,7 +27,7 @@ SHA-256 is
 `de084ff0564acdb89889f28b9dcfddce9b6f0955a1b2aead30d75770039e0453`.
 The Q execution source remains unchanged.
 
-`qualified_exact_search_promotion.tsv` binds the Q revision/tree,
+`qualified_exact_search_promotion.tsv` binds the historical Q revision/tree,
 qualification source blobs, promotion-gate receipt, independent review,
 findings, candidate binary, exact backend, and both workload tiers.
 `verify_qualified_exact_search_promotion.sh` accepts a release only when the
@@ -45,10 +47,16 @@ as falsification history.
 
 The measurements were taken on an Apple M5 Max running macOS arm64 with
 Rust 1.93.0. Exact host, compiler, binary, fixture, and Rebar revision details
-are recorded in each result directory's `environment.txt`. Current
-qualification uses a clean Git revision plus a verified source-bound binary
+are recorded in each result directory's `environment.txt`. The historical
+qualification used a clean Git revision plus a verified source-bound binary
 receipt. Older retained result directories without Git metadata record their
 workspace revision honestly as `unknown`.
+
+The current composed source uses V8 as its default emitter policy, but the V8,
+tag-10, tag-19, and tag-21 qualification atoms are all `Candidate`; legacy V7
+is also hard `Candidate`. The historical V7 bundle and results in this
+directory therefore authorize neither current production execution nor a
+current performance claim.
 
 ## Fixed matrix
 

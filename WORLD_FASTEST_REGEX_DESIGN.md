@@ -945,6 +945,11 @@ boundaries are tested with guard pages; no undocumented overread is allowed.
 
 ### 6.4 Backend bakeoff and initial budgets
 
+This section records research options from the original design, not the
+current compiler architecture. FRE's current Search JIT and Search AOT share
+the custom direct `fre-jit-aarch64` machine-code emitter, while Count-v2 AOT
+uses the separate custom direct `fre-aot-aarch64` emitter.
+
 Compare the same Kernel IR through:
 
 - precompiled static kernels;
@@ -953,7 +958,9 @@ Compare the same Kernel IR through:
 - a tiny custom macroassembler; and
 - Cranelift as a control/possible larger hot tier.
 
-LLVM belongs in offline AOT experiments, not the mandatory runtime dependency.
+LLVM was proposed only as an optional offline AOT research experiment, not as
+FRE's current regex compiler or payload generator. No such LLVM AOT backend is
+implemented in the current source.
 Choose a Pareto frontier, not a backend by taste. Measure process-cold p50/p99
 parse, plan, emit, seal, first call, steady cycles/byte, code bytes, and reuse
 break-even on both ISAs.
@@ -1005,11 +1012,13 @@ The re2c model of generated conditional control flow is an important ceiling
 FRE additionally needs ordinary search, both compatibility-profile families, bounded
 construction, and stable embedding.
 
-The in-tree AOT planner and emitters obey deterministic counters. An optional
-general compiler such as LLVM runs as an OS-limited worker with explicit
-memory, CPU, output, and cancellation limits; its failure cannot invalidate
-the already constructed bounded plan. Wall time is an outer watchdog, never
-the resource proof for an internal pass.
+The in-tree AOT planner and direct emitters obey deterministic counters. A
+hypothetical future experiment with a general compiler such as LLVM would have
+to run as an OS-limited worker with explicit memory, CPU, output, and
+cancellation limits; its failure could not invalidate the already constructed
+bounded plan. That experiment is not implemented and is not part of FRE's
+current JIT or AOT compiler architecture. Wall time would be an outer watchdog,
+never the resource proof for an internal pass.
 
 `fre-build` should consume a manifest and produce a normal object/static
 library, immutable data, a small metadata record, Rust bindings, and a C

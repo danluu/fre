@@ -21,7 +21,9 @@ runtime verifier, while the duplicate-object link is required to fail.
 integrated C5 candidate source. Its raw C driver still reports
 `runtime_authority=absent`, because that driver deliberately stubs the adopter.
 The adjacent `benchmarks/c5-qualified-vs-portable/` package links both retained
-objects with the real `fre-aot-static-runtime`, exercises the literal selector
-11 production row and immutable-image verifier, and measures only the resulting
-safe authenticated handle. The C5 row is not releasable until that package has
-been run in a sealed source-bound qualification and independently verified.
+objects with the real `fre-aot-static-runtime`, exercises the
+qualification-private selector-11 Candidate row and immutable-image verifier,
+and measures only the resulting safe authenticated handle. The ordinary
+production table remains empty while the promotion atom is all-zero. The C5
+row is not releasable until that package has been run in a sealed source-bound
+qualification, independently verified, and separately promoted.
