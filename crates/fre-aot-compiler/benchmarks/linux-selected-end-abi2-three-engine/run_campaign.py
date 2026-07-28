@@ -8,6 +8,16 @@ never kills unrelated work, and never retries a measurement process.
 
 from __future__ import annotations
 
+import sys
+
+if (
+    sys.flags.isolated != 1
+    or not sys.dont_write_bytecode
+    or sys.flags.optimize != 0
+):
+    print("REFUSED: use python3 -I -B without optimization", file=sys.stderr)
+    raise SystemExit(1)
+
 import argparse
 import hashlib
 import json
@@ -16,7 +26,6 @@ import platform
 import re
 import stat
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -26,7 +35,7 @@ CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v1"
 BENCHMARK_SCHEMA = "fre-aot-selected-end-abi2-three-engine-v2"
 ADMISSION_SCHEMA = "fre-aot-selected-end-abi2-retained-admission-v1"
 HEARTBEAT_SCHEMA = "fre-aot-selected-end-abi2-admission-heartbeat-v1"
-POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v1"
+POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v2"
 EVIDENCE_CLASS = "diagnostic-nonpromotion"
 AUTHORITY = "absent"
 PROFILE = "linux-target-cpu-local-v1"
@@ -57,6 +66,30 @@ RAW_DIRECTORY = "raw"
 EVIDENCE_DIRECTORY = "evidence"
 MANIFEST_NAME = "manifest.v1.json"
 MANIFEST_SHA_NAME = "manifest.v1.json.sha256"
+POST_LINK_FIELDS = {
+    "source_commit",
+    "source_tree",
+    "artifact_identity",
+    "compile_identity",
+    "implementation_object_identity",
+    "glue_object_identity",
+    "bundle_identity",
+    "final_binary_sha256",
+    "helper_sha256",
+    "profile",
+    "wrapper_call",
+    "primary_aot_call",
+    "entry_bytes_equal",
+    "payload_bytes_equal",
+    "metadata_bytes_equal",
+    "compile_identity_derived",
+    "reject_plt",
+    "reject_blr",
+    "reject_x4_argument",
+    "result_slot_bytes",
+    "runtime_authority",
+    "promotion_authority",
+}
 
 
 class Refusal(RuntimeError):
@@ -210,6 +243,7 @@ def copy_fd_exclusive(
     destination_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
     digest = hashlib.sha256()
     offset = 0
+    snapshot_fd = -1
     try:
         while offset < source.st_size:
             chunk = os.pread(source_fd, min(1 << 20, source.st_size - offset), offset)
@@ -227,15 +261,34 @@ def copy_fd_exclusive(
         )
         os.fsync(destination_fd)
         os.fchmod(destination_fd, mode)
+        destination = os.fstat(destination_fd)
+        snapshot_fd = os.open(
+            f"/proc/self/fd/{destination_fd}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        snapshot = os.fstat(snapshot_fd)
+        require(
+            stat.S_ISREG(snapshot.st_mode)
+            and (
+                snapshot.st_dev,
+                snapshot.st_ino,
+                snapshot.st_size,
+                snapshot.st_mtime_ns,
+            )
+            == (
+                destination.st_dev,
+                destination.st_ino,
+                destination.st_size,
+                destination.st_mtime_ns,
+            ),
+            f"{label} snapshot changed while reopening its exact descriptor",
+        )
+    except BaseException:
+        if snapshot_fd >= 0:
+            os.close(snapshot_fd)
+        raise
     finally:
         os.close(destination_fd)
-    snapshot_fd = os.open(
-        name,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        dir_fd=directory_fd,
-    )
     return (
         {
             "path": f"{EVIDENCE_DIRECTORY}/{name}",
@@ -419,6 +472,7 @@ def validate_admission(
         acquisition["deadline_unix_ns"], 1, (1 << 63) - 1, "admission deadline"
     )
     require(started <= completed <= deadline, "admission exceeded its acquisition deadline")
+    require(completed <= now_unix_ns, "admission acquisition completed in the future")
 
     continuity = receipt["continuity"]
     require(
@@ -810,8 +864,9 @@ def run_child(
     admission: dict[str, Any],
     admission_evidence_sha256: str,
     admission_heartbeat_path: str,
+    previous_heartbeat: dict[str, Any],
     baseline: dict[str, str] | None,
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
     now_unix_ns = time.time_ns()
     require(
         now_unix_ns < admission["valid_until_unix_ns"],
@@ -829,6 +884,12 @@ def run_child(
         identity,
         now_unix_ns,
     )
+    require(
+        heartbeat_before["sequence"] >= previous_heartbeat["sequence"]
+        and heartbeat_before["observed_unix_ns"]
+        >= previous_heartbeat["observed_unix_ns"],
+        "admission heartbeat moved backward between child executions",
+    )
     heartbeat_before_record = write_exclusive(
         raw_fd,
         f"{stem}.admission-before.json",
@@ -842,7 +903,7 @@ def run_child(
     stdout_name = f"{stem}.stdout"
     stderr_name = f"{stem}.stderr"
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_CLOEXEC", 0)
@@ -882,6 +943,12 @@ def run_child(
         stderr_file.flush()
         os.fsync(stdout_file.fileno())
         os.fsync(stderr_file.fileno())
+        stdout = read_all_fd(
+            stdout_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stdout"
+        )
+        stderr = read_all_fd(
+            stderr_file.fileno(), MAX_CHILD_OUTPUT_BYTES, f"{command} stderr"
+        )
         os.fchmod(stdout_file.fileno(), 0o444)
         os.fchmod(stderr_file.fileno(), 0o444)
     completed_monotonic_ns = time.monotonic_ns()
@@ -915,14 +982,6 @@ def run_child(
         "post-child admission heartbeat",
     )
     heartbeat_after_record["path"] = f"{RAW_DIRECTORY}/{stem}.admission-after.json"
-    stdout_path = Path(f"/proc/self/fd/{raw_fd}") / stdout_name
-    stderr_path = Path(f"/proc/self/fd/{raw_fd}") / stderr_name
-    stdout = stdout_path.read_bytes()
-    stderr = stderr_path.read_bytes()
-    require(
-        len(stdout) <= MAX_CHILD_OUTPUT_BYTES and len(stderr) <= MAX_CHILD_OUTPUT_BYTES,
-        f"{command} output exceeded its bound",
-    )
     require(not timed_out, f"{command} exceeded its {timeout}-second child deadline")
     require(exit_code == 0, f"{command} exited with status {exit_code}")
     metadata = validate_process_output(
@@ -955,7 +1014,7 @@ def run_child(
             "mode": "0444",
         },
     }
-    return record, metadata
+    return record, metadata, heartbeat_after
 
 
 def parse_post_link_observation(
@@ -978,6 +1037,7 @@ def parse_post_link_observation(
         key, value = column.split("=", 1)
         require(key != "" and key not in fields, "duplicate post-link observation field")
         fields[key] = value
+    require(set(fields) == POST_LINK_FIELDS, "post-link observation field set changed")
     for key, expected in (
         ("source_commit", identity["source_commit"]),
         ("source_tree", identity["source_tree"]),
@@ -994,6 +1054,7 @@ def parse_post_link_observation(
         ("entry_bytes_equal", "true"),
         ("payload_bytes_equal", "true"),
         ("metadata_bytes_equal", "true"),
+        ("compile_identity_derived", "true"),
     ):
         require(fields.get(key) == expected, f"post-link {key} drifted")
     for key in (
@@ -1109,6 +1170,17 @@ def main() -> int:
         identity,
         time.time_ns(),
     )
+    started_unix_ns = time.time_ns()
+    started_monotonic_ns = time.monotonic_ns()
+    require(
+        admission_summary["valid_until_unix_ns"]
+        >= started_unix_ns
+        + arguments.campaign_deadline_seconds * 1_000_000_000,
+        "admission receipt does not cover the campaign deadline from actual start",
+    )
+    campaign_deadline_monotonic_ns = (
+        started_monotonic_ns + arguments.campaign_deadline_seconds * 1_000_000_000
+    )
 
     post_link_fd, _, _ = open_exact_regular(
         arguments.post_link_observation, "post-link observation", MAX_EVIDENCE_BYTES
@@ -1177,17 +1249,6 @@ def main() -> int:
         )
         cpuinfo_record["path"] = f"{EVIDENCE_DIRECTORY}/proc-cpuinfo.raw"
 
-        started_unix_ns = time.time_ns()
-        started_monotonic_ns = time.monotonic_ns()
-        require(
-            admission_summary["valid_until_unix_ns"]
-            >= started_unix_ns
-            + arguments.campaign_deadline_seconds * 1_000_000_000,
-            "admission receipt does not cover the campaign deadline from actual start",
-        )
-        campaign_deadline_monotonic_ns = (
-            started_monotonic_ns + arguments.campaign_deadline_seconds * 1_000_000_000
-        )
         processes: list[dict[str, Any]] = []
         qualification_arguments = [
             source_commit,
@@ -1197,7 +1258,7 @@ def main() -> int:
             helper_sha256,
             arguments.profile,
         ]
-        qualification_record, baseline = run_child(
+        qualification_record, baseline, last_heartbeat = run_child(
             snapshot_binary_fd,
             raw_fd,
             0,
@@ -1211,6 +1272,7 @@ def main() -> int:
             admission_summary,
             admission_evidence_sha256,
             arguments.admission_heartbeat,
+            initial_heartbeat,
             None,
         )
         processes.append(qualification_record)
@@ -1241,7 +1303,7 @@ def main() -> int:
                         *qualification_arguments,
                     ]
                     for command in ("cell", "lifecycle"):
-                        record, _ = run_child(
+                        record, _, last_heartbeat = run_child(
                             snapshot_binary_fd,
                             raw_fd,
                             sequence,
@@ -1255,6 +1317,7 @@ def main() -> int:
                             admission_summary,
                             admission_evidence_sha256,
                             arguments.admission_heartbeat,
+                            last_heartbeat,
                             baseline,
                         )
                         processes.append(record)
@@ -1287,9 +1350,9 @@ def main() -> int:
             "final admission heartbeat is not valid at campaign completion",
         )
         require(
-            final_heartbeat["sequence"] >= initial_heartbeat["sequence"]
+            final_heartbeat["sequence"] >= last_heartbeat["sequence"]
             and final_heartbeat["observed_unix_ns"]
-            >= initial_heartbeat["observed_unix_ns"],
+            >= last_heartbeat["observed_unix_ns"],
             "admission heartbeat moved backward across the campaign",
         )
         final_heartbeat_record = write_exclusive(

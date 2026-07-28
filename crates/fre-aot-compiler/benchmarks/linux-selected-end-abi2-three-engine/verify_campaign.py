@@ -3,6 +3,16 @@
 
 from __future__ import annotations
 
+import sys
+
+if (
+    sys.flags.isolated != 1
+    or not sys.dont_write_bytecode
+    or sys.flags.optimize != 0
+):
+    print("REFUSED: use python3 -I -B without optimization", file=sys.stderr)
+    raise SystemExit(1)
+
 import argparse
 import hashlib
 import json
@@ -10,7 +20,6 @@ import math
 import os
 import re
 import stat
-import sys
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -20,7 +29,7 @@ CAMPAIGN_SCHEMA = "fre-aot-selected-end-abi2-three-engine-campaign-v1"
 BENCHMARK_SCHEMA = "fre-aot-selected-end-abi2-three-engine-v2"
 ADMISSION_SCHEMA = "fre-aot-selected-end-abi2-retained-admission-v1"
 HEARTBEAT_SCHEMA = "fre-aot-selected-end-abi2-admission-heartbeat-v1"
-POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v1"
+POST_LINK_SCHEMA = "fre-aot-selected-end-abi2-post-link-observation-v2"
 SUMMARY_SCHEMA = "fre-aot-selected-end-abi2-three-engine-summary-v1"
 EVIDENCE_CLASS = "diagnostic-nonpromotion"
 AUTHORITY = "absent"
@@ -63,6 +72,30 @@ MAX_MANIFEST_BYTES = 256 << 20
 MAX_EVIDENCE_BYTES = 16 << 20
 MAX_BINARY_BYTES = 512 << 20
 MAX_CHILD_OUTPUT_BYTES = 4 << 20
+POST_LINK_FIELDS = {
+    "source_commit",
+    "source_tree",
+    "artifact_identity",
+    "compile_identity",
+    "implementation_object_identity",
+    "glue_object_identity",
+    "bundle_identity",
+    "final_binary_sha256",
+    "helper_sha256",
+    "profile",
+    "wrapper_call",
+    "primary_aot_call",
+    "entry_bytes_equal",
+    "payload_bytes_equal",
+    "metadata_bytes_equal",
+    "compile_identity_derived",
+    "reject_plt",
+    "reject_blr",
+    "reject_x4_argument",
+    "result_slot_bytes",
+    "runtime_authority",
+    "promotion_authority",
+}
 
 
 class Refusal(RuntimeError):
@@ -508,8 +541,12 @@ def validate_lifecycle(
         engine = fields.get("engine", "")
         require(engine in ENGINES, "lifecycle engine drifted")
         require(fields.get("code_origin") == ENGINE_ORIGINS[engine], "lifecycle origin drifted")
-        require(uint_field(fields, "iterations", 8) == 8, "lifecycle iterations drifted")
-        timings = {key: uint_field(fields, key) for key in timing_keys}
+        iterations = uint_field(fields, "iterations", 8)
+        require(iterations == 8, "lifecycle iterations drifted")
+        timings = {
+            "iterations": iterations,
+            **{key: uint_field(fields, key) for key in timing_keys},
+        }
         require(timings["total_ns"] > 0, "lifecycle total is empty")
         require(
             sum(timings[key] for key in timing_keys[:-1]) <= timings["total_ns"],
@@ -682,6 +719,10 @@ def validate_receipt(
     require(
         acquired_start <= acquired_complete <= acquired_deadline,
         "admission exceeded bounded acquisition deadline",
+    )
+    require(
+        acquired_complete <= started_unix_ns,
+        "admission acquisition completed after the campaign started",
     )
 
     continuity = receipt["continuity"]
@@ -887,6 +928,7 @@ def parse_post_link(
         key, value = column.split("=", 1)
         require(key != "" and key not in fields, f"duplicate post-link field {key!r}")
         fields[key] = value
+    require(set(fields) == POST_LINK_FIELDS, "post-link observation field set changed")
     for key, expected in (
         ("source_commit", identity["source_commit"]),
         ("source_tree", identity["source_tree"]),
@@ -902,6 +944,7 @@ def parse_post_link(
         ("entry_bytes_equal", "true"),
         ("payload_bytes_equal", "true"),
         ("metadata_bytes_equal", "true"),
+        ("compile_identity_derived", "true"),
         ("runtime_authority", AUTHORITY),
         ("promotion_authority", AUTHORITY),
     ):
@@ -1082,7 +1125,8 @@ def break_even_summary(
 ) -> dict[str, Any]:
     setup_deltas: list[Fraction] = []
     hot_savings: list[Fraction] = []
-    calls: list[Fraction] = []
+    additional_hot_calls: list[Fraction] = []
+    total_calls: list[Fraction] = []
     unavailable = 0
     for key in sorted(hot):
         hot_candidate = Fraction(
@@ -1102,11 +1146,22 @@ def break_even_summary(
         setup_deltas.append(setup_delta)
         hot_savings.append(saving)
         if saving > 0:
-            calls.append(max(setup_delta, Fraction(0)) / saving)
+            exact_additional = max(setup_delta, Fraction(0)) / saving
+            rounded_additional = (
+                exact_additional.numerator + exact_additional.denominator - 1
+            ) // exact_additional.denominator
+            additional_hot_calls.append(Fraction(rounded_additional))
+            total_calls.append(Fraction(rounded_additional + 1))
         else:
             unavailable += 1
     return {
-        "formula": "max(candidate_lifecycle_minus_baseline_lifecycle,0)/baseline_hot_minus_candidate_hot",
+        "formula": (
+            "additional_hot_calls=ceil(max(candidate_lifecycle_minus_"
+            "baseline_lifecycle,0)/(baseline_hot_minus_candidate_hot));"
+            " total_calls=1+additional_hot_calls because each measured lifecycle"
+            " already includes its first call"
+        ),
+        "rounding": "exact-rational-ceiling-per-paired-input-before-summary",
         "paired_inputs": len(setup_deltas),
         "candidate_lifecycle_minus_baseline_lifecycle_ns": numeric_stats(
             setup_deltas, geometric=False
@@ -1114,9 +1169,17 @@ def break_even_summary(
         "baseline_hot_minus_candidate_hot_ns_per_call": numeric_stats(
             hot_savings, geometric=False
         ),
-        "break_even_calls_when_candidate_hot_is_faster": (
-            numeric_stats(calls, geometric=all(value > 0 for value in calls))
-            if calls
+        "additional_hot_calls_after_lifecycle_when_candidate_hot_is_faster": (
+            numeric_stats(
+                additional_hot_calls,
+                geometric=all(value > 0 for value in additional_hot_calls),
+            )
+            if additional_hot_calls
+            else None
+        ),
+        "total_calls_including_lifecycle_first_call_when_candidate_hot_is_faster": (
+            numeric_stats(total_calls, geometric=True)
+            if total_calls
             else None
         ),
         "unavailable_when_candidate_not_hotter": unavailable,
@@ -1253,6 +1316,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--helper-sha256", required=True)
     result.add_argument("--profile", required=True)
     result.add_argument("--target-cpu", required=True, type=int)
+    result.add_argument("--expected-manifest-sha256", required=True)
     result.add_argument("--expected-binary-sha256", required=True)
     result.add_argument("--expected-admission-receipt-sha256", required=True)
     result.add_argument("--expected-admission-evidence-sha256", required=True)
@@ -1314,6 +1378,9 @@ def main() -> int:
     )
     require(identity["profile"] == PROFILE, "profile is unsupported")
     require(0 <= identity["target_cpu"] < (1 << 20), "target CPU is outside safe range")
+    expected_manifest_sha256 = require_hex(
+        arguments.expected_manifest_sha256, 64, "expected manifest SHA-256"
+    )
     expected_binary_sha256 = require_hex(
         arguments.expected_binary_sha256, 64, "expected binary SHA-256"
     )
@@ -1332,6 +1399,10 @@ def main() -> int:
     try:
         manifest_raw = read_named(root_fd, MANIFEST_NAME, MAX_MANIFEST_BYTES, 0o444, "manifest")
         manifest_sha256 = sha256(manifest_raw)
+        require(
+            manifest_sha256 == expected_manifest_sha256,
+            "manifest differs from the independently supplied digest",
+        )
         digest_sidecar = read_named(
             root_fd, MANIFEST_SHA_NAME, 256, 0o444, "manifest digest sidecar"
         )

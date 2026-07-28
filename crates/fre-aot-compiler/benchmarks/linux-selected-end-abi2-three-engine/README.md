@@ -158,17 +158,19 @@ realized pointer alignments. Smaller multiples of six are diagnostic subsets.
 The runner takes no success threshold and the verifier never converts its
 statistics into promotion authority.
 
-This campaign branch composes the hardened benchmark v2 row contract and
-hardened post-link observation after the original three-engine benchmark
-commit. It also requires the separate row-authority follow-up that repeats
-`runtime_authority=absent` on every qualification/header/sample row; compose
-that follow-up before running the campaign. Missing authority fields fail
-closed. The required post-link `PASS` row includes and proves all of:
+This candidate composes the hardened benchmark v2 row contract, hardened
+post-link observation, and row-authority follow-up after the original
+three-engine benchmark commit. The follow-up repeats
+`runtime_authority=absent` on every qualification/header/sample row. Missing
+authority fields fail closed. The required post-link `PASS` row includes and
+proves all of:
 
 - `final_binary_sha256`, bound directly to the binary snapshot that is run;
 - implementation and glue object identities;
 - `entry_bytes_equal=true`, `payload_bytes_equal=true`, and
   `metadata_bytes_equal=true`;
+- the exact hardened v2 observation field set, including
+  `compile_identity_derived=true`;
 - source commit/tree, helper SHA-256, profile, artifact/compile/bundle
   identities, and absent runtime/promotion authority.
 
@@ -255,7 +257,9 @@ stores read-only raw stdout, stderr, before/after admission heartbeats, the
 binary, host/admission/post-link evidence, a canonical manifest, and a manifest
 digest sidecar. A partial or failed campaign never gets a final manifest.
 
-Verify using expected digests supplied independently of the manifest:
+Retain the runner-printed manifest digest outside the campaign directory.
+Verify using that digest and the other expected digests supplied independently
+of the manifest:
 
 ```text
 python3 -I -B verify_campaign.py \
@@ -268,6 +272,7 @@ python3 -I -B verify_campaign.py \
   --helper-sha256 <64-lowercase-hex> \
   --profile linux-target-cpu-local-v1 \
   --target-cpu <admitted-cpu> \
+  --expected-manifest-sha256 <runner-printed-64-lowercase-hex> \
   --expected-binary-sha256 <64-lowercase-hex> \
   --expected-admission-receipt-sha256 <64-lowercase-hex> \
   --expected-admission-evidence-sha256 <64-lowercase-hex> \
@@ -279,6 +284,9 @@ malformed numeric fields, identity/artifact/bundle drift, CPU/order/alignment
 drift, broken continuous-admission chains, changed raw hashes, and unexpected
 files. Its canonical summary reports per-cell and equal-weight aggregate
 portable/JIT/AOT hot and lifecycle paired ratios, stage and AOT-activation
-distributions, exact sign-test inputs, and break-even inputs. A ratio is
-left-over-right, so values below one favor the left engine. AOT offline compiler
-and linker cost stays explicitly unmeasured and excluded.
+distributions, exact sign-test inputs, and break-even inputs. Because each
+lifecycle measurement already contains its first call, break-even is reported
+as the exact rational ceiling of additional hot calls after that lifecycle and
+also as total calls (`1 + additional`). A ratio is left-over-right, so values
+below one favor the left engine. AOT offline compiler and linker cost stays
+explicitly unmeasured and excluded.
