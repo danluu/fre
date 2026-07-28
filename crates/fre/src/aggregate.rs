@@ -16597,11 +16597,140 @@ impl AggregatePlan {
         })
     }
 
+    // Keep fixed-domain validation and error construction out of the scalar
+    // dispatcher, matching the count-value stack-frame boundary above.
+    #[inline(never)]
+    fn execute_fixed_absolute_span_sum_value(
+        &self,
+        engine: &AggregateFixedAbsoluteDomainEngine,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if engine.residual.is_some() {
+            return Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "span-sum fixed-domain route retained a residual",
+                ),
+            ));
+        }
+        engine
+            .guard
+            .span_sum(haystack, limits.fixed_absolute)
+            .map(|result| result.span_sum)
+            .map_err(|source| {
+                self.fixed_execution_error(
+                    limits,
+                    AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+                )
+            })
+    }
+
+    // Keep the large continuation attempt and error receipts local to plans
+    // that actually execute the continuation engine.
+    #[inline(never)]
+    fn execute_continuation_span_sum_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = engine
+            .span_sum_value_with_receipt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
+        u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })
+    }
+
+    #[inline(never)]
+    fn execute_unicode_scalar_span_sum_value(
+        &self,
+        engine: &UnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .span_sum(haystack, limits.unicode_scalar)
+            .map(|result| result.span_sum)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
+    #[inline(never)]
+    fn execute_dispatched_unicode_scalar_span_sum_value(
+        &self,
+        engine: &DispatchedUnicodeScalarAggregatePlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        engine
+            .span_sum(haystack, limits.unicode_scalar)
+            .map(|result| result.span_sum)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::UnicodeScalar(source),
+                )
+            })
+    }
+
+    // Keep the entry dispatcher as a small route selector. In particular,
+    // direct Unicode span-sum plans should not inherit stack probes or code
+    // placement from receipt-heavy fallback routes.
+    #[inline(never)]
+    fn execute_span_sum_value(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        match &self.engine {
+            AggregateEngine::FixedAbsoluteDomain(engine) => {
+                self.execute_fixed_absolute_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::UnicodeScalar(engine) => {
+                self.execute_unicode_scalar_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                self.execute_dispatched_unicode_scalar_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::Continuation(engine) => {
+                self.execute_continuation_span_sum_value(engine, haystack, limits)
+            }
+            _ => self.execute_span_sum_value_fallback(haystack, limits),
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the exhaustive scalar dispatch avoids materializing the much larger audited execution enum"
     )]
-    fn execute_span_sum_value(
+    #[inline(never)]
+    fn execute_span_sum_value_fallback(
         &self,
         haystack: &[u8],
         limits: &AggregateRunLimits,
@@ -16627,26 +16756,12 @@ impl AggregatePlan {
                     }
                 }
             }
-            AggregateEngine::UnicodeScalar(engine) => engine
-                .span_sum(haystack, limits.unicode_scalar)
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::UnicodeScalar(source),
-                    )
-                }),
-            AggregateEngine::DispatchedUnicodeScalar(engine) => engine
-                .span_sum(haystack, limits.unicode_scalar)
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::UnicodeScalar(source),
-                    )
-                }),
+            AggregateEngine::UnicodeScalar(engine) => {
+                self.execute_unicode_scalar_span_sum_value(engine, haystack, limits)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                self.execute_dispatched_unicode_scalar_span_sum_value(engine, haystack, limits)
+            }
             AggregateEngine::WordRun(engine) => engine
                 .aggregate_span_sum(haystack, limits.word_run)
                 .map(|result| result.span_sum)
@@ -16779,24 +16894,7 @@ impl AggregatePlan {
                     )
                 }),
             AggregateEngine::FixedAbsoluteDomain(engine) => {
-                if engine.residual.is_some() {
-                    return Err(self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "span-sum fixed-domain route retained a residual",
-                        ),
-                    ));
-                }
-                engine
-                    .guard
-                    .span_sum(haystack, limits.fixed_absolute)
-                    .map(|result| result.span_sum)
-                    .map_err(|source| {
-                        self.fixed_execution_error(
-                            limits,
-                            AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
-                        )
-                    })
+                self.execute_fixed_absolute_span_sum_value(engine, haystack, limits)
             }
             AggregateEngine::PackedFiniteSpanSum(engine) => engine
                 .span_sum(haystack, packed_finite_reduce_limits(limits.finite_literal))
@@ -16887,31 +16985,7 @@ impl AggregatePlan {
                     )
                 }),
             AggregateEngine::Continuation(engine) => {
-                let strategy = self.report.continuation_strategy.ok_or_else(|| {
-                    self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation span-sum plan lacks storage strategy",
-                        ),
-                    )
-                })?;
-                let attempt = engine
-                    .span_sum_value_with_receipt(
-                        haystack,
-                        Self::full_range(haystack),
-                        strategy,
-                        limits.continuation,
-                    )
-                    .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-                match u64::try_from(attempt.value) {
-                    Ok(value) => Ok(value),
-                    Err(_) => Err(self.execution_error(
-                        limits,
-                        AggregateExecutionSource::InternalInvariant(
-                            "continuation span sum does not fit u64",
-                        ),
-                    )),
-                }
+                self.execute_continuation_span_sum_value(engine, haystack, limits)
             }
         }
     }
