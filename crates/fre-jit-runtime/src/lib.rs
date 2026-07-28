@@ -47,7 +47,8 @@ pub use limits::{PublicationAccounting, PublicationLimits};
 pub use operation::{RuntimeAggregateOperation, RuntimeOperation};
 pub use selected_end_register_v2::{
     PublishedSelectedEndRegisterThreadSessionV2, PublishedSelectedEndRegisterV2,
-    SelectedEndRegisterCallErrorV2, publish_selected_end_register_v2,
+    SelectedEndRegisterCallErrorV2, native_selected_end_register_backend_support_v2,
+    publish_selected_end_register_v2,
 };
 
 use crate::{limits::PublicationPlan, platform::ExecutableMapping};
@@ -56,9 +57,10 @@ use crate::{limits::PublicationPlan, platform::ExecutableMapping};
 ///
 /// `sve_vector_bytes` is an observation of the calling Linux thread. It is
 /// `None` when SVE is absent or the query is unavailable. Most fixed-lane
-/// images use predication and do not bind to this value. Search tags 10, 19,
-/// and 21 deliberately require and record exactly 16 bytes at construction
-/// and publication.
+/// images use predication and do not bind to this value. Search-v1 tags 10,
+/// 19, and 21 deliberately require and record exactly 16 bytes at construction
+/// and publication. Register-return ABI2 tag21 instead defers its one VL16
+/// observation to current-thread session construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeHostCapabilities {
     asimd: bool,
@@ -114,9 +116,10 @@ pub fn native_host_support() -> Result<(), PublishError> {
 /// Discover native `AArch64` features exposed to this process.
 ///
 /// Linux activation comes from `AT_HWCAP`/`AT_HWCAP2`. If SVE is active, the
-/// current per-thread vector length is queried. Search tags 10, 19, and 21 use
-/// that value for construction/publication admission; callers may also report
-/// it in hardware qualification evidence.
+/// current per-thread vector length is queried. Search-v1 tags 10, 19, and 21
+/// use that value for construction/publication admission; callers may also
+/// report it in hardware qualification evidence. Register-return ABI2
+/// admission has a separate feature-only helper.
 pub fn native_host_capabilities() -> Result<NativeHostCapabilities, PublishError> {
     platform::capabilities()
 }
@@ -254,10 +257,12 @@ fn search_host_admission(backend: BackendVersion) -> Result<SearchHostAdmission,
 /// homogeneous Arm `0x41/0xd84` host class named by its independent
 /// performance-qualification scope. Search tag 19 retains its ASIMD, SVE,
 /// vector-length 16, and same-host-class contract without requiring SVE2.
-/// Candidate tag 21 restores the tag-10 SVE2 requirements for its paired-ASIMD
-/// and predicate-recovery graph. These construction-time checks are repeated
-/// independently at publication; generated-code calls do not perform a
-/// `prctl` syscall.
+/// Candidate Search-v1 tag 21 restores the tag-10 SVE2 requirements for its
+/// paired-ASIMD and predicate-recovery graph. These construction-time checks
+/// are repeated independently at publication; generated-code calls do not
+/// perform a `prctl` syscall. Register-return ABI2 callers use
+/// [`native_selected_end_register_backend_support_v2`] instead, deferring the
+/// tag21 VL check to session construction.
 pub fn native_search_backend_support(backend: BackendVersion) -> Result<(), PublishError> {
     search_host_admission(backend).map(|_| ())
 }

@@ -7,9 +7,10 @@ use fre_kernel_ir::{
 
 use super::*;
 
-// V2 is a new public-facade value-only timing boundary. Existing V1
-// reporting-path rows remain historical evidence and must never be relabeled.
-const SCHEMA: &str = "fre-jit-bridge-qualification-v2";
+// V3 measures the public-facade value-only register-return ABI2 boundary.
+// Existing V1 reporting-path and V2 value-only ABI1 rows remain historical
+// evidence and must never be relabeled.
+const SCHEMA: &str = "fre-jit-bridge-qualification-v3";
 const PATTERN: &str = "0123456789abcdef";
 const LITERAL: &[u8] = PATTERN.as_bytes();
 const V8_WIDE_CANDIDATE_STARTS: usize = 64;
@@ -519,7 +520,12 @@ fn artifact(bridge: &QualifiedExactSearchFacade) -> ([u8; 32], u16) {
         "bridge qualification must preserve the explicit V8 policy"
     );
     let QualifiedExactSearchNativeStatus::Published {
-        identity, mapping, ..
+        identity,
+        mapping,
+        abi,
+        sve_vector_bytes_at_publication,
+        required_thread_sve_vector_bytes,
+        ..
     } = &report.native
     else {
         panic!(
@@ -536,6 +542,15 @@ fn artifact(bridge: &QualifiedExactSearchFacade) -> ([u8; 32], u16) {
         BackendVersion::SEARCH_V8,
         "bridge qualification is scoped to SEARCH_V8"
     );
+    assert_eq!(
+        identity.abi,
+        QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+    );
+    assert_eq!(*abi, QualifiedExactSearchNativeAbi::SelectedEndRegisterV2);
+    assert_eq!(identity.sve_vector_bytes_at_publication, None);
+    assert_eq!(identity.required_thread_sve_vector_bytes, None);
+    assert_eq!(*sve_vector_bytes_at_publication, None);
+    assert_eq!(*required_thread_sve_vector_bytes, None);
     let minimum_guard_bytes = mapping
         .page_bytes
         .checked_mul(2)
@@ -846,7 +861,7 @@ fn driver() {
 
 #[test]
 fn qualification_csv_schema_and_row_cardinality_are_closed() {
-    assert_eq!(SCHEMA, "fre-jit-bridge-qualification-v2");
+    assert_eq!(SCHEMA, "fre-jit-bridge-qualification-v3");
     assert_eq!(LITERAL.len(), QUALIFIED_EXACT_SEARCH_LITERAL_BYTES);
     let columns: Vec<_> = CSV_HEADER.split(',').collect();
     assert_eq!(columns.len(), 25);
@@ -1034,9 +1049,19 @@ fn candidate_guard_exercises_public_builder_without_relabeling() {
     );
     let _ = artifact(&bridge);
     let haystack = make_haystack(Size::K64, Scenario::Absent);
-    let (_, execution) = bridge
+    let (_, sessionless) = bridge
         .find(haystack.bytes(), SearchLimits::unlimited())
-        .expect("public bridge search");
+        .expect("public bridge sessionless search");
+    assert_eq!(
+        sessionless.route,
+        QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::PortableLiteral)
+    );
+    let session = bridge
+        .begin_current_thread_session()
+        .expect("V8 register ABI2 session");
+    let (_, execution) = session
+        .find(haystack.bytes(), SearchLimits::unlimited())
+        .expect("public bridge session search");
     assert_eq!(
         execution.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
@@ -1074,18 +1099,32 @@ fn default_candidate_guard_is_v8_and_guard_loss_falls_back() {
         identity.qualification,
         QualifiedExactSearchQualification::Candidate
     );
+    assert_eq!(
+        identity.abi,
+        QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+    );
     let haystack = make_haystack(Size::K64, Scenario::Absent);
-    let (_, guarded) = bridge
+    let (_, sessionless) = bridge
         .find(haystack.bytes(), SearchLimits::unlimited())
-        .expect("guarded default V8 search");
+        .expect("guarded default V8 sessionless search");
+    assert_eq!(
+        sessionless.route,
+        QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::PortableLiteral)
+    );
+    let session = bridge
+        .begin_current_thread_session()
+        .expect("guarded default V8 register ABI2 session");
+    let (_, guarded) = session
+        .find(haystack.bytes(), SearchLimits::unlimited())
+        .expect("guarded default V8 session search");
     assert_eq!(
         guarded.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
     );
     drop(guard);
-    let (_, after_loss) = bridge
+    let (_, after_loss) = session
         .find(haystack.bytes(), SearchLimits::unlimited())
-        .expect("guard-loss default fallback");
+        .expect("guard-loss session fallback");
     assert_eq!(
         after_loss.route,
         QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::PortableLiteral)

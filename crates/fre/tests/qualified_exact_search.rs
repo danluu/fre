@@ -10,7 +10,7 @@ use fre::{
     SearchLimits, SearchWindow,
 };
 use fre_jit_aarch64::EmitLimits;
-use fre_jit_runtime::{CallError, PublicationLimits};
+use fre_jit_runtime::{CallError, PublicationLimits, SelectedEndRegisterCallErrorV2};
 use fre_kernel_ir::ValidateLimits;
 use fre_kernels::LiteralBuildLimits;
 
@@ -485,11 +485,28 @@ fn candidate_refusal_precedes_unsupported_host_and_aarch64_emission() {
 
 #[test]
 fn native_call_errors_remain_typed_at_the_facade_boundary() {
-    let source = CallError::BackendFault { status: 0x55 };
-    let exact_error = QualifiedExactSearchError::from(source.clone());
+    let legacy_source = CallError::BackendFault { status: 0x55 };
+    let exact_error = QualifiedExactSearchError::from(legacy_source.clone());
     assert_eq!(
         exact_error,
-        QualifiedExactSearchError::Native(source.clone())
+        QualifiedExactSearchError::Native(legacy_source.clone())
+    );
+    let facade_error = QualifiedExactSearchFacadeError::from(exact_error.clone());
+    assert_eq!(
+        facade_error,
+        QualifiedExactSearchFacadeError::ExactLiteral(exact_error)
+    );
+
+    let register_source = SelectedEndRegisterCallErrorV2::InvalidNativeEnd {
+        end_or_zero: 7,
+        literal_bytes: 16,
+        window_start: 4,
+        window_end: 64,
+    };
+    let exact_error = QualifiedExactSearchError::from(register_source.clone());
+    assert_eq!(
+        exact_error,
+        QualifiedExactSearchError::NativeRegisterV2(register_source)
     );
     let facade_error = QualifiedExactSearchFacadeError::from(exact_error.clone());
     assert_eq!(

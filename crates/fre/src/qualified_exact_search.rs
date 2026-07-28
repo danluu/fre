@@ -9,11 +9,15 @@ use std::cell::Cell;
 mod qualification_subject;
 
 use fre_jit_aarch64::{
-    BackendVersion, EmitError, EmitLimits, ImageStats, TargetSpec, emit_audited_with_backend,
+    BackendVersion, EmitError, EmitLimits, ImageStats, SelectedEndRegisterBackendV2, TargetSpec,
+    emit_audited_with_backend, emit_selected_end_register_v2,
 };
 use fre_jit_runtime::{
     CallError, PublicationAccounting, PublicationLimits, PublishError, PublishedKernel,
-    PublishedKernelThreadSession, native_search_backend_support, publish_audited,
+    PublishedKernelThreadSession, PublishedSelectedEndRegisterThreadSessionV2,
+    PublishedSelectedEndRegisterV2, SelectedEndRegisterCallErrorV2, native_search_backend_support,
+    native_selected_end_register_backend_support_v2, publish_audited,
+    publish_selected_end_register_v2,
 };
 use fre_kernel_ir::{
     AnchorFlags, BuildError as KernelBuildError, CheckedSearchWindow as NativeCheckedSearchWindow,
@@ -259,7 +263,10 @@ pub const QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES: usize = 64;
 /// returning only its end removes one generated result store without losing
 /// any match information.
 #[inline]
-fn match_from_native_selected_end(end: usize, window: SearchWindow) -> Result<Match, CallError> {
+fn match_from_legacy_native_selected_end(
+    end: usize,
+    window: NativeSearchWindow,
+) -> Result<Match, CallError> {
     let start = end
         .checked_sub(QUALIFIED_EXACT_SEARCH_LITERAL_BYTES)
         .ok_or(CallError::InvalidNativeOutput {
@@ -420,6 +427,15 @@ pub enum QualifiedExactSearchRoute {
     NativeJit,
 }
 
+/// Generated-code call ABI retained by one published native route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QualifiedExactSearchNativeAbi {
+    /// Sealed Search-v1 out-pointer ABI retained only for tag10/tag19 fallback.
+    LegacySelectedEndV1,
+    /// Register-return ABI2 used by V8 and tag21.
+    SelectedEndRegisterV2,
+}
+
 /// Concrete identity of one published native route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QualifiedExactSearchNativeIdentity {
@@ -429,12 +445,20 @@ pub struct QualifiedExactSearchNativeIdentity {
     pub target: TargetSpec,
     /// Backend contract version authenticated from the image.
     pub backend: BackendVersion,
+    /// Generated-code call ABI authenticated by the retained publication type.
+    pub abi: QualifiedExactSearchNativeAbi,
     /// SHA-256 of the complete deterministic native image and manifest.
     pub artifact_sha256: [u8; 32],
     /// Typed review state for the exact qualification subject.
     pub qualification: QualifiedExactSearchQualification,
     /// SVE vector length bound at publication, when the backend requires one.
     pub sve_vector_bytes_at_publication: Option<u16>,
+    /// SVE vector length required when opening an invocation session.
+    ///
+    /// Register-return tag21 reports `Some(16)` here and `None` for
+    /// `sve_vector_bytes_at_publication`, because ABI2 performs its sole VL
+    /// observation at session construction.
+    pub required_thread_sve_vector_bytes: Option<u16>,
 }
 
 /// Native publication state retained by a qualified exact matcher.
@@ -460,7 +484,9 @@ pub enum QualifiedExactSearchNativeStatus {
     Published {
         image: ImageStats,
         mapping: PublicationAccounting,
+        abi: QualifiedExactSearchNativeAbi,
         sve_vector_bytes_at_publication: Option<u16>,
+        required_thread_sve_vector_bytes: Option<u16>,
         identity: QualifiedExactSearchNativeIdentity,
     },
     /// The native leaf was valid but could not be published on this process.
@@ -468,6 +494,11 @@ pub enum QualifiedExactSearchNativeStatus {
     /// Searches safely retain the portable route, and the complete typed
     /// reason remains inspectable instead of becoming a silent fallback.
     Unavailable(PublishError),
+    /// This source revision does not expose an invocation ABI for a retired
+    /// candidate backend.
+    UnsupportedBackendAbi {
+        backend_policy: QualifiedExactSearchBackendPolicy,
+    },
 }
 
 impl QualifiedExactSearchNativeStatus {
@@ -545,7 +576,10 @@ impl From<EmitError> for QualifiedExactSearchBuildError {
 #[non_exhaustive]
 pub enum QualifiedExactSearchError {
     Portable(LiteralError),
+    /// Legacy Search-v1 native call failure.
     Native(CallError),
+    /// Register-return Search ABI2 native call failure.
+    NativeRegisterV2(SelectedEndRegisterCallErrorV2),
 }
 
 impl fmt::Display for QualifiedExactSearchError {
@@ -562,6 +596,7 @@ impl std::error::Error for QualifiedExactSearchError {
         match self {
             Self::Portable(error) => Some(error),
             Self::Native(error) => Some(error),
+            Self::NativeRegisterV2(error) => Some(error),
         }
     }
 }
@@ -578,6 +613,12 @@ impl From<CallError> for QualifiedExactSearchError {
     }
 }
 
+impl From<SelectedEndRegisterCallErrorV2> for QualifiedExactSearchError {
+    fn from(value: SelectedEndRegisterCallErrorV2) -> Self {
+        Self::NativeRegisterV2(value)
+    }
+}
+
 /// Experimental exact-literal matcher with an evidence-gated native leaf.
 ///
 /// This API is an explicit opt-in and is not selected by FRE's default
@@ -586,37 +627,75 @@ impl From<CallError> for QualifiedExactSearchError {
 /// bounded `AArch64` emission and strict-W^X publication. Searches enter
 /// generated code only when their windows satisfy that declared minimum.
 /// Every other width/window/workload, and every unavailable native host,
-/// remains on the portable plan. Search V8 may execute through the sessionless
-/// methods. Fixed-VL tags 10, 19, and 21 require
-/// [`Self::begin_current_thread_session`] for native execution; their
-/// sessionless calls deliberately remain portable.
+/// remains on the portable plan. Every generated-code invocation goes through
+/// [`Self::begin_current_thread_session`]. Sessionless calls deliberately
+/// retain the portable owner, including V8; tag10/tag19 use the sealed legacy
+/// ABI only as fallback, while V8/tag21 use the register-return ABI2.
 #[derive(Debug)]
 pub struct QualifiedExactSearch {
     portable: LiteralPlan,
-    native: Option<PublishedKernel<NativeSelectedEnd>>,
+    native: Option<QualifiedExactSearchNative>,
     report: QualifiedExactSearchBuildReport,
 }
 
-enum QualifiedExactSearchNativeCall<'call, 'kernel> {
-    Direct(&'call PublishedKernel<NativeSelectedEnd>),
-    ThreadSession(&'call PublishedKernelThreadSession<'kernel, NativeSelectedEnd>),
+#[derive(Debug)]
+enum QualifiedExactSearchNative {
+    LegacyV1(PublishedKernel<NativeSelectedEnd>),
+    RegisterV2(PublishedSelectedEndRegisterV2),
 }
 
-impl QualifiedExactSearchNativeCall<'_, '_> {
+impl QualifiedExactSearchNative {
     #[inline]
-    fn search_checked(
-        self,
-        checked: NativeCheckedSearchWindow<'_>,
-    ) -> Result<Option<usize>, CallError> {
+    fn begin_current_thread_session(
+        &self,
+    ) -> Result<QualifiedExactSearchNativeThreadSession<'_>, QualifiedExactSearchThreadContractError>
+    {
         match self {
-            Self::Direct(native) => native.search_checked(checked),
-            Self::ThreadSession(native) => native.search_checked(checked),
+            Self::LegacyV1(native) => native
+                .begin_current_thread_session()
+                .map(QualifiedExactSearchNativeThreadSession::LegacyV1),
+            Self::RegisterV2(native) => native
+                .begin_current_thread_session()
+                .map(QualifiedExactSearchNativeThreadSession::RegisterV2),
         }
     }
 }
 
-const fn sessionless_native_route_allowed(requires_current_thread_session: bool) -> bool {
-    !requires_current_thread_session
+#[derive(Debug)]
+enum QualifiedExactSearchNativeThreadSession<'kernel> {
+    LegacyV1(PublishedKernelThreadSession<'kernel, NativeSelectedEnd>),
+    RegisterV2(PublishedSelectedEndRegisterThreadSessionV2<'kernel>),
+}
+
+impl QualifiedExactSearchNativeThreadSession<'_> {
+    #[inline]
+    fn search_preflighted(
+        &self,
+        preflight: fre_kernels::LiteralSearchPreflight<'_, '_>,
+    ) -> Result<(Option<Match>, LiteralAccounting), QualifiedExactSearchError> {
+        match self {
+            Self::LegacyV1(native) => {
+                let accounting = preflight.accounting();
+                let checked_window = preflight.checked_window();
+                let decode_window = checked_window.window();
+                let matched = native
+                    .search_checked(checked_window)?
+                    .map(|end| match_from_legacy_native_selected_end(end, decode_window))
+                    .transpose()?;
+                Ok((matched, accounting))
+            }
+            Self::RegisterV2(native) => {
+                let (matched, accounting) = native.search_preflighted(preflight)?;
+                Ok((
+                    matched.map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    }),
+                    accounting,
+                ))
+            }
+        }
+    }
 }
 
 #[inline]
@@ -627,6 +706,38 @@ fn retained_native_if_authorized<T>(
     match native {
         Some(native) if authorization() => Some(native),
         _ => None,
+    }
+}
+
+const fn selected_end_register_backend_v2(
+    backend_policy: QualifiedExactSearchBackendPolicy,
+) -> Option<SelectedEndRegisterBackendV2> {
+    match backend_policy {
+        QualifiedExactSearchBackendPolicy::AsimdV8 => Some(SelectedEndRegisterBackendV2::AsimdV8),
+        QualifiedExactSearchBackendPolicy::Sve2Fixed16V2 => {
+            Some(SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16)
+        }
+        QualifiedExactSearchBackendPolicy::AsimdV7
+        | QualifiedExactSearchBackendPolicy::Sve16
+        | QualifiedExactSearchBackendPolicy::Sve2Fixed16
+        | QualifiedExactSearchBackendPolicy::Sve16V6 => None,
+    }
+}
+
+const fn legacy_selected_end_v1_backend(backend_policy: QualifiedExactSearchBackendPolicy) -> bool {
+    matches!(
+        backend_policy,
+        QualifiedExactSearchBackendPolicy::Sve2Fixed16 | QualifiedExactSearchBackendPolicy::Sve16V6
+    )
+}
+
+fn qualified_exact_search_backend_support(
+    backend_policy: QualifiedExactSearchBackendPolicy,
+) -> Result<(), PublishError> {
+    if let Some(backend) = selected_end_register_backend_v2(backend_policy) {
+        native_selected_end_register_backend_support_v2(backend)
+    } else {
+        native_search_backend_support(backend_policy.backend_version())
     }
 }
 
@@ -780,8 +891,8 @@ impl QualifiedExactSearch {
             QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
             QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve2Fixed16V2.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
                 )
             },
             || {
@@ -873,8 +984,15 @@ impl QualifiedExactSearch {
                 None,
                 QualifiedExactSearchNativeStatus::Unqualified { qualification },
             )
+        } else if selected_end_register_backend_v2(backend_policy).is_none()
+            && !legacy_selected_end_v1_backend(backend_policy)
+        {
+            (
+                None,
+                QualifiedExactSearchNativeStatus::UnsupportedBackendAbi { backend_policy },
+            )
         } else if let Err(error) = prechecked_host_support
-            .unwrap_or_else(|| native_search_backend_support(backend_policy.backend_version()))
+            .unwrap_or_else(|| qualified_exact_search_backend_support(backend_policy))
         {
             (None, QualifiedExactSearchNativeStatus::Unavailable(error))
         } else {
@@ -883,33 +1001,81 @@ impl QualifiedExactSearch {
                 AnchorFlags::default(),
                 validation_limits,
             )?;
-            let audited_image =
-                emit_audited_with_backend(&program, backend_policy, emission_limits)?;
-            let image = audited_image.as_image();
-            let image_stats = image.stats();
-            match publish_audited::<NativeSelectedEnd>(&audited_image, publication_limits) {
-                Ok(kernel) => {
-                    let mapping = kernel.accounting();
-                    let sve_vector_bytes_at_publication = kernel.sve_vector_bytes_at_publication();
-                    let identity = QualifiedExactSearchNativeIdentity {
-                        backend_policy,
-                        target: image.target(),
-                        backend: image.backend_version(),
-                        artifact_sha256: *image.artifact_identity().as_bytes(),
-                        qualification,
-                        sve_vector_bytes_at_publication,
-                    };
-                    (
-                        Some(kernel),
-                        QualifiedExactSearchNativeStatus::Published {
-                            image: image_stats,
-                            mapping,
+            if let Some(register_backend) = selected_end_register_backend_v2(backend_policy) {
+                let audited_image =
+                    emit_selected_end_register_v2(&program, register_backend, emission_limits)?;
+                let image_stats = audited_image.stats();
+                match publish_selected_end_register_v2(&audited_image, publication_limits) {
+                    Ok(kernel) => {
+                        let mapping = kernel.accounting();
+                        let abi = QualifiedExactSearchNativeAbi::SelectedEndRegisterV2;
+                        let sve_vector_bytes_at_publication = None;
+                        let required_thread_sve_vector_bytes =
+                            match kernel.backend().fixed_active_vector_bytes() {
+                                0 => None,
+                                bytes => Some(bytes),
+                            };
+                        let identity = QualifiedExactSearchNativeIdentity {
+                            backend_policy,
+                            target: audited_image.target(),
+                            backend: audited_image.backend_version(),
+                            abi,
+                            artifact_sha256: *audited_image.artifact_identity().as_bytes(),
+                            qualification,
                             sve_vector_bytes_at_publication,
-                            identity,
-                        },
-                    )
+                            required_thread_sve_vector_bytes,
+                        };
+                        (
+                            Some(QualifiedExactSearchNative::RegisterV2(kernel)),
+                            QualifiedExactSearchNativeStatus::Published {
+                                image: image_stats,
+                                mapping,
+                                abi,
+                                sve_vector_bytes_at_publication,
+                                required_thread_sve_vector_bytes,
+                                identity,
+                            },
+                        )
+                    }
+                    Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
                 }
-                Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
+            } else {
+                debug_assert!(legacy_selected_end_v1_backend(backend_policy));
+                let audited_image =
+                    emit_audited_with_backend(&program, backend_policy, emission_limits)?;
+                let image = audited_image.as_image();
+                let image_stats = image.stats();
+                match publish_audited::<NativeSelectedEnd>(&audited_image, publication_limits) {
+                    Ok(kernel) => {
+                        let mapping = kernel.accounting();
+                        let abi = QualifiedExactSearchNativeAbi::LegacySelectedEndV1;
+                        let sve_vector_bytes_at_publication =
+                            kernel.sve_vector_bytes_at_publication();
+                        let required_thread_sve_vector_bytes = sve_vector_bytes_at_publication;
+                        let identity = QualifiedExactSearchNativeIdentity {
+                            backend_policy,
+                            target: image.target(),
+                            backend: image.backend_version(),
+                            abi,
+                            artifact_sha256: *image.artifact_identity().as_bytes(),
+                            qualification,
+                            sve_vector_bytes_at_publication,
+                            required_thread_sve_vector_bytes,
+                        };
+                        (
+                            Some(QualifiedExactSearchNative::LegacyV1(kernel)),
+                            QualifiedExactSearchNativeStatus::Published {
+                                image: image_stats,
+                                mapping,
+                                abi,
+                                sve_vector_bytes_at_publication,
+                                required_thread_sve_vector_bytes,
+                                identity,
+                            },
+                        )
+                    }
+                    Err(error) => (None, QualifiedExactSearchNativeStatus::Unavailable(error)),
+                }
             }
         };
         Ok(Self {
@@ -955,7 +1121,7 @@ impl QualifiedExactSearch {
         let native = retained_native_if_authorized(self.native.as_ref(), || {
             self.retained_native_execution_authorized()
         })
-        .map(PublishedKernel::begin_current_thread_session)
+        .map(QualifiedExactSearchNative::begin_current_thread_session)
         .transpose()?;
         Ok(QualifiedExactSearchThreadSession {
             search: self,
@@ -1003,12 +1169,7 @@ impl QualifiedExactSearch {
             haystack,
             window,
             limits,
-            self.native
-                .as_ref()
-                .filter(|native| {
-                    sessionless_native_route_allowed(native.requires_current_thread_session())
-                })
-                .map(QualifiedExactSearchNativeCall::Direct),
+            None,
             |matched, route, accounting| {
                 (matched, QualifiedExactSearchExecution { route, accounting })
             },
@@ -1021,7 +1182,7 @@ impl QualifiedExactSearch {
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
-        native: Option<QualifiedExactSearchNativeCall<'_, '_>>,
+        native: Option<&QualifiedExactSearchNativeThreadSession<'_>>,
         project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
     ) -> Result<R, QualifiedExactSearchError> {
         let literal_limits = LiteralSearchLimits {
@@ -1041,11 +1202,7 @@ impl QualifiedExactSearch {
                 .portable
                 .preflight_checked_window(checked_window, literal_limits)?;
             if preflight.searched_bytes() >= self.report.workload.minimum_window_bytes() {
-                let accounting = preflight.accounting();
-                let matched = native
-                    .search_checked(preflight.checked_window())?
-                    .map(|end| match_from_native_selected_end(end, window))
-                    .transpose()?;
+                let (matched, accounting) = native.search_preflighted(preflight)?;
                 return Ok(project(
                     matched,
                     QualifiedExactSearchRoute::NativeJit,
@@ -1108,7 +1265,7 @@ impl QualifiedExactSearch {
 #[derive(Debug)]
 pub struct QualifiedExactSearchThreadSession<'session> {
     search: &'session QualifiedExactSearch,
-    native: Option<PublishedKernelThreadSession<'session, NativeSelectedEnd>>,
+    native: Option<QualifiedExactSearchNativeThreadSession<'session>>,
 }
 
 impl QualifiedExactSearchThreadSession<'_> {
@@ -1204,15 +1361,8 @@ impl QualifiedExactSearchThreadSession<'_> {
         limits: SearchLimits,
         project: impl FnOnce(Option<Match>, QualifiedExactSearchRoute, LiteralAccounting) -> R,
     ) -> Result<R, QualifiedExactSearchError> {
-        self.search.find_window_with_native(
-            haystack,
-            window,
-            limits,
-            self.native
-                .as_ref()
-                .map(QualifiedExactSearchNativeCall::ThreadSession),
-            project,
-        )
+        self.search
+            .find_window_with_native(haystack, window, limits, self.native.as_ref(), project)
     }
 }
 
@@ -1372,9 +1522,10 @@ enum QualifiedExactSearchFacadePlan {
 /// publication failures remain typed failures for the selected backend and are
 /// never masked by rebuilding a different backend.
 ///
-/// Sessionless V8 calls may execute natively. Published fixed-VL tags 10, 19,
-/// and 21 require [`Self::begin_current_thread_session`] for native routing;
-/// sessionless calls use the retained portable owner.
+/// All generated-code calls require [`Self::begin_current_thread_session`].
+/// Sessionless calls use the retained portable owner. V8 session construction
+/// performs no SVE syscall; tag21 checks VL16 once there, while legacy
+/// tag10/tag19 retain their sealed fixed-VL session contract.
 #[derive(Debug)]
 pub struct QualifiedExactSearchFacade {
     plan: QualifiedExactSearchFacadePlan,
@@ -1522,8 +1673,8 @@ impl QualifiedExactSearchFacade {
             QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
             QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve2Fixed16V2.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
                 )
             },
             || {
@@ -1752,9 +1903,10 @@ impl QualifiedExactSearchFacade {
     /// Establish one same-thread session for repeated facade calls.
     ///
     /// Exact fixed-VL native plans check the calling thread's SVE vector
-    /// length once here. Portable and non-native plans create a portable
-    /// session without a host query. A typed error performs no search and is
-    /// never converted into an implicit portable retry.
+    /// length once here. V8 creates its required native session without an SVE
+    /// host query. Portable and non-native plans create a portable session
+    /// without a host query. A typed error performs no search and is never
+    /// converted into an implicit portable retry.
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<QualifiedExactSearchFacadeThreadSession<'_>, QualifiedExactSearchThreadContractError>
@@ -2037,15 +2189,119 @@ mod tests {
         QualifiedExactSearchQualification::Candidate;
 
     #[test]
-    fn fixed_vl_native_route_requires_a_current_thread_session() {
-        assert!(
-            sessionless_native_route_allowed(false),
-            "V8 and other non-fixed-VL kernels retain the direct route"
+    fn backend_abi_selection_is_closed() {
+        assert_eq!(
+            selected_end_register_backend_v2(QualifiedExactSearchBackendPolicy::AsimdV8),
+            Some(SelectedEndRegisterBackendV2::AsimdV8)
         );
-        assert!(
-            !sessionless_native_route_allowed(true),
-            "fixed-VL kernels must fall back portably without a thread session"
+        assert_eq!(
+            selected_end_register_backend_v2(QualifiedExactSearchBackendPolicy::Sve2Fixed16V2),
+            Some(SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16)
         );
+        for policy in [
+            QualifiedExactSearchBackendPolicy::Sve2Fixed16,
+            QualifiedExactSearchBackendPolicy::Sve16V6,
+        ] {
+            assert_eq!(selected_end_register_backend_v2(policy), None);
+            assert!(legacy_selected_end_v1_backend(policy));
+        }
+        for policy in [
+            QualifiedExactSearchBackendPolicy::AsimdV7,
+            QualifiedExactSearchBackendPolicy::Sve16,
+        ] {
+            assert_eq!(selected_end_register_backend_v2(policy), None);
+            assert!(!legacy_selected_end_v1_backend(policy));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one source seal keeps publication typing, session-only ABI2 invocation, and the authoritative-preflight handoff together"
+    )]
+    fn public_native_abi2_and_single_preflight_boundaries_are_source_sealed() {
+        fn position(source: &str, marker: &str) -> usize {
+            source
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing public ABI2 source marker: {marker}"))
+        }
+
+        let source = include_str!("qualified_exact_search.rs");
+        let owner_start = position(source, "enum QualifiedExactSearchNative {");
+        let owner_end = owner_start
+            + position(
+                &source[owner_start..],
+                "\nimpl QualifiedExactSearchNative {",
+            );
+        let owner = &source[owner_start..owner_end];
+        assert!(owner.contains("LegacyV1(PublishedKernel<NativeSelectedEnd>)"));
+        assert!(owner.contains("RegisterV2(PublishedSelectedEndRegisterV2)"));
+
+        let session_start = position(
+            source,
+            "enum QualifiedExactSearchNativeThreadSession<'kernel> {",
+        );
+        let session_end = session_start
+            + position(
+                &source[session_start..],
+                "\nimpl QualifiedExactSearchNativeThreadSession<'_> {",
+            );
+        let session = &source[session_start..session_end];
+        assert!(session.contains("PublishedKernelThreadSession<'kernel, NativeSelectedEnd>"));
+        assert!(session.contains("PublishedSelectedEndRegisterThreadSessionV2<'kernel>"));
+
+        let construction_start = position(
+            source,
+            "    fn with_portable_plan_backend_and_qualification(",
+        );
+        let construction_end = construction_start
+            + position(
+                &source[construction_start..],
+                "\n    /// The exact literal retained by the portable semantic owner.",
+            );
+        let construction = &source[construction_start..construction_end];
+        assert!(construction.contains("emit_selected_end_register_v2("));
+        assert!(construction.contains("publish_selected_end_register_v2("));
+        assert!(construction.contains("emit_audited_with_backend("));
+        assert!(construction.contains("publish_audited::<NativeSelectedEnd>("));
+
+        let sessionless_start = position(
+            source,
+            "    pub fn find_window(\n        &self,\n        haystack: &[u8],",
+        );
+        let sessionless_end = sessionless_start
+            + position(
+                &source[sessionless_start..],
+                "\n    #[inline]\n    fn find_window_with_native<R>(",
+            );
+        let sessionless = &source[sessionless_start..sessionless_end];
+        assert!(sessionless.contains("self.find_window_with_native("));
+        assert!(sessionless.contains("\n            None,"));
+        assert!(!sessionless.contains("self.native"));
+
+        let call_start = position(source, "    fn find_window_with_native<R>(");
+        let call_end = call_start
+            + position(
+                &source[call_start..],
+                "\n    /// Whether a selected match exists in the complete haystack.",
+            );
+        let call = &source[call_start..call_end];
+        assert_eq!(call.matches(".preflight_checked_window(").count(), 1);
+        assert!(call.contains("native.search_preflighted(preflight)?"));
+        assert!(!call.contains("preflight_literal_window("));
+
+        let invocation_start =
+            position(source, "impl QualifiedExactSearchNativeThreadSession<'_> {");
+        let invocation_end = invocation_start
+            + position(
+                &source[invocation_start..],
+                "\n#[inline]\nfn retained_native_if_authorized",
+            );
+        let invocation = &source[invocation_start..invocation_end];
+        assert!(invocation.contains("Self::RegisterV2(native)"));
+        assert!(invocation.contains("native.search_preflighted(preflight)?"));
+        assert!(invocation.contains("Self::LegacyV1(native)"));
+        assert!(invocation.contains("match_from_legacy_native_selected_end(end, decode_window)"));
     }
 
     #[test]
@@ -2064,13 +2320,14 @@ mod tests {
 
     #[test]
     fn selected_end_reconstructs_the_fixed_width_span_and_rejects_underflow() {
-        let offset_window = SearchWindow::new(32, 128);
+        let offset_window = NativeSearchWindow::new(32, 128);
         assert_eq!(
-            match_from_native_selected_end(48, offset_window).expect("exact fixed-width span"),
+            match_from_legacy_native_selected_end(48, offset_window)
+                .expect("exact fixed-width span"),
             Match { start: 32, end: 48 }
         );
         assert!(matches!(
-            match_from_native_selected_end(47, offset_window),
+            match_from_legacy_native_selected_end(47, offset_window),
             Err(CallError::InvalidNativeOutput {
                 output: NativeOutputKind::SelectedEnd,
                 start: 31,
@@ -2080,9 +2337,9 @@ mod tests {
             })
         ));
         assert!(matches!(
-            match_from_native_selected_end(
+            match_from_legacy_native_selected_end(
                 QUALIFIED_EXACT_SEARCH_LITERAL_BYTES - 1,
-                SearchWindow::new(0, 128),
+                NativeSearchWindow::new(0, 128),
             ),
             Err(CallError::InvalidNativeOutput {
                 output: NativeOutputKind::SelectedEnd,
@@ -3158,7 +3415,7 @@ mod tests {
             )
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=candidate_closed\tpolicy=AsimdV8\tbackend=none\tqualification=Candidate\tpublication_vl=none\troute=PortableLiteral\tartifact_sha256=none\tstatus=PASS"
+            "fre-jit-auto-facade-v4\tcase=candidate_closed\tpolicy=AsimdV8\tbackend=none\tabi=none\tqualification=Candidate\tpublication_vl=none\tsession_vl=none\troute=PortableLiteral\tartifact_sha256=none\tstatus=PASS"
         );
 
         let v8_qualified = QualifiedExactSearchQualification::Qualified {
@@ -3185,8 +3442,8 @@ mod tests {
             tag10_qualified,
             tag21_qualified,
             || {
-                native_search_backend_support(
-                    QualifiedExactSearchBackendPolicy::Sve2Fixed16V2.backend_version(),
+                native_selected_end_register_backend_support_v2(
+                    SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16,
                 )
             },
             || panic!("supported tag21 must win before probing tag10"),
@@ -3196,7 +3453,9 @@ mod tests {
         let tag21_report = tag21.qualified_build_report().expect("tag21 exact report");
         let QualifiedExactSearchNativeStatus::Published {
             identity: tag21_identity,
+            abi: tag21_abi,
             sve_vector_bytes_at_publication: tag21_publication_vl,
+            required_thread_sve_vector_bytes: tag21_session_vl,
             ..
         } = &tag21_report.native
         else {
@@ -3212,8 +3471,18 @@ mod tests {
         );
         assert_eq!(tag21_identity.target.features.bits(), 7);
         assert_eq!(tag21_identity.qualification, tag21_qualified);
-        assert_eq!(tag21_identity.sve_vector_bytes_at_publication, Some(16));
-        assert_eq!(*tag21_publication_vl, Some(16));
+        assert_eq!(
+            tag21_identity.abi,
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+        );
+        assert_eq!(
+            *tag21_abi,
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+        );
+        assert_eq!(tag21_identity.sve_vector_bytes_at_publication, None);
+        assert_eq!(tag21_identity.required_thread_sve_vector_bytes, Some(16));
+        assert_eq!(*tag21_publication_vl, None);
+        assert_eq!(*tag21_session_vl, Some(16));
         let (_, tag21_sessionless) = tag21
             .find(&bytes, SearchLimits::unlimited())
             .expect("tag21 sessionless portable fallback");
@@ -3234,7 +3503,7 @@ mod tests {
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=tag21_auto\tpolicy=Sve2Fixed16V2\tbackend=21\tqualification=TestQualified\tpublication_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
+            "fre-jit-auto-facade-v4\tcase=tag21_auto\tpolicy=Sve2Fixed16V2\tbackend=21\tabi=SelectedEndRegisterV2\tqualification=TestQualified\tpublication_vl=none\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(tag21_identity.artifact_sha256)
         );
 
@@ -3264,7 +3533,9 @@ mod tests {
         let tag10_report = tag10.qualified_build_report().expect("tag10 exact report");
         let QualifiedExactSearchNativeStatus::Published {
             identity: tag10_identity,
+            abi: tag10_abi,
             sve_vector_bytes_at_publication: tag10_publication_vl,
+            required_thread_sve_vector_bytes: tag10_session_vl,
             ..
         } = &tag10_report.native
         else {
@@ -3281,8 +3552,18 @@ mod tests {
             tag10_identity.artifact_sha256,
             tag21_identity.artifact_sha256
         );
+        assert_eq!(
+            tag10_identity.abi,
+            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+        );
+        assert_eq!(
+            *tag10_abi,
+            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+        );
         assert_eq!(tag10_identity.sve_vector_bytes_at_publication, Some(16));
+        assert_eq!(tag10_identity.required_thread_sve_vector_bytes, Some(16));
         assert_eq!(*tag10_publication_vl, Some(16));
+        assert_eq!(*tag10_session_vl, Some(16));
         assert_eq!(
             *tag10_publication_vl,
             tag10_identity.sve_vector_bytes_at_publication
@@ -3307,7 +3588,7 @@ mod tests {
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=tag10_fallback\tpolicy=Sve2Fixed16\tbackend=10\tqualification=TestQualified\tpublication_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
+            "fre-jit-auto-facade-v4\tcase=tag10_fallback\tpolicy=Sve2Fixed16\tbackend=10\tabi=LegacySelectedEndV1\tqualification=TestQualified\tpublication_vl=16\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(tag10_identity.artifact_sha256)
         );
 
@@ -3337,7 +3618,9 @@ mod tests {
         let tag19_report = tag19.qualified_build_report().expect("tag19 exact report");
         let QualifiedExactSearchNativeStatus::Published {
             identity: tag19_identity,
+            abi: tag19_abi,
             sve_vector_bytes_at_publication: tag19_publication_vl,
+            required_thread_sve_vector_bytes: tag19_session_vl,
             ..
         } = &tag19_report.native
         else {
@@ -3349,8 +3632,18 @@ mod tests {
         );
         assert_eq!(tag19_identity.backend, BackendVersion::SEARCH_SVE16_V6);
         assert_eq!(tag19_identity.qualification, tag19_qualified);
+        assert_eq!(
+            tag19_identity.abi,
+            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+        );
+        assert_eq!(
+            *tag19_abi,
+            QualifiedExactSearchNativeAbi::LegacySelectedEndV1
+        );
         assert_eq!(tag19_identity.sve_vector_bytes_at_publication, Some(16));
+        assert_eq!(tag19_identity.required_thread_sve_vector_bytes, Some(16));
         assert_eq!(*tag19_publication_vl, Some(16));
+        assert_eq!(*tag19_session_vl, Some(16));
         assert_eq!(
             *tag19_publication_vl,
             tag19_identity.sve_vector_bytes_at_publication
@@ -3379,7 +3672,7 @@ mod tests {
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=tag19_fallback\tpolicy=Sve16V6\tbackend=19\tqualification=TestQualified\tpublication_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
+            "fre-jit-auto-facade-v4\tcase=tag19_fallback\tpolicy=Sve16V6\tbackend=19\tabi=LegacySelectedEndV1\tqualification=TestQualified\tpublication_vl=16\tsession_vl=16\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(tag19_identity.artifact_sha256)
         );
 
@@ -3405,7 +3698,9 @@ mod tests {
         let v8_report = v8.qualified_build_report().expect("V8 exact report");
         let QualifiedExactSearchNativeStatus::Published {
             identity: v8_identity,
+            abi: v8_abi,
             sve_vector_bytes_at_publication: v8_publication_vl,
+            required_thread_sve_vector_bytes: v8_session_vl,
             ..
         } = &v8_report.native
         else {
@@ -3417,23 +3712,45 @@ mod tests {
         );
         assert_eq!(v8_identity.backend, BackendVersion::SEARCH_V8);
         assert_eq!(v8_identity.qualification, v8_qualified);
+        assert_eq!(
+            v8_identity.abi,
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+        );
+        assert_eq!(
+            *v8_abi,
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+        );
         assert_eq!(v8_identity.sve_vector_bytes_at_publication, None);
+        assert_eq!(v8_identity.required_thread_sve_vector_bytes, None);
         assert_eq!(*v8_publication_vl, None);
+        assert_eq!(*v8_session_vl, None);
         assert_eq!(
             *v8_publication_vl,
             v8_identity.sve_vector_bytes_at_publication
         );
         assert_ne!(v8_identity.artifact_sha256, tag19_identity.artifact_sha256);
         assert_ne!(v8_identity.artifact_sha256, tag10_identity.artifact_sha256);
-        let (_, v8_execution) = v8
+        let (_, v8_sessionless) = v8
             .find(&bytes, SearchLimits::unlimited())
-            .expect("V8 fallback native search");
+            .expect("V8 sessionless portable fallback");
+        assert_eq!(
+            v8_sessionless.route,
+            QualifiedExactSearchFacadeRoute::ExactLiteral(
+                QualifiedExactSearchRoute::PortableLiteral
+            )
+        );
+        let v8_session = v8
+            .begin_current_thread_session()
+            .expect("V8 ABI2 session construction is SVE-syscall-free");
+        let (_, v8_execution) = v8_session
+            .find(&bytes, SearchLimits::unlimited())
+            .expect("V8 fallback native session search");
         assert_eq!(
             v8_execution.route,
             QualifiedExactSearchFacadeRoute::ExactLiteral(QualifiedExactSearchRoute::NativeJit)
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=v8_fallback\tpolicy=AsimdV8\tbackend=8\tqualification=TestQualified\tpublication_vl=none\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
+            "fre-jit-auto-facade-v4\tcase=v8_fallback\tpolicy=AsimdV8\tbackend=8\tabi=SelectedEndRegisterV2\tqualification=TestQualified\tpublication_vl=none\tsession_vl=none\troute=NativeJit\tartifact_sha256={}\tstatus=PASS",
             artifact_hex(v8_identity.artifact_sha256)
         );
 
@@ -3446,7 +3763,9 @@ mod tests {
             .expect("guarded exact report");
         let QualifiedExactSearchNativeStatus::Published {
             identity: guard_identity,
+            abi: guard_abi,
             sve_vector_bytes_at_publication: guard_publication_vl,
+            required_thread_sve_vector_bytes: guard_session_vl,
             ..
         } = &guard_report.native
         else {
@@ -3457,7 +3776,12 @@ mod tests {
             guard_identity.qualification,
             QualifiedExactSearchQualification::Candidate
         );
+        assert_eq!(
+            *guard_abi,
+            QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+        );
         assert_eq!(*guard_publication_vl, None);
+        assert_eq!(*guard_session_vl, None);
         assert_eq!(guard_identity.artifact_sha256, v8_identity.artifact_sha256);
         let guard_loss_session = guard_loss
             .begin_current_thread_session()
@@ -3481,7 +3805,7 @@ mod tests {
             )
         );
         println!(
-            "fre-jit-auto-facade-v3\tcase=guard_loss\tpolicy=AsimdV8\tbackend=8\tqualification=Candidate\tpublication_vl=none\troute=PortableLiteral\tartifact_sha256={guard_artifact}\tstatus=PASS"
+            "fre-jit-auto-facade-v4\tcase=guard_loss\tpolicy=AsimdV8\tbackend=8\tabi=SelectedEndRegisterV2\tqualification=Candidate\tpublication_vl=none\tsession_vl=none\troute=PortableLiteral\tartifact_sha256={guard_artifact}\tstatus=PASS"
         );
     }
 
@@ -3721,7 +4045,7 @@ mod tests {
             matched.map(|span| (span.start(), span.end())),
             Some((expected_start, expected_end))
         );
-        assert_eq!(execution.route, QualifiedExactSearchRoute::NativeJit);
+        assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
         assert_eq!(execution.accounting.linear_terms, exact_terms);
 
         let session = search
@@ -3731,7 +4055,11 @@ mod tests {
             .find(&haystack, exact_limits)
             .expect("V8 session shares the exact native preflight");
         assert_eq!(session_matched, matched);
-        assert_eq!(session_execution, execution);
+        assert_eq!(
+            session_execution.route,
+            QualifiedExactSearchRoute::NativeJit
+        );
+        assert_eq!(session_execution.accounting, execution.accounting);
         assert_eq!(
             session
                 .find_value(&haystack, exact_limits)

@@ -248,10 +248,21 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     }
 
     let runtime = include_str!("selected_end_register_v2.rs");
+    let support_start = position(
+        runtime,
+        "pub fn native_selected_end_register_backend_support_v2(",
+    );
     let publish_start = position(
         runtime,
         "pub(crate) fn publish_selected_end_register_v2_impl(",
     );
+    let support = &runtime[support_start..publish_start];
+    assert!(support.contains("platform::ensure_host_supported()?"));
+    assert!(support.contains("platform::has_asimd()"));
+    assert!(support.contains("platform::has_sve()"));
+    assert!(support.contains("platform::has_sve2()"));
+    assert!(!support.contains("current_thread_sve_vector_bytes"));
+
     let preflight_start = position(runtime, "fn preflight_selected_end_register_v2(");
     let publish = &runtime[publish_start..preflight_start];
     assert_eq!(
@@ -279,6 +290,12 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     );
     let handle = &runtime[handle_start..session_start];
     assert!(handle.contains("pub fn begin_current_thread_session("));
+    assert!(handle.contains("let required = self.backend.fixed_active_vector_bytes();"));
+    assert!(handle.contains("if required != 0"));
+    assert_eq!(
+        handle.matches("current_thread_sve_vector_bytes()").count(),
+        1
+    );
     assert!(!handle.contains("pub fn search("));
     assert!(!handle.contains("pub fn find("));
 

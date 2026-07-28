@@ -4,9 +4,10 @@ use fre_kernel_ir::Span as NativeSpan;
 
 use super::*;
 
-// V3 is a new value-only timing boundary. Existing V2 reporting-path rows
-// remain historical evidence and must never be relabeled.
-const SCHEMA: &str = "fre-jit-tag21-facade-performance-v3";
+// V4 measures the register-return ABI2 facade boundary. Existing V2
+// reporting-path and V3 value-only ABI1 rows remain historical evidence and
+// must never be relabeled.
+const SCHEMA: &str = "fre-jit-tag21-facade-performance-v4";
 const CSV_HEADER: &str = "schema,revision,pid,repetition,literal_class,literal_hex,size,scenario,order,engine,stage,iterations,total_ns,ns_per_iter,checksum,semantic_value,haystack_bytes,route,backend,qualification_state,artifact_sha256,declared_min_window_bytes,declared_min_calls,measured_calls";
 const BUILD_ITERATIONS: usize = 8;
 
@@ -243,7 +244,9 @@ fn facade_artifact(facade: &QualifiedExactSearchFacade) -> [u8; 32] {
     assert_eq!(report.qualification, expected_qualification);
     let QualifiedExactSearchNativeStatus::Published {
         identity,
+        abi,
         sve_vector_bytes_at_publication,
+        required_thread_sve_vector_bytes,
         ..
     } = &report.native
     else {
@@ -253,10 +256,17 @@ fn facade_artifact(facade: &QualifiedExactSearchFacade) -> [u8; 32] {
         );
     };
     assert_eq!(identity.backend, BackendVersion::SEARCH_SVE2_FIXED16_V2);
+    assert_eq!(
+        identity.abi,
+        QualifiedExactSearchNativeAbi::SelectedEndRegisterV2
+    );
+    assert_eq!(*abi, QualifiedExactSearchNativeAbi::SelectedEndRegisterV2);
     assert_eq!(identity.target.features.bits(), 7);
     assert_eq!(identity.qualification, expected_qualification);
-    assert_eq!(identity.sve_vector_bytes_at_publication, Some(16));
-    assert_eq!(*sve_vector_bytes_at_publication, Some(16));
+    assert_eq!(identity.sve_vector_bytes_at_publication, None);
+    assert_eq!(identity.required_thread_sve_vector_bytes, Some(16));
+    assert_eq!(*sve_vector_bytes_at_publication, None);
+    assert_eq!(*required_thread_sve_vector_bytes, Some(16));
     identity.artifact_sha256
 }
 
@@ -757,7 +767,7 @@ fn driver() {
 
 #[test]
 fn qualification_schema_literal_corpus_and_row_cardinality_are_closed() {
-    assert_eq!(SCHEMA, "fre-jit-tag21-facade-performance-v3");
+    assert_eq!(SCHEMA, "fre-jit-tag21-facade-performance-v4");
     let columns: Vec<_> = CSV_HEADER.split(',').collect();
     assert_eq!(columns.len(), 24);
     let mut deduplicated = columns.clone();

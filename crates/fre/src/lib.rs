@@ -463,8 +463,9 @@ pub use qualified_exact_search::{
     QualifiedExactSearchFacade, QualifiedExactSearchFacadeBuildError,
     QualifiedExactSearchFacadeError, QualifiedExactSearchFacadeExecution,
     QualifiedExactSearchFacadeRoute, QualifiedExactSearchFacadeSelection,
-    QualifiedExactSearchFacadeThreadSession, QualifiedExactSearchNativeIdentity,
-    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
+    QualifiedExactSearchFacadeThreadSession, QualifiedExactSearchNativeAbi,
+    QualifiedExactSearchNativeIdentity, QualifiedExactSearchNativeStatus,
+    QualifiedExactSearchQualification, QualifiedExactSearchRoute,
     QualifiedExactSearchThreadContractError, QualifiedExactSearchThreadSession,
     QualifiedExactSearchWorkload,
 };

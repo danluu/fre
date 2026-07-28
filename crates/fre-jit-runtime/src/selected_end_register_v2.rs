@@ -286,6 +286,33 @@ pub fn publish_selected_end_register_v2(
     publish_selected_end_register_v2_impl(image, limits, FailureInjection::None)
 }
 
+/// Check process-wide host admission for one register-return ABI2 backend.
+///
+/// This deliberately does not inspect the calling thread's SVE vector length.
+/// V8 needs no SVE thread contract, while tag21 performs its one VL16 check
+/// only when [`PublishedSelectedEndRegisterV2::begin_current_thread_session`]
+/// creates the session that may invoke generated code.
+pub fn native_selected_end_register_backend_support_v2(
+    backend: SelectedEndRegisterBackendV2,
+) -> Result<(), PublishError> {
+    platform::ensure_host_supported()?;
+    validate_selected_end_register_host_features_v2(
+        backend,
+        SelectedEndRegisterHostFeaturesV2 {
+            asimd: platform::has_asimd(),
+            sve: platform::has_sve(),
+            sve2: platform::has_sve2(),
+        },
+    )?;
+    if backend == SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 {
+        crate::validate_search_backend_tuning(
+            backend.backend_version(),
+            fre_target_features::host().tuning(),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn publish_selected_end_register_v2_impl(
     image: &AuditedSelectedEndRegisterImageV2,
     limits: PublicationLimits,
@@ -327,21 +354,7 @@ pub(crate) fn publish_selected_end_register_v2_impl(
 fn preflight_selected_end_register_v2(
     image: &AuditedSelectedEndRegisterImageV2,
 ) -> Result<NonZeroU32, PublishError> {
-    platform::ensure_host_supported()?;
-    validate_selected_end_register_host_features_v2(
-        image.backend(),
-        SelectedEndRegisterHostFeaturesV2 {
-            asimd: platform::has_asimd(),
-            sve: platform::has_sve(),
-            sve2: platform::has_sve2(),
-        },
-    )?;
-    if image.backend() == SelectedEndRegisterBackendV2::Sve2Fixed16Tag21Vl16 {
-        crate::validate_search_backend_tuning(
-            image.backend_version(),
-            fre_target_features::host().tuning(),
-        )?;
-    }
+    native_selected_end_register_backend_support_v2(image.backend())?;
     audit_selected_end_register_v2(image).map_err(PublishError::ImageAudit)?;
     validate_selected_end_register_target_v2(image)?;
     NonZeroU32::new(image.literal_bytes()).ok_or(PublishError::PublicationIdentityMismatch)
