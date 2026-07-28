@@ -182,7 +182,7 @@ fn selected_end_register_v2_preflight_refuses_before_entry_and_returns_accountin
 }
 
 #[test]
-fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_width() {
+fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exact_literal() {
     let haystack = b"xxneedlezz";
     let checked = CheckedSearchWindow::new(haystack, SearchWindow::new(2, 8))
         .expect("checked literal window");

@@ -29,7 +29,7 @@ pub enum SelectedEndRegisterCallErrorV2 {
     LiteralWidthNotRepresentable { bytes: u32 },
     /// Shared scalar literal/window/resource preflight refused the call.
     Preflight(LiteralError),
-    /// A preflight token came from a different literal plan.
+    /// A preflight token's literal width differs from the sealed artifact.
     LiteralWidthMismatch {
         expected_bytes: usize,
         actual_bytes: usize,
