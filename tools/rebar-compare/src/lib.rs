@@ -28,37 +28,38 @@ use fre::{
     AbsoluteFullCaptureRunLimits, AggregateBuildAccounting, AggregateBuildError,
     AggregateBuildLimits, AggregateBuildReport, AggregateBuilder, AggregateCaptureSemantics,
     AggregateCompileRegex, AggregateContinuationSemantics, AggregateCountRegex,
-    AggregateEngineError, AggregateExactLiteralSemantics, AggregateExecutionDetails,
-    AggregateExecutionReport, AggregateExecutionSource, AggregateFiniteLiteralIdentity,
-    AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
-    AggregateGraphemeScalarDfaSemantics, AggregateManyBuildAccounting, AggregateManyBuildError,
-    AggregateManyBuildLimits, AggregateManyBuildReport, AggregateManyBuilder,
-    AggregateManyCaptureCountRegex, AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics,
-    AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
-    AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
-    AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
+    AggregateCountWorkspace, AggregateEngineError, AggregateExactLiteralSemantics,
+    AggregateExecutionDetails, AggregateExecutionReport, AggregateExecutionSource,
+    AggregateFiniteLiteralIdentity, AggregateFiniteLiteralSemantics,
+    AggregateFixedClassSandwichSemantics, AggregateGraphemeScalarDfaSemantics,
+    AggregateManyBuildAccounting, AggregateManyBuildError, AggregateManyBuildLimits,
+    AggregateManyBuildReport, AggregateManyBuilder, AggregateManyCaptureCountRegex,
+    AggregateManyCaptureRunLimits, AggregateManyCaptureSemantics, AggregateManyCompileRegex,
+    AggregateManyCountRegex, AggregateManyExecutionSource, AggregateManyLiteralSemantics,
+    AggregateManyOperation, AggregateManyPlanIdentity, AggregateManyPlanKind,
+    AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
     AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
-    AggregateStrategy, AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError,
-    AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder, AnchoredLineCapturePlan,
-    AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits, AnchoredWordCaptureBuildError,
-    AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder, AnchoredWordCapturePlan,
-    AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, BlockingDelimiterBuildAccounting,
-    BlockingDelimiterBuildError, BlockingDelimiterBuildLimits, BlockingDelimiterReduceError,
-    BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError, BoundedClassSequenceBuildLimits,
-    BoundedClassSequenceReduceError, BoundedClassSequenceReduceLimits,
-    BoundedSeparatedFieldsBuildError, BoundedSeparatedFieldsBuildLimits,
-    BoundedSeparatedFieldsReduceError, BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits,
-    CaptureBuildError, CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource,
-    CaptureOperation, CapturePlanKind, CaptureRegex, CaptureRequiredLiteralBuildLimits,
-    CaptureRequiredLiteralPlan, CaptureRequiredLiteralRunLimits,
-    CaptureRequiredLiteralSearchOperation, CaptureRunAlternationBuildError,
-    CaptureRunAlternationBuildLimits, CaptureRunAlternationBuilder, CaptureRunAlternationPlan,
-    CaptureRunAlternationRunError, CaptureRunAlternationRunLimits, CaptureRunLimits,
-    CaptureSearchError, CaptureSearchLimits, CaptureStreamDomains, CaptureStreamProjection,
-    CaptureStreamSession, CaptureWordRunBuildError, CaptureWordRunBuildLimits,
-    CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError, CaptureWordRunRunLimits,
-    CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    AggregateSpanSumWorkspace, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    AnchoredLineCaptureBuildError, AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder,
+    AnchoredLineCapturePlan, AnchoredLineCaptureRunError, AnchoredLineCaptureRunLimits,
+    AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuilder,
+    AnchoredWordCapturePlan, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
+    BlockingDelimiterBuildAccounting, BlockingDelimiterBuildError, BlockingDelimiterBuildLimits,
+    BlockingDelimiterReduceError, BlockingDelimiterReduceLimits, BoundedClassSequenceBuildError,
+    BoundedClassSequenceBuildLimits, BoundedClassSequenceReduceError,
+    BoundedClassSequenceReduceLimits, BoundedSeparatedFieldsBuildError,
+    BoundedSeparatedFieldsBuildLimits, BoundedSeparatedFieldsReduceError,
+    BoundedSeparatedFieldsReduceLimits, CaptureAggregateLimits, CaptureBuildError,
+    CaptureBuildLimits, CaptureBuilder, CaptureExecutionSource, CaptureOperation, CapturePlanKind,
+    CaptureRegex, CaptureRequiredLiteralBuildLimits, CaptureRequiredLiteralPlan,
+    CaptureRequiredLiteralRunLimits, CaptureRequiredLiteralSearchOperation,
+    CaptureRunAlternationBuildError, CaptureRunAlternationBuildLimits,
+    CaptureRunAlternationBuilder, CaptureRunAlternationPlan, CaptureRunAlternationRunError,
+    CaptureRunAlternationRunLimits, CaptureRunLimits, CaptureSearchError, CaptureSearchLimits,
+    CaptureStreamDomains, CaptureStreamProjection, CaptureStreamSession, CaptureWordRunBuildError,
+    CaptureWordRunBuildLimits, CaptureWordRunBuilder, CaptureWordRunPlan, CaptureWordRunRunError,
+    CaptureWordRunRunLimits, CompatibilityProfile, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
     FixedClassSandwichBuildError, FixedClassSandwichBuildLimits, FixedClassSandwichOperation,
     FixedClassSandwichReduceError, FixedClassSandwichReduceLimits, FixedPredicateWord64BuildError,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
@@ -1800,12 +1801,22 @@ enum CurrentFreAggregateOperationInner {
         UnicodeFoldedLiteralRunLimits,
     ),
     CountSingle(AggregateCountRegex, AggregateRunLimits),
+    CountSingleDense(
+        AggregateCountRegex,
+        AggregateRunLimits,
+        RefCell<AggregateCountWorkspace>,
+    ),
     CountMany(AggregateManyCountRegex, AggregateManyRunLimits),
     SpanSumFolded(
         UnicodeFoldedLiteralSpanSumRegex,
         UnicodeFoldedLiteralRunLimits,
     ),
     SpanSumSingle(AggregateSpanSumRegex, AggregateRunLimits),
+    SpanSumSingleDense(
+        AggregateSpanSumRegex,
+        AggregateRunLimits,
+        RefCell<AggregateSpanSumWorkspace>,
+    ),
     SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
 }
 
@@ -1909,6 +1920,15 @@ impl CurrentFreAggregateOperationLifecycle {
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 })
             }
+            CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, workspace) => {
+                let mut workspace = workspace.borrow_mut();
+                regex
+                    .count_value_with_workspace(haystack, limits, &mut workspace)
+                    .map_err(|error| {
+                        let message = format!("FRE count lifecycle: {error}");
+                        CompareError::new(aggregate_attempt_error(&error, message).message)
+                    })
+            }
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
                 .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
@@ -1923,6 +1943,15 @@ impl CurrentFreAggregateOperationLifecycle {
                     let message = format!("FRE span-sum lifecycle: {error}");
                     CompareError::new(aggregate_attempt_error(&error, message).message)
                 })
+            }
+            CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, workspace) => {
+                let mut workspace = workspace.borrow_mut();
+                regex
+                    .span_sum_value_with_workspace(haystack, limits, &mut workspace)
+                    .map_err(|error| {
+                        let message = format!("FRE span-sum lifecycle: {error}");
+                        CompareError::new(aggregate_attempt_error(&error, message).message)
+                    })
             }
             CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => {
                 regex.span_sum_value(haystack, *limits).map_err(|error| {
@@ -1977,7 +2006,8 @@ impl CurrentFreAggregateOperationLifecycle {
                 .map_err(|error| {
                     CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
                 }),
-            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits)
+            | CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, _) => regex
                 .count_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
                     value: result.value(),
@@ -2009,7 +2039,8 @@ impl CurrentFreAggregateOperationLifecycle {
                 .map_err(|error| {
                     CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
                 }),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits)
+            | CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, _) => regex
                 .span_sum_value_with_counters(haystack, limits)
                 .map(|result| CurrentFreAggregateOperationCounterResult {
                     value: result.value(),
@@ -2343,10 +2374,16 @@ fn build_current_fre_count_lifecycle_incumbent(
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        (
-            plan,
-            CurrentFreAggregateOperationInner::CountSingle(regex, limits),
-        )
+        let inner = if regex.build_report().plan == AggregatePlanKind::FiniteLiteralDfa {
+            CurrentFreAggregateOperationInner::CountSingleDense(
+                regex,
+                limits,
+                RefCell::new(AggregateCountWorkspace::new()),
+            )
+        } else {
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits)
+        };
+        (plan, inner)
     } else {
         let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
             .build_count()
@@ -2451,10 +2488,16 @@ fn build_current_fre_span_sum_lifecycle_incumbent(
             &RunLimits::default(),
         )
         .map_err(|error| CompareError::new(error.message))?;
-        (
-            plan,
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits),
-        )
+        let inner = if regex.build_report().plan == AggregatePlanKind::FiniteLiteralDfa {
+            CurrentFreAggregateOperationInner::SpanSumSingleDense(
+                regex,
+                limits,
+                RefCell::new(AggregateSpanSumWorkspace::new()),
+            )
+        } else {
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits)
+        };
+        (plan, inner)
     } else {
         let regex = current_fre_rebar_aggregate_many_builder(patterns, unicode, case_insensitive)
             .build_span_sum()
@@ -21971,6 +22014,8 @@ mod tests {
                 CurrentFreAggregateOperationInner::CountCanonical(_)
                 | CurrentFreAggregateOperationInner::CountFolded(_, _)
                 | CurrentFreAggregateOperationInner::SpanSumFolded(_, _)
+                | CurrentFreAggregateOperationInner::CountSingleDense(_, _, _)
+                | CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, _)
                 | CurrentFreAggregateOperationInner::CountMany(_, _)
                 | CurrentFreAggregateOperationInner::SpanSumMany(_, _) => {
                     panic!(
@@ -24803,6 +24848,76 @@ mod tests {
                 CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
             ));
         }
+    }
+
+    #[test]
+    fn dense_finite_lifecycles_retain_workspace_after_the_first_operation() {
+        let patterns = ["a|bc".to_string()];
+        let first_haystack = b"abcaba";
+        let second_haystack = b"bcbcab";
+
+        let count = current_fre_rebar_aggregate_operation_lifecycle(
+            "count",
+            &patterns,
+            false,
+            false,
+            first_haystack.len(),
+        )
+        .expect("dense finite count lifecycle");
+        assert_eq!(count.plan(), "aggregate-finite-literal-dfa");
+        let CurrentFreAggregateOperationInner::CountSingleDense(_, _, count_workspace) =
+            &count.inner
+        else {
+            panic!("dense finite count did not retain a workspace")
+        };
+        assert_eq!(
+            count_workspace.borrow().retained_dense_finite_bytes(),
+            Some(0)
+        );
+        assert_eq!(count.execute(first_haystack).expect("first dense count"), 4);
+        let count_bytes = count_workspace
+            .borrow()
+            .retained_dense_finite_bytes()
+            .expect("count workspace byte computation");
+        assert!(count_bytes > 0);
+        assert_eq!(
+            count.execute(second_haystack).expect("steady dense count"),
+            3
+        );
+        assert_eq!(
+            count_workspace.borrow().retained_dense_finite_bytes(),
+            Some(count_bytes)
+        );
+
+        let span = current_fre_rebar_aggregate_operation_lifecycle(
+            "count-spans",
+            &patterns,
+            false,
+            false,
+            first_haystack.len(),
+        )
+        .expect("dense finite span lifecycle");
+        assert_eq!(span.plan(), "aggregate-finite-literal-dfa");
+        let CurrentFreAggregateOperationInner::SpanSumSingleDense(_, _, span_workspace) =
+            &span.inner
+        else {
+            panic!("dense finite span-sum did not retain a workspace")
+        };
+        assert_eq!(
+            span_workspace.borrow().retained_dense_finite_bytes(),
+            Some(0)
+        );
+        assert_eq!(span.execute(first_haystack).expect("first dense span"), 5);
+        let span_bytes = span_workspace
+            .borrow()
+            .retained_dense_finite_bytes()
+            .expect("span workspace byte computation");
+        assert!(span_bytes > 0);
+        assert_eq!(span.execute(second_haystack).expect("steady dense span"), 5);
+        assert_eq!(
+            span_workspace.borrow().retained_dense_finite_bytes(),
+            Some(span_bytes)
+        );
     }
 
     #[test]

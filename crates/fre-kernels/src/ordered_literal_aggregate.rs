@@ -281,6 +281,66 @@ pub struct SpanSumResult<'a> {
     pub accounting: ReduceAccounting<'a>,
 }
 
+/// Caller-owned scratch retained across dense count operations.
+///
+/// The first operation grows and initializes this workspace exactly as
+/// [`OrderedLiteralCountPlan::count`] does. Later operations may reuse the
+/// initialized allocation. The workspace is opaque so callers cannot forge
+/// initialized DP state; every operation still overwrites each slot before a
+/// value from that slot can be observed.
+#[derive(Debug, Default)]
+pub struct OrderedLiteralCountWorkspace {
+    ring: Vec<CountState>,
+}
+
+impl OrderedLiteralCountWorkspace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { ring: Vec::new() }
+    }
+
+    /// Retained allocation capacity in count-DP entries.
+    #[must_use]
+    pub const fn retained_entries(&self) -> usize {
+        self.ring.capacity()
+    }
+
+    /// Retained allocation capacity in bytes.
+    #[must_use]
+    pub fn retained_bytes(&self) -> Option<usize> {
+        self.ring.capacity().checked_mul(size_of::<CountState>())
+    }
+}
+
+/// Caller-owned scratch retained across dense span-sum operations.
+///
+/// This has the same first/steady boundary as
+/// [`OrderedLiteralCountWorkspace`], with span-DP state kept in a distinct
+/// type so operation-specialized plans cannot exchange scratch accidentally.
+#[derive(Debug, Default)]
+pub struct OrderedLiteralSpanSumWorkspace {
+    ring: Vec<SpanState>,
+}
+
+impl OrderedLiteralSpanSumWorkspace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { ring: Vec::new() }
+    }
+
+    /// Retained allocation capacity in span-DP entries.
+    #[must_use]
+    pub const fn retained_entries(&self) -> usize {
+        self.ring.capacity()
+    }
+
+    /// Retained allocation capacity in bytes.
+    #[must_use]
+    pub fn retained_bytes(&self) -> Option<usize> {
+        self.ring.capacity().checked_mul(size_of::<SpanState>())
+    }
+}
+
 /// Typed construction refusal. No plan is published on error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1010,9 +1070,9 @@ impl OrderedLiteralCountPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<CountResult<'a>, ReduceError> {
-        let mut upper = self
-            .core
-            .preflight_reduce::<CountState>(haystack.len(), false, limits)?;
+        let mut upper =
+            self.core
+                .preflight_reduce::<CountState>(haystack.len(), false, None, limits)?;
         let mut ring = reserve_ring::<CountState>(upper.ring_entries, "count DP ring")?;
         self.core.finish_scratch_preflight(
             &mut upper,
@@ -1022,6 +1082,60 @@ impl OrderedLiteralCountPlan {
         )?;
         ring.resize(upper.ring_entries, CountState::default());
         let actual = self.core.execute_count(haystack, &mut ring, upper)?;
+        Ok(CountResult {
+            count: actual.match_events,
+            accounting: ReduceAccounting {
+                identity: self.cache_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Count while retaining the DP allocation in caller-owned scratch.
+    ///
+    /// A newly created workspace has the same allocation and initialization
+    /// work as [`Self::count`]. Once it contains enough entries, later calls
+    /// perform no allocation or ring initialization. Retained capacity remains
+    /// charged as scratch and peak memory on every call.
+    pub fn count_with_workspace<'a>(
+        &'a self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &mut OrderedLiteralCountWorkspace,
+    ) -> Result<CountResult<'a>, ReduceError> {
+        let ring_entries = self.core.ring_entries(haystack.len())?;
+        let ring_initializations = ring_entries.saturating_sub(workspace.ring.len());
+        let mut upper = self.core.preflight_reduce::<CountState>(
+            haystack.len(),
+            false,
+            Some(ring_initializations),
+            limits,
+        )?;
+        reserve_workspace_ring(
+            &mut workspace.ring,
+            upper.ring_entries,
+            "count DP workspace",
+        )?;
+        self.core.finish_scratch_preflight(
+            &mut upper,
+            workspace.ring.capacity(),
+            size_of::<CountState>(),
+            limits,
+        )?;
+        if workspace.ring.len() < upper.ring_entries {
+            workspace
+                .ring
+                .resize(upper.ring_entries, CountState::default());
+        }
+        let active_ring =
+            workspace
+                .ring
+                .get_mut(..upper.ring_entries)
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "count workspace contains the active DP ring",
+                })?;
+        let actual = self.core.execute_count(haystack, active_ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1083,9 +1197,9 @@ impl OrderedLiteralSpanSumPlan {
         haystack: &[u8],
         limits: ReduceLimits,
     ) -> Result<SpanSumResult<'a>, ReduceError> {
-        let mut upper = self
-            .core
-            .preflight_reduce::<SpanState>(haystack.len(), true, limits)?;
+        let mut upper =
+            self.core
+                .preflight_reduce::<SpanState>(haystack.len(), true, None, limits)?;
         let mut ring = reserve_ring::<SpanState>(upper.ring_entries, "span-sum DP ring")?;
         self.core.finish_scratch_preflight(
             &mut upper,
@@ -1095,6 +1209,61 @@ impl OrderedLiteralSpanSumPlan {
         )?;
         ring.resize(upper.ring_entries, SpanState::default());
         let actual = self.core.execute_span(haystack, &mut ring, upper)?;
+        let span_sum = actual
+            .span_sum
+            .expect("span plan always publishes a span sum");
+        Ok(SpanSumResult {
+            span_sum,
+            accounting: ReduceAccounting {
+                identity: self.cache_identity(),
+                upper_bounds: upper,
+                actual,
+            },
+        })
+    }
+
+    /// Sum spans while retaining the DP allocation in caller-owned scratch.
+    ///
+    /// The first/steady allocation and accounting boundary is identical to
+    /// [`OrderedLiteralCountPlan::count_with_workspace`].
+    pub fn span_sum_with_workspace<'a>(
+        &'a self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+        workspace: &mut OrderedLiteralSpanSumWorkspace,
+    ) -> Result<SpanSumResult<'a>, ReduceError> {
+        let ring_entries = self.core.ring_entries(haystack.len())?;
+        let ring_initializations = ring_entries.saturating_sub(workspace.ring.len());
+        let mut upper = self.core.preflight_reduce::<SpanState>(
+            haystack.len(),
+            true,
+            Some(ring_initializations),
+            limits,
+        )?;
+        reserve_workspace_ring(
+            &mut workspace.ring,
+            upper.ring_entries,
+            "span-sum DP workspace",
+        )?;
+        self.core.finish_scratch_preflight(
+            &mut upper,
+            workspace.ring.capacity(),
+            size_of::<SpanState>(),
+            limits,
+        )?;
+        if workspace.ring.len() < upper.ring_entries {
+            workspace
+                .ring
+                .resize(upper.ring_entries, SpanState::default());
+        }
+        let active_ring =
+            workspace
+                .ring
+                .get_mut(..upper.ring_entries)
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "span workspace contains the active DP ring",
+                })?;
+        let actual = self.core.execute_span(haystack, active_ring, upper)?;
         let span_sum = actual
             .span_sum
             .expect("span plan always publishes a span sum");
@@ -1436,10 +1605,21 @@ impl PlanCore {
         }
     }
 
+    fn ring_entries(&self, haystack_len: usize) -> Result<usize, ReduceError> {
+        self.build
+            .max_pattern_bytes
+            .min(haystack_len)
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "DP ring entries",
+            })
+    }
+
     fn preflight_reduce<T>(
         &self,
         haystack_len: usize,
         check_span: bool,
+        ring_initializations: Option<usize>,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
         let transitions = haystack_len;
@@ -1470,15 +1650,13 @@ impl PlanCore {
             u64::try_from(haystack_len).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "span upper bound as u64",
             })?;
-        let ring_entries = self
-            .build
-            .max_pattern_bytes
-            .min(haystack_len)
-            .checked_add(1)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "DP ring entries",
-            })?;
-        let ring_initializations = ring_entries;
+        let ring_entries = self.ring_entries(haystack_len)?;
+        let ring_initializations = ring_initializations.unwrap_or(ring_entries);
+        if ring_initializations > ring_entries {
+            return Err(ReduceError::InternalInvariant {
+                detail: "ring initializations fit the active DP ring",
+            });
+        }
         let total_work = transitions
             .checked_add(reducer_steps)
             .and_then(|work| work.checked_add(ring_initializations))
@@ -1615,7 +1793,7 @@ impl PlanCore {
         Ok(ReduceActualCounters {
             transitions: haystack.len(),
             reducer_steps: upper.reducer_steps,
-            ring_initializations: ring.len(),
+            ring_initializations: upper.ring_initializations,
             total_work: upper.total_work,
             match_events: next_initial,
             count: Some(next_initial),
@@ -1702,7 +1880,7 @@ impl PlanCore {
         Ok(ReduceActualCounters {
             transitions: haystack.len(),
             reducer_steps: upper.reducer_steps,
-            ring_initializations: ring.len(),
+            ring_initializations: upper.ring_initializations,
             total_work: upper.total_work,
             match_events: next_initial.initial_count,
             count: Some(next_initial.initial_count),
@@ -2222,6 +2400,27 @@ fn reserve_ring<T>(additional: usize, structure: &'static str) -> Result<Vec<T>,
     Ok(values)
 }
 
+fn reserve_workspace_ring<T>(
+    values: &mut Vec<T>,
+    needed: usize,
+    structure: &'static str,
+) -> Result<(), ReduceError> {
+    if values.capacity() >= needed {
+        return Ok(());
+    }
+    let additional = needed
+        .checked_sub(values.len())
+        .ok_or(ReduceError::InternalInvariant {
+            detail: "workspace growth exceeds its initialized length",
+        })?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| ReduceError::AllocationFailed {
+            structure,
+            additional,
+        })
+}
+
 fn capacity_bytes<T>(values: &Vec<T>) -> Result<usize, BuildError> {
     values
         .capacity()
@@ -2310,8 +2509,9 @@ mod tests {
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan, ReduceError,
-        ReduceLimits, build_allocation_probe, checked_dp_target_slot, previous_dp_ring_slot,
+        BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralCountWorkspace,
+        OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace, ReduceError, ReduceLimits,
+        build_allocation_probe, checked_dp_target_slot, previous_dp_ring_slot,
     };
     use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
 
@@ -2750,6 +2950,72 @@ mod tests {
         assert_eq!(counted.accounting.actual.reducer_steps, 1);
         assert_eq!(counted.accounting.actual.ring_initializations, 1);
         assert_eq!(counted.accounting.actual.total_work, 2);
+    }
+
+    #[test]
+    fn caller_owned_workspaces_preserve_first_cost_and_remove_steady_initialization() {
+        let patterns = [b"ab".as_slice(), b"a".as_slice(), b"ba".as_slice()];
+        let count = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span = OrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let first_haystack = b"ababxaba";
+        let second_haystack = b"baxababb";
+        let mut count_workspace = OrderedLiteralCountWorkspace::new();
+        let mut span_workspace = OrderedLiteralSpanSumWorkspace::new();
+
+        let first_count = count
+            .count_with_workspace(
+                first_haystack,
+                ReduceLimits::unlimited(),
+                &mut count_workspace,
+            )
+            .unwrap();
+        let first_span = span
+            .span_sum_with_workspace(
+                first_haystack,
+                ReduceLimits::unlimited(),
+                &mut span_workspace,
+            )
+            .unwrap();
+        assert_eq!(
+            first_count.accounting.actual.ring_initializations,
+            first_count.accounting.upper_bounds.ring_entries
+        );
+        assert_eq!(
+            first_span.accounting.actual.ring_initializations,
+            first_span.accounting.upper_bounds.ring_entries
+        );
+        assert!(count_workspace.retained_entries() >= 3);
+        assert!(span_workspace.retained_entries() >= 3);
+        assert!(count_workspace.retained_bytes().is_some());
+        assert!(span_workspace.retained_bytes().is_some());
+
+        let mut steady_limits = ReduceLimits::unlimited();
+        steady_limits.max_ring_initializations = 0;
+        steady_limits.max_total_work = second_haystack.len() + second_haystack.len() + 1;
+        let second_count = count
+            .count_with_workspace(second_haystack, steady_limits, &mut count_workspace)
+            .unwrap();
+        let second_span = span
+            .span_sum_with_workspace(second_haystack, steady_limits, &mut span_workspace)
+            .unwrap();
+        let ordinary_count = count
+            .count(second_haystack, ReduceLimits::unlimited())
+            .unwrap();
+        let ordinary_span = span
+            .span_sum(second_haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(second_count.count, ordinary_count.count);
+        assert_eq!(second_span.span_sum, ordinary_span.span_sum);
+        assert_eq!(second_count.accounting.actual.ring_initializations, 0);
+        assert_eq!(second_span.accounting.actual.ring_initializations, 0);
+        assert_eq!(
+            second_count.accounting.actual.total_work,
+            second_haystack.len() + second_haystack.len() + 1
+        );
+        assert_eq!(
+            second_span.accounting.actual.total_work,
+            second_haystack.len() + second_haystack.len() + 1
+        );
     }
 
     #[test]

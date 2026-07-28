@@ -87,27 +87,27 @@ use fre_kernels::{
     OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
     OrderedLiteralAggregateOperation, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
-    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
-    PackedBoundedPrefixLiteralBounds, PackedBoundedPrefixLiteralCountPlan,
-    PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
-    PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
-    PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
-    PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
-    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
-    PackedOrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
-    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
-    PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
-    PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
-    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
-    PrefixClassAlternationSpanSumResult, PrefixClassAlternationUpperBounds,
-    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
-    ReverseInnerBuildAccounting, ReverseInnerBuildError, ReverseInnerBuildLimits,
-    ReverseInnerCountResult, ReverseInnerOperationIdentity, ReverseInnerPlan,
-    ReverseInnerReduceAccounting, ReverseInnerReduceError, ReverseInnerReduceLimits,
-    ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralCountWorkspace, OrderedLiteralSpanSumPlan,
+    OrderedLiteralSpanSumWorkspace, PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PackedBoundedPrefixLiteralBounds,
+    PackedBoundedPrefixLiteralCountPlan, PackedOrderedLiteralAggregateActualCounters,
+    PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
+    PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
+    PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
+    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateUpperBounds,
+    PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
+    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
+    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
+    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
+    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
+    PrefixClassAlternationReduceLimits, PrefixClassAlternationSpanSumResult,
+    PrefixClassAlternationUpperBounds, REVERSE_INNER_COUNT_OPERATION_ID,
+    REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
+    ReverseInnerBuildLimits, ReverseInnerCountResult, ReverseInnerOperationIdentity,
+    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
+    ReverseInnerReduceLimits, ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
     SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
@@ -16311,6 +16311,27 @@ impl AggregatePlan {
         }
     }
 
+    fn execute_count_value_with_workspace(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        workspace: &mut OrderedLiteralCountWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        let AggregateEngine::FiniteCount(engine) = &self.engine else {
+            return self.execute_count_value(haystack, limits);
+        };
+        engine
+            .count_with_workspace(haystack, limits.finite_literal, workspace)
+            .map(|result| result.count)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::FiniteLiteral(source),
+                )
+            })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the exhaustive scalar dispatch avoids constructing the large audited result enum"
@@ -16752,6 +16773,27 @@ impl AggregatePlan {
             }
             _ => self.execute_span_sum_value_fallback(haystack, limits),
         }
+    }
+
+    fn execute_span_sum_value_with_workspace(
+        &self,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        workspace: &mut OrderedLiteralSpanSumWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        let AggregateEngine::FiniteSpanSum(engine) = &self.engine else {
+            return self.execute_span_sum_value(haystack, limits);
+        };
+        engine
+            .span_sum_with_workspace(haystack, limits.finite_literal, workspace)
+            .map(|result| result.span_sum)
+            .map_err(|source| {
+                self.direct_execution_error(
+                    haystack.len(),
+                    limits,
+                    AggregateExecutionSource::FiniteLiteral(source),
+                )
+            })
     }
 
     #[allow(
@@ -19876,6 +19918,52 @@ impl Iterator for AggregateSearchStepIter<'_> {
 
 impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 
+/// Caller-owned scratch for repeated value-only count operations.
+///
+/// Dense finite-literal plans retain their DP allocation here after the first
+/// call. Other selected plans ignore the workspace and keep their existing
+/// operation boundary.
+#[derive(Debug, Default)]
+pub struct AggregateCountWorkspace {
+    dense_finite: OrderedLiteralCountWorkspace,
+}
+
+impl AggregateCountWorkspace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            dense_finite: OrderedLiteralCountWorkspace::new(),
+        }
+    }
+
+    /// Bytes retained for a dense finite-literal reducer.
+    #[must_use]
+    pub fn retained_dense_finite_bytes(&self) -> Option<usize> {
+        self.dense_finite.retained_bytes()
+    }
+}
+
+/// Caller-owned scratch for repeated value-only span-sum operations.
+#[derive(Debug, Default)]
+pub struct AggregateSpanSumWorkspace {
+    dense_finite: OrderedLiteralSpanSumWorkspace,
+}
+
+impl AggregateSpanSumWorkspace {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            dense_finite: OrderedLiteralSpanSumWorkspace::new(),
+        }
+    }
+
+    /// Bytes retained for a dense finite-literal reducer.
+    #[must_use]
+    pub fn retained_dense_finite_bytes(&self) -> Option<usize> {
+        self.dense_finite.retained_bytes()
+    }
+}
+
 /// Compiled complete match-count operation.
 #[derive(Debug)]
 pub struct AggregateCountRegex(AggregatePlan);
@@ -19970,6 +20058,24 @@ impl AggregateCountRegex {
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
         self.0.execute_count_value(haystack, limits)
+    }
+
+    /// Count through the selected value-only plan while retaining eligible
+    /// dense finite-literal scratch in a caller-owned workspace.
+    ///
+    /// The first dense call performs the same allocation and initialization
+    /// as [`Self::count_value`]. Later calls reuse that allocation. This method
+    /// does not alter route selection, and non-dense plans execute exactly as
+    /// [`Self::count_value`] does.
+    pub fn count_value_with_workspace(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateCountWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        let limits = limits.borrow();
+        self.0
+            .execute_count_value_with_workspace(haystack, limits, &mut workspace.dense_finite)
     }
 
     /// Count through the same selected value-only plan as [`Self::count_value`]
@@ -20118,6 +20224,19 @@ impl AggregateSpanSumRegex {
     ) -> Result<u64, AggregateExecutionError> {
         let limits = limits.borrow();
         self.0.execute_span_sum_value(haystack, limits)
+    }
+
+    /// Sum spans through the selected value-only plan while retaining eligible
+    /// dense finite-literal scratch in a caller-owned workspace.
+    pub fn span_sum_value_with_workspace(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        workspace: &mut AggregateSpanSumWorkspace,
+    ) -> Result<u64, AggregateExecutionError> {
+        let limits = limits.borrow();
+        self.0
+            .execute_span_sum_value_with_workspace(haystack, limits, &mut workspace.dense_finite)
     }
 
     /// Sum spans through the same selected value-only plan as
