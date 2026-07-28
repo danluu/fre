@@ -53,6 +53,10 @@ const BYTE_FREQUENCY_RANK: [u8; 256] = [
     255,
 ];
 
+pub(crate) fn byte_frequency_rank(byte: u8) -> u8 {
+    BYTE_FREQUENCY_RANK[usize::from(byte)]
+}
+
 /// Smallest admitted ordered set. Singletons already have a stronger direct
 /// literal implementation.
 pub const CERTIFIED_MIN_PATTERNS: usize = 2;

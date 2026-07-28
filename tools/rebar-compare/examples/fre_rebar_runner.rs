@@ -666,9 +666,7 @@ fn aggregate_plan(model: &str, report: &AggregateBuildReport) -> &'static str {
         (_, AggregatePlanKind::FiniteLiteralDfa, false) => "aggregate-finite-literal-dfa",
         (_, AggregatePlanKind::PackedFiniteLiteral, _) => "aggregate-finite-literal-packed-v2",
         (_, AggregatePlanKind::GuardedAsciiWordDictionary, _) => "aggregate-guarded-ascii-word",
-        (_, AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => {
-            "aggregate-guarded-unicode-word"
-        }
+        (_, AggregatePlanKind::GuardedUnicodeWordLiteralSet, _) => "aggregate-guarded-unicode-word",
         (_, AggregatePlanKind::FixedPredicateWord64, _) => "aggregate-fixed-predicate-word64",
         (_, AggregatePlanKind::ContinuationProgram, _) => "aggregate-continuation-program",
     }

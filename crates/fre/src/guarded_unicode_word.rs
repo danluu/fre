@@ -1475,6 +1475,15 @@ mod tests {
             haystack.extend_from_slice(" βas asβ as ".as_bytes());
             cases.push(haystack);
         }
+        let mut one_block_flush = vec![b' '; 30];
+        one_block_flush.extend_from_slice(b"as");
+        cases.push(one_block_flush);
+        let mut two_block_flush = vec![b' '; 62];
+        two_block_flush.extend_from_slice(b"as");
+        cases.push(two_block_flush);
+        let mut split_unicode_scalar = vec![b' '; 31];
+        split_unicode_scalar.extend_from_slice("βas as".as_bytes());
+        cases.push(split_unicode_scalar);
         for haystack in cases {
             let expected = oracle.find_iter(&haystack).collect::<Vec<_>>();
             let expected_count = u64::try_from(expected.len()).unwrap();
