@@ -10,24 +10,38 @@
 //! over the reversed literals. One right-to-left transition reports the first
 //! ordered literal starting at each byte position. A bounded dynamic-program
 //! ring then implements the regex iterator's initial/progressed empty-match
-//! states. Search takes exactly `N` DFA transitions and `N + 1` reducer steps,
-//! plus `O(min(N, longest_literal))` explicitly bounded scratch.
+//! states. Search logically charges exactly `N` DFA transitions and `N + 1`
+//! reducer steps, while maximal root-miss runs avoid redundant physical table
+//! lookups and DP stores. Scratch is explicitly bounded by
+//! `O(min(N, longest_literal))`.
 
 use core::{fmt, mem::size_of};
 use std::collections::VecDeque;
 
+use memchr::{memrchr, memrchr2, memrchr3};
+
 const UNSET: u32 = u32::MAX;
 const CACHE_FORMAT_VERSION: u32 = 1;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
+const BYTE_CLASS_MASK: u16 = 0x01FF;
+const ROOT_INTEREST_FLAG: u16 = 0x0200;
+const ROOT_METADATA_SHIFT: u32 = 10;
+const ROOT_METADATA_CHUNK_MASK: u16 = 0x003F;
+const ROOT_METADATA_CHUNK_SHIFTS: [u32; 6] = [0, 6, 12, 18, 24, 30];
+const ROOT_COUNT_MASK: u64 = 0x01FF;
+const ROOT_SMALL_0_SHIFT: u32 = 9;
+const ROOT_SMALL_1_SHIFT: u32 = 17;
+const ROOT_SMALL_2_SHIFT: u32 = 25;
 
 /// Stable strategy identity shared by both operation-typed plans.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-dp.v1";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.reverse-dense-ac-root-skip-dp.v2";
 /// Stable identity for the count-specialized plan.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-dp.v1";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.reverse-dense-ac-root-skip-dp.v2";
 /// Stable identity for the span-sum-specialized plan.
-pub const SPAN_SUM_PLAN_ID: &str = "ordered-literal-aggregate.span-sum.reverse-dense-ac-dp.v1";
+pub const SPAN_SUM_PLAN_ID: &str =
+    "ordered-literal-aggregate.span-sum.reverse-dense-ac-root-skip-dp.v2";
 /// Version of the receipt-bearing dense construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 1;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
 /// Version of the partial-actual dense construction ledger.
 pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 1;
 
@@ -898,6 +912,43 @@ impl fmt::Display for ReduceError {
 
 impl std::error::Error for ReduceError {}
 
+#[derive(Clone, Copy, Debug)]
+struct RootInterest<'a> {
+    byte_classes: &'a [u16; 256],
+    small: [u8; 3],
+    count: u16,
+}
+
+impl RootInterest<'_> {
+    #[inline]
+    fn contains(&self, byte: u8) -> bool {
+        self.byte_classes[usize::from(byte)] & ROOT_INTEREST_FLAG != 0
+    }
+
+    #[inline]
+    fn last_in(&self, haystack: &[u8]) -> Option<usize> {
+        match self.count {
+            0 => None,
+            1 => memrchr(self.small[0], haystack),
+            2 => memrchr2(self.small[0], self.small[1], haystack),
+            3 => memrchr3(self.small[0], self.small[1], self.small[2], haystack),
+            256 if !haystack.is_empty() => haystack.len().checked_sub(1),
+            _ => haystack.iter().rposition(|&byte| self.contains(byte)),
+        }
+    }
+
+    #[inline]
+    fn miss_suffix_len(&self, haystack: &[u8]) -> usize {
+        self.last_in(haystack).map_or(haystack.len(), |position| {
+            haystack
+                .len()
+                .checked_sub(position)
+                .and_then(|width| width.checked_sub(1))
+                .expect("a retained position is inside the searched slice")
+        })
+    }
+}
+
 #[derive(Debug)]
 struct DenseReverseDfa {
     byte_classes: [u16; 256],
@@ -911,7 +962,7 @@ impl DenseReverseDfa {
     #[inline]
     fn next(&self, state: u32, byte: u8) -> u32 {
         let state = usize::try_from(state).expect("u32 state always fits usize");
-        let class = usize::from(self.byte_classes[usize::from(byte)]);
+        let class = usize::from(self.byte_classes[usize::from(byte)] & BYTE_CLASS_MASK);
         let cell = state
             .checked_mul(self.alphabet_classes)
             .and_then(|base| base.checked_add(class))
@@ -928,6 +979,31 @@ impl DenseReverseDfa {
                 .expect("u32 pattern length always fits usize");
             (pattern, length)
         })
+    }
+
+    #[inline]
+    fn root_has_no_output(&self) -> bool {
+        self.output_pattern[0] == UNSET
+    }
+
+    fn root_interest(&self) -> RootInterest<'_> {
+        let mut metadata = 0_u64;
+        for (&entry, shift) in self.byte_classes.iter().zip(ROOT_METADATA_CHUNK_SHIFTS) {
+            let chunk = (entry >> ROOT_METADATA_SHIFT) & ROOT_METADATA_CHUNK_MASK;
+            metadata |= u64::from(chunk) << shift;
+        }
+        RootInterest {
+            byte_classes: &self.byte_classes,
+            small: [
+                u8::try_from((metadata >> ROOT_SMALL_0_SHIFT) & u64::from(u8::MAX))
+                    .expect("encoded root byte fits u8"),
+                u8::try_from((metadata >> ROOT_SMALL_1_SHIFT) & u64::from(u8::MAX))
+                    .expect("encoded root byte fits u8"),
+                u8::try_from((metadata >> ROOT_SMALL_2_SHIFT) & u64::from(u8::MAX))
+                    .expect("encoded root byte fits u8"),
+            ],
+            count: u16::try_from(metadata & ROOT_COUNT_MASK).expect("encoded root count fits u16"),
+        }
     }
 }
 
@@ -1081,7 +1157,9 @@ impl OrderedLiteralCountPlan {
             limits,
         )?;
         ring.resize(upper.ring_entries, CountState::default());
-        let actual = self.core.execute_count(haystack, &mut ring, upper)?;
+        let actual = self
+            .core
+            .execute_count::<true>(haystack, &mut ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1135,7 +1213,9 @@ impl OrderedLiteralCountPlan {
                 .ok_or(ReduceError::InternalInvariant {
                     detail: "count workspace contains the active DP ring",
                 })?;
-        let actual = self.core.execute_count(haystack, active_ring, upper)?;
+        let actual = self
+            .core
+            .execute_count::<true>(haystack, active_ring, upper)?;
         Ok(CountResult {
             count: actual.match_events,
             accounting: ReduceAccounting {
@@ -1208,7 +1288,7 @@ impl OrderedLiteralSpanSumPlan {
             limits,
         )?;
         ring.resize(upper.ring_entries, SpanState::default());
-        let actual = self.core.execute_span(haystack, &mut ring, upper)?;
+        let actual = self.core.execute_span::<true>(haystack, &mut ring, upper)?;
         let span_sum = actual
             .span_sum
             .expect("span plan always publishes a span sum");
@@ -1263,7 +1343,9 @@ impl OrderedLiteralSpanSumPlan {
                 .ok_or(ReduceError::InternalInvariant {
                     detail: "span workspace contains the active DP ring",
                 })?;
-        let actual = self.core.execute_span(haystack, active_ring, upper)?;
+        let actual = self
+            .core
+            .execute_span::<true>(haystack, active_ring, upper)?;
         let span_sum = actual
             .span_sum
             .expect("span plan always publishes a span sum");
@@ -1303,7 +1385,7 @@ impl PlanCore {
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
             transition_kind: "byte-class-compressed dense u32 reverse AC DFA",
-            traversal_kind: "single reverse DFA pass plus bounded initial/progressed DP ring",
+            traversal_kind: "root-miss-skipping reverse DFA pass plus bounded initial/progressed DP ring",
             semantics: Semantics::RUST_BYTES_UNICODE_OFF,
             encoded_patterns: &self.encoded_patterns,
         }
@@ -1444,7 +1526,8 @@ impl PlanCore {
                 let mut state = 0_usize;
                 for &byte in bytes.iter().rev() {
                     tracker.charge(1)?;
-                    let class = usize::from(preflight.byte_classes[usize::from(byte)]);
+                    let class =
+                        usize::from(preflight.byte_classes[usize::from(byte)] & BYTE_CLASS_MASK);
                     let cell = state
                         .checked_mul(preflight.alphabet_classes)
                         .and_then(|base| base.checked_add(class))
@@ -1729,7 +1812,11 @@ impl PlanCore {
         Ok(())
     }
 
-    fn execute_count(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the root-skip proof and count DP recurrence stay adjacent for audit"
+    )]
+    fn execute_count<const SKIP_ROOT_RUNS: bool>(
         &self,
         haystack: &[u8],
         ring: &mut [CountState],
@@ -1738,6 +1825,8 @@ impl PlanCore {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = 0_u64;
+        let can_skip_root_runs = SKIP_ROOT_RUNS && self.dfa.root_has_no_output();
+        let root_interest = self.dfa.root_interest();
         let mut current_slot =
             haystack
                 .len()
@@ -1745,8 +1834,38 @@ impl PlanCore {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "count DP initial ring slot",
                 })?;
-        for position in (0..=haystack.len()).rev() {
+        let mut position = haystack.len();
+        loop {
             if position < haystack.len() {
+                if can_skip_root_runs && state == 0 {
+                    let root_miss_run = root_interest.miss_suffix_len(&haystack[..=position]);
+                    if root_miss_run != 0 {
+                        let consumed_through_start = root_miss_run
+                            == position
+                                .checked_add(1)
+                                .ok_or(ReduceError::ArithmeticOverflow {
+                                    computation: "root-miss count run endpoint",
+                                })?;
+                        if consumed_through_start {
+                            break;
+                        }
+                        current_slot = materialize_constant_reverse_run(
+                            ring,
+                            current_slot,
+                            root_miss_run,
+                            CountState {
+                                initial: next_initial,
+                                progressed: next_initial,
+                            },
+                        )?;
+                        position = position.checked_sub(root_miss_run).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "root-miss count position",
+                            },
+                        )?;
+                        continue;
+                    }
+                }
                 state = self.dfa.next(state, haystack[position]);
             }
             let value = match self.dfa.output(state) {
@@ -1787,6 +1906,13 @@ impl PlanCore {
             next_initial = value.initial;
             if position != 0 {
                 current_slot = previous_dp_ring_slot(current_slot, ring.len())?;
+                position = position
+                    .checked_sub(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "count reverse position",
+                    })?;
+            } else {
+                break;
             }
         }
         debug_assert!(next_initial <= upper.count);
@@ -1803,7 +1929,11 @@ impl PlanCore {
         })
     }
 
-    fn execute_span(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the root-skip proof and span DP recurrence stay adjacent for audit"
+    )]
+    fn execute_span<const SKIP_ROOT_RUNS: bool>(
         &self,
         haystack: &[u8],
         ring: &mut [SpanState],
@@ -1812,6 +1942,8 @@ impl PlanCore {
         validate_ring(ring.len(), upper.ring_entries)?;
         let mut state = 0_u32;
         let mut next_initial = SpanState::default();
+        let can_skip_root_runs = SKIP_ROOT_RUNS && self.dfa.root_has_no_output();
+        let root_interest = self.dfa.root_interest();
         let mut current_slot =
             haystack
                 .len()
@@ -1819,8 +1951,39 @@ impl PlanCore {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "span DP initial ring slot",
                 })?;
-        for position in (0..=haystack.len()).rev() {
+        let mut position = haystack.len();
+        loop {
             if position < haystack.len() {
+                if can_skip_root_runs && state == 0 {
+                    let root_miss_run = root_interest.miss_suffix_len(&haystack[..=position]);
+                    if root_miss_run != 0 {
+                        let consumed_through_start = root_miss_run
+                            == position
+                                .checked_add(1)
+                                .ok_or(ReduceError::ArithmeticOverflow {
+                                    computation: "root-miss span run endpoint",
+                                })?;
+                        if consumed_through_start {
+                            break;
+                        }
+                        current_slot = materialize_constant_reverse_run(
+                            ring,
+                            current_slot,
+                            root_miss_run,
+                            SpanState {
+                                initial_count: next_initial.initial_count,
+                                progressed_count: next_initial.initial_count,
+                                span_sum: next_initial.span_sum,
+                            },
+                        )?;
+                        position = position.checked_sub(root_miss_run).ok_or(
+                            ReduceError::ArithmeticOverflow {
+                                computation: "root-miss span position",
+                            },
+                        )?;
+                        continue;
+                    }
+                }
                 state = self.dfa.next(state, haystack[position]);
             }
             let value = match self.dfa.output(state) {
@@ -1873,6 +2036,13 @@ impl PlanCore {
             next_initial = value;
             if position != 0 {
                 current_slot = previous_dp_ring_slot(current_slot, ring.len())?;
+                position = position
+                    .checked_sub(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "span reverse position",
+                    })?;
+            } else {
+                break;
             }
         }
         debug_assert!(next_initial.initial_count <= upper.count);
@@ -1905,6 +2075,18 @@ struct BuildPreflight {
     has_empty_pattern: bool,
 }
 
+fn encode_root_metadata(byte_classes: &mut [u16; 256], count: u16, small: [u8; 3]) {
+    let metadata = u64::from(count)
+        | (u64::from(small[0]) << ROOT_SMALL_0_SHIFT)
+        | (u64::from(small[1]) << ROOT_SMALL_1_SHIFT)
+        | (u64::from(small[2]) << ROOT_SMALL_2_SHIFT);
+    for (entry, shift) in byte_classes.iter_mut().zip(ROOT_METADATA_CHUNK_SHIFTS) {
+        let chunk = u16::try_from((metadata >> shift) & u64::from(ROOT_METADATA_CHUNK_MASK))
+            .expect("six encoded metadata bits fit u16");
+        *entry |= chunk << ROOT_METADATA_SHIFT;
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one ordered preflight makes every construction allocation derivable before reserve"
@@ -1933,7 +2115,7 @@ fn preflight_build<P: AsRef<[u8]>>(
     let mut max_pattern_bytes = 0_usize;
     let mut min_nonempty_pattern_bytes = None;
     let mut has_empty_pattern = false;
-    let mut used = [false; 256];
+    let mut used = [0_u8; 256];
     for pattern in patterns {
         let bytes = pattern.as_ref();
         pattern_bytes =
@@ -1949,9 +2131,14 @@ fn preflight_build<P: AsRef<[u8]>>(
             min_nonempty_pattern_bytes = Some(
                 min_nonempty_pattern_bytes.map_or(bytes.len(), |old: usize| old.min(bytes.len())),
             );
+            used[usize::from(
+                *bytes
+                    .last()
+                    .expect("a nonempty pattern has a reverse-trie root byte"),
+            )] |= 0b10;
         }
         for &byte in bytes {
-            used[usize::from(byte)] = true;
+            used[usize::from(byte)] |= 0b01;
         }
     }
     if pattern_bytes > limits.max_pattern_bytes {
@@ -2001,7 +2188,7 @@ fn preflight_build<P: AsRef<[u8]>>(
         });
     }
     let mut byte_classes = [0_u16; 256];
-    let used_count = used.iter().filter(|&&present| present).count();
+    let used_count = used.iter().filter(|&&flags| flags & 0b01 != 0).count();
     let alphabet_classes = if used_count == 256 {
         256
     } else {
@@ -2012,9 +2199,22 @@ fn preflight_build<P: AsRef<[u8]>>(
             })?
     };
     let mut next_class = 0_u16;
-    for (byte, &present) in used.iter().enumerate() {
-        if present {
-            byte_classes[byte] = next_class;
+    let mut root_small = [0_u8; 3];
+    let mut root_count = 0_u16;
+    for (byte, &flags) in used.iter().enumerate() {
+        if flags & 0b01 != 0 {
+            let root_flag = if flags & 0b10 != 0 {
+                if let Some(slot) = root_small.get_mut(usize::from(root_count)) {
+                    *slot = u8::try_from(byte).expect("byte-domain index fits u8");
+                }
+                root_count = root_count
+                    .checked_add(1)
+                    .expect("the byte domain has at most 256 members");
+                ROOT_INTEREST_FLAG
+            } else {
+                0
+            };
+            byte_classes[byte] = next_class | root_flag;
             next_class = next_class
                 .checked_add(1)
                 .ok_or(BuildError::ArithmeticOverflow {
@@ -2023,12 +2223,13 @@ fn preflight_build<P: AsRef<[u8]>>(
         }
     }
     if used_count < 256 {
-        for (byte, &present) in used.iter().enumerate() {
-            if !present {
+        for (byte, &flags) in used.iter().enumerate() {
+            if flags & 0b01 == 0 {
                 byte_classes[byte] = next_class;
             }
         }
     }
+    encode_root_metadata(&mut byte_classes, root_count, root_small);
     let dfa_cells_upper_bound = trie_states_upper_bound
         .checked_mul(alphabet_classes)
         .ok_or(BuildError::ArithmeticOverflow {
@@ -2439,6 +2640,87 @@ fn validate_ring(actual: usize, expected: usize) -> Result<(), ReduceError> {
     Ok(())
 }
 
+/// Advance past a reverse root-miss run while retaining exactly the cyclic
+/// suffix that a later nonempty match can address. Logical transition and
+/// reducer accounting remains based on the complete run; this only removes
+/// redundant physical stores and root-row lookups.
+fn materialize_constant_reverse_run<T: Copy>(
+    ring: &mut [T],
+    current_slot: usize,
+    run: usize,
+    value: T,
+) -> Result<usize, ReduceError> {
+    if ring.is_empty() || current_slot >= ring.len() || run == 0 {
+        return Err(ReduceError::InternalInvariant {
+            detail: "root-miss run starts in a nonempty DP ring",
+        });
+    }
+    let wrapped_run = run
+        .checked_rem(ring.len())
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "root-miss ring advance",
+        })?;
+    let next_slot = if current_slot >= wrapped_run {
+        current_slot
+            .checked_sub(wrapped_run)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "root-miss unwrapped ring slot",
+            })?
+    } else {
+        ring.len()
+            .checked_sub(wrapped_run.checked_sub(current_slot).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "root-miss wrapped ring distance",
+                },
+            )?)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "root-miss wrapped ring slot",
+            })?
+    };
+    let readable_suffix = ring
+        .len()
+        .checked_sub(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "root-miss readable DP suffix",
+        })?;
+    let retained = run.min(readable_suffix);
+    let first = if next_slot
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "root-miss retained suffix start",
+        })?
+        == ring.len()
+    {
+        0
+    } else {
+        next_slot
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "root-miss retained suffix start",
+            })?
+    };
+    let first_end = first
+        .checked_add(retained)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "root-miss retained suffix end",
+        })?
+        .min(ring.len());
+    ring[first..first_end].fill(value);
+    let first_width = first_end
+        .checked_sub(first)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "root-miss first retained width",
+        })?;
+    let wrapped_width =
+        retained
+            .checked_sub(first_width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "root-miss wrapped retained width",
+            })?;
+    ring[..wrapped_width].fill(value);
+    Ok(next_slot)
+}
+
 #[inline]
 fn checked_dp_target_slot(
     position: usize,
@@ -2504,14 +2786,16 @@ fn previous_dp_ring_slot(current_slot: usize, ring_len: usize) -> Result<usize, 
 
 #[cfg(test)]
 mod tests {
+    use core::mem::size_of;
     use std::fmt::Write as _;
 
     use regex::bytes::{Regex, RegexBuilder};
 
     use super::{
-        BuildError, BuildLimits, OrderedLiteralCountPlan, OrderedLiteralCountWorkspace,
-        OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace, ReduceError, ReduceLimits,
-        build_allocation_probe, checked_dp_target_slot, previous_dp_ring_slot,
+        BuildError, BuildLimits, CountState, OrderedLiteralCountPlan, OrderedLiteralCountWorkspace,
+        OrderedLiteralSpanSumPlan, OrderedLiteralSpanSumWorkspace, ReduceActualCounters,
+        ReduceError, ReduceLimits, SpanState, build_allocation_probe, checked_dp_target_slot,
+        materialize_constant_reverse_run, previous_dp_ring_slot, reserve_ring,
     };
     use crate::{ASCII_WIDE_BYTES, AsciiByteSet, DispatchPolicy, Feature, SimdDispatchContext};
 
@@ -2695,6 +2979,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn root_interest_uses_small_reverse_searches_and_full_domain_bitmap_fallback() {
+        let haystack = b"\xFFa0b1c2d3a\x80";
+        let empty =
+            OrderedLiteralCountPlan::build(&[b"".as_slice()], BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            empty.core.dfa.root_interest().miss_suffix_len(haystack),
+            haystack.len()
+        );
+
+        let one =
+            OrderedLiteralCountPlan::build(&[b"xa".as_slice()], BuildLimits::unlimited()).unwrap();
+        let interest = one.core.dfa.root_interest();
+        assert_eq!(interest.count, 1);
+        assert_eq!(interest.last_in(haystack), Some(9));
+
+        let three = OrderedLiteralCountPlan::build(
+            &[b"xa".as_slice(), b"xb".as_slice(), b"xc".as_slice()],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let interest = three.core.dfa.root_interest();
+        assert_eq!(interest.count, 3);
+        assert_eq!(interest.last_in(haystack), Some(9));
+
+        let six = OrderedLiteralCountPlan::build(
+            &[
+                b"xa".as_slice(),
+                b"xb".as_slice(),
+                b"xc".as_slice(),
+                b"xd".as_slice(),
+                b"x\xFF".as_slice(),
+                b"x\x80".as_slice(),
+            ],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let interest = six.core.dfa.root_interest();
+        assert_eq!(interest.count, 6);
+        assert_eq!(interest.last_in(haystack), Some(10));
+        assert_eq!(interest.miss_suffix_len(haystack), 0);
+        assert_eq!(interest.miss_suffix_len(&haystack[..9]), 1);
+        assert_eq!(interest.miss_suffix_len(&haystack[..10]), 0);
+
+        let every_byte = (u8::MIN..=u8::MAX)
+            .map(|byte| vec![byte])
+            .collect::<Vec<_>>();
+        let all = OrderedLiteralCountPlan::build(&every_byte, BuildLimits::unlimited()).unwrap();
+        let interest = all.core.dfa.root_interest();
+        for byte in u8::MIN..=u8::MAX {
+            assert!(interest.contains(byte));
+        }
+        assert_eq!(interest.count, 256);
+        assert_eq!(interest.last_in(haystack), haystack.len().checked_sub(1));
+    }
+
+    #[test]
+    fn retained_root_interest_exactly_matches_constructed_root_transitions() {
+        let languages: &[&[&[u8]]] = &[
+            &[b""],
+            &[b"ab"],
+            &[b"ab", b"cb", b"\xFF\x00"],
+            &[b"", b"qa", b"wb", b"ec", b"rd", b"t\xFF", b"y\x80"],
+        ];
+        for &patterns in languages {
+            let plan = OrderedLiteralCountPlan::build(patterns, BuildLimits::unlimited()).unwrap();
+            let root_interest = plan.core.dfa.root_interest();
+            assert_eq!(
+                plan.core.dfa.root_has_no_output(),
+                !plan.build_accounting().has_empty_pattern
+            );
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    root_interest.contains(byte),
+                    plan.core.dfa.next(0, byte) != 0,
+                    "patterns={patterns:?}, byte={byte}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn constant_reverse_run_retains_only_future_readable_wrapped_slots() {
+        for ring_len in 2_usize..=9 {
+            for current_slot in 0..ring_len {
+                for run in 1_usize..=ring_len.checked_mul(3).unwrap() {
+                    let stale = usize::MAX;
+                    let value = 17_usize;
+                    let mut ring = vec![stale; ring_len];
+                    let next_slot =
+                        materialize_constant_reverse_run(&mut ring, current_slot, run, value)
+                            .unwrap();
+                    assert_eq!(
+                        next_slot,
+                        current_slot
+                            .checked_add(ring_len)
+                            .and_then(|slot| slot.checked_sub(run % ring_len))
+                            .unwrap()
+                            % ring_len
+                    );
+                    let retained = run.min(ring_len - 1);
+                    for offset in 1..=retained {
+                        assert_eq!(
+                            ring[(next_slot + offset) % ring_len],
+                            value,
+                            "ring_len={ring_len}, current_slot={current_slot}, run={run}, offset={offset}"
+                        );
+                    }
+                    if retained == ring_len - 1 {
+                        assert_eq!(ring[next_slot], stale);
+                    }
+                }
+            }
+        }
+    }
+
     fn regex(patterns: &[Vec<u8>]) -> Regex {
         let mut source = String::from("(?:");
         for (index, pattern) in patterns.iter().enumerate() {
@@ -2743,6 +3143,46 @@ mod tests {
             level = next;
         }
         all
+    }
+
+    fn scalar_count_actual(
+        plan: &OrderedLiteralCountPlan,
+        haystack: &[u8],
+    ) -> ReduceActualCounters {
+        let limits = ReduceLimits::unlimited();
+        let mut upper = plan
+            .core
+            .preflight_reduce::<CountState>(haystack.len(), false, None, limits)
+            .unwrap();
+        let mut ring =
+            reserve_ring::<CountState>(upper.ring_entries, "scalar test count ring").unwrap();
+        plan.core
+            .finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<CountState>(), limits)
+            .unwrap();
+        ring.resize(upper.ring_entries, CountState::default());
+        plan.core
+            .execute_count::<false>(haystack, &mut ring, upper)
+            .unwrap()
+    }
+
+    fn scalar_span_actual(
+        plan: &OrderedLiteralSpanSumPlan,
+        haystack: &[u8],
+    ) -> ReduceActualCounters {
+        let limits = ReduceLimits::unlimited();
+        let mut upper = plan
+            .core
+            .preflight_reduce::<SpanState>(haystack.len(), true, None, limits)
+            .unwrap();
+        let mut ring =
+            reserve_ring::<SpanState>(upper.ring_entries, "scalar test span ring").unwrap();
+        plan.core
+            .finish_scratch_preflight(&mut upper, ring.capacity(), size_of::<SpanState>(), limits)
+            .unwrap();
+        ring.resize(upper.ring_entries, SpanState::default());
+        plan.core
+            .execute_span::<false>(haystack, &mut ring, upper)
+            .unwrap()
     }
 
     fn plan_sequence(plan: &OrderedLiteralCountPlan, haystack: &[u8]) -> Vec<(u32, usize, usize)> {
@@ -2857,6 +3297,8 @@ mod tests {
                 let span = span_plan
                     .span_sum(haystack, ReduceLimits::unlimited())
                     .unwrap();
+                let scalar_count = scalar_count_actual(&count_plan, haystack);
+                let scalar_span = scalar_span_actual(&span_plan, haystack);
                 let expected_span = expected
                     .iter()
                     .map(|&(start, end)| u64::try_from(end - start).unwrap())
@@ -2871,9 +3313,222 @@ mod tests {
                     "patterns={patterns:?}, haystack={haystack:?}"
                 );
                 assert_eq!(span.accounting.actual.match_events, count.count);
+                assert_eq!(
+                    count.accounting.actual, scalar_count,
+                    "root skip/count scalar differential: patterns={patterns:?}, haystack={haystack:?}"
+                );
+                assert_eq!(
+                    span.accounting.actual, scalar_span,
+                    "root skip/span scalar differential: patterns={patterns:?}, haystack={haystack:?}"
+                );
                 assert_eq!(count.accounting.actual.transitions, haystack.len());
                 assert_eq!(count.accounting.actual.reducer_steps, haystack.len() + 1);
             }
+        }
+    }
+
+    #[test]
+    fn directed_root_skip_differential_covers_empty_duplicates_priority_and_failure() {
+        type Case<'a> = (&'a str, &'a [&'a [u8]], &'a [u8]);
+
+        let cases: &[Case<'_>] = &[
+            (
+                "empty disables skipping",
+                &[b"", b"ab", b"a"],
+                b"xxxxabxxxx",
+            ),
+            (
+                "duplicates preserve priority",
+                &[b"abc", b"abc", b"bc"],
+                b"xxxabcxxbc",
+            ),
+            (
+                "terminal beats failure output",
+                &[b"ab", b"b", b"cab"],
+                b"xxxxcabxxab",
+            ),
+            (
+                "failure output beats later terminal",
+                &[b"b", b"ab", b"cab"],
+                b"xxxxcabxxab",
+            ),
+            (
+                "single reverse root edge resumes correctly",
+                &[b"ab"],
+                b"aaaaabxxxxxxabaaaa",
+            ),
+            (
+                "four-plus full-byte bitmap fallback",
+                &[b"qa", b"wb", b"ec", b"rd", b"t\xFF", b"y\x80"],
+                b"xxxxxxxxqa--wb--ec--rd--t\xFF--y\x80",
+            ),
+            (
+                "ring wraps before and after failure chains",
+                &[b"abcde", b"bcde", b"cde", b"de"],
+                b"xxxxabcde---------bcde--------cde",
+            ),
+        ];
+        for &(label, patterns, haystack) in cases {
+            let count = OrderedLiteralCountPlan::build(patterns, BuildLimits::unlimited()).unwrap();
+            let span =
+                OrderedLiteralSpanSumPlan::build(patterns, BuildLimits::unlimited()).unwrap();
+            let skipped_count = count.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let skipped_span = span.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(
+                skipped_count.accounting.actual,
+                scalar_count_actual(&count, haystack),
+                "{label}: count"
+            );
+            assert_eq!(
+                skipped_span.accounting.actual,
+                scalar_span_actual(&span, haystack),
+                "{label}: span"
+            );
+        }
+    }
+
+    #[test]
+    fn root_skip_preserves_logical_accounting_and_exact_limit_refusals() {
+        let patterns = [b"ab".as_slice(), b"cab".as_slice()];
+        let haystack = b"xxxxxxxxabxxxxxxxxcabxxxxxxxx";
+        let count = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span = OrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let counted = count.count(haystack, ReduceLimits::unlimited()).unwrap();
+        let summed = span.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+
+        for actual in [counted.accounting.actual, summed.accounting.actual] {
+            assert_eq!(actual.transitions, haystack.len());
+            assert_eq!(actual.reducer_steps, haystack.len() + 1);
+            assert_eq!(
+                actual.total_work,
+                haystack.len() + haystack.len() + 1 + actual.ring_initializations
+            );
+        }
+
+        let count_exact = exact_reduce_limits(counted.accounting.upper_bounds, u64::MAX);
+        let span_exact = exact_reduce_limits(
+            summed.accounting.upper_bounds,
+            summed.accounting.upper_bounds.span_sum,
+        );
+        count.count(haystack, count_exact).unwrap();
+        span.span_sum(haystack, span_exact).unwrap();
+
+        assert!(matches!(
+            count.count(
+                haystack,
+                ReduceLimits {
+                    max_transitions: count_exact.max_transitions - 1,
+                    ..count_exact
+                }
+            ),
+            Err(ReduceError::TransitionLimit { .. })
+        ));
+        assert!(matches!(
+            count.count(
+                haystack,
+                ReduceLimits {
+                    max_reducer_steps: count_exact.max_reducer_steps - 1,
+                    ..count_exact
+                }
+            ),
+            Err(ReduceError::ReducerStepsLimit { .. })
+        ));
+        assert!(matches!(
+            span.span_sum(
+                haystack,
+                ReduceLimits {
+                    max_total_work: span_exact.max_total_work - 1,
+                    ..span_exact
+                }
+            ),
+            Err(ReduceError::TotalWorkLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn root_skip_overwrites_stale_workspace_at_boundary_ring_alignments() {
+        let patterns = [b"zzzzzzzzq".as_slice(), b"ab".as_slice()];
+        let count = OrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span = OrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let ring_len = count.core.ring_entries(usize::MAX).unwrap();
+        assert_eq!(ring_len, 10);
+        let mut count_workspace = OrderedLiteralCountWorkspace::new();
+        let mut span_workspace = OrderedLiteralSpanSumWorkspace::new();
+
+        let poison = b"zzzzzzzzqabababzzzzzzzzq";
+        let first_count = count
+            .count_with_workspace(poison, ReduceLimits::unlimited(), &mut count_workspace)
+            .unwrap();
+        let first_span = span
+            .span_sum_with_workspace(poison, ReduceLimits::unlimited(), &mut span_workspace)
+            .unwrap();
+        assert!(first_count.count > 0);
+        assert!(first_span.span_sum > 0);
+        assert_eq!(
+            first_count.accounting.actual.ring_initializations,
+            first_count.accounting.upper_bounds.ring_entries
+        );
+        assert_eq!(
+            first_span.accounting.actual.ring_initializations,
+            first_span.accounting.upper_bounds.ring_entries
+        );
+
+        for haystack_len in [ring_len * 2, ring_len * 2 + 1, ring_len * 3 - 1] {
+            let mut haystack = vec![b'x'; haystack_len];
+            haystack[2..4].copy_from_slice(b"ab");
+            let tail_match = haystack_len - 4;
+            haystack[tail_match..tail_match + 2].copy_from_slice(b"ab");
+            let expected_count = count.count(&haystack, ReduceLimits::unlimited()).unwrap();
+            let expected_span = span.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+            let mut steady_limits = ReduceLimits::unlimited();
+            steady_limits.max_ring_initializations = 0;
+            let steady_count = count
+                .count_with_workspace(&haystack, steady_limits, &mut count_workspace)
+                .unwrap();
+            let steady_span = span
+                .span_sum_with_workspace(&haystack, steady_limits, &mut span_workspace)
+                .unwrap();
+            assert_eq!(
+                steady_count.count, expected_count.count,
+                "haystack_len={haystack_len}"
+            );
+            assert_eq!(
+                steady_span.span_sum, expected_span.span_sum,
+                "haystack_len={haystack_len}"
+            );
+            assert_eq!(steady_count.accounting.actual.ring_initializations, 0);
+            assert_eq!(steady_span.accounting.actual.ring_initializations, 0);
+            assert_eq!(
+                steady_count.count,
+                scalar_count_actual(&count, &haystack).match_events,
+                "haystack_len={haystack_len}"
+            );
+            assert_eq!(
+                steady_span.span_sum,
+                scalar_span_actual(&span, &haystack).span_sum.unwrap(),
+                "haystack_len={haystack_len}"
+            );
+        }
+
+        for haystack in [b"abxxxxxabab".as_slice(), b"abxab"] {
+            let mut steady_limits = ReduceLimits::unlimited();
+            steady_limits.max_ring_initializations = 0;
+            let steady_count = count
+                .count_with_workspace(haystack, steady_limits, &mut count_workspace)
+                .unwrap();
+            let steady_span = span
+                .span_sum_with_workspace(haystack, steady_limits, &mut span_workspace)
+                .unwrap();
+            assert_eq!(
+                steady_count.count,
+                scalar_count_actual(&count, haystack).match_events
+            );
+            assert_eq!(
+                steady_span.span_sum,
+                scalar_span_actual(&span, haystack).span_sum.unwrap()
+            );
+            assert_eq!(steady_count.accounting.actual.ring_initializations, 0);
+            assert_eq!(steady_span.accounting.actual.ring_initializations, 0);
         }
     }
 
