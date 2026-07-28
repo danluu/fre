@@ -1413,15 +1413,15 @@ impl PlanCore {
                     computation: "candidate positions",
                 })?
         };
-        let pattern_checks = candidate_positions.checked_mul(self.build.patterns).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "pattern checks",
-            },
-        )?;
-        let verification_reads = candidate_positions
-            .checked_mul(self.build.pattern_bytes)
+        let pattern_checks = candidate_positions
+            .checked_mul(self.build.max_anchor_byte_bucket_patterns)
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "verification source reads",
+                computation: "anchor-byte bucket pattern checks",
+            })?;
+        let verification_reads = candidate_positions
+            .checked_mul(self.build.max_anchor_byte_bucket_pattern_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "anchor-byte bucket verification source reads",
             })?;
         let fixed_source_reads_per_position =
             self.build
@@ -1438,8 +1438,8 @@ impl PlanCore {
             })?;
         let work_per_position = self
             .build
-            .pattern_bytes
-            .checked_add(self.build.patterns)
+            .max_anchor_byte_bucket_pattern_bytes
+            .checked_add(self.build.max_anchor_byte_bucket_patterns)
             .and_then(|work| work.checked_add(4))
             .and_then(|work| work.checked_add(fixed_source_reads_per_position))
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -3496,6 +3496,14 @@ mod tests {
             build.max_anchor_byte_bucket_pattern_bytes,
             b"Sherlock".len()
         );
+        assert!(
+            build.patterns > build.max_anchor_byte_bucket_patterns,
+            "the proof must distinguish the whole set from one anchor-byte bucket"
+        );
+        assert!(
+            build.pattern_bytes > build.max_anchor_byte_bucket_pattern_bytes,
+            "the proof must charge only bytes reachable through one anchor-byte bucket"
+        );
         let result = plan
             .count(
                 b"Sherlock and Holmes and Sherlock",
@@ -3512,20 +3520,45 @@ mod tests {
             upper.pattern_checks,
             upper
                 .candidate_positions
-                .checked_mul(patterns.len())
+                .checked_mul(build.max_anchor_byte_bucket_patterns)
                 .unwrap()
         );
         assert_eq!(
             upper.source_byte_reads,
             upper
                 .candidate_positions
-                .checked_mul(
-                    patterns.iter().map(|pattern| pattern.len()).sum::<usize>()
-                        + build.mask_columns
-                        + 1
-                )
+                .checked_mul(build.max_anchor_byte_bucket_pattern_bytes + build.mask_columns + 1)
                 .unwrap()
         );
+        assert_eq!(
+            upper.work,
+            u64::try_from(
+                upper
+                    .candidate_positions
+                    .checked_mul(
+                        build.max_anchor_byte_bucket_pattern_bytes
+                            + build.max_anchor_byte_bucket_patterns
+                            + build.mask_columns
+                            + 5
+                    )
+                    .and_then(|work| work.checked_add(1))
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            plan.count(
+                b"Sherlock and Holmes and Sherlock",
+                ReduceLimits {
+                    max_work: upper.work - 1,
+                    ..ReduceLimits::unlimited()
+                }
+            ),
+            Err(ReduceError::WorkLimit {
+                needed,
+                limit
+            }) if needed == upper.work && limit == upper.work - 1
+        ));
         assert_eq!(actual.classified_positions, upper.candidate_positions);
         assert!(actual.candidate_events <= upper.candidate_positions);
         assert!(actual.pattern_checks <= upper.pattern_checks);
