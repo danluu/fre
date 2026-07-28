@@ -1,4 +1,4 @@
-//! JIT- and runtime-neutral claim-side wire contract for static Search V1 Span
+//! JIT- and runtime-neutral claim-side wire contracts for static Search
 //! candidates.
 //!
 //! This crate strictly projects canonical metadata and expectation bytes into
@@ -16,6 +16,12 @@
 //! domain-separated identity.
 
 #![forbid(unsafe_code)]
+
+/// Strict, parallel contract for Linux tag21 `SelectedEnd` register-return V2.
+///
+/// Its distinct record sizes, magics, identity domains, ABI tuple, and symbol
+/// prefixes deliberately prevent either Search V1 parser from admitting it.
+pub mod selected_end_v2;
 
 use core::fmt;
 
