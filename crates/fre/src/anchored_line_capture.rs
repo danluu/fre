@@ -3,9 +3,10 @@
 //! Construction parses the pinned Rust byte HIR and accepts only an absolute
 //! start followed by a bounded inline sequence of literal bytes, byte classes,
 //! and greedy single-byte repetitions. Explicit captures must be mandatory
-//! children of the root concatenation and must have positive width. Variable
-//! repetition boundaries are certified by the native kernel before the plan
-//! is published.
+//! children of the root concatenation, but may participate with an empty span.
+//! An optional terminal absolute End assertion is retained in the plan.
+//! Variable repetition boundaries are certified by the native kernel before
+//! the plan is published.
 
 use core::{fmt, mem::size_of};
 
@@ -24,7 +25,7 @@ use fre_syntax::{
 };
 use regex_syntax::hir::{Class, Hir, HirKind, Look, Repetition};
 
-pub const ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION: u32 = 1;
+pub const ANCHORED_LINE_CAPTURE_ALGORITHM_VERSION: u32 = 2;
 pub const ANCHORED_LINE_CAPTURE_ACCOUNTING_VERSION: u32 = 1;
 
 const INSPECTION_STACK_CAPACITY: usize = 64;
@@ -246,6 +247,7 @@ impl AnchoredLineCaptureBuilder {
             inspection.atoms,
             inspection.accounting.emitted_atoms,
             explicit_captures,
+            inspection.require_line_end,
             inspection.digest.finish(),
             KernelBuildLimits {
                 max_atoms: self.limits.max_atoms,
@@ -426,6 +428,7 @@ struct Inspector {
     limits: AnchoredLineCaptureBuildLimits,
     atoms: [AnchoredLineCaptureAtom; ANCHORED_LINE_CAPTURE_MAX_ATOMS],
     accounting: AnchoredLineCaptureHirAccounting,
+    require_line_end: bool,
     digest: StructuralDigest,
 }
 
@@ -444,6 +447,7 @@ impl Inspector {
                 emitted_atoms: 0,
                 inspection_work: 0,
             },
+            require_line_end: false,
             digest: StructuralDigest::new(source_digest),
         }
     }
@@ -467,6 +471,12 @@ impl Inspector {
             ));
         }
         self.digest.byte(0x01);
+        let (body, require_line_end) = body
+            .split_last()
+            .filter(|(last, _)| matches!(last.kind(), HirKind::Look(Look::End)))
+            .map_or((body, false), |(_, prefix)| (prefix, true));
+        self.require_line_end = require_line_end;
+        self.digest.byte(u8::from(require_line_end));
         for child in body {
             match child.kind() {
                 HirKind::Capture(capture) => {
@@ -482,14 +492,7 @@ impl Inspector {
                     self.charge(1)?;
                     self.digest.byte(0x02);
                     self.digest.u32(capture.index);
-                    let first_atom = self.accounting.emitted_atoms;
                     self.flatten(capture.sub.as_ref())?;
-                    let capture_minimum = self.minimum_width(first_atom)?;
-                    if capture_minimum == 0 {
-                        return Err(AnchoredLineCaptureBuildError::Unsupported(
-                            "mandatory captures must have positive width",
-                        ));
-                    }
                     self.digest.byte(0x03);
                 }
                 _ => self.flatten(child)?,
@@ -737,21 +740,6 @@ impl Inspector {
         Ok(())
     }
 
-    fn minimum_width(&self, first_atom: usize) -> Result<usize, AnchoredLineCaptureBuildError> {
-        self.atoms[first_atom..self.accounting.emitted_atoms]
-            .iter()
-            .try_fold(0_usize, |total, atom| {
-                let minimum = usize::try_from(atom.minimum()).map_err(|_| {
-                    AnchoredLineCaptureBuildError::ArithmeticOverflow("capture minimum width")
-                })?;
-                total
-                    .checked_add(minimum)
-                    .ok_or(AnchoredLineCaptureBuildError::ArithmeticOverflow(
-                        "capture minimum width",
-                    ))
-            })
-    }
-
     fn node(&mut self) -> Result<(), AnchoredLineCaptureBuildError> {
         self.accounting.hir_nodes = self.accounting.hir_nodes.checked_add(1).ok_or(
             AnchoredLineCaptureBuildError::ArithmeticOverflow("HIR nodes"),
@@ -786,6 +774,7 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     const TARGET: &str = r"^ *(\w+) +(\w+) +(\w+)";
+    const DELIMITED_TARGET: &str = r"^([A-Z0-9]+);([^;]+);([^;]+);([0-9]+);([^;]+);([^;]*);([0-9]*);([0-9]*);([-0-9/]*);([YN]);([^;]*);([^;]*);([^;]*);([^;]*);([^;]*)$";
 
     fn build(pattern: &str) -> AnchoredLineCapturePlan {
         AnchoredLineCaptureBuilder::new(pattern)
@@ -857,8 +846,10 @@ mod tests {
             r"^ *(a+) +(b+)",
             r"^([ab]{1,3}) +(z+)",
             r"^(ab)( +)([0-9]{2,4})",
+            r"^(a*)b",
             r"^x{2}([A-Z]+)",
             r"^(.+)",
+            r"^(a*);(b*)$",
         ];
         let alphabet = [
             b'a', b'b', b'z', b'0', b'9', b'A', b'Z', b'_', b' ', b'\r', b'\n', 0xFF,
@@ -887,6 +878,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn delimited_empty_fields_and_terminal_end_match_regex_bytes() {
+        let plan = build(DELIMITED_TARGET);
+        let report = plan.build_report();
+        assert_eq!(report.explicit_captures, 15);
+        assert_eq!(report.groups_per_match, 16);
+        assert!(report.identity.kernel.require_line_end);
+        let haystack = b"0041;LATIN CAPITAL LETTER A;Lu;0;L;;;;;N;;;;0061;\n\
+                         0000;<control>;Cc;0;BN;;;;;N;NULL;;;;\r\n\
+                         BAD;missing;fields\n\
+                         0042;LATIN CAPITAL LETTER B;Lu;0;L;;;;;N;;;;0062;;extra";
+        let actual = plan
+            .grep_capture_count(haystack, AnchoredLineCaptureRunLimits::default())
+            .unwrap()
+            .capture_count;
+        assert_eq!(actual, oracle(DELIMITED_TARGET, haystack));
+        assert_eq!(actual, 32);
     }
 
     #[test]
@@ -923,12 +933,11 @@ mod tests {
         for pattern in [
             r"(\w+)",
             r"^((a+))",
-            r"^(a*)b",
             r"^(a+|b+)",
             r"^(a+?) b",
             r"^(a+)a",
             r"^a*(?:b*)c",
-            r"^(\w+)$",
+            r"^(\w+)\b$",
         ] {
             assert!(
                 matches!(

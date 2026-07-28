@@ -234,7 +234,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v48-covered-ordered-root-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v49-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -621,10 +621,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible one-pattern grep-captures may bind one caller-owned authenticated whole-input LF/CRLF stream with reusable state/tag storage at the retained lifecycle boundary; direct one-shot reductions retain the unchanged generic per-line selector/replay, and source-free stream construction refusal selects that same fallback before source access",
         );
         identity.identity.push_str(
-            "; anchored-line-capture-v1 lowers generic Unicode-off absolute-start deterministic byte HIRs to fixed inline masks and counts mandatory capture participation in one raw LF/CRLF pass",
+            "; anchored-line-capture-v2 lowers generic Unicode-off absolute-start deterministic byte HIRs to fixed inline masks, retains an optional terminal absolute-End assertion, and counts mandatory capture participation in one raw LF/CRLF pass",
         );
         identity.availability.push_str(
-            "; grep-captures admits bounded absolute-start literal/byte-class/greedy-single-byte-repeat sequences whose variable boundaries are disjoint, with mandatory positive-width root captures and zero execution allocation/scratch/output",
+            "; grep-captures admits bounded absolute-start literal/byte-class/greedy-single-byte-repeat sequences whose variable boundaries are disjoint, including mandatory empty-span root captures and exact line-end matching, with zero execution allocation/scratch/output",
         );
         identity.identity.push_str(
             "; capture-word-run-v1 derives bounded captured same-subclass whole-word alternatives from canonical HIR and counts their fixed mandatory participation while preserving full ASCII or Unicode word context",
@@ -19289,6 +19289,7 @@ mod tests {
     #[test]
     fn generic_anchored_line_capture_routes_target_and_preserves_controls() {
         const PATTERN: &str = r"^ *(\w+) +(\w+) +(\w+)";
+        const DELIMITED: &str = r"^([A-Z0-9]+);([^;]+);([^;]+);([0-9]+);([^;]+);([^;]*);([0-9]*);([0-9]*);([-0-9/]*);([YN]);([^;]*);([^;]*);([^;]*);([^;]*);([^;]*)$";
         let limits = RunLimits::default();
         let haystack = b"one two three\n".repeat(8_782);
         let patterns = vec![PATTERN.to_string()];
@@ -19335,6 +19336,25 @@ mod tests {
         .expect("supported non-benchmark neighbor");
         assert_eq!(neighbor.actual, 6);
         assert_eq!(neighbor.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
+
+        let delimited_haystack = b"0041;LATIN CAPITAL LETTER A;Lu;0;L;;;;;N;;;;0061;\n\
+              0000;<control>;Cc;0;BN;;;;;N;NULL;;;;\r\n\
+              0042;LATIN CAPITAL LETTER B;Lu;0;L;;;;;N;;;;0062;;extra\n";
+        let delimited_patterns = vec![DELIMITED.to_string()];
+        let delimited = fre_reducer(
+            CandidateRequest {
+                job_id: "test/generic-anchored-delimited-empty-fields",
+                model: "grep-captures",
+                patterns: &delimited_patterns,
+                haystack: delimited_haystack,
+                unicode: false,
+                case_insensitive: false,
+            },
+            &limits,
+        )
+        .expect("generic terminal anchored-line reduction");
+        assert_eq!(delimited.actual, 32);
+        assert_eq!(delimited.plan, CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN);
 
         let ambiguous_haystack = b"aaa\n";
         let mut control = current_fre_rebar_capture_lifecycle(
@@ -22158,7 +22178,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v48-covered-ordered-root-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v49-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(identity.identity.contains("capture-word-run-v1"));
         assert!(identity.identity.contains("anchored-word-capture-v1"));
@@ -22212,7 +22232,7 @@ mod tests {
         );
         assert!(identity.availability.contains("two full word boundaries"));
         assert!(identity.identity.contains("aggregate-word-run-v1"));
-        assert!(identity.identity.contains("anchored-line-capture-v1"));
+        assert!(identity.identity.contains("anchored-line-capture-v2"));
         assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
         assert!(identity.identity.contains("literal-class-run-literal-v2"));
         assert!(identity.identity.contains("bounded-literal-pair-v1"));

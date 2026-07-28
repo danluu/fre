@@ -8,7 +8,7 @@
 
 use core::{fmt, mem::size_of};
 
-pub const PLAN_ID: &str = "anchored-line-capture.inline-byte-atoms.v1";
+pub const PLAN_ID: &str = "anchored-line-capture.inline-byte-atoms.v2";
 pub const COUNT_OPERATION_ID: &str = "anchored-line-capture.grep-participation-count.v1";
 pub const MAX_ATOMS: usize = 32;
 
@@ -132,6 +132,7 @@ pub struct OperationIdentity {
     pub explicit_captures: usize,
     pub groups_per_match: usize,
     pub minimum_match_bytes: usize,
+    pub require_line_end: bool,
     pub structural_digest: [u64; 2],
 }
 
@@ -474,6 +475,7 @@ impl AnchoredLineCapturePlan {
         atoms: [Atom; MAX_ATOMS],
         atom_count: usize,
         explicit_captures: usize,
+        require_line_end: bool,
         structural_digest: [u64; 2],
         limits: BuildLimits,
     ) -> Result<Self, BuildError> {
@@ -539,6 +541,7 @@ impl AnchoredLineCapturePlan {
             explicit_captures,
             groups_per_match,
             minimum_match_bytes,
+            require_line_end,
             structural_digest,
         };
         let build = BuildAccounting {
@@ -602,7 +605,11 @@ impl AnchoredLineCapturePlan {
         )?;
         enforce_run("peak bytes", upper_bounds.peak_bytes, limits.max_peak_bytes)?;
 
-        let mut scanner = LineScanner::new(self.atoms(), self.identity.groups_per_match);
+        let mut scanner = LineScanner::new(
+            self.atoms(),
+            self.identity.groups_per_match,
+            self.identity.require_line_end,
+        );
         for &byte in haystack {
             scanner.load(byte)?;
         }
@@ -730,15 +737,17 @@ enum MatchState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LineMatcher<'a> {
     atoms: &'a [Atom],
+    require_line_end: bool,
     atom: usize,
     repeated: u32,
     state: MatchState,
 }
 
 impl<'a> LineMatcher<'a> {
-    const fn new(atoms: &'a [Atom]) -> Self {
+    const fn new(atoms: &'a [Atom], require_line_end: bool) -> Self {
         Self {
             atoms,
+            require_line_end,
             atom: 0,
             repeated: 0,
             state: MatchState::Active,
@@ -746,6 +755,10 @@ impl<'a> LineMatcher<'a> {
     }
 
     fn push(&mut self, byte: u8, actual: &mut RunActual) -> Result<(), RunError> {
+        if self.require_line_end && self.state == MatchState::Matched {
+            self.state = MatchState::Failed;
+            return Ok(());
+        }
         while self.state == MatchState::Active {
             let Some(atom) = self.atoms.get(self.atom).copied() else {
                 self.state = MatchState::Matched;
@@ -773,6 +786,10 @@ impl<'a> LineMatcher<'a> {
             }
             if self.repeated >= atom.minimum {
                 self.advance(actual)?;
+                if self.require_line_end && self.state == MatchState::Matched {
+                    self.state = MatchState::Failed;
+                    return Ok(());
+                }
                 continue;
             }
             self.state = MatchState::Failed;
@@ -828,6 +845,7 @@ impl<'a> LineMatcher<'a> {
 struct LineScanner<'a> {
     atoms: &'a [Atom],
     groups_per_match: usize,
+    require_line_end: bool,
     matcher: LineMatcher<'a>,
     pending_cr: bool,
     ended_with_lf: bool,
@@ -835,11 +853,12 @@ struct LineScanner<'a> {
 }
 
 impl<'a> LineScanner<'a> {
-    const fn new(atoms: &'a [Atom], groups_per_match: usize) -> Self {
+    const fn new(atoms: &'a [Atom], groups_per_match: usize, require_line_end: bool) -> Self {
         Self {
             atoms,
             groups_per_match,
-            matcher: LineMatcher::new(atoms),
+            require_line_end,
+            matcher: LineMatcher::new(atoms, require_line_end),
             pending_cr: false,
             ended_with_lf: false,
             actual: RunActual {
@@ -942,7 +961,7 @@ impl<'a> LineScanner<'a> {
                     computation: "reducer events",
                 })?;
         }
-        self.matcher = LineMatcher::new(self.atoms);
+        self.matcher = LineMatcher::new(self.atoms, self.require_line_end);
         Ok(())
     }
 }
@@ -976,7 +995,7 @@ mod tests {
         {
             atoms[index] = atom;
         }
-        AnchoredLineCapturePlan::new(atoms, 6, 3, [7, 11], BuildLimits::default()).unwrap()
+        AnchoredLineCapturePlan::new(atoms, 6, 3, false, [7, 11], BuildLimits::default()).unwrap()
     }
 
     #[test]
@@ -1029,13 +1048,32 @@ mod tests {
         any.insert_range(0, u8::MAX).unwrap();
         let mut atoms = [Atom::default(); MAX_ATOMS];
         atoms[0] = Atom::new(any, 1, None);
-        let plan =
-            AnchoredLineCapturePlan::new(atoms, 1, 1, [1, 2], BuildLimits::default()).unwrap();
+        let plan = AnchoredLineCapturePlan::new(atoms, 1, 1, false, [1, 2], BuildLimits::default())
+            .unwrap();
         let result = plan
             .count(b"\xFF\n\xC0\x80\r\n", RunLimits::default())
             .unwrap();
         assert_eq!(result.actual.matches, 2);
         assert_eq!(result.capture_count, 4);
+    }
+
+    #[test]
+    fn terminal_end_requires_full_line_and_keeps_empty_captures() {
+        let a = ByteMask::singleton(b'a');
+        let semicolon = ByteMask::singleton(b';');
+        let b = ByteMask::singleton(b'b');
+        let mut atoms = [Atom::default(); MAX_ATOMS];
+        atoms[0] = Atom::new(a, 0, None);
+        atoms[1] = Atom::new(semicolon, 1, Some(1));
+        atoms[2] = Atom::new(b, 0, None);
+        let plan = AnchoredLineCapturePlan::new(atoms, 3, 2, true, [3, 5], BuildLimits::default())
+            .unwrap();
+        let result = plan
+            .count(b";\naa;bb\r\naa;bbx\nxaa;bb\n", RunLimits::default())
+            .unwrap();
+        assert!(result.identity.require_line_end);
+        assert_eq!(result.actual.matches, 2);
+        assert_eq!(result.capture_count, 6);
     }
 
     #[test]
@@ -1046,12 +1084,12 @@ mod tests {
         atoms[0] = Atom::new(a, 1, None);
         atoms[1] = Atom::new(a, 1, Some(1));
         assert!(matches!(
-            AnchoredLineCapturePlan::new(atoms, 2, 1, [0; 2], BuildLimits::default()),
+            AnchoredLineCapturePlan::new(atoms, 2, 1, false, [0; 2], BuildLimits::default()),
             Err(BuildError::AmbiguousBoundary { atom: 0 })
         ));
         atoms[1] = Atom::new(b, 0, None);
         assert!(matches!(
-            AnchoredLineCapturePlan::new(atoms, 2, 1, [0; 2], BuildLimits::default()),
+            AnchoredLineCapturePlan::new(atoms, 2, 1, false, [0; 2], BuildLimits::default()),
             Err(BuildError::NonPositiveBoundary { atom: 0 })
         ));
     }
