@@ -36,6 +36,7 @@ mod anchored_line_capture;
 mod anchored_word_capture;
 mod blocking_delimiter;
 mod bounded_literal_pair;
+mod capture_absolute_full;
 mod capture_count_seal;
 mod capture_iteration_seal;
 mod capture_noqa;
@@ -205,12 +206,21 @@ pub use anchored_line_capture::{
 pub use anchored_word_capture::{
     ANCHORED_WORD_CAPTURE_ACCOUNTING_VERSION, ANCHORED_WORD_CAPTURE_ALGORITHM_VERSION,
     ANCHORED_WORD_CAPTURE_COUNT_OPERATION_ID, ANCHORED_WORD_CAPTURE_PLAN_ID,
-    AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits,
-    AnchoredWordCaptureBuildReport, AnchoredWordCaptureBuilder, AnchoredWordCaptureCountResult,
-    AnchoredWordCaptureHirAccounting, AnchoredWordCaptureKind, AnchoredWordCaptureMode,
-    AnchoredWordCaptureOperationIdentity, AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity,
-    AnchoredWordCaptureRunActual, AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits,
-    AnchoredWordCaptureRunResource, AnchoredWordCaptureRunUpperBounds,
+    AnchoredWordCaptureBuildError, AnchoredWordCaptureBuildLimits, AnchoredWordCaptureBuildReport,
+    AnchoredWordCaptureBuilder, AnchoredWordCaptureCountResult, AnchoredWordCaptureHirAccounting,
+    AnchoredWordCaptureKind, AnchoredWordCaptureMode, AnchoredWordCaptureOperationIdentity,
+    AnchoredWordCapturePlan, AnchoredWordCapturePlanIdentity, AnchoredWordCaptureRunActual,
+    AnchoredWordCaptureRunError, AnchoredWordCaptureRunLimits, AnchoredWordCaptureRunResource,
+    AnchoredWordCaptureRunUpperBounds,
+};
+pub use capture_absolute_full::{
+    ABSOLUTE_FULL_CAPTURE_ACCOUNTING_VERSION, ABSOLUTE_FULL_CAPTURE_ALGORITHM_VERSION,
+    ABSOLUTE_FULL_CAPTURE_COUNT_OPERATION_ID, ABSOLUTE_FULL_CAPTURE_PLAN_ID,
+    AbsoluteFullCaptureBuildError, AbsoluteFullCaptureBuildLimits, AbsoluteFullCaptureBuildReport,
+    AbsoluteFullCaptureBuilder, AbsoluteFullCaptureCountResult, AbsoluteFullCaptureHirAccounting,
+    AbsoluteFullCaptureOperationIdentity, AbsoluteFullCapturePlan, AbsoluteFullCapturePlanIdentity,
+    AbsoluteFullCaptureRunActual, AbsoluteFullCaptureRunError, AbsoluteFullCaptureRunLimits,
+    AbsoluteFullCaptureRunResource, AbsoluteFullCaptureRunUpperBounds,
 };
 pub use capture_count_seal::{
     CAPTURE_COUNT_ACCOUNTING_VERSION, CAPTURE_COUNT_ALGORITHM_VERSION, CaptureCountActual,
