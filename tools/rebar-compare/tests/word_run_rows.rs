@@ -86,6 +86,55 @@ fn durable_word_run_targets_use_the_authenticated_aggregate_route() {
 }
 
 #[test]
+fn bare_greedy_word_repetitions_use_the_authenticated_aggregate_route() {
+    let ascii_haystack = b"\xffone two_2 \x80x";
+    for (model, expected) in [("count", 3), ("count-spans", 9)] {
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            model,
+            &[r"\w+".to_owned()],
+            false,
+            false,
+            ascii_haystack.len(),
+        )
+        .unwrap();
+        assert_eq!(lifecycle.plan(), "aggregate-word-run-v1");
+        assert_eq!(lifecycle.execute(ascii_haystack).unwrap(), expected);
+    }
+
+    let unicode_haystack = b"\xe9\x9b\xaa abc \xff \xce\x94";
+    for (model, expected) in [("count", 3), ("count-spans", 8)] {
+        let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
+            model,
+            &[r"\w+".to_owned()],
+            true,
+            false,
+            unicode_haystack.len(),
+        )
+        .unwrap();
+        assert_eq!(lifecycle.plan(), "aggregate-unicode-scalar-class");
+        assert_eq!(lifecycle.execute(unicode_haystack).unwrap(), expected);
+    }
+
+    let minimum = current_fre_rebar_aggregate_operation_lifecycle(
+        "count-spans",
+        &[r"\w{2,}".to_owned()],
+        false,
+        false,
+        b"a bc def".len(),
+    )
+    .unwrap();
+    assert_eq!(minimum.plan(), "aggregate-word-run-v1");
+    assert_eq!(minimum.execute(b"a bc def").unwrap(), 5);
+
+    for pattern in [r"\w+?", r"\w{1,3}"] {
+        let regex = current_fre_rebar_aggregate_builder(pattern, false, false)
+            .build_span_sum()
+            .unwrap();
+        assert_ne!(regex.build_report().plan, AggregatePlanKind::WordRun);
+    }
+}
+
+#[test]
 fn adapter_identity_names_the_operation_owned_word_run() {
     let identity = CurrentFreAdapter.identity();
     assert!(identity.adapter.contains("aggregate-word-run-v1"));

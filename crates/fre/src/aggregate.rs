@@ -1242,7 +1242,7 @@ pub struct AggregateBuildLimits {
     /// examined by selection.
     pub max_unicode_scalar_planner_work: usize,
     /// Maximum structural HIR/range/membership inspection work for the direct
-    /// complete-boundary word-run specialization.
+    /// complete-boundary or bare greedy word-run specialization.
     pub max_word_run_planner_work: usize,
     /// Maximum allocation-free HIR/literal inspection work for the ordered
     /// start-line/end-line literal specialization.
@@ -2717,7 +2717,7 @@ pub struct AggregateBuildReport {
     /// and canonical-range inspection even when continuation is selected. It
     /// is not an executed-CPU-instruction count.
     pub unicode_scalar_planner_work: usize,
-    /// Direct word-run HIR/range/boundary-membership inspection work. This
+    /// Direct word-run HIR/range/shape inspection work. This
     /// remains nonzero when an ineligible inspection precedes another
     /// selected family.
     pub word_run_planner_work: usize,

@@ -5,7 +5,7 @@ use fre_kernels::{
 };
 use regex_syntax::{
     ParserBuilder,
-    hir::{Class, Hir, HirKind, Look},
+    hir::{Class, Hir, HirKind, Look, Repetition},
 };
 
 use crate::{
@@ -1393,6 +1393,37 @@ pub(crate) fn inspect_aggregate_attempt(
         .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
 }
 
+fn inspect_bare_word_repetition(
+    repetition: &Repetition,
+    limit: usize,
+    accounting: &mut InspectionAccounting,
+) -> Result<Option<Plan>, AggregateInspectionError> {
+    if repetition.min == 0 || repetition.max.is_some() || !repetition.greedy {
+        return Ok(None);
+    }
+    let class_hir = peel_captures_accounted(&repetition.sub, limit, accounting)?;
+    let mode = match class_hir.kind() {
+        HirKind::Class(Class::Bytes(class)) => {
+            accounting.charge(class.ranges().len(), limit)?;
+            if !is_exact_ascii_word_class(class) {
+                return Ok(None);
+            }
+            WordMode::Ascii
+        }
+        HirKind::Class(Class::Unicode(class)) => {
+            accounting.charge(class.ranges().len(), limit)?;
+            if !is_exact_unicode_word_class(class, limit, accounting)? {
+                return Ok(None);
+            }
+            WordMode::Unicode
+        }
+        _ => return Ok(None),
+    };
+    let minimum_scalars =
+        usize::try_from(repetition.min).map_err(|_| AggregateInspectionError::Overflow)?;
+    Ok(Some(Plan::new(minimum_scalars, mode)))
+}
+
 fn inspect_aggregate_with_accounting(
     hir: &Hir,
     limit: usize,
@@ -1401,6 +1432,14 @@ fn inspect_aggregate_with_accounting(
     let root = peel_captures_accounted(hir, limit, accounting)?;
     if let HirKind::Repetition(repetition) = root.kind() {
         accounting.charge(3, limit)?;
+        if let Some(plan) = inspect_bare_word_repetition(repetition, limit, accounting)? {
+            return Ok(AggregateInspectionOutcome::Eligible(AggregateInspection {
+                plan,
+                work: accounting.work,
+                hir_nodes: accounting.hir_nodes,
+                captures: accounting.captures,
+            }));
+        }
         let exact = repetition.max == Some(repetition.min);
         let chunk_bytes =
             usize::try_from(repetition.min).map_err(|_| AggregateInspectionError::Overflow)?;
@@ -1903,11 +1942,13 @@ mod tests {
     };
 
     use regex::bytes::RegexBuilder;
+    use regex_syntax::ParserBuilder;
 
     use super::{
         ASCII_RUN_SCANNER_BUILD_WORK, AggregateBuildAccounting, AggregateBuildLimits,
-        AggregateOperationIdentity, AggregateReduceLimits, AsciiPlan, AsciiPlanOwner,
-        FIXED_BUILD_WORK, Plan, WordMode, aggregate_build_accounting_matches, ascii_word_set,
+        AggregateInspectionError, AggregateInspectionOutcome, AggregateOperationIdentity,
+        AggregateReduceLimits, AsciiPlan, AsciiPlanOwner, FIXED_BUILD_WORK, Plan, WordMode,
+        aggregate_build_accounting_matches, ascii_word_set, inspect_aggregate_attempt,
     };
     use crate::{SearchLimits, SearchWindow};
 
@@ -2044,6 +2085,85 @@ mod tests {
             &[0xC3, 0x28, 0xFF, b'a', b'c', b'x'],
         ] {
             assert_plan_matches(r"[\x61-\x63\x80\xff]{3}", plan, haystack);
+        }
+    }
+
+    #[test]
+    fn bare_ascii_word_runs_exhaust_short_malformed_sources() {
+        let cases = [
+            (r"\w+", Plan::new(1, WordMode::Ascii)),
+            (r"\w{2,}", Plan::new(2, WordMode::Ascii)),
+        ];
+        for (pattern, plan) in cases {
+            for len in 0_u32..=6 {
+                for mut encoded in 0..4_usize.pow(len) {
+                    let mut haystack =
+                        Vec::with_capacity(usize::try_from(len).expect("small length"));
+                    for _ in 0..len {
+                        haystack.push(match encoded % 4 {
+                            0 => b'a',
+                            1 => b'_',
+                            2 => b'!',
+                            _ => 0xff,
+                        });
+                        encoded /= 4;
+                    }
+                    assert_plan_matches(pattern, plan, &haystack);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bare_greedy_word_inspection_is_exact_and_refuses_nearby_shapes() {
+        let ascii = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(r"(\w+)")
+            .expect("ASCII word HIR");
+        let inspected = inspect_aggregate_attempt(&ascii, usize::MAX).expect("inspection");
+        let AggregateInspectionOutcome::Eligible(inspection) = inspected else {
+            panic!("bare greedy ASCII word run was not selected");
+        };
+        assert_eq!(inspection.plan, Plan::new(1, WordMode::Ascii));
+        assert_eq!(inspection.captures, 1);
+        assert_eq!(inspection.hir_nodes, 3);
+        let refusal = inspect_aggregate_attempt(&ascii, inspection.work - 1)
+            .expect_err("one-below planner work");
+        assert_eq!(
+            *refusal.source(),
+            AggregateInspectionError::WorkLimit {
+                needed: inspection.work,
+                limit: inspection.work - 1,
+            }
+        );
+        assert!(refusal.work() < inspection.work);
+
+        let unicode = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(r"\w{2,}")
+            .expect("Unicode word HIR");
+        let AggregateInspectionOutcome::Eligible(inspection) =
+            inspect_aggregate_attempt(&unicode, usize::MAX).expect("Unicode inspection")
+        else {
+            panic!("bare greedy Unicode word run was not selected");
+        };
+        assert_eq!(inspection.plan, Plan::new(2, WordMode::Unicode));
+
+        for pattern in [r"\w*", r"\w+?", r"\w{1,3}", r"[A-Z]+"] {
+            let hir = ParserBuilder::new()
+                .unicode(false)
+                .utf8(false)
+                .build()
+                .parse(pattern)
+                .expect("nearby ASCII HIR");
+            assert!(matches!(
+                inspect_aggregate_attempt(&hir, usize::MAX).expect("ineligible inspection"),
+                AggregateInspectionOutcome::Ineligible { .. }
+            ));
         }
     }
 

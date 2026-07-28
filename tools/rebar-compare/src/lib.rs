@@ -651,10 +651,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; Unicode-off bounded-affix count/span-sum scans maximal middle-byte runs once, verifies only suffix literals at disjoint right endpoints, and uses zero execution scratch",
         );
         identity.identity.push_str(
-            "; aggregate-word-run-v1 is a direct aggregate word-run with independent pre-source prospective limits and checked actual counters",
+            "; aggregate-word-run-v1 is a direct aggregate word-run derived from complete-boundary or bare greedy unbounded canonical word-class repetitions and reduced under independent pre-source prospective limits with checked actual counters",
         );
         identity.availability.push_str(
-            "; the direct word-run reduces canonical complete-boundary ASCII/Unicode runs once with zero execution scratch",
+            "; the direct word-run reduces canonical complete-boundary or bare greedy unbounded ASCII/Unicode runs once with zero execution scratch",
         );
         identity.identity.push_str(
             "; fixed-class-chunks-v1 authenticates arbitrary canonical Unicode-off byte classes and nonzero exact widths with operation-specific count/span-sum identities",
