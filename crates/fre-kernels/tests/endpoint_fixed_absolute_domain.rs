@@ -749,6 +749,153 @@ fn endpoint_run_exact_limits_succeed_and_every_one_below_refuses_before_source()
 }
 
 #[test]
+fn endpoint_compact_values_match_full_results_and_refuse_without_receipts() {
+    let limits = FixedAbsoluteDomainReduceLimits::default();
+
+    let end_masks = FixedAbsoluteDomainPlan::build_end_mask_sequence(
+        masks(b"abc"),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [b"xabc".as_slice(), b"xabd".as_slice(), b"ab".as_slice()] {
+        assert_eq!(
+            end_masks.span_sum_value_success(haystack, limits),
+            Some(end_masks.span_sum(haystack, limits).unwrap().span_sum)
+        );
+    }
+
+    let start_masks = FixedAbsoluteDomainPlan::build_start_mask_sequence(
+        masks(b"abc"),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [b"abcd".as_slice(), b"abxd".as_slice(), b"ab".as_slice()] {
+        assert_eq!(
+            start_masks.count_value_success(haystack, limits),
+            start_masks.count(haystack, limits).unwrap().count()
+        );
+        assert_eq!(
+            start_masks.span_sum_value_success(haystack, limits),
+            Some(start_masks.span_sum(haystack, limits).unwrap().span_sum)
+        );
+    }
+
+    let end_one = FixedAbsoluteDomainPlan::build_end_one_byte_mask(
+        singleton(b'z'),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [b"az".as_slice(), b"za".as_slice(), b"".as_slice()] {
+        assert_eq!(
+            end_one.span_sum_value_success(haystack, limits),
+            Some(end_one.span_sum(haystack, limits).unwrap().span_sum)
+        );
+    }
+
+    let terminal_greedy = FixedAbsoluteDomainPlan::build_end_greedy_class_literal(
+        FixedAbsoluteDomainByteMask::inclusive(b'a', b'z'),
+        b"XYZ",
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [
+        b"00abcXYZ".as_slice(),
+        b"00XYZ".as_slice(),
+        b"00abcXYQ".as_slice(),
+    ] {
+        assert_eq!(
+            terminal_greedy.span_sum_value_success(haystack, limits),
+            Some(terminal_greedy.span_sum(haystack, limits).unwrap().span_sum)
+        );
+    }
+
+    let repeat = FixedAbsoluteDomainPlan::build_whole_byte_repeat(
+        b'a',
+        2,
+        5,
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [
+        b"aaa".as_slice(),
+        b"aab".as_slice(),
+        b"a".as_slice(),
+        b"aaaaaa".as_slice(),
+    ] {
+        assert_eq!(
+            repeat.count_value_success(haystack, limits),
+            repeat.count(haystack, limits).unwrap().count()
+        );
+    }
+
+    let words = FixedAbsoluteDomainPlan::build_whole_ordered_words_precounted(
+        3,
+        8,
+        [b"aaa".as_slice(), b"bb".as_slice(), b"ccc".as_slice()].into_iter(),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [b"aaa".as_slice(), b"ccc".as_slice(), b"ddd".as_slice()] {
+        assert_eq!(
+            words.count_value_success(haystack, limits),
+            words.count(haystack, limits).unwrap().count()
+        );
+    }
+
+    let prefix = FixedAbsoluteDomainPlan::build_start_ordered_prefix(
+        b"abc",
+        [b'd', b'e', b'e'].into_iter(),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    for haystack in [
+        b"abcdx".as_slice(),
+        b"abcex".as_slice(),
+        b"abcfx".as_slice(),
+    ] {
+        assert_eq!(
+            prefix.span_sum_value_success(haystack, limits),
+            Some(prefix.span_sum(haystack, limits).unwrap().span_sum)
+        );
+    }
+
+    let scalar = FixedAbsoluteDomainPlan::build_whole_scalar_envelope_precounted(
+        2,
+        1,
+        [(0, 0x10_FFFF)].into_iter(),
+        FixedAbsoluteDomainBuildLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(scalar.count_value_success(b"a", limits), Some(0));
+    assert_eq!(scalar.count_value_success(b"aa", limits), None);
+
+    let upper = end_masks
+        .preflight(
+            4,
+            Window::new(0, 4),
+            FixedAbsoluteDomainOperation::SpanSum,
+            limits,
+        )
+        .unwrap()
+        .prospective();
+    let exact = exact_reduce_limits(upper);
+    assert_eq!(end_masks.span_sum_value_success(b"xabc", exact), Some(3));
+    let one_below = FixedAbsoluteDomainReduceLimits {
+        max_total_work: exact.max_total_work.checked_sub(1).unwrap(),
+        ..exact
+    };
+    assert_eq!(end_masks.span_sum_value_success(b"xabc", one_below), None);
+    assert_eq!(
+        end_masks
+            .span_sum(b"xabc", one_below)
+            .unwrap_err()
+            .receipt
+            .prospective,
+        Some(upper)
+    );
+}
+
+#[test]
 fn endpoint_every_descriptor_has_exact_and_every_positive_one_below_run_fences() {
     let end_masks = FixedAbsoluteDomainPlan::build_end_mask_sequence(
         masks(b"ab"),

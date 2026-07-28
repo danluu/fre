@@ -16087,6 +16087,12 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine
+            .guard
+            .count_value_success(haystack, limits.fixed_absolute)
+        {
+            return Ok(value);
+        }
         let guard = engine
             .guard
             .count(haystack, limits.fixed_absolute)
@@ -16097,7 +16103,12 @@ impl AggregatePlan {
                 )
             })?;
         match guard.outcome {
-            FixedAbsoluteDomainCountOutcome::Complete { count } => Ok(count),
+            FixedAbsoluteDomainCountOutcome::Complete { .. } => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-domain count refusal did not reproduce during authenticated replay",
+                ),
+            )),
             FixedAbsoluteDomainCountOutcome::PrepublishedContinuation => {
                 let residual = engine.residual.as_ref().ok_or_else(|| {
                     self.execution_error(
@@ -16738,16 +16749,24 @@ impl AggregatePlan {
                 ),
             ));
         }
-        engine
+        if let Some(value) = engine
             .guard
-            .span_sum(haystack, limits.fixed_absolute)
-            .map(|result| result.span_sum)
-            .map_err(|source| {
-                self.fixed_execution_error(
-                    limits,
-                    AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
-                )
-            })
+            .span_sum_value_success(haystack, limits.fixed_absolute)
+        {
+            return Ok(value);
+        }
+        match engine.guard.span_sum(haystack, limits.fixed_absolute) {
+            Err(source) => Err(self.fixed_execution_error(
+                limits,
+                AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact fixed-domain span-sum refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
     }
 
     #[inline(never)]

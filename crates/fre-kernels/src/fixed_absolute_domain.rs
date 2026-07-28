@@ -507,6 +507,12 @@ pub struct SpanSumResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactMatch {
+    matched: bool,
+    variable_span: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReduceResource {
     ByteProbes,
     BranchChecks,
@@ -2021,6 +2027,36 @@ impl FixedAbsoluteDomainPlan {
         self.count_in(haystack, Window::full(haystack), limits)
     }
 
+    /// Return only a successfully admitted complete count without
+    /// materializing a success receipt.
+    ///
+    /// `None` deliberately carries no terminal error and also represents the
+    /// prepublished-continuation disposition. Callers that publish an error or
+    /// continue a residual must replay [`Self::count`] with the same arguments
+    /// so the operation retains its complete authenticated receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let admission = self
+            .preflight(
+                haystack.len(),
+                Window::full(haystack),
+                Operation::Count,
+                limits,
+            )
+            .ok()?;
+        if admission.prospective.disposition != Disposition::Complete {
+            return None;
+        }
+        let compact = self.compact_match(haystack, &admission)?;
+        let count = u64::from(compact.matched);
+        (compact.variable_span.is_none()
+            && count <= admission.prospective.count
+            && usize::try_from(count).ok()? <= admission.prospective.match_events)
+            .then_some(count)
+    }
+
     pub fn count_in(
         &self,
         haystack: &[u8],
@@ -2071,6 +2107,39 @@ impl FixedAbsoluteDomainPlan {
         limits: ReduceLimits,
     ) -> Result<SpanSumResult, ReduceError> {
         self.span_sum_in(haystack, Window::full(haystack), limits)
+    }
+
+    /// Return only a successfully admitted span sum without materializing a
+    /// success receipt.
+    ///
+    /// `None` deliberately carries no terminal error. Callers that publish an
+    /// error must replay [`Self::span_sum`] with the same arguments so the
+    /// refusal retains its complete authenticated receipt.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let admission = self
+            .preflight(
+                haystack.len(),
+                Window::full(haystack),
+                Operation::SpanSum,
+                limits,
+            )
+            .ok()?;
+        if admission.prospective.disposition != Disposition::Complete {
+            return None;
+        }
+        let compact = self.compact_match(haystack, &admission)?;
+        let span_sum = if compact.matched {
+            match compact.variable_span {
+                Some(span) => u64::try_from(span).ok()?,
+                None => admission.prospective.span_sum,
+            }
+        } else {
+            0
+        };
+        (span_sum <= admission.prospective.span_sum).then_some(span_sum)
     }
 
     pub fn span_sum_in(
@@ -2311,6 +2380,87 @@ impl FixedAbsoluteDomainPlan {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn compact_match(&self, haystack: &[u8], admission: &Admission<'_>) -> Option<CompactMatch> {
+        if !core::ptr::eq(self, admission.owner)
+            || admission.identity != self.operation_identity(admission.operation)
+            || admission.haystack_len != haystack.len()
+            || admission.prospective.disposition != Disposition::Complete
+        {
+            return None;
+        }
+        if !admission.candidate_active {
+            return Some(CompactMatch {
+                matched: false,
+                variable_span: None,
+            });
+        }
+        let window = admission.window;
+        let result = match &self.descriptor {
+            Descriptor::MaskSequence(masks) => {
+                if matches!(self.identity, DescriptorIdentity::StartMaskSequence { .. }) {
+                    let source = haystack.get(..masks.len())?;
+                    source
+                        .iter()
+                        .zip(masks.iter())
+                        .all(|(&byte, mask)| mask.contains(byte))
+                } else {
+                    let start = haystack.len().checked_sub(masks.len())?;
+                    let source = haystack.get(start..)?;
+                    source
+                        .iter()
+                        .zip(masks.iter())
+                        .all(|(&byte, mask)| mask.contains(byte))
+                }
+            }
+            Descriptor::EndOneByteMask(mask) => {
+                let index = haystack.len().checked_sub(1)?;
+                mask.contains(*haystack.get(index)?)
+            }
+            Descriptor::EndGreedyClassLiteral { class, suffix } => {
+                let suffix_start = haystack.len().checked_sub(suffix.len())?;
+                if haystack.get(suffix_start..)? != &**suffix {
+                    return Some(CompactMatch {
+                        matched: false,
+                        variable_span: None,
+                    });
+                }
+                let mut start = suffix_start;
+                while start > window.start() {
+                    let index = start.checked_sub(1)?;
+                    if !class.contains(*haystack.get(index)?) {
+                        break;
+                    }
+                    start = index;
+                }
+                return Some(CompactMatch {
+                    matched: true,
+                    variable_span: Some(haystack.len().checked_sub(start)?),
+                });
+            }
+            Descriptor::WholeByteRepeat { byte, .. } => {
+                haystack.iter().all(|candidate| candidate == byte)
+            }
+            Descriptor::WholeOrderedWords { bytes, words } => words.iter().any(|word| {
+                bytes
+                    .get(word.start..word.end)
+                    .is_some_and(|source| source == haystack)
+            }),
+            Descriptor::StartOrderedPrefix {
+                prefix,
+                alternatives,
+            } => {
+                let candidate = *haystack.get(prefix.len())?;
+                haystack.get(..prefix.len())? == &**prefix && alternatives.contains(&candidate)
+            }
+            Descriptor::WholeScalarEnvelope { .. } => return None,
+        };
+        Some(CompactMatch {
+            matched: result,
+            variable_span: None,
+        })
     }
 
     #[allow(
