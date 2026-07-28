@@ -3,20 +3,21 @@
 //! The admitted shape is `PREFIX MIDDLE{N} SUFFIX` for `N > 0`. Unicode-off
 //! plans consume one byte per unit. Unicode-on plans decode each valid UTF-8
 //! scalar once; invalid bytes break the pending window and advance one byte.
-//! A circular `N + 2` unit window retains prefix/middle/suffix membership and
-//! the middle membership total. Byte plans compile each class to an inline
-//! 256-bit mask; Unicode plans retain bounded binary search over scalar ranges.
-//! The reducer therefore checks each candidate start in constant time, emits
-//! the leftmost non-overlapping sequence, and never constructs a
-//! boundary-indexed continuation log.
+//! Byte plans of at most 64 units compile the three classes into a 256-entry
+//! byte-category table and eight position masks. One Shift-And recurrence then
+//! recognizes the fixed-width sequence without operation-time allocation.
+//! Longer byte plans and Unicode plans retain a circular `N + 2` unit window;
+//! Unicode membership uses bounded binary search over scalar ranges. Both
+//! reducers emit the same leftmost non-overlapping sequence and never
+//! construct a boundary-indexed continuation log.
 
 use core::{fmt, mem::size_of};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError, Window};
 
-pub const PLAN_ID: &str = "fixed-class-sandwich.circular-window-byte-bitsets.v2";
-pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v2";
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v2";
+pub const PLAN_ID: &str = "fixed-class-sandwich.byte-shift-and-or-circular-window.v3";
+pub const COUNT_OPERATION_ID: &str = "fixed-class-sandwich.count.v3";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-class-sandwich.span-sum.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Semantics {
@@ -599,12 +600,120 @@ impl ByteClass {
     }
 }
 
+const BYTE_VALUES: usize = 256;
+const BYTE_CATEGORY_COUNT: usize = 8;
+const SHIFT_AND_MAX_UNITS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ByteShiftAnd {
+    categories: [u8; BYTE_VALUES],
+    position_masks: [u64; BYTE_CATEGORY_COUNT],
+    accept_mask: u64,
+}
+
+impl ByteShiftAnd {
+    fn build(
+        classes: &[ByteClass; 3],
+        window_units: usize,
+        limits: BuildLimits,
+        work: &mut usize,
+        tracker: &mut DirectBuildTracker,
+    ) -> Result<Option<Self>, BuildError> {
+        if window_units > SHIFT_AND_MAX_UNITS {
+            return Ok(None);
+        }
+        let suffix_position =
+            window_units
+                .checked_sub(1)
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class Shift-And suffix position",
+                })?;
+        let accept_mask = 1_u64
+            .checked_shl(u32::try_from(suffix_position).map_err(|_| {
+                BuildError::ArithmeticOverflow {
+                    computation: "fixed class Shift-And suffix shift",
+                }
+            })?)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "fixed class Shift-And accept mask",
+            })?;
+        let middle_units = window_units
+            .checked_sub(2)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "fixed class Shift-And middle width",
+            })?;
+        let middle_mask = if middle_units == 0 {
+            0
+        } else {
+            let low = 1_u64
+                .checked_shl(u32::try_from(middle_units).map_err(|_| {
+                    BuildError::ArithmeticOverflow {
+                        computation: "fixed class Shift-And middle shift",
+                    }
+                })?)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class Shift-And middle mask",
+                })?;
+            low.checked_shl(1).ok_or(BuildError::ArithmeticOverflow {
+                computation: "fixed class Shift-And middle placement",
+            })?
+        };
+        let mut position_masks = [0_u64; BYTE_CATEGORY_COUNT];
+        for (category, mask) in position_masks.iter_mut().enumerate() {
+            if category & 1 != 0 {
+                *mask |= 1;
+            }
+            if category & 2 != 0 {
+                *mask |= middle_mask;
+            }
+            if category & 4 != 0 {
+                *mask |= accept_mask;
+            }
+        }
+        let mut categories = [0_u8; BYTE_VALUES];
+        for byte in u8::MIN..=u8::MAX {
+            let mut category = 0_u8;
+            for (index, class) in classes.iter().enumerate() {
+                if class.contains(byte) {
+                    category |= 1_u8
+                        .checked_shl(u32::try_from(index).map_err(|_| {
+                            BuildError::ArithmeticOverflow {
+                                computation: "fixed class Shift-And category shift",
+                            }
+                        })?)
+                        .ok_or(BuildError::ArithmeticOverflow {
+                            computation: "fixed class Shift-And category bit",
+                        })?;
+                }
+                *work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+                    computation: "fixed class Shift-And classification work",
+                })?;
+                enforce_build(*work, limits.max_build_work, BuildResource::Work)?;
+                tracker.record_work(*work)?;
+            }
+            categories[usize::from(byte)] = category;
+        }
+        Ok(Some(Self {
+            categories,
+            position_masks,
+            accept_mask,
+        }))
+    }
+
+    #[inline]
+    fn position_mask(&self, byte: u8) -> u64 {
+        self.position_masks[usize::from(self.categories[usize::from(byte)])]
+    }
+}
+
 #[derive(Debug)]
 pub struct FixedClassSandwichPlan {
     prefix: Box<[ScalarRange]>,
     middle: Box<[ScalarRange]>,
     suffix: Box<[ScalarRange]>,
     byte_classes: Option<[ByteClass; 3]>,
+    byte_shift_and: Option<ByteShiftAnd>,
     semantics: Semantics,
     middle_repetitions: u32,
     window_units: usize,
@@ -772,6 +881,12 @@ impl FixedClassSandwichPlan {
             } else {
                 None
             };
+            let byte_shift_and = match &byte_classes {
+                Some(classes) => {
+                    ByteShiftAnd::build(classes, window_units, limits, &mut work, &mut tracker)?
+                }
+                None => None,
+            };
             work = work.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
                 computation: "fixed class repetition work",
             })?;
@@ -829,6 +944,7 @@ impl FixedClassSandwichPlan {
                 middle: middle.into_boxed_slice(),
                 suffix: suffix.into_boxed_slice(),
                 byte_classes,
+                byte_shift_and,
                 semantics,
                 middle_repetitions,
                 window_units,
@@ -945,9 +1061,10 @@ impl FixedClassSandwichPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "fixed class decode byte checks",
                 })?;
+        let membership_factor = if self.byte_shift_and.is_some() { 1 } else { 3 };
         let membership_tests =
             input_bytes
-                .checked_mul(3)
+                .checked_mul(membership_factor)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "fixed class membership tests",
                 })?;
@@ -1038,9 +1155,14 @@ impl FixedClassSandwichPlan {
         enforce_reduce(work, limits.max_work, ReduceResource::Work)?;
 
         let mut ring = Vec::new();
-        ring.try_reserve_exact(self.window_units)
+        let ring_units = if self.byte_shift_and.is_some() {
+            0
+        } else {
+            self.window_units
+        };
+        ring.try_reserve_exact(ring_units)
             .map_err(|_| ReduceError::AllocationFailed {
-                additional: self.window_units,
+                additional: ring_units,
             })?;
         let scratch_bytes = ring.capacity().checked_mul(size_of::<Unit>()).ok_or(
             ReduceError::ArithmeticOverflow {
@@ -1052,7 +1174,7 @@ impl FixedClassSandwichPlan {
             limits.max_scratch_bytes,
             ReduceResource::Scratch,
         )?;
-        ring.resize(self.window_units, Unit::default());
+        ring.resize(ring_units, Unit::default());
         let persistent_bytes = self.build.persistent_bytes;
         let peak_bytes =
             persistent_bytes
@@ -1092,6 +1214,9 @@ impl FixedClassSandwichPlan {
         mut ring: Vec<Unit>,
     ) -> Result<ReduceActualCounters, ReduceError> {
         let local = &haystack[window.start()..window.end()];
+        if let Some(shift_and) = &self.byte_shift_and {
+            return self.execute_byte_shift_and(local, upper, shift_and);
+        }
         let mut position = 0_usize;
         let mut head = 0_usize;
         let mut length = 0_usize;
@@ -1278,6 +1403,83 @@ impl FixedClassSandwichPlan {
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual fixed class work",
             })?;
+        debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
+        debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
+        debug_assert!(actual.membership_tests <= upper.membership_tests);
+        debug_assert!(actual.range_comparisons <= upper.range_comparisons);
+        debug_assert!(actual.reducer_steps <= upper.reducer_steps);
+        debug_assert!(actual.match_events <= upper.match_events);
+        debug_assert!(actual.count <= upper.count);
+        debug_assert!(actual.matched_bytes <= upper.span_sum);
+        debug_assert!(actual.work <= upper.work);
+        Ok(actual)
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the Shift-And state uses intentional wrapping-width bit shifts while every published counter remains checked"
+    )]
+    fn execute_byte_shift_and(
+        &self,
+        local: &[u8],
+        upper: ReduceUpperBounds,
+        shift_and: &ByteShiftAnd,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let mut state = 0_u64;
+        let mut count = 0_u64;
+        for &byte in local {
+            state = (state.wrapping_shl(1) | 1) & shift_and.position_mask(byte);
+            if state & shift_and.accept_mask != 0 {
+                count = count
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "fixed class Shift-And count",
+                    })?;
+                // A fixed-width match suppresses every overlapping candidate.
+                // The next byte injects the first legal post-match start.
+                state = 0;
+            }
+        }
+        let match_events = usize::try_from(count).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "fixed class Shift-And match events",
+        })?;
+        let width =
+            u64::try_from(self.window_units).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "fixed class Shift-And width as u64",
+            })?;
+        let matched_bytes = count
+            .checked_mul(width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class Shift-And matched bytes",
+            })?;
+        let reducer_steps = local
+            .len()
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class Shift-And reducer steps",
+            })?;
+        let work = local
+            .len()
+            .checked_add(local.len())
+            .and_then(|value| value.checked_add(reducer_steps))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed class Shift-And work",
+            })?;
+        let actual = ReduceActualCounters {
+            input_bytes_advanced: local.len(),
+            decode_byte_checks: local.len(),
+            valid_units: local.len(),
+            invalid_bytes: 0,
+            membership_tests: local.len(),
+            range_comparisons: 0,
+            reducer_steps,
+            window_resets: match_events,
+            match_events,
+            count,
+            matched_bytes,
+            work,
+            scratch_bytes: 0,
+        };
         debug_assert!(actual.input_bytes_advanced <= upper.input_bytes);
         debug_assert!(actual.decode_byte_checks <= upper.decode_byte_checks);
         debug_assert!(actual.membership_tests <= upper.membership_tests);
@@ -1685,6 +1887,33 @@ mod tests {
         assert_eq!(counted.accounting.upper_bounds.range_comparisons, 0);
         assert_eq!(counted.accounting.actual.range_comparisons, 0);
         assert_eq!(counted.accounting.identity.plan_id, super::PLAN_ID);
+    }
+
+    #[test]
+    fn byte_shift_and_covers_64_units_and_resets_after_each_match() {
+        let plan = FixedClassSandwichPlan::build_bytes(
+            [(b'a', b'a')],
+            [(b'b', b'b')],
+            [(b'c', b'c')],
+            62,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        assert!(plan.byte_shift_and.is_some());
+        let one = format!("a{}c", "b".repeat(62));
+        let haystack = format!("{one}{one}a{}c", "b".repeat(61));
+        let expected = oracle("ab{62}c", false, haystack.as_bytes());
+        let counted = plan
+            .count(haystack.as_bytes(), ReduceLimits::default())
+            .unwrap();
+        let summed = plan
+            .span_sum(haystack.as_bytes(), ReduceLimits::default())
+            .unwrap();
+        assert_eq!(counted.count, expected.0);
+        assert_eq!(summed.span_sum, expected.1);
+        assert_eq!(counted.accounting.upper_bounds.scratch_bytes, 0);
+        assert_eq!(counted.accounting.actual.scratch_bytes, 0);
+        assert_eq!(counted.accounting.actual.membership_tests, haystack.len());
     }
 
     #[test]

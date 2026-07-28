@@ -2885,18 +2885,15 @@ fn fixed_class_sandwich_admission_and_execution_limits_are_typed() {
     else {
         panic!("fixed class plan executed another family")
     };
+    assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
     let mut run_limits = AggregateRunLimits::default();
-    run_limits.fixed_class_sandwich.max_scratch_bytes = accounting
-        .upper_bounds
-        .scratch_bytes
-        .checked_sub(1)
-        .unwrap();
+    run_limits.fixed_class_sandwich.max_work = accounting.upper_bounds.work.checked_sub(1).unwrap();
     let error = regex.count(haystack, run_limits).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
         AggregateExecutionSource::FixedClassSandwich(
-            FixedClassSandwichReduceError::ScratchLimit { .. }
+            FixedClassSandwichReduceError::WorkLimit { .. }
         )
     ));
 
