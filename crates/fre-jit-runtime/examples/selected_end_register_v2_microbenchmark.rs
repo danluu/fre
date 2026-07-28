@@ -177,7 +177,7 @@ mod linux_aarch64 {
 
     struct Fixture {
         storage: Vec<u8>,
-        alignment: usize,
+        offset: usize,
         bytes: usize,
         window: SearchWindow,
         expected: SpanValue,
@@ -185,7 +185,7 @@ mod linux_aarch64 {
 
     impl Fixture {
         fn haystack(&self) -> &[u8] {
-            &self.storage[self.alignment..self.alignment + self.bytes]
+            &self.storage[self.offset..self.offset + self.bytes]
         }
     }
 
@@ -537,7 +537,6 @@ mod linux_aarch64 {
         preflight: LiteralSearchPreflight<'_, '_>,
         expected: SpanValue,
     ) -> Result<ColdSample, Box<dyn Error>> {
-        let total_started = Instant::now();
         match engine {
             Engine::Portable => {
                 let plan_started = Instant::now();
@@ -556,7 +555,7 @@ mod linux_aarch64 {
                     publish_ns: 0,
                     session_ns: 0,
                     first_call_ns,
-                    total_ns: total_started.elapsed().as_nanos(),
+                    total_ns: sum_cold_stages(plan_build_ns, 0, 0, 0, first_call_ns)?,
                     code_bytes: 0,
                     checksum: span_checksum(actual, 0)?,
                 })
@@ -589,7 +588,7 @@ mod linux_aarch64 {
                     publish_ns,
                     session_ns,
                     first_call_ns,
-                    total_ns: total_started.elapsed().as_nanos(),
+                    total_ns: sum_cold_stages(0, emit_ns, publish_ns, session_ns, first_call_ns)?,
                     code_bytes,
                     checksum: span_checksum(actual, 0)?,
                 })
@@ -612,11 +611,11 @@ mod linux_aarch64 {
                 let session_ns = session_started.elapsed().as_nanos();
                 let first_started = Instant::now();
                 let (matched, accounting) = black_box(session.search_preflighted(preflight)?);
+                let actual = black_box(matched.map(|span| (span.start(), span.end())));
                 let first_call_ns = first_started.elapsed().as_nanos();
                 if accounting != preflight.accounting() {
                     return Err("cold ABI2 accounting mismatch".into());
                 }
-                let actual = matched.map(|span| (span.start(), span.end()));
                 require_expected(engine, actual, expected)?;
                 Ok(ColdSample {
                     plan_build_ns: 0,
@@ -624,12 +623,34 @@ mod linux_aarch64 {
                     publish_ns,
                     session_ns,
                     first_call_ns,
-                    total_ns: total_started.elapsed().as_nanos(),
+                    total_ns: sum_cold_stages(0, emit_ns, publish_ns, session_ns, first_call_ns)?,
                     code_bytes,
                     checksum: span_checksum(actual, 0)?,
                 })
             }
         }
+    }
+
+    fn sum_cold_stages(
+        plan_build_ns: u128,
+        emit_ns: u128,
+        publish_ns: u128,
+        session_ns: u128,
+        first_call_ns: u128,
+    ) -> Result<u128, Box<dyn Error>> {
+        [
+            plan_build_ns,
+            emit_ns,
+            publish_ns,
+            session_ns,
+            first_call_ns,
+        ]
+        .into_iter()
+        .try_fold(0_u128, |total, stage| {
+            total
+                .checked_add(stage)
+                .ok_or_else(|| "cold-stage total overflow".into())
+        })
     }
 
     fn calibrate(
@@ -732,7 +753,16 @@ mod linux_aarch64 {
         }
         let storage_bytes = bytes.checked_add(15).ok_or("fixture allocation overflow")?;
         let mut storage = vec![b'x'; storage_bytes];
-        let haystack = &mut storage[alignment..alignment + bytes];
+        let base_alignment = storage.as_ptr().addr() & 15;
+        let offset = alignment
+            .checked_add(16)
+            .and_then(|value| value.checked_sub(base_alignment))
+            .ok_or("fixture alignment overflow")?
+            & 15;
+        let haystack = &mut storage[offset..offset + bytes];
+        if haystack.as_ptr().addr() & 15 != alignment {
+            return Err("fixture failed to realize its requested alignment".into());
+        }
         let mut window = SearchWindow::new(0, bytes);
         let expected = match scenario {
             Scenario::Present => {
@@ -774,7 +804,7 @@ mod linux_aarch64 {
         };
         Ok(Fixture {
             storage,
-            alignment,
+            offset,
             bytes,
             window,
             expected,
@@ -867,10 +897,17 @@ mod linux_aarch64 {
         {
             return Err("run ID is empty or contains unsupported characters".into());
         }
-        if !(identity.instance_type.starts_with("c9g.")
-            || identity.instance_type.starts_with("m9g."))
+        let instance_suffix = identity
+            .instance_type
+            .strip_prefix("c9g.")
+            .or_else(|| identity.instance_type.strip_prefix("m9g."));
+        if instance_suffix.is_none_or(str::is_empty)
+            || !identity
+                .instance_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
         {
-            return Err("instance type is outside c9g/m9g".into());
+            return Err("instance type is outside the safe c9g/m9g grammar".into());
         }
         Ok(identity)
     }
@@ -1035,6 +1072,7 @@ mod linux_aarch64 {
         print_meta("sve_lane_contract", "PTRUE-VL16");
         print_meta("timed_preflight", "outside");
         print_meta("timed_result_projection", "value-only");
+        print_meta("cold_total", "sum-of-timed-stages-preflight-outside");
         print_meta("sample_order", "caller-supplied-permutation");
     }
 
