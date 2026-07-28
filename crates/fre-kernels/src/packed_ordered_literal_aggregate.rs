@@ -2,9 +2,10 @@
 //!
 //! The retained owner is entirely FRE controlled. It contains one
 //! length-prefixed copy of the ordered patterns, fixed metadata, a fixed
-//! fixed-anchor-byte-to-pattern map and one already-dispatched ASCII
-//! classifier. Construction ranks common in-pattern offsets using a frozen
-//! byte-frequency policy and complete bucket cost.
+//! fixed-anchor-byte-to-pattern map, one full-byte screening classifier and
+//! one correlated full-byte bucket classifier. Construction ranks common
+//! in-pattern offsets using a frozen byte-frequency policy and complete bucket
+//! cost.
 //! Construction publishes that owner through one exact fallible allocation.
 //! The operation walks candidate starts monotonically, verifies pattern IDs in
 //! source order and never allocates.
@@ -18,19 +19,19 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, try_box_preserve};
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, DispatchPolicy, FeatureSet,
-    SimdDispatchContext,
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
+    ByteBucketTables, DispatchPolicy, FeatureSet, SelectionReceipt, SimdDispatchContext,
 };
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
-const CACHE_FORMAT_VERSION: u32 = 5;
+const CACHE_FORMAT_VERSION: u32 = 6;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_TOTAL_PATTERN_BYTES;
-const CLASSIFIER_BUILD_WORK: usize = 128;
-const SIMD_BLOCK_BYTES: usize = 32;
+const CLASSIFIER_BUILD_WORK: usize = 256;
+const SIMD_BLOCK_BYTES: usize = BYTE_BUCKET_BLOCK_BYTES;
 
 // Frozen memchr 2.8.3 packed-pair frequency order, shared conceptually with
 // the authenticated AArch64 literal backend. Lower ranks are rarer and
@@ -77,20 +78,20 @@ pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
 /// Largest greedy byte prefix admitted by the bounded-prefix wrapper.
 pub const CERTIFIED_MAX_BOUNDED_PREFIX_BYTES: u8 = 4;
 /// Stable FRE-owned strategy identity.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-ranked-anchor-stream.v4";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-byte-bucket-stream.v5";
 /// Stable count-plan identity.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-ranked-anchor-stream.v4";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-byte-bucket-stream.v5";
 /// Stable span-sum-plan identity.
 pub const SPAN_SUM_PLAN_ID: &str =
-    "ordered-literal-aggregate.span-sum.packed-ranked-anchor-stream.v4";
+    "ordered-literal-aggregate.span-sum.packed-byte-bucket-stream.v5";
 /// Stable count identity for a finite greedy dot-byte prefix followed by the
 /// ordered literal set.
 pub const BOUNDED_PREFIX_COUNT_PLAN_ID: &str =
-    "bounded-prefix-ordered-literal-aggregate.count.packed-ranked-anchor-stream.v2";
+    "bounded-prefix-ordered-literal-aggregate.count.packed-byte-bucket-stream.v3";
 /// Version of the success-or-failure construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 4;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 5;
 /// Version of the partial-actual construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 4;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 5;
 
 /// Boundary contract owned by this byte-string kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +129,8 @@ pub struct CacheIdentity<'a> {
     pub semantics: Semantics,
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
-    pub classifier_selection: AsciiSelection,
+    pub mask_columns: u8,
+    pub classifier_selection: SelectionReceipt,
     pub certified_min_patterns: usize,
     pub certified_max_patterns: usize,
     pub certified_min_pattern_bytes: usize,
@@ -145,10 +147,10 @@ pub struct BoundedPrefixBounds {
     pub maximum: u8,
 }
 
-/// Copyable operation and exact wide-classifier identity. Pattern bytes remain
-/// in [`CacheIdentity`] and may be authenticated separately by an owning
-/// facade. The wide receipt names its delegated narrow leaf when applicable,
-/// so retaining the separate narrow receipt would be redundant.
+/// Copyable operation and exact classifier identity. Pattern bytes remain in
+/// [`CacheIdentity`] and may be authenticated separately by an owning facade.
+/// The `wide_*` field names are retained for facade compatibility; they now
+/// describe the direct fixed-width byte-bucket leaf.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
     pub algorithm_id: &'static str,
@@ -163,6 +165,7 @@ pub struct OperationIdentity {
     pub wide_minimum_input_bytes: usize,
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
+    pub mask_columns: u8,
     pub bounded_prefix: Option<BoundedPrefixBounds>,
 }
 
@@ -171,7 +174,7 @@ impl CacheIdentity<'_> {
     /// operation and native-classifier identity.
     #[must_use]
     pub const fn operation_identity(self) -> OperationIdentity {
-        let wide = self.classifier_selection.wide();
+        let wide = self.classifier_selection;
         OperationIdentity {
             algorithm_id: self.algorithm_id,
             plan_id: self.plan_id,
@@ -185,6 +188,7 @@ impl CacheIdentity<'_> {
             wide_minimum_input_bytes: wide.minimum_input_bytes,
             anchor_offset: self.anchor_offset,
             anchor_has_non_ascii: self.anchor_has_non_ascii,
+            mask_columns: self.mask_columns,
             bounded_prefix: self.bounded_prefix,
         }
     }
@@ -241,6 +245,8 @@ pub struct BuildAccounting {
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
     pub anchor_selection_work: u64,
+    pub mask_columns: usize,
+    pub bucket_assignment_work: u64,
     pub max_anchor_byte_bucket_patterns: usize,
     pub max_anchor_byte_bucket_pattern_bytes: usize,
     pub identity_bytes: usize,
@@ -642,7 +648,9 @@ impl PatternMeta {
 
 #[derive(Debug)]
 struct PackedOwner {
-    classifier: AsciiByteSetClassifier,
+    screening_classifier: ByteBucketClassifier,
+    classifier: ByteBucketClassifier,
+    bucket_patterns: [u16; BYTE_BUCKET_COUNT],
     anchor_offset: u8,
     has_non_ascii_anchor_byte: bool,
     anchor_byte_patterns: [u16; 256],
@@ -1130,6 +1138,8 @@ impl PlanCore {
             semantics: SEMANTICS,
             anchor_offset: usize::from(self.owner.anchor_offset),
             anchor_has_non_ascii: self.owner.has_non_ascii_anchor_byte,
+            mask_columns: u8::try_from(self.owner.classifier.tables().columns())
+                .expect("the fixed mask-column cap fits in u8"),
             classifier_selection: self.owner.classifier.selection(),
             certified_min_patterns: CERTIFIED_MIN_PATTERNS,
             certified_max_patterns: CERTIFIED_MAX_PATTERNS,
@@ -1162,6 +1172,9 @@ impl PlanCore {
         .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
 
         let anchor_offset = select_anchor_offset(patterns, preflight.min_pattern_bytes);
+        let (screening_tables, bucket_tables, bucket_patterns) =
+            build_byte_bucket_tables(patterns, preflight.mask_columns, anchor_offset)
+                .map_err(|error| attempt_error(error, identity, actual))?;
         let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
         let mut pattern_meta = [PatternMeta::EMPTY; CERTIFIED_MAX_PATTERNS];
         let mut anchor_byte_patterns = [0_u16; 256];
@@ -1180,7 +1193,6 @@ impl PlanCore {
         })?;
         encoded_patterns[..LENGTH_PREFIX_BYTES].copy_from_slice(&count.to_le_bytes());
         let mut cursor = LENGTH_PREFIX_BYTES;
-        let mut ascii_words = [0_u64; 2];
         for (index, pattern) in patterns.iter().enumerate() {
             let bytes = pattern.as_ref();
             let length = u64::try_from(bytes.len()).map_err(|_| {
@@ -1271,11 +1283,7 @@ impl PlanCore {
             })?;
             max_anchor_byte_bucket_pattern_bytes = max_anchor_byte_bucket_pattern_bytes
                 .max(anchor_byte_pattern_bytes[usize::from(anchor)]);
-            if anchor < 128 {
-                let word = usize::from(anchor / 64);
-                let shift = u32::from(anchor % 64);
-                ascii_words[word] |= 1_u64 << shift;
-            } else {
+            if anchor >= 128 {
                 has_non_ascii_anchor_byte = true;
             }
             cursor = bytes_end;
@@ -1292,11 +1300,17 @@ impl PlanCore {
         actual.work = preflight.build_work;
         actual.copied_bytes = preflight.identity_bytes;
         actual.initialized_bytes = size_of::<PackedOwner>();
-        let classifier = dispatch
-            .ascii_byte_set_classifier(AsciiByteSet::from_words(ascii_words), DispatchPolicy::Auto)
+        let screening_classifier = dispatch
+            .byte_bucket_classifier(screening_tables, DispatchPolicy::Auto)
             .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
+        let classifier = dispatch
+            .byte_bucket_classifier(bucket_tables, DispatchPolicy::Auto)
+            .map_err(|_| attempt_error(BuildError::UnsupportedTargetOrShape, identity, actual))?;
+        debug_assert_eq!(screening_classifier.selection(), classifier.selection());
         let owner = PackedOwner {
+            screening_classifier,
             classifier,
+            bucket_patterns,
             anchor_offset: u8::try_from(anchor_offset).map_err(|_| {
                 attempt_error(
                     BuildError::ArithmeticOverflow {
@@ -1353,6 +1367,8 @@ impl PlanCore {
             anchor_offset,
             anchor_has_non_ascii: has_non_ascii_anchor_byte,
             anchor_selection_work: preflight.anchor_selection_work,
+            mask_columns: preflight.mask_columns,
+            bucket_assignment_work: preflight.bucket_assignment_work,
             max_anchor_byte_bucket_patterns,
             max_anchor_byte_bucket_pattern_bytes,
             identity_bytes: preflight.identity_bytes,
@@ -1397,21 +1413,23 @@ impl PlanCore {
                     computation: "candidate positions",
                 })?
         };
-        let pattern_checks = candidate_positions
-            .checked_mul(self.build.max_anchor_byte_bucket_patterns)
-            .ok_or(ReduceError::ArithmeticOverflow {
+        let pattern_checks = candidate_positions.checked_mul(self.build.patterns).ok_or(
+            ReduceError::ArithmeticOverflow {
                 computation: "pattern checks",
-            })?;
+            },
+        )?;
         let verification_reads = candidate_positions
-            .checked_mul(self.build.max_anchor_byte_bucket_pattern_bytes)
+            .checked_mul(self.build.pattern_bytes)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "verification source reads",
             })?;
-        let fixed_source_reads_per_position = 2_usize
-            .checked_add(usize::from(self.owner.has_non_ascii_anchor_byte))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "fixed source reads per position",
-            })?;
+        let fixed_source_reads_per_position =
+            self.build
+                .mask_columns
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "fixed source reads per position",
+                })?;
         let source_byte_reads = candidate_positions
             .checked_mul(fixed_source_reads_per_position)
             .and_then(|reads| reads.checked_add(verification_reads))
@@ -1420,8 +1438,8 @@ impl PlanCore {
             })?;
         let work_per_position = self
             .build
-            .max_anchor_byte_bucket_pattern_bytes
-            .checked_add(self.build.max_anchor_byte_bucket_patterns)
+            .pattern_bytes
+            .checked_add(self.build.patterns)
             .and_then(|work| work.checked_add(4))
             .and_then(|work| work.checked_add(fixed_source_reads_per_position))
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -1504,39 +1522,44 @@ impl PlanCore {
                     computation: "SIMD block end",
                 },
             )?;
-            let anchor_block_start =
+            let screening_start =
                 block_start
                     .checked_add(anchor_offset)
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "SIMD anchor block start",
+                        computation: "byte-bucket screening start",
                     })?;
-            let anchor_block_end = anchor_block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+            let screening_end = screening_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "SIMD anchor block end",
+                    computation: "byte-bucket screening end",
                 },
             )?;
-            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[anchor_block_start..anchor_block_end]
-                .try_into()
-                .map_err(|_| ReduceError::InternalInvariant {
-                    detail: "complete anchor block lost its fixed extent",
-                })?;
-            let classified = self.owner.classifier.classify_32(block);
-            let mut candidates = classified.member_mask();
-            if self.owner.has_non_ascii_anchor_byte {
-                let mut non_ascii = !classified.ascii_mask();
-                while non_ascii != 0 {
-                    let lane = non_ascii.trailing_zeros();
-                    non_ascii &= non_ascii.wrapping_sub(1);
-                    let lane_usize =
-                        usize::try_from(lane).map_err(|_| ReduceError::ArithmeticOverflow {
-                            computation: "non-ASCII candidate lane",
-                        })?;
-                    if self.owner.anchor_byte_patterns[usize::from(block[lane_usize])] != 0 {
-                        candidates |= 1_u32 << lane;
-                    }
-                }
+            let screening = self
+                .owner
+                .screening_classifier
+                .classify_16(&haystack[screening_start..screening_end])
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "complete candidate block lost its screening extent",
+                })?
+                .chunks();
+            if screening == [0, 0] {
+                block_start = block_end;
+                continue;
             }
-            self.consume_candidate_mask::<SPAN_SUM>(
+            let classifier_end = block_end
+                .checked_add(self.build.mask_columns.saturating_sub(1))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "byte-bucket classifier end",
+                })?;
+            let classified = self
+                .owner
+                .classifier
+                .classify_16(&haystack[block_start..classifier_end])
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "complete candidate block lost its correlated-byte extent",
+                })?
+                .chunks();
+            let candidates = [screening[0] & classified[0], screening[1] & classified[1]];
+            self.consume_bucket_candidate_chunks::<SPAN_SUM>(
                 haystack,
                 block_start,
                 candidates,
@@ -1556,7 +1579,8 @@ impl PlanCore {
                         computation: "scalar anchor position",
                     })?;
             let byte = haystack[anchor_position];
-            if self.owner.anchor_byte_patterns[usize::from(byte)] != 0 {
+            let pattern_bits = self.owner.anchor_byte_patterns[usize::from(byte)];
+            if pattern_bits != 0 {
                 candidate_events =
                     candidate_events
                         .checked_add(1)
@@ -1566,6 +1590,7 @@ impl PlanCore {
                 self.consume_candidate::<SPAN_SUM>(
                     haystack,
                     block_start,
+                    pattern_bits,
                     &mut consumed_through,
                     &mut pattern_checks,
                     &mut match_events,
@@ -1695,39 +1720,44 @@ impl PlanCore {
                     computation: "bounded-prefix SIMD block end",
                 },
             )?;
-            let anchor_block_start =
+            let screening_start =
                 block_start
                     .checked_add(anchor_offset)
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "bounded-prefix SIMD anchor block start",
+                        computation: "bounded-prefix byte-bucket screening start",
                     })?;
-            let anchor_block_end = anchor_block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+            let screening_end = screening_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
                 ReduceError::ArithmeticOverflow {
-                    computation: "bounded-prefix SIMD anchor block end",
+                    computation: "bounded-prefix byte-bucket screening end",
                 },
             )?;
-            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[anchor_block_start..anchor_block_end]
-                .try_into()
-                .map_err(|_| ReduceError::InternalInvariant {
-                    detail: "complete bounded-prefix anchor block lost its fixed extent",
-                })?;
-            let classified = self.owner.classifier.classify_32(block);
-            let mut candidates = classified.member_mask();
-            if self.owner.has_non_ascii_anchor_byte {
-                let mut non_ascii = !classified.ascii_mask();
-                while non_ascii != 0 {
-                    let lane = non_ascii.trailing_zeros();
-                    non_ascii &= non_ascii.wrapping_sub(1);
-                    let lane_usize =
-                        usize::try_from(lane).map_err(|_| ReduceError::ArithmeticOverflow {
-                            computation: "bounded-prefix non-ASCII candidate lane",
-                        })?;
-                    if self.owner.anchor_byte_patterns[usize::from(block[lane_usize])] != 0 {
-                        candidates |= 1_u32 << lane;
-                    }
-                }
+            let screening = self
+                .owner
+                .screening_classifier
+                .classify_16(&haystack[screening_start..screening_end])
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "complete bounded-prefix block lost its screening extent",
+                })?
+                .chunks();
+            if screening == [0, 0] {
+                block_start = block_end;
+                continue;
             }
-            self.consume_bounded_prefix_candidate_mask(
+            let classifier_end = block_end
+                .checked_add(self.build.mask_columns.saturating_sub(1))
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix byte-bucket classifier end",
+                })?;
+            let classified = self
+                .owner
+                .classifier
+                .classify_16(&haystack[block_start..classifier_end])
+                .ok_or(ReduceError::InternalInvariant {
+                    detail: "complete bounded-prefix block lost its correlated-byte extent",
+                })?
+                .chunks();
+            let candidates = [screening[0] & classified[0], screening[1] & classified[1]];
+            self.consume_bounded_prefix_bucket_chunks(
                 haystack,
                 block_start,
                 candidates,
@@ -1746,7 +1776,8 @@ impl PlanCore {
                         computation: "bounded-prefix scalar anchor position",
                     })?;
             let byte = haystack[anchor_position];
-            if self.owner.anchor_byte_patterns[usize::from(byte)] != 0 {
+            let pattern_bits = self.owner.anchor_byte_patterns[usize::from(byte)];
+            if pattern_bits != 0 {
                 candidate_events =
                     candidate_events
                         .checked_add(1)
@@ -1756,6 +1787,7 @@ impl PlanCore {
                 self.consume_bounded_prefix_candidate(
                     haystack,
                     block_start,
+                    pattern_bits,
                     bounds,
                     &mut pattern_checks,
                     &mut reducer,
@@ -1822,41 +1854,56 @@ impl PlanCore {
         clippy::too_many_arguments,
         reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
     )]
-    fn consume_bounded_prefix_candidate_mask(
+    fn consume_bounded_prefix_bucket_chunks(
         &self,
         haystack: &[u8],
         block_start: usize,
-        mut candidates: u32,
+        chunks: [u64; 2],
         bounds: BoundedPrefixBounds,
         candidate_events: &mut usize,
         pattern_checks: &mut usize,
         reducer: &mut BoundedPrefixReducer,
     ) -> Result<(), ReduceError> {
-        while candidates != 0 {
-            let lane = candidates.trailing_zeros();
-            candidates &= candidates.wrapping_sub(1);
-            let start = block_start
-                .checked_add(usize::try_from(lane).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
-                        computation: "bounded-prefix candidate lane",
-                    }
-                })?)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-prefix candidate start",
-                })?;
-            *candidate_events =
-                candidate_events
-                    .checked_add(1)
+        for (chunk_index, mut chunk) in chunks.into_iter().enumerate() {
+            while chunk != 0 {
+                let byte_lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
+                    .expect("a u64 byte lane fits in usize");
+                let shift = u32::try_from(
+                    byte_lane
+                        .checked_mul(8)
+                        .expect("a packed byte-lane shift fits in usize"),
+                )
+                .expect("a packed byte-lane shift fits in u32");
+                let buckets = u8::try_from((chunk >> shift) & u64::from(u8::MAX))
+                    .expect("the masked candidate bucket set fits in u8");
+                chunk &= !(u64::from(u8::MAX) << shift);
+                let lane = chunk_index
+                    .checked_mul(8)
+                    .and_then(|base| base.checked_add(byte_lane))
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "bounded-prefix actual candidate events",
+                        computation: "bounded-prefix candidate lane",
                     })?;
-            self.consume_bounded_prefix_candidate(
-                haystack,
-                start,
-                bounds,
-                pattern_checks,
-                reducer,
-            )?;
+                let start =
+                    block_start
+                        .checked_add(lane)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-prefix candidate start",
+                        })?;
+                *candidate_events =
+                    candidate_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-prefix actual candidate events",
+                        })?;
+                self.consume_bounded_prefix_candidate(
+                    haystack,
+                    start,
+                    self.patterns_for_buckets(buckets),
+                    bounds,
+                    pattern_checks,
+                    reducer,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1865,11 +1912,13 @@ impl PlanCore {
         &self,
         haystack: &[u8],
         literal_start: usize,
+        pattern_bits: u16,
         bounds: BoundedPrefixBounds,
         pattern_checks: &mut usize,
         reducer: &mut BoundedPrefixReducer,
     ) -> Result<(), ReduceError> {
-        let Some(end) = self.verified_candidate_end(haystack, literal_start, pattern_checks)?
+        let Some(end) =
+            self.verified_candidate_end(haystack, literal_start, pattern_bits, pattern_checks)?
         else {
             return Ok(());
         };
@@ -1880,51 +1929,82 @@ impl PlanCore {
         clippy::too_many_arguments,
         reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
     )]
-    fn consume_candidate_mask<const SPAN_SUM: bool>(
+    fn consume_bucket_candidate_chunks<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         block_start: usize,
-        mut candidates: u32,
+        chunks: [u64; 2],
         consumed_through: &mut usize,
         candidate_events: &mut usize,
         pattern_checks: &mut usize,
         match_events: &mut u64,
         span_sum: &mut u64,
     ) -> Result<(), ReduceError> {
-        while candidates != 0 {
-            let lane = candidates.trailing_zeros();
-            candidates &= candidates.wrapping_sub(1);
-            let start = block_start
-                .checked_add(usize::try_from(lane).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
-                        computation: "candidate lane",
-                    }
-                })?)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "candidate start",
-                })?;
-            *candidate_events =
-                candidate_events
-                    .checked_add(1)
+        for (chunk_index, mut chunk) in chunks.into_iter().enumerate() {
+            while chunk != 0 {
+                let byte_lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
+                    .expect("a u64 byte lane fits in usize");
+                let shift = u32::try_from(
+                    byte_lane
+                        .checked_mul(8)
+                        .expect("a packed byte-lane shift fits in usize"),
+                )
+                .expect("a packed byte-lane shift fits in u32");
+                let buckets = u8::try_from((chunk >> shift) & u64::from(u8::MAX))
+                    .expect("the masked candidate bucket set fits in u8");
+                chunk &= !(u64::from(u8::MAX) << shift);
+                let lane = chunk_index
+                    .checked_mul(8)
+                    .and_then(|base| base.checked_add(byte_lane))
                     .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "actual candidate events",
+                        computation: "candidate lane",
                     })?;
-            self.consume_candidate::<SPAN_SUM>(
-                haystack,
-                start,
-                consumed_through,
-                pattern_checks,
-                match_events,
-                span_sum,
-            )?;
+                let start =
+                    block_start
+                        .checked_add(lane)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "candidate start",
+                        })?;
+                *candidate_events =
+                    candidate_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual candidate events",
+                        })?;
+                self.consume_candidate::<SPAN_SUM>(
+                    haystack,
+                    start,
+                    self.patterns_for_buckets(buckets),
+                    consumed_through,
+                    pattern_checks,
+                    match_events,
+                    span_sum,
+                )?;
+            }
         }
         Ok(())
     }
 
+    fn patterns_for_buckets(&self, mut buckets: u8) -> u16 {
+        let mut patterns = 0_u16;
+        while buckets != 0 {
+            let bucket = buckets.trailing_zeros();
+            buckets &= buckets.wrapping_sub(1);
+            patterns |= self.owner.bucket_patterns
+                [usize::try_from(bucket).expect("a u8 bucket index fits in usize")];
+        }
+        patterns
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the hot exact verifier keeps its scalar counters borrowed and allocation-free"
+    )]
     fn consume_candidate<const SPAN_SUM: bool>(
         &self,
         haystack: &[u8],
         start: usize,
+        pattern_bits: u16,
         consumed_through: &mut usize,
         pattern_checks: &mut usize,
         match_events: &mut u64,
@@ -1933,7 +2013,9 @@ impl PlanCore {
         if start < *consumed_through {
             return Ok(());
         }
-        let Some(end) = self.verified_candidate_end(haystack, start, pattern_checks)? else {
+        let Some(end) =
+            self.verified_candidate_end(haystack, start, pattern_bits, pattern_checks)?
+        else {
             return Ok(());
         };
         *match_events = match_events
@@ -1943,11 +2025,16 @@ impl PlanCore {
             })?;
         if SPAN_SUM {
             *span_sum = span_sum
-                .checked_add(u64::try_from(end - start).map_err(|_| {
-                    ReduceError::ArithmeticOverflow {
+                .checked_add(
+                    u64::try_from(end.checked_sub(start).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "matched width",
+                        },
+                    )?)
+                    .map_err(|_| ReduceError::ArithmeticOverflow {
                         computation: "matched width as u64",
-                    }
-                })?)
+                    })?,
+                )
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "actual span sum",
                 })?;
@@ -1960,15 +2047,9 @@ impl PlanCore {
         &self,
         haystack: &[u8],
         start: usize,
+        mut pattern_bits: u16,
         pattern_checks: &mut usize,
     ) -> Result<Option<usize>, ReduceError> {
-        let anchor_position = start
-            .checked_add(usize::from(self.owner.anchor_offset))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "candidate anchor position",
-            })?;
-        let mut pattern_bits =
-            self.owner.anchor_byte_patterns[usize::from(haystack[anchor_position])];
         while pattern_bits != 0 {
             let id = pattern_bits.trailing_zeros();
             pattern_bits &= pattern_bits.wrapping_sub(1);
@@ -2085,7 +2166,10 @@ fn bounded_prefix_match_start(
     let mut run_start = floor;
     for (offset, &byte) in haystack[floor..literal_start].iter().enumerate() {
         if byte == b'\n' {
-            run_start = floor + offset + 1;
+            run_start = floor
+                .checked_add(offset)
+                .and_then(|position| position.checked_add(1))
+                .expect("the observed prefix offset remains within the haystack");
         }
     }
     let start = cursor.max(run_start);
@@ -2150,12 +2234,84 @@ fn select_anchor_offset<P: AsRef<[u8]>>(patterns: &[P], min_pattern_bytes: usize
     selected_offset
 }
 
+fn build_byte_bucket_tables<P: AsRef<[u8]>>(
+    patterns: &[P],
+    mask_columns: usize,
+    anchor_offset: usize,
+) -> Result<(ByteBucketTables, ByteBucketTables, [u16; BYTE_BUCKET_COUNT]), BuildError> {
+    debug_assert!((1..=BYTE_BUCKET_MAX_COLUMNS).contains(&mask_columns));
+    debug_assert!(patterns.len() <= CERTIFIED_MAX_PATTERNS);
+    let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut screening_low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut screening_high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut bucket_patterns = [0_u16; BYTE_BUCKET_COUNT];
+    let mut assigned = [0_u8; CERTIFIED_MAX_PATTERNS];
+    let mut distinct_prefixes = 0_usize;
+
+    for (id, pattern) in patterns.iter().enumerate() {
+        let bytes = pattern.as_ref();
+        let mut inherited = None;
+        for prior in 0..id {
+            let mut equal = true;
+            for (column, &byte) in bytes.iter().take(mask_columns).enumerate() {
+                equal &= byte == patterns[prior].as_ref()[column];
+            }
+            if equal && inherited.is_none() {
+                inherited = Some(assigned[prior]);
+            }
+        }
+        let bucket = inherited.unwrap_or_else(|| {
+            let bucket = BYTE_BUCKET_COUNT
+                .checked_sub(1)
+                .and_then(|last| last.checked_sub(distinct_prefixes % BYTE_BUCKET_COUNT))
+                .expect("a fixed recycled bucket index fits in usize");
+            distinct_prefixes = distinct_prefixes
+                .checked_add(1)
+                .expect("the certified pattern count fits in usize");
+            u8::try_from(bucket).expect("the fixed bucket count fits in u8")
+        });
+        assigned[id] = bucket;
+        let pattern_bit = 1_u16
+            .checked_shl(
+                u32::try_from(id).map_err(|_| BuildError::ArithmeticOverflow {
+                    computation: "bucket pattern bit",
+                })?,
+            )
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "bucket pattern bit",
+            })?;
+        let bucket_index = usize::from(bucket);
+        bucket_patterns[bucket_index] |= pattern_bit;
+        let bucket_bit =
+            1_u8.checked_shl(u32::from(bucket))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "byte-bucket mask bit",
+                })?;
+        for column in 0..mask_columns {
+            let byte = bytes[column];
+            low[column][usize::from(byte & 0x0f)] |= bucket_bit;
+            high[column][usize::from(byte >> 4)] |= bucket_bit;
+        }
+        let anchor = bytes[anchor_offset];
+        screening_low[0][usize::from(anchor & 0x0f)] |= bucket_bit;
+        screening_high[0][usize::from(anchor >> 4)] |= bucket_bit;
+    }
+    let tables = ByteBucketTables::new(mask_columns, low, high)
+        .map_err(|_| BuildError::UnsupportedTargetOrShape)?;
+    let screening_tables = ByteBucketTables::new(1, screening_low, screening_high)
+        .map_err(|_| BuildError::UnsupportedTargetOrShape)?;
+    Ok((screening_tables, tables, bucket_patterns))
+}
+
 #[derive(Clone, Copy)]
 struct BuildPreflight {
     pattern_bytes: usize,
     max_pattern_bytes: usize,
     min_pattern_bytes: usize,
     anchor_selection_work: u64,
+    mask_columns: usize,
+    bucket_assignment_work: u64,
     identity_bytes: usize,
     build_work: u64,
     persistent_bytes: usize,
@@ -2402,11 +2558,42 @@ fn preflight<P: AsRef<[u8]>>(
             },
             actual,
         })?;
+    let mask_columns = min_pattern_bytes.min(BYTE_BUCKET_MAX_COLUMNS);
+    let bucket_prefix_comparisons =
+        prior_anchor_comparisons
+            .checked_mul(mask_columns)
+            .ok_or(PreflightFailure {
+                source: BuildError::ArithmeticOverflow {
+                    computation: "byte-bucket prefix comparisons",
+                },
+                actual,
+            })?;
+    let bucket_table_writes = patterns
+        .len()
+        .checked_mul(mask_columns)
+        .and_then(|work| work.checked_mul(2))
+        .and_then(|work| work.checked_add(patterns.len().checked_mul(2)?))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "byte-bucket table writes",
+            },
+            actual,
+        })?;
+    let bucket_assignment_work = bucket_prefix_comparisons
+        .checked_add(bucket_table_writes)
+        .and_then(|work| work.checked_add(patterns.len()))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "byte-bucket assignment work",
+            },
+            actual,
+        })?;
     let build_work_usize = patterns
         .len()
         .checked_add(1)
         .and_then(|work| work.checked_add(initial_work))
         .and_then(|work| work.checked_add(anchor_selection_work))
+        .and_then(|work| work.checked_add(bucket_assignment_work))
         .and_then(|work| work.checked_add(size_of::<PackedOwner>()))
         .and_then(|work| work.checked_add(identity_bytes))
         .and_then(|work| work.checked_add(CLASSIFIER_BUILD_WORK))
@@ -2466,12 +2653,21 @@ fn preflight<P: AsRef<[u8]>>(
             },
             actual,
         })?;
+    let bucket_assignment_work =
+        u64::try_from(bucket_assignment_work).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "byte-bucket assignment work as u64",
+            },
+            actual,
+        })?;
     Ok((
         BuildPreflight {
             pattern_bytes,
             max_pattern_bytes,
             min_pattern_bytes,
             anchor_selection_work,
+            mask_columns,
+            bucket_assignment_work,
             identity_bytes,
             build_work,
             persistent_bytes,
@@ -3312,12 +3508,22 @@ mod tests {
         assert_eq!(actual.scratch_bytes, 0);
         assert_eq!(actual.span_sum, None);
         assert_eq!(upper.scratch_bytes, 0);
-        assert_eq!(upper.pattern_checks, upper.candidate_positions);
+        assert_eq!(
+            upper.pattern_checks,
+            upper
+                .candidate_positions
+                .checked_mul(patterns.len())
+                .unwrap()
+        );
         assert_eq!(
             upper.source_byte_reads,
             upper
                 .candidate_positions
-                .checked_mul(b"Sherlock".len() + 2)
+                .checked_mul(
+                    patterns.iter().map(|pattern| pattern.len()).sum::<usize>()
+                        + build.mask_columns
+                        + 1
+                )
                 .unwrap()
         );
         assert_eq!(actual.classified_positions, upper.candidate_positions);
@@ -3327,6 +3533,135 @@ mod tests {
         assert!(actual.work <= upper.work);
         assert_eq!(upper.restart_tail_positions, 0);
         assert_eq!(upper.iterator_setup_work, 0);
+    }
+
+    #[test]
+    fn ranked_full_byte_screen_rejects_sparse_non_ascii_blocks() {
+        let patterns = [
+            b"\xFF\x00needle".as_slice(),
+            b"rare-two".as_slice(),
+            b"third\xFE".as_slice(),
+        ];
+        let plan =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let source = [0x80_u8; 96];
+        let classified = plan
+            .core
+            .owner
+            .screening_classifier
+            .classify_16(&source)
+            .unwrap();
+        assert_eq!(classified.chunks(), [0, 0]);
+    }
+
+    #[test]
+    fn scalar_vector_boundaries_and_ordered_prefixes_match_regex() {
+        let pattern_sets = [
+            vec![b"ab".to_vec(), b"abc".to_vec(), b"\xFF\x00".to_vec()],
+            vec![b"abc".to_vec(), b"ab".to_vec(), b"\xFF\x00".to_vec()],
+        ];
+        for patterns in pattern_sets {
+            let regex = RegexBuilder::new(&source(&patterns))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let count =
+                PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+            let span = PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited())
+                .unwrap();
+            for candidate_positions in [15_usize, 16, 17, 31, 32, 33] {
+                let haystack_len = candidate_positions + 1;
+                for match_start in [0_usize, 14, 15, 16, 17, 30, 31] {
+                    let mut haystack = vec![0x80_u8; haystack_len];
+                    if let Some(end) = match_start.checked_add(3)
+                        && end <= haystack.len()
+                    {
+                        haystack[match_start..end].copy_from_slice(b"abc");
+                    }
+                    let expected_count = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+                    let expected_span = regex
+                        .find_iter(&haystack)
+                        .map(|matched| u64::try_from(matched.len()).unwrap())
+                        .sum::<u64>();
+                    assert_eq!(
+                        count
+                            .count(&haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                            .count,
+                        expected_count,
+                        "patterns={patterns:?} candidates={candidate_positions} start={match_start}"
+                    );
+                    assert_eq!(
+                        span.span_sum(&haystack, ReduceLimits::unlimited())
+                            .unwrap()
+                            .span_sum,
+                        expected_span,
+                        "patterns={patterns:?} candidates={candidate_positions} start={match_start}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recycled_bucket_false_positives_are_verified_in_global_pattern_order() {
+        let patterns = vec![
+            vec![0x12, 0x56, b'a', b'a'],
+            vec![0x20, 0x40, b'c', b'c'],
+            vec![0x21, 0x41, b'd', b'd'],
+            vec![0x22, 0x42, b'e', b'e'],
+            vec![0x23, 0x43, b'f', b'f'],
+            vec![0x24, 0x44, b'g', b'g'],
+            vec![0x25, 0x45, b'h', b'h'],
+            vec![0x26, 0x46, b'i', b'i'],
+            vec![0x34, 0x78, b'b', b'b'],
+        ];
+        let plan =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let mut false_positive_source = Vec::new();
+        for _ in 0..12 {
+            false_positive_source.extend_from_slice(&[0x14, 0x58, b'a', b'b']);
+        }
+        let false_positive = plan
+            .count(&false_positive_source, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(false_positive.count, 0);
+        assert!(
+            false_positive.accounting.actual.candidate_events > 0,
+            "the recycled-bucket cross product must reach exact verification"
+        );
+        assert!(false_positive.accounting.actual.pattern_checks > 0);
+
+        let ordered = [
+            b"same".as_slice(),
+            b"same-long".as_slice(),
+            b"other".as_slice(),
+        ];
+        let first_short =
+            PackedOrderedLiteralSpanSumPlan::build(&ordered, BuildLimits::unlimited()).unwrap();
+        let reversed = [
+            b"same-long".as_slice(),
+            b"same".as_slice(),
+            b"other".as_slice(),
+        ];
+        let first_long =
+            PackedOrderedLiteralSpanSumPlan::build(&reversed, BuildLimits::unlimited()).unwrap();
+        let mut haystack = vec![b'x'; 48];
+        haystack[16..25].copy_from_slice(b"same-long");
+        assert_eq!(
+            first_short
+                .span_sum(&haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .span_sum,
+            4
+        );
+        assert_eq!(
+            first_long
+                .span_sum(&haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .span_sum,
+            9
+        );
     }
 
     #[test]

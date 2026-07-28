@@ -37,6 +37,7 @@ pub use fre_target_features::{
 mod aarch64;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
 mod aarch64_sve2;
+mod byte_bucket;
 #[cfg_attr(
     feature = "static-dispatch",
     allow(
@@ -57,6 +58,11 @@ mod x86_64;
 
 #[cfg(test)]
 mod tests;
+
+pub use byte_bucket::{
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_COUNT, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier,
+    ByteBucketMasks16, ByteBucketTableError, ByteBucketTables,
+};
 
 /// Number of bytes consumed by the narrow classifier operation.
 pub const ASCII_NARROW_BYTES: usize = 16;
@@ -167,6 +173,20 @@ impl SimdDispatchContext {
             return Ok(AsciiWordSpaceClassifier::from_static_profile());
         }
         AsciiWordSpaceClassifier::with_capabilities(self.capabilities, policy)
+    }
+
+    /// Build a full-byte, eight-bucket nibble classifier from this captured
+    /// snapshot.
+    pub fn byte_bucket_classifier(
+        self,
+        tables: ByteBucketTables,
+        policy: DispatchPolicy,
+    ) -> Result<ByteBucketClassifier, UnsupportedRequiredFeatures> {
+        #[cfg(feature = "static-dispatch")]
+        if policy == DispatchPolicy::Auto {
+            return Ok(ByteBucketClassifier::from_static_profile(tables));
+        }
+        ByteBucketClassifier::with_capabilities(tables, self.capabilities, policy)
     }
 }
 
