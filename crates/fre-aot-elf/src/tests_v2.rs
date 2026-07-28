@@ -309,9 +309,8 @@ fn selected_end_v2_symbols_sections_visibility_and_c_abi_are_distinct() {
     )));
     assert!(!declarations.contains("fre_aot_search_result_v1"));
     assert!(!C_SELECTED_END_HEADER_V2.contains("fre_aot_search_result_v1"));
-    assert!(
-        C_SELECTED_END_HEADER_V2.contains("typedef size_t (*fre_aot_search_selected_end_entry_v2)")
-    );
+    assert!(!C_SELECTED_END_HEADER_V2.contains("typedef"));
+    assert!(!C_SELECTED_END_HEADER_V2.contains("(*"));
     assert!(
         C_SELECTED_END_HEADER_V2
             .contains("sizeof(struct fre_aot_search_selected_end_metadata_v2) == 224")

@@ -24,6 +24,15 @@
 //! pull `fre-jit-runtime` into the standalone compiler. The direct
 //! `fre-jit-aarch64` dependency is the inert custom machine-code emitter; this
 //! crate never publishes its output as executable memory.
+//!
+//! The parallel Linux tag21 `SelectedEnd` V2 slice is register-return only:
+//! source, semantic plan, validated KIR, sealed fixed-VL16 SVE2 image, ELF
+//! object, 608-byte neutral expectation, generated direct-call assembly/header,
+//! and qualification receipt are all identity-bound. Its private wrapper has
+//! one hidden `R_AARCH64_CALL26` `bl` to the exact four-argument entry and no
+//! function-pointer API, x4 argument, or result slot. Final-image disassembly
+//! remains an explicit pending qualification obligation; no V2 artifact grants
+//! runtime or deployment authority.
 
 #![forbid(unsafe_code)]
 
@@ -41,6 +50,9 @@ mod search_glue;
 mod search_linux;
 mod search_linux_expectation;
 mod search_linux_glue;
+mod search_selected_end_bundle_v2;
+mod search_selected_end_expectation_v2;
+mod search_selected_end_v2;
 mod search_static_expectation;
 mod static_expectation;
 mod static_expectation_v2;
@@ -125,6 +137,47 @@ pub use search_linux_glue::{
     LinuxUnsignedSearchSpanFinalImageReceiptV1, PublishedLinuxSearchSpanFinalImageGlueV1,
     inspect_linux_search_span_final_image_glue_v1, publish_linux_search_span_final_image_glue_v1,
     publish_linux_search_span_qualification_final_image_glue_v1,
+};
+pub use search_selected_end_bundle_v2::{
+    HARD_MAX_LINUX_SELECTED_END_DIRECT_GLUE_OBJECT_BYTES_V2,
+    HARD_MAX_LINUX_SELECTED_END_DIRECT_GLUE_SOURCE_BYTES_V2,
+    HARD_MAX_LINUX_SELECTED_END_DIRECT_HEADER_BYTES_V2,
+    LINUX_SELECTED_END_DIRECT_GLUE_CALL_OFFSET_V2, LINUX_SELECTED_END_DIRECT_GLUE_CODE_BYTES_V2,
+    LINUX_SELECTED_END_DIRECT_GLUE_CODE_V2, LINUX_SELECTED_END_DIRECT_GLUE_INSTRUCTIONS_V2,
+    LINUX_SELECTED_END_DIRECT_GLUE_RELOCATIONS_V2,
+    LINUX_SELECTED_END_QUALIFICATION_RECEIPT_BYTES_V2, LinuxSelectedEndCandidateBundleIdentityV2,
+    LinuxSelectedEndDirectGlueCodeIdentityV2, LinuxSelectedEndDirectGlueErrorV2,
+    LinuxSelectedEndDirectGlueInspectionV2, LinuxSelectedEndDirectGlueLimitsV2,
+    LinuxSelectedEndDirectGlueObjectIdentityV2, LinuxSelectedEndDirectGlueObjectV2,
+    LinuxSelectedEndDirectGlueSourceIdentityV2, LinuxSelectedEndDirectGlueSourceV2,
+    LinuxSelectedEndDirectHeaderIdentityV2, LinuxSelectedEndDirectHeaderV2,
+    LinuxSelectedEndDirectSymbolNameV2, LinuxSelectedEndDirectSymbolsV2,
+    LinuxSelectedEndPostLinkDisassemblyRequirementsV2, LinuxSelectedEndQualificationBundleV2,
+    LinuxSelectedEndQualificationReceiptV2, POST_LINK_DISASSEMBLY_REQUIREMENTS_V2,
+    POST_LINK_REJECT_BLR_V2, POST_LINK_REJECT_PLT_V2, POST_LINK_REJECT_RESULT_SLOT_V2,
+    POST_LINK_REJECT_X4_ARGUMENT_V2, POST_LINK_REQUIRE_DIRECT_BL_V2,
+    POST_LINK_REQUIRE_HIDDEN_BINDINGS_V2, POST_LINK_REQUIRE_IDENTITY_SUFFIXED_BINDINGS_V2,
+    R_AARCH64_CALL26_V2, build_linux_selected_end_qualification_bundle_v2,
+    inspect_linux_selected_end_direct_glue_v2,
+};
+pub use search_selected_end_expectation_v2::{
+    LinuxStaticSearchSelectedEndExpectationBuildErrorV2,
+    LinuxStaticSearchSelectedEndExpectationIdentityV2, LinuxStaticSearchSelectedEndExpectationV2,
+    build_linux_static_search_selected_end_expectation_v2,
+};
+pub use search_selected_end_v2::{
+    AOT_LINUX_SELECTED_END_COMPILE_RECEIPT_SCHEMA_VERSION_V2,
+    AOT_LINUX_SELECTED_END_COMPILER_VERSION_V2, AOT_LINUX_SELECTED_END_MANIFEST_SCHEMA_VERSION_V2,
+    LINUX_SELECTED_END_COMPILE_RECEIPT_BODY_BYTES_V2, LINUX_SELECTED_END_COMPILE_RECEIPT_BYTES_V2,
+    LinuxAarch64SelectedEndCompilePolicyV2, LinuxAarch64SelectedEndManifestV2,
+    LinuxSelectedEndCompileErrorV2, LinuxSelectedEndCompileReceiptIdentityV2,
+    LinuxSelectedEndCompileReceiptInspectionV2, LinuxSelectedEndCompileReceiptV2,
+    LinuxSelectedEndCompiledObjectV2, LinuxSelectedEndLiteralIdentityV2,
+    LinuxSelectedEndManifestErrorV2, LinuxSelectedEndManifestIdentityV2,
+    LinuxSelectedEndSourceIdentityV2, MAX_AOT_LINUX_SELECTED_END_SOURCE_BYTES_V2,
+    SelectedEndAotRuntimeAuthorityV2, compute_linux_selected_end_literal_identity_v2,
+    compute_linux_selected_end_source_identity_v2, inspect_linux_selected_end_compile_receipt_v2,
+    plan_and_compile_linux_aarch64_selected_end_v2,
 };
 pub use search_static_expectation::{
     STATIC_SEARCH_SPAN_EXPECTATION_BUILD_ALLOCATIONS_V1,

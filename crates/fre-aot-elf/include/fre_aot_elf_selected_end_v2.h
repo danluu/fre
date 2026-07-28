@@ -15,14 +15,10 @@ extern "C" {
  *   x2 = inclusive window start, x3 = exclusive window end,
  *   x0 = absolute match end, or zero when no match exists.
  *
- * The symbol's concrete identity-suffixed declaration is emitted by
- * ExportedSymbolsV2::write_c_declarations.
+ * This generic layout header deliberately contains neither a callable alias
+ * nor a concrete entry declaration. Qualification-specific bindings must name
+ * one exact identity-suffixed symbol directly and must declare it hidden.
  */
-typedef size_t (*fre_aot_search_selected_end_entry_v2)(
-    const uint8_t *haystack,
-    size_t haystack_len,
-    size_t window_start,
-    size_t window_end);
 
 struct fre_aot_search_selected_end_metadata_v2 {
   uint8_t magic[8];
