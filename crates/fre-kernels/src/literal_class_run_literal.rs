@@ -1,14 +1,22 @@
-//! Whole-operation reduction for `LITERAL BYTE_CLASS+ LITERAL`.
+//! Whole-operation reduction for `LITERAL? BYTE_CLASS+ LITERAL?`, with at
+//! least one nonempty literal, and the separately guarded ASCII-word form
+//! `\b\w+SUFFIX\b`.
 //!
 //! Admission proves that the byte immediately before and after the class run
 //! is outside the class. Construction selects the longer fixed literal as a
 //! native `memmem` anchor. Anchor occurrences are visited monotonically,
 //! including overlaps; only their adjacent maximal class run and opposite
-//! literal are checked. Prefix-anchor order is match-start order. For a suffix
-//! anchor, the first suffix byte is a non-class barrier, so increasing suffix
-//! order is also increasing maximal-run start order. Filtering starts behind
+//! literal are checked. Prefix-anchor order is match-start order. A suffix
+//! anchor normally starts at a non-class barrier, so increasing suffix order
+//! is also increasing maximal-run start order. The one-sided `CLASS+ SUFFIX`
+//! form additionally admits a suffix wholly contained in the class: its first
+//! occurrence identifies a disjoint maximal run, and the last overlapping
+//! occurrence in that run determines the greedy end. Filtering starts behind
 //! the preceding selected end therefore preserves greedy, leftmost-first,
 //! non-overlapping Rust byte semantics without classifying unrelated bytes.
+//! When an empty-prefix suffix begins outside the class but ends inside it,
+//! backward recovery is clamped at that selected end so a consumed suffix tail
+//! cannot hide the next legal repetition.
 //!
 //! For haystack width `N`, anchor width `A`, at most
 //! `Q = max(0, N-A+1)` overlapping anchor starts exist. Restarting one byte
@@ -27,6 +35,17 @@
 //! These bounds, every finder call/candidate, results, persistent owner bytes,
 //! and zero operation scratch are admitted before source access and checked
 //! against cumulative actual counters after execution.
+//!
+//! The guarded mode is deliberately separate. For nonempty suffix width `A`,
+//! it visits overlapping suffix occurrences with the same finder and uses
+//! `Q = max(0, N-A+1)`. Finder calls are at most `Q` and finder service at
+//! most `N + Q*(A-1)`. Count classifies at most the next and previous byte per
+//! occurrence (`2Q`) and never calls a run scanner. Span sum classifies at
+//! most `N+Q` logical bytes across right probes and disjoint backward
+//! recoveries; retained SIMD scanners additionally publish their bounded
+//! physical terminating-load overhead. Only span sum invokes backward run
+//! recovery. Matches are at most `N/(A+1)`, and their disjoint span sum is at
+//! most `N`.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -44,9 +63,9 @@ use memchr::memmem::{Finder, FinderBuilder};
 
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
-pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v2";
-pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v2";
-pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v2";
+pub const PLAN_ID: &str = "literal-class-run-literal.maximal-byte-run.v4";
+pub const COUNT_OPERATION_ID: &str = "literal-class-run-literal.count.unicode-off.v4";
+pub const SPAN_SUM_OPERATION_ID: &str = "literal-class-run-literal.span-sum.unicode-off.v4";
 
 const FIXED_BUILD_WORK: usize = 32;
 const LITERAL_BUILD_WORK_PER_BYTE: usize = 4;
@@ -70,6 +89,16 @@ const MATCH_WORK: usize = 8;
 const SIMD_FIXED_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
 const SIMD_SCALAR_PROOF_BYTES: usize = ASCII_WIDE_BYTES;
+const ASCII_WORD_CLASS_WORDS: [u64; 4] = [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
+
+/// Boundary interpretation proved by the builder and retained by the plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundarySemantics {
+    /// An unguarded one- or two-sided literal/class-run contract.
+    Unguarded,
+    /// A complete ASCII word run ending in a nonempty all-word suffix.
+    CompleteAsciiWordRun,
+}
 
 /// Stable identity of the compiled class-scan implementation in one plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +140,7 @@ pub struct OperationIdentity {
     pub suffix_bytes: usize,
     pub class_words: [u64; 4],
     pub class_scan: Option<ClassScanIdentity>,
+    pub boundary_semantics: BoundarySemantics,
     pub unicode: bool,
     pub greedy: bool,
     pub non_overlapping: bool,
@@ -277,12 +307,16 @@ pub struct SpanSumResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BuildError {
+    MissingLiteralAnchor,
     EmptyPrefix,
+    NonEmptyPrefixForCompleteAsciiWordRun,
     EmptySuffix,
     EmptyClass,
     NonCanonicalClass,
     PrefixBoundaryInClass,
     SuffixBoundaryInClass,
+    InexactAsciiWordClass,
+    SuffixByteOutsideAsciiWordClass,
     LiteralBytesLimit {
         needed: usize,
         limit: usize,
@@ -441,6 +475,7 @@ impl ByteClass {
 enum Anchor {
     Prefix,
     Suffix,
+    CompleteAsciiWordSuffix,
 }
 
 #[derive(Debug)]
@@ -499,7 +534,14 @@ impl LiteralClassRunLiteralPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt_inner(None, prefix, ranges, suffix, limits)
+        Self::build_attempt_inner(
+            None,
+            BoundarySemantics::Unguarded,
+            prefix,
+            ranges,
+            suffix,
+            limits,
+        )
     }
 
     /// Build with a pre-captured dispatch context while retaining exact
@@ -516,6 +558,87 @@ impl LiteralClassRunLiteralPlan {
     {
         Self::build_attempt_inner(
             Some((dispatch, DispatchPolicy::Auto)),
+            BoundarySemantics::Unguarded,
+            prefix,
+            ranges,
+            suffix,
+            limits,
+        )
+    }
+
+    /// Build the guarded `\b ASCII_WORD+ SUFFIX \b` specialization.
+    ///
+    /// `prefix` must be empty, `ranges` must be exactly the complete ASCII
+    /// word class, and every byte of the nonempty suffix must belong to that
+    /// class. Keeping those proof inputs explicit lets this kernel revalidate
+    /// the facade's HIR admission before publishing a guarded plan.
+    pub fn build_complete_ascii_word_run<I>(
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_complete_ascii_word_run_attempt(prefix, ranges, suffix, limits)
+            .map(DirectBuildAttempt::into_plan)
+            .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the guarded specialization with a caller-captured SIMD context.
+    pub fn build_complete_ascii_word_run_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_complete_ascii_word_run_attempt_with_dispatch(
+            dispatch, prefix, ranges, suffix, limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
+    }
+
+    /// Build the guarded specialization while retaining terminal effects.
+    pub fn build_complete_ascii_word_run_attempt<I>(
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(
+            None,
+            BoundarySemantics::CompleteAsciiWordRun,
+            prefix,
+            ranges,
+            suffix,
+            limits,
+        )
+    }
+
+    /// Build the guarded specialization with captured dispatch while
+    /// retaining exact successful or partial terminal effects.
+    pub fn build_complete_ascii_word_run_attempt_with_dispatch<I>(
+        dispatch: SimdDispatchContext,
+        prefix: &[u8],
+        ranges: I,
+        suffix: &[u8],
+        limits: BuildLimits,
+    ) -> Result<DirectBuildAttempt<Self>, DirectBuildAttemptError<BuildError>>
+    where
+        I: Iterator<Item = (u8, u8)>,
+    {
+        Self::build_attempt_inner(
+            Some((dispatch, DispatchPolicy::Auto)),
+            BoundarySemantics::CompleteAsciiWordRun,
             prefix,
             ranges,
             suffix,
@@ -535,9 +658,16 @@ impl LiteralClassRunLiteralPlan {
     where
         I: Iterator<Item = (u8, u8)>,
     {
-        Self::build_attempt_inner(Some((dispatch, policy)), prefix, ranges, suffix, limits)
-            .map(DirectBuildAttempt::into_plan)
-            .map_err(DirectBuildAttemptError::into_source)
+        Self::build_attempt_inner(
+            Some((dispatch, policy)),
+            BoundarySemantics::Unguarded,
+            prefix,
+            ranges,
+            suffix,
+            limits,
+        )
+        .map(DirectBuildAttempt::into_plan)
+        .map_err(DirectBuildAttemptError::into_source)
     }
 
     #[allow(
@@ -546,6 +676,7 @@ impl LiteralClassRunLiteralPlan {
     )]
     fn build_attempt_inner<I>(
         dispatch: Option<(SimdDispatchContext, DispatchPolicy)>,
+        boundary_semantics: BoundarySemantics,
         prefix: &[u8],
         mut ranges: I,
         suffix: &[u8],
@@ -556,10 +687,16 @@ impl LiteralClassRunLiteralPlan {
     {
         let mut actual = DirectBuildAttemptActual::default();
         let result = (|| {
-            if prefix.is_empty() {
-                return Err(BuildError::EmptyPrefix);
+            match boundary_semantics {
+                BoundarySemantics::Unguarded if prefix.is_empty() && suffix.is_empty() => {
+                    return Err(BuildError::MissingLiteralAnchor);
+                }
+                BoundarySemantics::CompleteAsciiWordRun if !prefix.is_empty() => {
+                    return Err(BuildError::NonEmptyPrefixForCompleteAsciiWordRun);
+                }
+                BoundarySemantics::Unguarded | BoundarySemantics::CompleteAsciiWordRun => {}
             }
-            if suffix.is_empty() {
+            if boundary_semantics == BoundarySemantics::CompleteAsciiWordRun && suffix.is_empty() {
                 return Err(BuildError::EmptySuffix);
             }
             let literal_bytes =
@@ -569,10 +706,10 @@ impl LiteralClassRunLiteralPlan {
                     .ok_or(BuildError::ArithmeticOverflow {
                         computation: "literal byte total",
                     })?;
-            let anchor_kind = if prefix.len() >= suffix.len() {
-                Anchor::Prefix
-            } else {
-                Anchor::Suffix
+            let anchor_kind = match boundary_semantics {
+                BoundarySemantics::Unguarded if prefix.len() >= suffix.len() => Anchor::Prefix,
+                BoundarySemantics::Unguarded => Anchor::Suffix,
+                BoundarySemantics::CompleteAsciiWordRun => Anchor::CompleteAsciiWordSuffix,
             };
             let anchor_bytes = prefix.len().max(suffix.len());
             enforce_build(
@@ -614,26 +751,60 @@ impl LiteralClassRunLiteralPlan {
             let mut work = BuildWork::new(limits.max_build_work, &mut actual);
             work.charge(literal_work)?;
             let (class, class_ranges, class_members) = build_class(&mut ranges, limits, &mut work)?;
-            work.charge(2)?;
-            if class.contains(*prefix.last().ok_or(BuildError::EmptyPrefix)?) {
-                return Err(BuildError::PrefixBoundaryInClass);
-            }
-            if class.contains(*suffix.first().ok_or(BuildError::EmptySuffix)?) {
-                return Err(BuildError::SuffixBoundaryInClass);
+            match boundary_semantics {
+                BoundarySemantics::Unguarded => {
+                    work.charge(2)?;
+                    if prefix
+                        .last()
+                        .is_some_and(|&boundary| class.contains(boundary))
+                    {
+                        return Err(BuildError::PrefixBoundaryInClass);
+                    }
+                    if suffix
+                        .first()
+                        .is_some_and(|&boundary| class.contains(boundary))
+                    {
+                        if !prefix.is_empty() {
+                            return Err(BuildError::SuffixBoundaryInClass);
+                        }
+                        work.charge(suffix.len())?;
+                        if !suffix.iter().all(|&byte| class.contains(byte)) {
+                            return Err(BuildError::SuffixBoundaryInClass);
+                        }
+                    }
+                }
+                BoundarySemantics::CompleteAsciiWordRun => {
+                    work.charge(1)?;
+                    if class.0 != ASCII_WORD_CLASS_WORDS {
+                        return Err(BuildError::InexactAsciiWordClass);
+                    }
+                    for &byte in suffix {
+                        work.charge(1)?;
+                        if !class.contains(byte) {
+                            return Err(BuildError::SuffixByteOutsideAsciiWordClass);
+                        }
+                    }
+                }
             }
             let ascii_scanner =
                 build_ascii_scanner(dispatch.filter(|_| class.is_ascii()), class, &mut work)?;
             let work_upper_bound = work.used;
 
             let prefix = copy_literal(prefix, "prefix")?;
-            record_literal_copy(&mut actual, prefix.len())?;
+            if !prefix.is_empty() {
+                record_literal_copy(&mut actual, prefix.len())?;
+            }
             let suffix = copy_literal(suffix, "suffix")?;
-            record_literal_copy(&mut actual, suffix.len())?;
+            if !suffix.is_empty() {
+                record_literal_copy(&mut actual, suffix.len())?;
+            }
             let prefix_bytes = prefix.len();
             let suffix_bytes = suffix.len();
             let (anchor, opposite_literal) = match anchor_kind {
                 Anchor::Prefix => (FinderBuilder::new().build_forward_owned(prefix), suffix),
-                Anchor::Suffix => (FinderBuilder::new().build_forward_owned(suffix), prefix),
+                Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => {
+                    (FinderBuilder::new().build_forward_owned(suffix), prefix)
+                }
             };
             actual.initialized_bytes = actual
                 .initialized_bytes
@@ -718,6 +889,7 @@ impl LiteralClassRunLiteralPlan {
                 }
                 None => None,
             },
+            boundary_semantics: self.boundary_semantics(),
             unicode: false,
             greedy: true,
             non_overlapping: true,
@@ -727,15 +899,31 @@ impl LiteralClassRunLiteralPlan {
     fn prefix(&self) -> &[u8] {
         match self.anchor_kind {
             Anchor::Prefix => self.anchor.needle(),
-            Anchor::Suffix => &self.opposite_literal,
+            Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => &self.opposite_literal,
         }
     }
 
     fn suffix(&self) -> &[u8] {
         match self.anchor_kind {
             Anchor::Prefix => &self.opposite_literal,
-            Anchor::Suffix => self.anchor.needle(),
+            Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => self.anchor.needle(),
         }
+    }
+
+    #[must_use]
+    pub const fn boundary_semantics(&self) -> BoundarySemantics {
+        match self.anchor_kind {
+            Anchor::Prefix | Anchor::Suffix => BoundarySemantics::Unguarded,
+            Anchor::CompleteAsciiWordSuffix => BoundarySemantics::CompleteAsciiWordRun,
+        }
+    }
+
+    fn suffix_is_inside_class(&self) -> bool {
+        self.prefix().is_empty()
+            && self
+                .suffix()
+                .first()
+                .is_some_and(|&byte| self.class.contains(byte))
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
@@ -793,7 +981,21 @@ impl LiteralClassRunLiteralPlan {
             Some(AsciiClassScanner::Run(_)) => ClassScanKind::Run,
             None => ClassScanKind::Scalar,
         };
-        derive_reduce_upper_bounds(self.build, class_scan, input_bytes, operation)
+        match self.boundary_semantics() {
+            BoundarySemantics::Unguarded => derive_reduce_upper_bounds(
+                self.build,
+                class_scan,
+                self.suffix_is_inside_class(),
+                input_bytes,
+                operation,
+            ),
+            BoundarySemantics::CompleteAsciiWordRun => derive_complete_ascii_word_run_upper_bounds(
+                self.build,
+                class_scan,
+                input_bytes,
+                operation,
+            ),
+        }
     }
 
     /// Publish the exact source-free full-window count envelope retained by
@@ -821,6 +1023,12 @@ impl LiteralClassRunLiteralPlan {
         operation: Operation,
         upper: ReduceUpperBounds,
     ) -> Result<ReduceActualCounters, ReduceError> {
+        if self.boundary_semantics() == BoundarySemantics::CompleteAsciiWordRun {
+            return self.scan_complete_ascii_word_run(haystack, operation, upper);
+        }
+        if self.suffix_is_inside_class() {
+            return self.scan_suffix_inside_class(haystack, operation, upper);
+        }
         let mut actual = ReduceActualCounters {
             source_reads: 0,
             finder_scanned_bytes: 0,
@@ -895,7 +1103,7 @@ impl LiteralClassRunLiteralPlan {
                     restart,
                     &mut actual,
                 )?,
-                Anchor::Suffix => self.suffix_anchor_candidate(
+                Anchor::Suffix | Anchor::CompleteAsciiWordSuffix => self.suffix_anchor_candidate(
                     haystack,
                     anchor_start,
                     anchor_end,
@@ -946,6 +1154,414 @@ impl LiteralClassRunLiteralPlan {
             .and_then(|reads| reads.checked_add(actual.literal_comparisons))
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "actual source reads",
+            })?;
+        verify_actual(actual, upper)?;
+        Ok(actual)
+    }
+
+    /// Reduce `CLASS+ SUFFIX` when every suffix byte is itself a class member.
+    ///
+    /// The first suffix occurrence identifies one maximal class run. Span-sum
+    /// recovers the run start; both operations probe the byte after the suffix
+    /// before retaining a forward scanner. Count only needs to prove that some
+    /// suffix in the run has a class predecessor, while span-sum selects the
+    /// last suffix for greedy repetition semantics. A valid run contributes
+    /// at most one match, and the cursor skips to the proved run end.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "grouped suffix discovery keeps the shared count/span accounting adjacent to every sparse source operation"
+    )]
+    fn scan_suffix_inside_class(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        let mut actual = ReduceActualCounters {
+            source_reads: 0,
+            finder_scanned_bytes: 0,
+            finder_calls: 0,
+            anchor_candidates: 0,
+            classifications: 0,
+            literal_comparisons: 0,
+            runs: 0,
+            candidates: 0,
+            matches: 0,
+            count: 0,
+            span_sum: 0,
+            work: FIXED_REDUCE_WORK,
+            scratch_bytes: 0,
+        };
+        let suffix_bytes = self.anchor.needle().len();
+        debug_assert_eq!(self.anchor_kind, Anchor::Suffix);
+        debug_assert!(self.prefix().is_empty());
+        debug_assert!(suffix_bytes != 0);
+        let mut cursor = 0_usize;
+        loop {
+            let remaining =
+                haystack
+                    .len()
+                    .checked_sub(cursor)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "class-suffix search remaining bytes",
+                    })?;
+            if remaining < suffix_bytes {
+                break;
+            }
+            let search = haystack
+                .get(cursor..)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "class-suffix search window",
+                })?;
+            actual.finder_calls = checked_add(actual.finder_calls, 1, "actual finder calls")?;
+            actual.work = checked_add(actual.work, FINDER_CALL_WORK, "finder call work")?;
+            let Some(relative) = self.anchor.find(search) else {
+                charge_finder_scan(&mut actual, search.len())?;
+                break;
+            };
+            let finder_service =
+                relative
+                    .checked_add(suffix_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "class-suffix successful finder service",
+                    })?;
+            charge_finder_scan(&mut actual, finder_service)?;
+            let first_suffix =
+                cursor
+                    .checked_add(relative)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "first suffix in class run",
+                    })?;
+            let first_suffix_end =
+                first_suffix
+                    .checked_add(suffix_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "first suffix end in class run",
+                    })?;
+            actual.anchor_candidates =
+                checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
+            actual.work = checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
+
+            let (run_start, mut has_class_prefix) = if operation == Operation::SpanSum {
+                let start = scan_class_run_backward(
+                    haystack,
+                    self.class,
+                    self.ascii_scanner.as_ref(),
+                    first_suffix,
+                    &mut actual,
+                )?
+                .unwrap_or(first_suffix);
+                (start, start < first_suffix)
+            } else {
+                let has_class_prefix = if let Some(previous) = first_suffix.checked_sub(1) {
+                    self.class
+                        .contains(read_classified(haystack, previous, &mut actual)?)
+                } else {
+                    false
+                };
+                (first_suffix, has_class_prefix)
+            };
+            let next_is_class = if first_suffix_end < haystack.len() {
+                Some(
+                    self.class
+                        .contains(read_classified(haystack, first_suffix_end, &mut actual)?),
+                )
+            } else {
+                None
+            };
+            let run_end = match next_is_class {
+                Some(true) => {
+                    let after_proved_member =
+                        first_suffix_end
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "class-suffix proved member advance",
+                            })?;
+                    scan_class_run_forward(
+                        haystack,
+                        self.class,
+                        self.ascii_scanner.as_ref(),
+                        after_proved_member,
+                        &mut actual,
+                    )?
+                    .unwrap_or(after_proved_member)
+                }
+                None | Some(false) => first_suffix_end,
+            };
+            actual.runs = checked_add(actual.runs, 1, "actual run count")?;
+            actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
+
+            let mut last_suffix = first_suffix;
+            if !has_class_prefix || operation == Operation::SpanSum {
+                let mut overlap_cursor =
+                    first_suffix
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "overlapping suffix restart",
+                        })?;
+                while run_end.saturating_sub(overlap_cursor) >= suffix_bytes {
+                    let run_search = haystack.get(overlap_cursor..run_end).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "overlapping suffix run window",
+                        },
+                    )?;
+                    actual.finder_calls =
+                        checked_add(actual.finder_calls, 1, "actual finder calls")?;
+                    actual.work = checked_add(actual.work, FINDER_CALL_WORK, "finder call work")?;
+                    let Some(relative) = self.anchor.find(run_search) else {
+                        charge_finder_scan(&mut actual, run_search.len())?;
+                        break;
+                    };
+                    let finder_service = relative.checked_add(suffix_bytes).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "overlapping suffix finder service",
+                        },
+                    )?;
+                    charge_finder_scan(&mut actual, finder_service)?;
+                    last_suffix = overlap_cursor.checked_add(relative).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "last suffix in class run",
+                        },
+                    )?;
+                    actual.anchor_candidates =
+                        checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
+                    actual.work =
+                        checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
+                    has_class_prefix = true;
+                    if operation == Operation::Count {
+                        break;
+                    }
+                    overlap_cursor =
+                        last_suffix
+                            .checked_add(1)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "next overlapping suffix restart",
+                            })?;
+                }
+            }
+
+            if has_class_prefix {
+                let end = last_suffix.checked_add(suffix_bytes).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "greedy class-suffix match end",
+                    },
+                )?;
+                actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
+                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
+                actual.count =
+                    actual
+                        .count
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual count",
+                        })?;
+                if operation == Operation::SpanSum {
+                    let width =
+                        end.checked_sub(run_start)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "actual class-suffix match width",
+                            })?;
+                    actual.span_sum = actual
+                        .span_sum
+                        .checked_add(u64::try_from(width).map_err(|_| {
+                            ReduceError::ArithmeticOverflow {
+                                computation: "actual class-suffix width as u64",
+                            }
+                        })?)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual span sum",
+                        })?;
+                }
+                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+            }
+            cursor = run_end;
+        }
+        actual.source_reads = actual
+            .finder_scanned_bytes
+            .checked_add(actual.classifications)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "class-suffix finder and class source reads",
+            })?;
+        verify_actual(actual, upper)?;
+        Ok(actual)
+    }
+
+    /// Search overlapping suffix occurrences and prove only the two ASCII
+    /// word-boundary conditions that are not already implied by the suffix.
+    ///
+    /// Embedded suffix occurrences advance by one byte so a later overlapping
+    /// terminal occurrence remains visible. Accepted matches advance to the
+    /// suffix end, preserving Rust's non-overlapping iteration. Count needs
+    /// only the preceding-byte probe; span sum alone recovers the maximal run
+    /// start with the retained backward scanner.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the guarded monotone traversal keeps every source probe, overlap restart, and actual accounting charge adjacent"
+    )]
+    fn scan_complete_ascii_word_run(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        upper: ReduceUpperBounds,
+    ) -> Result<ReduceActualCounters, ReduceError> {
+        debug_assert_eq!(self.anchor_kind, Anchor::CompleteAsciiWordSuffix);
+        debug_assert!(self.opposite_literal.is_empty());
+        let mut actual = ReduceActualCounters {
+            source_reads: 0,
+            finder_scanned_bytes: 0,
+            finder_calls: 0,
+            anchor_candidates: 0,
+            classifications: 0,
+            literal_comparisons: 0,
+            runs: 0,
+            candidates: 0,
+            matches: 0,
+            count: 0,
+            span_sum: 0,
+            work: FIXED_REDUCE_WORK,
+            scratch_bytes: 0,
+        };
+        let suffix_bytes = self.anchor.needle().len();
+        if haystack.len() < suffix_bytes {
+            verify_actual(actual, upper)?;
+            return Ok(actual);
+        }
+
+        let mut cursor = 0_usize;
+        loop {
+            let remaining =
+                haystack
+                    .len()
+                    .checked_sub(cursor)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "guarded suffix search remaining bytes",
+                    })?;
+            if remaining < suffix_bytes {
+                break;
+            }
+            let search = haystack
+                .get(cursor..)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "guarded suffix search window",
+                })?;
+            actual.finder_calls = checked_add(actual.finder_calls, 1, "actual finder calls")?;
+            actual.work = checked_add(actual.work, FINDER_CALL_WORK, "finder call work")?;
+            let Some(relative) = self.anchor.find(search) else {
+                charge_finder_scan(&mut actual, search.len())?;
+                break;
+            };
+            let finder_service =
+                relative
+                    .checked_add(suffix_bytes)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "successful guarded finder service bytes",
+                    })?;
+            charge_finder_scan(&mut actual, finder_service)?;
+            let start = cursor
+                .checked_add(relative)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "absolute guarded suffix start",
+                })?;
+            let end = start
+                .checked_add(suffix_bytes)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "absolute guarded suffix end",
+                })?;
+            actual.anchor_candidates =
+                checked_add(actual.anchor_candidates, 1, "actual anchor candidates")?;
+            actual.work = checked_add(actual.work, ANCHOR_CANDIDATE_WORK, "anchor candidate work")?;
+
+            if end < haystack.len() {
+                let next = read_classified(haystack, end, &mut actual)?;
+                if self.class.contains(next) {
+                    cursor = start
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "embedded guarded suffix progress",
+                        })?;
+                    continue;
+                }
+            }
+
+            actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
+            let match_start = match operation {
+                Operation::Count => {
+                    if start == 0 {
+                        None
+                    } else {
+                        let previous =
+                            start
+                                .checked_sub(1)
+                                .ok_or(ReduceError::ArithmeticOverflow {
+                                    computation: "guarded suffix preceding position",
+                                })?;
+                        let byte = read_classified(haystack, previous, &mut actual)?;
+                        self.class.contains(byte).then_some(start)
+                    }
+                }
+                Operation::SpanSum => {
+                    if start == 0 {
+                        None
+                    } else {
+                        let recovered = scan_class_run_backward(
+                            haystack,
+                            self.class,
+                            self.ascii_scanner.as_ref(),
+                            start,
+                            &mut actual,
+                        )?;
+                        if let Some(run_start) = recovered.filter(|&run_start| run_start < start) {
+                            actual.runs = checked_add(actual.runs, 1, "actual run count")?;
+                            actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
+                            Some(run_start)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some(match_start) = match_start {
+                actual.matches = checked_add(actual.matches, 1, "actual match count")?;
+                actual.count =
+                    actual
+                        .count
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual count",
+                        })?;
+                if operation == Operation::SpanSum {
+                    let width =
+                        end.checked_sub(match_start)
+                            .ok_or(ReduceError::ArithmeticOverflow {
+                                computation: "guarded match width",
+                            })?;
+                    actual.span_sum = actual
+                        .span_sum
+                        .checked_add(u64::try_from(width).map_err(|_| {
+                            ReduceError::ArithmeticOverflow {
+                                computation: "guarded match width as u64",
+                            }
+                        })?)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "actual span sum",
+                        })?;
+                }
+                actual.work = checked_add(actual.work, MATCH_WORK, "actual match work")?;
+                cursor = end;
+            } else {
+                cursor = start
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "rejected guarded suffix progress",
+                    })?;
+            }
+        }
+        actual.source_reads = actual
+            .finder_scanned_bytes
+            .checked_add(actual.classifications)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "guarded finder and class source reads",
             })?;
         verify_actual(actual, upper)?;
         Ok(actual)
@@ -1007,12 +1623,21 @@ impl LiteralClassRunLiteralPlan {
         };
         actual.runs = checked_add(actual.runs, 1, "actual run count")?;
         actual.work = checked_add(actual.work, RUN_WORK, "actual run work")?;
-        let Some(start) = run_start.checked_sub(self.prefix().len()) else {
-            return Ok(None);
+        let start = if self.prefix().is_empty() {
+            let start = run_start.max(restart);
+            if start >= anchor_start {
+                return Ok(None);
+            }
+            start
+        } else {
+            let Some(start) = run_start.checked_sub(self.prefix().len()) else {
+                return Ok(None);
+            };
+            if start < restart {
+                return Ok(None);
+            }
+            start
         };
-        if start < restart {
-            return Ok(None);
-        }
         actual.candidates = checked_add(actual.candidates, 1, "actual candidate count")?;
         if !literal_equals(haystack, start, self.prefix(), actual)? {
             return Ok(None);
@@ -1028,17 +1653,17 @@ impl LiteralClassRunLiteralPlan {
 fn derive_reduce_upper_bounds(
     build: BuildAccounting,
     class_scan: ClassScanKind,
+    suffix_inside_class: bool,
     input_bytes: usize,
     operation: Operation,
 ) -> Result<ReduceUpperBounds, ReduceError> {
     let anchor_bytes = build.prefix_bytes.max(build.suffix_bytes);
     let opposite_literal_bytes = build.prefix_bytes.min(build.suffix_bytes);
-    let anchor_candidates = input_bytes
+    let possible_anchor_starts = input_bytes
         .checked_sub(anchor_bytes)
         .and_then(|remaining| remaining.checked_add(1))
         .unwrap_or(0);
-    let finder_calls = anchor_candidates;
-    let repeated_anchor_bytes = anchor_candidates
+    let repeated_anchor_bytes = possible_anchor_starts
         .checked_mul(
             anchor_bytes
                 .checked_sub(1)
@@ -1049,24 +1674,94 @@ fn derive_reduce_upper_bounds(
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "overlapping anchor finder service",
         })?;
-    let finder_scanned_bytes =
+    let general_finder_scanned_bytes =
         input_bytes
             .checked_add(repeated_anchor_bytes)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "complete anchor finder service",
             })?;
-    let run_events = input_bytes / 2 + input_bytes % 2;
-    let logical_classifications =
-        input_bytes
-            .checked_add(anchor_candidates)
+    let general_run_events = input_bytes / 2 + input_bytes % 2;
+    let (
+        finder_calls,
+        finder_scanned_bytes,
+        anchor_candidates,
+        run_events,
+        logical_classifications,
+        simd_run_recoveries,
+    ) = if suffix_inside_class && operation == Operation::Count {
+        // The contained-suffix Count route coalesces all suffix occurrences in
+        // one maximal class run. Such runs need at least A source bytes and
+        // distinct runs need a separating nonmember, so there are at most
+        // ceil(N/(A+1)). Outer Finder windows are disjoint; at most one inner
+        // overlapping search is needed per run and those windows are also
+        // disjoint.
+        let run_denominator =
+            anchor_bytes
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "contained suffix run denominator",
+                })?;
+        let contained_runs = input_bytes / run_denominator
+            + usize::from(!input_bytes.is_multiple_of(run_denominator));
+        let finder_calls = contained_runs
+            .checked_mul(2)
+            .and_then(|calls| calls.checked_add(1))
             .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "class run plus adjacent class probes",
+                computation: "contained suffix finder call bound",
             })?;
+        let finder_scanned_bytes =
+            input_bytes
+                .checked_mul(2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "contained suffix finder service bound",
+                })?;
+        let anchor_candidates =
+            contained_runs
+                .checked_mul(2)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "contained suffix anchor candidate bound",
+                })?;
+        let logical_classifications = contained_runs
+            .checked_mul(2)
+            .and_then(|probes| input_bytes.checked_add(probes))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "contained suffix run plus boundary probes",
+            })?;
+        (
+            finder_calls,
+            finder_scanned_bytes,
+            anchor_candidates,
+            contained_runs,
+            logical_classifications,
+            contained_runs,
+        )
+    } else {
+        let logical_classifications = input_bytes.checked_add(possible_anchor_starts).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "class run plus adjacent class probes",
+            },
+        )?;
+        (
+            possible_anchor_starts,
+            general_finder_scanned_bytes,
+            possible_anchor_starts,
+            general_run_events,
+            logical_classifications,
+            possible_anchor_starts,
+        )
+    };
     let classifications = match class_scan {
         ClassScanKind::Run => logical_classifications
             .checked_add(
-                anchor_candidates
-                    .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                simd_run_recoveries
+                    .checked_mul(if suffix_inside_class && operation == Operation::SpanSum {
+                        2
+                    } else {
+                        1
+                    })
+                    .and_then(|candidates| {
+                        candidates.checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                    })
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "SIMD class-run recovery classification bound",
                     })?,
@@ -1164,6 +1859,155 @@ fn derive_reduce_upper_bounds(
         work,
         run_events,
         candidate_events: run_events,
+        match_events,
+        count,
+        span_sum,
+        scratch_bytes,
+        persistent_bytes,
+        peak_bytes,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the guarded source-free preflight keeps its distinct count and span proof envelopes adjacent"
+)]
+fn derive_complete_ascii_word_run_upper_bounds(
+    build: BuildAccounting,
+    class_scan: ClassScanKind,
+    input_bytes: usize,
+    operation: Operation,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let anchor_bytes = build.suffix_bytes;
+    let anchor_candidates = input_bytes
+        .checked_sub(anchor_bytes)
+        .and_then(|remaining| remaining.checked_add(1))
+        .unwrap_or(0);
+    let finder_calls = anchor_candidates;
+    let repeated_anchor_bytes = anchor_candidates
+        .checked_mul(
+            anchor_bytes
+                .checked_sub(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "nonempty guarded suffix overlap width",
+                })?,
+        )
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "overlapping guarded suffix finder service",
+        })?;
+    let finder_scanned_bytes =
+        input_bytes
+            .checked_add(repeated_anchor_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete guarded suffix finder service",
+            })?;
+    let logical_classifications =
+        match operation {
+            Operation::Count => {
+                anchor_candidates
+                    .checked_mul(2)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "guarded count boundary classifications",
+                    })?
+            }
+            Operation::SpanSum => input_bytes.checked_add(anchor_candidates).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "guarded span right probes and backward recovery",
+                },
+            )?,
+        };
+    let classifications = match operation {
+        Operation::Count => logical_classifications,
+        Operation::SpanSum => {
+            let overhead_per_recovery = match class_scan {
+                ClassScanKind::Run => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                // A terminating fixed-width block can physically classify at
+                // most 31 lanes outside its logical backward run.
+                ClassScanKind::Fixed => ASCII_WIDE_BYTES - 1,
+                ClassScanKind::Scalar => 0,
+            };
+            logical_classifications
+                .checked_add(anchor_candidates.checked_mul(overhead_per_recovery).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "guarded backward scanner physical overhead",
+                    },
+                )?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "guarded span physical classifications",
+                })?
+        }
+    };
+    let source_reads = finder_scanned_bytes.checked_add(classifications).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "guarded finder and class source reads",
+        },
+    )?;
+    let minimum_width = anchor_bytes
+        .checked_add(1)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "guarded minimum match width",
+        })?;
+    let match_events = input_bytes / minimum_width;
+    let run_events = match operation {
+        Operation::Count => 0,
+        Operation::SpanSum => match_events,
+    };
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "guarded match event bound as u64",
+    })?;
+    let span_sum = match operation {
+        Operation::Count => 0,
+        Operation::SpanSum => {
+            u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "guarded input length as span-sum bound",
+            })?
+        }
+    };
+    let work = finder_scanned_bytes
+        .checked_mul(FINDER_SCAN_WORK)
+        .and_then(|value| {
+            finder_calls
+                .checked_mul(FINDER_CALL_WORK)
+                .and_then(|calls| value.checked_add(calls))
+        })
+        .and_then(|value| {
+            anchor_candidates
+                .checked_mul(ANCHOR_CANDIDATE_WORK)
+                .and_then(|candidates| value.checked_add(candidates))
+        })
+        .and_then(|value| {
+            classifications
+                .checked_mul(CLASSIFICATION_WORK)
+                .and_then(|classifications| value.checked_add(classifications))
+        })
+        .and_then(|value| {
+            run_events
+                .checked_mul(RUN_WORK)
+                .and_then(|runs| value.checked_add(runs))
+        })
+        .and_then(|value| {
+            match_events
+                .checked_mul(MATCH_WORK)
+                .and_then(|matches| value.checked_add(matches))
+        })
+        .and_then(|value| value.checked_add(FIXED_REDUCE_WORK))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "complete guarded reduction work bound",
+        })?;
+    let scratch_bytes = 0;
+    let persistent_bytes = build.persistent_bytes;
+    let peak_bytes = persistent_bytes;
+    Ok(ReduceUpperBounds {
+        input_bytes,
+        source_reads,
+        finder_scanned_bytes,
+        finder_calls,
+        anchor_candidates,
+        classifications,
+        literal_comparisons: 0,
+        work,
+        run_events,
+        candidate_events: anchor_candidates,
         match_events,
         count,
         span_sum,
@@ -1882,12 +2726,24 @@ mod tests {
     use super::*;
 
     const RANGES: [(u8, u8); 2] = [(b'\t', b'\r'), (b' ', b' ')];
+    const ASCII_WORD_RANGES: [(u8, u8); 4] =
+        [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
 
     fn plan() -> LiteralClassRunLiteralPlan {
         LiteralClassRunLiteralPlan::build(
             b"ab",
             RANGES.into_iter(),
             b"cd",
+            BuildLimits::unlimited(),
+        )
+        .unwrap()
+    }
+
+    fn complete_ascii_word_run_plan(suffix: &[u8]) -> LiteralClassRunLiteralPlan {
+        LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+            b"",
+            ASCII_WORD_RANGES.into_iter(),
+            suffix,
             BuildLimits::unlimited(),
         )
         .unwrap()
@@ -2020,6 +2876,130 @@ mod tests {
     }
 
     #[test]
+    fn complete_ascii_word_run_exhaustive_count_and_span_sum_match_regex_bytes() {
+        let alphabet = [b'n', b'a', b'_', b'!', 0xff];
+        for (suffix, pattern) in [
+            (b"n".as_slice(), r"\b\w+n\b"),
+            (b"nn".as_slice(), r"\b\w+nn\b"),
+        ] {
+            let plan = complete_ascii_word_run_plan(suffix);
+            assert_eq!(
+                plan.count_identity().boundary_semantics,
+                BoundarySemantics::CompleteAsciiWordRun
+            );
+            assert_exhaustive_matches(&plan, pattern, &alphabet, 7);
+        }
+    }
+
+    #[test]
+    fn complete_ascii_word_run_overlap_boundaries_and_bounds_are_audited() {
+        let plan = complete_ascii_word_run_plan(b"nn");
+        for haystack in [
+            b"".as_slice(),
+            b"nn",
+            b"nnn",
+            b"!nnn!",
+            b"_nn ",
+            b"\xffann\x80nnn!",
+            b"ann!bnn?nnnn.",
+        ] {
+            let (count, sum, _) = reference(r"\b\w+nn\b", haystack);
+            let counted = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+            let spanned = plan.span_sum(haystack, ReduceLimits::unlimited()).unwrap();
+            assert_eq!(counted.count, count, "haystack={haystack:?}");
+            assert_eq!(spanned.span_sum, sum, "haystack={haystack:?}");
+
+            let input_bytes = haystack.len();
+            let suffix_bytes = b"nn".len();
+            let candidates = input_bytes
+                .checked_sub(suffix_bytes)
+                .map_or(0, |remaining| remaining + 1);
+            let finder_service = input_bytes + candidates * (suffix_bytes - 1);
+            assert_eq!(counted.accounting.upper_bounds.finder_calls, candidates);
+            assert_eq!(
+                counted.accounting.upper_bounds.finder_scanned_bytes,
+                finder_service
+            );
+            assert_eq!(
+                counted.accounting.upper_bounds.classifications,
+                2 * candidates
+            );
+            assert_eq!(counted.accounting.upper_bounds.run_events, 0);
+            assert_eq!(counted.accounting.actual.runs, 0);
+            assert_eq!(counted.accounting.actual.literal_comparisons, 0);
+            assert_eq!(
+                counted.accounting.upper_bounds.match_events,
+                input_bytes / (suffix_bytes + 1)
+            );
+            assert_eq!(counted.accounting.upper_bounds.span_sum, 0);
+            assert_eq!(
+                spanned.accounting.upper_bounds.classifications,
+                input_bytes + candidates
+            );
+            assert_eq!(
+                spanned.accounting.upper_bounds.span_sum,
+                u64::try_from(input_bytes).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn complete_ascii_word_run_builder_revalidates_every_guard() {
+        assert!(matches!(
+            LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+                b"x",
+                ASCII_WORD_RANGES.into_iter(),
+                b"n",
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::NonEmptyPrefixForCompleteAsciiWordRun)
+        ));
+        assert!(matches!(
+            LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+                b"",
+                ASCII_WORD_RANGES.into_iter(),
+                b"",
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::EmptySuffix)
+        ));
+        assert!(matches!(
+            LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+                b"",
+                [(b'a', b'z')].into_iter(),
+                b"n",
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::InexactAsciiWordClass)
+        ));
+        assert!(matches!(
+            LiteralClassRunLiteralPlan::build_complete_ascii_word_run(
+                b"",
+                ASCII_WORD_RANGES.into_iter(),
+                b"n-",
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::SuffixByteOutsideAsciiWordClass)
+        ));
+        let guarded = complete_ascii_word_run_plan(b"n");
+        let unguarded = plan();
+        assert_eq!(
+            guarded.boundary_semantics(),
+            BoundarySemantics::CompleteAsciiWordRun
+        );
+        assert_eq!(
+            guarded.count_identity().boundary_semantics,
+            BoundarySemantics::CompleteAsciiWordRun
+        );
+        assert_eq!(
+            unguarded.count_identity().boundary_semantics,
+            BoundarySemantics::Unguarded
+        );
+        assert_eq!(guarded.count_identity().plan_id, PLAN_ID);
+        assert_eq!(guarded.count_identity().operation_id, COUNT_OPERATION_ID);
+    }
+
+    #[test]
     fn overlapping_prefix_anchor_candidates_are_not_skipped() {
         let plan = LiteralClassRunLiteralPlan::build(
             b"aaa",
@@ -2071,6 +3051,114 @@ mod tests {
             );
         }
         assert_exhaustive_matches(&plan, r"ax+aaaa", b"axy", 9);
+    }
+
+    #[test]
+    fn one_sided_literal_anchors_preserve_greedy_nonoverlap() {
+        let suffix_anchored = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'z')].into_iter(),
+            b"ing",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(suffix_anchored.anchor_kind, Anchor::Suffix);
+        assert_exhaustive_matches(&suffix_anchored, r"[a-z]+ing", b"aginx-", 6);
+
+        let bordered_suffix = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'a')].into_iter(),
+            b"aa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_exhaustive_matches(&bordered_suffix, r"a+aa", b"ab-", 7);
+        for (haystack, expected_count, expected_span_sum) in [
+            (b"aa".as_slice(), 0, 0),
+            (b"aaa".as_slice(), 1, 3),
+            (b"aaaa".as_slice(), 1, 4),
+            (b"aabaa".as_slice(), 0, 0),
+            (b"aaaaa".as_slice(), 1, 5),
+        ] {
+            assert_eq!(
+                bordered_suffix
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count,
+                expected_count
+            );
+            assert_eq!(
+                bordered_suffix
+                    .span_sum(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .span_sum,
+                expected_span_sum
+            );
+        }
+
+        let prefix_anchored = LiteralClassRunLiteralPlan::build(
+            b"item",
+            [(b'0', b'9')].into_iter(),
+            b"",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(prefix_anchored.anchor_kind, Anchor::Prefix);
+        assert_exhaustive_matches(&prefix_anchored, r"item[0-9]+", b"item012x", 6);
+
+        let mixed_suffix = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'a')].into_iter(),
+            b"Xa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_exhaustive_matches(&mixed_suffix, r"a+Xa", b"aX-", 7);
+
+        let mixed_suffix_wide_class = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'b')].into_iter(),
+            b"Xa",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_exhaustive_matches(&mixed_suffix_wide_class, r"[ab]+Xa", b"abX-", 7);
+
+        let digit_suffix = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'0', b'9')].into_iter(),
+            b"X5",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"1X567X5";
+        assert_eq!(
+            digit_suffix
+                .count(haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            digit_suffix
+                .span_sum(haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .span_sum,
+            7
+        );
+    }
+
+    #[test]
+    fn a_literal_anchor_is_required() {
+        assert!(matches!(
+            LiteralClassRunLiteralPlan::build(
+                b"",
+                [(b'a', b'z')].into_iter(),
+                b"",
+                BuildLimits::unlimited(),
+            ),
+            Err(BuildError::MissingLiteralAnchor)
+        ));
     }
 
     #[test]
@@ -2649,6 +3737,50 @@ mod tests {
         below.max_work -= 1;
         assert!(matches!(
             plan.span_sum(&haystack, below),
+            Err(ReduceError::WorkLimit { needed, limit })
+                if needed == upper.work && limit == upper.work - 1
+        ));
+    }
+
+    #[test]
+    fn contained_suffix_count_uses_grouped_prospective_bounds() {
+        let plan = LiteralClassRunLiteralPlan::build(
+            b"",
+            [(b'a', b'z')].into_iter(),
+            b"ing",
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        let haystack = b"ing-thing-inging-xxing-ing-aaaaingbbbbing";
+        let baseline = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+        let upper = baseline.accounting.upper_bounds;
+        let actual = baseline.accounting.actual;
+        assert_eq!(baseline.count, reference(r"[a-z]+ing", haystack).0);
+        assert!(actual.finder_calls <= upper.finder_calls);
+        assert!(actual.finder_scanned_bytes <= upper.finder_scanned_bytes);
+        assert!(actual.anchor_candidates <= upper.anchor_candidates);
+        assert!(actual.classifications <= upper.classifications);
+        assert!(actual.runs <= upper.run_events);
+        assert!(actual.work <= upper.work);
+
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_source_reads: upper.source_reads,
+            max_work: upper.work,
+            max_run_events: upper.run_events,
+            max_match_events: upper.match_events,
+            max_count: upper.count,
+            max_span_sum: upper.span_sum,
+            max_scratch_bytes: upper.scratch_bytes,
+            max_persistent_bytes: upper.persistent_bytes,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(plan.count(haystack, exact).unwrap().count, baseline.count);
+
+        let mut below = exact;
+        below.max_work -= 1;
+        assert!(matches!(
+            plan.count(haystack, below),
             Err(ReduceError::WorkLimit { needed, limit })
                 if needed == upper.work && limit == upper.work - 1
         ));

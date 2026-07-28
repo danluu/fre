@@ -75,18 +75,19 @@ use fre_kernels::{
     LiteralAssertionsBuildLimits, LiteralAssertionsCountResult, LiteralAssertionsOperationIdentity,
     LiteralAssertionsPlan, LiteralAssertionsReduceAccounting, LiteralAssertionsReduceError,
     LiteralAssertionsReduceLimits, LiteralAssertionsSpanSumResult,
-    LiteralClassRunLiteralBuildAccounting, LiteralClassRunLiteralBuildError,
-    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralCountResult,
-    LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
-    LiteralClassRunLiteralReduceAccounting, LiteralClassRunLiteralReduceError,
-    LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
-    LiteralClassRunLiteralUpperBounds, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildAttemptActual, OrderedLiteralAggregateBuildError,
-    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateOperation,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    LiteralClassRunLiteralBoundarySemantics, LiteralClassRunLiteralBuildAccounting,
+    LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
+    LiteralClassRunLiteralCountResult, LiteralClassRunLiteralOperationIdentity,
+    LiteralClassRunLiteralPlan, LiteralClassRunLiteralReduceAccounting,
+    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
+    LiteralClassRunLiteralSpanSumResult, LiteralClassRunLiteralUpperBounds,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildAttemptActual,
+    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
+    OrderedLiteralAggregateOperation, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
     PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
     PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
@@ -199,7 +200,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 40;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 41;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -10082,18 +10083,35 @@ impl AggregateBuilder {
                         detail: "syntax summary differs from literal/class-run/literal inspection",
                     });
                 }
-                let attempt = LiteralClassRunLiteralPlan::build_attempt_with_dispatch(
-                    simd_dispatch,
-                    inspection.prefix,
+                let ranges = || {
                     inspection
                         .class
                         .ranges()
                         .iter()
                         .copied()
-                        .map(class_bytes_range_tuple),
-                    inspection.suffix,
-                    limits.literal_class_run_literal,
-                )
+                        .map(class_bytes_range_tuple)
+                };
+                let attempt = match inspection.boundary_semantics {
+                    LiteralClassRunLiteralBoundarySemantics::Unguarded => {
+                        LiteralClassRunLiteralPlan::build_attempt_with_dispatch(
+                            simd_dispatch,
+                            inspection.prefix,
+                            ranges(),
+                            inspection.suffix,
+                            limits.literal_class_run_literal,
+                        )
+                    }
+                    LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun => {
+                        LiteralClassRunLiteralPlan::
+                            build_complete_ascii_word_run_attempt_with_dispatch(
+                                simd_dispatch,
+                                inspection.prefix,
+                                ranges(),
+                                inspection.suffix,
+                                limits.literal_class_run_literal,
+                            )
+                    }
+                }
                 .map_err(|error| {
                     construction.pending_terminal_effect =
                         direct_build_stage_effect(inspection.work, error.actual());

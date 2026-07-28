@@ -1,12 +1,14 @@
 use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregatePlanIdentity, AggregatePlanKind,
-    AggregatePlanSelection, AggregateRunLimits, LiteralClassRunLiteralBuildLimits,
-    LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits, RustProfile,
+    AggregatePlanSelection, AggregateRunLimits, LiteralClassRunLiteralBoundarySemantics,
+    LiteralClassRunLiteralBuildLimits, LiteralClassRunLiteralReduceError,
+    LiteralClassRunLiteralReduceLimits, RustProfile,
 };
 use regex::bytes::RegexBuilder;
 
 const ROW_PATTERN: &str = r"Sherlock\s+Holmes";
+const WORD_SUFFIX_PATTERN: &str = r"\b\w+nn\b";
 
 fn builder(pattern: &str) -> AggregateBuilder {
     AggregateBuilder::new(pattern)
@@ -97,6 +99,116 @@ fn exact_sherlock_rows_select_one_operation_typed_leaf() {
             .value(),
         expected_count
     );
+}
+
+#[test]
+fn guarded_ascii_word_suffix_selects_direct_aggregate_values_and_accounting() {
+    let haystack = b"nn nnn!_nn \xffann\x80nnn! znnn? nn";
+    let (expected_count, expected_sum) = oracle(WORD_SUFFIX_PATTERN, haystack);
+    assert_eq!((expected_count, expected_sum), (5, 16));
+
+    let count = builder(WORD_SUFFIX_PATTERN).build_count().unwrap();
+    assert_eq!(
+        count.build_report().plan,
+        AggregatePlanKind::LiteralClassRunLiteral
+    );
+    let AggregatePlanIdentity::LiteralClassRunLiteral(identity) =
+        count.build_report().plan_identity
+    else {
+        panic!("guarded count selected another identity");
+    };
+    assert_eq!(
+        identity.kernel.boundary_semantics,
+        LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun
+    );
+    assert_eq!(identity.kernel.prefix_bytes, 0);
+    assert_eq!(identity.kernel.suffix_bytes, 2);
+    assert!(identity.kernel.class_scan.is_some());
+    assert_eq!(
+        identity.kernel.operation_id,
+        fre::LITERAL_CLASS_RUN_LITERAL_COUNT_OPERATION_ID
+    );
+    let AggregateBuildAccounting::LiteralClassRunLiteral(build) = count.build_report().build else {
+        panic!("guarded count retained another build certificate");
+    };
+    assert_eq!(build.prefix_bytes, 0);
+    assert_eq!(build.suffix_bytes, 2);
+    assert_eq!(build.literal_bytes, 2);
+    assert_eq!(build.class_ranges, 4);
+    assert_eq!(build.class_members, 63);
+    assert!(count.build_report().literal_class_run_literal_planner_work > 0);
+    let counted = count
+        .count(haystack, AggregateRunLimits::default())
+        .unwrap();
+    assert_eq!(counted.value(), expected_count);
+    let AggregateExecutionDetails::LiteralClassRunLiteral(accounting) = counted.report().details()
+    else {
+        panic!("guarded count executed another plan");
+    };
+    let candidates = haystack.len() - 1;
+    assert_eq!(accounting.upper_bounds.finder_calls, candidates);
+    assert_eq!(accounting.upper_bounds.classifications, 2 * candidates);
+    assert_eq!(accounting.upper_bounds.run_events, 0);
+    assert_eq!(accounting.actual.runs, 0);
+    assert_eq!(accounting.actual.literal_comparisons, 0);
+    assert!(accounting.actual.finder_calls <= accounting.upper_bounds.finder_calls);
+    assert!(accounting.actual.finder_scanned_bytes <= accounting.upper_bounds.finder_scanned_bytes);
+
+    let span = builder(WORD_SUFFIX_PATTERN).build_span_sum().unwrap();
+    assert_eq!(
+        span.build_report().plan,
+        AggregatePlanKind::LiteralClassRunLiteral
+    );
+    assert_eq!(
+        span.span_sum_value(haystack, AggregateRunLimits::default())
+            .unwrap(),
+        expected_sum
+    );
+    let compiled = builder(WORD_SUFFIX_PATTERN).build_compile().unwrap();
+    assert_eq!(
+        compiled.build_report().plan,
+        AggregatePlanKind::LiteralClassRunLiteral
+    );
+    assert_eq!(
+        compiled
+            .verify_count(haystack, AggregateRunLimits::default())
+            .unwrap()
+            .value(),
+        expected_count
+    );
+}
+
+#[test]
+fn guarded_ascii_word_suffix_captures_are_transparent_and_near_misses_fall_through() {
+    let captured = builder(r"(\b)(\w+)((nn))(\b)").build_count().unwrap();
+    assert_eq!(
+        captured.build_report().plan,
+        AggregatePlanKind::LiteralClassRunLiteral
+    );
+    assert_eq!(captured.build_report().captures_erased, 5);
+    assert_eq!(
+        captured
+            .count_value(b"ann!nnn", AggregateRunLimits::default())
+            .unwrap(),
+        2
+    );
+
+    for pattern in [
+        r"\B\w+nn\b",
+        r"\b\w+nn\B",
+        r"\b\w+?nn\b",
+        r"\b\w{1,3}nn\b",
+        r"\b[a-z]+nn\b",
+        r"\b\w+nn-\b",
+        r"\b\w+\x7F\b",
+        r"\b\w+\b",
+    ] {
+        assert_ne!(
+            builder(pattern).build_count().unwrap().build_report().plan,
+            AggregatePlanKind::LiteralClassRunLiteral,
+            "pattern={pattern:?}"
+        );
+    }
 }
 
 #[test]

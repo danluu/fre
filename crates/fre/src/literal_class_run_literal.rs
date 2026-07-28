@@ -1,14 +1,20 @@
-//! Allocation-free structural admission for `LITERAL BYTE_CLASS+ LITERAL`.
+//! Allocation-free structural admission for
+//! `LITERAL? BYTE_CLASS+ LITERAL?`, with at least one nonempty literal, and
+//! the guarded ASCII-word suffix form `\b\w+SUFFIX\b`.
 
-use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind};
+use fre_kernels::LiteralClassRunLiteralBoundarySemantics as BoundarySemantics;
+use regex_syntax::hir::{Class, ClassBytes, Hir, HirKind, Look};
 
 use crate::aggregate_construction::AggregateInspectionAttemptError;
+
+const ASCII_WORD_RANGES: [(u8, u8); 4] = [(b'0', b'9'), (b'A', b'Z'), (b'_', b'_'), (b'a', b'z')];
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Inspection<'a> {
     pub prefix: &'a [u8],
     pub class: &'a ClassBytes,
     pub suffix: &'a [u8],
+    pub boundary_semantics: BoundarySemantics,
     pub work: usize,
     pub hir_nodes: usize,
     pub captures: usize,
@@ -60,10 +66,11 @@ impl Accounting {
     }
 }
 
-/// Recognize exactly one canonical byte concat `L C+ R`, treating captures as
-/// transparent because the aggregate facade exposes whole-match values only.
-/// Every node, literal byte, range, repetition-role check and boundary
-/// membership comparison is charged before it is inspected.
+/// Recognize exactly one canonical byte concat `L? C+ R?`, requiring at least
+/// one literal anchor, or `WordAscii ASCII_WORD+ S WordAscii`, treating
+/// captures as transparent because the aggregate facade exposes whole-match
+/// values only. Every node, literal byte, range, repetition-role check and
+/// boundary comparison is charged before it is inspected.
 #[cfg(test)]
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
     inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
@@ -78,6 +85,10 @@ pub(super) fn inspect_attempt(
         .map_err(|source| AggregateInspectionAttemptError::new(source, accounting.work))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the combined structural admission keeps charged one-sided and guarded concat dispatch adjacent to their shared proof"
+)]
 fn inspect_with_accounting<'a>(
     hir: &'a Hir,
     limit: usize,
@@ -88,20 +99,62 @@ fn inspect_with_accounting<'a>(
         return Ok(accounting.ineligible());
     };
     accounting.charge(parts.len(), limit)?;
-    let [prefix_hir, repeated_hir, suffix_hir] = parts.as_slice() else {
-        return Ok(accounting.ineligible());
+    let empty: &'a [u8] = &[];
+    let (prefix, repeated_hir, suffix) = match parts.as_slice() {
+        [first_hir, second_hir] => {
+            let first_hir = peel_captures(first_hir, limit, accounting)?;
+            let second_hir = peel_captures(second_hir, limit, accounting)?;
+            match (first_hir.kind(), second_hir.kind()) {
+                (HirKind::Literal(prefix), HirKind::Repetition(_)) => {
+                    accounting.charge(prefix.0.len(), limit)?;
+                    if prefix.0.is_empty() {
+                        return Ok(accounting.ineligible());
+                    }
+                    (&prefix.0[..], second_hir, empty)
+                }
+                (HirKind::Repetition(_), HirKind::Literal(suffix)) => {
+                    accounting.charge(suffix.0.len(), limit)?;
+                    if suffix.0.is_empty() {
+                        return Ok(accounting.ineligible());
+                    }
+                    (empty, first_hir, &suffix.0[..])
+                }
+                _ => return Ok(accounting.ineligible()),
+            }
+        }
+        [prefix_hir, repeated_hir, suffix_hir] => {
+            let prefix_hir = peel_captures(prefix_hir, limit, accounting)?;
+            let repeated_hir = peel_captures(repeated_hir, limit, accounting)?;
+            let suffix_hir = peel_captures(suffix_hir, limit, accounting)?;
+            let HirKind::Literal(prefix) = prefix_hir.kind() else {
+                return Ok(accounting.ineligible());
+            };
+            accounting.charge(prefix.0.len(), limit)?;
+            if prefix.0.is_empty() {
+                return Ok(accounting.ineligible());
+            }
+            let HirKind::Literal(suffix) = suffix_hir.kind() else {
+                return Ok(accounting.ineligible());
+            };
+            accounting.charge(suffix.0.len(), limit)?;
+            if suffix.0.is_empty() {
+                return Ok(accounting.ineligible());
+            }
+            (&prefix.0[..], repeated_hir, &suffix.0[..])
+        }
+        [left_hir, repeated_hir, suffix_hir, right_hir] => {
+            return inspect_complete_ascii_word_run(
+                left_hir,
+                repeated_hir,
+                suffix_hir,
+                right_hir,
+                limit,
+                accounting,
+            );
+        }
+        _ => return Ok(accounting.ineligible()),
     };
 
-    let prefix_hir = peel_captures(prefix_hir, limit, accounting)?;
-    let HirKind::Literal(prefix) = prefix_hir.kind() else {
-        return Ok(accounting.ineligible());
-    };
-    accounting.charge(prefix.0.len(), limit)?;
-    if prefix.0.is_empty() {
-        return Ok(accounting.ineligible());
-    }
-
-    let repeated_hir = peel_captures(repeated_hir, limit, accounting)?;
     let HirKind::Repetition(repetition) = repeated_hir.kind() else {
         return Ok(accounting.ineligible());
     };
@@ -118,6 +171,55 @@ fn inspect_with_accounting<'a>(
         return Ok(accounting.ineligible());
     }
 
+    if let Some(&prefix_last) = prefix.last()
+        && class_contains(class, prefix_last, limit, accounting)?
+    {
+        return Ok(accounting.ineligible());
+    }
+    if let Some(&suffix_first) = suffix.first()
+        && class_contains(class, suffix_first, limit, accounting)?
+    {
+        if !prefix.is_empty() {
+            return Ok(accounting.ineligible());
+        }
+        for &byte in suffix.iter().skip(1) {
+            if !class_contains(class, byte, limit, accounting)? {
+                return Ok(accounting.ineligible());
+            }
+        }
+    }
+
+    Ok(InspectionOutcome::Eligible(Inspection {
+        prefix,
+        class,
+        suffix,
+        boundary_semantics: BoundarySemantics::Unguarded,
+        work: accounting.work,
+        hir_nodes: accounting.hir_nodes,
+        captures: accounting.captures,
+    }))
+}
+
+fn inspect_complete_ascii_word_run<'a>(
+    left_hir: &'a Hir,
+    repeated_hir: &'a Hir,
+    suffix_hir: &'a Hir,
+    right_hir: &'a Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<InspectionOutcome<'a>, InspectionError> {
+    if !ascii_word_boundary(left_hir, limit, accounting)?
+        || !ascii_word_boundary(right_hir, limit, accounting)?
+    {
+        return Ok(accounting.ineligible());
+    }
+    let Some(class) = greedy_unbounded_byte_class(repeated_hir, limit, accounting)? else {
+        return Ok(accounting.ineligible());
+    };
+    if !exact_ascii_word_class(class, limit, accounting)? {
+        return Ok(accounting.ineligible());
+    }
+
     let suffix_hir = peel_captures(suffix_hir, limit, accounting)?;
     let HirKind::Literal(suffix) = suffix_hir.kind() else {
         return Ok(accounting.ineligible());
@@ -126,23 +228,71 @@ fn inspect_with_accounting<'a>(
     if suffix.0.is_empty() {
         return Ok(accounting.ineligible());
     }
-
-    let prefix_last = *prefix.0.last().ok_or(InspectionError::Overflow)?;
-    let suffix_first = *suffix.0.first().ok_or(InspectionError::Overflow)?;
-    if class_contains(class, prefix_last, limit, accounting)?
-        || class_contains(class, suffix_first, limit, accounting)?
-    {
-        return Ok(accounting.ineligible());
+    for &byte in &suffix.0 {
+        accounting.charge(1, limit)?;
+        if !(byte.is_ascii_alphanumeric() || byte == b'_') {
+            return Ok(accounting.ineligible());
+        }
     }
 
     Ok(InspectionOutcome::Eligible(Inspection {
-        prefix: &prefix.0,
+        prefix: &[],
         class,
         suffix: &suffix.0,
+        boundary_semantics: BoundarySemantics::CompleteAsciiWordRun,
         work: accounting.work,
         hir_nodes: accounting.hir_nodes,
         captures: accounting.captures,
     }))
+}
+
+fn ascii_word_boundary(
+    hir: &Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<bool, InspectionError> {
+    let hir = peel_captures(hir, limit, accounting)?;
+    accounting.charge(1, limit)?;
+    Ok(matches!(hir.kind(), HirKind::Look(Look::WordAscii)))
+}
+
+fn greedy_unbounded_byte_class<'a>(
+    hir: &'a Hir,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<Option<&'a ClassBytes>, InspectionError> {
+    let hir = peel_captures(hir, limit, accounting)?;
+    let HirKind::Repetition(repetition) = hir.kind() else {
+        return Ok(None);
+    };
+    accounting.charge(3, limit)?;
+    if repetition.min != 1 || repetition.max.is_some() || !repetition.greedy {
+        return Ok(None);
+    }
+    let class_hir = peel_captures(&repetition.sub, limit, accounting)?;
+    let HirKind::Class(Class::Bytes(class)) = class_hir.kind() else {
+        return Ok(None);
+    };
+    accounting.charge(class.ranges().len(), limit)?;
+    Ok((!class.ranges().is_empty()).then_some(class))
+}
+
+fn exact_ascii_word_class(
+    class: &ClassBytes,
+    limit: usize,
+    accounting: &mut Accounting,
+) -> Result<bool, InspectionError> {
+    accounting.charge(1, limit)?;
+    if class.ranges().len() != ASCII_WORD_RANGES.len() {
+        return Ok(false);
+    }
+    for (range, (start, end)) in class.ranges().iter().zip(ASCII_WORD_RANGES) {
+        accounting.charge(2, limit)?;
+        if range.start() != start || range.end() != end {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn peel_captures<'a>(
@@ -197,16 +347,43 @@ mod tests {
 
     #[test]
     fn admits_exact_shape_and_transparent_captures() {
-        for pattern in [r"Sherlock\s+Holmes", r"((ab))([ \t]+)((cd))"] {
+        for pattern in [
+            r"Sherlock\s+Holmes",
+            r"((ab))([ \t]+)((cd))",
+            r"[a-zA-Z]+ing",
+            r"item[0-9]+",
+            r"[0-9]+X5",
+        ] {
             let parsed = hir(pattern);
             let InspectionOutcome::Eligible(inspection) = inspect(&parsed, usize::MAX).unwrap()
             else {
                 panic!("expected eligibility for {pattern:?}");
             };
-            assert!(!inspection.prefix.is_empty());
-            assert!(!inspection.suffix.is_empty());
+            assert!(!inspection.prefix.is_empty() || !inspection.suffix.is_empty());
             assert!(!inspection.class.ranges().is_empty());
-            assert!(inspection.hir_nodes >= 5);
+            assert_eq!(inspection.boundary_semantics, BoundarySemantics::Unguarded);
+            assert!(inspection.hir_nodes >= 4);
+        }
+    }
+
+    #[test]
+    fn admits_complete_ascii_word_suffix_shape_and_transparent_captures() {
+        for (pattern, suffix) in [
+            (r"\b\w+n\b", b"n".as_slice()),
+            (r"(\b)(\w+)((nn))(\b)", b"nn".as_slice()),
+        ] {
+            let parsed = hir(pattern);
+            let InspectionOutcome::Eligible(inspection) = inspect(&parsed, usize::MAX).unwrap()
+            else {
+                panic!("expected guarded eligibility for {pattern:?}");
+            };
+            assert!(inspection.prefix.is_empty());
+            assert_eq!(inspection.suffix, suffix);
+            assert_eq!(
+                inspection.boundary_semantics,
+                BoundarySemantics::CompleteAsciiWordRun
+            );
+            assert_eq!(inspection.class.ranges().len(), ASCII_WORD_RANGES.len());
         }
     }
 
@@ -217,12 +394,18 @@ mod tests {
             r"ab[ ]+?cd",
             r"ab[ ]{1,3}cd",
             r"ab[ ]cd",
-            r"[ ]+cd",
-            r"ab[ ]+",
             r"ab[ ]+cd|xy[ ]+zz",
             r"a[ab]+c",
             r"a[bc]+b",
             r"ab(?:[ ]|\t)+cd",
+            r"\B\w+n\b",
+            r"\b\w+n\B",
+            r"\b\w+?n\b",
+            r"\b\w{1,3}n\b",
+            r"\b[a-z]+n\b",
+            r"\b\w+n-\b",
+            r"\b\w+\x7F\b",
+            r"\b\w+\b",
         ] {
             assert!(matches!(
                 inspect(&hir(pattern), usize::MAX).unwrap(),

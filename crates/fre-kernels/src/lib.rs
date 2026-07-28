@@ -330,6 +330,7 @@ pub use literal_assertions::{
 };
 
 pub use literal_class_run_literal::{
+    BoundarySemantics as LiteralClassRunLiteralBoundarySemantics,
     BuildAccounting as LiteralClassRunLiteralBuildAccounting,
     BuildError as LiteralClassRunLiteralBuildError,
     BuildLimits as LiteralClassRunLiteralBuildLimits,

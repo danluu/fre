@@ -206,7 +206,9 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v42-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1";
+const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
+    [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
 const UNICODE_LITERAL_SEMANTIC_DOMAIN: &str =
     "rust-bytes.unicode-on.case-sensitive.canonical-nonempty-valid-utf8-literal.v2";
@@ -621,10 +623,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; the direct token-phrase reducer scans one monotone maximal-token stream with zero execution scratch",
         );
         identity.identity.push_str(
-            "; literal-class-run-literal-v1 authenticates count/span-sum for fixed byte literals bracketing one greedy nonempty byte-class run",
+            "; literal-class-run-literal-v2 authenticates count/span-sum for one greedy nonempty byte-class run with one or two fixed byte-literal anchors, or one complete ASCII word run ending in a nonempty fixed word suffix",
         );
         identity.availability.push_str(
-            "; the literal/class-run/literal reducer selects the longer fixed literal as an overlap-complete monotone memmem anchor, then verifies only its adjacent maximal byte-class run and opposite literal under complete prospective bounds with zero execution scratch",
+            "; the literal/class-run/literal reducer selects an overlap-complete monotone memmem anchor, then verifies either its adjacent maximal byte-class run and optional opposite literal or, under a distinct boundary identity, the terminal and preceding guards of a complete ASCII word run, all with complete prospective bounds and zero execution scratch",
         );
         identity
             .availability
@@ -2151,7 +2153,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
             "compile-aggregate-fixed-class-sandwich"
         }
         ("compile", AggregatePlanKind::LiteralClassRunLiteral, _) => {
-            "compile-aggregate-literal-class-run-literal-v1"
+            "compile-aggregate-literal-class-run-literal-v2"
         }
         ("compile", AggregatePlanKind::GraphemeScalarDfa, _) => {
             "compile-aggregate-grapheme-scalar-dfa"
@@ -2198,7 +2200,7 @@ fn aggregate_single_plan_label(model: &str, report: &AggregateBuildReport) -> &'
         (_, AggregatePlanKind::TokenPhrase, _) => "aggregate-token-phrase-v1",
         (_, AggregatePlanKind::FixedClassSandwich, _) => "aggregate-fixed-class-sandwich",
         (_, AggregatePlanKind::LiteralClassRunLiteral, _) => {
-            "aggregate-literal-class-run-literal-v1"
+            "aggregate-literal-class-run-literal-v2"
         }
         (_, AggregatePlanKind::GraphemeScalarDfa, _) => "aggregate-grapheme-scalar-dfa",
         (_, AggregatePlanKind::BoundedClassSequence, _) => "aggregate-bounded-class-sequence",
@@ -10335,6 +10337,20 @@ fn literal_class_run_literal_plan_identity_matches(
         .try_fold(0_usize, |total, word| {
             total.checked_add(usize::try_from(word.count_ones()).ok()?)
         });
+    let boundary_semantics_match = match identity.kernel.boundary_semantics {
+        fre::LiteralClassRunLiteralBoundarySemantics::Unguarded => {
+            (identity.kernel.prefix_bytes > 0 || identity.kernel.suffix_bytes > 0)
+                && build.class_ranges > 0
+        }
+        fre::LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun => {
+            identity.kernel.prefix_bytes == 0
+                && identity.kernel.suffix_bytes > 0
+                && identity.kernel.class_words == LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS
+                && identity.kernel.class_scan.is_some()
+                && build.class_ranges == 4
+                && build.class_members == 63
+        }
+    };
     operation_matches
         && report.selection == AggregatePlanSelection::Auto
         && report.plan == AggregatePlanKind::LiteralClassRunLiteral
@@ -10345,10 +10361,8 @@ fn literal_class_run_literal_plan_identity_matches(
         && !identity.kernel.unicode
         && identity.kernel.greedy
         && identity.kernel.non_overlapping
-        && identity.kernel.prefix_bytes > 0
-        && identity.kernel.suffix_bytes > 0
+        && boundary_semantics_match
         && literal_bytes_match
-        && build.class_ranges > 0
         && class_members == Some(build.class_members)
         && build.scratch_bytes == 0
         && build.peak_bytes == build.persistent_bytes
@@ -19442,7 +19456,7 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v42-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
+            "fre-current-aggregate-capture-v43-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v1-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v1-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-fixed-predicate-word64-v1-fixed-class-sandwich-v1-literal-class-run-literal-v2-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v1-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v4-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1"
         );
         assert!(identity.identity.contains("direct Unicode scalar-class"));
         assert!(
@@ -19473,7 +19487,7 @@ mod tests {
         assert!(identity.identity.contains("aggregate-word-run-v1"));
         assert!(identity.identity.contains("anchored-line-capture-v1"));
         assert!(identity.identity.contains("bounded-affix-span-sum-v1"));
-        assert!(identity.identity.contains("literal-class-run-literal-v1"));
+        assert!(identity.identity.contains("literal-class-run-literal-v2"));
         assert!(identity.identity.contains("bounded-literal-pair-v1"));
         assert!(
             identity
