@@ -2952,7 +2952,11 @@ impl CompiledRegex {
         };
         let utf8_validation =
             preflight_unicode_word_utf8_bytes(&self.program, haystack.len(), prospective_limits)?;
-        let required_literal_scan_enabled = receipt_bearing
+        // Value reducers use observed-work execution without a full attempt
+        // receipt. Keep their negative census enabled independently of
+        // `receipt_bearing`; admitted diagnostic paths retain their existing
+        // accounting unless they explicitly requested a receipt.
+        let required_literal_scan_enabled = (OBSERVED_WORK || receipt_bearing)
             && forced_generic_count_route.is_none()
             && strategy == Strategy::ReverseSequentialRows
             && !self.required_literals.is_empty();
@@ -10968,6 +10972,43 @@ mod tests {
                 prospective.accounting.required_literal_source_bytes,
                 haystack.len()
             );
+
+            let hot_count = compiled
+                .count_value_with_counters(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(hot_count.value, 0);
+            assert!(hot_count.receipt.closes());
+            assert_eq!(
+                hot_count.receipt.accounting.required_literal_source_bytes,
+                haystack.len()
+            );
+            assert_eq!(hot_count.receipt.accounting.state_evaluations, 0);
+            assert_eq!(hot_count.receipt.accounting.random_access_bytes_read, 0);
+
+            let hot_span_sum = compiled
+                .span_sum_value_with_counters(
+                    &haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+            assert_eq!(hot_span_sum.value, 0);
+            assert!(hot_span_sum.receipt.closes());
+            assert_eq!(
+                hot_span_sum
+                    .receipt
+                    .accounting
+                    .required_literal_source_bytes,
+                haystack.len()
+            );
+            assert_eq!(hot_span_sum.receipt.accounting.state_evaluations, 0);
+            assert_eq!(hot_span_sum.receipt.accounting.random_access_bytes_read, 0);
 
             let work_one_below = compiled
                 .span_sum_value_with_receipt(

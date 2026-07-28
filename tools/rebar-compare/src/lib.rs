@@ -37,7 +37,7 @@ use fre::{
     AggregateManyCompileRegex, AggregateManyCountRegex, AggregateManyExecutionSource,
     AggregateManyLiteralSemantics, AggregateManyOperation, AggregateManyPlanIdentity,
     AggregateManyPlanKind, AggregateManyRunLimits, AggregateManySpanSumRegex, AggregateOperation,
-    AggregateOperationCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
+    AggregateOperationHotCounterReceipt, AggregateOperationLimits, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateSpanSumRegex,
     AggregateStrategy, AggregateUnicodeScalarSemantics, AnchoredLineCaptureBuildError,
     AnchoredLineCaptureBuildLimits, AnchoredLineCaptureBuilder, AnchoredLineCapturePlan,
@@ -1818,8 +1818,9 @@ enum CurrentFreAggregateOperationInner {
 /// operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CurrentFreAggregateCounterReceiptStatus {
-    /// The single-pattern continuation route published a sealed P/A receipt.
-    Continuation(Box<AggregateOperationCounterReceipt>),
+    /// The single-pattern continuation route published a sealed hot-path
+    /// certificate and structural counter projection.
+    Continuation(Box<AggregateOperationHotCounterReceipt>),
     /// A single-pattern direct route completed without a continuation receipt.
     DirectSelectedPlan,
     /// A multi-pattern route completed before its native counter receipt is
@@ -1844,7 +1845,7 @@ impl CurrentFreAggregateOperationCounterResult {
 
     /// Optional immutable structural receipt from a continuation operation.
     #[must_use]
-    pub const fn continuation_receipt(&self) -> Option<&AggregateOperationCounterReceipt> {
+    pub const fn continuation_receipt(&self) -> Option<&AggregateOperationHotCounterReceipt> {
         match &self.receipt_status {
             CurrentFreAggregateCounterReceiptStatus::Continuation(receipt) => Some(receipt),
             CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan

@@ -3,8 +3,8 @@ use std::sync::{Arc, Weak};
 
 use fre_aggregate::{
     AdmittedCountAttempt, AdmittedSpanSumAttempt, AdmittedSpans, CompiledRegex,
-    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt, OperationCounterReceipt,
-    OperationProspective, RustByteProfile, SpanIter,
+    OperationAttemptError, OperationAttemptKind, OperationAttemptReceipt,
+    OperationHotCounterReceipt, OperationProspective, RustByteProfile, SpanIter,
 };
 use fre_kernels::{
     BLOCKING_DELIMITER_COUNT_OPERATION_ID, BLOCKING_DELIMITER_SPAN_SUM_OPERATION_ID,
@@ -15097,6 +15097,53 @@ impl AggregatePlan {
         }
     }
 
+    /// Re-run the incumbent receipt-bearing Count operation after the compact
+    /// value path refuses. The replay is authoritative: a successful replay
+    /// preserves the previous public success, while a failed replay publishes
+    /// exactly the same authenticated typed error as the pre-optimization
+    /// implementation.
+    #[cold]
+    #[inline(never)]
+    fn replay_continuation_count_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        strategy: AggregateStrategy,
+    ) -> Result<usize, AggregateExecutionError> {
+        engine
+            .count_value_attempt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map(|attempt| attempt.value)
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))
+    }
+
+    /// Receipt-bearing `SpanSum` replay paired with
+    /// [`Self::replay_continuation_count_value`].
+    #[cold]
+    #[inline(never)]
+    fn replay_continuation_span_sum_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+        strategy: AggregateStrategy,
+    ) -> Result<usize, AggregateExecutionError> {
+        engine
+            .span_sum_value_with_receipt(
+                haystack,
+                Self::full_range(haystack),
+                strategy,
+                limits.continuation,
+            )
+            .map(|attempt| attempt.value)
+            .map_err(|attempt| self.continuation_execution_error(limits, attempt))
+    }
+
     fn fixed_execution_error(
         &self,
         execution_limits: &AggregateRunLimits,
@@ -16165,8 +16212,9 @@ impl AggregatePlan {
         }
     }
 
-    // As above, keep the large continuation attempt and error receipts local
-    // to plans that actually execute the continuation engine.
+    // Keep the ordinary success path separate from its cold receipt-bearing
+    // replay so successful continuation values never materialize a full
+    // attempt receipt.
     #[inline(never)]
     fn execute_continuation_count_value(
         &self,
@@ -16182,15 +16230,16 @@ impl AggregatePlan {
                 ),
             )
         })?;
-        let attempt = engine
-            .count_value_attempt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        u64::try_from(attempt.value).map_err(|_| {
+        let value = match engine.count_value(
+            haystack,
+            Self::full_range(haystack),
+            strategy,
+            limits.continuation,
+        ) {
+            Ok(value) => value,
+            Err(_) => self.replay_continuation_count_value(engine, haystack, limits, strategy)?,
+        };
+        u64::try_from(value).map_err(|_| {
             self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
@@ -16545,9 +16594,57 @@ impl AggregatePlan {
         }
     }
 
-    /// Execute the incumbent value-only Count path and retain the optional
-    /// continuation counter receipt that it already sealed. This deliberately
-    /// does not introduce a new selector or a report-building pass.
+    fn execute_continuation_count_value_with_counters(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation count plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = match engine.count_value_with_counters(
+            haystack,
+            Self::full_range(haystack),
+            strategy,
+            limits.continuation,
+        ) {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                match self.replay_continuation_count_value(engine, haystack, limits, strategy) {
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "ordinary continuation count failure did not reproduce during authenticated replay",
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
+        let value = u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
+            )
+        })?;
+        Ok(AggregateValueCounterResult {
+            value,
+            continuation_receipt: Some(attempt.receipt),
+        })
+    }
+
+    /// Execute the incumbent value-only Count path and retain its optional
+    /// hot-path continuation counter receipt. This deliberately does not
+    /// introduce a new selector, full attempt receipt, or report-building pass
+    /// on success.
     fn execute_count_value_with_counters(
         &self,
         haystack: &[u8],
@@ -16561,40 +16658,7 @@ impl AggregatePlan {
                 }
             });
         };
-        let strategy = self.report.continuation_strategy.ok_or_else(|| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation count plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .count_value_attempt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        let value = u64::try_from(attempt.value).map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant("continuation count does not fit u64"),
-            )
-        })?;
-        let continuation_receipt = attempt.into_counter_receipt().map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "sealed continuation count could not publish structural counters",
-                ),
-            )
-        })?;
-        Ok(AggregateValueCounterResult {
-            value,
-            continuation_receipt: Some(continuation_receipt),
-        })
+        self.execute_continuation_count_value_with_counters(engine, haystack, limits)
     }
 
     // Keep fixed-domain validation and error construction out of the scalar
@@ -16624,41 +16688,6 @@ impl AggregatePlan {
                     AggregateFixedAbsoluteDomainAttemptFailure::Guard(source),
                 )
             })
-    }
-
-    // Keep the large continuation attempt and error receipts local to plans
-    // that actually execute the continuation engine.
-    #[inline(never)]
-    fn execute_continuation_span_sum_value(
-        &self,
-        engine: &CompiledRegex,
-        haystack: &[u8],
-        limits: &AggregateRunLimits,
-    ) -> Result<u64, AggregateExecutionError> {
-        let strategy = self.report.continuation_strategy.ok_or_else(|| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span-sum plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .span_sum_value_with_receipt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        u64::try_from(attempt.value).map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span sum does not fit u64",
-                ),
-            )
-        })
     }
 
     #[inline(never)]
@@ -16990,9 +17019,97 @@ impl AggregatePlan {
         }
     }
 
-    /// Execute the incumbent value-only `SpanSum` path and retain the optional
-    /// continuation counter receipt that it already sealed. This deliberately
-    /// does not introduce a new selector or a report-building pass.
+    // Keep the ordinary continuation success and cold authenticated replay
+    // local to span-sum plans, preserving the small entry-dispatch frame.
+    #[inline(never)]
+    fn execute_continuation_span_sum_value(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let value = match engine.span_sum_value(
+            haystack,
+            Self::full_range(haystack),
+            strategy,
+            limits.continuation,
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                self.replay_continuation_span_sum_value(engine, haystack, limits, strategy)?
+            }
+        };
+        u64::try_from(value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })
+    }
+
+    fn execute_continuation_span_sum_value_with_counters(
+        &self,
+        engine: &CompiledRegex,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<AggregateValueCounterResult, AggregateExecutionError> {
+        let strategy = self.report.continuation_strategy.ok_or_else(|| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span-sum plan lacks storage strategy",
+                ),
+            )
+        })?;
+        let attempt = match engine.span_sum_value_with_counters(
+            haystack,
+            Self::full_range(haystack),
+            strategy,
+            limits.continuation,
+        ) {
+            Ok(attempt) => attempt,
+            Err(_) => {
+                match self.replay_continuation_span_sum_value(engine, haystack, limits, strategy) {
+                    Err(error) => return Err(error),
+                    Ok(_) => {
+                        return Err(self.execution_error(
+                            limits,
+                            AggregateExecutionSource::InternalInvariant(
+                                "ordinary continuation span-sum failure did not reproduce during authenticated replay",
+                            ),
+                        ));
+                    }
+                }
+            }
+        };
+        let value = u64::try_from(attempt.value).map_err(|_| {
+            self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "continuation span sum does not fit u64",
+                ),
+            )
+        })?;
+        Ok(AggregateValueCounterResult {
+            value,
+            continuation_receipt: Some(attempt.receipt),
+        })
+    }
+
+    /// Execute the incumbent value-only `SpanSum` path and retain its optional
+    /// hot-path continuation counter receipt. This deliberately does not
+    /// introduce a new selector, full attempt receipt, or report-building pass
+    /// on success.
     fn execute_span_sum_value_with_counters(
         &self,
         haystack: &[u8],
@@ -17006,42 +17123,7 @@ impl AggregatePlan {
                 }
             });
         };
-        let strategy = self.report.continuation_strategy.ok_or_else(|| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span-sum plan lacks storage strategy",
-                ),
-            )
-        })?;
-        let attempt = engine
-            .span_sum_value_with_receipt(
-                haystack,
-                Self::full_range(haystack),
-                strategy,
-                limits.continuation,
-            )
-            .map_err(|attempt| self.continuation_execution_error(limits, attempt))?;
-        let value = u64::try_from(attempt.value).map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "continuation span sum does not fit u64",
-                ),
-            )
-        })?;
-        let continuation_receipt = attempt.into_counter_receipt().map_err(|_| {
-            self.execution_error(
-                limits,
-                AggregateExecutionSource::InternalInvariant(
-                    "sealed continuation span-sum could not publish structural counters",
-                ),
-            )
-        })?;
-        Ok(AggregateValueCounterResult {
-            value,
-            continuation_receipt: Some(continuation_receipt),
-        })
+        self.execute_continuation_span_sum_value_with_counters(engine, haystack, limits)
     }
 }
 
@@ -19891,10 +19973,10 @@ impl AggregateCountRegex {
     }
 
     /// Count through the same selected value-only plan as [`Self::count_value`]
-    /// and, when that plan is a continuation, publish its immutable structural
-    /// counters after the operation completes. The counter projection is
-    /// optional and does not add a selector input or construct an execution
-    /// report.
+    /// and, when that plan is a continuation, publish its immutable hot-path
+    /// certificate and structural counters after the operation completes. The
+    /// counter projection is optional and does not add a selector input,
+    /// construct a full attempt receipt, or construct an execution report.
     pub fn count_value_with_counters(
         &self,
         haystack: &[u8],
@@ -19928,12 +20010,12 @@ impl AggregateCountResult {
 ///
 /// A direct selected plan retains the incumbent value-only behavior and has no
 /// continuation receipt. A continuation selected plan returns the same value
-/// and route as its ordinary value-only API, plus the receipt published after
-/// the completed operation.
+/// and route as its ordinary value-only API, plus the hot-path certificate and
+/// counter receipt published after the completed operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateValueCounterResult {
     value: u64,
-    continuation_receipt: Option<OperationCounterReceipt>,
+    continuation_receipt: Option<OperationHotCounterReceipt>,
 }
 
 impl AggregateValueCounterResult {
@@ -19943,9 +20025,9 @@ impl AggregateValueCounterResult {
         self.value
     }
 
-    /// Optional immutable continuation attribution/counter receipt.
+    /// Optional immutable continuation hot-path attribution/counter receipt.
     #[must_use]
-    pub const fn continuation_receipt(&self) -> Option<&OperationCounterReceipt> {
+    pub const fn continuation_receipt(&self) -> Option<&OperationHotCounterReceipt> {
         self.continuation_receipt.as_ref()
     }
 }
@@ -20040,9 +20122,10 @@ impl AggregateSpanSumRegex {
 
     /// Sum spans through the same selected value-only plan as
     /// [`Self::span_sum_value`] and, when that plan is a continuation,
-    /// publish its immutable structural counters after the operation
-    /// completes. The counter projection is optional and does not add a
-    /// selector input or construct an execution report.
+    /// publish its immutable hot-path certificate and structural counters
+    /// after the operation completes. The counter projection is optional and
+    /// does not add a selector input, construct a full attempt receipt, or
+    /// construct an execution report.
     pub fn span_sum_value_with_counters(
         &self,
         haystack: &[u8],

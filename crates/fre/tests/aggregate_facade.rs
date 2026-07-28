@@ -5,19 +5,20 @@ use fre::{
     AggregateExecutionDetails, AggregateExecutionError, AggregateExecutionSource,
     AggregateFiniteLiteralSemantics, AggregateFixedClassSandwichSemantics,
     AggregateGuardedAsciiWordSemantics, AggregateLiteralIneligibility, AggregateOperation,
-    AggregateOperationAttemptKind, AggregateOperationCounterValue, AggregatePlanIdentity,
-    AggregatePlanKind, AggregatePlanSelection, AggregateResource, AggregateRunLimits,
-    AggregateSpanSumRegex, AggregateSpanSumResult, AggregateStrategy,
-    AggregateUnicodeScalarSemantics, BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID,
-    BoundedContextReduceError, DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID,
-    DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID, FixedClassSandwichOperation,
-    FixedClassSandwichReduceError, LITERAL_AGGREGATE_ACCOUNTING_VERSION,
-    LITERAL_AGGREGATE_ALGORITHM_VERSION, LiteralAggregateActualCounters,
-    LiteralAggregateBuildError, LiteralAggregateBuildLimits, LiteralAggregateDeclaredFallback,
-    LiteralAggregateOperation, LiteralAggregateOperationIdentity, LiteralAggregateReduceError,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind, PortableBuilder,
-    PrefixClassAlternationReduceError, RustProfile, SearchLimits, SimdDispatchContext, SimdFeature,
-    UnicodeScalarAggregateOperation, UnicodeScalarAggregateReduceError, guarded_ascii_word,
+    AggregateOperationAttemptKind, AggregateOperationCounterValue,
+    AggregateOperationHotCounterReceipt, AggregatePlanIdentity, AggregatePlanKind,
+    AggregatePlanSelection, AggregateResource, AggregateRunLimits, AggregateSpanSumRegex,
+    AggregateSpanSumResult, AggregateStrategy, AggregateUnicodeScalarSemantics,
+    BOUNDED_AFFIX_PLAN_ID, BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID, BoundedContextReduceError,
+    DISPATCHED_PREFIX_CLASS_ALTERNATION_PLAN_ID, DISPATCHED_UNICODE_SCALAR_AGGREGATE_PLAN_ID,
+    FixedClassSandwichOperation, FixedClassSandwichReduceError,
+    LITERAL_AGGREGATE_ACCOUNTING_VERSION, LITERAL_AGGREGATE_ALGORITHM_VERSION,
+    LiteralAggregateActualCounters, LiteralAggregateBuildError, LiteralAggregateBuildLimits,
+    LiteralAggregateDeclaredFallback, LiteralAggregateOperation, LiteralAggregateOperationIdentity,
+    LiteralAggregateReduceError, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PlanKind,
+    PortableBuilder, PrefixClassAlternationReduceError, RustProfile, SearchLimits,
+    SimdDispatchContext, SimdFeature, UnicodeScalarAggregateOperation,
+    UnicodeScalarAggregateReduceError, guarded_ascii_word,
 };
 const STRATEGIES: [AggregateStrategy; 2] = [
     AggregateStrategy::FullTable,
@@ -4759,6 +4760,114 @@ fn counter_value_facade_keeps_selected_values_routes_and_direct_absence() {
         .unwrap();
     assert_eq!(counter_direct.value(), ordinary_direct);
     assert!(counter_direct.continuation_receipt().is_none());
+}
+
+#[test]
+fn continuation_value_success_uses_the_ordinary_path_and_hot_counter_receipts() {
+    let pattern = r"(?:a+b|a)";
+    let haystack = b"aaaab a";
+    let limits = AggregateRunLimits::default();
+
+    let count = aggregate_builder(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let audited_count = count.count(haystack, limits).unwrap().value();
+    assert_eq!(count.count_value(haystack, limits).unwrap(), audited_count);
+    let counter_count = count.count_value_with_counters(haystack, limits).unwrap();
+    assert_eq!(counter_count.value(), audited_count);
+    let count_receipt: &AggregateOperationHotCounterReceipt = counter_count
+        .continuation_receipt()
+        .expect("continuation Count hot receipt");
+    assert!(count_receipt.closes());
+    assert_eq!(
+        count_receipt.value,
+        AggregateOperationCounterValue::Count(usize::try_from(audited_count).unwrap())
+    );
+
+    let span_sum = aggregate_builder(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_span_sum()
+        .unwrap();
+    let audited_span_sum = span_sum.span_sum(haystack, limits).unwrap().value();
+    assert_eq!(
+        span_sum.span_sum_value(haystack, limits).unwrap(),
+        audited_span_sum
+    );
+    let counter_span_sum = span_sum
+        .span_sum_value_with_counters(haystack, limits)
+        .unwrap();
+    assert_eq!(counter_span_sum.value(), audited_span_sum);
+    let span_sum_receipt: &AggregateOperationHotCounterReceipt = counter_span_sum
+        .continuation_receipt()
+        .expect("continuation SpanSum hot receipt");
+    assert!(span_sum_receipt.closes());
+    assert_eq!(
+        span_sum_receipt.value,
+        AggregateOperationCounterValue::SpanSum(usize::try_from(audited_span_sum).unwrap())
+    );
+}
+
+#[test]
+fn continuation_value_failure_replays_and_preserves_typed_receipts() {
+    let pattern = r"(?:a+b|a)";
+    let haystack = b"aaaab a";
+
+    let count = aggregate_builder(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_count()
+        .unwrap();
+    let mut count_limits = AggregateRunLimits::default();
+    count_limits.continuation.max_output_matches = 0;
+    let count_error = count.count_value(haystack, count_limits).unwrap_err();
+    assert!(count_error.has_closed_continuation_attempt());
+    let AggregateExecutionSource::Continuation(count_source) = &count_error.source else {
+        panic!("continuation Count failure lost its typed source");
+    };
+    let count_receipt = count_error
+        .continuation_receipt()
+        .expect("continuation Count failure receipt");
+    assert!(count_receipt.authenticates_source(count_source));
+    assert_eq!(
+        count_receipt.identity.operation,
+        AggregateOperationAttemptKind::Count
+    );
+    let counter_count_error = count
+        .count_value_with_counters(haystack, count_limits)
+        .unwrap_err();
+    assert_eq!(counter_count_error.source, count_error.source);
+    assert!(counter_count_error.has_closed_continuation_attempt());
+
+    let span_sum = aggregate_builder(pattern)
+        .unicode(false)
+        .plan_selection(AggregatePlanSelection::ForceContinuation)
+        .build_span_sum()
+        .unwrap();
+    let mut span_sum_limits = AggregateRunLimits::default();
+    span_sum_limits.continuation.max_span_sum = 0;
+    let span_sum_error = span_sum
+        .span_sum_value(haystack, span_sum_limits)
+        .unwrap_err();
+    assert!(span_sum_error.has_closed_continuation_attempt());
+    let AggregateExecutionSource::Continuation(span_sum_source) = &span_sum_error.source else {
+        panic!("continuation SpanSum failure lost its typed source");
+    };
+    let span_sum_receipt = span_sum_error
+        .continuation_receipt()
+        .expect("continuation SpanSum failure receipt");
+    assert!(span_sum_receipt.authenticates_source(span_sum_source));
+    assert_eq!(
+        span_sum_receipt.identity.operation,
+        AggregateOperationAttemptKind::SpanSum
+    );
+    let counter_span_sum_error = span_sum
+        .span_sum_value_with_counters(haystack, span_sum_limits)
+        .unwrap_err();
+    assert_eq!(counter_span_sum_error.source, span_sum_error.source);
+    assert!(counter_span_sum_error.has_closed_continuation_attempt());
 }
 
 #[test]

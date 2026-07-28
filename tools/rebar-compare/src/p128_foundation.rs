@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fre::{AggregateOperationCounterReceipt, AggregateOperationCounterValue};
+use fre::{AggregateOperationCounterValue, AggregateOperationHotCounterReceipt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -514,7 +514,7 @@ impl P128FoundationAggregateCounterObservation {
 
     fn into_continuation_receipt(
         self,
-    ) -> Result<(usize, usize, AggregateOperationCounterReceipt), CompareError> {
+    ) -> Result<(usize, usize, AggregateOperationHotCounterReceipt), CompareError> {
         let receipt = match self.result.receipt_status() {
             CurrentFreAggregateCounterReceiptStatus::Continuation(receipt) => {
                 receipt.as_ref().clone()
@@ -539,7 +539,7 @@ impl P128FoundationAggregateCounterObservation {
     }
 }
 
-/// Immutable post-operation attribution record for a continuation counter
+/// Immutable post-operation attribution record for a continuation hot-counter
 /// receipt. Capture and build-many executors will bind their own receipt
 /// variants in their scoped Foundation interfaces; this type never invents a
 /// counter for an executor that has not published one.
@@ -555,8 +555,8 @@ pub struct P128FoundationCounterRecord {
     session_id: usize,
     /// Completed operation sequence within that diagnostic session.
     observation_sequence: usize,
-    /// Immutable selected-route continuation receipt.
-    pub receipt: Box<AggregateOperationCounterReceipt>,
+    /// Immutable selected-route continuation hot-counter receipt.
+    pub receipt: Box<AggregateOperationHotCounterReceipt>,
     authentication: P128FoundationCounterRecordAuthentication,
 }
 
@@ -576,7 +576,7 @@ impl P128FoundationCounterRecord {
         point: P128FoundationLedgerRecord,
         session_id: usize,
         observation_sequence: usize,
-        receipt: AggregateOperationCounterReceipt,
+        receipt: AggregateOperationHotCounterReceipt,
     ) -> Result<Self, CompareError> {
         if !receipt.closes() || !single_continuation_matches(&point, receipt.value) {
             return Err(CompareError::new(
@@ -656,10 +656,11 @@ fn expected_receipt_kind(family: &str, model: &str) -> Option<P128FoundationRece
     }
 }
 
-fn counter_receipt_fingerprint(receipt: &AggregateOperationCounterReceipt) -> [u8; 32] {
-    // The nested receipt independently seals every public P/A field. This
-    // compact outer fingerprint binds that whole receipt to one attribution
-    // record without retaining a second stack-heavy clone.
+fn counter_receipt_fingerprint(receipt: &AggregateOperationHotCounterReceipt) -> [u8; 32] {
+    // The nested receipt independently seals its route certificate, actual
+    // accounting, reducer value, and projected counters. This compact outer
+    // fingerprint binds that whole receipt to one attribution record without
+    // retaining a second stack-heavy clone.
     Sha256::digest(format!("{receipt:?}").as_bytes()).into()
 }
 
