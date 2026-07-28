@@ -10,7 +10,10 @@ fn compile(ast: &Ast) -> Arc<Program> {
 }
 
 fn exact_limits(program: &Program, haystack_len: usize) -> CaptureStreamLimits {
-    let prospective = CaptureStream::prospective(program, haystack_len).expect("prospective");
+    let prospective =
+        CaptureStream::operation_prospective(program, haystack_len, CaptureStreamDomains::Whole)
+            .expect("whole operation prospective")
+            .construction;
     // Rebar line domains dominate the whole-input operation envelope and make
     // this fixture an exact source-free admission for either public domain.
     let operation = CaptureStream::operation_prospective(
@@ -345,7 +348,10 @@ fn construction_and_operation_limits_refuse_at_exact_one_below_before_source_acc
         Ast::Byte(b'b').capture(2).repeat(0, Some(1), Greed::Greedy),
     ]);
     let program = compile(&ast);
-    let prospective = CaptureStream::prospective(&program, 2).expect("prospective");
+    let prospective =
+        CaptureStream::operation_prospective(&program, 2, CaptureStreamDomains::Whole)
+            .expect("whole operation prospective")
+            .construction;
     let mut cache_cells = exact_limits(&program, 2);
     cache_cells.max_mask_states = prospective
         .participation_cache_cells()
@@ -402,6 +408,70 @@ fn construction_and_operation_limits_refuse_at_exact_one_below_before_source_acc
             limit,
         } if required == operation.state_visits && limit == one_below.max_state_visits
     ));
+}
+
+#[test]
+fn participation_cache_construction_is_authentic_only_for_regular_whole_streams() {
+    let program = compile(&Ast::concat([
+        Ast::Byte(b'a').capture(1),
+        Ast::Byte(b'b').capture(2).repeat(0, Some(1), Greed::Greedy),
+    ]));
+    let source_bytes = 4;
+    let established = CaptureStream::prospective(&program, source_bytes).expect("established");
+    let whole =
+        CaptureStream::operation_prospective(&program, source_bytes, CaptureStreamDomains::Whole)
+            .expect("whole prospective");
+    let lines = CaptureStream::operation_prospective(
+        &program,
+        source_bytes,
+        CaptureStreamDomains::RebarLines,
+    )
+    .expect("line prospective");
+
+    assert_eq!(established.participation_cache_cells(), 0);
+    assert!(whole.construction.participation_cache_cells() > 0);
+    assert_eq!(lines.construction, established);
+    assert_eq!(
+        whole.construction.allocations,
+        established
+            .allocations
+            .checked_add(8)
+            .expect("cache allocation count")
+    );
+    assert!(whole.construction.build_work > established.build_work);
+    assert!(whole.construction.authenticates_program(&program));
+    assert!(lines.authenticates_program(&program));
+
+    let established_limits = CaptureStreamLimits {
+        max_source_bytes: established.source_bytes,
+        max_states: established.states,
+        max_build_work: established.build_work,
+        max_persistent_bytes: established.persistent_bytes,
+        max_combined_peak_bytes: established.combined_peak_bytes,
+        max_allocations: established.allocations,
+        ..CaptureStreamLimits::default()
+    };
+    let exact = CaptureStream::new_exact(Arc::clone(&program), source_bytes, established_limits)
+        .expect("exact workspace");
+    assert_eq!(exact.build_report(), established);
+    assert_eq!(exact.build_report().participation_cache_cells(), 0);
+
+    let limits = exact_limits(&program, source_bytes);
+    let lines_stream = CaptureStream::new(
+        Arc::clone(&program),
+        source_bytes,
+        CaptureStreamDomains::RebarLines,
+        limits,
+    )
+    .expect("line stream");
+    assert_eq!(lines_stream.build_report(), established);
+    assert_eq!(lines_stream.build_report().participation_cache_cells(), 0);
+
+    let whole_stream =
+        CaptureStream::new(program, source_bytes, CaptureStreamDomains::Whole, limits)
+            .expect("whole stream");
+    assert_eq!(whole_stream.build_report(), whole.construction);
+    assert!(whole_stream.build_report().participation_cache_cells() > 0);
 }
 
 #[test]
@@ -470,9 +540,7 @@ fn exact_span_workspace_preserves_priority_and_refuses_one_below() {
         max_materialization_reads: accounting.materialization_reads,
         max_materialization_writes: accounting.materialization_writes,
         max_materialization_preview_writes: accounting.materialization_preview_writes,
-        max_mask_states: accounting
-            .mask_states
-            .max(prospective.participation_cache_cells()),
+        max_mask_states: accounting.mask_states,
         max_mask_word_copies: accounting.mask_word_copies,
         max_mask_word_reads: accounting.mask_word_reads,
         max_reset_cells: accounting.reset_cells,

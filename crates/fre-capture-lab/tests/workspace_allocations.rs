@@ -172,7 +172,11 @@ fn assert_capture_stream_census() {
         )
         .expect("program"),
     );
-    let prospective = CaptureStream::prospective(&program, 4).expect("prospective");
+    let prospective =
+        CaptureStream::operation_prospective(&program, 4, CaptureStreamDomains::Whole)
+            .expect("whole operation prospective")
+            .construction;
+    let established = CaptureStream::prospective(&program, 4).expect("established prospective");
     let limits = CaptureStreamLimits {
         max_source_bytes: prospective.source_bytes,
         max_states: prospective.states,
@@ -192,6 +196,29 @@ fn assert_capture_stream_census() {
     assert_eq!(stats.deallocations, 0);
     assert_eq!(stats.bytes_reallocated, 0);
     assert!(prospective.closes());
+    assert_eq!(
+        prospective.allocations,
+        established
+            .allocations
+            .checked_add(8)
+            .expect("cache allocation count")
+    );
+
+    let (line_stream, stats) = census(|| {
+        CaptureStream::new(
+            Arc::clone(&program),
+            4,
+            CaptureStreamDomains::RebarLines,
+            limits,
+        )
+        .expect("line stream")
+    });
+    assert_eq!(line_stream.build_report(), established);
+    assert_eq!(stats.allocations, established.allocations);
+    assert_eq!(stats.bytes_allocated, established.allocator_bytes);
+    assert_eq!(stats.reallocations, 0);
+    assert_eq!(stats.deallocations, 0);
+    assert_eq!(stats.bytes_reallocated, 0);
 
     let mut stream = stream;
     for _ in 0..2 {

@@ -2675,7 +2675,6 @@ fn capture_exact_stream_limits(
     states: usize,
     user_captures: usize,
     source_bytes: usize,
-    participation_cache_cells: usize,
     limits: EngineSearchLimits,
     requested: CaptureStreamLimits,
 ) -> CaptureStreamLimits {
@@ -2703,7 +2702,7 @@ fn capture_exact_stream_limits(
         max_materialization_reads: limits.max_history_walk,
         max_materialization_writes: limits.max_history_walk,
         max_materialization_preview_writes: 0,
-        max_mask_states: participation_cache_cells,
+        max_mask_states: 0,
         max_mask_word_copies: 0,
         max_mask_word_reads: limits.max_state_visits,
         max_reset_cells: usize::MAX,
@@ -2866,7 +2865,6 @@ impl CaptureRegex {
             self.report.engine.states,
             self.report.engine.captures,
             source_bytes,
-            prospective.participation_cache_cells(),
             limits,
             projection_limits,
         );
@@ -2888,31 +2886,23 @@ impl CaptureRegex {
         limits: EngineSearchLimits,
         projection_limits: CaptureStreamLimits,
     ) -> Result<CaptureExactProjectionSession, CaptureStreamError> {
-        let uniform_entries =
-            if let Some(participating) = self.report.uniform_participating_captures {
-                let entries = participating
-                    .checked_add(1)
-                    .and_then(|entries| u64::try_from(entries).ok())
-                    .ok_or(CaptureStreamError::InvalidProgram)?;
-                if self.uniform_count_minimum_match_bytes.is_some() {
-                    return Ok(CaptureExactProjectionSession {
-                        route: CaptureExactProjectionRoute::Uniform { entries },
-                    });
-                }
-                Some(entries)
-            } else {
-                None
-            };
-        let prospective = CaptureStream::prospective(self.engine.program(), source_bytes)?;
         let stream_limits = capture_exact_stream_limits(
             self.report.engine.states,
             self.report.engine.captures,
             source_bytes,
-            prospective.participation_cache_cells(),
             limits,
             projection_limits,
         );
-        if let Some(entries) = uniform_entries {
+        if let Some(participating) = self.report.uniform_participating_captures {
+            let entries = participating
+                .checked_add(1)
+                .and_then(|entries| u64::try_from(entries).ok())
+                .ok_or(CaptureStreamError::InvalidProgram)?;
+            if self.uniform_count_minimum_match_bytes.is_some() {
+                return Ok(CaptureExactProjectionSession {
+                    route: CaptureExactProjectionRoute::Uniform { entries },
+                });
+            }
             let stream = CaptureStream::new_exact(
                 Arc::clone(self.engine.program()),
                 source_bytes,

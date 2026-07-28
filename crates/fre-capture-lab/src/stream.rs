@@ -468,8 +468,20 @@ impl CaptureStreamOperationProspective {
     /// Recompute and authenticate this exact fixed-program envelope.
     #[must_use]
     pub fn authenticates_program(self, program: &Program) -> bool {
-        CaptureStream::operation_prospective(program, self.construction.source_bytes, self.domains)
-            .is_ok_and(|expected| expected == self)
+        let Ok(cache_shape) = self.construction.participation_cache_shape() else {
+            return false;
+        };
+        let cache_enabled = cache_shape != ParticipationCacheShape::default();
+        if cache_enabled && self.domains != CaptureStreamDomains::Whole {
+            return false;
+        }
+        CaptureStream::operation_prospective_with_cache(
+            program,
+            self.construction.source_bytes,
+            self.domains,
+            cache_enabled,
+        )
+        .is_ok_and(|expected| expected == self)
     }
 
     /// Check every construction and operation resource before source access.
@@ -780,12 +792,19 @@ impl CaptureStreamProspective {
             && self.combined_peak_bytes == self.persistent_bytes
     }
 
-    /// Whether this prospective is the unique mechanically derived envelope
-    /// for `program` and its already-bound source length.
+    /// Whether this prospective is a mechanically derived cached or uncached
+    /// envelope for `program` and its already-bound source length.
     #[must_use]
     pub fn authenticates_program(self, program: &Program) -> bool {
-        CaptureStream::prospective(program, self.source_bytes)
-            .is_ok_and(|expected| expected == self)
+        let Ok(cache_shape) = self.participation_cache_shape() else {
+            return false;
+        };
+        CaptureStream::prospective_with_cache(
+            program,
+            self.source_bytes,
+            cache_shape != ParticipationCacheShape::default(),
+        )
+        .is_ok_and(|expected| expected == self)
     }
 }
 
@@ -1105,14 +1124,28 @@ struct CaptureStreamRun {
 }
 
 impl CaptureStream {
-    /// Derive a complete source-independent envelope without allocating.
+    /// Derive the established source-independent frontier/tag envelope without
+    /// allocating.
+    ///
+    /// This mode-neutral construction is used by exact-span and line-domain
+    /// callers. A regular whole-operation prospective returned by
+    /// [`Self::operation_prospective`] may additionally retain the bounded
+    /// participation cache.
+    pub fn prospective(
+        program: &Program,
+        source_bytes: usize,
+    ) -> Result<CaptureStreamProspective, CaptureStreamError> {
+        Self::prospective_with_cache(program, source_bytes, false)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the source-free constructor closes the complete cache, frontier, tag, and allocation envelope in one auditable derivation"
     )]
-    pub fn prospective(
+    fn prospective_with_cache(
         program: &Program,
         source_bytes: usize,
+        participation_cache_enabled: bool,
     ) -> Result<CaptureStreamProspective, CaptureStreamError> {
         let states = program.states.len();
         let groups = program.groups.len();
@@ -1157,7 +1190,9 @@ impl CaptureStream {
             .ok_or(CaptureStreamError::Overflow(
                 CaptureStreamResource::PersistentBytes,
             ))?;
-        let participation_cache = if projection == CaptureStreamProjection::ParticipationMask {
+        let participation_cache = if participation_cache_enabled
+            && projection == CaptureStreamProjection::ParticipationMask
+        {
             ParticipationCacheShape::for_program(program, source_bytes)?
         } else {
             ParticipationCacheShape::default()
@@ -1224,16 +1259,34 @@ impl CaptureStream {
     /// Derive the complete restart-aware operation envelope without reading
     /// source bytes or allocating. The executor rejects empty winners, so the
     /// positive-width restarted proof applies to both stream projections.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "every published restart, tag, result, and work dimension is derived together before source access"
-    )]
     pub fn operation_prospective(
         program: &Program,
         source_bytes: usize,
         domains: CaptureStreamDomains,
     ) -> Result<CaptureStreamOperationProspective, CaptureStreamError> {
-        let construction = Self::prospective(program, source_bytes)?;
+        Self::operation_prospective_with_cache(
+            program,
+            source_bytes,
+            domains,
+            domains == CaptureStreamDomains::Whole,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the mode-authenticated construction and every restart, tag, result, and work dimension are derived together before source access"
+    )]
+    fn operation_prospective_with_cache(
+        program: &Program,
+        source_bytes: usize,
+        domains: CaptureStreamDomains,
+        participation_cache_enabled: bool,
+    ) -> Result<CaptureStreamOperationProspective, CaptureStreamError> {
+        if participation_cache_enabled && domains != CaptureStreamDomains::Whole {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        let construction =
+            Self::prospective_with_cache(program, source_bytes, participation_cache_enabled)?;
         let restarted = program
             .history_program_shape()
             .restarted_prospective_with_minimum(
@@ -1424,11 +1477,13 @@ impl CaptureStream {
         for _ in 0..prospective.states {
             exact_push(&mut seen, 0)?;
         }
-        let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
-        if prospective.projection == CaptureStreamProjection::ParticipationMask
-            && !tags.install_participation_cache(participation_cache)
-        {
-            return Err(CaptureStreamError::InvalidProgram);
+        if prospective.participation_cache_cells() != 0 {
+            let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
+            if prospective.projection != CaptureStreamProjection::ParticipationMask
+                || !tags.install_participation_cache(participation_cache)
+            {
+                return Err(CaptureStreamError::InvalidProgram);
+            }
         }
         Ok(Self {
             program,
@@ -1460,11 +1515,15 @@ impl CaptureStream {
         source_bytes: usize,
         limits: CaptureStreamLimits,
     ) -> Result<Self, CaptureStreamError> {
-        let operation =
-            Self::operation_prospective(&program, source_bytes, CaptureStreamDomains::Whole)?;
+        let operation = Self::operation_prospective_with_cache(
+            &program,
+            source_bytes,
+            CaptureStreamDomains::Whole,
+            false,
+        )?;
         let prospective = operation.construction;
         operation.admits_construction(limits)?;
-        let mut tags = TagWorkspace::new(
+        let tags = TagWorkspace::new(
             prospective.groups,
             prospective.tags.history_nodes,
             0,
@@ -1500,12 +1559,6 @@ impl CaptureStream {
         let mut seen = exact_vec(prospective.states)?;
         for _ in 0..prospective.states {
             exact_push(&mut seen, 0)?;
-        }
-        let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
-        if prospective.projection == CaptureStreamProjection::ParticipationMask
-            && !tags.install_participation_cache(participation_cache)
-        {
-            return Err(CaptureStreamError::InvalidProgram);
         }
         Ok(Self {
             program,

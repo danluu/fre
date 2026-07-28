@@ -33,6 +33,8 @@ const BOUNDARY_ALPHABET: usize = BYTE_ALPHABET * 2;
 const MAX_CACHE_STATES: usize = 256;
 const MAX_CACHE_ITEMS: usize = 1 << 16;
 const CELL_UNFILLED: u32 = u32::MAX;
+const INITIAL_CONTEXTS: usize = 4;
+const INITIAL_CONTEXT_PAIRS: usize = INITIAL_CONTEXTS * (INITIAL_CONTEXTS - 1) / 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ParticipationCacheShape {
@@ -132,25 +134,7 @@ impl ParticipationCacheShape {
         // One exact box retains the cache metadata without inflating every
         // public receipt that embeds a prepared capture stream.
         let allocations = 8;
-        let initialized = cells
-            .checked_add(states)
-            .and_then(|value| value.checked_add(program_states))
-            .ok_or(CaptureStreamError::Overflow(
-                CaptureStreamResource::BuildWork,
-            ))?;
-        let build_work = initialized
-            .checked_add(
-                program_states
-                    .checked_mul(4)
-                    .ok_or(CaptureStreamError::Overflow(
-                        CaptureStreamResource::BuildWork,
-                    ))?,
-            )
-            .and_then(|value| value.checked_add(allocations))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(CaptureStreamError::Overflow(
-                CaptureStreamResource::BuildWork,
-            ))?;
+        let build_work = cache_build_work(program_states, states, cells, items, allocations)?;
         Ok(Self {
             states,
             cells,
@@ -173,20 +157,65 @@ impl ParticipationCacheShape {
             .checked_mul(self.states)
             .map(|items| items.min(MAX_CACHE_ITEMS).max(program_states));
         let expected_bytes = cache_bytes(program_states, self.states, self.cells, self.items).ok();
-        let expected_initialized = self
-            .cells
-            .checked_add(self.states)
-            .and_then(|value| value.checked_add(program_states));
-        let expected_build_work = expected_initialized
-            .and_then(|value| value.checked_add(program_states.checked_mul(4)?))
-            .and_then(|value| value.checked_add(8))
-            .and_then(|value| value.checked_add(1));
+        let expected_build_work =
+            cache_build_work(program_states, self.states, self.cells, self.items, 8).ok();
         expected_cells == Some(self.cells)
             && expected_items == Some(self.items)
             && expected_bytes == Some(self.bytes)
             && self.allocations == 8
             && expected_build_work == Some(self.build_work)
     }
+}
+
+fn cache_build_work(
+    program_states: usize,
+    cache_states: usize,
+    cells: usize,
+    items: usize,
+    allocations: usize,
+) -> Result<usize, CaptureStreamError> {
+    let initialized = cells
+        .checked_add(cache_states)
+        .and_then(|value| value.checked_add(program_states))
+        .ok_or(CaptureStreamError::Overflow(
+            CaptureStreamResource::BuildWork,
+        ))?;
+    // Each of the four absolute start/end contexts may visit the complete
+    // program. Interning those closures additionally compares each context
+    // with every preceding context (one metadata comparison plus at most one
+    // complete frontier comparison) and copies at most four complete
+    // frontiers into the fixed item arena. Four metadata records are then
+    // published. This is deliberately a conservative source-free bound: a
+    // duplicate context or an early full arena only reduces the actual work.
+    let closure_visits =
+        program_states
+            .checked_mul(INITIAL_CONTEXTS)
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::BuildWork,
+            ))?;
+    let interner_comparisons = program_states
+        .checked_add(1)
+        .and_then(|per_pair| per_pair.checked_mul(INITIAL_CONTEXT_PAIRS))
+        .ok_or(CaptureStreamError::Overflow(
+            CaptureStreamResource::BuildWork,
+        ))?;
+    let maximum_initial_items =
+        program_states
+            .checked_mul(INITIAL_CONTEXTS)
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::BuildWork,
+            ))?;
+    let retained_item_copies = items.min(maximum_initial_items);
+    initialized
+        .checked_add(closure_visits)
+        .and_then(|value| value.checked_add(interner_comparisons))
+        .and_then(|value| value.checked_add(retained_item_copies))
+        .and_then(|value| value.checked_add(INITIAL_CONTEXTS))
+        .and_then(|value| value.checked_add(allocations))
+        .and_then(|value| value.checked_add(1))
+        .ok_or(CaptureStreamError::Overflow(
+            CaptureStreamResource::BuildWork,
+        ))
 }
 
 fn cache_bytes(
@@ -1350,6 +1379,28 @@ mod tests {
     use crate::{
         Ast, BuildLimits, CaptureStream, CaptureStreamDomains, CaptureStreamLimits, Greed,
     };
+
+    #[test]
+    fn shape_charges_initial_closure_interning_comparisons_and_copies() {
+        let program_states = 7;
+        let cache_states = INITIAL_CONTEXTS;
+        let cells = cache_states * BOUNDARY_ALPHABET;
+        let shape =
+            ParticipationCacheShape::from_cells(program_states, cells).expect("cache shape");
+        let initialized = cells + cache_states + program_states;
+        let closure_visits = program_states * INITIAL_CONTEXTS;
+        let comparisons = (program_states + 1) * INITIAL_CONTEXT_PAIRS;
+        let copies = program_states * INITIAL_CONTEXTS;
+        let expected = initialized
+            + closure_visits
+            + comparisons
+            + copies
+            + INITIAL_CONTEXTS
+            + shape.allocations
+            + 1;
+        assert_eq!(shape.build_work, expected);
+        assert!(shape.closes(program_states));
+    }
 
     fn assert_forced_saturation_preserves_result(ast: &Ast, haystack: &[u8]) {
         let program =
