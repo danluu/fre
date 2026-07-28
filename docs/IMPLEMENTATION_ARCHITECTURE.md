@@ -24,6 +24,12 @@ fre-kernel-ir          verified native-kernel contract/oracle  │
   │     └─> fre-jit-runtime  guarded strict-W^X publication      │
   │             └─> fre-jit-cache  bounded typed mapping cache   │
   └─> fre-jit-x86_64   bounded immutable native images          │
+fre + fre-kernel-ir + fre-jit-aarch64 + fre-aot-aarch64         │
+  └─> fre-aot-compiler  source-first inert Mach-O/ELF compile    │
+        ├─> fre-aot-macho  deterministic Mach-O object layer     │
+        └─> fre-aot-elf    deterministic ELF object layer        │
+fre-aot-static-runtime  authenticated Count/Search adoption      │
+  └─> fre (default-off explicit owner/handle binding only)        │
 fre-required-literal-lab  isolated proved fast-plan research    │
 rebar tools            isolated qualification tooling ─────────┘ (receipts only)
 fre ──> fre-capi       versioned C11 ABI and C++17 RAII wrapper
@@ -33,6 +39,26 @@ The independent oracle must not call syntax HIR lowering, production automata,
 planning, or native code. Production executors must not turn oracle evaluation
 into a fallback. Conformance adapters may depend on both sides, but no
 production crate may depend on `fre-conformance` or `fre-reference`.
+
+Search JIT and Search AOT share FRE's typed Kernel IR and custom
+`fre-jit-aarch64` direct machine-code emitter. Count-v2 AOT uses the separate
+custom direct-Count emitter in `fre-aot-aarch64`. The JIT publishes an audited
+Search native image through `fre-jit-runtime`; AOT packages already-emitted
+Search or Count bytes in a deterministic object for static linking and
+authenticated adoption. `rustc` may use LLVM for Rust host or tool code, and a
+system linker may place the payload in a final executable, but LLVM does not
+select, optimize, or generate the regex payload.
+
+`fre` keeps its qualified exact-search JIT API behind the default-on
+`qualified-exact-search-jit` feature. The separate
+`explicit-search-span-aot` feature is default-off and depends on the static
+runtime without enabling that runtime's link/adoption features. It only binds
+an already-adopted Search Span handle to the exact portable semantic owner; it
+cannot create runtime authority or alter portable routing. The AOT compiler
+consumes `fre` with default features disabled, so portable source/plan
+authentication does not transitively depend on executable-memory publication.
+Its direct `fre-jit-aarch64` dependency is the inert custom machine-code
+emitter.
 
 ## Implemented layers
 
@@ -46,7 +72,7 @@ production crate may depend on `fre-conformance` or `fre-reference`.
 | `fre-iterator-lab` | restricted capture-free byte models | whole-operation candidate traces | prove/falsify exact bounded iteration; never silently become production |
 | `fre-aggregate` | bounded canonical Rust byte HIR subset, with explicit whole-match capture erasure | complete non-overlapping spans and checked reducers | production zero/progress compiler, same-boundary DAG certificate, forced full-table/reverse-row strategies, exact limits, and 242,910 sequence differentials; operation-typed facade/Rebar integration preserves fixed strategy and accounting |
 | `fre-kernels` | certified finite literals or proved `CLASS+ SUFFIX`, search range, and operation-typed aggregate plans | exact literal/ordered-set/required-literal/forward-anchored search plus exact, scalar-class/run, or ordered-literal whole-operation count/span sum | theorem-gated native primitives and forced resource/differential tests; the scalar-run reducer handles canonical greedy/lazy root `CLASS+` in one UTF-8 traversal with zero dynamic scratch; forward has 1,534,572 comparisons, exact aggregate 232,050, and ordered reverse AC/DP 31,218 exhaustive cases with exact `N` transitions; packed ordered search is explicitly research-only pending fallible owned construction |
-| `fre` | profile, pattern, limits, haystack, and aggregate operation type | subset public matcher plus aggregate count/span-sum plans and reports | two-pass bounded search planning, operation-specific aggregate construction, charged whole-match capture erasure, honest plan/cache identity, forced parity, and no post-selection fallback |
+| `fre` | profile, pattern, limits, haystack, aggregate operation type, and optionally an already-adopted Search Span handle | subset public matcher plus aggregate count/span-sum plans and reports; default-off explicit AOT binding | two-pass bounded search planning, operation-specific aggregate construction, charged whole-match capture erasure, honest plan/cache identity, forced parity, and no post-selection fallback; AOT binding checks the complete semantic identity and literal width while retaining the portable owner |
 | `fre-re2-syntax` | pinned RE2 pattern/options | checked typed RE2 AST or exact diagnostic | source-mapped iterative parser and pinned direct C++ oracle slice; program admission/lowering still open |
 | `fre-capture-lab` | restricted tagged capture AST | two canonical capture traces | bounded independent history formulations and upstream differentials; its repeated aggregate search remains an oracle, not production |
 | `fre-required-literal-lab` | proved `CLASS+ SUFFIX` byte shape | bounded candidate/confirmation plan | 196,740 direct span comparisons, window/limit proofs, and retained wins/losses; production required-literal and distinct forward-anchored promotions are separately forced and tested |
@@ -55,6 +81,9 @@ production crate may depend on `fre-conformance` or `fre-reference`.
 | `fre-jit-x86_64` | validated Kernel IR plus SysV target stamp | immutable code/data/relocation image and address-free AOT artifact | 276,309 scalar/SSE external instruction executions, independent audit, exact limits; AVX2 and production publication remain open |
 | `fre-jit-runtime` | audited AArch64 native image plus typed output contract | immutable reference-counted callable mapping | strict `PROT_NONE` to RW to RX lifecycle with guards, exact accounting, rollback and concurrency tests, and 663,084 actual-hardware/oracle comparisons; planner integration remains open |
 | `fre-jit-cache` | immutable AArch64 image, typed output contract, fixed publication/cache limits | callable lease plus exact current/peak/event snapshot | same-key single-flight, different-key concurrency, deterministic LRU, unique-token retirement, outstanding-lease accounting, O(1) precomputed full-AOT identity, forced races/failures, and 14 cache tests; process-local only and no speed claim |
+| `fre-aot-macho` / `fre-aot-elf` | audited AArch64 native image plus an external planner binding | deterministic relocatable object, metadata, identity-derived symbols, and object receipts | independently reparse and validate emitted bytes; object creation is inert and grants no linker or runtime authority |
+| `fre-aot-compiler` | authenticated facade source/plan plus sealed Count or Search manifest | deterministic machine-code object plus source/KIR/native/object receipt; Search Span can also emit deterministic final-image glue and an unsigned source-bound receipt | Count-v2 has a narrow static Candidate; nonempty exact-literal Search V1 keeps runtime authority unconditionally absent and cannot populate a qualification row |
+| `fre-aot-static-runtime` | linked Count-v2 or Search Span symbols plus pinned source-qualified expectations, or an already-completed raw Search V1 call | registry-owned authenticated Count/Search Span handle, or typed inert raw Search result | mapped-image adoption verifies immutable code and metadata; production and qualification-private authority come only from isolated source atoms, both current Search tables are empty, and missing or mismatched qualification fails closed |
 | `fre-capi` | caller-owned versioned C records and byte views | opaque retained matcher plus plan/exists/end/span results | ten ABI/lifetime/failure/plan-tag tests and debug/release exact-symbol C11/C++17 smokes; only the current Rust-bytes portable subset is advertised and admission remains upstream-oracle-pending |
 | `fre-holdout` | authenticated frozen visible suite/schema/digests | deterministic correctness receipts plus separate diagnostic timing | 1,014 hot/one-shot operation comparisons, canonical cross-architecture framing, tamper/resource/fault gates, and byte-identical 1,014-pass/zero-unsupported/zero-failure reruns; not blind or performance qualification |
 | `rebar-manifest` | retained canonical Rebar inventory | deterministic qualification manifest and summary | runner provenance/configuration; semantic and performance results are separate gates |
@@ -112,6 +141,16 @@ columns form the initial mask, and ranked third/fourth columns are loaded only
 while that mask has multiple survivors. Sparse recovery selects lanes in
 ascending order, preserves reusable filter constants across rejected full
 confirmations, and retains byte-identical V1--V6 AOT identities.
+
+AOT adds no LLVM or other second regex optimizer. Search packages the same
+audited native-image contract used by its JIT, while Count-v2 packages its
+independently typed direct-Count image. Both write deterministic Mach-O or ELF
+object bytes and leave linking and deployment inert. A safe static callable is
+exposed only after the source-qualified runtime adopter verifies the exact
+row, metadata, payload, mapped protections, and target contract. Compiler
+output, a linked symbol, or a Cargo feature cannot manufacture that authority.
+The current Search production and qualification-private row tables are empty,
+so Search dynamic validation and performance qualification remain pending.
 
 ## Qualification status language
 

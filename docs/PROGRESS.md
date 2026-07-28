@@ -74,6 +74,12 @@ an open P0 row.
   confirmation tiers, typed relocations, deterministic AOT, independent audit,
   and 276,309 bounded scalar/SSE external instruction executions. AVX2 actual
   execution remains explicitly open.
+- [x] `fre-aot-compiler`: source-authenticated custom direct-machine-code
+  emission into deterministic Mach-O or ELF objects, with typed
+  source/KIR/native/object receipts and no LLVM regex-codegen dependency.
+  Compiler output remains inert: the Search production and
+  qualification-private authority tables are empty, so no current Search AOT
+  deployment is authorized.
 - [x] `fre-aggregate`: production capture-free zero/progress compilation for
   arbitrary nested finite/open repetition, forced full-table and reverse-row
   whole-operation strategies, exact resource accounting, and 242,910 complete
@@ -135,8 +141,12 @@ reducers without repeated suffix searches; count and span-sum are exposed by
 operation-typed facade plans and the exact Rebar semantic adapter. General
 match-sequence exposure remains separate. Pattern-specialized AArch64 code can
 be published and executed under a strict audited W^X lifecycle, but is not yet
-a facade planner choice. There is still no capture API, general Unicode execution,
-production AOT loader, or compatibility-qualified embedding surface. A small
+a facade planner choice. There is still no capture API, general Unicode
+execution, qualified Search AOT authority row, or compatibility-qualified
+embedding surface. The source-first AOT compiler, deterministic static
+objects, authenticated adopter, and default-off explicit facade binding are
+implemented, but they create no runtime authority and have not received fresh
+dynamic validation or performance qualification on this composed tree. A small
 implemented C11/C++17 surface exists for the current portable subset and
 reports `UPSTREAM_ORACLE_PENDING` in every plan record.
 
@@ -255,6 +265,17 @@ authorizes only explicit 16-byte searches declaring at least 1,024 calls over
 64 KiB windows or at least 64 calls over 1 MiB windows. It does not select a
 default route or qualify class-plus-suffix, Sherlock/aggregate, other widths,
 x86-64, or AOT.
+
+The separate AOT track is direct machine code, not LLVM regex compilation.
+FRE's custom AArch64 emitters produce the regex payloads; the AOT compiler
+wraps those already-emitted bytes in deterministic objects and the system
+linker only packages them. Historical macOS Count measurements remain
+development evidence for their exact source and artifacts. The composed
+Search AOT route still has empty production and qualification-private row
+tables, and no fresh
+correctness, linked-image, adoption-lifecycle, or AOT/JIT/portable benchmark
+result has been generated for this tree. No AOT promotion or speed claim is
+therefore current.
 
 ## Non-negotiable gates
 
