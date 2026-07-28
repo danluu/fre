@@ -89,25 +89,25 @@ use fre_kernels::{
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
     OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PackedBoundedPrefixLiteralBounds,
-    PackedBoundedPrefixLiteralCountPlan, PackedOrderedLiteralAggregateActualCounters,
-    PackedOrderedLiteralAggregateBuildAccounting, PackedOrderedLiteralAggregateBuildAttemptActual,
-    PackedOrderedLiteralAggregateBuildError, PackedOrderedLiteralAggregateBuildLimits,
-    PackedOrderedLiteralAggregateOperationIdentity, PackedOrderedLiteralAggregateReduceError,
-    PackedOrderedLiteralAggregateReduceLimits, PackedOrderedLiteralAggregateUpperBounds,
-    PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
-    PrefixClassAlternationBuildAccounting, PrefixClassAlternationBuildError,
-    PrefixClassAlternationBuildLimits, PrefixClassAlternationCountResult,
-    PrefixClassAlternationOperationIdentity, PrefixClassAlternationPlan,
-    PrefixClassAlternationReduceAccounting, PrefixClassAlternationReduceError,
-    PrefixClassAlternationReduceLimits, PrefixClassAlternationSpanSumResult,
-    PrefixClassAlternationUpperBounds, REVERSE_INNER_COUNT_OPERATION_ID,
-    REVERSE_INNER_SPAN_SUM_OPERATION_ID, ReverseInnerBuildAccounting, ReverseInnerBuildError,
-    ReverseInnerBuildLimits, ReverseInnerCountResult, ReverseInnerOperationIdentity,
-    ReverseInnerPlan, ReverseInnerReduceAccounting, ReverseInnerReduceError,
-    ReverseInnerReduceLimits, ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
+    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PackedBoundedPrefixLiteralBounds, PackedBoundedPrefixLiteralCountPlan,
+    PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
+    PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
+    PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
+    PackedOrderedLiteralAggregateReduceError, PackedOrderedLiteralAggregateReduceLimits,
+    PackedOrderedLiteralAggregateUpperBounds, PackedOrderedLiteralCountPlan,
+    PackedOrderedLiteralSpanSumPlan, PrefixClassAlternationBuildAccounting,
+    PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
+    PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
+    PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
+    PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
+    PrefixClassAlternationSpanSumResult, PrefixClassAlternationUpperBounds,
+    REVERSE_INNER_COUNT_OPERATION_ID, REVERSE_INNER_SPAN_SUM_OPERATION_ID,
+    ReverseInnerBuildAccounting, ReverseInnerBuildError, ReverseInnerBuildLimits,
+    ReverseInnerCountResult, ReverseInnerOperationIdentity, ReverseInnerPlan,
+    ReverseInnerReduceAccounting, ReverseInnerReduceError, ReverseInnerReduceLimits,
+    ReverseInnerSpanSumResult, ReverseInnerUpperBounds,
     SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
     SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
     SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
@@ -324,7 +324,7 @@ pub enum AggregatePlanKind {
     /// Finite ASCII-word alternatives with full Unicode word boundaries,
     /// lowered to one maximal ASCII-word-run literal-set reducer.
     GuardedUnicodeWordLiteralSet,
-    /// One fixed-width sequence of ASCII-byte predicates lowered to an inline
+    /// One fixed-width sequence of byte predicates lowered to an inline
     /// 64-bit Shift-And state and byte-to-position masks.
     FixedPredicateWord64,
     /// Bounded prioritized continuation program from `fre-aggregate`.
@@ -380,7 +380,7 @@ pub enum AggregatePlanIdentity {
     GuardedAsciiWord(AggregateGuardedAsciiWordIdentity),
     /// Guarded Unicode-word maximal-run identity.
     GuardedUnicodeWord(AggregateGuardedUnicodeWordIdentity),
-    /// Fixed ASCII-byte-predicate Shift-And operation identity.
+    /// Fixed byte-predicate Shift-And operation identity.
     FixedPredicateWord64(FixedPredicateWord64OperationIdentity),
     /// Semantic continuation-program identity.
     Continuation(AggregateContinuationIdentity),
@@ -1227,7 +1227,7 @@ pub enum AggregateBuildAccounting {
     GuardedAsciiWord(AggregateGuardedAsciiWordBuildAccounting),
     /// Guarded dictionary plus maximal-run literal-set construction.
     GuardedUnicodeWord(AggregateGuardedUnicodeWordBuildAccounting),
-    /// Inline fixed ASCII-byte-predicate construction certificate.
+    /// Inline fixed byte-predicate construction certificate.
     FixedPredicateWord64(FixedPredicateWord64BuildAccounting),
     /// Continuation compiler construction certificate.
     Continuation(AggregateCompileAccounting),
@@ -5519,7 +5519,7 @@ pub enum AggregateBuildError {
         selection: AggregatePlanSelection,
         source: guarded_unicode_word::BuildError,
     },
-    /// Fixed ASCII-byte-predicate Shift-And construction failed after
+    /// Fixed byte-predicate Shift-And construction failed after
     /// semantic selection.
     FixedPredicateWord64Build {
         operation: AggregateOperation,
@@ -6676,7 +6676,7 @@ pub enum AggregateExecutionSource {
     /// complete P/A receipt so this route does not inflate every public
     /// execution result.
     GuardedUnicodeWord(Box<guarded_unicode_word::ReduceError>),
-    /// Fixed ASCII-byte-predicate Shift-And whole-operation refusal.
+    /// Fixed byte-predicate Shift-And whole-operation refusal.
     FixedPredicateWord64(FixedPredicateWord64ReduceError),
     /// Continuation whole-operation refusal.
     Continuation(AggregateEngineError),
@@ -7010,7 +7010,7 @@ pub enum AggregateExecutionDetails {
     GuardedAsciiWord(guarded_ascii_word::ReduceAccounting),
     /// Ranked-anchor finite ASCII-word scan with full Unicode boundaries.
     GuardedUnicodeWord(guarded_unicode_word::ReduceAccounting),
-    /// Fixed ASCII-byte-predicate Shift-And bounds and exact counters.
+    /// Fixed byte-predicate Shift-And bounds and exact counters.
     FixedPredicateWord64(FixedPredicateWord64ReduceAccounting),
     /// Continuation whole-operation certificate and exact counters.
     Continuation {
@@ -13284,7 +13284,7 @@ impl AggregateBuilder {
                             "packed finite semantic refusal violated construction order: {error:?}"
                         );
                     }
-                    if !unicode && words.len() > PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS {
+                    if !unicode {
                         let inspected =
                             finite::inspect_fixed_predicate_word64_after_finite_refusal_attempt(
                                 &rust.hir,
@@ -13689,7 +13689,7 @@ impl AggregateBuilder {
                     return Err(AggregateBuildError::InternalInvariant {
                         operation,
                         selection,
-                        detail: "fixed-predicate source escaped its variable ASCII predicate proof",
+                        detail: "fixed-predicate source escaped its variable byte predicate proof",
                     });
                 }
                 if source.hir_nodes() != expected_nodes || source.captures() != expected_captures {

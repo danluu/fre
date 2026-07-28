@@ -22,7 +22,7 @@ use crate::guarded_ascii_word::{
     PublishedBuildAccounting as GuardedPublishedBuild, SourceWord,
 };
 
-const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 2;
+const FIXED_PREDICATE_WORD64_MIN_WIDTH: usize = 1;
 const FIXED_PREDICATE_WORD64_MAX_WIDTH: usize = 64;
 const FIXED_PREDICATE_MAX_RANGES: usize = 4;
 
@@ -862,7 +862,7 @@ impl FixedPredicateInspectionAttempt {
     }
 }
 
-/// Inline proof source for a fixed-width ASCII-byte Cartesian predicate word.
+/// Inline proof source for a fixed-width byte Cartesian predicate word.
 ///
 /// Construction is only attempted after the incumbent finite route has
 /// declined its compact representation, so this source cannot displace a
@@ -933,53 +933,55 @@ impl FixedPredicateWord64Source {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FixedPredicate(u64);
+struct FixedPredicate {
+    ranges: [(u8, u8); FIXED_PREDICATE_MAX_RANGES],
+    range_count: u8,
+}
 
 impl FixedPredicate {
-    const EMPTY: Self = Self(0);
+    const EMPTY: Self = Self {
+        ranges: [(0, 0); FIXED_PREDICATE_MAX_RANGES],
+        range_count: 0,
+    };
 
     fn singleton(byte: u8) -> Self {
-        Self(u64::from_le_bytes([byte | 0x80, byte, 0, 0, 0, 0, 0, 0]))
+        let mut ranges = [(0, 0); FIXED_PREDICATE_MAX_RANGES];
+        ranges[0] = (byte, byte);
+        Self {
+            ranges,
+            range_count: 1,
+        }
     }
 
-    fn from_ascii_class(class: &regex_syntax::hir::ClassBytes) -> Option<(Self, bool)> {
+    fn from_byte_class(class: &regex_syntax::hir::ClassBytes) -> Option<(Self, bool)> {
         let ranges = class.ranges();
         if ranges.is_empty() || ranges.len() > FIXED_PREDICATE_MAX_RANGES {
             return None;
         }
-        let mut encoded = [0_u8; 8];
+        let mut normalized = [(0, 0); FIXED_PREDICATE_MAX_RANGES];
         let mut members = 0_usize;
         for (index, range) in ranges.iter().enumerate() {
             let start = range.start();
             let end = range.end();
-            if !start.is_ascii() || !end.is_ascii() {
-                return None;
-            }
-            let offset = index.checked_mul(2)?;
-            *encoded.get_mut(offset)? = start | 0x80;
-            *encoded.get_mut(offset.checked_add(1)?)? = end;
-            let inclusive_members = end.checked_sub(start)?.checked_add(1)?;
-            members = members.checked_add(usize::from(inclusive_members))?;
+            *normalized.get_mut(index)? = (start, end);
+            let inclusive_members = usize::from(end)
+                .checked_sub(usize::from(start))?
+                .checked_add(1)?;
+            members = members.checked_add(inclusive_members)?;
         }
-        Some((Self(u64::from_le_bytes(encoded)), members > 1))
+        Some((
+            Self {
+                ranges: normalized,
+                range_count: u8::try_from(ranges.len()).ok()?,
+            },
+            members > 1,
+        ))
     }
 
     fn ranges(self) -> FixedPredicateRanges {
-        let encoded = self.0.to_le_bytes();
-        debug_assert_ne!(encoded[0] & 0x80, 0);
-        let range_count = encoded
-            .chunks_exact(2)
-            .take_while(|range| range[0] & 0x80 != 0)
-            .count();
         FixedPredicateRanges {
-            ranges: [
-                (encoded[0] & 0x7F, encoded[1]),
-                (encoded[2] & 0x7F, encoded[3]),
-                (encoded[4] & 0x7F, encoded[5]),
-                (encoded[6] & 0x7F, encoded[7]),
-            ],
-            range_count: u8::try_from(range_count)
-                .unwrap_or_else(|_| unreachable!("at most four ranges are encoded")),
+            ranges: self.ranges,
+            range_count: self.range_count,
         }
     }
 
@@ -1506,12 +1508,12 @@ fn inspect_fixed_predicate_word64(
                 tasks.push_reserved(FixedPredicateTask::Visit(repetition.sub.as_ref()))?;
             }
             HirKind::Literal(literal) if !literal.0.is_empty() => {
-                if !push_fixed_ascii_literal(&mut source, &literal.0, context)? {
+                if !push_fixed_byte_literal(&mut source, &literal.0, context)? {
                     return Ok(None);
                 }
             }
             HirKind::Class(Class::Bytes(class)) => {
-                if !push_fixed_ascii_class(&mut source, class, context)? {
+                if !push_fixed_byte_class(&mut source, class, context)? {
                     return Ok(None);
                 }
             }
@@ -1573,7 +1575,7 @@ fn repeat_fixed_predicate_suffix(
     Ok(true)
 }
 
-fn push_fixed_ascii_literal(
+fn push_fixed_byte_literal(
     source: &mut FixedPredicateWord64Source,
     literal: &[u8],
     context: &FiniteExtractionContext,
@@ -1589,9 +1591,6 @@ fn push_fixed_ascii_literal(
     }
     context.charge(u64::try_from(literal.len()).unwrap_or(u64::MAX))?;
     for &byte in literal {
-        if !byte.is_ascii() {
-            return Ok(false);
-        }
         context.charge(1)?;
         if !source.push(FixedPredicate::singleton(byte), false)? {
             return Ok(false);
@@ -1600,7 +1599,7 @@ fn push_fixed_ascii_literal(
     Ok(true)
 }
 
-fn push_fixed_ascii_class(
+fn push_fixed_byte_class(
     source: &mut FixedPredicateWord64Source,
     class: &regex_syntax::hir::ClassBytes,
     context: &FiniteExtractionContext,
@@ -1612,7 +1611,7 @@ fn push_fixed_ascii_class(
         return Ok(false);
     }
     context.charge(u64::try_from(class.ranges().len()).unwrap_or(u64::MAX))?;
-    let Some((predicate, is_variable)) = FixedPredicate::from_ascii_class(class) else {
+    let Some((predicate, is_variable)) = FixedPredicate::from_byte_class(class) else {
         return Ok(false);
     };
     context.charge(1)?;
@@ -4842,19 +4841,33 @@ mod tests {
                 .width(),
             64
         );
-        for hir in [
-            parse_case_insensitive("a"),
-            parse_case_insensitive(&"a".repeat(65)),
-            parse("ab"),
-            parse_case_insensitive("a+"),
-            parse_case_insensitive(r"\ba"),
-            parse_case_insensitive(r"\xFFa"),
+        let one = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse_case_insensitive("a"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("one variable byte predicate is a complete fixed word");
+        assert_eq!(one.width(), 1);
+        assert_eq!(one.variable_predicates(), 1);
+
+        for (pattern, hir) in [
+            (
+                "case-insensitive width 65",
+                parse_case_insensitive(&"a".repeat(65)),
+            ),
+            ("exact literal", parse("ab")),
+            ("unbounded repetition", parse_case_insensitive("a+")),
+            ("look assertion", parse_case_insensitive(r"\ba")),
+            ("exact high byte", parse(r"\xFFa")),
         ] {
             assert!(
                 super::inspect_fixed_predicate_word64_after_finite_refusal(&hir, 0, u64::MAX,)
                     .unwrap()
                     .source
-                    .is_none()
+                    .is_none(),
+                "{pattern}"
             );
         }
         let ranged = super::inspect_fixed_predicate_word64_after_finite_refusal(
@@ -4879,6 +4892,19 @@ mod tests {
         assert_eq!(
             two_ranged.positions().next().unwrap().ranges(),
             &[(b'A', b'Z'), (b'a', b'z')]
+        );
+        let full_byte = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse(r"[\x80-\xFF]"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("one full-byte-domain range remains inline");
+        assert_eq!(full_byte.width(), 1);
+        assert_eq!(
+            full_byte.positions().next().unwrap().ranges(),
+            &[(0x80, 0xFF)]
         );
         let four_ranged = super::inspect_fixed_predicate_word64_after_finite_refusal(
             &parse("[aceg]x"),

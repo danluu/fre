@@ -1,9 +1,9 @@
-//! Fixed-width ASCII byte-predicate matching with an exact anchor when one
+//! Fixed-width byte-predicate matching with an exact anchor when one
 //! exists and one 64-bit Shift-And state otherwise.
 //!
-//! Construction accepts between two and 64 nonempty byte predicates. Each
-//! predicate is supplied as inclusive ASCII-byte ranges and is compiled into
-//! a full byte-to-position mask table. Non-ASCII entries remain zero. An exact
+//! Construction accepts between one and 64 nonempty byte predicates. Each
+//! predicate is supplied as inclusive byte ranges and is compiled into a full
+//! byte-to-position mask table. An exact
 //! one-or-two-byte predicate drives a monotone candidate stream when available;
 //! otherwise reduction performs one Shift-And transition per haystack byte.
 //! Both reducers restart after each accepted word, allocate no operation
@@ -16,26 +16,26 @@ use memchr::{memchr, memchr2};
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
-pub const PLAN_ID: &str = "fixed-predicate-word64.fixed-anchor-or-shift-and.nonoverlap.v3";
+pub const PLAN_ID: &str = "fixed-predicate-word64.fixed-anchor-or-shift-and.nonoverlap.v4";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v2";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v3";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v2";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v3";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 3;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 4;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 3;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 4;
 /// Minimum fixed word width accepted by this closed kernel.
-pub const MIN_WIDTH: usize = 2;
+pub const MIN_WIDTH: usize = 1;
 /// Maximum fixed word width representable by one Shift-And state.
 pub const MAX_WIDTH: usize = 64;
 /// Full byte-domain mask slots retained by the plan.
 pub const MASK_SLOTS: usize = 256;
 
-const MAX_MEMBERS_PER_RANGE: usize = 128;
+const MAX_MEMBERS_PER_RANGE: usize = 256;
 const BUILD_FIXED_WORK: usize = 4;
 const RANGE_FIXED_WORK: usize = 2;
-const ANCHOR_MASK_DOMAIN: usize = 128;
+const ANCHOR_MASK_DOMAIN: usize = 256;
 const TRANSITION_WORK: usize = 6;
 const FINDER_SCAN_BYTE_WORK: usize = 1;
 const FINDER_CALL_WORK: usize = 1;
@@ -162,7 +162,7 @@ pub struct BuildAccounting {
     pub range_inspections: usize,
     /// Byte-to-position mask writes, including duplicate union writes.
     pub member_writes: usize,
-    /// ASCII mask cells inspected while selecting a fixed anchor.
+    /// Full byte-domain mask cells inspected while selecting a fixed anchor.
     pub anchor_mask_reads: usize,
     /// Bound admitted before reading source range values.
     pub work_upper_bound: u64,
@@ -375,7 +375,10 @@ pub enum BuildError {
         start: u8,
         end: u8,
     },
-    /// One otherwise ordered range contains a non-ASCII byte.
+    /// Compatibility variant retained from the former ASCII-only contract.
+    ///
+    /// Full byte-domain ranges are now admitted, so current constructors do
+    /// not emit this variant.
     NonAsciiRange {
         position: usize,
         range: usize,
@@ -1086,14 +1089,6 @@ fn compile_masks(
                     end,
                 });
             }
-            if !start.is_ascii() || !end.is_ascii() {
-                return Err(BuildError::NonAsciiRange {
-                    position,
-                    range,
-                    start,
-                    end,
-                });
-            }
             for byte in start..=end {
                 let slot = masks
                     .get_mut(usize::from(byte))
@@ -1130,7 +1125,7 @@ fn select_anchor(
             })?;
         let mut bytes = [0_u8; 2];
         let mut members = 0_usize;
-        for byte in 0_u8..=127 {
+        for byte in 0_u8..=u8::MAX {
             tracker.read_anchor_mask()?;
             if masks[usize::from(byte)] & bit != 0 {
                 if let Some(slot) = bytes.get_mut(members) {
@@ -2177,10 +2172,14 @@ mod tests {
             FixedPredicateWord64Plan::build(&no_positions, BuildLimits::unlimited()),
             Err(BuildError::WidthTooSmall { needed: 0, .. })
         ));
-        assert!(matches!(
-            FixedPredicateWord64Plan::build(&[A], BuildLimits::unlimited()),
-            Err(BuildError::WidthTooSmall { needed: 1, .. })
-        ));
+        let width_one = FixedPredicateWord64Plan::build(&[A], BuildLimits::unlimited()).unwrap();
+        assert_eq!(
+            width_one
+                .count(b"aba", ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            2
+        );
         let empty: &[(u8, u8)] = &[];
         assert!(matches!(
             FixedPredicateWord64Plan::build(&[A, empty], BuildLimits::unlimited()),
@@ -2196,16 +2195,17 @@ mod tests {
                 end: 4
             })
         ));
-        let non_ascii: &[(u8, u8)] = &[(0x7F, 0x80)];
-        assert!(matches!(
-            FixedPredicateWord64Plan::build(&[A, non_ascii], BuildLimits::unlimited()),
-            Err(BuildError::NonAsciiRange {
-                position: 1,
-                range: 0,
-                start: 0x7F,
-                end: 0x80
-            })
-        ));
+        let full_byte_range: &[(u8, u8)] = &[(0x7F, 0xFF)];
+        let full_byte =
+            FixedPredicateWord64Plan::build(&[A, full_byte_range], BuildLimits::unlimited())
+                .unwrap();
+        assert_eq!(
+            full_byte
+                .count(&[b'a', 0x80, b'a', 0xFF], ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            2
+        );
 
         let width_63 = [X; 63];
         let plan_63 = FixedPredicateWord64Plan::build(&width_63, BuildLimits::unlimited()).unwrap();
@@ -2248,11 +2248,11 @@ mod tests {
         assert_eq!(accounting.temporary_copies, 0);
         assert_eq!(accounting.scratch_bytes, 0);
         // P=2, R=4 and every range has one member. Construction additionally
-        // reads all 128 ASCII mask cells for each position to select the
+        // reads all 256 byte-domain mask cells for each position to select the
         // smallest exact anchor, without allocating.
-        assert_eq!(accounting.anchor_mask_reads, 256);
-        assert_eq!(accounting.work_upper_bound, 1_038);
-        assert_eq!(accounting.work_charged, 530);
+        assert_eq!(accounting.anchor_mask_reads, 512);
+        assert_eq!(accounting.work_upper_bound, 1_806);
+        assert_eq!(accounting.work_charged, 786);
         assert!(accounting.work_charged <= accounting.work_upper_bound);
 
         let exact = BuildLimits {
@@ -2462,18 +2462,18 @@ mod tests {
     }
 
     #[test]
-    fn inclusive_ascii_ranges_union_without_allocation_and_high_bytes_mismatch() {
+    fn inclusive_full_byte_ranges_union_without_allocation() {
         const FIRST: &[(u8, u8)] = &[(0, 2), (2, 3)];
-        const SECOND: &[(u8, u8)] = &[(b'a', b'c')];
+        const SECOND: &[(u8, u8)] = &[(b'a', b'c'), (0x80, 0xFF)];
         let plan =
             FixedPredicateWord64Plan::build(&[FIRST, SECOND], BuildLimits::unlimited()).unwrap();
         let result = plan
             .count(
-                &[0, b'a', 2, b'b', 0xFF, b'c', 3, b'c', 4, b'a'],
+                &[0, b'a', 2, b'b', 2, 0xFF, 3, 0x80, 4, b'a'],
                 ReduceLimits::unlimited(),
             )
             .unwrap();
-        assert_eq!(result.count, 3);
+        assert_eq!(result.count, 4);
         assert_eq!(plan.build_accounting().allocations, 0);
         assert_eq!(plan.build_accounting().reserves, 0);
         assert_eq!(plan.build_accounting().temporary_copies, 0);

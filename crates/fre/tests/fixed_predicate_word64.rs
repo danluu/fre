@@ -88,6 +88,53 @@ fn dense_finite_cartesian_words_select_the_authenticated_anchor_route() {
 }
 
 #[test]
+fn one_byte_and_full_domain_classes_select_the_allocation_free_route() {
+    let cases: [(&str, &[u8]); 2] = [("[ac]", b"abcac\xFF"), ("(?s:.)", b"\0\n\r\x80\xFF")];
+    for (pattern, haystack) in cases {
+        let expected = upstream_spans(pattern, haystack, false);
+        let build = || {
+            AggregateBuilder::new(pattern)
+                .profile(RustProfile::rebar_1_12_4())
+                .unicode(false)
+        };
+        let counted = build().build_count().unwrap();
+        assert_eq!(
+            counted.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64,
+            "pattern={pattern:?}"
+        );
+        let AggregateBuildAccounting::FixedPredicateWord64(accounting) =
+            counted.build_report().build
+        else {
+            panic!("one-byte class selected another accounting family");
+        };
+        assert_eq!(accounting.positions, 1);
+        assert_eq!(accounting.allocations, 0);
+        assert_eq!(
+            counted
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(expected.len()).unwrap()
+        );
+
+        let span_sum = build().build_span_sum().unwrap();
+        assert_eq!(
+            span_sum.build_report().plan,
+            AggregatePlanKind::FixedPredicateWord64
+        );
+        assert_eq!(
+            span_sum
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected
+                .iter()
+                .map(|(start, end)| u64::try_from(end - start).unwrap())
+                .sum()
+        );
+    }
+}
+
+#[test]
 fn exact_repeated_ascii_classes_select_one_retained_predicate_word() {
     let pattern = r"\w{5}\s\w{6}\s\w{7}";
     let haystack =
