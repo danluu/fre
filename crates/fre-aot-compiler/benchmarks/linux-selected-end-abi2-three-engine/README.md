@@ -141,3 +141,144 @@ wrapper, result-slot contracts, RWX load segments, and executable stack, and
 reports the final executable SHA-256. Its successful output is still an
 observation with `runtime_authority=absent` and
 `promotion_authority=absent`.
+
+## Fresh-process campaign and independent results verification
+
+`run_campaign.py` is the bounded Linux/AArch64 campaign layer.
+`verify_campaign.py` independently reads only its immutable evidence directory;
+it does not import the runner. The runner performs one qualification process,
+then one fresh process for each hot cell and one fresh process for each
+lifecycle cell across all four sizes, all six scenarios, and every requested
+repetition. The three engines remain together inside each process, so the
+benchmark's six-order rotation remains paired.
+
+Repetitions must be a multiple of six in `6..96`. A 96-repetition campaign is
+the canonical full grid: each of the six engine orders occurs at each of the 16
+realized pointer alignments. Smaller multiples of six are diagnostic subsets.
+The runner takes no success threshold and the verifier never converts its
+statistics into promotion authority.
+
+This campaign branch composes the hardened benchmark v2 row contract and
+hardened post-link observation after the original three-engine benchmark
+commit. It also requires the separate row-authority follow-up that repeats
+`runtime_authority=absent` on every qualification/header/sample row; compose
+that follow-up before running the campaign. Missing authority fields fail
+closed. The required post-link `PASS` row includes and proves all of:
+
+- `final_binary_sha256`, bound directly to the binary snapshot that is run;
+- implementation and glue object identities;
+- `entry_bytes_equal=true`, `payload_bytes_equal=true`, and
+  `metadata_bytes_equal=true`;
+- source commit/tree, helper SHA-256, profile, artifact/compile/bundle
+  identities, and absent runtime/promotion authority.
+
+Every benchmark qualification/header/sample row must independently repeat the
+source commit/tree, run ID, instance type, helper SHA-256, profile,
+artifact/bundle identities, evidence class, and absent authorities. Header rows
+must also repeat the admitted affinity CPU. Missing fields are refusals, not
+defaults.
+
+### Continuous admission input
+
+The runner does not guess or invoke a resource-coordinator CLI. It accepts
+three exact files produced by a caller-controlled adapter around the reviewed
+live helper:
+
+1. a canonical retained admission receipt;
+2. the opaque raw headroom evidence whose SHA-256 the receipt names; and
+3. a canonical heartbeat file maintained atomically by the same live
+   holder/session for the entire campaign.
+
+This repository does not supply or claim a live cutover adapter. Until the
+controller provides and reviews that external adapter/receipt contract, these
+required inputs are unavailable and the campaign must fail closed.
+
+The receipt schema is
+`fre-aot-selected-end-abi2-retained-admission-v1`. It binds the exact
+source/tree/helper/profile/run/instance/target CPU and a nonempty pin set. Its
+headroom section must say:
+
+```json
+{"basis":"reviewed helper-specific description","evidence_sha256":"<64 lowercase hex>","other_work_kill_policy":"never","target_cpu_admitted":true,"unrelated_cpu_work":"coexist-if-target-cpu-admitted"}
+```
+
+Its acquisition section records `attempts_used`, `max_attempts`,
+`started_unix_ns`, `completed_unix_ns`, and `deadline_unix_ns`; acquisition
+must complete within both bounds. Its continuity section has this shape:
+
+```json
+{"continuous_since_unix_ns":0,"heartbeat_schema":"fre-aot-selected-end-abi2-admission-heartbeat-v1","holder_id":"<safe id>","lease_epoch":"<safe id>","maximum_heartbeat_age_ns":30000000000,"mode":"continuous-live-holder","session_id":"<safe id>"}
+```
+
+Use real positive timestamps; zero above is only a shape placeholder. The
+receipt's validity must cover the entire bounded campaign deadline. The
+heartbeat repeats the exact identity, receipt/holder/session/lease epoch,
+continuous-start timestamp, target CPU, helper/profile, monotonically
+nondecreasing sequence, observation and validity timestamps, and the same
+headroom/evidence binding.
+
+The runner snapshots and hashes the heartbeat immediately before and after
+every child and once at campaign completion. It refuses stale, expired,
+backward, replaced-session, or withdrawn-admission transitions. It never waits
+for or retries admission itself, never retries a measurement, and never kills
+unrelated work. A child deadline can terminate only the runner's own benchmark
+child, after which the campaign remains incomplete and has no final manifest.
+
+### Invocation and evidence
+
+After the admission cutover GO and all deferred build/static-verifier gates,
+run with isolated Python and absolute, non-symlink paths:
+
+```text
+python3 -I -B run_campaign.py \
+  --binary /absolute/path/to/fre-aot-linux-selected-end-abi2-three-engine \
+  --output /absolute/new/campaign-directory \
+  --source-commit <40-lowercase-hex> \
+  --source-tree <40-lowercase-hex> \
+  --run-id <safe-run-id> \
+  --instance-id <exact-instance-id> \
+  --instance-type <c9g.*-or-m9g.*> \
+  --helper-sha256 <64-lowercase-hex> \
+  --profile linux-target-cpu-local-v1 \
+  --target-cpu <admitted-cpu> \
+  --repetitions 96 \
+  --admission-receipt /absolute/path/admission-receipt.json \
+  --admission-evidence /absolute/path/admission-evidence.raw \
+  --admission-heartbeat /absolute/path/live-heartbeat.json \
+  --post-link-observation /absolute/path/post-link-observation.txt
+```
+
+The runner clears the ambient environment, executes a read-only binary
+snapshot through its already-open file descriptor, pins each child directly
+with `sched_setaffinity`, and sets common thread-pool variables to one. It
+stores read-only raw stdout, stderr, before/after admission heartbeats, the
+binary, host/admission/post-link evidence, a canonical manifest, and a manifest
+digest sidecar. A partial or failed campaign never gets a final manifest.
+
+Verify using expected digests supplied independently of the manifest:
+
+```text
+python3 -I -B verify_campaign.py \
+  --campaign-dir /absolute/campaign-directory \
+  --source-commit <40-lowercase-hex> \
+  --source-tree <40-lowercase-hex> \
+  --run-id <safe-run-id> \
+  --instance-id <exact-instance-id> \
+  --instance-type <c9g.*-or-m9g.*> \
+  --helper-sha256 <64-lowercase-hex> \
+  --profile linux-target-cpu-local-v1 \
+  --target-cpu <admitted-cpu> \
+  --expected-binary-sha256 <64-lowercase-hex> \
+  --expected-admission-receipt-sha256 <64-lowercase-hex> \
+  --expected-admission-evidence-sha256 <64-lowercase-hex> \
+  --summary-out /absolute/new/summary.v1.json
+```
+
+The verifier rejects partial schedules, duplicate paths/coordinates/rows,
+malformed numeric fields, identity/artifact/bundle drift, CPU/order/alignment
+drift, broken continuous-admission chains, changed raw hashes, and unexpected
+files. Its canonical summary reports per-cell and equal-weight aggregate
+portable/JIT/AOT hot and lifecycle paired ratios, stage and AOT-activation
+distributions, exact sign-test inputs, and break-even inputs. A ratio is
+left-over-right, so values below one favor the left engine. AOT offline compiler
+and linker cost stays explicitly unmeasured and excluded.
