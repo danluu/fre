@@ -148,10 +148,12 @@ impl std::error::Error for StaticSearchSelectedEndCallErrorV2 {}
 /// Nonzero per-generated-module key for one exact linked ABI2 artifact.
 ///
 /// Generated source owns a private static instance. The safe bind path records
-/// its address after comparing the portable plan with the embedded literal;
-/// each hot call then authenticates both this key and the issuing plan by
-/// pointer identity. Keeping the key nonzero-sized makes distinct statics
-/// distinct allocations even when their payload bytes happen to match.
+/// its address after comparing the portable plan with the embedded literal.
+/// The generic boundary can authenticate both this key and the issuing plan by
+/// pointer identity. Optimized generated source instead encloses the
+/// authenticated session in its own private nominal type, so repeated calls
+/// need only the plan check. Keeping the key nonzero-sized makes distinct
+/// statics distinct allocations even when their payload bytes happen to match.
 #[derive(Debug)]
 pub struct StaticSearchSelectedEndBindingKeyV2 {
     identity: [u8; 32],
@@ -238,8 +240,9 @@ impl<'owner> StaticSearchSelectedEndThreadSessionV2<'owner> {
     ///
     /// The linked artifact's literal is compared once here. Calls prepared
     /// through the returned token can then authenticate their private-field
-    /// preflight certificate and the generated artifact by pointer identity
-    /// instead of comparing sixteen literal bytes on every hot call.
+    /// preflight certificate and the generated artifact without comparing
+    /// sixteen literal bytes on every hot call. Generated bindings additionally
+    /// enclose the token in an artifact-specific private nominal type.
     pub fn bind_literal_plan<'session, 'plan>(
         &'session self,
         plan: &'plan LiteralPlan,
@@ -329,10 +332,13 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
     /// Consume one authoritative preflight from the plan bound at session
     /// construction.
     ///
-    /// The successful hot path is two allocation-free pointer-identity checks:
-    /// one for the generated artifact key and one for the issuing plan. A
-    /// token from another plan or generated module is rejected before native
-    /// code can be invoked, even when its literal bytes are equal.
+    /// This generic successful path performs two allocation-free
+    /// pointer-identity checks: one for the generated artifact key and one for
+    /// the issuing plan. A token from another plan or generated module is
+    /// rejected before native code can be invoked, even when its literal
+    /// bytes are equal. Generated private nominal wrappers use
+    /// [`Self::prepare_plan_bound`] to discharge the artifact proof in the
+    /// type and retain only the plan check per call.
     #[inline]
     pub fn prepare<'haystack>(
         &self,
@@ -345,6 +351,28 @@ impl<'session, 'owner, 'plan> StaticSearchSelectedEndPlanSessionV2<'session, 'ow
         if !core::ptr::eq(self.binding, binding) {
             return Err(StaticSearchSelectedEndCallErrorV2::BindingIdentityMismatch);
         }
+        self.prepare_plan_bound(preflight)
+    }
+
+    /// Consume one authoritative preflight after a generated private wrapper
+    /// has already authenticated this session's artifact key.
+    ///
+    /// This qualification-private primitive performs only the plan-identity
+    /// check. It does not itself authorize any native call: generated source
+    /// encloses the session in a module-private nominal type that can be
+    /// constructed only by that artifact's exact bind function. Keeping the
+    /// artifact proof in the nominal type removes the second pointer check
+    /// from repeated calls without allowing one generated module's session to
+    /// enter another module's safe call boundary.
+    #[doc(hidden)]
+    #[inline]
+    pub fn prepare_plan_bound<'haystack>(
+        &self,
+        preflight: LiteralSearchPreflight<'_, 'haystack>,
+    ) -> Result<
+        StaticSearchSelectedEndPreparedCallV2<'session, 'owner, 'haystack>,
+        StaticSearchSelectedEndCallErrorV2,
+    > {
         if !preflight.was_issued_by(self.plan) {
             let actual_bytes = preflight.literal_bytes();
             if actual_bytes != SELECTED_END_LITERAL_BYTES_V2 {
@@ -736,14 +764,16 @@ mod tests {
         let implementation = &source[..tests];
         assert!(!implementation[bind..decode].contains("prctl("));
         let plan_prepare = &implementation[plan_prepare..decode];
-        let pointer_check = plan_prepare
-            .find("preflight.was_issued_by(self.plan)")
-            .unwrap();
         let binding_check = plan_prepare
             .find("core::ptr::eq(self.binding, binding)")
             .unwrap();
+        let plan_bound_prepare = plan_prepare.find("pub fn prepare_plan_bound<").unwrap();
+        let pointer_check = plan_prepare
+            .find("preflight.was_issued_by(self.plan)")
+            .unwrap();
         let literal_width = plan_prepare.find("preflight.literal_bytes()").unwrap();
-        assert!(binding_check < pointer_check);
+        assert!(binding_check < plan_bound_prepare);
+        assert!(plan_bound_prepare < pointer_check);
         assert!(pointer_check < literal_width);
         assert!(!plan_prepare.contains("preflight.literal()"));
         assert_eq!(implementation.matches("libc::prctl(").count(), 1);

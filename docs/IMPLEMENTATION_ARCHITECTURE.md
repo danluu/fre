@@ -164,9 +164,10 @@ receipt bits are requirements, not observations: `observation_complete` is
 false, `RuntimeAuthority` is `Absent`, and this source has no ABI2 adopter or
 callable AOT path. Its qualification-private generated safe binding performs
 the 16-byte literal comparison once when binding a portable plan to the
-current-thread session; hot preflighted calls use artifact-key and plan
-identity. The retained Count-v2 and Search V1 static-adoption architectures
-remain separate; their existence cannot authorize ABI2.
+current-thread session, then encloses it in a generated artifact-private
+nominal type; hot preflighted calls use only plan identity. The retained
+Count-v2 and Search V1 static-adoption architectures remain separate; their
+existence cannot authorize ABI2.
 
 ## Qualification status language
 

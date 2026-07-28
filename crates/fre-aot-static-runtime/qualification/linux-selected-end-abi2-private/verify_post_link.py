@@ -740,6 +740,9 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "static EXACT_PLAN_BINDING_KEY: "
         "fre_aot_static_runtime::StaticSearchSelectedEndBindingKeyV2"
     )
+    nominal_start = source.find(
+        "pub(super) struct ExactLinkedAotSelectedEndPlanSessionV2"
+    )
     bind_start = source.find(
         "pub(super) fn bind_exact_linked_aot_selected_end_plan_v2"
     )
@@ -750,10 +753,11 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "pub(super) fn search_exact_linked_aot_selected_end_qualification_wrapper_v2"
     )
     require(
-        0 <= key_start < bind_start < primary_start < diagnostic_start,
-        "binding key/plan/primary/diagnostic functions are missing or reordered",
+        0 <= key_start < nominal_start < bind_start < primary_start < diagnostic_start,
+        "binding key/nominal session/plan/primary/diagnostic functions are missing or reordered",
     )
-    key_source = source[key_start:bind_start]
+    key_source = source[key_start:nominal_start]
+    nominal_source = source[nominal_start:bind_start]
     bind_source = source[bind_start:primary_start]
     primary_source = source[primary_start:diagnostic_start]
     require(
@@ -765,12 +769,30 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
         "binding key is not tied to the exact compile identity",
     )
     require(
+        (
+            "pub(super) struct "
+            "ExactLinkedAotSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        )
+        in nominal_source
+        and (
+            "inner: fre_aot_static_runtime::"
+            "StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        )
+        in nominal_source
+        and "pub(super) inner:" not in nominal_source
+        and "pub(crate) inner:" not in nominal_source
+        and "pub inner:" not in nominal_source,
+        "binding does not keep the artifact session inside a private nominal wrapper",
+    )
+    require(
         "StaticSearchSelectedEndThreadSessionV2<'owner>" in bind_source
-        and "StaticSearchSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        and (
+            "ExactLinkedAotSelectedEndPlanSessionV2<'session, 'owner, 'plan>"
+        )
         in bind_source
         and (
-            "session.bind_literal_plan("
-            "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)"
+            "inner: session.bind_literal_plan("
+            "plan, &EXACT_LITERAL, &EXACT_PLAN_BINDING_KEY)?"
         )
         in bind_source,
         "binding omits one-time exact-literal/artifact plan binding",
@@ -787,13 +809,21 @@ def validate_binding(binding: bytes, contract: dict[str, str]) -> None:
     )
     require(
         source.count(
-            "let prepared = plan_session.prepare("
-            "preflight, &EXACT_PLAN_BINDING_KEY)?;"
+            "let prepared = plan_session.inner.prepare_plan_bound(preflight)?;"
         )
         == 2
+        and source.count(
+            "plan_session: &ExactLinkedAotSelectedEndPlanSessionV2<'_, '_, '_>"
+        )
+        == 2
+        and source.count("&EXACT_PLAN_BINDING_KEY") == 1
         and "session.prepare(preflight, &EXACT_LITERAL)?" not in source
-        and "plan_session.prepare(preflight)?" not in source,
-        "binding omits artifact/plan-identity preflight or retains per-call literal comparison",
+        and "plan_session.prepare(preflight)?" not in source
+        and (
+            "plan_session.prepare(preflight, &EXACT_PLAN_BINDING_KEY)?;"
+            not in source
+        ),
+        "binding omits nominal-session plan preflight or retains a per-call artifact/literal check",
     )
     for forbidden in ("transmute", "extern \"C\" fn(", "*mut", "result_slot", " x4", "blr"):
         require(forbidden not in source, f"binding contains forbidden form {forbidden!r}")
