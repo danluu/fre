@@ -2,20 +2,23 @@
 
 Last updated: 2026-07-28 (America/Vancouver)
 
-This document describes implementation Candidate
-`ec6651f767561d65524d1190b6afd52157bad545`, tree
-`fd89927138f0a64f934a01debf3d78a87d07f904`. Its relevant composed
+This document describes implementation source sealed at
+`0bd0f5d085d01d2b21d06845af9b461d01c963d3`, tree
+`f23cebd1ca60a960978e495be7914d447e93f8ca`. Its immediately relevant
 succession is:
 
 ```text
-65f4910a  Linux SelectedEnd ABI2 AOT qualification bundle
-  -> 8ae82e80  public JIT bakeoff migrated to register ABI2 sessions
-  -> 1fb7d684  V3 evidence bound to an external ABI2 witness
-  -> ec6651f7  hidden direct-call AOT declarations hardened
+d8be7786  SVE tag 19 moved to SelectedEnd register ABI2
+  -> 0bd0f5d0  source-bound tag-19 ABI2 qualification producers
 ```
 
-The documentation child adds no implementation or dynamic evidence. Review or
-evidence from an ancestor does not authorize this exact composed tree.
+Protocol/docs child
+`63225a1dbf812159449cd4420386ff236f1197f7` adds a Candidate-rooted
+executable verifier and documentation, but no runtime/compiler implementation
+or dynamic evidence. Git content cannot embed the identity of its own
+containing commit; the verifier therefore authenticates the externally
+supplied exact final Candidate commit and tree at run time. Review or evidence
+from an ancestor does not authorize that composed tree.
 
 ## Compiler boundary
 
