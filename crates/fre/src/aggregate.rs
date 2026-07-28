@@ -21451,6 +21451,52 @@ mod tests {
     }
 
     #[test]
+    fn long_utf8_finite_language_publishes_packed_route() {
+        std::thread::Builder::new()
+            .name("aggregate-packed-long-utf8-route".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(long_utf8_finite_language_publishes_packed_route_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn long_utf8_finite_language_publishes_packed_route_body() {
+        let pattern = "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти";
+        let haystack =
+            "Шерлок Холмс и Джон Уотсон; профессор Мориарти, инспектор Лестрейд, Ирен Адлер.";
+        let upstream = regex::Regex::new(pattern).unwrap();
+        let count = AggregateBuilder::new(pattern).build_count().unwrap();
+        let span = AggregateBuilder::new(pattern).build_span_sum().unwrap();
+        for report in [count.build_report(), span.build_report()] {
+            assert!(report.has_closed_construction_attempt());
+            assert_eq!(report.plan, super::AggregatePlanKind::PackedFiniteLiteral);
+            let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity else {
+                panic!("expected packed finite identity");
+            };
+            assert_eq!(
+                identity.semantics,
+                super::AggregateFiniteLiteralSemantics::UnicodeOnNonemptyUtf8Words
+            );
+            assert!(identity.packed_operation_identity.is_some());
+        }
+        assert_eq!(
+            count
+                .count_value(haystack.as_bytes(), AggregateRunLimits::default())
+                .unwrap(),
+            u64::try_from(upstream.find_iter(haystack).count()).unwrap()
+        );
+        assert_eq!(
+            span.span_sum_value(haystack.as_bytes(), AggregateRunLimits::default())
+                .unwrap(),
+            upstream
+                .find_iter(haystack)
+                .map(|matched| u64::try_from(matched.as_str().len()).unwrap())
+                .sum::<u64>()
+        );
+    }
+
+    #[test]
     fn tom_sawyer_bounded_prefixes_publish_packed_count_route_and_match_regex() {
         let cases = [
             (

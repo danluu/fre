@@ -24,7 +24,7 @@ use fre_simd_kernels::{
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
-const CACHE_FORMAT_VERSION: u32 = 4;
+const CACHE_FORMAT_VERSION: u32 = 5;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
@@ -71,24 +71,24 @@ pub const CERTIFIED_MAX_PATTERNS: usize = 16;
 /// existing byte-class reducers until separately qualified.
 pub const CERTIFIED_MIN_PATTERN_BYTES: usize = 2;
 /// Absolute theorem bound, independent of caller limits.
-pub const CERTIFIED_MAX_PATTERN_BYTES: usize = 32;
+pub const CERTIFIED_MAX_PATTERN_BYTES: usize = 64;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
 /// Largest greedy byte prefix admitted by the bounded-prefix wrapper.
 pub const CERTIFIED_MAX_BOUNDED_PREFIX_BYTES: u8 = 4;
 /// Stable FRE-owned strategy identity.
-pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-ranked-anchor-stream.v3";
+pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-ranked-anchor-stream.v4";
 /// Stable count-plan identity.
-pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-ranked-anchor-stream.v3";
+pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-ranked-anchor-stream.v4";
 /// Stable span-sum-plan identity.
 pub const SPAN_SUM_PLAN_ID: &str =
-    "ordered-literal-aggregate.span-sum.packed-ranked-anchor-stream.v3";
+    "ordered-literal-aggregate.span-sum.packed-ranked-anchor-stream.v4";
 /// Stable count identity for a finite greedy dot-byte prefix followed by the
 /// ordered literal set.
 pub const BOUNDED_PREFIX_COUNT_PLAN_ID: &str =
-    "bounded-prefix-ordered-literal-aggregate.count.packed-ranked-anchor-stream.v1";
+    "bounded-prefix-ordered-literal-aggregate.count.packed-ranked-anchor-stream.v2";
 /// Version of the success-or-failure construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 3;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 4;
 /// Version of the partial-actual construction ledger.
 pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 4;
 
@@ -2774,6 +2774,47 @@ mod tests {
     }
 
     #[test]
+    fn maximum_width_ordered_arbitrary_bytes_match_regex() {
+        let mut first = vec![b'a'; super::CERTIFIED_MAX_PATTERN_BYTES];
+        first[31] = 0xFF;
+        first[super::CERTIFIED_MAX_PATTERN_BYTES - 1] = b'x';
+        let mut second = first.clone();
+        second[super::CERTIFIED_MAX_PATTERN_BYTES - 1] = b'y';
+        let patterns = vec![first, second];
+        let regex = RegexBuilder::new(&source(&patterns))
+            .unicode(false)
+            .build()
+            .unwrap();
+        let count =
+            PackedOrderedLiteralCountPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let span =
+            PackedOrderedLiteralSpanSumPlan::build(&patterns, BuildLimits::unlimited()).unwrap();
+        let mut haystack = patterns[1].clone();
+        haystack.extend_from_slice(b"--");
+        haystack.extend_from_slice(&patterns[0]);
+        haystack.extend_from_slice(b"--");
+        haystack.extend_from_slice(&patterns[1]);
+        let expected_count = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+        let expected_span = regex
+            .find_iter(&haystack)
+            .map(|matched| u64::try_from(matched.end() - matched.start()).unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            count
+                .count(&haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .count,
+            expected_count
+        );
+        assert_eq!(
+            span.span_sum(&haystack, ReduceLimits::unlimited())
+                .unwrap()
+                .span_sum,
+            expected_span
+        );
+    }
+
+    #[test]
     fn bounded_prefix_greediness_newline_and_restart_match_regex() {
         let patterns = [
             b"Tom".to_vec(),
@@ -3194,9 +3235,22 @@ mod tests {
                 ..
             })
         ));
-        let wide = vec![b'a'; super::CERTIFIED_MAX_PATTERN_BYTES];
-        let too_large = vec![wide.as_slice(); super::CERTIFIED_MAX_PATTERNS];
-        PackedOrderedLiteralCountPlan::build(&too_large, BuildLimits::unlimited()).unwrap();
+        let maximum_width = vec![b'a'; super::CERTIFIED_MAX_PATTERN_BYTES];
+        let maximum_total = vec![
+            maximum_width.as_slice();
+            super::CERTIFIED_MAX_TOTAL_PATTERN_BYTES
+                / super::CERTIFIED_MAX_PATTERN_BYTES
+        ];
+        PackedOrderedLiteralCountPlan::build(&maximum_total, BuildLimits::unlimited()).unwrap();
+        let mut too_large = maximum_total;
+        too_large.push(b"bb".as_slice());
+        assert!(matches!(
+            PackedOrderedLiteralCountPlan::build(&too_large, BuildLimits::unlimited()),
+            Err(BuildError::ProofRefused {
+                fact: "total literal bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
