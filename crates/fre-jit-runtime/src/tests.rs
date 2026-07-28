@@ -39,8 +39,9 @@ use crate::{
     publish_impl, publish_selected_end_register_v2,
     selected_end_register_v2::{
         SelectedEndRegisterHostFeaturesV2, checked_selected_end_register_call_v2,
-        decode_selected_end_register_v2, invoke_preflighted_selected_end_register_v2,
-        publish_selected_end_register_v2_impl, validate_selected_end_register_host_features_v2,
+        decode_selected_end_register_v2, invoke_plan_preflighted_selected_end_register_v2,
+        invoke_preflighted_selected_end_register_v2, publish_selected_end_register_v2_impl,
+        validate_selected_end_register_host_features_v2,
     },
 };
 
@@ -216,7 +217,6 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
     let result = invoke_preflighted_selected_end_register_v2(
         NonZeroU32::new(6).expect("nonzero literal"),
         b"needle",
-        None,
         preflight,
         |bound_haystack, bound_window| {
             calls.set(calls.get() + 1);
@@ -245,7 +245,6 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
         invoke_preflighted_selected_end_register_v2(
             NonZeroU32::new(6).expect("nonzero literal"),
             b"needle",
-            None,
             wrong,
             |_, _| {
                 calls.set(calls.get() + 1);
@@ -268,7 +267,6 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
         invoke_preflighted_selected_end_register_v2(
             NonZeroU32::new(6).expect("nonzero literal"),
             b"needle",
-            None,
             wrong_identity_preflight,
             |_, _| {
                 calls.set(calls.get() + 1);
@@ -279,17 +277,12 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
     );
     assert_eq!(calls.get(), before);
 
-    let plan_bound = invoke_preflighted_selected_end_register_v2(
-        NonZeroU32::new(6).expect("nonzero literal"),
-        b"needle",
-        Some(&plan),
-        preflight,
-        |_, _| {
+    let plan_bound =
+        invoke_plan_preflighted_selected_end_register_v2(6, &plan, preflight, |_, _| {
             calls.set(calls.get() + 1);
             8
-        },
-    )
-    .expect("exact plan identity takes the allocation-free hot path");
+        })
+        .expect("exact plan identity takes the allocation-free hot path");
     assert_eq!(plan_bound.0, Some(fre_kernel_ir::MatchSpan::new(2, 8)));
     assert_eq!(calls.get(), before + 1);
 
@@ -299,10 +292,9 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
         .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
         .expect("distinct equal preflight");
     assert_eq!(
-        invoke_preflighted_selected_end_register_v2(
-            NonZeroU32::new(6).expect("nonzero literal"),
-            b"needle",
-            Some(&plan),
+        invoke_plan_preflighted_selected_end_register_v2(
+            6,
+            &plan,
             equal_but_distinct_preflight,
             |_, _| {
                 calls.set(calls.get() + 1);
@@ -312,12 +304,24 @@ fn selected_end_register_v2_consumes_one_authoritative_preflight_and_checks_exac
         Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch)
     );
     assert_eq!(calls.get(), before + 1);
+
+    assert_eq!(
+        invoke_plan_preflighted_selected_end_register_v2(6, &plan, wrong, |_, _| {
+            calls.set(calls.get() + 1);
+            0
+        },),
+        Err(SelectedEndRegisterCallErrorV2::LiteralWidthMismatch {
+            expected_bytes: 6,
+            actual_bytes: 7,
+        })
+    );
+    assert_eq!(calls.get(), before + 1);
 }
 
 #[test]
 #[allow(
     clippy::too_many_lines,
-    reason = "one source seal keeps the distinct entry, repeated P1 audit, session-only API, and authoritative preflight boundaries together"
+    reason = "one source seal keeps the distinct entry, repeated P1 audit, split session APIs, and authoritative preflight boundaries together"
 )]
 fn selected_end_register_v2_source_boundaries_are_sealed() {
     fn position(source: &str, marker: &str) -> usize {
@@ -363,14 +367,22 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     assert!(!preflight.contains("current_thread_sve_vector_bytes"));
 
     let handle_start = position(runtime, "impl PublishedSelectedEndRegisterV2 {");
-    let session_start = position(
+    let general_session_start = position(
         runtime,
         "impl PublishedSelectedEndRegisterThreadSessionV2<'_> {",
     );
-    let handle = &runtime[handle_start..session_start];
+    let plan_session_start = position(
+        runtime,
+        "impl PublishedSelectedEndRegisterPlanThreadSessionV2<'_> {",
+    );
+    let handle = &runtime[handle_start..general_session_start];
     assert!(handle.contains("pub fn begin_current_thread_session("));
     assert!(handle.contains("pub fn begin_current_thread_session_for_literal_plan"));
-    assert!(handle.contains("plan.needle() != self.exact_literal()"));
+    assert!(handle.contains("let literal = plan.needle();"));
+    assert!(handle.contains("if literal != self.exact_literal()"));
+    assert!(handle.contains("PublishedSelectedEndRegisterPlanThreadSessionV2<'session>"));
+    assert!(handle.contains("literal_plan: plan"));
+    assert!(handle.contains("literal_bytes: literal.len()"));
     assert!(handle.contains("let required = self.backend.fixed_active_vector_bytes();"));
     assert!(handle.contains("if required != 0"));
     assert_eq!(
@@ -380,19 +392,71 @@ fn selected_end_register_v2_source_boundaries_are_sealed() {
     assert!(!handle.contains("pub fn search("));
     assert!(!handle.contains("pub fn find("));
 
-    let token_start = position(
+    let general_struct_start = position(
+        runtime,
+        "pub struct PublishedSelectedEndRegisterThreadSessionV2<'kernel> {",
+    );
+    let plan_struct_start = position(
+        runtime,
+        "pub struct PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel> {",
+    );
+    let clone_start = position(runtime, "impl Clone for PublishedSelectedEndRegisterV2 {");
+    let general_struct = &runtime[general_struct_start..plan_struct_start];
+    let plan_struct = &runtime[plan_struct_start..clone_start];
+    assert!(!general_struct.contains("literal_plan"));
+    assert!(plan_struct.contains("literal_plan: &'kernel LiteralPlan"));
+    assert!(plan_struct.contains("literal_bytes: usize"));
+
+    let general_session = &runtime[general_session_start..plan_session_start];
+    assert!(general_session.contains("invoke_preflighted_selected_end_register_v2("));
+    assert!(!general_session.contains("invoke_plan_preflighted_selected_end_register_v2("));
+    let plan_session = &runtime[plan_session_start..publish_start];
+    assert!(plan_session.contains("invoke_plan_preflighted_selected_end_register_v2("));
+    assert!(plan_session.contains("#[inline(always)]\n    pub fn search_preflighted("));
+
+    let general_token_start = position(
         runtime,
         "pub(crate) fn invoke_preflighted_selected_end_register_v2(",
     );
+    let plan_token_start = position(
+        runtime,
+        "pub(crate) fn invoke_plan_preflighted_selected_end_register_v2(",
+    );
     let decode_start = position(runtime, "pub(crate) fn decode_selected_end_register_v2(");
-    let token = &runtime[token_start..decode_start];
-    assert!(token.contains("preflight.literal_bytes()"));
-    assert!(token.contains("preflight.literal() == exact_literal"));
-    assert!(token.contains("preflight.was_issued_by(plan)"));
-    assert!(token.contains("preflight.checked_window()"));
-    assert!(!token.contains("preflight_literal_window("));
+    assert!(runtime.contains(
+        "#[inline(always)]\npub(crate) fn invoke_plan_preflighted_selected_end_register_v2("
+    ));
+    assert!(runtime.contains("#[inline(always)]\npub(crate) fn decode_selected_end_register_v2("));
+    let general_token = &runtime[general_token_start..plan_token_start];
+    assert!(general_token.contains("preflight.literal_bytes()"));
+    assert!(general_token.contains("preflight.literal() != exact_literal"));
+    assert!(!general_token.contains("preflight.was_issued_by("));
+    assert!(general_token.contains("preflight.checked_window()"));
+    assert!(!general_token.contains("preflight_literal_window("));
+
+    let plan_token = &runtime[plan_token_start..decode_start];
+    assert!(plan_token.contains(
+        ") -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {\n    if !preflight.was_issued_by(literal_plan) {"
+    ));
+    assert_eq!(plan_token.matches("preflight.was_issued_by(").count(), 1);
+    assert_eq!(plan_token.matches("preflight.literal_bytes()").count(), 1);
+    assert!(!plan_token.contains("preflight.literal()"));
+    assert!(!plan_token.contains("usize::try_from"));
+    assert!(!plan_token.contains("exact_literal"));
+    let plan_success_start = position(plan_token, "    let accounting = preflight.accounting();");
+    let plan_success = &plan_token[plan_success_start..];
+    assert!(!plan_success.contains("preflight.literal_bytes()"));
+    assert!(!plan_success.contains("preflight.was_issued_by("));
+    assert!(plan_success.contains("preflight.checked_window()"));
+    assert!(!plan_success.contains("preflight_literal_window("));
+    let decode = &runtime[decode_start..];
+    assert!(decode.contains("match end_or_zero.checked_sub(literal_len)"));
+    assert!(!decode.contains(".expect("));
 
     let platform = include_str!("platform/aarch64.rs");
+    assert!(platform.contains(
+        "impl SelectedEndRegisterEntryV2 {\n    #[inline(always)]\n    pub(crate) fn invoke("
+    ));
     assert!(platform.contains("unsafe extern \"C\" fn(*const u8, usize, usize, usize) -> usize;"));
     assert!(platform.contains("Self::SelectedEndRegisterV2(image) =>"));
     assert!(platform.contains("audit_selected_end_register_v2(image)"));

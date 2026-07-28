@@ -76,9 +76,9 @@ impl From<LiteralError> for SelectedEndRegisterCallErrorV2 {
 /// Immutable strict-W^X publication of one register-return ABI2 image.
 ///
 /// The handle intentionally has no direct call method. Every invocation goes
-/// through [`PublishedSelectedEndRegisterThreadSessionV2`], so tag19 and
-/// tag21 cannot inherit Search-v1's backward-compatible unchecked-thread
-/// assumption.
+/// through [`PublishedSelectedEndRegisterThreadSessionV2`] or
+/// [`PublishedSelectedEndRegisterPlanThreadSessionV2`], so tag19 and tag21
+/// cannot inherit Search-v1's backward-compatible unchecked-thread assumption.
 pub struct PublishedSelectedEndRegisterV2 {
     pub(crate) mapping: Arc<ExecutableMapping>,
     entry: SelectedEndRegisterEntryV2,
@@ -113,8 +113,34 @@ pub struct PublishedSelectedEndRegisterThreadSessionV2<'kernel> {
     entry: SelectedEndRegisterEntryV2,
     literal_bytes: NonZeroU32,
     kernel: &'kernel PublishedSelectedEndRegisterV2,
-    literal_plan: Option<&'kernel LiteralPlan>,
     thread_bound: PhantomData<Rc<()>>,
+}
+
+/// Current-thread ABI2 token bound once to one exact portable literal plan.
+///
+/// Construction proves that the plan's immutable literal equals the sealed
+/// artifact and performs the same sole fixed-VL observation as the general
+/// session. Repeated preflighted calls therefore need only prove that their
+/// private-field certificate came from this exact plan before invoking native
+/// code. The token remains neither [`Send`] nor [`Sync`].
+///
+/// ```compile_fail,E0277
+/// use fre_jit_runtime::PublishedSelectedEndRegisterPlanThreadSessionV2;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<PublishedSelectedEndRegisterPlanThreadSessionV2<'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_jit_runtime::PublishedSelectedEndRegisterPlanThreadSessionV2;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<PublishedSelectedEndRegisterPlanThreadSessionV2<'static>>();
+/// ```
+pub struct PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel> {
+    session: PublishedSelectedEndRegisterThreadSessionV2<'kernel>,
+    literal_plan: &'kernel LiteralPlan,
+    literal_bytes: usize,
 }
 
 impl Clone for PublishedSelectedEndRegisterV2 {
@@ -155,6 +181,17 @@ impl fmt::Debug for PublishedSelectedEndRegisterThreadSessionV2<'_> {
     }
 }
 
+impl fmt::Debug for PublishedSelectedEndRegisterPlanThreadSessionV2<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedSelectedEndRegisterPlanThreadSessionV2")
+            .field("artifact_identity", &self.session.kernel.artifact_identity)
+            .field("backend", &self.session.kernel.backend)
+            .field("literal_bytes", &self.literal_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PublishedSelectedEndRegisterV2 {
     /// Establish the only callable boundary for this ABI2 publication.
     ///
@@ -164,7 +201,7 @@ impl PublishedSelectedEndRegisterV2 {
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'_>, KernelThreadContractError> {
-        self.begin_current_thread_session_impl(None)
+        self.begin_current_thread_session_impl()
     }
 
     /// Establish a plan-bound session for the qualified exact-literal facade.
@@ -177,19 +214,23 @@ impl PublishedSelectedEndRegisterV2 {
     pub fn begin_current_thread_session_for_literal_plan<'session>(
         &'session self,
         plan: &'session LiteralPlan,
-    ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'session>, KernelThreadContractError>
+    ) -> Result<PublishedSelectedEndRegisterPlanThreadSessionV2<'session>, KernelThreadContractError>
     {
-        if plan.needle() != self.exact_literal() {
+        let literal = plan.needle();
+        if literal != self.exact_literal() {
             return Err(KernelThreadContractError::LiteralIdentityMismatch);
         }
-        self.begin_current_thread_session_impl(Some(plan))
+        let session = self.begin_current_thread_session_impl()?;
+        Ok(PublishedSelectedEndRegisterPlanThreadSessionV2 {
+            session,
+            literal_plan: plan,
+            literal_bytes: literal.len(),
+        })
     }
 
-    fn begin_current_thread_session_impl<'session>(
-        &'session self,
-        literal_plan: Option<&'session LiteralPlan>,
-    ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'session>, KernelThreadContractError>
-    {
+    fn begin_current_thread_session_impl(
+        &self,
+    ) -> Result<PublishedSelectedEndRegisterThreadSessionV2<'_>, KernelThreadContractError> {
         let required = self.backend.fixed_active_vector_bytes();
         if required != 0 {
             let actual = platform::current_thread_sve_vector_bytes()
@@ -207,7 +248,6 @@ impl PublishedSelectedEndRegisterV2 {
             entry: self.entry,
             literal_bytes: self.literal_bytes,
             kernel: self,
-            literal_plan,
             thread_bound: PhantomData,
         })
     }
@@ -371,9 +411,9 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
     /// The token's private fields bind its exact plan, haystack, window,
     /// accounting, and successful resource admission. This boundary verifies
     /// that plan's exact literal against the sealed ABI2 image, then invokes
-    /// native code without repeating scalar preflight. Qualified facade
-    /// sessions bind their plan once at construction and use a pointer check
-    /// here; general sessions compare the exact bytes.
+    /// native code without repeating scalar preflight. General sessions compare
+    /// the exact bytes on every call; qualified facade sessions use the
+    /// distinct once-bound plan token below.
     #[doc(hidden)]
     #[inline]
     pub fn search_preflighted(
@@ -383,7 +423,6 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
         invoke_preflighted_selected_end_register_v2(
             self.literal_bytes,
             self.kernel.exact_literal(),
-            self.literal_plan,
             preflight,
             |haystack, window| self.entry.invoke(haystack, window),
         )
@@ -393,6 +432,94 @@ impl PublishedSelectedEndRegisterThreadSessionV2<'_> {
     #[must_use]
     pub const fn kernel(&self) -> &PublishedSelectedEndRegisterV2 {
         self.kernel
+    }
+}
+
+impl PublishedSelectedEndRegisterPlanThreadSessionV2<'_> {
+    /// SVE vector length validated while this qualification session opened,
+    /// or `None` for an ASIMD-only session.
+    #[cfg(all(
+        feature = "sve-hardware-qualification",
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn qualification_validated_thread_sve_vector_bytes(&self) -> Option<u16> {
+        self.session
+            .qualification_validated_thread_sve_vector_bytes()
+    }
+
+    /// Search one half-open byte window after shared scalar preflight.
+    #[inline]
+    pub fn search(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: LiteralSearchLimits,
+    ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
+        self.session.search(haystack, window, limits)
+    }
+
+    /// Exercise the exact ABI2 entry through the qualification-only vector
+    /// callee-saved-lane canary.
+    #[cfg(all(
+        any(test, feature = "sve-hardware-qualification"),
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        target_pointer_width = "64",
+        target_endian = "little"
+    ))]
+    #[doc(hidden)]
+    pub fn qualification_preserves_abi2_vector_callee_saved_lanes(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: LiteralSearchLimits,
+        canaries: [u64; 8],
+    ) -> Result<bool, SelectedEndRegisterCallErrorV2> {
+        self.session
+            .qualification_preserves_abi2_vector_callee_saved_lanes(
+                haystack, window, limits, canaries,
+            )
+    }
+
+    /// Search the complete haystack after shared scalar preflight.
+    #[inline]
+    pub fn find(
+        &self,
+        haystack: &[u8],
+        limits: LiteralSearchLimits,
+    ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
+        self.session.find(haystack, limits)
+    }
+
+    /// Invoke from a preflight issued by the exact plan bound at construction.
+    ///
+    /// The successful hot path performs one allocation-free plan-pointer
+    /// identity check, then invokes and decodes the native result. Literal
+    /// width and bytes were already authenticated when this session opened and
+    /// are consulted only to classify a mismatched token.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn search_preflighted(
+        &self,
+        preflight: LiteralSearchPreflight<'_, '_>,
+    ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
+        invoke_plan_preflighted_selected_end_register_v2(
+            self.literal_bytes,
+            self.literal_plan,
+            preflight,
+            |haystack, window| self.session.entry.invoke(haystack, window),
+        )
+    }
+
+    /// Immutable publication retained for this session's complete lifetime.
+    #[must_use]
+    pub const fn kernel(&self) -> &PublishedSelectedEndRegisterV2 {
+        self.session.kernel
     }
 }
 
@@ -615,7 +742,6 @@ pub(crate) fn checked_selected_end_register_call_v2(
 pub(crate) fn invoke_preflighted_selected_end_register_v2(
     literal_bytes: NonZeroU32,
     exact_literal: &[u8],
-    literal_plan: Option<&LiteralPlan>,
     preflight: LiteralSearchPreflight<'_, '_>,
     invoke: impl FnOnce(&[u8], SearchWindow) -> usize,
 ) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
@@ -634,14 +760,7 @@ pub(crate) fn invoke_preflighted_selected_end_register_v2(
     if exact_literal.len() != expected_bytes {
         return Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch);
     }
-    let exact_identity = match literal_plan {
-        Some(plan) => {
-            debug_assert_eq!(plan.needle(), exact_literal);
-            preflight.was_issued_by(plan)
-        }
-        None => preflight.literal() == exact_literal,
-    };
-    if !exact_identity {
+    if preflight.literal() != exact_literal {
         return Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch);
     }
     let accounting = preflight.accounting();
@@ -655,6 +774,32 @@ pub(crate) fn invoke_preflighted_selected_end_register_v2(
     Ok((matched, accounting))
 }
 
+#[inline(always)]
+pub(crate) fn invoke_plan_preflighted_selected_end_register_v2(
+    literal_bytes: usize,
+    literal_plan: &LiteralPlan,
+    preflight: LiteralSearchPreflight<'_, '_>,
+    invoke: impl FnOnce(&[u8], SearchWindow) -> usize,
+) -> Result<(Option<MatchSpan>, LiteralAccounting), SelectedEndRegisterCallErrorV2> {
+    if !preflight.was_issued_by(literal_plan) {
+        let actual_bytes = preflight.literal_bytes();
+        if actual_bytes != literal_bytes {
+            return Err(SelectedEndRegisterCallErrorV2::LiteralWidthMismatch {
+                expected_bytes: literal_bytes,
+                actual_bytes,
+            });
+        }
+        return Err(SelectedEndRegisterCallErrorV2::LiteralIdentityMismatch);
+    }
+    let accounting = preflight.accounting();
+    let checked = preflight.checked_window();
+    let window = checked.window();
+    let matched =
+        decode_selected_end_register_v2(invoke(checked.haystack(), window), window, literal_bytes)?;
+    Ok((matched, accounting))
+}
+
+#[inline(always)]
 pub(crate) fn decode_selected_end_register_v2(
     end_or_zero: usize,
     window: SearchWindow,
@@ -663,20 +808,17 @@ pub(crate) fn decode_selected_end_register_v2(
     if end_or_zero == 0 {
         return Ok(None);
     }
-    let start = end_or_zero.checked_sub(literal_len);
-    if end_or_zero > window.end()
-        || start.is_none_or(|start| start < window.start())
-        || literal_len == 0
-    {
-        return Err(SelectedEndRegisterCallErrorV2::InvalidNativeEnd {
+    match end_or_zero.checked_sub(literal_len) {
+        Some(start)
+            if end_or_zero <= window.end() && start >= window.start() && literal_len != 0 =>
+        {
+            Ok(Some(MatchSpan::new(start, end_or_zero)))
+        }
+        _ => Err(SelectedEndRegisterCallErrorV2::InvalidNativeEnd {
             end_or_zero,
             literal_bytes: literal_len,
             window_start: window.start(),
             window_end: window.end(),
-        });
+        }),
     }
-    Ok(Some(MatchSpan::new(
-        start.expect("validated selected-end start"),
-        end_or_zero,
-    )))
 }

@@ -153,7 +153,7 @@ mod linux_aarch64 {
     fn differential_corpus(
         program: &fre_kernel_ir::ValidatedProgram<SelectedEnd>,
         portable: &LiteralPlan,
-        session: &fre_jit_runtime::PublishedSelectedEndRegisterThreadSessionV2<'_>,
+        session: &fre_jit_runtime::PublishedSelectedEndRegisterPlanThreadSessionV2<'_>,
     ) -> Result<usize, Box<dyn Error>> {
         let mut state = 0x6a09_e667_f3bc_c909_u64;
         let mut comparisons = 0_usize;
@@ -199,7 +199,7 @@ mod linux_aarch64 {
     fn compare_one(
         program: &fre_kernel_ir::ValidatedProgram<SelectedEnd>,
         portable: &LiteralPlan,
-        session: &fre_jit_runtime::PublishedSelectedEndRegisterThreadSessionV2<'_>,
+        session: &fre_jit_runtime::PublishedSelectedEndRegisterPlanThreadSessionV2<'_>,
         haystack: &[u8],
         window: SearchWindow,
     ) -> Result<(), Box<dyn Error>> {
@@ -226,7 +226,7 @@ mod linux_aarch64 {
 
     fn guard_page_checks(
         portable: &LiteralPlan,
-        session: &fre_jit_runtime::PublishedSelectedEndRegisterThreadSessionV2<'_>,
+        session: &fre_jit_runtime::PublishedSelectedEndRegisterPlanThreadSessionV2<'_>,
     ) -> Result<(), Box<dyn Error>> {
         let cases = [
             (vec![b'x'; 128], SearchWindow::new(0, 128)),

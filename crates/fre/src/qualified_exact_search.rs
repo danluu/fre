@@ -14,7 +14,7 @@ use fre_jit_aarch64::{
 };
 use fre_jit_runtime::{
     CallError, PublicationAccounting, PublicationLimits, PublishError, PublishedKernel,
-    PublishedKernelThreadSession, PublishedSelectedEndRegisterThreadSessionV2,
+    PublishedKernelThreadSession, PublishedSelectedEndRegisterPlanThreadSessionV2,
     PublishedSelectedEndRegisterV2, SelectedEndRegisterCallErrorV2, native_search_backend_support,
     native_selected_end_register_backend_support_v2, publish_audited,
     publish_selected_end_register_v2,
@@ -667,7 +667,7 @@ impl QualifiedExactSearchNative {
 #[derive(Debug)]
 enum QualifiedExactSearchNativeThreadSession<'kernel> {
     LegacyV1(PublishedKernelThreadSession<'kernel, NativeSelectedEnd>),
-    RegisterV2(PublishedSelectedEndRegisterThreadSessionV2<'kernel>),
+    RegisterV2(PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel>),
 }
 
 impl QualifiedExactSearchNativeThreadSession<'_> {
@@ -2258,7 +2258,7 @@ mod tests {
             );
         let session = &source[session_start..session_end];
         assert!(session.contains("PublishedKernelThreadSession<'kernel, NativeSelectedEnd>"));
-        assert!(session.contains("PublishedSelectedEndRegisterThreadSessionV2<'kernel>"));
+        assert!(session.contains("PublishedSelectedEndRegisterPlanThreadSessionV2<'kernel>"));
 
         let native_session_start = position(source, "\nimpl QualifiedExactSearchNative {");
         let native_session_end = native_session_start

@@ -312,7 +312,7 @@ impl SearchEntry {
 }
 
 impl SelectedEndRegisterEntryV2 {
-    #[inline]
+    #[inline(always)]
     pub(crate) fn invoke(self, haystack: &[u8], window: SearchWindow) -> usize {
         // SAFETY: construction decoded this exact four-argument callable only
         // from a P1-audited ABI2 mapping after its final RX transition. The

@@ -46,9 +46,9 @@ pub use identity::RuntimeIdentity;
 pub use limits::{PublicationAccounting, PublicationLimits};
 pub use operation::{RuntimeAggregateOperation, RuntimeOperation};
 pub use selected_end_register_v2::{
-    PublishedSelectedEndRegisterThreadSessionV2, PublishedSelectedEndRegisterV2,
-    SelectedEndRegisterCallErrorV2, native_selected_end_register_backend_support_v2,
-    publish_selected_end_register_v2,
+    PublishedSelectedEndRegisterPlanThreadSessionV2, PublishedSelectedEndRegisterThreadSessionV2,
+    PublishedSelectedEndRegisterV2, SelectedEndRegisterCallErrorV2,
+    native_selected_end_register_backend_support_v2, publish_selected_end_register_v2,
 };
 
 use crate::{limits::PublicationPlan, platform::ExecutableMapping};
