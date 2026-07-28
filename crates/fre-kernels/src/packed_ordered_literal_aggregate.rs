@@ -24,7 +24,7 @@ use fre_simd_kernels::{
 
 use crate::ordered_literal_aggregate::{IterationSemantics, MatchSemantics, Operation};
 
-const CACHE_FORMAT_VERSION: u32 = 3;
+const CACHE_FORMAT_VERSION: u32 = 4;
 const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
 const IDENTITY_CAPACITY_BYTES: usize = LENGTH_PREFIX_BYTES
     + CERTIFIED_MAX_PATTERNS * LENGTH_PREFIX_BYTES
@@ -74,6 +74,8 @@ pub const CERTIFIED_MIN_PATTERN_BYTES: usize = 2;
 pub const CERTIFIED_MAX_PATTERN_BYTES: usize = 32;
 /// Absolute theorem bound, independent of caller limits.
 pub const CERTIFIED_MAX_TOTAL_PATTERN_BYTES: usize = 512;
+/// Largest greedy byte prefix admitted by the bounded-prefix wrapper.
+pub const CERTIFIED_MAX_BOUNDED_PREFIX_BYTES: u8 = 4;
 /// Stable FRE-owned strategy identity.
 pub const ALGORITHM_ID: &str = "ordered-literal-aggregate.packed-ranked-anchor-stream.v3";
 /// Stable count-plan identity.
@@ -81,10 +83,14 @@ pub const COUNT_PLAN_ID: &str = "ordered-literal-aggregate.count.packed-ranked-a
 /// Stable span-sum-plan identity.
 pub const SPAN_SUM_PLAN_ID: &str =
     "ordered-literal-aggregate.span-sum.packed-ranked-anchor-stream.v3";
+/// Stable count identity for a finite greedy dot-byte prefix followed by the
+/// ordered literal set.
+pub const BOUNDED_PREFIX_COUNT_PLAN_ID: &str =
+    "bounded-prefix-ordered-literal-aggregate.count.packed-ranked-anchor-stream.v1";
 /// Version of the success-or-failure construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 2;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 3;
 /// Version of the partial-actual construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 3;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 4;
 
 /// Boundary contract owned by this byte-string kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,7 +134,15 @@ pub struct CacheIdentity<'a> {
     pub certified_min_pattern_bytes: usize,
     pub certified_max_pattern_bytes: usize,
     pub certified_max_total_pattern_bytes: usize,
+    pub bounded_prefix: Option<BoundedPrefixBounds>,
     pub encoded_patterns: &'a [u8],
+}
+
+/// Exact greedy byte-prefix bounds bound into construction and cache identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundedPrefixBounds {
+    pub minimum: u8,
+    pub maximum: u8,
 }
 
 /// Copyable operation and exact wide-classifier identity. Pattern bytes remain
@@ -149,6 +163,7 @@ pub struct OperationIdentity {
     pub wide_minimum_input_bytes: usize,
     pub anchor_offset: usize,
     pub anchor_has_non_ascii: bool,
+    pub bounded_prefix: Option<BoundedPrefixBounds>,
 }
 
 impl CacheIdentity<'_> {
@@ -170,6 +185,7 @@ impl CacheIdentity<'_> {
             wide_minimum_input_bytes: wide.minimum_input_bytes,
             anchor_offset: self.anchor_offset,
             anchor_has_non_ascii: self.anchor_has_non_ascii,
+            bounded_prefix: self.bounded_prefix,
         }
     }
 }
@@ -233,6 +249,7 @@ pub struct BuildAccounting {
     pub build_peak_upper_bound: usize,
     pub persistent_bytes: usize,
     pub simd_minimum_haystack_bytes: usize,
+    pub bounded_prefix: Option<BoundedPrefixBounds>,
 }
 
 /// Immutable identity and caller envelope for one construction attempt.
@@ -244,6 +261,7 @@ pub struct BuildAttemptIdentity {
     pub limits: BuildLimits,
     pub algorithm_version: u32,
     pub accounting_version: u32,
+    pub bounded_prefix: Option<BoundedPrefixBounds>,
 }
 
 /// Exact effects committed through the last completed construction step.
@@ -308,14 +326,16 @@ impl BuildAttemptReceipt {
                     .saturating_add(self.actual.live_scratch_bytes)
     }
 
-    fn closes_success(&self, operation: Operation, accounting: BuildAccounting) -> bool {
+    fn closes_success(
+        &self,
+        plan_id: &'static str,
+        operation: Operation,
+        accounting: BuildAccounting,
+    ) -> bool {
         self.published
             && self.identity.operation == operation
-            && self.identity.plan_id
-                == match operation {
-                    Operation::Count => COUNT_PLAN_ID,
-                    Operation::SpanSum => SPAN_SUM_PLAN_ID,
-                }
+            && self.identity.plan_id == plan_id
+            && self.identity.bounded_prefix == accounting.bounded_prefix
             && self.accounting == Some(accounting)
             && self.contains_actual()
             && self.actual.work <= accounting.build_work_upper_bound
@@ -665,6 +685,14 @@ pub struct PackedOrderedLiteralSpanSumPlan {
     core: PlanCore,
 }
 
+/// Non-`Clone`, count-specialized plan for a greedy finite dot-byte prefix
+/// followed by a small ordered literal set.
+#[derive(Debug)]
+pub struct PackedBoundedPrefixLiteralCountPlan {
+    core: PlanCore,
+    bounds: BoundedPrefixBounds,
+}
+
 /// Successful count-plan construction and its closed receipt.
 #[derive(Debug)]
 pub struct CountBuildAttempt {
@@ -685,8 +713,11 @@ impl CountBuildAttempt {
 
     #[must_use]
     pub fn closes(&self) -> bool {
-        self.receipt
-            .closes_success(Operation::Count, self.plan.build_accounting())
+        self.receipt.closes_success(
+            COUNT_PLAN_ID,
+            Operation::Count,
+            self.plan.build_accounting(),
+        )
     }
 
     #[must_use]
@@ -720,8 +751,11 @@ impl SpanSumBuildAttempt {
 
     #[must_use]
     pub fn closes(&self) -> bool {
-        self.receipt
-            .closes_success(Operation::SpanSum, self.plan.build_accounting())
+        self.receipt.closes_success(
+            SPAN_SUM_PLAN_ID,
+            Operation::SpanSum,
+            self.plan.build_accounting(),
+        )
     }
 
     #[must_use]
@@ -731,6 +765,44 @@ impl SpanSumBuildAttempt {
 
     #[must_use]
     pub fn into_plan(self) -> PackedOrderedLiteralSpanSumPlan {
+        self.plan
+    }
+}
+
+/// Successful bounded-prefix count-plan construction and its closed receipt.
+#[derive(Debug)]
+pub struct BoundedPrefixCountBuildAttempt {
+    plan: PackedBoundedPrefixLiteralCountPlan,
+    receipt: BuildAttemptReceipt,
+}
+
+impl BoundedPrefixCountBuildAttempt {
+    #[must_use]
+    pub const fn plan(&self) -> &PackedBoundedPrefixLiteralCountPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &BuildAttemptReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub fn closes(&self) -> bool {
+        self.receipt.closes_success(
+            BOUNDED_PREFIX_COUNT_PLAN_ID,
+            Operation::Count,
+            self.plan.build_accounting(),
+        )
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (PackedBoundedPrefixLiteralCountPlan, BuildAttemptReceipt) {
+        (self.plan, self.receipt)
+    }
+
+    #[must_use]
+    pub fn into_plan(self) -> PackedBoundedPrefixLiteralCountPlan {
         self.plan
     }
 }
@@ -773,7 +845,7 @@ impl PackedOrderedLiteralCountPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<CountBuildAttempt, BuildAttemptError> {
-        let identity = build_attempt_identity(Operation::Count, limits);
+        let identity = build_attempt_identity(COUNT_PLAN_ID, Operation::Count, None, limits);
         PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
             |(core, receipt)| CountBuildAttempt {
                 plan: Self { core },
@@ -789,7 +861,11 @@ impl PackedOrderedLiteralCountPlan {
 
     #[must_use]
     pub fn cache_identity(&self) -> CacheIdentity<'_> {
-        self.core.identity(Operation::Count)
+        self.core.identity(
+            COUNT_PLAN_ID,
+            Operation::Count,
+            "FRE-owned monotone fixed-anchor SIMD candidate stream with ordered verification",
+        )
     }
 
     #[inline]
@@ -848,7 +924,7 @@ impl PackedOrderedLiteralSpanSumPlan {
         patterns: &[P],
         limits: BuildLimits,
     ) -> Result<SpanSumBuildAttempt, BuildAttemptError> {
-        let identity = build_attempt_identity(Operation::SpanSum, limits);
+        let identity = build_attempt_identity(SPAN_SUM_PLAN_ID, Operation::SpanSum, None, limits);
         PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
             |(core, receipt)| SpanSumBuildAttempt {
                 plan: Self { core },
@@ -864,7 +940,11 @@ impl PackedOrderedLiteralSpanSumPlan {
 
     #[must_use]
     pub fn cache_identity(&self) -> CacheIdentity<'_> {
-        self.core.identity(Operation::SpanSum)
+        self.core.identity(
+            SPAN_SUM_PLAN_ID,
+            Operation::SpanSum,
+            "FRE-owned monotone fixed-anchor SIMD candidate stream with ordered verification",
+        )
     }
 
     #[inline]
@@ -885,31 +965,165 @@ impl PackedOrderedLiteralSpanSumPlan {
     }
 }
 
-const fn build_attempt_identity(operation: Operation, limits: BuildLimits) -> BuildAttemptIdentity {
+impl PackedBoundedPrefixLiteralCountPlan {
+    pub fn build<P: AsRef<[u8]>>(
+        patterns: &[P],
+        bounds: BoundedPrefixBounds,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_with_dispatch(SimdDispatchContext::capture(), patterns, bounds, limits)
+    }
+
+    /// Build from one caller-captured capability snapshot.
+    pub fn build_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        bounds: BoundedPrefixBounds,
+        limits: BuildLimits,
+    ) -> Result<Self, BuildError> {
+        Self::build_attempt_with_dispatch(dispatch, patterns, bounds, limits)
+            .map(BoundedPrefixCountBuildAttempt::into_plan)
+            .map_err(BuildAttemptError::into_source)
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt<P: AsRef<[u8]>>(
+        patterns: &[P],
+        bounds: BoundedPrefixBounds,
+        limits: BuildLimits,
+    ) -> Result<BoundedPrefixCountBuildAttempt, BuildAttemptError> {
+        Self::build_attempt_with_dispatch(SimdDispatchContext::capture(), patterns, bounds, limits)
+    }
+
+    /// Build with one caller-captured capability snapshot and retain the
+    /// complete success-or-failure receipt.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the terminal receipt remains inline so failed allocation reporting cannot allocate"
+    )]
+    pub fn build_attempt_with_dispatch<P: AsRef<[u8]>>(
+        dispatch: SimdDispatchContext,
+        patterns: &[P],
+        bounds: BoundedPrefixBounds,
+        limits: BuildLimits,
+    ) -> Result<BoundedPrefixCountBuildAttempt, BuildAttemptError> {
+        let identity = build_attempt_identity(
+            BOUNDED_PREFIX_COUNT_PLAN_ID,
+            Operation::Count,
+            Some(bounds),
+            limits,
+        );
+        if limits.max_build_work == 0 {
+            return Err(attempt_error(
+                BuildError::WorkLimit {
+                    needed: 1,
+                    limit: 0,
+                },
+                identity,
+                BuildAttemptActual::default(),
+            ));
+        }
+        let bounds_actual = BuildAttemptActual {
+            work: 1,
+            ..BuildAttemptActual::default()
+        };
+        if bounds.minimum > bounds.maximum {
+            return Err(attempt_error(
+                BuildError::ProofRefused {
+                    fact: "bounded prefix minimum does not exceed maximum",
+                    needed: usize::from(bounds.minimum),
+                    certified_limit: usize::from(bounds.maximum),
+                },
+                identity,
+                bounds_actual,
+            ));
+        }
+        if bounds.maximum > CERTIFIED_MAX_BOUNDED_PREFIX_BYTES {
+            return Err(attempt_error(
+                BuildError::ProofRefused {
+                    fact: "bounded prefix maximum",
+                    needed: usize::from(bounds.maximum),
+                    certified_limit: usize::from(CERTIFIED_MAX_BOUNDED_PREFIX_BYTES),
+                },
+                identity,
+                bounds_actual,
+            ));
+        }
+        PlanCore::build_attempt(patterns, limits, size_of::<Self>(), identity, dispatch).map(
+            |(core, receipt)| BoundedPrefixCountBuildAttempt {
+                plan: Self { core, bounds },
+                receipt,
+            },
+        )
+    }
+
+    #[must_use]
+    pub const fn build_accounting(&self) -> BuildAccounting {
+        self.core.build
+    }
+
+    #[must_use]
+    pub fn cache_identity(&self) -> CacheIdentity<'_> {
+        self.core.identity(
+            BOUNDED_PREFIX_COUNT_PLAN_ID,
+            Operation::Count,
+            "FRE-owned monotone fixed-anchor SIMD literal-start stream with greedy bounded-prefix arbitration",
+        )
+    }
+
+    #[inline]
+    pub fn count<'a>(
+        &'a self,
+        haystack: &[u8],
+        limits: ReduceLimits,
+    ) -> Result<CountResult<'a>, ReduceError> {
+        let outcome = self
+            .core
+            .reduce_bounded_prefix(haystack, self.bounds, limits)?;
+        Ok(CountResult {
+            count: outcome.count,
+            accounting: ReduceAccounting {
+                identity: self.cache_identity(),
+                upper_bounds: outcome.upper,
+                actual: outcome.actual,
+            },
+        })
+    }
+}
+
+const fn build_attempt_identity(
+    plan_id: &'static str,
+    operation: Operation,
+    bounded_prefix: Option<BoundedPrefixBounds>,
+    limits: BuildLimits,
+) -> BuildAttemptIdentity {
     BuildAttemptIdentity {
         algorithm_id: ALGORITHM_ID,
-        plan_id: match operation {
-            Operation::Count => COUNT_PLAN_ID,
-            Operation::SpanSum => SPAN_SUM_PLAN_ID,
-        },
+        plan_id,
         operation,
         limits,
         algorithm_version: BUILD_ATTEMPT_ALGORITHM_VERSION,
         accounting_version: BUILD_ATTEMPT_ACCOUNTING_VERSION,
+        bounded_prefix,
     }
 }
 
 impl PlanCore {
-    fn identity(&self, operation: Operation) -> CacheIdentity<'_> {
+    fn identity(
+        &self,
+        plan_id: &'static str,
+        operation: Operation,
+        implementation_kind: &'static str,
+    ) -> CacheIdentity<'_> {
         CacheIdentity {
             algorithm_id: ALGORITHM_ID,
-            plan_id: match operation {
-                Operation::Count => COUNT_PLAN_ID,
-                Operation::SpanSum => SPAN_SUM_PLAN_ID,
-            },
+            plan_id,
             operation,
             cache_format_version: CACHE_FORMAT_VERSION,
-            implementation_kind: "FRE-owned monotone fixed-anchor SIMD candidate stream with ordered verification",
+            implementation_kind,
             identity_scope: "process-local semantic identity with authenticated classifier receipt",
             target_arch: std::env::consts::ARCH,
             runtime_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
@@ -922,6 +1136,7 @@ impl PlanCore {
             certified_min_pattern_bytes: CERTIFIED_MIN_PATTERN_BYTES,
             certified_max_pattern_bytes: CERTIFIED_MAX_PATTERN_BYTES,
             certified_max_total_pattern_bytes: CERTIFIED_MAX_TOTAL_PATTERN_BYTES,
+            bounded_prefix: self.build.bounded_prefix,
             encoded_patterns: self.owner.encoded_patterns(),
         }
     }
@@ -938,8 +1153,13 @@ impl PlanCore {
         identity: BuildAttemptIdentity,
         dispatch: SimdDispatchContext,
     ) -> Result<(Self, BuildAttemptReceipt), BuildAttemptError> {
-        let (preflight, mut actual) = preflight(patterns, limits, inline_bytes)
-            .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
+        let (preflight, mut actual) = preflight(
+            patterns,
+            limits,
+            inline_bytes,
+            usize::from(identity.bounded_prefix.is_some()),
+        )
+        .map_err(|failure| BuildAttemptError::new(failure.source, identity, failure.actual))?;
 
         let anchor_offset = select_anchor_offset(patterns, preflight.min_pattern_bytes);
         let mut encoded_patterns = [0_u8; IDENTITY_CAPACITY_BYTES];
@@ -1141,6 +1361,7 @@ impl PlanCore {
             build_peak_upper_bound: preflight.peak_bytes,
             persistent_bytes: preflight.persistent_bytes,
             simd_minimum_haystack_bytes: SIMD_BLOCK_BYTES,
+            bounded_prefix: identity.bounded_prefix,
         };
         let receipt = BuildAttemptReceipt {
             identity,
@@ -1149,7 +1370,7 @@ impl PlanCore {
             published: true,
         };
         let core = Self { owner, build };
-        if !receipt.closes_success(identity.operation, core.build) {
+        if !receipt.closes_success(identity.plan_id, identity.operation, core.build) {
             return Err(attempt_error(
                 BuildError::ArithmeticOverflow {
                     computation: "successful construction receipt closure",
@@ -1408,6 +1629,253 @@ impl PlanCore {
         })
     }
 
+    fn preflight_bounded_prefix_reduce(
+        &self,
+        haystack_len: usize,
+        bounds: BoundedPrefixBounds,
+        limits: ReduceLimits,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        let mut upper = self.preflight_reduce::<false>(haystack_len, ReduceLimits::unlimited())?;
+        let prefix_reads = upper
+            .candidate_positions
+            .checked_mul(usize::from(bounds.maximum))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-prefix source reads",
+            })?;
+        upper.source_byte_reads = upper.source_byte_reads.checked_add(prefix_reads).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "bounded-prefix total source reads",
+            },
+        )?;
+        upper.work_per_position = upper
+            .work_per_position
+            .checked_add(usize::from(bounds.maximum))
+            .and_then(|work| work.checked_add(8))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-prefix work per position",
+            })?;
+        let work_usize = upper
+            .candidate_positions
+            .checked_mul(upper.work_per_position)
+            .and_then(|work| work.checked_add(1))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-prefix operation work",
+            })?;
+        upper.work = u64::try_from(work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "bounded-prefix operation work as u64",
+        })?;
+        check_reduce(upper, false, limits)?;
+        Ok(upper)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotone SIMD literal-start traversal and greedy-prefix arbitration remain adjacent for audit"
+    )]
+    fn reduce_bounded_prefix(
+        &self,
+        haystack: &[u8],
+        bounds: BoundedPrefixBounds,
+        limits: ReduceLimits,
+    ) -> Result<ReduceOutcome, ReduceError> {
+        let upper = self.preflight_bounded_prefix_reduce(haystack.len(), bounds, limits)?;
+        let candidate_positions = upper.candidate_positions;
+        let anchor_offset = usize::from(self.owner.anchor_offset);
+        let mut block_start = 0_usize;
+        let mut candidate_events = 0_usize;
+        let mut pattern_checks = 0_usize;
+        let mut reducer = BoundedPrefixReducer::default();
+
+        while block_start
+            .checked_add(SIMD_BLOCK_BYTES)
+            .is_some_and(|end| end <= candidate_positions)
+        {
+            let block_end = block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix SIMD block end",
+                },
+            )?;
+            let anchor_block_start =
+                block_start
+                    .checked_add(anchor_offset)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-prefix SIMD anchor block start",
+                    })?;
+            let anchor_block_end = anchor_block_start.checked_add(SIMD_BLOCK_BYTES).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix SIMD anchor block end",
+                },
+            )?;
+            let block: &[u8; SIMD_BLOCK_BYTES] = haystack[anchor_block_start..anchor_block_end]
+                .try_into()
+                .map_err(|_| ReduceError::InternalInvariant {
+                    detail: "complete bounded-prefix anchor block lost its fixed extent",
+                })?;
+            let classified = self.owner.classifier.classify_32(block);
+            let mut candidates = classified.member_mask();
+            if self.owner.has_non_ascii_anchor_byte {
+                let mut non_ascii = !classified.ascii_mask();
+                while non_ascii != 0 {
+                    let lane = non_ascii.trailing_zeros();
+                    non_ascii &= non_ascii.wrapping_sub(1);
+                    let lane_usize =
+                        usize::try_from(lane).map_err(|_| ReduceError::ArithmeticOverflow {
+                            computation: "bounded-prefix non-ASCII candidate lane",
+                        })?;
+                    if self.owner.anchor_byte_patterns[usize::from(block[lane_usize])] != 0 {
+                        candidates |= 1_u32 << lane;
+                    }
+                }
+            }
+            self.consume_bounded_prefix_candidate_mask(
+                haystack,
+                block_start,
+                candidates,
+                bounds,
+                &mut candidate_events,
+                &mut pattern_checks,
+                &mut reducer,
+            )?;
+            block_start = block_end;
+        }
+        while block_start < candidate_positions {
+            let anchor_position =
+                block_start
+                    .checked_add(anchor_offset)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-prefix scalar anchor position",
+                    })?;
+            let byte = haystack[anchor_position];
+            if self.owner.anchor_byte_patterns[usize::from(byte)] != 0 {
+                candidate_events =
+                    candidate_events
+                        .checked_add(1)
+                        .ok_or(ReduceError::ArithmeticOverflow {
+                            computation: "bounded-prefix actual candidate events",
+                        })?;
+                self.consume_bounded_prefix_candidate(
+                    haystack,
+                    block_start,
+                    bounds,
+                    &mut pattern_checks,
+                    &mut reducer,
+                )?;
+            }
+            block_start = block_start
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix scalar candidate cursor",
+                })?;
+        }
+        reducer.finish()?;
+
+        let iterator_next_calls =
+            candidate_events
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix candidate stream calls",
+                })?;
+        let candidate_control_work =
+            candidate_events
+                .checked_mul(8)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix actual candidate control work",
+                })?;
+        let actual_work_usize = candidate_positions
+            .checked_add(upper.source_byte_reads)
+            .and_then(|work| work.checked_add(pattern_checks))
+            .and_then(|work| work.checked_add(candidate_control_work))
+            .and_then(|work| work.checked_add(iterator_next_calls))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual bounded-prefix operation work",
+            })?;
+        let actual_work =
+            u64::try_from(actual_work_usize).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "actual bounded-prefix operation work as u64",
+            })?;
+        let actual = ReduceActualCounters {
+            match_events: reducer.count,
+            iterator_next_calls,
+            count: Some(reducer.count),
+            span_sum: None,
+            classified_positions: candidate_positions,
+            candidate_events,
+            pattern_checks,
+            source_byte_reads: upper.source_byte_reads,
+            work: actual_work,
+            scratch_bytes: 0,
+            peak_bytes: self.build.persistent_bytes,
+        };
+        debug_assert!(reducer.count <= upper.count);
+        debug_assert!(candidate_events <= upper.candidate_positions);
+        debug_assert!(pattern_checks <= upper.pattern_checks);
+        debug_assert!(actual.work <= upper.work);
+        Ok(ReduceOutcome {
+            count: reducer.count,
+            span_sum: 0,
+            upper,
+            actual,
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
+    )]
+    fn consume_bounded_prefix_candidate_mask(
+        &self,
+        haystack: &[u8],
+        block_start: usize,
+        mut candidates: u32,
+        bounds: BoundedPrefixBounds,
+        candidate_events: &mut usize,
+        pattern_checks: &mut usize,
+        reducer: &mut BoundedPrefixReducer,
+    ) -> Result<(), ReduceError> {
+        while candidates != 0 {
+            let lane = candidates.trailing_zeros();
+            candidates &= candidates.wrapping_sub(1);
+            let start = block_start
+                .checked_add(usize::try_from(lane).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "bounded-prefix candidate lane",
+                    }
+                })?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "bounded-prefix candidate start",
+                })?;
+            *candidate_events =
+                candidate_events
+                    .checked_add(1)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "bounded-prefix actual candidate events",
+                    })?;
+            self.consume_bounded_prefix_candidate(
+                haystack,
+                start,
+                bounds,
+                pattern_checks,
+                reducer,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn consume_bounded_prefix_candidate(
+        &self,
+        haystack: &[u8],
+        literal_start: usize,
+        bounds: BoundedPrefixBounds,
+        pattern_checks: &mut usize,
+        reducer: &mut BoundedPrefixReducer,
+    ) -> Result<(), ReduceError> {
+        let Some(end) = self.verified_candidate_end(haystack, literal_start, pattern_checks)?
+        else {
+            return Ok(());
+        };
+        reducer.observe(haystack, literal_start, end, bounds)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the hot monotone reducer keeps its scalar counters borrowed and allocation-free"
@@ -1465,6 +1933,35 @@ impl PlanCore {
         if start < *consumed_through {
             return Ok(());
         }
+        let Some(end) = self.verified_candidate_end(haystack, start, pattern_checks)? else {
+            return Ok(());
+        };
+        *match_events = match_events
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual match events",
+            })?;
+        if SPAN_SUM {
+            *span_sum = span_sum
+                .checked_add(u64::try_from(end - start).map_err(|_| {
+                    ReduceError::ArithmeticOverflow {
+                        computation: "matched width as u64",
+                    }
+                })?)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual span sum",
+                })?;
+        }
+        *consumed_through = end;
+        Ok(())
+    }
+
+    fn verified_candidate_end(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        pattern_checks: &mut usize,
+    ) -> Result<Option<usize>, ReduceError> {
         let anchor_position = start
             .checked_add(usize::from(self.owner.anchor_offset))
             .ok_or(ReduceError::ArithmeticOverflow {
@@ -1491,29 +1988,111 @@ impl PlanCore {
                     computation: "matched end",
                 })?;
             if end <= haystack.len() && haystack[start..end] == *pattern {
-                *match_events =
-                    match_events
-                        .checked_add(1)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual match events",
-                        })?;
-                if SPAN_SUM {
-                    *span_sum = span_sum
-                        .checked_add(u64::try_from(pattern.len()).map_err(|_| {
-                            ReduceError::ArithmeticOverflow {
-                                computation: "matched width as u64",
-                            }
-                        })?)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "actual span sum",
-                        })?;
-                }
-                *consumed_through = end;
-                break;
+                return Ok(Some(end));
             }
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingBoundedPrefixMatch {
+    start: usize,
+    literal_start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Default)]
+struct BoundedPrefixReducer {
+    cursor: usize,
+    pending: Option<PendingBoundedPrefixMatch>,
+    count: u64,
+}
+
+impl BoundedPrefixReducer {
+    fn observe(
+        &mut self,
+        haystack: &[u8],
+        literal_start: usize,
+        end: usize,
+        bounds: BoundedPrefixBounds,
+    ) -> Result<(), ReduceError> {
+        loop {
+            let Some(start) =
+                bounded_prefix_match_start(haystack, self.cursor, literal_start, bounds)
+            else {
+                return Ok(());
+            };
+            let Some(pending) = self.pending else {
+                self.pending = Some(PendingBoundedPrefixMatch {
+                    start,
+                    literal_start,
+                    end,
+                });
+                return Ok(());
+            };
+            if start < pending.start {
+                return Err(ReduceError::InternalInvariant {
+                    detail: "bounded-prefix literal stream lost monotone match starts",
+                });
+            }
+            if start == pending.start {
+                if literal_start > pending.literal_start {
+                    self.pending = Some(PendingBoundedPrefixMatch {
+                        start,
+                        literal_start,
+                        end,
+                    });
+                }
+                return Ok(());
+            }
+            self.commit_pending()?;
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), ReduceError> {
+        if self.pending.is_some() {
+            self.commit_pending()?;
         }
         Ok(())
     }
+
+    fn commit_pending(&mut self) -> Result<(), ReduceError> {
+        let pending = self.pending.take().ok_or(ReduceError::InternalInvariant {
+            detail: "bounded-prefix reducer committed an empty group",
+        })?;
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-prefix actual match events",
+            })?;
+        self.cursor = pending.end;
+        Ok(())
+    }
+}
+
+fn bounded_prefix_match_start(
+    haystack: &[u8],
+    cursor: usize,
+    literal_start: usize,
+    bounds: BoundedPrefixBounds,
+) -> Option<usize> {
+    if literal_start < cursor {
+        return None;
+    }
+    let floor = literal_start.saturating_sub(usize::from(bounds.maximum));
+    let mut run_start = floor;
+    for (offset, &byte) in haystack[floor..literal_start].iter().enumerate() {
+        if byte == b'\n' {
+            run_start = floor + offset + 1;
+        }
+    }
+    let start = cursor.max(run_start);
+    literal_start
+        .checked_sub(start)
+        .filter(|&width| width >= usize::from(bounds.minimum))
+        .map(|_| start)
 }
 
 /// Choose the lowest-cost common byte offset using a frozen general-purpose
@@ -1596,18 +2175,47 @@ fn preflight<P: AsRef<[u8]>>(
     patterns: &[P],
     limits: BuildLimits,
     inline_bytes: usize,
+    initial_work: usize,
 ) -> Result<(BuildPreflight, BuildAttemptActual), PreflightFailure> {
-    let mut actual = BuildAttemptActual::default();
-    if limits.max_build_work == 0 {
+    let mut actual = BuildAttemptActual {
+        work: u64::try_from(initial_work).map_err(|_| PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "initial build proof work as u64",
+            },
+            actual: BuildAttemptActual::default(),
+        })?,
+        ..BuildAttemptActual::default()
+    };
+    if initial_work > limits.max_build_work {
         return Err(PreflightFailure {
             source: BuildError::WorkLimit {
-                needed: 1,
+                needed: initial_work,
+                limit: limits.max_build_work,
+            },
+            actual: BuildAttemptActual::default(),
+        });
+    }
+    let first_work = initial_work.checked_add(1).ok_or(PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "initial set proof work",
+        },
+        actual,
+    })?;
+    if first_work > limits.max_build_work {
+        return Err(PreflightFailure {
+            source: BuildError::WorkLimit {
+                needed: first_work,
                 limit: limits.max_build_work,
             },
             actual,
         });
     }
-    actual.work = 1;
+    actual.work = u64::try_from(first_work).map_err(|_| PreflightFailure {
+        source: BuildError::ArithmeticOverflow {
+            computation: "initial set proof work as u64",
+        },
+        actual,
+    })?;
     if patterns.is_empty() {
         return Err(PreflightFailure {
             source: BuildError::EmptyPatternSet,
@@ -1643,12 +2251,16 @@ fn preflight<P: AsRef<[u8]>>(
             actual,
         });
     }
-    let census_work = patterns.len().checked_add(1).ok_or(PreflightFailure {
-        source: BuildError::ArithmeticOverflow {
-            computation: "set proof and pattern length census work",
-        },
-        actual,
-    })?;
+    let census_work = patterns
+        .len()
+        .checked_add(1)
+        .and_then(|work| work.checked_add(initial_work))
+        .ok_or(PreflightFailure {
+            source: BuildError::ArithmeticOverflow {
+                computation: "set proof and pattern length census work",
+            },
+            actual,
+        })?;
     if census_work > limits.max_build_work {
         return Err(PreflightFailure {
             source: BuildError::WorkLimit {
@@ -1793,6 +2405,7 @@ fn preflight<P: AsRef<[u8]>>(
     let build_work_usize = patterns
         .len()
         .checked_add(1)
+        .and_then(|work| work.checked_add(initial_work))
         .and_then(|work| work.checked_add(anchor_selection_work))
         .and_then(|work| work.checked_add(size_of::<PackedOwner>()))
         .and_then(|work| work.checked_add(identity_bytes))
@@ -1979,8 +2592,9 @@ mod tests {
     use regex::bytes::RegexBuilder;
 
     use super::{
-        BuildError, BuildLimits, PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan,
-        ReduceError, ReduceLimits, build_allocation_probe,
+        BoundedPrefixBounds, BuildError, BuildLimits, PackedBoundedPrefixLiteralCountPlan,
+        PackedOrderedLiteralCountPlan, PackedOrderedLiteralSpanSumPlan, ReduceError, ReduceLimits,
+        build_allocation_probe,
     };
 
     fn source(patterns: &[Vec<u8>]) -> String {
@@ -1995,6 +2609,15 @@ mod tests {
         }
         source.push(')');
         source
+    }
+
+    fn bounded_prefix_source(patterns: &[Vec<u8>], bounds: BoundedPrefixBounds) -> String {
+        format!(
+            ".{{{},{}}}{}",
+            bounds.minimum,
+            bounds.maximum,
+            source(patterns)
+        )
     }
 
     fn words(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
@@ -2148,6 +2771,219 @@ mod tests {
             count.cache_identity().semantics.boundary_semantics,
             super::BoundarySemantics::NonemptyByteStrings
         );
+    }
+
+    #[test]
+    fn bounded_prefix_greediness_newline_and_restart_match_regex() {
+        let patterns = [
+            b"Tom".to_vec(),
+            b"Sawyer".to_vec(),
+            b"Huckleberry".to_vec(),
+            b"Finn".to_vec(),
+        ];
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"Tom",
+            b"xxTom",
+            b"xxxxTom",
+            b"xxxxxTom",
+            b"x\nxTom",
+            b"xxTomSawyer",
+            b"xxTomxxSawyerxxFinn",
+            b"TomTomTom",
+            b"xxxSawyerxFinnxxxxHuckleberry",
+        ];
+        for bounds in [
+            BoundedPrefixBounds {
+                minimum: 0,
+                maximum: 2,
+            },
+            BoundedPrefixBounds {
+                minimum: 2,
+                maximum: 4,
+            },
+        ] {
+            let regex = RegexBuilder::new(&bounded_prefix_source(&patterns, bounds))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let plan = PackedBoundedPrefixLiteralCountPlan::build(
+                &patterns,
+                bounds,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(plan.cache_identity().bounded_prefix, Some(bounds));
+            for haystack in haystacks {
+                let expected = u64::try_from(regex.find_iter(haystack).count()).unwrap();
+                let actual = plan
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count;
+                assert_eq!(actual, expected, "bounds={bounds:?}, haystack={haystack:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_prefix_small_exhaustive_matches_regex() {
+        let patterns = [b"Tom".to_vec(), b"Saw".to_vec()];
+        let haystacks = words(b"\naxTomS", 5);
+        for bounds in [
+            BoundedPrefixBounds {
+                minimum: 0,
+                maximum: 2,
+            },
+            BoundedPrefixBounds {
+                minimum: 2,
+                maximum: 4,
+            },
+        ] {
+            let regex = RegexBuilder::new(&bounded_prefix_source(&patterns, bounds))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let plan = PackedBoundedPrefixLiteralCountPlan::build(
+                &patterns,
+                bounds,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            for haystack in &haystacks {
+                let expected = u64::try_from(regex.find_iter(haystack).count()).unwrap();
+                let actual = plan
+                    .count(haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count;
+                assert_eq!(actual, expected, "bounds={bounds:?}, haystack={haystack:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_prefix_deterministic_random_differential_matches_regex() {
+        let patterns = [
+            b"Tom".to_vec(),
+            b"Sawyer".to_vec(),
+            b"Huckleberry".to_vec(),
+            b"Finn".to_vec(),
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for bounds in [
+            BoundedPrefixBounds {
+                minimum: 0,
+                maximum: 2,
+            },
+            BoundedPrefixBounds {
+                minimum: 2,
+                maximum: 4,
+            },
+        ] {
+            let regex = RegexBuilder::new(&bounded_prefix_source(&patterns, bounds))
+                .unicode(false)
+                .build()
+                .unwrap();
+            let plan = PackedBoundedPrefixLiteralCountPlan::build(
+                &patterns,
+                bounds,
+                BuildLimits::unlimited(),
+            )
+            .unwrap();
+            for _ in 0..2_000 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let len = usize::try_from((state >> 32) % 192).unwrap();
+                let mut haystack = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    const ALPHABET: &[u8] = b"\n abcdefiklmnorstuwyTFHS";
+                    let index =
+                        usize::try_from(state % u64::try_from(ALPHABET.len()).unwrap()).unwrap();
+                    haystack.push(ALPHABET[index]);
+                }
+                let expected = u64::try_from(regex.find_iter(&haystack).count()).unwrap();
+                let actual = plan
+                    .count(&haystack, ReduceLimits::unlimited())
+                    .unwrap()
+                    .count;
+                assert_eq!(actual, expected, "bounds={bounds:?}, haystack={haystack:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_prefix_bounds_and_build_work_are_receipt_closed() {
+        let patterns = [b"Tom".as_slice(), b"Finn".as_slice()];
+        let bounds = BoundedPrefixBounds {
+            minimum: 2,
+            maximum: 4,
+        };
+        let attempt = PackedBoundedPrefixLiteralCountPlan::build_attempt(
+            &patterns,
+            bounds,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(attempt.closes());
+        assert_eq!(attempt.receipt().identity().bounded_prefix, Some(bounds));
+        let exact_work =
+            usize::try_from(attempt.plan().build_accounting().build_work_upper_bound).unwrap();
+        assert!(
+            PackedBoundedPrefixLiteralCountPlan::build_attempt(
+                &patterns,
+                bounds,
+                BuildLimits {
+                    max_build_work: exact_work,
+                    ..BuildLimits::unlimited()
+                }
+            )
+            .unwrap()
+            .closes()
+        );
+        let one_below = PackedBoundedPrefixLiteralCountPlan::build_attempt(
+            &patterns,
+            bounds,
+            BuildLimits {
+                max_build_work: exact_work - 1,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(one_below.closes());
+        assert!(matches!(one_below.source(), BuildError::WorkLimit { .. }));
+
+        let invalid = PackedBoundedPrefixLiteralCountPlan::build_attempt(
+            &patterns,
+            BoundedPrefixBounds {
+                minimum: 4,
+                maximum: 2,
+            },
+            BuildLimits::unlimited(),
+        )
+        .unwrap_err();
+        assert!(invalid.closes());
+        assert_eq!(invalid.receipt().actual().work, 1);
+        let zero_work = PackedBoundedPrefixLiteralCountPlan::build_attempt(
+            &patterns,
+            bounds,
+            BuildLimits {
+                max_build_work: 0,
+                ..BuildLimits::unlimited()
+            },
+        )
+        .unwrap_err();
+        assert!(zero_work.closes());
+        assert!(matches!(
+            zero_work.source(),
+            BuildError::WorkLimit {
+                needed: 1,
+                limit: 0
+            }
+        ));
+        assert_eq!(zero_work.receipt().actual().work, 0);
     }
 
     #[test]

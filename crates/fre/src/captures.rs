@@ -1846,6 +1846,9 @@ fn build_prefix_class_participation(
             ),
         })?;
     match inspection {
+        PrefixClassInspection::PackedBoundedPrefixLiterals { .. } => unreachable!(
+            "capture prefix/class inspection does not request bounded-prefix alternatives"
+        ),
         PrefixClassInspection::Ineligible { work } => {
             charge_hir(accounting, work, limits.max_hir_work)?;
             Ok(CapturePrefixClassParticipationBuild {

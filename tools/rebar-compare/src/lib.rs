@@ -12175,6 +12175,18 @@ fn finite_plan_identity_matches(
     unicode: bool,
     operation: LiteralAggregateOperation,
 ) -> bool {
+    if !unicode
+        && operation == LiteralAggregateOperation::Count
+        && identity.semantics == AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix
+    {
+        return identity.algorithm == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+            && identity.operation == fre::PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID
+            && identity.packed_operation_identity.is_some_and(|native| {
+                native.algorithm_id == fre::PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+                    && native.plan_id == fre::PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID
+                    && native.bounded_prefix.is_some()
+            });
+    }
     let (dense_finite_operation, packed_finite_operation, sparse_finite_operation) = match operation
     {
         LiteralAggregateOperation::Count => (
@@ -21337,6 +21349,36 @@ mod tests {
             20,
             "aggregate-prefix-class-alternation",
         );
+    }
+
+    #[test]
+    fn current_fre_tom_sawyer_bounded_prefixes_use_packed_count_route() {
+        let limits = RunLimits::default();
+        for (pattern, haystack, expected) in [
+            (
+                r".{0,2}(Tom|Sawyer|Huckleberry|Finn)",
+                b"xxTom yySawyer Finn".as_slice(),
+                3,
+            ),
+            (
+                r".{2,4}(Tom|Sawyer|Huckleberry|Finn)",
+                b"xxxxTom yySawyer Finn".as_slice(),
+                2,
+            ),
+        ] {
+            assert_current_fre_execution(
+                current_fre(
+                    "count",
+                    &[pattern.to_string()],
+                    haystack,
+                    false,
+                    false,
+                    &limits,
+                ),
+                expected,
+                "aggregate-finite-literal-packed-v2",
+            );
+        }
     }
 
     #[test]

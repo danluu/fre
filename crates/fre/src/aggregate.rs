@@ -88,9 +88,11 @@ use fre_kernels::{
     OrderedLiteralAggregateOperation, OrderedLiteralAggregateReduceError,
     OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
     OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
-    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS,
-    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID, PackedBoundedPrefixLiteralBounds,
+    PackedBoundedPrefixLiteralCountPlan,
     PackedOrderedLiteralAggregateActualCounters, PackedOrderedLiteralAggregateBuildAccounting,
     PackedOrderedLiteralAggregateBuildAttemptActual, PackedOrderedLiteralAggregateBuildError,
     PackedOrderedLiteralAggregateBuildLimits, PackedOrderedLiteralAggregateOperationIdentity,
@@ -441,6 +443,9 @@ pub enum AggregateFiniteLiteralSemantics {
     /// exactly enumerated language of nonempty valid UTF-8 words. Every word
     /// starts with ASCII or a UTF-8 leading byte and ends on a scalar boundary.
     UnicodeOnNonemptyUtf8Words,
+    /// Rust bytes with Unicode disabled: one greedy bounded dot-byte prefix,
+    /// excluding LF, followed by a source-ordered nonempty literal set.
+    UnicodeOffGreedyBoundedDotPrefix,
 }
 
 /// Semantic proof attached to an exact-literal facade identity.
@@ -2431,6 +2436,17 @@ fn construction_stage_for_report(report: &AggregateBuildReport) -> AggregateCons
             AggregateConstructionStage::SparseFiniteRoot
         }
         AggregatePlanKind::FiniteLiteralDfa => AggregateConstructionStage::DenseFinite,
+        AggregatePlanKind::PackedFiniteLiteral
+            if matches!(
+                report.plan_identity,
+                AggregatePlanIdentity::FiniteLiteral(AggregateFiniteLiteralIdentity {
+                    semantics: AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix,
+                    ..
+                })
+            ) =>
+        {
+            AggregateConstructionStage::PrefixClassAlternation
+        }
         AggregatePlanKind::PackedFiniteLiteral => AggregateConstructionStage::PackedFinite,
         AggregatePlanKind::GuardedAsciiWordDictionary
         | AggregatePlanKind::GuardedUnicodeWordLiteralSet => {
@@ -2457,6 +2473,15 @@ fn construction_stage_closes_plan(
             AggregatePlanKind::PackedFiniteLiteral,
             AggregatePlanIdentity::FiniteLiteral(identity),
         ) => return packed_finite_identity_closes_native(&identity),
+        (
+            AggregateConstructionStage::PrefixClassAlternation,
+            AggregatePlanKind::PackedFiniteLiteral,
+            AggregatePlanIdentity::FiniteLiteral(identity),
+        ) if identity.semantics
+            == AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix =>
+        {
+            return packed_finite_identity_closes_native(&identity);
+        }
         (
             AggregateConstructionStage::DenseFinite,
             AggregatePlanKind::FiniteLiteralDfa,
@@ -3859,22 +3884,32 @@ fn direct_operation_id_closes(
 }
 
 fn packed_finite_identity_closes_native(identity: &AggregateFiniteLiteralIdentity) -> bool {
-    let (expected_operation, expected_plan_id) = match identity.operation {
+    let (expected_operation, expected_plan_id, bounded_prefix) = match identity.operation {
         PACKED_ORDERED_LITERAL_COUNT_PLAN_ID => (
             OrderedLiteralAggregateOperation::Count,
             PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+            false,
         ),
         PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID => (
             OrderedLiteralAggregateOperation::SpanSum,
             PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+            false,
+        ),
+        PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID => (
+            OrderedLiteralAggregateOperation::Count,
+            PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+            true,
         ),
         _ => return false,
     };
     identity.algorithm == PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
+        && (identity.semantics == AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix)
+            == bounded_prefix
         && identity.packed_operation_identity.is_some_and(|native| {
             native.algorithm_id == PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID
                 && native.plan_id == expected_plan_id
                 && native.operation == expected_operation
+                && native.bounded_prefix.is_some() == bounded_prefix
         })
 }
 
@@ -4080,12 +4115,21 @@ fn direct_plan_operation_closes(cache: &AggregateCacheIdentity) -> bool {
         AggregatePlanIdentity::FiniteLiteral(identity) => match identity.algorithm {
             PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
                 packed_finite_identity_closes_native(&identity)
-                    && direct_operation_id_closes(
-                        cache.operation,
-                        identity.operation,
-                        PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-                        Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-                    )
+                    && if identity.operation == PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID {
+                        direct_operation_id_closes(
+                            cache.operation,
+                            identity.operation,
+                            PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+                            None,
+                        )
+                    } else {
+                        direct_operation_id_closes(
+                            cache.operation,
+                            identity.operation,
+                            PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+                            Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                        )
+                    }
             }
             ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID => {
                 identity.packed_operation_identity.is_none()
@@ -4362,12 +4406,21 @@ fn direct_details_close_cache(
         ) => {
             packed_finite_identity_closes_native(identity)
                 && identity.packed_operation_identity == Some(*operation_identity)
-                && direct_operation_id_closes(
-                    cache.operation,
-                    identity.operation,
-                    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-                    Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
-                )
+                && if identity.operation == PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID {
+                    direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+                        None,
+                    )
+                } else {
+                    direct_operation_id_closes(
+                        cache.operation,
+                        identity.operation,
+                        PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
+                        Some(PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID),
+                    )
+                }
         }
         (
             AggregatePlanIdentity::FiniteLiteral(identity),
@@ -9978,10 +10031,20 @@ impl AggregateBuilder {
                 .is_some_and(|work| work <= limits.max_prefix_class_alternation_planner_work)
         {
             Some(
-                inspect_prefix_class_alternation(
-                    &rust.hir,
-                    limits.max_prefix_class_alternation_planner_work,
-                )
+                if matches!(
+                    operation,
+                    AggregateOperation::Compile | AggregateOperation::Count
+                ) {
+                    inspect_prefix_class_or_bounded_prefix(
+                        &rust.hir,
+                        limits.max_prefix_class_alternation_planner_work,
+                    )
+                } else {
+                    inspect_prefix_class_alternation(
+                        &rust.hir,
+                        limits.max_prefix_class_alternation_planner_work,
+                    )
+                }
                 .map_err(|error| {
                     construction.pending_terminal_effect =
                         construction_work_effect(error.consumed_work());
@@ -10008,6 +10071,140 @@ impl AggregateBuilder {
             None
         };
         let prefix_class_alternation_planner_work = match prefix_class_inspection {
+            Some(PrefixClassInspection::PackedBoundedPrefixLiterals {
+                literals,
+                bounds,
+                work,
+                hir_nodes,
+                captures,
+            }) => {
+                select_construction_stage(
+                    construction,
+                    AggregateConstructionStage::PrefixClassAlternation,
+                    construction_work_effect(work),
+                );
+                if hir_nodes != expected_nodes || captures != expected_captures {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "syntax summary differs from bounded-prefix literal inspection",
+                    });
+                }
+                if !matches!(
+                    operation,
+                    AggregateOperation::Compile | AggregateOperation::Count
+                ) {
+                    return Err(AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "bounded-prefix literal count plan escaped operation eligibility",
+                    });
+                }
+                let attempt = PackedBoundedPrefixLiteralCountPlan::build_attempt_with_dispatch(
+                    simd_dispatch,
+                    &literals,
+                    bounds,
+                    packed_finite_build_limits(limits.finite_literal),
+                )
+                .map_err(|error| {
+                    construction.pending_terminal_effect = include_construction_work(
+                        packed_finite_build_effect(error.receipt().actual()),
+                        work,
+                    )
+                    .unwrap_or_else(|| {
+                        unreachable!("bounded-prefix literal refusal effect exceeded its envelope")
+                    });
+                    AggregateBuildError::PackedFiniteLiteralBuild {
+                        operation,
+                        selection,
+                        source: error.into_source(),
+                    }
+                })?;
+                debug_assert!(attempt.closes());
+                let (engine, receipt) = attempt.into_parts();
+                let build_actual = receipt.actual();
+                let unpublished =
+                    include_construction_work(packed_finite_build_effect(build_actual), work)
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded-prefix literal build effect overflow",
+                        })?;
+                let published = include_selected_plan_owner_effect(unpublished).ok_or(
+                    AggregateBuildError::InternalInvariant {
+                        operation,
+                        selection,
+                        detail: "bounded-prefix literal publication effect overflow",
+                    },
+                )?;
+                construction.pending_terminal_effect = unpublished;
+                construction.selected_success_effect = Some(published);
+                let build = engine.build_accounting();
+                let packed_operation_identity = engine.cache_identity().operation_identity();
+                let capture_erasure_work =
+                    captures
+                        .checked_mul(2)
+                        .ok_or(AggregateBuildError::InternalInvariant {
+                            operation,
+                            selection,
+                            detail: "bounded-prefix literal capture-erasure accounting overflow",
+                        })?;
+                let report = AggregateBuildReport {
+                    schema_version: AGGREGATE_EXPLAIN_SCHEMA_VERSION,
+                    construction_attempt: AggregateClosureEvidence::empty(),
+                    published_artifact_owner: AggregateClosureEvidence::empty(),
+                    syntax_attempt: AggregateClosureEvidence::empty(),
+                    syntax_key,
+                    admission,
+                    syntax,
+                    operation,
+                    selection,
+                    requested_strategy: strategy,
+                    build_limits: limits,
+                    plan: AggregatePlanKind::PackedFiniteLiteral,
+                    continuation_strategy: None,
+                    capture_semantics: AggregateCaptureSemantics::ErasedForWholeMatchOnly,
+                    planner_work,
+                    unicode_scalar_planner_work,
+                    word_run_planner_work,
+                    literal_assertions_planner_work,
+                    blocking_delimiter_planner_work,
+                    token_phrase_planner_work,
+                    fixed_class_sandwich_planner_work,
+                    bounded_affix_planner_work: 0,
+                    grapheme_scalar_dfa_planner_work,
+                    bounded_class_sequence_planner_work,
+                    bounded_separated_fields_planner_work,
+                    prefix_class_alternation_planner_work: work,
+                    literal_class_run_literal_planner_work: 0,
+                    bounded_literal_pair_planner_work: 0,
+                    bounded_context_planner_work: 0,
+                    fixed_absolute_planner_work: 0,
+                    finite_planner_work: 0,
+                    capture_erasure_work,
+                    captures_erased: captures,
+                    build: AggregateBuildAccounting::PackedFiniteLiteral(build),
+                    plan_identity: AggregatePlanIdentity::FiniteLiteral(
+                        AggregateFiniteLiteralIdentity {
+                            semantics:
+                                AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix,
+                            algorithm: PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+                            operation: PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
+                            packed_operation_identity: Some(packed_operation_identity),
+                        },
+                    ),
+                    sealed_bounded_separated_fields_identity: None,
+                    sealed_required_internal_anchor_identity: None,
+                    sealed_url_aggregate_identity: None,
+                    retained_capacity_bytes: build.persistent_bytes,
+                };
+                return Ok(AggregatePlan {
+                    engine: AggregateEngine::PackedBoundedPrefixCount(engine),
+                    minimum_match_bytes,
+                    limits,
+                    report,
+                });
+            }
             Some(PrefixClassInspection::Eligible {
                 prefixes,
                 classes,
@@ -13933,6 +14130,7 @@ enum AggregateEngine {
     FixedAbsoluteDomain(AggregateFixedAbsoluteDomainEngine),
     PackedFiniteCount(PackedOrderedLiteralCountPlan),
     PackedFiniteSpanSum(PackedOrderedLiteralSpanSumPlan),
+    PackedBoundedPrefixCount(PackedBoundedPrefixLiteralCountPlan),
     FiniteCount(OrderedLiteralCountPlan),
     FiniteSpanSum(OrderedLiteralSpanSumPlan),
     SparseFiniteCount(SparseOrderedLiteralCountPlan),
@@ -14068,7 +14266,9 @@ impl AggregatePlan {
                 Some(AggregateDirectRoute::BoundedLiteralPair)
             }
             AggregateEngine::BoundedContext(_) => Some(AggregateDirectRoute::BoundedContext),
-            AggregateEngine::PackedFiniteCount(_) | AggregateEngine::PackedFiniteSpanSum(_) => {
+            AggregateEngine::PackedFiniteCount(_)
+            | AggregateEngine::PackedFiniteSpanSum(_)
+            | AggregateEngine::PackedBoundedPrefixCount(_) => {
                 Some(AggregateDirectRoute::PackedFiniteLiteral)
             }
             AggregateEngine::FiniteCount(_) | AggregateEngine::FiniteSpanSum(_) => {
@@ -15356,6 +15556,21 @@ impl AggregatePlan {
                         AggregateExecutionSource::PackedFiniteLiteral(source),
                     )
                 }),
+            AggregateEngine::PackedBoundedPrefixCount(engine) => engine
+                .count(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| AggregateCountExecution::PackedFiniteLiteral {
+                    value: result.count,
+                    operation_identity: result.accounting.identity.operation_identity(),
+                    upper_bounds: result.accounting.upper_bounds,
+                    actual: result.accounting.actual,
+                })
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
             AggregateEngine::PackedFiniteSpanSum(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
@@ -15687,7 +15902,8 @@ impl AggregatePlan {
                         AggregateExecutionSource::PackedFiniteLiteral(source),
                     )
                 }),
-            AggregateEngine::PackedFiniteCount(_) => Err(self.execution_error(
+            AggregateEngine::PackedFiniteCount(_)
+            | AggregateEngine::PackedBoundedPrefixCount(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a packed finite count plan",
@@ -16234,6 +16450,16 @@ impl AggregatePlan {
                         AggregateExecutionSource::PackedFiniteLiteral(source),
                     )
                 }),
+            AggregateEngine::PackedBoundedPrefixCount(engine) => engine
+                .count(haystack, packed_finite_reduce_limits(limits.finite_literal))
+                .map(|result| result.count)
+                .map_err(|source| {
+                    self.direct_execution_error(
+                        haystack.len(),
+                        limits,
+                        AggregateExecutionSource::PackedFiniteLiteral(source),
+                    )
+                }),
             AggregateEngine::PackedFiniteSpanSum(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
@@ -16580,7 +16806,8 @@ impl AggregatePlan {
                         AggregateExecutionSource::PackedFiniteLiteral(source),
                     )
                 }),
-            AggregateEngine::PackedFiniteCount(_) => Err(self.execution_error(
+            AggregateEngine::PackedFiniteCount(_)
+            | AggregateEngine::PackedBoundedPrefixCount(_) => Err(self.execution_error(
                 limits,
                 AggregateExecutionSource::InternalInvariant(
                     "span-sum operation retained a packed finite count plan",
@@ -18462,6 +18689,13 @@ fn charge_fixed_class_inspection_work(
 }
 
 pub(crate) enum PrefixClassInspection<'a> {
+    PackedBoundedPrefixLiterals {
+        literals: [&'a [u8]; 4],
+        bounds: PackedBoundedPrefixLiteralBounds,
+        work: usize,
+        hir_nodes: usize,
+        captures: usize,
+    },
     Eligible {
         prefixes: [&'a [u8]; 2],
         classes: [&'a ClassBytes; 2],
@@ -18513,7 +18747,31 @@ pub(crate) fn inspect_prefix_class_alternation(
     hir: &Hir,
     limit: usize,
 ) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
-    let mut work = 0_usize;
+    inspect_prefix_class_alternation_after_work(hir, limit, 0)
+}
+
+fn inspect_prefix_class_or_bounded_prefix(
+    hir: &Hir,
+    limit: usize,
+) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
+    let prior_work = match inspect_packed_bounded_prefix_literals(hir, limit)? {
+        eligible @ PrefixClassInspection::PackedBoundedPrefixLiterals { .. } => {
+            return Ok(eligible);
+        }
+        PrefixClassInspection::Ineligible { work } => work,
+        PrefixClassInspection::Eligible { .. } => {
+            unreachable!("bounded-prefix inspector returned the established prefix/class shape")
+        }
+    };
+    inspect_prefix_class_alternation_after_work(hir, limit, prior_work)
+}
+
+fn inspect_prefix_class_alternation_after_work(
+    hir: &Hir,
+    limit: usize,
+    prior_work: usize,
+) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
+    let mut work = prior_work;
     let mut hir_nodes = 0_usize;
     let mut captures = 0_usize;
     let root = peel_prefix_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
@@ -18552,6 +18810,143 @@ pub(crate) fn inspect_prefix_class_alternation(
         captures,
         uniform_participating_capture_indices,
     })
+}
+
+fn inspect_packed_bounded_prefix_literals(
+    hir: &Hir,
+    limit: usize,
+) -> Result<PrefixClassInspection<'_>, PrefixClassInspectionError> {
+    let mut work = 0_usize;
+    let mut hir_nodes = 0_usize;
+    let mut captures = 0_usize;
+    let root = peel_prefix_class_captures(hir, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Concat(parts) = root.hir.kind() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let [prefix, alternatives] = parts.as_slice() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let prefix =
+        peel_prefix_class_captures(prefix, &mut work, &mut hir_nodes, &mut captures, limit)?;
+    let HirKind::Repetition(repetition) = prefix.hir.kind() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(maximum) = repetition.max else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let bounds = match (repetition.min, maximum, repetition.greedy) {
+        (0, 2, true) => PackedBoundedPrefixLiteralBounds {
+            minimum: 0,
+            maximum: 2,
+        },
+        (2, 4, true) => PackedBoundedPrefixLiteralBounds {
+            minimum: 2,
+            maximum: 4,
+        },
+        _ => return Ok(PrefixClassInspection::Ineligible { work }),
+    };
+    let repeated = peel_prefix_class_captures(
+        repetition.sub.as_ref(),
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let HirKind::Class(Class::Bytes(class)) = repeated.hir.kind() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    charge_prefix_class_work(&mut work, class.ranges().len(), limit)?;
+    let [before_lf, after_lf] = class.ranges() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    if before_lf.start() != u8::MIN
+        || before_lf.end() != b'\n' - 1
+        || after_lf.start() != b'\n' + 1
+        || after_lf.end() != u8::MAX
+    {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    }
+    let alternatives = peel_prefix_class_captures(
+        alternatives,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?;
+    let HirKind::Alternation(branches) = alternatives.hir.kind() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    charge_prefix_class_work(&mut work, branches.len(), limit)?;
+    let [first, second, third, fourth] = branches.as_slice() else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(first) = inspect_packed_bounded_prefix_literal(
+        first,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(second) = inspect_packed_bounded_prefix_literal(
+        second,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(third) = inspect_packed_bounded_prefix_literal(
+        third,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    let Some(fourth) = inspect_packed_bounded_prefix_literal(
+        fourth,
+        &mut work,
+        &mut hir_nodes,
+        &mut captures,
+        limit,
+    )?
+    else {
+        return Ok(PrefixClassInspection::Ineligible { work });
+    };
+    Ok(PrefixClassInspection::PackedBoundedPrefixLiterals {
+        literals: [first, second, third, fourth],
+        bounds,
+        work,
+        hir_nodes,
+        captures,
+    })
+}
+
+fn inspect_packed_bounded_prefix_literal<'a>(
+    hir: &'a Hir,
+    work: &mut usize,
+    hir_nodes: &mut usize,
+    captures: &mut usize,
+    limit: usize,
+) -> Result<Option<&'a [u8]>, PrefixClassInspectionError> {
+    let peeled = peel_prefix_class_captures(hir, work, hir_nodes, captures, limit)?;
+    let HirKind::Literal(literal) = peeled.hir.kind() else {
+        return Ok(None);
+    };
+    let bytes = literal.0.as_ref();
+    let literal_work = bytes
+        .len()
+        .checked_mul(2)
+        .ok_or(PrefixClassInspectionError::Overflow { consumed: *work })?;
+    charge_prefix_class_work(work, literal_work, limit)?;
+    Ok((bytes.len() >= 2).then_some(bytes))
 }
 
 fn inspect_prefix_class_branch<'a>(
@@ -20551,6 +20946,84 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn tom_sawyer_bounded_prefixes_publish_packed_count_route_and_match_regex() {
+        let cases = [
+            (
+                ".{0,2}(Tom|Sawyer|Huckleberry|Finn)",
+                fre_kernels::PackedBoundedPrefixLiteralBounds {
+                    minimum: 0,
+                    maximum: 2,
+                },
+            ),
+            (
+                ".{2,4}(Tom|Sawyer|Huckleberry|Finn)",
+                fre_kernels::PackedBoundedPrefixLiteralBounds {
+                    minimum: 2,
+                    maximum: 4,
+                },
+            ),
+        ];
+        let haystacks: &[&[u8]] = &[
+            b"",
+            b"Tom",
+            b"xxTom",
+            b"xxxxTom",
+            b"x\nxTom",
+            b"xxTomSawyer",
+            b"xxTomxxSawyerxxFinn",
+            b"TomTomTom",
+            b"xxxSawyerxFinnxxxxHuckleberry",
+        ];
+        for (pattern, bounds) in cases {
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let count = AggregateBuilder::new(pattern)
+                .unicode(false)
+                .build_count()
+                .unwrap();
+            let report = count.build_report();
+            assert!(report.has_closed_construction_attempt());
+            assert_eq!(report.plan, super::AggregatePlanKind::PackedFiniteLiteral);
+            assert!(matches!(
+                count.0.engine,
+                super::AggregateEngine::PackedBoundedPrefixCount(_)
+            ));
+            let AggregatePlanIdentity::FiniteLiteral(identity) = report.plan_identity else {
+                panic!("expected packed bounded-prefix identity");
+            };
+            assert_eq!(
+                identity.semantics,
+                super::AggregateFiniteLiteralSemantics::UnicodeOffGreedyBoundedDotPrefix
+            );
+            assert_eq!(
+                identity.operation,
+                super::PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID
+            );
+            assert_eq!(
+                identity
+                    .packed_operation_identity
+                    .expect("bounded-prefix plan retains native identity")
+                    .bounded_prefix,
+                Some(bounds)
+            );
+            for haystack in haystacks {
+                let expected = u64::try_from(upstream.find_iter(haystack).count()).unwrap();
+                let result = count
+                    .count(haystack, AggregateRunLimits::default())
+                    .unwrap();
+                assert_eq!(
+                    result.value(),
+                    expected,
+                    "pattern={pattern:?}, haystack={haystack:?}"
+                );
+                assert!(result.report().has_closed_direct_attempt());
+            }
+        }
     }
 
     #[test]
