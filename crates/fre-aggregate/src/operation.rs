@@ -279,7 +279,7 @@ const fn operation_attempt_kind(kind: OperationKind) -> OperationAttemptKind {
 }
 
 /// Version of the continuation execution algorithm bound into every attempt.
-pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 3;
+pub const CONTINUATION_OPERATION_ALGORITHM_VERSION: u8 = 4;
 
 /// Version of the continuation prospective/actual accounting schema.
 pub const CONTINUATION_OPERATION_ACCOUNTING_VERSION: u8 = 6;
@@ -2555,6 +2555,7 @@ impl CompiledRegex {
             input_bytes,
             limits,
         )?;
+        let receipt_bearing = attempt.is_some();
         if let Some(publication) = attempt.as_mut() {
             publication.identity.physical_route = Some(OperationPhysicalRoute::RootAssertion);
             publication.identity.prepublication_fallback = OperationPrepublicationFallback::None;
@@ -2562,6 +2563,30 @@ impl CompiledRegex {
             if let Some(observer) = prospective_observer.as_mut() {
                 observer(prospective)?;
             }
+        }
+        let utf8_validation = if assertion.is_unicode_word() {
+            haystack.len()
+        } else {
+            0
+        };
+        if !receipt_bearing {
+            // Preserve the ordinary continuation's established malformed
+            // UTF-8 precedence: preflight only validation work/source bytes,
+            // read and validate the complete haystack, and then enforce the
+            // remaining operation envelope.
+            let preflight =
+                preflight_unicode_word_utf8_bytes(&self.program, haystack.len(), limits)?;
+            if preflight != utf8_validation {
+                return Err(Error::InternalInvariant(
+                    "root-assertion UTF-8 preflight diverged from retained assertion",
+                ));
+            }
+            enforce(
+                utf8_validation,
+                prospective.work_bound,
+                Resource::ExecutionWork,
+            )?;
+            validate_unicode_word_utf8(haystack, utf8_validation, attempt_accounting)?;
         }
         enforce(
             prospective.allocations,
@@ -2573,17 +2598,14 @@ impl CompiledRegex {
         // Route and complete input-only envelope are fixed. No source-aware
         // fallback is permitted beyond this point.
         *actual_allocations = 0;
-        let utf8_validation = if assertion.is_unicode_word() {
-            haystack.len()
-        } else {
-            0
-        };
-        enforce(
-            utf8_validation,
-            prospective.work_bound,
-            Resource::ExecutionWork,
-        )?;
-        validate_unicode_word_utf8(haystack, utf8_validation, attempt_accounting)?;
+        if receipt_bearing {
+            enforce(
+                utf8_validation,
+                prospective.work_bound,
+                Resource::ExecutionWork,
+            )?;
+            validate_unicode_word_utf8(haystack, utf8_validation, attempt_accounting)?;
+        }
 
         let assertions = AssertionContext::new(haystack, range.start, input_bytes)?;
         let mut matches = 0_usize;
@@ -16394,6 +16416,16 @@ mod tests {
             count.receipt.identity.physical_route,
             Some(OperationPhysicalRoute::RootAssertion)
         );
+        assert_eq!(count.receipt.identity.algorithm_version, 4);
+        assert_eq!(
+            count.receipt.identity.accounting_version,
+            CONTINUATION_OPERATION_ACCOUNTING_VERSION
+        );
+        let mut legacy_algorithm = count.receipt.clone();
+        legacy_algorithm.identity.algorithm_version = 3;
+        assert_ne!(legacy_algorithm.identity, count.receipt.identity);
+        assert!(!legacy_algorithm.authenticates_canonical());
+        assert!(!legacy_algorithm.authenticates_success());
         let prospective = count.receipt.prospective.unwrap();
         assert!(prospective.contains(count.receipt.actual));
         assert_eq!(count.receipt.actual_allocations, 0);
@@ -16563,6 +16595,63 @@ mod tests {
             ),
             Err(Error::InvalidUtf8ForUnicodeWordBoundary)
         ));
+        let invalid_outside_range = b"\xFFa";
+        assert!(matches!(
+            compiled.count_value(
+                invalid_outside_range,
+                1..2,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_boundaries: 0,
+                    ..OperationLimits::default()
+                },
+            ),
+            Err(Error::InvalidUtf8ForUnicodeWordBoundary)
+        ));
+        assert!(matches!(
+            compiled.count_value(
+                invalid_outside_range,
+                1..2,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_boundaries: 0,
+                    max_sequential_bytes: invalid_outside_range.len() - 1,
+                    ..OperationLimits::default()
+                },
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::SequentialBytes,
+                ..
+            })
+        ));
+        let receipt_refusal = compiled
+            .count_value_attempt(
+                invalid_outside_range,
+                1..2,
+                Strategy::ReverseSequentialRows,
+                OperationLimits {
+                    max_boundaries: 0,
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            receipt_refusal.source,
+            Error::ResourceLimit {
+                resource: Resource::Boundaries,
+                ..
+            }
+        ));
+        assert_eq!(
+            receipt_refusal.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::RootAssertion)
+        );
+        assert!(receipt_refusal.receipt.prospective.is_some());
+        assert_eq!(
+            receipt_refusal.receipt.actual,
+            ExecutionAccounting::default()
+        );
+        assert!(receipt_refusal.closes());
         let nearby = root_assertion_fixture(r"a\b", true);
         assert!(nearby.program.root_assertion().is_none());
         let captured = root_assertion_fixture(r"(\b)", true);

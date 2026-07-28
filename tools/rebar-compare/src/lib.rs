@@ -240,7 +240,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v8-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 const LITERAL_CLASS_RUN_LITERAL_ASCII_WORD_CLASS_WORDS: [u64; 4] =
     [0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe, 0, 0];
 const NFA_SIZE_LIMIT: usize = 100 * 1_048_576;
@@ -22855,8 +22855,10 @@ mod tests {
         let identity = CurrentFreAdapter.identity();
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v7-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v52-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v1-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-continuation-accounting-v8-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
+        assert!(identity.adapter.contains("-continuation-accounting-v8-"));
+        assert!(!identity.adapter.contains("-continuation-accounting-v7-"));
         assert!(identity.identity.contains("capture-word-run-v1"));
         assert!(
             identity
@@ -25190,14 +25192,19 @@ mod tests {
 
         let run_limits =
             aggregate_run_limits(haystack.len(), regex.build_report(), &baseline).unwrap();
-        let sequential = run_limits.continuation.max_sequential_bytes;
+        let dense_safe_sequential = run_limits.continuation.max_sequential_bytes;
         let audited = regex.count(haystack, run_limits).unwrap();
-        let fre::AggregateExecutionDetails::Continuation { accounting, .. } =
-            audited.report().details()
+        let fre::AggregateExecutionDetails::Continuation {
+            certificate,
+            accounting,
+        } = audited.report().details()
         else {
             panic!("expected continuation execution details");
         };
         assert_eq!(accounting.utf8_validation_work, haystack.len());
+        let sequential = certificate.sequential_bytes_bound;
+        assert_eq!(sequential, haystack.len());
+        assert!(sequential <= dense_safe_sequential);
 
         let exact = RunLimits {
             fre_aggregate_operation_work: accounting.work,
@@ -25535,7 +25542,8 @@ mod tests {
         // instruction owns two `usize` certificate entries. Fixed storage is
         // rederived below from the
         // terminal-frontier seed, minimum-width proof, start-domain proof,
-        // required-literal proof, and both complete inline theorem slots.
+        // root-assertion proof, required-literal proof, and both complete
+        // inline theorem slots.
         const ALTERNATIVES: usize = 10;
         const SCALAR_RANGES_PER_CLASS: usize = 677;
         const SCALAR_STATES: usize = (5 + 14) * ALTERNATIVES / 2;
@@ -25546,6 +25554,7 @@ mod tests {
         const TERMINAL_FRONTIER_SEED_BYTES: usize = 56;
         const MINIMUM_MATCH_PROOF_BYTES: usize = core::mem::size_of::<Option<usize>>();
         const START_DOMAIN_PROOF_BYTES: usize = 1;
+        const ROOT_ASSERTION_PROOF_BYTES: usize = 1;
         const COMPLETE_REQUIRED_LITERAL_PROOF_BYTES: usize = 80;
         const COMPLETE_STATE_BYTE_SLOT_BYTES: usize = 208;
         const COMPLETE_ORDERED_BOUNDED_SPAN_SUM_SLOT_BYTES: usize = 144;
@@ -25554,8 +25563,10 @@ mod tests {
             + CERTIFICATE_ENTRIES_PER_STATE * core::mem::size_of::<usize>();
         const SCALAR_STORAGE_BYTES: usize =
             SCALAR_STATES * SCALAR_RANGES_PER_CLASS * SCALAR_RANGE_BYTES;
-        const FIXED_PROOF_BYTES: usize =
-            TERMINAL_FRONTIER_SEED_BYTES + MINIMUM_MATCH_PROOF_BYTES + START_DOMAIN_PROOF_BYTES;
+        const FIXED_PROOF_BYTES: usize = TERMINAL_FRONTIER_SEED_BYTES
+            + MINIMUM_MATCH_PROOF_BYTES
+            + START_DOMAIN_PROOF_BYTES
+            + ROOT_ASSERTION_PROOF_BYTES;
 
         let run = RunLimits {
             pattern_bytes_per_job: 31,
@@ -25666,7 +25677,7 @@ mod tests {
         assert_eq!(SCALAR_RANGE_BYTES, 8);
         assert_eq!(ONE_STATE_ENVELOPE_BYTES, 72);
         assert_eq!(SCALAR_STORAGE_BYTES, 514_520);
-        assert_eq!(FIXED_PROOF_BYTES, 73);
+        assert_eq!(FIXED_PROOF_BYTES, 74);
 
         let default_fallback =
             capture_regex_one(overlapping, true, false, &RunLimits::default()).unwrap();
@@ -25703,6 +25714,10 @@ mod tests {
             usize::from(default_report.selector.start_domain_proof_bytes),
             START_DOMAIN_PROOF_BYTES
         );
+        assert_eq!(
+            default_report.selector.root_assertion_proof_bytes(),
+            ROOT_ASSERTION_PROOF_BYTES
+        );
         let required_suffix_storage = default_report.selector.required_suffix_bytes
             + default_report.selector.required_suffixes * core::mem::size_of::<usize>();
         let retained_components = required_suffix_storage
@@ -25723,9 +25738,9 @@ mod tests {
         let incremental_program_bytes = full_program_bytes - ONE_STATE_ENVELOPE_BYTES;
         let incremental_one_below = incremental_program_bytes - 1;
         let full_one_below = full_program_bytes - 1;
-        assert_eq!(retained_components, 505);
-        assert_eq!(incremental_program_bytes, 543_033);
-        assert_eq!(full_program_bytes, 543_105);
+        assert_eq!(retained_components, 506);
+        assert_eq!(incremental_program_bytes, 543_034);
+        assert_eq!(full_program_bytes, 543_106);
         assert_eq!(default_report.selector.program_bytes, full_program_bytes);
 
         let limits_at = |max_program_bytes| RunLimits {
