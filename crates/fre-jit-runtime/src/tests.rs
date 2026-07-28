@@ -1,8 +1,9 @@
 use std::sync::{Mutex, MutexGuard};
 
 use fre_jit_aarch64::{
-    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, decode, emit,
-    emit_exact_aggregate,
+    BackendVersion, DecodedInstruction, EmitLimits, NativeAggregateResult, NativeResult,
+    SearchBackendPolicy, decode, emit, emit_audited_with_backend, emit_exact_aggregate,
+    emit_with_backend,
 };
 #[cfg(all(
     target_arch = "aarch64",
@@ -17,23 +18,315 @@ use fre_jit_aarch64::{
     emit_exact_aggregate_sve2_fixed16_span_sum_experimental,
 };
 use fre_kernel_ir::{
-    AggregateExecutionLimits, AggregateOutput, AnchorFlags, ByteClass, Count, ExecutionLimits,
-    Exists, SearchWindow, SelectedEnd, Span, SpanSum, ValidateLimits, build_class_suffix,
-    build_exact_aggregate, build_exact_literal,
+    AggregateExecutionLimits, AggregateOutput, AnchorFlags, ByteClass, CheckedSearchWindow, Count,
+    ExecutionLimits, Exists, SearchWindow, SelectedEnd, Span, SpanSum, ValidateLimits,
+    build_class_suffix, build_exact_aggregate, build_exact_literal,
 };
+use fre_target_features::{ArmCpuIdentity, TuningClass};
 
 use crate::{
     CallError, FailureStage, PublicationLimits, PublishError, ResourceKind,
     RuntimeAggregateOperation, RuntimeIdentity, RuntimeOperation,
-    operation::{RawAggregateCallResult, decode_aggregate},
+    operation::{
+        RawAggregateCallResult, RawCallResult, decode as decode_operation, decode_aggregate,
+    },
     platform::{self, FailureInjection},
-    publish, publish_aggregate, publish_aggregate_impl, publish_impl,
+    publish, publish_aggregate, publish_aggregate_impl, publish_audited, publish_audited_impl,
+    publish_impl,
 };
 
 static NATIVE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn native_test_lock() -> MutexGuard<'static, ()> {
     NATIVE_TEST_LOCK.lock().expect("native test lock")
+}
+
+#[test]
+fn search_backend_admission_requirement_partition_is_exact() {
+    for backend in [
+        BackendVersion::SEARCH_SVE16_V1,
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE16_V6,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ] {
+        assert!(crate::search_backend_requires_capability_snapshot(backend));
+    }
+    for backend in [
+        BackendVersion::SEARCH_V1,
+        BackendVersion::SEARCH_V8,
+        BackendVersion::AGGREGATE_CURRENT,
+    ] {
+        assert!(!crate::search_backend_requires_capability_snapshot(backend));
+    }
+    for backend in [
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE16_V6,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ] {
+        assert!(crate::search_backend_requires_fixed16_tuning(backend));
+    }
+    for backend in [BackendVersion::SEARCH_V8, BackendVersion::SEARCH_SVE16_V1] {
+        assert!(!crate::search_backend_requires_fixed16_tuning(backend));
+    }
+}
+
+#[test]
+fn sve16_v6_admission_requires_and_binds_exact_vl16() {
+    let backend = BackendVersion::SEARCH_SVE16_V6;
+    let capabilities = |asimd, sve, vector_bytes| {
+        crate::NativeHostCapabilities::new(asimd, sve, false, vector_bytes)
+    };
+    assert_eq!(
+        crate::validate_search_backend_capabilities(backend, capabilities(false, true, Some(16)),),
+        Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(backend, capabilities(true, false, Some(16)),),
+        Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(backend, capabilities(true, true, None),),
+        Err(PublishError::SveVectorLengthMismatch {
+            expected: 16,
+            actual: None,
+        })
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(backend, capabilities(true, true, Some(32)),),
+        Err(PublishError::SveVectorLengthMismatch {
+            expected: 16,
+            actual: Some(32),
+        })
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(backend, capabilities(true, true, Some(16)),),
+        Ok(Some(16))
+    );
+    assert!(crate::search_vector_length_contract_valid(
+        backend,
+        Some(16)
+    ));
+    assert!(!crate::search_vector_length_contract_valid(backend, None));
+    assert!(!crate::search_vector_length_contract_valid(
+        backend,
+        Some(32)
+    ));
+    assert_eq!(
+        crate::validate_search_sve_vector_bytes(BackendVersion::SEARCH_V8, Some(32)),
+        Ok(None)
+    );
+    assert!(crate::search_vector_length_contract_valid(
+        BackendVersion::SEARCH_V8,
+        None
+    ));
+    assert!(!crate::search_vector_length_contract_valid(
+        BackendVersion::SEARCH_V8,
+        Some(16)
+    ));
+}
+
+#[test]
+fn legacy_sve16_admission_requires_sve_before_emission_without_binding_vl() {
+    let backend = BackendVersion::SEARCH_SVE16_V1;
+    let capabilities = |asimd, sve, sve2, vector_bytes| {
+        crate::NativeHostCapabilities::new(asimd, sve, sve2, vector_bytes)
+    };
+    assert_eq!(
+        crate::validate_search_backend_capabilities(
+            backend,
+            capabilities(true, false, false, None),
+        ),
+        Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(
+            backend,
+            capabilities(false, true, false, Some(16)),
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        crate::validate_search_backend_capabilities(
+            backend,
+            capabilities(true, true, true, Some(32)),
+        ),
+        Ok(None)
+    );
+    assert!(crate::search_vector_length_contract_valid(backend, None));
+    assert!(!crate::search_vector_length_contract_valid(
+        backend,
+        Some(16)
+    ));
+}
+
+#[test]
+fn sve2_fixed16_admission_requires_features_and_binds_exact_vl16() {
+    let capabilities = |asimd, sve, sve2, vector_bytes| {
+        crate::NativeHostCapabilities::new(asimd, sve, sve2, vector_bytes)
+    };
+    for backend in [
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ] {
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(false, true, true, Some(16)),
+            ),
+            Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
+        );
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(true, false, true, Some(16)),
+            ),
+            Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+        );
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(true, true, false, Some(16)),
+            ),
+            Err(PublishError::CpuFeatureUnavailable { feature: "sve2" })
+        );
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(true, true, true, None),
+            ),
+            Err(PublishError::SveVectorLengthMismatch {
+                expected: 16,
+                actual: None,
+            })
+        );
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(true, true, true, Some(32)),
+            ),
+            Err(PublishError::SveVectorLengthMismatch {
+                expected: 16,
+                actual: Some(32),
+            })
+        );
+        assert_eq!(
+            crate::validate_search_backend_capabilities(
+                backend,
+                capabilities(true, true, true, Some(16)),
+            ),
+            Ok(Some(16))
+        );
+        assert!(crate::search_vector_length_contract_valid(
+            backend,
+            Some(16)
+        ));
+        assert!(!crate::search_vector_length_contract_valid(backend, None));
+        assert!(!crate::search_vector_length_contract_valid(
+            backend,
+            Some(32)
+        ));
+    }
+}
+
+#[test]
+fn fixed_lane_search_capability_admission_matches_the_complete_truth_table() {
+    let mut cases = 0_usize;
+    for backend in [
+        BackendVersion::SEARCH_SVE16_V1,
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE16_V6,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ] {
+        for asimd in [false, true] {
+            for sve in [false, true] {
+                for sve2 in [false, true] {
+                    for vector_bytes in [None, Some(16), Some(32)] {
+                        let actual = crate::validate_search_backend_capabilities(
+                            backend,
+                            crate::NativeHostCapabilities::new(asimd, sve, sve2, vector_bytes),
+                        );
+                        let expected = if matches!(
+                            backend,
+                            BackendVersion::SEARCH_SVE2_16_V1
+                                | BackendVersion::SEARCH_SVE16_V6
+                                | BackendVersion::SEARCH_SVE2_FIXED16_V2
+                        ) && !asimd
+                        {
+                            Err(PublishError::CpuFeatureUnavailable { feature: "asimd" })
+                        } else if !sve {
+                            Err(PublishError::CpuFeatureUnavailable { feature: "sve" })
+                        } else if matches!(
+                            backend,
+                            BackendVersion::SEARCH_SVE2_16_V1
+                                | BackendVersion::SEARCH_SVE2_FIXED16_V2
+                        ) && !sve2
+                        {
+                            Err(PublishError::CpuFeatureUnavailable { feature: "sve2" })
+                        } else if matches!(
+                            backend,
+                            BackendVersion::SEARCH_SVE2_16_V1
+                                | BackendVersion::SEARCH_SVE16_V6
+                                | BackendVersion::SEARCH_SVE2_FIXED16_V2
+                        ) && vector_bytes != Some(16)
+                        {
+                            Err(PublishError::SveVectorLengthMismatch {
+                                expected: 16,
+                                actual: vector_bytes,
+                            })
+                        } else if backend == BackendVersion::SEARCH_SVE16_V1 {
+                            Ok(None)
+                        } else {
+                            Ok(Some(16))
+                        };
+                        assert_eq!(actual, expected);
+                        cases = cases.checked_add(1).expect("bounded truth table");
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 96);
+}
+
+#[test]
+fn qualified_fixed16_search_admission_is_scoped_to_arm_41_d84() {
+    let tuning = |implementer, part| TuningClass::ArmServer {
+        cpu: Some(ArmCpuIdentity {
+            implementer,
+            part,
+            variant: None,
+            revision: None,
+        }),
+    };
+    for backend in [
+        BackendVersion::SEARCH_SVE2_16_V1,
+        BackendVersion::SEARCH_SVE16_V6,
+        BackendVersion::SEARCH_SVE2_FIXED16_V2,
+    ] {
+        assert_eq!(
+            crate::validate_search_backend_tuning(backend, tuning(0x41, 0x0d84)),
+            Ok(())
+        );
+        for unqualified in [
+            TuningClass::Generic,
+            TuningClass::ArmServer { cpu: None },
+            tuning(0x41, 0x0d4f),
+            tuning(0x42, 0x0d84),
+        ] {
+            assert_eq!(
+                crate::validate_search_backend_tuning(backend, unqualified),
+                Err(PublishError::CpuTuningUnavailable {
+                    required: "arm-41-d84",
+                })
+            );
+        }
+    }
+    for generic in [BackendVersion::SEARCH_V8, BackendVersion::SEARCH_SVE16_V1] {
+        assert_eq!(
+            crate::validate_search_backend_tuning(generic, TuningClass::Generic),
+            Ok(())
+        );
+    }
 }
 
 #[cfg(all(
@@ -43,7 +336,65 @@ fn native_test_lock() -> MutexGuard<'static, ()> {
     target_endian = "little"
 ))]
 #[test]
-#[ignore = "qualification receipt: requires a native Linux host with SVE2"]
+#[ignore = "hardware proof: requires Arm 0x41/0xd84 with ASIMD+SVE+SVE2 and VL16"]
+fn fixed_vl16_checked_calls_require_tags_10_19_and_21() {
+    let _lock = native_test_lock();
+    let literal = b"0123456789abcdef";
+    let haystack = b"zz0123456789abcdefyy";
+    let window = SearchWindow::new(0, haystack.len());
+    let checked = CheckedSearchWindow::new(haystack, window).expect("checked VL16 fixture");
+    let program = build_exact_literal::<SelectedEnd>(
+        literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("VL16 selected-end checked-call program");
+
+    for (policy, backend) in [
+        (
+            SearchBackendPolicy::Sve2Fixed16,
+            BackendVersion::SEARCH_SVE2_16_V1,
+        ),
+        (
+            SearchBackendPolicy::Sve16V6,
+            BackendVersion::SEARCH_SVE16_V6,
+        ),
+        (
+            SearchBackendPolicy::Sve2Fixed16V2,
+            BackendVersion::SEARCH_SVE2_FIXED16_V2,
+        ),
+    ] {
+        crate::native_search_backend_support(backend)
+            .expect("fixture host must satisfy this exact fixed-VL backend");
+        let image = emit_with_backend(&program, policy, EmitLimits::default()).expect("VL16 image");
+        assert_eq!(image.backend_version(), backend);
+        let kernel = publish::<SelectedEnd>(&image, PublicationLimits::default())
+            .expect("VL16 selected-end publication");
+        assert_eq!(kernel.sve_vector_bytes_at_publication(), Some(16));
+        assert!(kernel.requires_current_thread_session());
+
+        let direct = kernel
+            .search_checked(checked)
+            .expect("direct checked fixed-VL call");
+        assert_eq!(direct, Some(18));
+        let session = kernel
+            .begin_current_thread_session()
+            .expect("current thread retains VL16");
+        let session_result = session
+            .search_checked(checked)
+            .expect("session checked fixed-VL call");
+        assert_eq!(session_result, direct);
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little"
+))]
+#[test]
+#[ignore = "qualification receipt: requires Arm 0x41/0xd84 with ASIMD+SVE+SVE2 and VL16"]
 fn fixed_16_sve_qualification_receipt() {
     use std::{hint::black_box, time::Instant};
 
@@ -58,10 +409,13 @@ fn fixed_16_sve_qualification_receipt() {
         iterations: usize,
     ) -> (u128, usize) {
         let window = SearchWindow::new(0, haystack.len());
+        let session = kernel
+            .begin_current_thread_session()
+            .expect("qualification thread must retain the publication VL");
         let started = Instant::now();
         let mut checksum = 0_usize;
         for _ in 0..iterations {
-            let found = kernel
+            let found = session
                 .search(black_box(haystack), black_box(window))
                 .expect("native qualification call")
                 .expect("qualification haystack contains the literal");
@@ -89,6 +443,8 @@ fn fixed_16_sve_qualification_receipt() {
     }
 
     let _lock = native_test_lock();
+    crate::native_search_backend_support(BackendVersion::SEARCH_SVE2_16_V1)
+        .expect("qualification host must satisfy the exact tag10 admission contract");
     println!(
         "fre_sve16_receipt,backend,width,code_bytes,rodata_bytes,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
     );
@@ -108,7 +464,14 @@ fn fixed_16_sve_qualification_receipt() {
         )
         .expect("qualification program");
         let images = [
-            ("asimd_v7", emit(&program, EmitLimits::default())),
+            (
+                "asimd_v7",
+                emit_with_backend(
+                    &program,
+                    SearchBackendPolicy::AsimdV7,
+                    EmitLimits::default(),
+                ),
+            ),
             ("sve16", emit_sve16(&program, EmitLimits::default())),
             ("sve2_16", emit_sve2_16(&program, EmitLimits::default())),
         ];
@@ -299,12 +662,14 @@ fn sve2_fixed16_pair_count_benchmark_receipt() {
 ))]
 #[test]
 fn fixed_16_sve_native_execution_matches_v7() {
-    use fre_jit_aarch64::{emit_sve2_16, emit_sve16};
+    use fre_jit_aarch64::{SearchBackendPolicy, emit_sve2_16, emit_sve16, emit_with_backend};
 
-    if !platform::has_sve() || !platform::has_sve2() {
-        eprintln!("skipped: Linux auxv does not advertise SVE2");
+    if let Err(error) = crate::native_search_backend_support(BackendVersion::SEARCH_SVE16_V1) {
+        eprintln!("skipped: host does not satisfy legacy tag9 admission: {error}");
         return;
     }
+    let tag10_supported =
+        crate::native_search_backend_support(BackendVersion::SEARCH_SVE2_16_V1).is_ok();
     let _lock = native_test_lock();
     for width in [1_usize, 3, 15, 16, 17, 31, 32] {
         let literal: Vec<u8> = (0..width)
@@ -321,11 +686,18 @@ fn fixed_16_sve_native_execution_matches_v7() {
             ValidateLimits::default(),
         )
         .expect("native SVE test program");
-        let images = [
-            emit(&program, EmitLimits::default()).expect("V7 image"),
+        let mut images = vec![
+            emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV7,
+                EmitLimits::default(),
+            )
+            .expect("V7 image"),
             emit_sve16(&program, EmitLimits::default()).expect("SVE16 image"),
-            emit_sve2_16(&program, EmitLimits::default()).expect("SVE2-16 image"),
         ];
+        if tag10_supported {
+            images.push(emit_sve2_16(&program, EmitLimits::default()).expect("SVE2-16 image"));
+        }
         for alignment in [0_usize, 1, 15, 16, 31] {
             let mut storage = vec![0xe7; alignment + 127 + width];
             let expected_start = alignment + 63;
@@ -357,10 +729,12 @@ fn fixed_16_sve_class_suffix_native_execution_matches_v7() {
 
     const ALPHABET: &[u8] = b"bcdefghijklmnopqrstuvwxyz012345";
 
-    if !platform::has_sve() || !platform::has_sve2() {
-        eprintln!("skipped: Linux auxv does not advertise SVE2");
+    if let Err(error) = crate::native_search_backend_support(BackendVersion::SEARCH_SVE16_V1) {
+        eprintln!("skipped: host does not satisfy legacy tag9 admission: {error}");
         return;
     }
+    let tag10_supported =
+        crate::native_search_backend_support(BackendVersion::SEARCH_SVE2_16_V1).is_ok();
     let _lock = native_test_lock();
     for member_count in [1_usize, 2, 5, 16] {
         let members: Vec<u8> = (0..member_count)
@@ -384,21 +758,15 @@ fn fixed_16_sve_class_suffix_native_execution_matches_v7() {
                     ValidateLimits::default(),
                 )
                 .expect("native class-suffix program");
-                let policies: &[SearchBackendPolicy] = if member_count == 1 {
-                    &[
-                        SearchBackendPolicy::AsimdV7,
-                        SearchBackendPolicy::Sve16,
-                        SearchBackendPolicy::Sve2Fixed16,
-                    ]
-                } else {
-                    &[
-                        SearchBackendPolicy::AsimdV7,
-                        SearchBackendPolicy::Sve2Fixed16,
-                    ]
-                };
+                let mut policies = vec![SearchBackendPolicy::AsimdV7];
+                if member_count == 1 {
+                    policies.push(SearchBackendPolicy::Sve16);
+                }
+                if tag10_supported {
+                    policies.push(SearchBackendPolicy::Sve2Fixed16);
+                }
                 let images: Vec<_> = policies
-                    .iter()
-                    .copied()
+                    .into_iter()
                     .map(|policy| {
                         emit_with_backend(&program, policy, EmitLimits::default())
                             .expect("native class-suffix image")
@@ -442,7 +810,7 @@ fn fixed_16_sve_class_suffix_native_execution_matches_v7() {
     target_endian = "little"
 ))]
 #[test]
-#[ignore = "qualification receipt: requires a native Linux host with SVE2"]
+#[ignore = "qualification receipt: requires Arm 0x41/0xd84 with ASIMD+SVE+SVE2 and VL16"]
 #[allow(
     clippy::too_many_lines,
     reason = "one ignored benchmark emits a complete parseable receipt for all class-suffix backends"
@@ -496,6 +864,8 @@ fn fixed_16_sve_class_suffix_qualification_receipt() {
     }
 
     let _lock = native_test_lock();
+    crate::native_search_backend_support(BackendVersion::SEARCH_SVE2_16_V1)
+        .expect("qualification host must satisfy the exact tag10 admission contract");
     println!(
         "fre_sve16_class_suffix_receipt,backend,class_members,suffix_bytes,code_bytes,rodata_bytes,feature_bits,asimd_instructions,sve_instructions,sve2_instructions,iterations,haystack_bytes,elapsed_ns,checksum,identity"
     );
@@ -583,6 +953,73 @@ fn strict_wx_smoke_matches_kernel_ir() {
         .into_output();
     let actual = kernel.search(haystack, window).expect("native call");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn emitter_attested_publication_matches_oracle_and_rolls_back_every_failure() {
+    let _lock = native_test_lock();
+    assert_eq!(platform::live_code_mappings(), 0);
+    let program =
+        build_exact_literal::<Span>(b"needle", AnchorFlags::default(), ValidateLimits::default())
+            .expect("valid exact literal");
+    let audited = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("audited image");
+    let expected_identity = RuntimeIdentity::for_image(audited.as_image());
+    assert!(matches!(
+        publish_audited::<Exists>(&audited, PublicationLimits::default()),
+        Err(PublishError::OutputContractMismatch { .. })
+    ));
+    assert_eq!(platform::live_code_mappings(), 0);
+
+    for stage in [
+        FailureStage::Reserve,
+        FailureStage::MakeWritable,
+        FailureStage::Copy,
+        FailureStage::Verify,
+        FailureStage::Reaudit,
+        FailureStage::MakeExecutable,
+        FailureStage::InvalidateInstructionCache,
+        FailureStage::Publish,
+    ] {
+        let error = publish_audited_impl::<Span>(
+            &audited,
+            PublicationLimits::default(),
+            FailureInjection::At(stage),
+        )
+        .expect_err("injected audited publication stage fails");
+        assert_eq!(error, PublishError::InjectedFailure { stage });
+        assert_eq!(platform::live_code_mappings(), 0, "leak at {stage:?}");
+    }
+    assert_eq!(
+        publish_audited_impl::<Span>(
+            &audited,
+            PublicationLimits::default(),
+            FailureInjection::CorruptCopy,
+        )
+        .expect_err("corrupt audited-image copy rejected"),
+        PublishError::CopyVerificationFailed
+    );
+    assert_eq!(platform::live_code_mappings(), 0);
+
+    let kernel =
+        publish_audited::<Span>(&audited, PublicationLimits::default()).expect("strict W^X");
+    assert_eq!(kernel.identity(), expected_identity);
+    let haystack = b"zzneedlezz";
+    let window = SearchWindow::new(0, haystack.len());
+    let expected = program
+        .execute(haystack, window, ExecutionLimits::unlimited())
+        .expect("oracle")
+        .into_output();
+    assert_eq!(
+        kernel.search(haystack, window).expect("native call"),
+        expected
+    );
+    drop(kernel);
+    assert_eq!(platform::live_code_mappings(), 0);
 }
 
 #[test]
@@ -1312,6 +1749,66 @@ fn aggregate_call_preflight_accepts_exact_and_refuses_each_positive_one_below() 
 }
 
 #[test]
+fn search_result_decoding_ignores_fault_slots_and_validates_success_spans() {
+    let window = SearchWindow::new(2, 8);
+    for status in [2_u64, 0x55, u64::MAX] {
+        for poisoned in [
+            NativeResult { start: 0, end: 0 },
+            NativeResult {
+                start: usize::MAX,
+                end: usize::MAX,
+            },
+        ] {
+            assert_eq!(
+                decode_operation::<Span>(
+                    RawCallResult {
+                        status,
+                        slot: poisoned,
+                    },
+                    window,
+                ),
+                Err(CallError::BackendFault { status })
+            );
+            assert_eq!(
+                decode_operation::<SelectedEnd>(
+                    RawCallResult {
+                        status,
+                        slot: poisoned,
+                    },
+                    window,
+                ),
+                Err(CallError::BackendFault { status })
+            );
+            assert_eq!(
+                decode_operation::<Exists>(
+                    RawCallResult {
+                        status,
+                        slot: poisoned,
+                    },
+                    window,
+                ),
+                Err(CallError::BackendFault { status })
+            );
+        }
+    }
+    assert!(matches!(
+        decode_operation::<Span>(
+            RawCallResult {
+                status: 1,
+                slot: NativeResult { start: 1, end: 9 },
+            },
+            window,
+        ),
+        Err(CallError::InvalidNativeOutput {
+            output: fre_kernel_ir::OutputKind::Span,
+            window_start: 2,
+            window_end: 8,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn aggregate_result_decoding_ignores_fault_slots_and_validates_success_values() {
     for poisoned in [0_u64, u64::MAX] {
         assert_eq!(
@@ -1472,6 +1969,101 @@ fn vector_candidate_tails_and_haystack_alignments_match_oracle() {
 }
 
 #[test]
+fn v8_adaptive_secondary_screen_rechecks_primary_before_fallback() {
+    const WIDE_CANDIDATES: usize = 64;
+    const PRIMARY_OFFSET: usize = 7;
+    const SECONDARY_OFFSET: usize = 6;
+    const TRUE_MATCH: usize = 320;
+
+    let _lock = native_test_lock();
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("adaptive V8 program");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("adaptive V8 image");
+    let filter_offsets = decode(image.code())
+        .expect("adaptive V8 image decodes")
+        .into_iter()
+        .filter_map(|instruction| match instruction {
+            DecodedInstruction::LoadByte {
+                destination: 11,
+                base: 8,
+                offset,
+            } => Some(usize::from(offset)),
+            _ => None,
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(filter_offsets, [PRIMARY_OFFSET, SECONDARY_OFFSET]);
+    let kernel =
+        publish::<Span>(&image, PublicationLimits::default()).expect("adaptive V8 publication");
+
+    for match_start in [None, Some(TRUE_MATCH)] {
+        let mut haystack = vec![b'x'; 512];
+        haystack[PRIMARY_OFFSET] = literal[PRIMARY_OFFSET];
+        haystack[WIDE_CANDIDATES + SECONDARY_OFFSET..].fill(literal[SECONDARY_OFFSET]);
+        if let Some(start) = match_start {
+            let end = start
+                .checked_add(literal.len())
+                .expect("bounded true match");
+            haystack[start..end].copy_from_slice(literal);
+        }
+
+        let first_group_primary_hits = (0..WIDE_CANDIDATES)
+            .filter(|&candidate| haystack[candidate + PRIMARY_OFFSET] == literal[PRIMARY_OFFSET])
+            .count();
+        assert_eq!(first_group_primary_hits, 1);
+        assert!((0..WIDE_CANDIDATES).all(|candidate| {
+            haystack[candidate + PRIMARY_OFFSET] != literal[PRIMARY_OFFSET]
+                || haystack[candidate + SECONDARY_OFFSET] != literal[SECONDARY_OFFSET]
+        }));
+        let maximum_start = haystack
+            .len()
+            .checked_sub(literal.len())
+            .expect("literal fits adaptive haystack");
+        let first_secondary_group_end = WIDE_CANDIDATES
+            .checked_mul(2)
+            .expect("bounded first secondary group");
+        assert!(
+            (WIDE_CANDIDATES..first_secondary_group_end).all(|candidate| {
+                haystack[candidate + SECONDARY_OFFSET] == literal[SECONDARY_OFFSET]
+                    && haystack[candidate + PRIMARY_OFFSET] != literal[PRIMARY_OFFSET]
+            })
+        );
+        if let Some(start) = match_start {
+            assert!((first_secondary_group_end..start).all(|candidate| {
+                haystack[candidate + PRIMARY_OFFSET] != literal[PRIMARY_OFFSET]
+            }));
+            assert_eq!(
+                &haystack[start..start + literal.len()],
+                literal,
+                "the first later pair must be the declared true match"
+            );
+        } else {
+            assert!(
+                (first_secondary_group_end..=maximum_start).all(|candidate| {
+                    haystack[candidate + PRIMARY_OFFSET] != literal[PRIMARY_OFFSET]
+                })
+            );
+        }
+
+        let window = SearchWindow::new(0, haystack.len());
+        let actual = kernel
+            .search(&haystack, window)
+            .expect("adaptive V8 execution")
+            .map(|span| (span.start(), span.end()));
+        let expected = match_start.map(|start| (start, start + literal.len()));
+        assert_eq!(actual, expected);
+        assert_native_matches(&program, &kernel, &haystack, window);
+    }
+}
+
+#[test]
 fn rare_pair_vector_candidates_respect_guard_pages_and_leftmost_windows() {
     const WINDOW_START: usize = 3;
     const CANDIDATE_STARTS: usize = 16;
@@ -1602,7 +2194,12 @@ fn v7_sparse_recovery_covers_every_lane_group_and_pair_direction() {
         let program =
             build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
                 .expect("ranked exact program");
-        let image = emit(&program, EmitLimits::default()).expect("ranked exact image");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV7,
+            EmitLimits::default(),
+        )
+        .expect("ranked exact image");
         assert_eq!(image.backend_version(), BackendVersion::SEARCH_V7);
         let instructions = decode(image.code()).expect("v7 native image decode");
         let filter_offsets: Vec<usize> = instructions
@@ -1751,7 +2348,12 @@ fn v7_multi_survivor_masks_preserve_leftmost_across_blocks_and_tail() {
             ValidateLimits::default(),
         )
         .expect("add-direction exact program");
-        let add_image = emit(&add_program, EmitLimits::default()).expect("add-direction image");
+        let add_image = emit_with_backend(
+            &add_program,
+            SearchBackendPolicy::AsimdV7,
+            EmitLimits::default(),
+        )
+        .expect("add-direction image");
         let add_offsets = initial_v7_filter_offsets(&add_image);
         assert_eq!(add_offsets, [0, 1, 2, 3]);
         let add_kernel =
@@ -1828,8 +2430,12 @@ fn v7_multi_survivor_masks_preserve_leftmost_across_blocks_and_tail() {
             ValidateLimits::default(),
         )
         .expect("subtract-direction exact program");
-        let subtract_image =
-            emit(&subtract_program, EmitLimits::default()).expect("subtract-direction image");
+        let subtract_image = emit_with_backend(
+            &subtract_program,
+            SearchBackendPolicy::AsimdV7,
+            EmitLimits::default(),
+        )
+        .expect("subtract-direction image");
         let subtract_offsets = initial_v7_filter_offsets(&subtract_image);
         assert_eq!(subtract_offsets, [8, 4, 2, 1]);
         let subtract_kernel = publish::<Span>(&subtract_image, PublicationLimits::default())
@@ -1930,7 +2536,12 @@ fn v7_overlapping_candidates_preserve_leftmost_and_window_nonoverlap() {
     let program =
         build_exact_literal::<Span>(LITERAL, AnchorFlags::default(), ValidateLimits::default())
             .expect("overlapping exact program");
-    let image = emit(&program, EmitLimits::default()).expect("overlapping v7 image");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV7,
+        EmitLimits::default(),
+    )
+    .expect("overlapping v7 image");
     assert_eq!(image.backend_version(), BackendVersion::SEARCH_V7);
     let kernel =
         publish::<Span>(&image, PublicationLimits::default()).expect("overlapping publication");
@@ -2279,6 +2890,49 @@ fn output_contract_window_and_resource_failures_are_typed() {
             haystack_len: 4,
         })
     );
+    let session = kernel
+        .begin_current_thread_session()
+        .expect("V8 establishes a syscall-free thread session");
+    assert!(!kernel.requires_current_thread_session());
+    assert_eq!(session.kernel().identity(), kernel.identity());
+    assert_eq!(
+        session.search(b"tiny", SearchWindow::new(2, 6)),
+        Err(CallError::InvalidWindow {
+            start: 2,
+            end: 6,
+            haystack_len: 4,
+        })
+    );
+    assert_eq!(
+        session
+            .search(
+                b"zz0123456789abcdefgzz",
+                SearchWindow::new(0, b"zz0123456789abcdefgzz".len()),
+            )
+            .expect("session native search")
+            .map(|span| (span.start(), span.end())),
+        Some((2, 19))
+    );
+    let checked_haystack = b"zz0123456789abcdefgzz";
+    let checked = CheckedSearchWindow::new(
+        checked_haystack,
+        SearchWindow::new(0, checked_haystack.len()),
+    )
+    .expect("valid checked window");
+    assert_eq!(
+        kernel
+            .search_checked(checked)
+            .expect("direct prechecked native search")
+            .map(|span| (span.start(), span.end())),
+        Some((2, 19))
+    );
+    assert_eq!(
+        session
+            .search_checked(checked)
+            .expect("prechecked session native search")
+            .map(|span| (span.start(), span.end())),
+        Some((2, 19))
+    );
     drop(kernel);
 
     for (resource, exact) in [
@@ -2315,8 +2969,12 @@ fn cloned_ownership_prevents_call_unmap_races() {
         workers.push(std::thread::spawn(move || {
             let haystack = b"zzneedlezz";
             let window = SearchWindow::new(0, haystack.len());
+            let checked =
+                CheckedSearchWindow::new(haystack, window).expect("worker checked window");
             for _ in 0..2_000 {
-                let span = clone.search(haystack, window).expect("concurrent call");
+                let span = clone
+                    .search_checked(checked)
+                    .expect("concurrent prechecked call");
                 assert_eq!(span.map(|value| (value.start(), value.end())), Some((2, 8)));
             }
         }));

@@ -10,6 +10,7 @@
 use core::fmt;
 
 use fre_exact_alloc::CopyError;
+use fre_kernel_ir::CheckedSearchWindow;
 use memchr::memmem::{Finder, FinderBuilder};
 
 pub use fre_simd_kernels::{
@@ -699,11 +700,144 @@ impl fmt::Display for LiteralError {
 
 impl std::error::Error for LiteralError {}
 
+/// Validate an exact-literal search from scalar lengths only.
+///
+/// This is the shared refusal boundary for executors that already have an
+/// authenticated literal width but do not own a [`LiteralPlan`], such as a
+/// statically linked AOT handle. It performs no allocation and does not read
+/// the haystack.
+///
+/// # Errors
+///
+/// Returns [`LiteralError::InvalidWindow`] or a checked limit/arithmetic
+/// failure before an executor may inspect or call through any haystack
+/// pointer.
+#[inline]
+pub fn preflight_literal_window(
+    needle_bytes: usize,
+    haystack_len: usize,
+    window: Window,
+    limits: LiteralSearchLimits,
+) -> Result<LiteralAccounting, LiteralError> {
+    if window.start > window.end || window.end > haystack_len {
+        return Err(LiteralError::InvalidWindow {
+            start: window.start,
+            end: window.end,
+            haystack_len,
+        });
+    }
+    let searched_bytes =
+        window
+            .end
+            .checked_sub(window.start)
+            .ok_or(LiteralError::ArithmeticOverflow {
+                computation: "literal window length",
+            })?;
+    preflight_literal_terms(needle_bytes, searched_bytes, limits)
+}
+
+/// Validate exact-literal resource limits for an already checked window.
+///
+/// The private-field [`CheckedSearchWindow`] proves the window bounds against
+/// its borrowed haystack. This boundary therefore performs only the shared
+/// literal work/accounting preflight and lets a native executor consume the
+/// same checked token without repeating the bounds check.
+///
+/// # Errors
+///
+/// Returns a checked limit or arithmetic failure before an executor may call
+/// through the checked haystack pointer.
+#[doc(hidden)]
+#[inline]
+pub fn preflight_checked_literal_window(
+    needle_bytes: usize,
+    window: CheckedSearchWindow<'_>,
+    limits: LiteralSearchLimits,
+) -> Result<LiteralAccounting, LiteralError> {
+    preflight_literal_terms(needle_bytes, window.searched_bytes(), limits)
+}
+
+#[inline]
+fn preflight_literal_terms(
+    needle_bytes: usize,
+    searched_bytes: usize,
+    limits: LiteralSearchLimits,
+) -> Result<LiteralAccounting, LiteralError> {
+    let linear_terms =
+        searched_bytes
+            .checked_add(needle_bytes)
+            .ok_or(LiteralError::ArithmeticOverflow {
+                computation: "literal linear terms",
+            })?;
+    if linear_terms > limits.max_linear_terms {
+        return Err(LiteralError::LinearTermLimit {
+            needed: linear_terms,
+            limit: limits.max_linear_terms,
+        });
+    }
+    Ok(LiteralAccounting {
+        needle_bytes,
+        searched_bytes,
+        linear_terms,
+        scratch_bytes: 0,
+    })
+}
+
 /// Immutable exact-literal plan with an owned preprocessed finder.
 #[derive(Debug)]
 pub struct LiteralPlan {
     finder: Finder<'static>,
     needle_bytes: usize,
+}
+
+/// Private-field certificate for one checked, resource-admitted literal call.
+///
+/// This token binds the exact plan, haystack borrow, window, accounting, and
+/// caller limit result. It is exposed only so FRE's sibling facade can hand
+/// the same checked window to an independently typed native executor.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct LiteralSearchPreflight<'plan, 'haystack> {
+    plan: &'plan LiteralPlan,
+    window: CheckedSearchWindow<'haystack>,
+    accounting: LiteralAccounting,
+}
+
+impl<'haystack> LiteralSearchPreflight<'_, 'haystack> {
+    /// Exact accounting produced by the authoritative literal preflight.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn accounting(self) -> LiteralAccounting {
+        self.accounting
+    }
+
+    /// Checked byte count used for workload routing and resource accounting.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn searched_bytes(self) -> usize {
+        self.accounting.searched_bytes
+    }
+
+    /// The non-forgeable window bound to this preflight's haystack.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub const fn checked_window(self) -> CheckedSearchWindow<'haystack> {
+        self.window
+    }
+
+    /// Execute the portable owner without repeating window or limit preflight.
+    #[doc(hidden)]
+    #[inline]
+    pub fn find(self) -> Result<Option<(usize, usize)>, LiteralError> {
+        let window = self.window.window();
+        self.plan.find_after_preflight(
+            self.window.haystack(),
+            Window::new(window.start(), window.end()),
+        )
+    }
 }
 
 impl LiteralPlan {
@@ -768,24 +902,33 @@ impl LiteralPlan {
         limits: LiteralSearchLimits,
     ) -> Result<(Option<(usize, usize)>, LiteralAccounting), LiteralError> {
         let accounting = self.preflight_window(haystack.len(), window, limits)?;
-        let relative = self.finder.find(&haystack[window.start..window.end]);
-        let matched =
-            relative
-                .map(|relative| {
-                    let start = window.start.checked_add(relative).ok_or(
-                        LiteralError::ArithmeticOverflow {
-                            computation: "literal match start",
-                        },
-                    )?;
-                    let end = start.checked_add(self.needle_bytes).ok_or(
-                        LiteralError::ArithmeticOverflow {
-                            computation: "literal match end",
-                        },
-                    )?;
-                    Ok((start, end))
-                })
-                .transpose()?;
+        let matched = self.find_after_preflight(haystack, window)?;
         Ok((matched, accounting))
+    }
+
+    fn find_after_preflight(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        let relative = self.finder.find(&haystack[window.start..window.end]);
+        relative
+            .map(|relative| {
+                let start =
+                    window
+                        .start
+                        .checked_add(relative)
+                        .ok_or(LiteralError::ArithmeticOverflow {
+                            computation: "literal match start",
+                        })?;
+                let end = start.checked_add(self.needle_bytes).ok_or(
+                    LiteralError::ArithmeticOverflow {
+                        computation: "literal match end",
+                    },
+                )?;
+                Ok((start, end))
+            })
+            .transpose()
     }
 
     /// Validate a literal search and return its exact resource certificate
@@ -800,36 +943,22 @@ impl LiteralPlan {
         window: Window,
         limits: LiteralSearchLimits,
     ) -> Result<LiteralAccounting, LiteralError> {
-        if window.start > window.end || window.end > haystack_len {
-            return Err(LiteralError::InvalidWindow {
-                start: window.start,
-                end: window.end,
-                haystack_len,
-            });
-        }
-        let searched_bytes =
-            window
-                .end
-                .checked_sub(window.start)
-                .ok_or(LiteralError::ArithmeticOverflow {
-                    computation: "literal window length",
-                })?;
-        let linear_terms = searched_bytes.checked_add(self.needle_bytes).ok_or(
-            LiteralError::ArithmeticOverflow {
-                computation: "literal linear terms",
-            },
-        )?;
-        if linear_terms > limits.max_linear_terms {
-            return Err(LiteralError::LinearTermLimit {
-                needed: linear_terms,
-                limit: limits.max_linear_terms,
-            });
-        }
-        Ok(LiteralAccounting {
-            needle_bytes: self.needle_bytes,
-            searched_bytes,
-            linear_terms,
-            scratch_bytes: 0,
+        preflight_literal_window(self.needle_bytes, haystack_len, window, limits)
+    }
+
+    /// Seal one checked window and exact resource admission into a proof token.
+    #[doc(hidden)]
+    #[inline]
+    pub fn preflight_checked_window<'plan, 'haystack>(
+        &'plan self,
+        window: CheckedSearchWindow<'haystack>,
+        limits: LiteralSearchLimits,
+    ) -> Result<LiteralSearchPreflight<'plan, 'haystack>, LiteralError> {
+        let accounting = preflight_checked_literal_window(self.needle_bytes, window, limits)?;
+        Ok(LiteralSearchPreflight {
+            plan: self,
+            window,
+            accounting,
         })
     }
 }
@@ -894,10 +1023,12 @@ mod exact_literal_copy_probe {
 #[cfg(test)]
 mod tests {
     use fre_exact_alloc::CopyError;
+    use fre_kernel_ir::{CheckedSearchWindow, SearchWindow as KernelSearchWindow};
 
     use super::{
-        LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits, Window,
-        copy_literal_exact, exact_literal_copy_probe,
+        LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan, LiteralSearchLimits,
+        Window, copy_literal_exact, exact_literal_copy_probe, preflight_checked_literal_window,
+        preflight_literal_window,
     };
 
     #[test]
@@ -918,6 +1049,60 @@ mod tests {
                 .0,
             Some((2, 2))
         );
+    }
+
+    #[test]
+    fn checked_literal_preflight_seals_accounting_limit_and_portable_execution() {
+        let plan = LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap();
+        let haystack = b"xxneedlexx";
+        let checked =
+            CheckedSearchWindow::new(haystack, KernelSearchWindow::new(1, haystack.len()))
+                .expect("valid checked window");
+        let expected = plan
+            .preflight_checked_window(checked, LiteralSearchLimits::unlimited())
+            .expect("unlimited preflight");
+        assert_eq!(
+            expected.accounting(),
+            plan.preflight_window(
+                haystack.len(),
+                Window::new(1, haystack.len()),
+                LiteralSearchLimits::unlimited(),
+            )
+            .expect("legacy preflight parity")
+        );
+        let exact_limit = LiteralSearchLimits {
+            max_linear_terms: expected.accounting().linear_terms,
+        };
+        let exact = plan
+            .preflight_checked_window(checked, exact_limit)
+            .expect("exact linear-term cap");
+        assert_eq!(exact.accounting(), expected.accounting());
+        assert_eq!(
+            exact.searched_bytes(),
+            haystack.len().checked_sub(1).expect("nonempty haystack")
+        );
+        assert_eq!(
+            exact.checked_window().haystack().as_ptr(),
+            haystack.as_ptr()
+        );
+        assert_eq!(exact.checked_window().haystack().len(), haystack.len());
+        assert_eq!(
+            exact.find().expect("preflighted portable search"),
+            Some((2, 8))
+        );
+
+        let one_below_terms = exact_limit
+            .max_linear_terms
+            .checked_sub(1)
+            .expect("positive exact linear terms");
+        let one_below = LiteralSearchLimits {
+            max_linear_terms: one_below_terms,
+        };
+        assert!(matches!(
+            plan.preflight_checked_window(checked, one_below),
+            Err(LiteralError::LinearTermLimit { needed, limit })
+                if needed == exact_limit.max_linear_terms && limit == one_below.max_linear_terms
+        ));
     }
 
     #[test]
@@ -971,6 +1156,52 @@ mod tests {
                 }
             ),
             Err(LiteralError::LinearTermLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn scalar_literal_preflight_is_the_plan_independent_refusal_contract() {
+        let plan = LiteralPlan::new(b"needle", LiteralBuildLimits::default()).unwrap();
+        let limits = LiteralSearchLimits {
+            max_linear_terms: 12,
+        };
+        for window in [
+            Window::new(0, 0),
+            Window::new(2, 6),
+            Window::new(6, 2),
+            Window::new(0, 9),
+        ] {
+            assert_eq!(
+                preflight_literal_window(6, 8, window, limits),
+                plan.preflight_window(8, window, limits)
+            );
+        }
+        assert_eq!(
+            preflight_literal_window(6, 8, Window::new(2, 6), limits),
+            Ok(LiteralAccounting {
+                needle_bytes: 6,
+                searched_bytes: 4,
+                linear_terms: 10,
+                scratch_bytes: 0,
+            })
+        );
+
+        let haystack = b"12345678";
+        let checked = CheckedSearchWindow::new(haystack, KernelSearchWindow::new(2, 6))
+            .expect("valid checked window");
+        assert_eq!(
+            preflight_checked_literal_window(6, checked, limits),
+            preflight_literal_window(6, haystack.len(), Window::new(2, 6), limits),
+        );
+        let one_below = LiteralSearchLimits {
+            max_linear_terms: 9,
+        };
+        assert!(matches!(
+            preflight_checked_literal_window(6, checked, one_below),
+            Err(LiteralError::LinearTermLimit {
+                needed: 10,
+                limit: 9
+            })
         ));
     }
 

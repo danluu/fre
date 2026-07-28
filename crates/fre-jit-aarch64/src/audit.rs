@@ -235,8 +235,11 @@ fn validate_search_backend_version(image: &NativeImage) -> Result<BackendVersion
         | BackendVersion::SEARCH_V5
         | BackendVersion::SEARCH_V6
         | BackendVersion::SEARCH_V7
+        | BackendVersion::SEARCH_V8
         | BackendVersion::SEARCH_SVE16_V1
-        | BackendVersion::SEARCH_SVE2_16_V1 => Ok(image.backend_version),
+        | BackendVersion::SEARCH_SVE2_16_V1
+        | BackendVersion::SEARCH_SVE16_V6
+        | BackendVersion::SEARCH_SVE2_FIXED16_V2 => Ok(image.backend_version),
         actual => Err(AuditError::SearchBackendVersionMismatch {
             expected: BackendVersion::SEARCH_CURRENT.0,
             actual: actual.0,
@@ -264,8 +267,11 @@ fn authenticate_search_envelope<'image>(
             | BackendVersion::SEARCH_V5
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
+            | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
+            | BackendVersion::SEARCH_SVE16_V6
+            | BackendVersion::SEARCH_SVE2_FIXED16_V2
     ) {
         let manifest = validate_sealed_search_manifest(image)?;
         let literal = authenticate_search_manifest(image, manifest, work)?;
@@ -446,6 +452,7 @@ fn authenticate_legacy_search_semantics(
         secondary_offset,
         verification_offset,
         quaternary_offset: SEARCH_CANDIDATE_OFFSET_NONE,
+        quinary_offset: SEARCH_CANDIDATE_OFFSET_NONE,
     })
 }
 
@@ -485,6 +492,16 @@ fn authenticate_search_manifest<'image>(
             {
                 return Err(AuditError::InvalidSearchManifest);
             }
+            if manifest.backend_version == BackendVersion::SEARCH_SVE16_V6
+                && (manifest.anchors != AnchorFlags::default() || literal_len < 16)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
+            if manifest.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                && (manifest.anchors != AnchorFlags::default() || literal_len != 16)
+            {
+                return Err(AuditError::InvalidSearchManifest);
+            }
             let [symbol] = image.symbols.as_ref() else {
                 return Err(AuditError::InvalidSearchManifest);
             };
@@ -519,6 +536,12 @@ fn authenticate_class_suffix_manifest(
     literal_len: usize,
     limits: ValidateLimits,
 ) -> Result<CacheIdentity, AuditError> {
+    if matches!(
+        manifest.backend_version,
+        BackendVersion::SEARCH_SVE16_V6 | BackendVersion::SEARCH_SVE2_FIXED16_V2
+    ) {
+        return Err(AuditError::InvalidSearchManifest);
+    }
     if !manifest.anchors.start && literal_len > MAX_EXACT_AGGREGATE_LITERAL_BYTES {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -596,8 +619,10 @@ const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
 const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
 const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
 const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_POLICY_V4: u16 = 4;
 const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
+const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -637,16 +662,25 @@ fn authenticate_search_candidate_policy(
                     }),
                     None,
                     None,
+                    None,
                 )
             } else {
                 let (primary, secondary) = independent_exact_candidate_pair(literal);
-                let (verification, quaternary) = if matches!(
+                let (verification, quaternary, quinary) = if manifest.backend_version
+                    == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                {
+                    independent_ranked_verification_offsets_v2(literal, primary, secondary)
+                } else if matches!(
                     manifest.backend_version,
                     BackendVersion::SEARCH_V7
+                        | BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
+                        | BackendVersion::SEARCH_SVE16_V6
                 ) {
-                    independent_ranked_verification_offsets(literal, primary, secondary)
+                    let (verification, quaternary) =
+                        independent_ranked_verification_offsets(literal, primary, secondary);
+                    (verification, quaternary, None)
                 } else {
                     (
                         matches!(
@@ -656,9 +690,10 @@ fn authenticate_search_candidate_policy(
                         .then(|| independent_exact_verification_offset(literal, primary, secondary))
                         .flatten(),
                         None,
+                        None,
                     )
                 };
-                (primary, secondary, verification, quaternary)
+                (primary, secondary, verification, quaternary, quinary)
             })
         }
         SearchShape::ClassSuffix if !manifest.anchors.start && !literal.is_empty() => {
@@ -683,6 +718,7 @@ fn authenticate_search_candidate_policy(
                     }),
                     None,
                     None,
+                    None,
                 )
             })
         }
@@ -696,22 +732,32 @@ fn authenticate_search_candidate_policy(
             SEARCH_CANDIDATE_OFFSET_NONE,
             SEARCH_CANDIDATE_OFFSET_NONE,
             SEARCH_CANDIDATE_OFFSET_NONE,
+            SEARCH_CANDIDATE_OFFSET_NONE,
         ),
-        |(primary, secondary, verification, quaternary)| {
+        |(primary, secondary, verification, quaternary, quinary)| {
             (
-                if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                if manifest.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                } else if manifest.backend_version == BackendVersion::SEARCH_V8
+                    && manifest.shape == SearchShape::ExactLiteral
+                {
+                    SEARCH_CANDIDATE_POLICY_V4
+                } else if manifest.backend_version == BackendVersion::SEARCH_SVE2_16_V1
                     && matches!(
                         manifest.shape,
                         SearchShape::ExactLiteral | SearchShape::ClassSuffix
                     )
                 {
                     SEARCH_CANDIDATE_POLICY_SVE2_16_V1
-                } else if manifest.backend_version == BackendVersion::SEARCH_SVE16_V1
-                    && matches!(
-                        manifest.shape,
-                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
-                    )
-                {
+                } else if matches!(
+                    manifest.backend_version,
+                    BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE16_V6
+                ) && matches!(
+                    manifest.shape,
+                    SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                ) {
                     SEARCH_CANDIDATE_POLICY_SVE16_V1
                 } else if manifest.backend_version == BackendVersion::SEARCH_V7
                     && manifest.shape == SearchShape::ExactLiteral
@@ -731,6 +777,7 @@ fn authenticate_search_candidate_policy(
                 secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                 verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                 quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                quinary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
             )
         },
     );
@@ -741,6 +788,7 @@ fn authenticate_search_candidate_policy(
         manifest.secondary_offset,
         manifest.verification_offset,
         manifest.quaternary_offset,
+        manifest.quinary_offset,
     );
     if actual != expected {
         return Err(AuditError::InvalidSearchManifest);
@@ -758,7 +806,13 @@ fn authenticate_search_candidate_policy(
                 && (usize::from(manifest.quaternary_offset) >= literal.len()
                     || manifest.quaternary_offset == manifest.primary_offset
                     || manifest.quaternary_offset == manifest.secondary_offset
-                    || manifest.quaternary_offset == manifest.verification_offset)))
+                    || manifest.quaternary_offset == manifest.verification_offset))
+            || (manifest.quinary_offset != SEARCH_CANDIDATE_OFFSET_NONE
+                && (usize::from(manifest.quinary_offset) >= literal.len()
+                    || manifest.quinary_offset == manifest.primary_offset
+                    || manifest.quinary_offset == manifest.secondary_offset
+                    || manifest.quinary_offset == manifest.verification_offset
+                    || manifest.quinary_offset == manifest.quaternary_offset)))
     {
         return Err(AuditError::InvalidSearchManifest);
     }
@@ -910,6 +964,55 @@ fn independent_ranked_verification_offsets(
     (
         first.map(|(_, offset)| offset),
         second.map(|(_, offset)| offset),
+    )
+}
+
+fn independent_ranked_verification_offsets_v2(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Independently reconstruct the terminal-column reservation. When the
+    // packed pair already includes the terminal byte, preserve three ranked
+    // verification columns instead.
+    let terminal_offset = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let force_terminal = terminal_offset
+        .is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let ranked = literal
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            let offset = u16::try_from(offset).ok()?;
+            (offset != primary_offset
+                && Some(offset) != secondary_offset
+                && (!force_terminal || Some(offset) != terminal_offset))
+                .then_some((INDEPENDENT_BYTE_FREQUENCY_RANK[usize::from(byte)], offset))
+        });
+    let mut selected = [None; 3];
+    for candidate in ranked {
+        if selected[0].is_none_or(|current| candidate < current) {
+            selected[2] = selected[1];
+            selected[1] = selected[0];
+            selected[0] = Some(candidate);
+        } else if selected[1].is_none_or(|current| candidate < current) {
+            selected[2] = selected[1];
+            selected[1] = Some(candidate);
+        } else if selected[2].is_none_or(|current| candidate < current) {
+            selected[2] = Some(candidate);
+        }
+    }
+    (
+        selected[0].map(|(_, offset)| offset),
+        selected[1].map(|(_, offset)| offset),
+        if force_terminal {
+            terminal_offset
+        } else {
+            selected[2].map(|(_, offset)| offset)
+        },
     )
 }
 
@@ -4307,6 +4410,7 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
             destination, base, ..
         } => forbidden(&[destination, base]),
         DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::LoadVectorPair128 { base, .. }
         | DecodedInstruction::SveLoadBytes { base, .. } => forbidden(&[base]),
         DecodedInstruction::LoadByteRegister {
             destination,
@@ -4337,8 +4441,12 @@ pub(crate) fn first_forbidden_explicit_gpr(instruction: DecodedInstruction) -> O
         | DecodedInstruction::SveCompareEqualBytes { .. }
         | DecodedInstruction::Sve2MatchBytes { .. }
         | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { .. }
         | DecodedInstruction::SveTestPredicateBytes { .. }
         | DecodedInstruction::SveBreakBeforeBytes { .. }
+        | DecodedInstruction::SveBreakAfterBytes { .. }
         | DecodedInstruction::Branch { .. }
         | DecodedInstruction::BranchCondition { .. }
         | DecodedInstruction::Return => None,
@@ -4350,6 +4458,7 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
         registers.iter().copied().find(|&register| register > 5)
     }
     match instruction {
+        DecodedInstruction::LoadVectorPair128 { .. } => Some(u8::MAX),
         DecodedInstruction::LoadVector128 { destination, .. }
         | DecodedInstruction::DuplicateByte16 { destination, .. }
         | DecodedInstruction::SveDuplicateByte { destination, .. }
@@ -4385,11 +4494,34 @@ fn first_forbidden_aggregate_vector_register(instruction: DecodedInstruction) ->
             predicate,
             left,
             right,
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
         } => forbidden(&[destination, predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             forbidden(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             destination,
             predicate,
             source,
@@ -4429,8 +4561,14 @@ fn first_forbidden_search_vector_register(
 ) -> Option<u8> {
     fn forbidden(registers: &[u8], backend_version: BackendVersion) -> Option<u8> {
         registers.iter().copied().find(|&register| {
-            register > 7
-                && !(backend_version == BackendVersion::SEARCH_V7 && matches!(register, 16 | 17))
+            let versioned_caller_saved = match backend_version {
+                BackendVersion::SEARCH_V7 => matches!(register, 16 | 17),
+                BackendVersion::SEARCH_V8
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2 => register >= 16,
+                _ => false,
+            };
+            register > 7 && !versioned_caller_saved
         })
     }
     fn forbidden_predicates(registers: &[u8]) -> Option<u8> {
@@ -4439,7 +4577,10 @@ fn first_forbidden_search_vector_register(
     if instruction.is_sve()
         && !matches!(
             backend_version,
-            BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
+            BackendVersion::SEARCH_SVE16_V1
+                | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         )
     {
         return Some(0);
@@ -4450,6 +4591,11 @@ fn first_forbidden_search_vector_register(
         | DecodedInstruction::SveDuplicateByte { destination, .. } => {
             forbidden(&[destination], backend_version)
         }
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            ..
+        } => forbidden(&[first_destination, second_destination], backend_version),
         DecodedInstruction::CompareEqualBytes16 {
             destination,
             left,
@@ -4512,11 +4658,34 @@ fn first_forbidden_search_vector_register(
             predicate,
             left,
             right,
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
         } => forbidden_predicates(&[destination, predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             forbidden_predicates(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             destination,
             predicate,
             source,
@@ -5363,9 +5532,7 @@ fn validate_aggregate_definite_initialization(
         if let Some(destination) = instruction.written_gpr() {
             output.gpr |= register_mask(&[destination]);
         }
-        if let Some(destination) = aggregate_vector_write(instruction) {
-            output.vector |= register_mask(&[destination]);
-        }
+        output.vector |= aggregate_vector_writes(instruction);
         if let Some(destination) = aggregate_predicate_write(instruction) {
             output.predicate |= predicate_mask(&[destination]);
         }
@@ -5433,6 +5600,7 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::CountLeadingZeros64 { source, .. } => register_mask(&[source]),
         DecodedInstruction::LoadByte { base, .. }
         | DecodedInstruction::LoadVector128 { base, .. }
+        | DecodedInstruction::LoadVectorPair128 { base, .. }
         | DecodedInstruction::SveLoadBytes { base, .. } => register_mask(&[base]),
         DecodedInstruction::LoadByteRegister { base, index, .. }
         | DecodedInstruction::Load64RegisterScaled { base, index, .. } => {
@@ -5458,8 +5626,12 @@ fn aggregate_gpr_reads(instruction: DecodedInstruction) -> u32 {
         | DecodedInstruction::SveCompareEqualBytes { .. }
         | DecodedInstruction::Sve2MatchBytes { .. }
         | DecodedInstruction::SveAndPredicateBytes { .. }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { .. }
         | DecodedInstruction::SveTestPredicateBytes { .. }
         | DecodedInstruction::SveBreakBeforeBytes { .. }
+        | DecodedInstruction::SveBreakAfterBytes { .. }
         | DecodedInstruction::SveCountPredicateBytes { .. }
         | DecodedInstruction::Address { .. }
         | DecodedInstruction::Branch { .. }
@@ -5484,8 +5656,13 @@ fn aggregate_vector_reads(instruction: DecodedInstruction) -> u32 {
     }
 }
 
-const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
+fn aggregate_vector_writes(instruction: DecodedInstruction) -> u32 {
     match instruction {
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            ..
+        } => register_mask(&[first_destination, second_destination]),
         DecodedInstruction::LoadVector128 { destination, .. }
         | DecodedInstruction::DuplicateByte16 { destination, .. }
         | DecodedInstruction::CompareEqualBytes16 { destination, .. }
@@ -5496,8 +5673,8 @@ const fn aggregate_vector_write(instruction: DecodedInstruction) -> Option<u8> {
         | DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 { destination, .. }
         | DecodedInstruction::AddAcrossBytes16 { destination, .. }
         | DecodedInstruction::SveDuplicateByte { destination, .. }
-        | DecodedInstruction::SveLoadBytes { destination, .. } => Some(destination),
-        _ => None,
+        | DecodedInstruction::SveLoadBytes { destination, .. } => register_mask(&[destination]),
+        _ => 0,
     }
 }
 
@@ -5510,11 +5687,32 @@ fn aggregate_predicate_reads(instruction: DecodedInstruction) -> u16 {
             left,
             right,
             ..
+        }
+        | DecodedInstruction::SveAndPredicateBytesSetFlags {
+            predicate,
+            left,
+            right,
+            ..
+        }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            predicate,
+            left,
+            right,
+            ..
+        }
+        | DecodedInstruction::SveBitClearPredicateBytes {
+            predicate,
+            left,
+            right,
+            ..
         } => predicate_mask(&[predicate, left, right]),
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             predicate_mask(&[predicate, tested])
         }
         DecodedInstruction::SveBreakBeforeBytes {
+            predicate, source, ..
+        }
+        | DecodedInstruction::SveBreakAfterBytes {
             predicate, source, ..
         }
         | DecodedInstruction::SveCountPredicateBytes {
@@ -5529,7 +5727,11 @@ const fn aggregate_predicate_write(instruction: DecodedInstruction) -> Option<u8
         DecodedInstruction::SvePtrueBytesVl16 { destination }
         | DecodedInstruction::Sve2MatchBytes { destination, .. }
         | DecodedInstruction::SveAndPredicateBytes { destination, .. }
-        | DecodedInstruction::SveBreakBeforeBytes { destination, .. } => Some(destination),
+        | DecodedInstruction::SveAndPredicateBytesSetFlags { destination, .. }
+        | DecodedInstruction::SveBitClearPredicateBytesSetFlags { destination, .. }
+        | DecodedInstruction::SveBitClearPredicateBytes { destination, .. }
+        | DecodedInstruction::SveBreakBeforeBytes { destination, .. }
+        | DecodedInstruction::SveBreakAfterBytes { destination, .. } => Some(destination),
         _ => None,
     }
 }

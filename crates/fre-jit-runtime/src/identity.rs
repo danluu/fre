@@ -11,7 +11,10 @@ impl RuntimeIdentity {
     ///
     /// Emission computes the canonical AOT digest once before returning the
     /// image. This accessor is O(1), allocation-free, and performs no rehash.
-    /// Executable publication independently audits the image again.
+    /// Generic executable publication re-runs the same independent auditor to
+    /// detect intervening mutation; that repetition adds no separate audit
+    /// implementation. Emitter-attested publication safely retains the
+    /// finalization result instead.
     #[must_use]
     pub const fn for_image(image: &NativeImage) -> Self {
         Self::from_preflight_image(image)

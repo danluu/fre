@@ -1,8 +1,18 @@
-pub const QUALIFIED_EXACT_SEARCH_QUALIFICATION: super::QualifiedExactSearchQualification =
-    super::QualifiedExactSearchQualification::Qualified {
-        bundle_sha256: [
-            0xde, 0x08, 0x4f, 0xf0, 0x56, 0x4a, 0xcd, 0xb8, 0x98, 0x89, 0xf2, 0x8b, 0x9d, 0xcf,
-            0xdd, 0xce, 0x9b, 0x6f, 0x09, 0x55, 0xa1, 0xb2, 0xae, 0xad, 0x30, 0xd7, 0x57, 0x70,
-            0x03, 0x9e, 0x04, 0x53,
-        ],
-    };
+use super::QualifiedExactSearchQualification;
+
+/// Qualification atom scoped only to `SearchBackendPolicy::AsimdV8` / tag 8.
+pub const QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION: QualifiedExactSearchQualification =
+    QualifiedExactSearchQualification::Candidate;
+
+/// Qualification atom scoped only to `SearchBackendPolicy::Sve16V6` / tag 19.
+pub const QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION: QualifiedExactSearchQualification =
+    QualifiedExactSearchQualification::Candidate;
+
+/// Qualification atom scoped only to `SearchBackendPolicy::Sve2Fixed16` / tag 10.
+pub const QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION: QualifiedExactSearchQualification =
+    QualifiedExactSearchQualification::Candidate;
+
+/// Qualification atom scoped only to `SearchBackendPolicy::Sve2Fixed16V2` /
+/// tag 21.
+pub const QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION: QualifiedExactSearchQualification =
+    QualifiedExactSearchQualification::Candidate;

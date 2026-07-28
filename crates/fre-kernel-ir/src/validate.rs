@@ -1,13 +1,20 @@
 use core::marker::PhantomData;
 
 use crate::{
-    AbiVersion, ArithmeticSite, BlockId, BlockOp, ByteClass, CacheIdentity, DataBlob, DataId,
-    InvalidProgram, Operation, RawProgram, ResourceKind, SemanticsVersion, SerializedProgram,
-    ValidateError,
-    serialize::{serialize, serialized_size},
+    AbiVersion, ArithmeticSite, Block, BlockId, BlockOp, ByteClass, CacheIdentity, DataBlob,
+    DataId, InvalidProgram, Operation, RawProgram, ResourceKind, SemanticsVersion,
+    SerializedProgram, ValidateError,
+    serialize::{identity_inline_scratch_bytes, serialization_inline_scratch_bytes, serialize},
 };
 
 const HARD_MAX_BLOCKS: usize = 64;
+const RESOURCE_ACCOUNTING_VERSION: u16 = 2;
+const DEFAULT_CONSTRUCTION_BYTES: u64 = 4 << 20;
+const RAW_HEADER_CHECK_WORK: u64 = 4;
+// One hash can materialize a digest, a staging identity and retained identity
+// storage. These constants deliberately charge the non-elided copy model.
+const IDENTITY_INITIALIZATION_WORK_PER_HASH: u64 = 128;
+const IDENTITY_COPY_WORK_PER_HASH: u64 = 96;
 
 /// Hard admission limits for an untrusted raw program.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,9 +24,17 @@ pub struct ValidateLimits {
     pub max_data_blobs: u64,
     pub max_data_bytes: u64,
     pub max_serialized_bytes: u64,
+    pub max_serialized_capacity_bytes: u64,
+    pub max_construction_allocation_bytes: u64,
+    pub max_raw_program_capacity_bytes: u64,
     pub max_estimated_code_bytes: u64,
     pub max_validation_work: u64,
+    pub max_construction_work: u64,
     pub max_validation_scratch_bytes: u64,
+    pub max_validation_phase_bytes: u64,
+    pub max_serialization_phase_bytes: u64,
+    pub max_identity_phase_bytes: u64,
+    pub max_retained_program_bytes: u64,
     pub max_work_factor: u64,
 }
 
@@ -31,11 +46,193 @@ impl Default for ValidateLimits {
             max_data_blobs: 16,
             max_data_bytes: 1 << 20,
             max_serialized_bytes: (1 << 20) + 4_096,
+            max_serialized_capacity_bytes: (1 << 20) + 4_096,
+            max_construction_allocation_bytes: DEFAULT_CONSTRUCTION_BYTES,
+            max_raw_program_capacity_bytes: 2 << 20,
             max_estimated_code_bytes: 1 << 20,
             max_validation_work: 8 << 20,
-            max_validation_scratch_bytes: 1 << 20,
+            max_construction_work: 16 << 20,
+            max_validation_scratch_bytes: 4_096,
+            max_validation_phase_bytes: DEFAULT_CONSTRUCTION_BYTES,
+            max_serialization_phase_bytes: DEFAULT_CONSTRUCTION_BYTES,
+            max_identity_phase_bytes: DEFAULT_CONSTRUCTION_BYTES,
+            max_retained_program_bytes: DEFAULT_CONSTRUCTION_BYTES,
             max_work_factor: (1 << 20) + 16,
         }
+    }
+}
+
+/// Versioned resource receipt for validation and fixed-shape construction.
+///
+/// Work is denominated in conservative logical touches: one admitted
+/// initialized storage byte, one copied byte, one hashed byte, or one
+/// validator step.
+/// Capacity and phase fields use observed allocator capacities, not requested
+/// logical lengths. `allocation_request_bytes` covers allocations performed
+/// by this construction call: raw fixed-shape allocations plus serialization
+/// for the builders, and serialization alone for caller-supplied raw input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResourceAccounting {
+    version: u16,
+    allocation_requests: u8,
+    literal_allocation_request_bytes: usize,
+    block_allocation_request_bytes: usize,
+    data_table_allocation_request_bytes: usize,
+    raw_allocation_request_bytes: usize,
+    serialized_allocation_request_bytes: usize,
+    allocation_request_bytes: usize,
+    literal_capacity_bytes: usize,
+    block_capacity_bytes: usize,
+    data_table_capacity_bytes: usize,
+    raw_program_capacity_bytes: usize,
+    serialized_capacity_bytes: usize,
+    planning_work: u64,
+    initialization_work: u64,
+    copy_work: u64,
+    hash_invocations: u8,
+    hash_work: u64,
+    validation_work: u64,
+    validation_work_upper_bound: u64,
+    construction_work: u64,
+    validation_scratch_bytes: usize,
+    validation_phase_peak_bytes: usize,
+    serialization_phase_peak_bytes: usize,
+    identity_phase_peak_bytes: usize,
+    retained_program_bytes: usize,
+}
+
+impl ResourceAccounting {
+    /// Current construction-resource accounting contract.
+    pub const VERSION: u16 = RESOURCE_ACCOUNTING_VERSION;
+
+    #[must_use]
+    pub const fn version(self) -> u16 {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn allocation_requests(self) -> u8 {
+        self.allocation_requests
+    }
+
+    #[must_use]
+    pub const fn literal_allocation_request_bytes(self) -> usize {
+        self.literal_allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn block_allocation_request_bytes(self) -> usize {
+        self.block_allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn data_table_allocation_request_bytes(self) -> usize {
+        self.data_table_allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn raw_allocation_request_bytes(self) -> usize {
+        self.raw_allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn serialized_allocation_request_bytes(self) -> usize {
+        self.serialized_allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn allocation_request_bytes(self) -> usize {
+        self.allocation_request_bytes
+    }
+
+    #[must_use]
+    pub const fn literal_capacity_bytes(self) -> usize {
+        self.literal_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn block_capacity_bytes(self) -> usize {
+        self.block_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn data_table_capacity_bytes(self) -> usize {
+        self.data_table_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn raw_program_capacity_bytes(self) -> usize {
+        self.raw_program_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn serialized_capacity_bytes(self) -> usize {
+        self.serialized_capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn planning_work(self) -> u64 {
+        self.planning_work
+    }
+
+    #[must_use]
+    pub const fn initialization_work(self) -> u64 {
+        self.initialization_work
+    }
+
+    #[must_use]
+    pub const fn copy_work(self) -> u64 {
+        self.copy_work
+    }
+
+    #[must_use]
+    pub const fn hash_invocations(self) -> u8 {
+        self.hash_invocations
+    }
+
+    #[must_use]
+    pub const fn hash_work(self) -> u64 {
+        self.hash_work
+    }
+
+    #[must_use]
+    pub const fn validation_work(self) -> u64 {
+        self.validation_work
+    }
+
+    #[must_use]
+    pub const fn validation_work_upper_bound(self) -> u64 {
+        self.validation_work_upper_bound
+    }
+
+    #[must_use]
+    pub const fn construction_work(self) -> u64 {
+        self.construction_work
+    }
+
+    #[must_use]
+    pub const fn validation_scratch_bytes(self) -> usize {
+        self.validation_scratch_bytes
+    }
+
+    #[must_use]
+    pub const fn validation_phase_peak_bytes(self) -> usize {
+        self.validation_phase_peak_bytes
+    }
+
+    #[must_use]
+    pub const fn serialization_phase_peak_bytes(self) -> usize {
+        self.serialization_phase_peak_bytes
+    }
+
+    #[must_use]
+    pub const fn identity_phase_peak_bytes(self) -> usize {
+        self.identity_phase_peak_bytes
+    }
+
+    #[must_use]
+    pub const fn retained_program_bytes(self) -> usize {
+        self.retained_program_bytes
     }
 }
 
@@ -48,8 +245,8 @@ pub struct ProgramStats {
     data_bytes: usize,
     serialized_bytes: usize,
     estimated_code_bytes: usize,
-    validation_work: u64,
     work_factor: u64,
+    resources: ResourceAccounting,
 }
 
 impl ProgramStats {
@@ -79,6 +276,12 @@ impl ProgramStats {
         self.serialized_bytes
     }
 
+    /// Retained serializer allocation, including allocator-rounded capacity.
+    #[must_use]
+    pub const fn serialized_capacity_bytes(self) -> usize {
+        self.resources.serialized_capacity_bytes
+    }
+
     #[must_use]
     pub const fn estimated_code_bytes(self) -> usize {
         self.estimated_code_bytes
@@ -86,22 +289,26 @@ impl ProgramStats {
 
     #[must_use]
     pub const fn validation_work(self) -> u64 {
-        self.validation_work
+        self.resources.validation_work
     }
 
     #[must_use]
     pub const fn work_factor(self) -> u64 {
         self.work_factor
     }
+
+    #[must_use]
+    pub const fn resources(self) -> ResourceAccounting {
+        self.resources
+    }
 }
 
 /// Immutable program that passed structural, resource and flow validation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ValidatedProgram<O: Operation> {
     pub(crate) raw: RawProgram,
     stats: ProgramStats,
     serialized: SerializedProgram,
-    identity: CacheIdentity,
     operation: PhantomData<O>,
 }
 
@@ -123,7 +330,7 @@ impl<O: Operation> ValidatedProgram<O> {
 
     #[must_use]
     pub const fn cache_identity(&self) -> CacheIdentity {
-        self.identity
+        self.serialized.identity()
     }
 
     /// Conservative portable-oracle work bound for a window width.
@@ -141,19 +348,231 @@ impl<O: Operation> ValidatedProgram<O> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ConstructionSeed {
+    pub(crate) raw_allocation_requests: u8,
+    pub(crate) literal_allocation_request_bytes: usize,
+    pub(crate) block_allocation_request_bytes: usize,
+    pub(crate) data_table_allocation_request_bytes: usize,
+    pub(crate) allocation_request_bytes: usize,
+    pub(crate) planning_work: u64,
+    pub(crate) initialization_work: u64,
+    pub(crate) copy_work: u64,
+    pub(crate) additional_hash_invocations: u8,
+    pub(crate) additional_hash_work: u64,
+    pub(crate) additional_retained_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FixedShapeAdmission {
+    dimensions: Dimensions,
+    seed: ConstructionSeed,
+    raw_metadata_planning_work: u64,
+}
+
+impl FixedShapeAdmission {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the audited fixed-shape receipt lists each independent resource component"
+    )]
+    pub(crate) fn new(
+        blocks: usize,
+        data_blobs: usize,
+        serialized_bytes: usize,
+        raw_allocation_requests: u8,
+        literal_allocation_request_bytes: usize,
+        block_allocation_request_bytes: usize,
+        data_table_allocation_request_bytes: usize,
+        planning_work: u64,
+        raw_initialization_work: u64,
+        raw_copy_work: u64,
+        validation_work_upper_bound: u64,
+        additional_hash_invocations: u8,
+        additional_hash_work: u64,
+        additional_retained_bytes: usize,
+    ) -> Result<Self, ValidateError> {
+        let serialized_bytes_u64 =
+            u64::try_from(serialized_bytes).map_err(|_| ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::SerializedBytes,
+            })?;
+        let raw_allocation_request_bytes = literal_allocation_request_bytes
+            .checked_add(block_allocation_request_bytes)
+            .and_then(|bytes| bytes.checked_add(data_table_allocation_request_bytes))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionAllocationBytes,
+            })?;
+        Ok(Self {
+            dimensions: Dimensions {
+                data_bytes: 0,
+                serialized_bytes,
+                serialized_bytes_u64,
+                estimated_code_bytes: 0,
+                work_factor: 0,
+                raw_program_capacity_bytes: raw_allocation_request_bytes,
+                literal_capacity_bytes: 0,
+                block_capacity_bytes: 0,
+                data_table_capacity_bytes: 0,
+                validation_work_upper_bound,
+            },
+            seed: ConstructionSeed {
+                raw_allocation_requests,
+                literal_allocation_request_bytes,
+                block_allocation_request_bytes,
+                data_table_allocation_request_bytes,
+                allocation_request_bytes: raw_allocation_request_bytes,
+                planning_work,
+                initialization_work: raw_initialization_work,
+                copy_work: raw_copy_work,
+                additional_hash_invocations,
+                additional_hash_work,
+                additional_retained_bytes,
+            },
+            raw_metadata_planning_work: raw_metadata_planning_envelope(blocks, data_blobs)?
+                .total()?,
+        })
+    }
+
+    pub(crate) fn admit<O: Operation>(
+        mut self,
+        observed_raw_capacity_bytes: usize,
+        limits: ValidateLimits,
+    ) -> Result<(), ValidateError> {
+        self.dimensions.raw_program_capacity_bytes = observed_raw_capacity_bytes;
+        let mut prospective_seed = self.seed;
+        prospective_seed.planning_work = prospective_seed
+            .planning_work
+            .checked_add(self.raw_metadata_planning_work)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let work = ConstructionWork::new(self.dimensions, prospective_seed)?;
+        admit_prospective::<O>(self.dimensions, work, limits)
+    }
+
+    pub(crate) const fn seed(self) -> ConstructionSeed {
+        self.seed
+    }
+}
+
+pub(crate) fn fixed_shape_validation_work_upper_bound(
+    blocks: usize,
+    data_blobs: usize,
+    comparison_work: u64,
+) -> Result<u64, ValidateError> {
+    let blocks = u64::try_from(blocks).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ValidationWork,
+    })?;
+    let data = u64::try_from(data_blobs).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ValidationWork,
+    })?;
+    validation_work_formula(blocks, data, comparison_work)
+}
+
+#[derive(Clone, Copy)]
+struct RawMetadataPlanningEnvelope {
+    header: u64,
+    block_census: u64,
+    data_census: u64,
+    comparison_scan: u64,
+    pair_planning: u64,
+}
+
+impl RawMetadataPlanningEnvelope {
+    fn total(self) -> Result<u64, ValidateError> {
+        self.header
+            .checked_add(self.block_census)
+            .and_then(|work| work.checked_add(self.data_census))
+            .and_then(|work| work.checked_add(self.comparison_scan))
+            .and_then(|work| work.checked_add(self.pair_planning))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })
+    }
+}
+
+fn raw_metadata_planning_envelope(
+    blocks: usize,
+    data_blobs: usize,
+) -> Result<RawMetadataPlanningEnvelope, ValidateError> {
+    let blocks = u64::try_from(blocks).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ConstructionWork,
+    })?;
+    let data = u64::try_from(data_blobs).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ConstructionWork,
+    })?;
+    // `blob_compare_work` reads the two data-entry headers for each unordered
+    // pair. Literal contents are read only by the later admitted validator.
+    let pair_planning =
+        data.saturating_sub(1)
+            .checked_mul(data)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+    Ok(RawMetadataPlanningEnvelope {
+        header: RAW_HEADER_CHECK_WORK,
+        block_census: blocks,
+        data_census: data,
+        comparison_scan: data,
+        pair_planning,
+    })
+}
+
 impl RawProgram {
     /// Validate an untrusted raw program for one compile-time output contract.
     pub fn validate<O: Operation>(
         self,
         limits: ValidateLimits,
     ) -> Result<ValidatedProgram<O>, ValidateError> {
-        let (dimensions, mut meter) = Validator::new(&self, limits).run::<O>()?;
-        // Serialization and hashing each touch every serialized byte.
-        meter.charge(dimensions.serialized_bytes_u64)?;
-        meter.charge(dimensions.serialized_bytes_u64)?;
-        let serialized = serialize(&self, dimensions.serialized_bytes)
-            .map_err(|resource| ValidateError::AllocationFailed { resource })?;
-        let identity = serialized.identity();
+        self.validate_accounted::<O>(limits, ConstructionSeed::default())
+    }
+
+    pub(crate) fn validate_accounted<O: Operation>(
+        self,
+        limits: ValidateLimits,
+        mut seed: ConstructionSeed,
+    ) -> Result<ValidatedProgram<O>, ValidateError> {
+        let mut planning = PlanningMeter::new(seed.planning_work, limits.max_construction_work);
+        planning.charge(RAW_HEADER_CHECK_WORK)?;
+        validate_headers::<O>(&self)?;
+        admit_raw_shape_counts(&self, limits)?;
+        let metadata_planning = raw_metadata_planning_envelope(self.blocks.len(), self.data.len())?;
+        let admitted_planning_work = seed
+            .planning_work
+            .checked_add(metadata_planning.total()?)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        enforce_work(
+            ResourceKind::ConstructionWork,
+            admitted_planning_work,
+            limits.max_construction_work,
+        )?;
+        let dimensions = preflight_dimensions(&self, limits, &mut planning)?;
+        ensure_planning_complete(admitted_planning_work, planning.consumed)?;
+        seed.planning_work = planning.consumed;
+        let work = ConstructionWork::new(dimensions, seed)?;
+        admit_prospective::<O>(dimensions, work, limits)?;
+
+        let mut meter = WorkMeter::new(limits.max_validation_work);
+        meter = Validator::new(&self, meter).run::<O>()?;
+        let actual_validation_work = meter.consumed;
+        let mut accounting = resource_accounting::<O>(
+            dimensions,
+            work,
+            dimensions.serialized_bytes,
+            actual_validation_work,
+        )?;
+        admit_accounting(accounting, limits)?;
+        let serialized = serialize(
+            &self,
+            dimensions.serialized_bytes,
+            limits.max_serialized_capacity_bytes,
+            |capacity| {
+                accounting =
+                    resource_accounting::<O>(dimensions, work, capacity, actual_validation_work)?;
+                admit_accounting(accounting, limits)
+            },
+        )?;
         let stats = ProgramStats {
             blocks: self.blocks.len(),
             instructions: self.blocks.len(),
@@ -161,17 +580,38 @@ impl RawProgram {
             data_bytes: dimensions.data_bytes,
             serialized_bytes: dimensions.serialized_bytes,
             estimated_code_bytes: dimensions.estimated_code_bytes,
-            validation_work: meter.consumed,
             work_factor: dimensions.work_factor,
+            resources: accounting,
         };
         Ok(ValidatedProgram {
             raw: self,
             stats,
             serialized,
-            identity,
             operation: PhantomData,
         })
     }
+}
+
+fn validate_headers<O: Operation>(raw: &RawProgram) -> Result<(), ValidateError> {
+    if raw.schema_version != RawProgram::SCHEMA_VERSION {
+        return Err(InvalidProgram::SchemaVersion {
+            actual: raw.schema_version,
+        }
+        .into());
+    }
+    if raw.semantics != SemanticsVersion::CURRENT {
+        return Err(InvalidProgram::SemanticsVersion {
+            actual: raw.semantics.0,
+        }
+        .into());
+    }
+    if raw.abi != AbiVersion::CURRENT {
+        return Err(InvalidProgram::AbiVersion { actual: raw.abi.0 }.into());
+    }
+    if raw.output != O::KIND {
+        return Err(InvalidProgram::OutputContract.into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,31 +626,28 @@ enum FlowState {
 
 struct Validator<'a> {
     raw: &'a RawProgram,
-    limits: ValidateLimits,
     meter: WorkMeter,
     reachable: [bool; HARD_MAX_BLOCKS],
     data_use: [u32; HARD_MAX_BLOCKS],
 }
 
 impl<'a> Validator<'a> {
-    const fn new(raw: &'a RawProgram, limits: ValidateLimits) -> Self {
+    const fn new(raw: &'a RawProgram, meter: WorkMeter) -> Self {
         Self {
             raw,
-            limits,
-            meter: WorkMeter::new(limits.max_validation_work),
+            meter,
             reachable: [false; HARD_MAX_BLOCKS],
             data_use: [0; HARD_MAX_BLOCKS],
         }
     }
 
-    fn run<O: Operation>(mut self) -> Result<(Dimensions, WorkMeter), ValidateError> {
+    fn run<O: Operation>(mut self) -> Result<WorkMeter, ValidateError> {
         self.validate_headers::<O>()?;
-        let dimensions = preflight_dimensions(self.raw, self.limits, &mut self.meter)?;
         self.validate_targets_and_flow()?;
         self.validate_reachability()?;
         self.validate_data()?;
         self.validate_topology_and_dominance()?;
-        Ok((dimensions, self.meter))
+        Ok(self.meter)
     }
 
     fn validate_headers<O: Operation>(&mut self) -> Result<(), ValidateError> {
@@ -370,14 +807,18 @@ impl<'a> Validator<'a> {
                 }
                 .into());
             }
-            if matches!(blob, DataBlob::ByteClass(class) if class.is_empty()) {
-                return Err(InvalidProgram::EmptyClass {
-                    data: index_id(index)?,
+            if let DataBlob::ByteClass(class) = blob {
+                self.meter.charge(4)?;
+                if class.is_empty() {
+                    return Err(InvalidProgram::EmptyClass {
+                        data: index_id(index)?,
+                    }
+                    .into());
                 }
-                .into());
             }
             for prior in 0..index {
-                self.meter.charge(1)?;
+                self.meter
+                    .charge(blob_compare_work(blob, &self.raw.data[prior])?)?;
                 if blob == &self.raw.data[prior] {
                     return Err(InvalidProgram::DuplicateData {
                         first: index_id(prior)?,
@@ -624,13 +1065,118 @@ struct Dimensions {
     serialized_bytes_u64: u64,
     estimated_code_bytes: usize,
     work_factor: u64,
+    raw_program_capacity_bytes: usize,
+    literal_capacity_bytes: usize,
+    block_capacity_bytes: usize,
+    data_table_capacity_bytes: usize,
+    validation_work_upper_bound: u64,
 }
 
-fn preflight_dimensions(
-    raw: &RawProgram,
-    limits: ValidateLimits,
-    meter: &mut WorkMeter,
-) -> Result<Dimensions, ValidateError> {
+const SERIALIZED_HEADER_BYTES: usize = 27;
+
+#[derive(Clone, Copy)]
+struct DimensionCensus {
+    serialized: Option<usize>,
+    estimated_code: Option<usize>,
+    longest_literal: usize,
+}
+
+impl DimensionCensus {
+    const fn new() -> Self {
+        Self {
+            serialized: Some(SERIALIZED_HEADER_BYTES),
+            estimated_code: Some(0),
+            longest_literal: 0,
+        }
+    }
+
+    fn observe_block(&mut self, op: &BlockOp) {
+        let (serialized_bytes, estimated_code_bytes) = match op {
+            BlockOp::Entry { .. } => (5, 16),
+            BlockOp::ScanLiteral { .. } | BlockOp::ConfirmSuffix { .. } => (14, 160),
+            BlockOp::ScanClassStart { .. } => (14, 192),
+            BlockOp::ExtendClassRun { .. } => (9, 128),
+            BlockOp::AdvanceAfterReject { .. } => (5, 32),
+            BlockOp::ReturnFound | BlockOp::ReturnNone => (1, 32),
+        };
+        accumulate_checked(&mut self.serialized, Some(serialized_bytes));
+        accumulate_checked(&mut self.estimated_code, Some(estimated_code_bytes));
+    }
+
+    fn observe_data(&mut self, blob: &DataBlob, payload_bytes: usize) {
+        accumulate_checked(&mut self.serialized, payload_bytes.checked_add(5));
+        let padded = payload_bytes.checked_add(15).map(|value| value & !15);
+        accumulate_checked(&mut self.estimated_code, padded);
+        if matches!(blob, DataBlob::Bytes(_)) {
+            self.longest_literal = self.longest_literal.max(payload_bytes);
+        }
+    }
+
+    fn finish(
+        self,
+        data_bytes: usize,
+        limits: ValidateLimits,
+    ) -> Result<Dimensions, ValidateError> {
+        enforce_count(ResourceKind::DataBytes, data_bytes, limits.max_data_bytes)?;
+        let serialized_bytes = self.serialized.ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::SerializedBytes,
+        })?;
+        let serialized_bytes_u64 = enforce_count(
+            ResourceKind::SerializedBytes,
+            serialized_bytes,
+            limits.max_serialized_bytes,
+        )?;
+        enforce_count(
+            ResourceKind::SerializedCapacityBytes,
+            serialized_bytes,
+            limits.max_serialized_capacity_bytes,
+        )?;
+        let estimated_code_bytes =
+            self.estimated_code
+                .ok_or(ValidateError::ArithmeticOverflow {
+                    site: ArithmeticSite::EstimatedCodeBytes,
+                })?;
+        enforce_count(
+            ResourceKind::EstimatedCodeBytes,
+            estimated_code_bytes,
+            limits.max_estimated_code_bytes,
+        )?;
+        let work_factor = u64::try_from(self.longest_literal)
+            .ok()
+            .and_then(|value| value.checked_add(8))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::WorkFactor,
+            })?;
+        if work_factor > limits.max_work_factor {
+            return Err(ValidateError::ResourceLimit {
+                resource: ResourceKind::WorkFactor,
+                limit: limits.max_work_factor,
+                required: work_factor,
+            });
+        }
+        Ok(Dimensions {
+            data_bytes,
+            serialized_bytes,
+            serialized_bytes_u64,
+            estimated_code_bytes,
+            work_factor,
+            raw_program_capacity_bytes: 0,
+            literal_capacity_bytes: 0,
+            block_capacity_bytes: 0,
+            data_table_capacity_bytes: 0,
+            validation_work_upper_bound: 0,
+        })
+    }
+}
+
+fn accumulate_checked(total: &mut Option<usize>, increment: Option<usize>) {
+    let Some(current) = *total else {
+        return;
+    };
+    *total = increment.and_then(|increment| current.checked_add(increment));
+}
+
+fn admit_raw_shape_counts(raw: &RawProgram, limits: ValidateLimits) -> Result<(), ValidateError> {
     enforce_count(ResourceKind::Blocks, raw.blocks.len(), limits.max_blocks)?;
     enforce_count(
         ResourceKind::Instructions,
@@ -652,29 +1198,81 @@ fn preflight_dimensions(
         raw.data.len(),
         u64::try_from(HARD_MAX_BLOCKS).expect("small constant"),
     )?;
-    let per_slot = core::mem::size_of::<bool>()
-        .checked_mul(2)
-        .and_then(|value| value.checked_add(core::mem::size_of::<u32>()))
-        .and_then(|value| value.checked_add(core::mem::size_of::<usize>()))
-        .ok_or(ValidateError::ArithmeticOverflow {
-            site: ArithmeticSite::ValidationWork,
-        })?;
-    let scratch =
-        HARD_MAX_BLOCKS
-            .checked_mul(per_slot)
-            .ok_or(ValidateError::ArithmeticOverflow {
-                site: ArithmeticSite::ValidationWork,
-            })?;
+    Ok(())
+}
+
+fn preflight_dimensions(
+    raw: &RawProgram,
+    limits: ValidateLimits,
+    planning: &mut PlanningMeter,
+) -> Result<Dimensions, ValidateError> {
     enforce_count(
         ResourceKind::ValidationScratchBytes,
-        scratch,
+        validation_scratch_bytes()?,
         limits.max_validation_scratch_bytes,
     )?;
+    let minimum_validation_work =
+        fixed_shape_validation_work_upper_bound(raw.blocks.len(), raw.data.len(), 0)?;
+    enforce_work(
+        ResourceKind::ValidationWork,
+        minimum_validation_work,
+        limits.max_validation_work,
+    )?;
+    let block_capacity = raw
+        .blocks
+        .capacity()
+        .checked_mul(core::mem::size_of::<Block>())
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    let data_table_capacity = raw
+        .data
+        .capacity()
+        .checked_mul(core::mem::size_of::<DataBlob>())
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    let mut raw_capacity = block_capacity.checked_add(data_table_capacity).ok_or(
+        ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        },
+    )?;
+    let mut literal_capacity = 0_usize;
+    enforce_count(
+        ResourceKind::RawProgramCapacityBytes,
+        raw_capacity,
+        limits.max_raw_program_capacity_bytes,
+    )?;
+
+    // Census retained headers and payload lengths. The hard 64-slot bound
+    // makes this a fixed-size metadata pass; it never reads literal contents.
+    let mut census = DimensionCensus::new();
+    for block in &raw.blocks {
+        planning.charge(1)?;
+        census.observe_block(&block.op);
+    }
     let mut data_bytes = 0_usize;
     for blob in &raw.data {
-        meter.charge(1)?;
+        planning.charge(1)?;
         let bytes = match blob {
-            DataBlob::Bytes(bytes) => bytes.len(),
+            DataBlob::Bytes(bytes) => {
+                literal_capacity = literal_capacity.checked_add(bytes.capacity()).ok_or(
+                    ValidateError::ArithmeticOverflow {
+                        site: ArithmeticSite::PhasePeakBytes,
+                    },
+                )?;
+                raw_capacity = raw_capacity.checked_add(bytes.capacity()).ok_or(
+                    ValidateError::ArithmeticOverflow {
+                        site: ArithmeticSite::PhasePeakBytes,
+                    },
+                )?;
+                enforce_count(
+                    ResourceKind::RawProgramCapacityBytes,
+                    raw_capacity,
+                    limits.max_raw_program_capacity_bytes,
+                )?;
+                bytes.len()
+            }
             DataBlob::ByteClass(_) => 32,
         };
         enforce_count(ResourceKind::DataBytes, bytes, u64::from(u32::MAX))?;
@@ -683,88 +1281,431 @@ fn preflight_dimensions(
             .ok_or(ValidateError::ArithmeticOverflow {
                 site: ArithmeticSite::DataBytes,
             })?;
+        census.observe_data(blob, bytes);
     }
-    enforce_count(ResourceKind::DataBytes, data_bytes, limits.max_data_bytes)?;
-    let serialized_bytes = serialized_size(raw).ok_or(ValidateError::ArithmeticOverflow {
-        site: ArithmeticSite::SerializedBytes,
+    let mut dimensions = census.finish(data_bytes, limits)?;
+    dimensions.raw_program_capacity_bytes = raw_capacity;
+    dimensions.literal_capacity_bytes = literal_capacity;
+    dimensions.block_capacity_bytes = block_capacity;
+    dimensions.data_table_capacity_bytes = data_table_capacity;
+    dimensions.validation_work_upper_bound = validation_work_upper_bound(raw, planning)?;
+    Ok(dimensions)
+}
+
+fn validation_scratch_bytes() -> Result<usize, ValidateError> {
+    let traversal = HARD_MAX_BLOCKS
+        .checked_mul(
+            core::mem::size_of::<bool>()
+                .checked_add(core::mem::size_of::<usize>())
+                .ok_or(ValidateError::ArithmeticOverflow {
+                    site: ArithmeticSite::PhasePeakBytes,
+                })?,
+        )
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    core::mem::size_of::<Validator<'static>>()
+        .checked_add(traversal)
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })
+}
+
+fn validation_work_upper_bound(
+    raw: &RawProgram,
+    planning: &mut PlanningMeter,
+) -> Result<u64, ValidateError> {
+    let blocks =
+        u64::try_from(raw.blocks.len()).map_err(|_| ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::ValidationWork,
+        })?;
+    let data = u64::try_from(raw.data.len()).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ValidationWork,
     })?;
-    let serialized_bytes_u64 = enforce_count(
-        ResourceKind::SerializedBytes,
-        serialized_bytes,
-        limits.max_serialized_bytes,
-    )?;
-    let estimated_code_bytes = estimate_code_bytes(raw)?;
-    enforce_count(
-        ResourceKind::EstimatedCodeBytes,
-        estimated_code_bytes,
-        limits.max_estimated_code_bytes,
-    )?;
-    let work_factor = compute_work_factor(raw)?;
-    if work_factor > limits.max_work_factor {
-        return Err(ValidateError::ResourceLimit {
-            resource: ResourceKind::WorkFactor,
-            limit: limits.max_work_factor,
-            required: work_factor,
-        });
+    let mut data_scan_work = 0_u64;
+    for (index, blob) in raw.data.iter().enumerate() {
+        planning.charge(1)?;
+        if matches!(blob, DataBlob::ByteClass(_)) {
+            data_scan_work =
+                data_scan_work
+                    .checked_add(4)
+                    .ok_or(ValidateError::ArithmeticOverflow {
+                        site: ArithmeticSite::ValidationWork,
+                    })?;
+        }
+        for prior in &raw.data[..index] {
+            planning.charge(2)?;
+            record_pair_planning_step();
+            data_scan_work = data_scan_work
+                .checked_add(blob_compare_work(blob, prior)?)
+                .ok_or(ValidateError::ArithmeticOverflow {
+                    site: ArithmeticSite::ValidationWork,
+                })?;
+        }
     }
-    Ok(Dimensions {
-        data_bytes,
-        serialized_bytes,
-        serialized_bytes_u64,
-        estimated_code_bytes,
-        work_factor,
+    validation_work_formula(blocks, data, data_scan_work)
+}
+
+fn validation_work_formula(
+    blocks: u64,
+    data_blobs: u64,
+    additional_data_work: u64,
+) -> Result<u64, ValidateError> {
+    // Per block: target/data checks <= 4, reachability <= 2, topology 1 and at
+    // most four dominance traversals. Per data entry: the primary data pass 1.
+    // The fixed 11 covers the duplicate four-header validator pass and the
+    // seven-edge class-shape check; literal shapes overpay it. The distinct
+    // preflight census and comparison planner are construction planning work.
+    blocks
+        .checked_mul(11)
+        .and_then(|work| work.checked_add(data_blobs))
+        .and_then(|work| work.checked_add(additional_data_work))
+        .and_then(|work| work.checked_add(11))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::ValidationWork,
+        })
+}
+
+fn blob_compare_work(left: &DataBlob, right: &DataBlob) -> Result<u64, ValidateError> {
+    let touches = match (left, right) {
+        (DataBlob::Bytes(left), DataBlob::Bytes(right)) => left.len().min(right.len()),
+        (DataBlob::ByteClass(_), DataBlob::ByteClass(_)) => 4,
+        (DataBlob::Bytes(_), DataBlob::ByteClass(_))
+        | (DataBlob::ByteClass(_), DataBlob::Bytes(_)) => 0,
+    };
+    u64::try_from(touches)
+        .ok()
+        .and_then(|touches| touches.checked_add(2))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::ValidationWork,
+        })
+}
+
+#[derive(Clone, Copy)]
+struct ConstructionWork {
+    allocation_requests: u8,
+    literal_allocation_request_bytes: usize,
+    block_allocation_request_bytes: usize,
+    data_table_allocation_request_bytes: usize,
+    raw_allocation_request_bytes: usize,
+    serialized_allocation_request_bytes: usize,
+    allocation_request_bytes: usize,
+    planning_work: u64,
+    initialization_work: u64,
+    copy_work: u64,
+    hash_invocations: u8,
+    hash_work: u64,
+    total_upper_bound: u64,
+    additional_retained_bytes: usize,
+}
+
+impl ConstructionWork {
+    fn new(dimensions: Dimensions, seed: ConstructionSeed) -> Result<Self, ValidateError> {
+        let allocation_requests = seed.raw_allocation_requests.checked_add(1).ok_or(
+            ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionAllocationBytes,
+            },
+        )?;
+        let allocation_request_bytes = seed
+            .allocation_request_bytes
+            .checked_add(dimensions.serialized_bytes)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionAllocationBytes,
+            })?;
+        let hash_invocations = seed.additional_hash_invocations.checked_add(1).ok_or(
+            ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            },
+        )?;
+        let identity_initialization_work = u64::from(hash_invocations)
+            .checked_mul(IDENTITY_INITIALIZATION_WORK_PER_HASH)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let identity_copy_work = u64::from(hash_invocations)
+            .checked_mul(IDENTITY_COPY_WORK_PER_HASH)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let initialization_work = seed
+            .initialization_work
+            .checked_add(dimensions.serialized_bytes_u64)
+            .and_then(|work| work.checked_add(identity_initialization_work))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let copy_work = seed
+            .copy_work
+            .checked_add(dimensions.serialized_bytes_u64)
+            .and_then(|work| work.checked_add(identity_copy_work))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let hash_work = dimensions
+            .serialized_bytes_u64
+            .checked_add(seed.additional_hash_work)
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        let total_upper_bound = dimensions
+            .validation_work_upper_bound
+            .checked_add(seed.planning_work)
+            .and_then(|work| work.checked_add(initialization_work))
+            .and_then(|work| work.checked_add(copy_work))
+            .and_then(|work| work.checked_add(hash_work))
+            .ok_or(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::ConstructionWork,
+            })?;
+        Ok(Self {
+            allocation_requests,
+            literal_allocation_request_bytes: seed.literal_allocation_request_bytes,
+            block_allocation_request_bytes: seed.block_allocation_request_bytes,
+            data_table_allocation_request_bytes: seed.data_table_allocation_request_bytes,
+            raw_allocation_request_bytes: seed.allocation_request_bytes,
+            serialized_allocation_request_bytes: dimensions.serialized_bytes,
+            allocation_request_bytes,
+            planning_work: seed.planning_work,
+            initialization_work,
+            copy_work,
+            hash_invocations,
+            hash_work,
+            total_upper_bound,
+            additional_retained_bytes: seed.additional_retained_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PhasePeaks {
+    validation: usize,
+    serialization: usize,
+    identity: usize,
+    retained: usize,
+}
+
+fn phase_peaks<O: Operation>(
+    dimensions: Dimensions,
+    serialized_capacity: usize,
+    additional_retained_bytes: usize,
+) -> Result<PhasePeaks, ValidateError> {
+    // Heap capacities are the allocator-observed values. Inline terms name
+    // the largest co-live state in each phase; retained excludes all scratch.
+    let validation_scratch = validation_scratch_bytes()?;
+    let control = phase_control_inline_bytes()?;
+    let validation = dimensions
+        .raw_program_capacity_bytes
+        .checked_add(core::mem::size_of::<RawProgram>())
+        .and_then(|peak| peak.checked_add(validation_scratch))
+        .and_then(|peak| peak.checked_add(control))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    let serialization = dimensions
+        .raw_program_capacity_bytes
+        .checked_add(serialized_capacity)
+        .and_then(|peak| peak.checked_add(core::mem::size_of::<RawProgram>()))
+        .and_then(|peak| peak.checked_add(serialization_inline_scratch_bytes()))
+        .and_then(|peak| peak.checked_add(control))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    let retained = dimensions
+        .raw_program_capacity_bytes
+        .checked_add(serialized_capacity)
+        .and_then(|peak| peak.checked_add(core::mem::size_of::<ValidatedProgram<O>>()))
+        .and_then(|peak| peak.checked_add(additional_retained_bytes))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    let identity = retained
+        .checked_add(identity_inline_scratch_bytes())
+        .and_then(|peak| peak.checked_add(control))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })?;
+    Ok(PhasePeaks {
+        validation,
+        serialization,
+        identity,
+        retained,
     })
 }
 
-fn estimate_code_bytes(raw: &RawProgram) -> Result<usize, ValidateError> {
-    let mut bytes = 0_usize;
-    for block in &raw.blocks {
-        let block_bytes = match block.op {
-            BlockOp::Entry { .. } => 16,
-            BlockOp::ScanLiteral { .. } | BlockOp::ConfirmSuffix { .. } => 160,
-            BlockOp::ScanClassStart { .. } => 192,
-            BlockOp::ExtendClassRun { .. } => 128,
-            BlockOp::AdvanceAfterReject { .. } | BlockOp::ReturnFound | BlockOp::ReturnNone => 32,
-        };
-        bytes = bytes
-            .checked_add(block_bytes)
-            .ok_or(ValidateError::ArithmeticOverflow {
-                site: ArithmeticSite::EstimatedCodeBytes,
-            })?;
-    }
-    for blob in &raw.data {
-        let length = match blob {
-            DataBlob::Bytes(bytes) => bytes.len(),
-            DataBlob::ByteClass(_) => 32,
-        };
-        let padded = length
-            .checked_add(15)
-            .ok_or(ValidateError::ArithmeticOverflow {
-                site: ArithmeticSite::EstimatedCodeBytes,
-            })?
-            & !15;
-        bytes = bytes
-            .checked_add(padded)
-            .ok_or(ValidateError::ArithmeticOverflow {
-                site: ArithmeticSite::EstimatedCodeBytes,
-            })?;
-    }
-    Ok(bytes)
+fn phase_control_inline_bytes() -> Result<usize, ValidateError> {
+    core::mem::size_of::<ValidateLimits>()
+        .checked_add(core::mem::size_of::<Dimensions>())
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<DimensionCensus>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<RawMetadataPlanningEnvelope>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<PlanningMeter>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<ConstructionSeed>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<ConstructionWork>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<PhasePeaks>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<ResourceAccounting>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<[Option<BlockId>; 8]>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<[Option<BlockId>; 2]>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<[FlowState; 2]>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<[Option<DataId>; 1]>()))
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<ClassShape>()))
+        .and_then(|bytes| bytes.checked_add(8_usize.saturating_mul(core::mem::size_of::<usize>())))
+        .ok_or(ValidateError::ArithmeticOverflow {
+            site: ArithmeticSite::PhasePeakBytes,
+        })
 }
 
-fn compute_work_factor(raw: &RawProgram) -> Result<u64, ValidateError> {
-    let mut longest = 0_usize;
-    for blob in &raw.data {
-        if let DataBlob::Bytes(bytes) = blob {
-            longest = longest.max(bytes.len());
-        }
+fn resource_accounting<O: Operation>(
+    dimensions: Dimensions,
+    work: ConstructionWork,
+    serialized_capacity: usize,
+    actual_validation_work: u64,
+) -> Result<ResourceAccounting, ValidateError> {
+    let peaks = phase_peaks::<O>(
+        dimensions,
+        serialized_capacity,
+        work.additional_retained_bytes,
+    )?;
+    Ok(ResourceAccounting {
+        version: RESOURCE_ACCOUNTING_VERSION,
+        allocation_requests: work.allocation_requests,
+        literal_allocation_request_bytes: work.literal_allocation_request_bytes,
+        block_allocation_request_bytes: work.block_allocation_request_bytes,
+        data_table_allocation_request_bytes: work.data_table_allocation_request_bytes,
+        raw_allocation_request_bytes: work.raw_allocation_request_bytes,
+        serialized_allocation_request_bytes: work.serialized_allocation_request_bytes,
+        allocation_request_bytes: work.allocation_request_bytes,
+        literal_capacity_bytes: dimensions.literal_capacity_bytes,
+        block_capacity_bytes: dimensions.block_capacity_bytes,
+        data_table_capacity_bytes: dimensions.data_table_capacity_bytes,
+        raw_program_capacity_bytes: dimensions.raw_program_capacity_bytes,
+        serialized_capacity_bytes: serialized_capacity,
+        planning_work: work.planning_work,
+        initialization_work: work.initialization_work,
+        copy_work: work.copy_work,
+        hash_invocations: work.hash_invocations,
+        hash_work: work.hash_work,
+        validation_work: actual_validation_work,
+        validation_work_upper_bound: dimensions.validation_work_upper_bound,
+        construction_work: work.total_upper_bound,
+        validation_scratch_bytes: validation_scratch_bytes()?,
+        validation_phase_peak_bytes: peaks.validation,
+        serialization_phase_peak_bytes: peaks.serialization,
+        identity_phase_peak_bytes: peaks.identity,
+        retained_program_bytes: peaks.retained,
+    })
+}
+
+fn admit_prospective<O: Operation>(
+    dimensions: Dimensions,
+    work: ConstructionWork,
+    limits: ValidateLimits,
+) -> Result<(), ValidateError> {
+    let accounting = resource_accounting::<O>(dimensions, work, dimensions.serialized_bytes, 0)?;
+    admit_accounting(accounting, limits)
+}
+
+fn admit_accounting(
+    accounting: ResourceAccounting,
+    limits: ValidateLimits,
+) -> Result<(), ValidateError> {
+    enforce_count(
+        ResourceKind::ConstructionAllocationBytes,
+        accounting.allocation_request_bytes,
+        limits.max_construction_allocation_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::RawProgramCapacityBytes,
+        accounting.raw_program_capacity_bytes,
+        limits.max_raw_program_capacity_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::SerializedCapacityBytes,
+        accounting.serialized_capacity_bytes,
+        limits.max_serialized_capacity_bytes,
+    )?;
+    enforce_work(
+        ResourceKind::ValidationWork,
+        accounting.validation_work_upper_bound,
+        limits.max_validation_work,
+    )?;
+    enforce_work(
+        ResourceKind::ConstructionWork,
+        accounting.construction_work,
+        limits.max_construction_work,
+    )?;
+    enforce_count(
+        ResourceKind::ValidationScratchBytes,
+        accounting.validation_scratch_bytes,
+        limits.max_validation_scratch_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::ValidationPhaseBytes,
+        accounting.validation_phase_peak_bytes,
+        limits.max_validation_phase_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::SerializationPhaseBytes,
+        accounting.serialization_phase_peak_bytes,
+        limits.max_serialization_phase_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::IdentityPhaseBytes,
+        accounting.identity_phase_peak_bytes,
+        limits.max_identity_phase_bytes,
+    )?;
+    enforce_count(
+        ResourceKind::RetainedProgramBytes,
+        accounting.retained_program_bytes,
+        limits.max_retained_program_bytes,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod dimension_census_tests {
+    use super::*;
+
+    #[test]
+    fn deferred_dimension_overflow_retains_adjudication_order() {
+        let both_overflowed = DimensionCensus {
+            serialized: None,
+            estimated_code: None,
+            longest_literal: 0,
+        };
+        assert!(matches!(
+            both_overflowed.finish(
+                1,
+                ValidateLimits {
+                    max_data_bytes: 0,
+                    ..ValidateLimits::default()
+                }
+            ),
+            Err(ValidateError::ResourceLimit {
+                resource: ResourceKind::DataBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            both_overflowed.finish(0, ValidateLimits::default()),
+            Err(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::SerializedBytes,
+            })
+        ));
+
+        let code_overflowed = DimensionCensus {
+            serialized: Some(SERIALIZED_HEADER_BYTES),
+            estimated_code: None,
+            longest_literal: 0,
+        };
+        assert!(matches!(
+            code_overflowed.finish(0, ValidateLimits::default()),
+            Err(ValidateError::ArithmeticOverflow {
+                site: ArithmeticSite::EstimatedCodeBytes,
+            })
+        ));
+
+        let mut total = Some(usize::MAX);
+        accumulate_checked(&mut total, Some(1));
+        assert_eq!(total, None);
     }
-    u64::try_from(longest)
-        .ok()
-        .and_then(|value| value.checked_add(8))
-        .ok_or(ValidateError::ArithmeticOverflow {
-            site: ArithmeticSite::WorkFactor,
-        })
 }
 
 fn enforce_count(
@@ -785,6 +1726,67 @@ fn enforce_count(
         });
     }
     Ok(required)
+}
+
+fn enforce_work(resource: ResourceKind, required: u64, limit: u64) -> Result<(), ValidateError> {
+    if required > limit {
+        return Err(ValidateError::ResourceLimit {
+            resource,
+            limit,
+            required,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PlanningMeter {
+    limit: u64,
+    consumed: u64,
+}
+
+impl PlanningMeter {
+    const fn new(consumed: u64, limit: u64) -> Self {
+        Self { limit, consumed }
+    }
+
+    fn admit(&self, additional: u64) -> Result<(), ValidateError> {
+        let required =
+            self.consumed
+                .checked_add(additional)
+                .ok_or(ValidateError::ArithmeticOverflow {
+                    site: ArithmeticSite::ConstructionWork,
+                })?;
+        enforce_work(ResourceKind::ConstructionWork, required, self.limit)
+    }
+
+    fn charge(&mut self, amount: u64) -> Result<(), ValidateError> {
+        self.admit(amount)?;
+        self.consumed =
+            self.consumed
+                .checked_add(amount)
+                .ok_or(ValidateError::ArithmeticOverflow {
+                    site: ArithmeticSite::ConstructionWork,
+                })?;
+        Ok(())
+    }
+}
+
+fn ensure_planning_complete(expected: u64, attempted: u64) -> Result<(), ValidateError> {
+    if expected == attempted {
+        return Ok(());
+    }
+    let expected = usize::try_from(expected).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ConstructionWork,
+    })?;
+    let attempted = usize::try_from(attempted).map_err(|_| ValidateError::ArithmeticOverflow {
+        site: ArithmeticSite::ConstructionWork,
+    })?;
+    Err(ValidateError::ConstructionLengthMismatch {
+        resource: ResourceKind::ConstructionWork,
+        expected,
+        attempted,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +1817,37 @@ impl WorkMeter {
         self.consumed = required;
         Ok(())
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PAIR_PLANNING_STEPS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_pair_planning_step() {
+    PAIR_PLANNING_STEPS.with(|steps| steps.set(steps.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+const fn record_pair_planning_step() {}
+
+#[cfg(test)]
+pub(crate) fn reset_pair_planning_steps() {
+    PAIR_PLANNING_STEPS.with(|steps| steps.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn pair_planning_steps() -> u64 {
+    PAIR_PLANNING_STEPS.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn raw_metadata_planning_work_for_test(
+    blocks: usize,
+    data_blobs: usize,
+) -> Result<u64, ValidateError> {
+    raw_metadata_planning_envelope(blocks, data_blobs)?.total()
 }
 
 fn block_index(block: BlockId) -> Option<usize> {

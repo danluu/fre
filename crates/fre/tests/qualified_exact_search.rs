@@ -1,11 +1,15 @@
 use fre::{
-    QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
-    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QualifiedExactSearch, QualifiedExactSearchBackendPolicy,
-    QualifiedExactSearchError, QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification,
-    QualifiedExactSearchRoute, QualifiedExactSearchWorkload, SearchLimits, SearchWindow,
+    QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
+    QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION, QualifiedExactSearch,
+    QualifiedExactSearchBackendPolicy, QualifiedExactSearchError, QualifiedExactSearchNativeStatus,
+    QualifiedExactSearchQualification, QualifiedExactSearchRoute, QualifiedExactSearchWorkload,
+    SearchLimits, SearchWindow,
 };
-use fre_jit_aarch64::{BackendVersion, EmitLimits, TargetSpec};
-use fre_jit_runtime::{CallError, PublicationLimits, PublishError};
+use fre_jit_aarch64::EmitLimits;
+use fre_jit_runtime::{CallError, PublicationLimits};
 use fre_kernel_ir::ValidateLimits;
 use fre_kernels::LiteralBuildLimits;
 
@@ -13,25 +17,27 @@ const QUALIFIED_WORKLOAD: QualifiedExactSearchWorkload = QualifiedExactSearchWor
     QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
     QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
 );
-const QUALIFIED_BUNDLE_SHA256: [u8; 32] = [
-    0xde, 0x08, 0x4f, 0xf0, 0x56, 0x4a, 0xcd, 0xb8, 0x98, 0x89, 0xf2, 0x8b, 0x9d, 0xcf, 0xdd, 0xce,
-    0x9b, 0x6f, 0x09, 0x55, 0xa1, 0xb2, 0xae, 0xad, 0x30, 0xd7, 0x57, 0x70, 0x03, 0x9e, 0x04, 0x53,
-];
-
 #[test]
 fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
+    for atom in [
+        QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION,
+        QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION,
+        QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
+        QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
+    ] {
+        assert_eq!(atom, QualifiedExactSearchQualification::Candidate);
+        assert!(!atom.is_authorized());
+    }
     let literal = b"0123456789abcdef";
     let search =
         QualifiedExactSearch::new(literal, QUALIFIED_WORKLOAD).expect("qualified exact matcher");
     assert_eq!(
         search.build_report().backend_policy,
-        QualifiedExactSearchBackendPolicy::AsimdV7
+        QualifiedExactSearchBackendPolicy::AsimdV8
     );
     assert_eq!(
         search.build_report().qualification,
-        QualifiedExactSearchQualification::Qualified {
-            bundle_sha256: QUALIFIED_BUNDLE_SHA256,
-        }
+        QualifiedExactSearchQualification::Candidate
     );
     assert_eq!(
         search.build_report().qualification,
@@ -42,9 +48,15 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
             .build_report()
             .qualification
             .authorized_bundle_sha256(),
-        Some(QUALIFIED_BUNDLE_SHA256)
+        None
     );
-    assert!(search.build_report().qualification.is_authorized());
+    assert!(!search.build_report().qualification.is_authorized());
+    assert_eq!(
+        search.build_report().native,
+        QualifiedExactSearchNativeStatus::Unqualified {
+            qualification: QualifiedExactSearchQualification::Candidate,
+        }
+    );
     let short = vec![b'x'; QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES - 1];
     let (_, short_execution) = search
         .find(&short, SearchLimits::unlimited())
@@ -64,27 +76,10 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
         matched.map(|span| (span.start(), span.end())),
         Some((threshold.len() - literal.len(), threshold.len()))
     );
-    if let QualifiedExactSearchNativeStatus::Published { identity, .. } =
-        &search.build_report().native
-    {
-        assert_eq!(
-            threshold_execution.route,
-            QualifiedExactSearchRoute::NativeJit
-        );
-        assert_eq!(
-            identity.backend_policy,
-            QualifiedExactSearchBackendPolicy::AsimdV7
-        );
-        assert_eq!(identity.target, TargetSpec::AARCH64_AAPCS64);
-        assert_eq!(identity.backend, BackendVersion::SEARCH_V7);
-        assert_ne!(identity.artifact_sha256, [0; 32]);
-        assert_eq!(identity.qualification, search.build_report().qualification);
-    } else {
-        assert_eq!(
-            threshold_execution.route,
-            QualifiedExactSearchRoute::PortableLiteral
-        );
-    }
+    assert_eq!(
+        threshold_execution.route,
+        QualifiedExactSearchRoute::PortableLiteral
+    );
 
     let other_width = QualifiedExactSearch::new(b"fifteen-byte-li", QUALIFIED_WORKLOAD)
         .expect("portable-only exact matcher");
@@ -119,34 +114,30 @@ fn qualified_router_uses_only_the_declared_width_and_window_envelope() {
 }
 
 #[test]
-fn explicit_backend_policy_selects_and_stamps_the_native_identity() {
+fn explicit_backend_policy_is_retained_while_candidate_fails_closed() {
     for policy in [
         QualifiedExactSearchBackendPolicy::AsimdV7,
+        QualifiedExactSearchBackendPolicy::AsimdV8,
         QualifiedExactSearchBackendPolicy::Sve16,
         QualifiedExactSearchBackendPolicy::Sve2Fixed16,
+        QualifiedExactSearchBackendPolicy::Sve16V6,
+        QualifiedExactSearchBackendPolicy::Sve2Fixed16V2,
     ] {
         let search =
             QualifiedExactSearch::new_with_backend(b"0123456789abcdef", QUALIFIED_WORKLOAD, policy)
                 .expect("policy-selected exact matcher");
         let report = search.build_report();
         assert_eq!(report.backend_policy, policy);
-        let expected_qualification = if policy == QualifiedExactSearchBackendPolicy::CURRENT {
-            QUALIFIED_EXACT_SEARCH_QUALIFICATION
-        } else {
+        assert_eq!(
+            report.qualification,
             QualifiedExactSearchQualification::Candidate
-        };
-        assert_eq!(report.qualification, expected_qualification);
-
-        match &report.native {
-            QualifiedExactSearchNativeStatus::Published { identity, .. } => {
-                assert_eq!(identity.backend_policy, policy);
-                assert_eq!(identity.backend, policy.backend_version());
-                assert_eq!(identity.qualification, expected_qualification);
-                assert_ne!(identity.artifact_sha256, [0; 32]);
+        );
+        assert_eq!(
+            report.native,
+            QualifiedExactSearchNativeStatus::Unqualified {
+                qualification: QualifiedExactSearchQualification::Candidate,
             }
-            QualifiedExactSearchNativeStatus::Unavailable(_) => {}
-            other => panic!("eligible policy unexpectedly refused: {other:?}"),
-        }
+        );
     }
 }
 
@@ -158,15 +149,25 @@ fn qualification_state_rejects_zero_and_invalidated_historical_hashes() {
     assert_eq!(zero.authorized_bundle_sha256(), None);
     assert!(!zero.is_authorized());
 
-    let historical = QualifiedExactSearchQualification::Qualified {
+    let invalidated_pre_q8 = QualifiedExactSearchQualification::Qualified {
         bundle_sha256: [
             0x89, 0xaf, 0x5a, 0x04, 0x19, 0x0a, 0x39, 0xc4, 0x0a, 0x48, 0x19, 0xce, 0x91, 0x6f,
             0xc2, 0x86, 0x30, 0x33, 0x05, 0x50, 0xe1, 0xca, 0xfc, 0x15, 0xe9, 0x91, 0x91, 0x22,
             0xaf, 0x0a, 0xe9, 0xf7,
         ],
     };
-    assert_eq!(historical.authorized_bundle_sha256(), None);
-    assert!(!historical.is_authorized());
+    assert_eq!(invalidated_pre_q8.authorized_bundle_sha256(), None);
+    assert!(!invalidated_pre_q8.is_authorized());
+
+    let retired_v7 = QualifiedExactSearchQualification::Qualified {
+        bundle_sha256: [
+            0xde, 0x08, 0x4f, 0xf0, 0x56, 0x4a, 0xcd, 0xb8, 0x98, 0x89, 0xf2, 0x8b, 0x9d, 0xcf,
+            0xdd, 0xce, 0x9b, 0x6f, 0x09, 0x55, 0xa1, 0xb2, 0xae, 0xad, 0x30, 0xd7, 0x57, 0x70,
+            0x03, 0x9e, 0x04, 0x53,
+        ],
+    };
+    assert_eq!(retired_v7.authorized_bundle_sha256(), None);
+    assert!(!retired_v7.is_authorized());
 
     let accepted = QualifiedExactSearchQualification::Qualified {
         bundle_sha256: [0x5a; 32],
@@ -204,9 +205,7 @@ fn qualified_router_preserves_windows_results_and_portable_refusals() {
             expected,
             "prefix={prefix} tail={tail} present={present}"
         );
-        if search.build_report().native.is_published() {
-            assert_eq!(execution.route, QualifiedExactSearchRoute::NativeJit);
-        }
+        assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
     }
 
     let haystack = vec![b'x'; QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES];
@@ -282,9 +281,7 @@ fn qualified_router_selects_the_leftmost_match_in_a_nonzero_window() {
         matched.map(|span| (span.start(), span.end())),
         Some((first, first + literal.len()))
     );
-    if search.build_report().native.is_published() {
-        assert_eq!(execution.route, QualifiedExactSearchRoute::NativeJit);
-    }
+    assert_eq!(execution.route, QualifiedExactSearchRoute::PortableLiteral);
 }
 
 #[cfg(all(
@@ -294,7 +291,7 @@ fn qualified_router_selects_the_leftmost_match_in_a_nonzero_window() {
     target_endian = "little"
 ))]
 #[test]
-fn publication_refusal_is_reported_and_preserves_the_portable_route() {
+fn candidate_refusal_precedes_publication_limits_and_preserves_the_portable_route() {
     let literal = b"0123456789abcdef";
     let search = QualifiedExactSearch::with_limits(
         literal,
@@ -307,15 +304,13 @@ fn publication_refusal_is_reported_and_preserves_the_portable_route() {
             ..PublicationLimits::default()
         },
     )
-    .expect("publication refusal is a retained native status");
-    assert!(matches!(
-        &search.build_report().native,
-        QualifiedExactSearchNativeStatus::Unavailable(PublishError::ResourceLimit {
-            resource: fre_jit_runtime::ResourceKind::CodeBytes,
-            limit: 0,
-            required,
-        }) if *required > 0
-    ));
+    .expect("Candidate refusal is a retained native status");
+    assert_eq!(
+        search.build_report().native,
+        QualifiedExactSearchNativeStatus::Unqualified {
+            qualification: QualifiedExactSearchQualification::Candidate,
+        }
+    );
 
     let haystack = vec![b'x'; QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES];
     let (_, execution) = search
@@ -331,7 +326,7 @@ fn publication_refusal_is_reported_and_preserves_the_portable_route() {
     target_endian = "little"
 )))]
 #[test]
-fn unsupported_host_is_reported_before_aarch64_emission() {
+fn candidate_refusal_precedes_unsupported_host_and_aarch64_emission() {
     let search = QualifiedExactSearch::with_limits(
         b"0123456789abcdef",
         QUALIFIED_WORKLOAD,
@@ -343,16 +338,13 @@ fn unsupported_host_is_reported_before_aarch64_emission() {
         },
         PublicationLimits::default(),
     )
-    .expect("unsupported host performs no target-specific emission");
-    assert!(matches!(
-        &search.build_report().native,
-        QualifiedExactSearchNativeStatus::Unavailable(PublishError::UnsupportedHost {
-            reason: fre_jit_runtime::HostSupportReason::Architecture
-                | fre_jit_runtime::HostSupportReason::OperatingSystem
-                | fre_jit_runtime::HostSupportReason::PointerWidth
-                | fre_jit_runtime::HostSupportReason::Endianness,
-        })
-    ));
+    .expect("Candidate host performs no target-specific emission");
+    assert_eq!(
+        search.build_report().native,
+        QualifiedExactSearchNativeStatus::Unqualified {
+            qualification: QualifiedExactSearchQualification::Candidate,
+        }
+    );
 }
 
 #[test]

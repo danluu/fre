@@ -7,10 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Exposes only the doc-hidden ABI canary used by source-bound hardware
+# qualification. Production users have no reason to enable it.
+sve-hardware-qualification = []
+
 [dependencies]
 fre-jit-aarch64 = { path = "../fre-jit-aarch64" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
+fre-target-features = { path = "../fre-target-features" }
 libc = "=0.2.186"
+
+[dev-dependencies]
+fre = { path = "../fre", default-features = false }
+sha2 = "=0.10.9"
 
 [lints.rust]
 unsafe_code = "warn"

@@ -1,10 +1,11 @@
 //! Honest operation-specific facade for the currently certified FRE subsets.
 //!
 //! [`PortableRegex`] provides bounded single-search operations for the HIR
-//! subset that `fre-lower` can prove exact. [`QualifiedExactSearch`] exposes
-//! an experimental, explicit opt-in 16-byte exact-literal JIT leaf with
-//! portable fallback outside its evidence-gated large-window envelope. No
-//! default facade selects that native route.
+//! subset that `fre-lower` can prove exact. With the default
+//! `qualified-exact-search-jit` feature, [`QualifiedExactSearch`] exposes an
+//! experimental, explicit opt-in 16-byte exact-literal JIT leaf with portable
+//! fallback outside its evidence-gated large-window envelope. No default
+//! facade selects that native route.
 //! [`PortableRegexSetBuilder`] and
 //! [`PortableTextRegexSetBuilder`] compose independently admitted matchers
 //! with exact ascending pattern-ID semantics. [`AggregateBuilder`] constructs
@@ -50,12 +51,14 @@ mod line_capture;
 mod literal_assertions;
 mod literal_class_run_literal;
 pub mod operation_session;
+#[cfg(feature = "qualified-exact-search-jit")]
 mod qualified_exact_search;
 mod replacement;
 mod required_literal;
 mod set;
 mod split;
 #[cfg(all(
+    feature = "qualified-exact-search-jit",
     test,
     target_arch = "aarch64",
     target_os = "linux",
@@ -424,14 +427,23 @@ pub use operation_session::{
     OperationSessionReducer, OperationSessionResetLimits, OperationSessionRunLimits,
     OperationSessionValue,
 };
+#[cfg(feature = "qualified-exact-search-jit")]
 pub use qualified_exact_search::{
-    QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES,
-    QUALIFIED_EXACT_SEARCH_LITERAL_BYTES, QUALIFIED_EXACT_SEARCH_MIN_SEARCHES,
-    QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_QUALIFICATION,
-    QualifiedExactSearch, QualifiedExactSearchBackendPolicy, QualifiedExactSearchBuildError,
+    QUALIFIED_EXACT_SEARCH_ASIMD_V8_QUALIFICATION, QUALIFIED_EXACT_SEARCH_LARGE_MIN_SEARCHES,
+    QUALIFIED_EXACT_SEARCH_LARGE_WINDOW_BYTES, QUALIFIED_EXACT_SEARCH_LITERAL_BYTES,
+    QUALIFIED_EXACT_SEARCH_MIN_SEARCHES, QUALIFIED_EXACT_SEARCH_MIN_WINDOW_BYTES,
+    QUALIFIED_EXACT_SEARCH_QUALIFICATION, QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE2_FIXED16_V2_QUALIFICATION,
+    QUALIFIED_EXACT_SEARCH_SVE16_V6_QUALIFICATION, QualifiedExactSearch,
+    QualifiedExactSearchBackendPolicy, QualifiedExactSearchBuildError,
     QualifiedExactSearchBuildReport, QualifiedExactSearchError, QualifiedExactSearchExecution,
-    QualifiedExactSearchNativeIdentity, QualifiedExactSearchNativeStatus,
-    QualifiedExactSearchQualification, QualifiedExactSearchRoute, QualifiedExactSearchWorkload,
+    QualifiedExactSearchFacade, QualifiedExactSearchFacadeBuildError,
+    QualifiedExactSearchFacadeError, QualifiedExactSearchFacadeExecution,
+    QualifiedExactSearchFacadeRoute, QualifiedExactSearchFacadeSelection,
+    QualifiedExactSearchFacadeThreadSession, QualifiedExactSearchNativeIdentity,
+    QualifiedExactSearchNativeStatus, QualifiedExactSearchQualification, QualifiedExactSearchRoute,
+    QualifiedExactSearchThreadContractError, QualifiedExactSearchThreadSession,
+    QualifiedExactSearchWorkload,
 };
 pub use replacement::{
     CaptureExpansionAccounting, CaptureExpansionError, CaptureExpansionLimits,

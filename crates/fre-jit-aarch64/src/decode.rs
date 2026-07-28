@@ -131,6 +131,12 @@ pub enum DecodedInstruction {
         base: u8,
         offset: u16,
     },
+    LoadVectorPair128 {
+        first_destination: u8,
+        second_destination: u8,
+        base: u8,
+        offset: u16,
+    },
     DuplicateByte16 {
         destination: u8,
         source: u8,
@@ -204,11 +210,34 @@ pub enum DecodedInstruction {
         left: u8,
         right: u8,
     },
+    SveAndPredicateBytesSetFlags {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveBitClearPredicateBytesSetFlags {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveBitClearPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
     SveTestPredicateBytes {
         predicate: u8,
         tested: u8,
     },
     SveBreakBeforeBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
+    SveBreakAfterBytes {
         destination: u8,
         predicate: u8,
         source: u8,
@@ -257,6 +286,7 @@ impl DecodedInstruction {
         matches!(
             self,
             Self::LoadVector128 { .. }
+                | Self::LoadVectorPair128 { .. }
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
                 | Self::AndBytes16 { .. }
@@ -273,8 +303,12 @@ impl DecodedInstruction {
                 | Self::SveCompareEqualBytes { .. }
                 | Self::Sve2MatchBytes { .. }
                 | Self::SveAndPredicateBytes { .. }
+                | Self::SveAndPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytes { .. }
                 | Self::SveTestPredicateBytes { .. }
                 | Self::SveBreakBeforeBytes { .. }
+                | Self::SveBreakAfterBytes { .. }
                 | Self::SveCountPredicateBytes { .. }
         )
     }
@@ -285,6 +319,7 @@ impl DecodedInstruction {
         matches!(
             self,
             Self::LoadVector128 { .. }
+                | Self::LoadVectorPair128 { .. }
                 | Self::DuplicateByte16 { .. }
                 | Self::CompareEqualBytes16 { .. }
                 | Self::AndBytes16 { .. }
@@ -309,8 +344,12 @@ impl DecodedInstruction {
                 | Self::SveCompareEqualBytes { .. }
                 | Self::Sve2MatchBytes { .. }
                 | Self::SveAndPredicateBytes { .. }
+                | Self::SveAndPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytesSetFlags { .. }
+                | Self::SveBitClearPredicateBytes { .. }
                 | Self::SveTestPredicateBytes { .. }
                 | Self::SveBreakBeforeBytes { .. }
+                | Self::SveBreakAfterBytes { .. }
                 | Self::SveCountPredicateBytes { .. }
         )
     }
@@ -368,6 +407,7 @@ impl DecodedInstruction {
             | Self::CompareImmediate32 { .. }
             | Self::Store64 { .. }
             | Self::LoadVector128 { .. }
+            | Self::LoadVectorPair128 { .. }
             | Self::DuplicateByte16 { .. }
             | Self::CompareEqualBytes16 { .. }
             | Self::AndBytes16 { .. }
@@ -382,8 +422,12 @@ impl DecodedInstruction {
             | Self::SveCompareEqualBytes { .. }
             | Self::Sve2MatchBytes { .. }
             | Self::SveAndPredicateBytes { .. }
+            | Self::SveAndPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytesSetFlags { .. }
+            | Self::SveBitClearPredicateBytes { .. }
             | Self::SveTestPredicateBytes { .. }
             | Self::SveBreakBeforeBytes { .. }
+            | Self::SveBreakAfterBytes { .. }
             | Self::Branch { .. }
             | Self::BranchCondition { .. }
             | Self::CompareBranchZero64 { .. }
@@ -542,6 +586,18 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
                 .checked_mul(16)
                 .expect("scaled vector imm12 fits u16"),
         }
+    } else if word & 0xffe0_0000 == 0xad40_0000 {
+        // LDP Q has a signed imm7. Pinning bit 21 to zero admits only its
+        // nonnegative half while leaving the low six immediate bits available.
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: rd,
+            second_destination: reg(word >> 10),
+            base: rn,
+            offset: u16::try_from((word >> 15) & 0x3f)
+                .expect("six-bit pair offset")
+                .checked_mul(16)
+                .expect("scaled vector-pair offset fits u16"),
+        }
     } else if word & 0xffff_fc00 == 0x4e01_0c00 {
         DecodedInstruction::DuplicateByte16 {
             destination: rd,
@@ -624,8 +680,29 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
             left: rn,
             right: rm,
         }
+    } else if word & 0xfff0_e210 == 0x2540_4000 {
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
     } else if word & 0xfff0_e210 == 0x2500_4000 {
         DecodedInstruction::SveAndPredicateBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
+    } else if word & 0xfff0_e210 == 0x2540_4010 {
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            left: predicate(word >> 5),
+            right: predicate(word >> 16),
+        }
+    } else if word & 0xfff0_e210 == 0x2500_4010 {
+        DecodedInstruction::SveBitClearPredicateBytes {
             destination: predicate(word),
             predicate: governing_predicate(word),
             left: predicate(word >> 5),
@@ -638,6 +715,12 @@ pub fn decode_one(word: u32, offset: u32) -> Result<DecodedInstruction, DecodeEr
         }
     } else if word & 0xffff_e210 == 0x2590_4000 {
         DecodedInstruction::SveBreakBeforeBytes {
+            destination: predicate(word),
+            predicate: governing_predicate(word),
+            source: predicate(word >> 5),
+        }
+    } else if word & 0xffff_e210 == 0x2510_4000 {
+        DecodedInstruction::SveBreakAfterBytes {
             destination: predicate(word),
             predicate: governing_predicate(word),
             source: predicate(word >> 5),
@@ -850,6 +933,24 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | field(base, 5)?
                 | field(destination, 0)?
         }
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            base,
+            offset,
+        } => {
+            if first_destination == second_destination
+                || !offset.is_multiple_of(16)
+                || offset / 16 >= 64
+            {
+                return None;
+            }
+            0xad40_0000
+                | (u32::from(offset / 16) << 15)
+                | field(second_destination, 10)?
+                | field(base, 5)?
+                | field(first_destination, 0)?
+        }
         DecodedInstruction::DuplicateByte16 {
             destination,
             source,
@@ -946,6 +1047,42 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
                 | predicate_field(left, 5)?
                 | predicate_field(destination, 0)?
         }
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2540_4000
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2540_4010
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBitClearPredicateBytes {
+            destination,
+            predicate,
+            left,
+            right,
+        } => {
+            0x2500_4010
+                | predicate_field(right, 16)?
+                | governing_predicate_field(predicate)?
+                | predicate_field(left, 5)?
+                | predicate_field(destination, 0)?
+        }
         DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
             0x2550_c000 | governing_predicate_field(predicate)? | predicate_field(tested, 5)?
         }
@@ -955,6 +1092,16 @@ pub(crate) fn canonical_word(instruction: DecodedInstruction) -> Option<u32> {
             source,
         } => {
             0x2590_4000
+                | governing_predicate_field(predicate)?
+                | predicate_field(source, 5)?
+                | predicate_field(destination, 0)?
+        }
+        DecodedInstruction::SveBreakAfterBytes {
+            destination,
+            predicate,
+            source,
+        } => {
+            0x2510_4000
                 | governing_predicate_field(predicate)?
                 | predicate_field(source, 5)?
                 | predicate_field(destination, 0)?

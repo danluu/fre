@@ -18,12 +18,12 @@ use crate::{
     EmitLimits, LabelKind, MAX_REPEATED_CONFIRM_BYTES, NativeAggregateImage, NativeAggregateResult,
     NativeImage, NativeResult, RelocationKind, RelocationTarget, ResourceKind, ResultLayout,
     SearchBackendPolicy, audit, audit_aggregate, decode, decode_one, emit,
-    emit::emit_search_version_for_test, emit_exact_aggregate,
+    emit::emit_search_version_for_test, emit_audited_with_backend, emit_exact_aggregate,
     emit_exact_aggregate_sve2_fixed16_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_count_experimental,
     emit_exact_aggregate_sve2_fixed16_pair_span_sum_experimental,
-    emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve16,
-    emit_with_backend, image::SearchShape,
+    emit_exact_aggregate_sve2_fixed16_span_sum_experimental, emit_sve2_16, emit_sve2_fixed16_v2,
+    emit_sve16, emit_sve16_v6, emit_with_backend, image::SearchShape,
 };
 
 const HAYSTACK_BASE: u64 = 0x0010_0000;
@@ -51,6 +51,38 @@ fn abi_layout_is_stable() {
         usize::from(AggregateResultLayout::AARCH64.alignment)
     );
     assert_eq!(AggregateResultLayout::AARCH64.value_offset, 0);
+}
+
+#[test]
+fn audited_emission_is_the_same_immutable_image_as_legacy_emission() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("program");
+    let audited = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::Sve2Fixed16V2,
+        EmitLimits::default(),
+    )
+    .expect("audited image");
+    let legacy = emit_with_backend(
+        &program,
+        SearchBackendPolicy::Sve2Fixed16V2,
+        EmitLimits::default(),
+    )
+    .expect("legacy image");
+    assert_eq!(audited.as_image(), &legacy);
+    assert_eq!(audited.into_image(), legacy);
+
+    let mut mutated = legacy.clone();
+    mutated.code[0] ^= u8::MAX;
+    reseal_test_image(&mut mutated);
+    assert!(
+        audit(&mutated).is_err(),
+        "a resealed plain-image mutation must still fail the independent audit"
+    );
 }
 
 #[test]
@@ -1314,10 +1346,10 @@ fn each_emission_resource_accepts_exact_boundary_and_refuses_one_less() {
     ));
 }
 
-fn independently_derived_v7_work(image: &NativeImage, policy_scan_work: u64) -> u64 {
-    const V7_AOT_FIXED_BYTES: u64 = 8 + 2 + 6 + 8 + 32 + 16 + 20 + 36 + 54;
+fn independently_derived_v8_work(image: &NativeImage, policy_scan_work: u64) -> u64 {
+    const V8_AOT_FIXED_BYTES: u64 = 8 + 2 + 6 + 8 + 32 + 16 + 20 + 36 + 54;
 
-    // Derive the receipt from structural outputs and the fixed V7 wire layout,
+    // Derive the receipt from structural outputs and the fixed V8 wire layout,
     // without reading the emission-work receipt under test. Emission charges
     // each copied rodata byte once, each label once when created and once when
     // bound, each emitted word once, each resolved relocation once, and every
@@ -1330,7 +1362,7 @@ fn independently_derived_v7_work(image: &NativeImage, policy_scan_work: u64) -> 
     let instruction_work =
         u64::try_from(image.code().len() / 4).expect("bounded instruction count");
     let relocation_work = u64::try_from(image.relocations().len()).expect("bounded relocations");
-    let canonical_identity_work = V7_AOT_FIXED_BYTES
+    let canonical_identity_work = V8_AOT_FIXED_BYTES
         .checked_add(u64::try_from(image.code().len()).expect("bounded code"))
         .and_then(|work| {
             work.checked_add(u64::try_from(image.rodata().len()).expect("bounded rodata"))
@@ -1364,11 +1396,11 @@ fn independently_derived_v7_work(image: &NativeImage, policy_scan_work: u64) -> 
         u64::try_from(
             image
                 .to_aot(AotLimits::default())
-                .expect("bounded V7 artifact")
+                .expect("bounded V8 artifact")
                 .as_bytes()
                 .len()
         )
-        .expect("bounded V7 artifact"),
+        .expect("bounded V8 artifact"),
         canonical_identity_work
     );
     policy_scan_work
@@ -1381,7 +1413,7 @@ fn independently_derived_v7_work(image: &NativeImage, policy_scan_work: u64) -> 
 }
 
 #[test]
-fn v7_ranked_policy_scans_are_precharged_and_total_work_is_exact() {
+fn v8_ranked_policy_scans_are_precharged_and_total_work_is_exact() {
     let literal: Vec<u8> = (0_u8..32).map(|byte| byte.wrapping_mul(73)).collect();
     let program =
         build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
@@ -1401,8 +1433,9 @@ fn v7_ranked_policy_scans_are_precharged_and_total_work_is_exact() {
     // at the second limit, a charge deferred until after rodata handling would
     // lose to DataBytes. The move-only admission token then gates both scans.
     for work_limit in [one_below_first_scan, one_below_scan_work] {
-        let error = emit(
+        let error = emit_with_backend(
             &program,
+            SearchBackendPolicy::AsimdV8,
             EmitLimits {
                 max_data_bytes: 0,
                 max_emission_work: work_limit,
@@ -1420,14 +1453,20 @@ fn v7_ranked_policy_scans_are_precharged_and_total_work_is_exact() {
         );
     }
 
-    let image = emit(&program, EmitLimits::default()).expect("baseline v7 image");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("baseline v8 image");
     assert_eq!(image.rodata(), literal);
     assert_eq!(image.code().len() % 4, 0);
-    let exact_work = independently_derived_v7_work(&image, scan_work);
+    let exact_work = independently_derived_v8_work(&image, scan_work);
     assert_eq!(image.stats().emission_work, exact_work);
 
-    emit(
+    emit_with_backend(
         &program,
+        SearchBackendPolicy::AsimdV8,
         EmitLimits {
             max_emission_work: exact_work,
             ..EmitLimits::default()
@@ -1435,8 +1474,9 @@ fn v7_ranked_policy_scans_are_precharged_and_total_work_is_exact() {
     )
     .expect("exact v7 work receipt succeeds");
     assert_eq!(
-        emit(
+        emit_with_backend(
             &program,
+            SearchBackendPolicy::AsimdV8,
             EmitLimits {
                 max_emission_work: exact_work.checked_sub(1).expect("nonzero total work"),
                 ..EmitLimits::default()
@@ -1516,6 +1556,13 @@ fn decoder_and_auditor_refuse_unknown_or_tampered_instructions() {
     );
     assert!(matches!(
         decode(&0xd61f_0000_u32.to_le_bytes()),
+        Err(DecodeError::UnknownInstruction { .. })
+    ));
+    // The architectural LDP Q immediate is signed. Tag 21 admits only its
+    // canonical nonnegative #0/#32 forms, so a negative-offset encoding must
+    // fail closed instead of being reinterpreted as a large unsigned offset.
+    assert!(matches!(
+        decode(&0xad7f_8440_u32.to_le_bytes()),
         Err(DecodeError::UnknownInstruction { .. })
     ));
     let program =
@@ -2246,7 +2293,7 @@ fn sealed_search_manifest_versions_and_cold_audit_accounting_are_explicit() {
     assert_eq!(exact_manifest.output, OutputKind::Span);
     assert_eq!(exact_manifest.anchors, AnchorFlags::default());
     assert_eq!(exact_manifest.literal_bytes, 6);
-    assert_eq!(exact_manifest.candidate_policy_version, 3);
+    assert_eq!(exact_manifest.candidate_policy_version, 4);
     assert_eq!(exact_manifest.candidate_block_width, 16);
     assert_eq!(
         (
@@ -2260,7 +2307,7 @@ fn sealed_search_manifest_versions_and_cold_audit_accounting_are_explicit() {
     assert_eq!(exact_manifest.source_identity, exact.source_identity());
     assert_eq!(
         &exact.to_aot(AotLimits::default()).unwrap().as_bytes()[..8],
-        b"FREA64\0\x07"
+        b"FREA64\0\x08"
     );
     let report = audit(&exact).expect("sealed exact audit");
     assert_eq!(report.decode_passes, 1);
@@ -2521,13 +2568,13 @@ fn search_backend_dispatch_accepts_legacy_shapes_and_rejects_v2_code_as_v1() {
     ));
 
     let mut unknown = exact_span_search_image(b"needle");
-    unknown.backend_version = BackendVersion(8);
+    unknown.backend_version = BackendVersion(20);
     unknown.code[0..4].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
     assert_eq!(
         audit(&unknown),
         Err(AuditError::SearchBackendVersionMismatch {
             expected: BackendVersion::SEARCH_CURRENT.0,
-            actual: 8,
+            actual: 20,
         })
     );
 
@@ -2699,11 +2746,11 @@ fn complete_search_templates_reject_anchored_and_class_post_prefix_load_mutation
 }
 
 #[test]
-fn v7_candidate_policy_and_manifest_exclusivity_are_authenticated() {
+fn current_v8_candidate_policy_and_manifest_exclusivity_are_authenticated() {
     let canonical = exact_span_search_image(b"0123456789abcdef");
     for mutation in 0_u8..5 {
         let mut image = canonical.clone();
-        let manifest = image.search.as_mut().expect("v7 search manifest");
+        let manifest = image.search.as_mut().expect("current V8 search manifest");
         match mutation {
             0 => manifest.candidate_policy_version = 2,
             1 => manifest.candidate_block_width = 15,
@@ -3281,7 +3328,9 @@ fn v7_rejects_downgrades_and_every_staged_recovery_mutation() {
     let program =
         build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
             .expect("exact program");
-    let canonical_v7 = emit(&program, EmitLimits::default()).expect("canonical v7");
+    let canonical_v7 =
+        emit_search_version_for_test(&program, EmitLimits::default(), BackendVersion::SEARCH_V7)
+            .expect("canonical v7");
     assert_eq!(canonical_v7.backend_version(), BackendVersion::SEARCH_V7);
     let manifest = canonical_v7.search_manifest().expect("v7 manifest");
     assert_eq!(
@@ -3548,7 +3597,7 @@ fn sve16_backends_are_differentiated_deterministic_and_match_the_oracle() {
         assert_eq!(sve, sve_repeat);
         assert_eq!(sve.backend_version(), BackendVersion::SEARCH_SVE16_V1);
         assert_eq!(sve2.backend_version(), BackendVersion::SEARCH_SVE2_16_V1);
-        assert_eq!(BackendVersion::SEARCH_CURRENT, BackendVersion::SEARCH_V7);
+        assert_eq!(BackendVersion::SEARCH_CURRENT, BackendVersion::SEARCH_V8);
         assert_eq!(
             sve.search_manifest()
                 .expect("SVE manifest")
@@ -3658,6 +3707,742 @@ fn sve16_backends_are_differentiated_deterministic_and_match_the_oracle() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one versioned-backend test keeps policy, audit, layout, and oracle witnesses together"
+)]
+fn sve16_v6_candidate_is_distinct_audited_and_matches_the_oracle() {
+    for width in [16_usize, 17, 32] {
+        let literal: Vec<u8> = (0..width)
+            .map(|index| {
+                u8::try_from(index)
+                    .expect("bounded width")
+                    .wrapping_mul(41)
+                    .wrapping_add(7)
+            })
+            .collect();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("SVE16 v6 program");
+        let image = emit_sve16_v6(&program, EmitLimits::default()).expect("SVE16 v6 image");
+        let repeated =
+            emit_sve16_v6(&program, EmitLimits::default()).expect("repeat SVE16 v6 image");
+        let v8 = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV8,
+            EmitLimits::default(),
+        )
+        .expect("V8 layout reference");
+
+        assert_eq!(image, repeated);
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_SVE16_V6);
+        assert_eq!(image.target().features, CpuFeatures::ASIMD_SVE);
+        assert_eq!(
+            image
+                .search_manifest()
+                .expect("SVE16 v6 manifest")
+                .candidate_policy_version,
+            5
+        );
+        audit(&image).expect("independent SVE16 v6 whole-template audit");
+        let instructions = decode(image.code()).expect("SVE16 v6 decode");
+        assert!(instructions.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+        )));
+        assert!(!instructions.iter().any(|instruction| instruction.is_sve2()));
+        if width == 16 {
+            assert_eq!(
+                image.stats().code_bytes,
+                v8.stats().code_bytes,
+                "the unreachable padding preserves V8's fixed-16 cold-tail address"
+            );
+        }
+        assert_eq!(
+            &image.to_aot(AotLimits::default()).unwrap().as_bytes()[..8],
+            b"FREA64\0\x13"
+        );
+
+        let mut haystacks = vec![
+            Vec::new(),
+            literal.clone(),
+            vec![literal[0]; 95],
+            [b"prefix".as_slice(), literal.as_slice(), b"suffix"].concat(),
+        ];
+        let mut late = vec![literal[0]; 129 + width];
+        late[129..].copy_from_slice(&literal);
+        haystacks.push(late);
+        for haystack in &haystacks {
+            for (start, end) in [
+                (0, haystack.len()),
+                (haystack.len().min(1), haystack.len()),
+                (0, haystack.len().saturating_sub(1)),
+            ] {
+                let window = SearchWindow::new(start, end);
+                let expected = program
+                    .execute(haystack, window, ExecutionLimits::unlimited())
+                    .expect("oracle execution")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, haystack, start, end).expect("SVE16 v6 ISA model");
+                assert_eq!(span_output(actual), expected);
+            }
+        }
+    }
+
+    let short = build_exact_literal::<Span>(
+        b"0123456789abcde",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("short exact program");
+    assert_eq!(
+        emit_sve16_v6(&short, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape
+        })
+    );
+    let anchored = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        ValidateLimits::default(),
+    )
+    .expect("anchored exact program");
+    assert_eq!(
+        emit_sve16_v6(&anchored, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape
+        })
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the tag21 source gate keeps identity, ISA shape, mutations, and the fixed-lane oracle matrix together"
+)]
+fn sve2_fixed16_v2_candidate_is_versioned_audited_and_matches_the_oracle() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("tag21 exact program");
+    let image =
+        emit_sve2_fixed16_v2(&program, EmitLimits::default()).expect("tag21 candidate image");
+    let repeated =
+        emit_sve2_fixed16_v2(&program, EmitLimits::default()).expect("repeat tag21 image");
+
+    assert_eq!(image, repeated);
+    assert_eq!(
+        image.backend_version(),
+        BackendVersion::SEARCH_SVE2_FIXED16_V2
+    );
+    assert_eq!(image.target().features, CpuFeatures::ASIMD_SVE2);
+    let manifest = image.search_manifest().expect("tag21 manifest");
+    assert_eq!(manifest.candidate_policy_version, 8);
+    assert_eq!(manifest.candidate_block_width, 16);
+    assert_eq!(
+        (
+            manifest.primary_offset,
+            manifest.secondary_offset,
+            manifest.verification_offset,
+            manifest.quaternary_offset,
+            manifest.quinary_offset,
+        ),
+        (7, 6, 8, 5, 15)
+    );
+    audit(&image).expect("independent tag21 whole-template audit");
+    let instructions = decode(image.code()).expect("tag21 decode");
+    let setup_immediates: Vec<_> = instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            DecodedInstruction::MoveZero64 {
+                destination: 11,
+                immediate,
+                shift: 0,
+            } => Some(*immediate),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_immediates,
+        [
+            u16::from(literal[7]),
+            u16::from(literal[6]),
+            u16::from(literal[8]),
+            u16::from(literal[5]),
+            u16::from(literal[15]),
+            u16::from(literal[0]),
+        ],
+        "tag21 materializes five filter bytes and the retained offset-zero byte without setup loads"
+    );
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 2,
+            base: 15,
+            offset: 0,
+        }
+    )));
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 4,
+            second_destination: 6,
+            base: 15,
+            offset: 32,
+        }
+    )));
+    for retained_filter in [5_u8, 7, 22] {
+        assert!(
+            instructions.iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstruction::CompareEqualBytes16 {
+                    right,
+                    ..
+                } if *right == retained_filter
+            )),
+            "missing retained wide filter q{retained_filter}"
+        );
+    }
+    let wide_pack_sources: Vec<_> = instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                destination: 16,
+                source,
+            } => Some(*source),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wide_pack_sources, [0, 2, 4, 6]);
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction,
+                DecodedInstruction::LoadByteRegister {
+                    destination: 10,
+                    base: 9,
+                    index: 13,
+                }
+            ))
+            .count(),
+        2,
+        "wide and narrow tag21 recovery both reject offset-zero mismatches before SVE confirmation"
+    );
+    let mask_constant = instructions
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::MoveZero64 {
+                    destination: 14,
+                    immediate: 0x1111,
+                    shift: 0,
+                }
+        })
+        .expect("lazy tag21 sparse mask constant");
+    let first_sparse_and = instructions
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::AndRegister64 {
+                    destination: 0,
+                    left: 0,
+                    right: 14,
+                }
+        })
+        .expect("first tag21 sparse mask AND");
+    assert_eq!(
+        &instructions[mask_constant..=first_sparse_and],
+        &[
+            DecodedInstruction::MoveZero64 {
+                destination: 14,
+                immediate: 0x1111,
+                shift: 0,
+            },
+            DecodedInstruction::MoveKeep64 {
+                destination: 14,
+                immediate: 0x1111,
+                shift: 16,
+            },
+            DecodedInstruction::MoveKeep64 {
+                destination: 14,
+                immediate: 0x1111,
+                shift: 32,
+            },
+            DecodedInstruction::MoveKeep64 {
+                destination: 14,
+                immediate: 0x1111,
+                shift: 48,
+            },
+            DecodedInstruction::AndRegister64 {
+                destination: 0,
+                left: 0,
+                right: 14,
+            },
+        ],
+        "tag21 materializes the four-instruction mask immediately before its first rare-path use"
+    );
+    assert_eq!(
+        instructions.get(
+            mask_constant
+                .checked_sub(1)
+                .expect("mask follows one instruction"),
+        ),
+        Some(&DecodedInstruction::MoveVectorDoubleTo64 {
+            destination: 0,
+            source: 16,
+        }),
+        "tag21 keeps mask setup out of eager and common screening paths"
+    );
+    for expected in ["MATCH", "CMPEQ", "ANDS", "BRKA", "BICS"] {
+        assert!(
+            instructions.iter().any(|instruction| match expected {
+                "MATCH" => matches!(instruction, DecodedInstruction::Sve2MatchBytes { .. }),
+                "CMPEQ" => matches!(instruction, DecodedInstruction::SveCompareEqualBytes { .. }),
+                "ANDS" => matches!(
+                    instruction,
+                    DecodedInstruction::SveAndPredicateBytesSetFlags { .. }
+                ),
+                "BRKA" => matches!(instruction, DecodedInstruction::SveBreakAfterBytes { .. }),
+                "BICS" => matches!(
+                    instruction,
+                    DecodedInstruction::SveBitClearPredicateBytesSetFlags { .. }
+                ),
+                _ => unreachable!("fixed tag21 instruction witness"),
+            }),
+            "missing tag21 {expected} witness"
+        );
+    }
+    let aot = image.to_aot(AotLimits::default()).expect("tag21 AOT");
+    assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x15");
+    assert_eq!(aot.identity(), image.artifact_identity());
+
+    let mut haystacks = vec![
+        Vec::new(),
+        literal.to_vec(),
+        vec![b'x'; 15],
+        vec![literal[7]; 160],
+    ];
+    for start in [0_usize, 1, 15, 16, 31, 32, 48, 63, 64, 65, 127] {
+        let mut haystack = vec![literal[7]; start + literal.len() + 19];
+        for false_start in (0..start).step_by(5) {
+            for &offset in &[7_usize, 6, 8, 5, 15] {
+                if let Some(slot) = haystack.get_mut(false_start + offset) {
+                    *slot = literal[offset];
+                }
+            }
+        }
+        haystack[start..start + literal.len()].copy_from_slice(literal);
+        haystacks.push(haystack);
+    }
+    let filter_offsets = [7_usize, 6, 8, 5, 15];
+    // Force each retained wide filter to reject a survivor in every quarter,
+    // while a later complete literal proves that scanning resumes exactly.
+    for rejected_filter in 2..filter_offsets.len() {
+        for false_start in [0_usize, 16, 32, 48] {
+            let true_start = 80;
+            let mut haystack = vec![0xa5; true_start + literal.len() + 19];
+            for &offset in &filter_offsets[..rejected_filter] {
+                haystack[false_start + offset] = literal[offset];
+            }
+            haystack[true_start..true_start + literal.len()].copy_from_slice(literal);
+            haystacks.push(haystack);
+        }
+    }
+    // Exercise sparse-mask recovery after an exact-confirmation miss, including
+    // moving from each earlier 16-lane quarter to a later survivor.
+    for (false_start, true_start) in [(0_usize, 16_usize), (0, 32), (0, 48), (16, 48), (32, 48)] {
+        let mut haystack = vec![0xa5; 96];
+        for &offset in &filter_offsets {
+            haystack[false_start + offset] = literal[offset];
+        }
+        haystack[true_start..true_start + literal.len()].copy_from_slice(literal);
+        haystacks.push(haystack);
+    }
+    for haystack in &haystacks {
+        for (start, end) in [
+            (0, haystack.len()),
+            (haystack.len().min(1), haystack.len()),
+            (0, haystack.len().saturating_sub(1)),
+        ] {
+            let window = SearchWindow::new(start, end);
+            let expected = program
+                .execute(haystack, window, ExecutionLimits::unlimited())
+                .expect("tag21 oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, haystack, start, end).expect("tag21 ISA model");
+            assert_eq!(
+                span_output(actual),
+                expected,
+                "tag21 haystack_len={} window={start}..{end}",
+                haystack.len()
+            );
+        }
+    }
+
+    let pair_index = instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadVectorPair128 {
+                    first_destination: 0,
+                    second_destination: 2,
+                    base: 15,
+                    offset: 0,
+                }
+            )
+        })
+        .expect("tag21 primary pair");
+    for replacement in [
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 1,
+            second_destination: 2,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 3,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 2,
+            base: 14,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 2,
+            base: 15,
+            offset: 16,
+        },
+    ] {
+        let mut mutated = image.clone();
+        replace_test_decoded_at(&mut mutated, pair_index, replacement);
+        assert_resealed_search_rejected(mutated, "tag21 pair-load substitution");
+    }
+
+    let break_after_index = instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SveBreakAfterBytes {
+                    destination: 3,
+                    predicate: 0,
+                    source: 1,
+                }
+            )
+        })
+        .expect("tag21 BRKA");
+    for replacement in [
+        DecodedInstruction::SveBreakAfterBytes {
+            destination: 2,
+            predicate: 0,
+            source: 1,
+        },
+        DecodedInstruction::SveBreakAfterBytes {
+            destination: 3,
+            predicate: 1,
+            source: 1,
+        },
+        DecodedInstruction::SveBreakAfterBytes {
+            destination: 3,
+            predicate: 0,
+            source: 2,
+        },
+    ] {
+        let mut mutated = image.clone();
+        replace_test_decoded_at(&mut mutated, break_after_index, replacement);
+        assert_resealed_search_rejected(mutated, "tag21 BRKA operand");
+    }
+
+    let and_set_flags_index = instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SveAndPredicateBytesSetFlags {
+                    destination: 1,
+                    predicate: 0,
+                    left: 1,
+                    right: 2,
+                }
+            )
+        })
+        .expect("tag21 predicate ANDS");
+    for replacement in [
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: 2,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        },
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 1,
+            left: 1,
+            right: 2,
+        },
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 0,
+            left: 2,
+            right: 2,
+        },
+        DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 3,
+        },
+        DecodedInstruction::SveAndPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        },
+    ] {
+        let mut mutated = image.clone();
+        replace_test_decoded_at(&mut mutated, and_set_flags_index, replacement);
+        assert_resealed_search_rejected(mutated, "tag21 predicate-ANDS substitution");
+    }
+
+    let bit_clear_index = instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+                    destination: 1,
+                    predicate: 0,
+                    left: 1,
+                    right: 3,
+                }
+            )
+        })
+        .expect("tag21 predicate BICS");
+    for replacement in [
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: 2,
+            predicate: 0,
+            left: 1,
+            right: 3,
+        },
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 1,
+            left: 1,
+            right: 3,
+        },
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 0,
+            left: 2,
+            right: 3,
+        },
+        DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        },
+    ] {
+        let mut mutated = image.clone();
+        replace_test_decoded_at(&mut mutated, bit_clear_index, replacement);
+        assert_resealed_search_rejected(mutated, "tag21 predicate-BICS operand");
+    }
+
+    let mut mutated_fifth = image.clone();
+    mutated_fifth
+        .search
+        .as_mut()
+        .expect("tag21 manifest")
+        .quinary_offset = manifest.primary_offset;
+    reseal_test_image(&mut mutated_fifth);
+    assert_eq!(
+        audit(&mutated_fifth),
+        Err(AuditError::InvalidSearchManifest)
+    );
+
+    for invalid_literal in [
+        b"0123456789abcde".as_slice(),
+        b"0123456789abcdefg".as_slice(),
+    ] {
+        let invalid = build_exact_literal::<Span>(
+            invalid_literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("tag21 invalid-width source still forms valid IR");
+        assert_eq!(
+            emit_sve2_fixed16_v2(&invalid, EmitLimits::default()),
+            Err(EmitError::Unsupported {
+                reason: crate::UnsupportedReason::KernelShape
+            })
+        );
+    }
+    let anchored = build_exact_literal::<Span>(
+        literal,
+        AnchorFlags {
+            start: true,
+            end: false,
+        },
+        ValidateLimits::default(),
+    )
+    .expect("tag21 anchored source still forms valid IR");
+    assert_eq!(
+        emit_sve2_fixed16_v2(&anchored, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape
+        })
+    );
+    let class_suffix = build_class_suffix::<Span>(
+        ByteClass::from_bytes(b"ab"),
+        b"0123456789abcde",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("tag21 class-suffix source still forms valid IR");
+    assert_eq!(
+        emit_sve2_fixed16_v2(&class_suffix, EmitLimits::default()),
+        Err(EmitError::Unsupported {
+            reason: crate::UnsupportedReason::KernelShape
+        })
+    );
+}
+
+#[test]
+fn tag21_omits_redundant_zero_precheck_when_a_filter_covers_zero() {
+    let literal = [b'a'; 16];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("repeated tag21 exact program");
+    let image =
+        emit_sve2_fixed16_v2(&program, EmitLimits::default()).expect("repeated tag21 image");
+    let manifest = image.search_manifest().expect("repeated tag21 manifest");
+    let filter_offsets = [
+        manifest.primary_offset,
+        manifest.secondary_offset,
+        manifest.verification_offset,
+        manifest.quaternary_offset,
+        manifest.quinary_offset,
+    ];
+    assert_eq!(filter_offsets, [0, 1, 2, 3, 15]);
+    audit(&image).expect("zero-covered tag21 whole-template audit");
+
+    let instructions = decode(image.code()).expect("zero-covered tag21 decode");
+    let setup_immediates: Vec<_> = instructions
+        .iter()
+        .filter_map(|instruction| match instruction {
+            DecodedInstruction::MoveZero64 {
+                destination: 11,
+                immediate,
+                shift: 0,
+            } => Some(*immediate),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_immediates,
+        [u16::from(b'a'); 5],
+        "an offset-zero filter needs five filter immediates and no retained duplicate"
+    );
+    assert!(
+        !instructions.iter().any(|instruction| matches!(
+            instruction,
+            DecodedInstruction::LoadByteRegister {
+                destination: 10,
+                base: 9,
+                index: 13,
+            }
+        )),
+        "a selected offset-zero filter makes both scalar recovery prechecks redundant"
+    );
+
+    let mut false_only = vec![b'x'; 96];
+    for &offset in &filter_offsets {
+        false_only[usize::from(offset)] = literal[usize::from(offset)];
+    }
+    let mut false_then_match = false_only.clone();
+    false_then_match[48..64].copy_from_slice(&literal);
+    for haystack in [&false_only, &false_then_match] {
+        let window = SearchWindow::new(0, haystack.len());
+        let expected = program
+            .execute(haystack, window, ExecutionLimits::unlimited())
+            .expect("zero-covered tag21 oracle")
+            .output()
+            .map(|span| (span.start(), span.end()));
+        let actual =
+            simulate(&image, haystack, 0, haystack.len()).expect("zero-covered tag21 ISA model");
+        assert_eq!(span_output(actual), expected);
+    }
+}
+
+#[test]
+fn tag21_fifth_offset_is_wire_versioned_without_changing_old_aot_layouts() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("versioned AOT program");
+    for policy in [
+        SearchBackendPolicy::AsimdV8,
+        SearchBackendPolicy::Sve2Fixed16,
+        SearchBackendPolicy::Sve16V6,
+    ] {
+        let mut image = emit_with_backend(&program, policy, EmitLimits::default())
+            .expect("historical AOT image");
+        let before = image.to_aot(AotLimits::default()).expect("historical AOT");
+        image
+            .search
+            .as_mut()
+            .expect("sealed historical manifest")
+            .quinary_offset = 4;
+        reseal_test_image(&mut image);
+        let after = image
+            .to_aot(AotLimits::default())
+            .expect("historical AOT after in-memory-only field mutation");
+        assert_eq!(
+            before,
+            after,
+            "old backend {} serialized a tag21-only field",
+            image.backend_version().0
+        );
+    }
+
+    let canonical =
+        emit_sve2_fixed16_v2(&program, EmitLimits::default()).expect("canonical tag21 image");
+    let mut fifth_mutation = canonical.clone();
+    fifth_mutation
+        .search
+        .as_mut()
+        .expect("tag21 manifest")
+        .quinary_offset = 3;
+    reseal_test_image(&mut fifth_mutation);
+    assert_ne!(
+        canonical.to_aot(AotLimits::default()).expect("tag21 AOT"),
+        fifth_mutation
+            .to_aot(AotLimits::default())
+            .expect("tag21 fifth-offset AOT"),
+        "tag21 must serialize its fifth authenticated offset"
+    );
+}
+
+#[test]
 fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
     let program = build_exact_literal::<Span>(
         b"0123456789abcdef",
@@ -3667,13 +4452,22 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
     .expect("policy test program");
     let policies = [
         (SearchBackendPolicy::AsimdV7, BackendVersion::SEARCH_V7),
+        (SearchBackendPolicy::AsimdV8, BackendVersion::SEARCH_V8),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
             BackendVersion::SEARCH_SVE2_16_V1,
         ),
+        (
+            SearchBackendPolicy::Sve16V6,
+            BackendVersion::SEARCH_SVE16_V6,
+        ),
+        (
+            SearchBackendPolicy::Sve2Fixed16V2,
+            BackendVersion::SEARCH_SVE2_FIXED16_V2,
+        ),
     ];
-    assert_eq!(SearchBackendPolicy::CURRENT, SearchBackendPolicy::AsimdV7);
+    assert_eq!(SearchBackendPolicy::CURRENT, SearchBackendPolicy::AsimdV8);
     assert_eq!(SearchBackendPolicy::default(), SearchBackendPolicy::CURRENT);
     assert_eq!(
         SearchBackendPolicy::CURRENT.backend_version(),
@@ -3699,9 +4493,11 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         audit(&image).expect("policy-selected image audits");
         identities.push(image.artifact_identity());
     }
-    assert_ne!(identities[0], identities[1]);
-    assert_ne!(identities[0], identities[2]);
-    assert_ne!(identities[1], identities[2]);
+    for left in 0..identities.len() {
+        for right in left + 1..identities.len() {
+            assert_ne!(identities[left], identities[right]);
+        }
+    }
 }
 
 #[test]
@@ -4285,6 +5081,17 @@ fn sve16_admission_features_relabels_and_operands_fail_closed() {
                 left,
                 right,
             }),
+            DecodedInstruction::SveAndPredicateBytesSetFlags {
+                destination,
+                predicate,
+                left,
+                right,
+            } => Some(DecodedInstruction::SveAndPredicateBytesSetFlags {
+                destination,
+                predicate: predicate ^ 1,
+                left,
+                right,
+            }),
             DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
                 Some(DecodedInstruction::SveTestPredicateBytes {
                     predicate,
@@ -4398,6 +5205,300 @@ fn sve2_operands_and_non_vl16_predicate_patterns_fail_closed() {
 }
 
 #[test]
+fn v7_canonical_image_identity_remains_frozen_after_v8() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("frozen v7 program");
+    let image =
+        emit_search_version_for_test(&program, EmitLimits::default(), BackendVersion::SEARCH_V7)
+            .expect("frozen v7 image");
+    assert_eq!(
+        image.artifact_identity().to_string(),
+        "6573feb9a1938ded6baf58586dbc7ef7eae166a166c8c31c4e5889ea5be7c02c"
+    );
+    assert_eq!(
+        &image.to_aot(AotLimits::default()).unwrap().as_bytes()[..8],
+        b"FREA64\0\x07"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V8 mutation matrix keeps the wide and adaptive control-flow contracts together"
+)]
+fn v8_rejects_v7_relabeling_and_wide_screen_mutations() {
+    let program = build_exact_literal::<Span>(
+        b"0123456789abcdef",
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("v8 mutation program");
+    let canonical_v8 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV8,
+        EmitLimits::default(),
+    )
+    .expect("canonical v8");
+    let canonical_v7 =
+        emit_search_version_for_test(&program, EmitLimits::default(), BackendVersion::SEARCH_V7)
+            .expect("canonical v7");
+    assert_eq!(canonical_v8.backend_version(), BackendVersion::SEARCH_V8);
+    assert_eq!(
+        canonical_v8
+            .search_manifest()
+            .expect("v8 manifest")
+            .candidate_policy_version,
+        4
+    );
+
+    let mut v8_as_v7 = canonical_v8.clone();
+    v8_as_v7.backend_version = BackendVersion::SEARCH_V7;
+    {
+        let manifest = v8_as_v7.search.as_mut().expect("v8 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V7;
+        manifest.candidate_policy_version = 3;
+    }
+    assert_resealed_search_rejected(v8_as_v7, "v8 code resealed as v7");
+
+    let mut v7_as_v8 = canonical_v7;
+    v7_as_v8.backend_version = BackendVersion::SEARCH_V8;
+    {
+        let manifest = v7_as_v8.search.as_mut().expect("v7 manifest");
+        manifest.backend_version = BackendVersion::SEARCH_V8;
+        manifest.candidate_policy_version = 4;
+    }
+    assert_resealed_search_rejected(v7_as_v8, "v7 code resealed as v8");
+
+    let decoded = decode(canonical_v8.code()).expect("canonical v8 decode");
+    let wide_secondary_load = decoded
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadVector128 {
+                    destination: 18,
+                    base: 10,
+                    offset: 0
+                }
+            )
+        })
+        .expect("wide secondary load");
+    let mut vector_operand = canonical_v8.clone();
+    replace_test_decoded_at(
+        &mut vector_operand,
+        wide_secondary_load,
+        DecodedInstruction::LoadVector128 {
+            destination: 22,
+            base: 10,
+            offset: 0,
+        },
+    );
+    assert_resealed_search_rejected(vector_operand, "v8 wide vector operand");
+
+    let adaptive_primary_load = decoded
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadVector128 {
+                    destination: 18,
+                    base: 15,
+                    offset: 0
+                }
+            )
+        })
+        .expect("adaptive primary recheck");
+    let secondary_empty_branch = adaptive_primary_load
+        .checked_sub(1)
+        .expect("adaptive primary recheck follows its secondary-empty branch");
+    assert!(matches!(
+        decoded.get(secondary_empty_branch),
+        Some(DecodedInstruction::CompareBranchZero64 {
+            register: 10,
+            nonzero: false,
+            ..
+        })
+    ));
+    let adaptive_recheck = [
+        DecodedInstruction::LoadVector128 {
+            destination: 18,
+            base: 15,
+            offset: 0,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 18,
+            left: 18,
+            right: 1,
+        },
+        DecodedInstruction::AndBytes16 {
+            destination: 0,
+            left: 0,
+            right: 18,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 19,
+            base: 15,
+            offset: 16,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 19,
+            left: 19,
+            right: 1,
+        },
+        DecodedInstruction::AndBytes16 {
+            destination: 2,
+            left: 2,
+            right: 19,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 20,
+            base: 15,
+            offset: 32,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 20,
+            left: 20,
+            right: 1,
+        },
+        DecodedInstruction::AndBytes16 {
+            destination: 4,
+            left: 4,
+            right: 20,
+        },
+        DecodedInstruction::LoadVector128 {
+            destination: 21,
+            base: 15,
+            offset: 48,
+        },
+        DecodedInstruction::CompareEqualBytes16 {
+            destination: 21,
+            left: 21,
+            right: 1,
+        },
+        DecodedInstruction::AndBytes16 {
+            destination: 6,
+            left: 6,
+            right: 21,
+        },
+    ];
+    let adaptive_recheck_end = adaptive_primary_load
+        .checked_add(adaptive_recheck.len())
+        .expect("bounded adaptive recheck");
+    assert_eq!(
+        decoded.get(adaptive_primary_load..adaptive_recheck_end),
+        Some(adaptive_recheck.as_slice())
+    );
+    let pair_empty_branch = adaptive_recheck_end
+        .checked_add(5)
+        .expect("bounded adaptive presence reduction");
+    assert!(matches!(
+        decoded.get(pair_empty_branch),
+        Some(DecodedInstruction::CompareBranchZero64 {
+            register: 10,
+            nonzero: false,
+            ..
+        })
+    ));
+    let branch_target = |instruction_index: usize| {
+        let DecodedInstruction::CompareBranchZero64 { displacement, .. } =
+            decoded[instruction_index]
+        else {
+            panic!("adaptive branch must be CBZ");
+        };
+        let instruction_bytes = i64::try_from(instruction_index)
+            .expect("small adaptive instruction index")
+            .checked_mul(4)
+            .expect("small adaptive instruction address");
+        let target_bytes = instruction_bytes
+            .checked_add(i64::from(displacement))
+            .expect("bounded adaptive branch target");
+        assert_eq!(target_bytes % 4, 0);
+        usize::try_from(target_bytes / 4).expect("nonnegative adaptive branch target")
+    };
+    let secondary_only_advance = branch_target(secondary_empty_branch);
+    let wide_advance = branch_target(pair_empty_branch);
+    assert!(
+        wide_advance < secondary_only_advance,
+        "pair-empty recheck must switch back to the earlier primary-first advance"
+    );
+    for advance in [wide_advance, secondary_only_advance] {
+        assert_eq!(
+            decoded.get(advance),
+            Some(&DecodedInstruction::AddImmediate64 {
+                destination: 5,
+                source: 5,
+                immediate: 64,
+            })
+        );
+    }
+    let redirected_displacement = i64::try_from(secondary_only_advance)
+        .expect("small secondary-only advance")
+        .checked_sub(i64::try_from(pair_empty_branch).expect("small adaptive branch"))
+        .and_then(|instructions| instructions.checked_mul(4))
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .expect("encodable adaptive redirect");
+    let mut redirected_pair_empty = canonical_v8.clone();
+    replace_test_branch_and_relocation_at(
+        &mut redirected_pair_empty,
+        pair_empty_branch,
+        DecodedInstruction::CompareBranchZero64 {
+            register: 10,
+            nonzero: false,
+            displacement: redirected_displacement,
+        },
+    );
+    assert_resealed_search_rejected(redirected_pair_empty, "v8 adaptive pair-empty mode switch");
+    let mut adaptive_operand = canonical_v8.clone();
+    replace_test_decoded_at(
+        &mut adaptive_operand,
+        adaptive_primary_load,
+        DecodedInstruction::LoadVector128 {
+            destination: 18,
+            base: 10,
+            offset: 0,
+        },
+    );
+    assert_resealed_search_rejected(adaptive_operand, "v8 adaptive primary operand");
+
+    let wide_presence_branch = decoded
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 10,
+                    nonzero: true,
+                    ..
+                }
+            )
+        })
+        .expect("v8 wide presence branch");
+    let DecodedInstruction::CompareBranchZero64 {
+        register,
+        nonzero,
+        displacement,
+    } = decoded[wide_presence_branch]
+    else {
+        unreachable!()
+    };
+    let mut inverted_branch = canonical_v8;
+    replace_test_branch_and_relocation_at(
+        &mut inverted_branch,
+        wide_presence_branch,
+        DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero: !nonzero,
+            displacement,
+        },
+    );
+    assert_resealed_search_rejected(inverted_branch, "v8 wide presence branch");
+}
+
+#[test]
 fn v6_sparse_recovery_widths_authenticate_for_every_output() {
     for width in [1_usize, 15, 17, 31, 32] {
         let mut literal = vec![b'a'; width];
@@ -4439,7 +5540,7 @@ fn v6_sparse_recovery_widths_authenticate_for_every_output() {
 }
 
 #[test]
-fn v7_every_admitted_width_audits_and_round_trips_for_every_output() {
+fn v8_every_admitted_width_audits_and_round_trips_for_every_output() {
     for width in 0_usize..=MAX_REPEATED_CONFIRM_BYTES {
         let literal: Vec<u8> = (0..width)
             .map(|offset| {
@@ -4468,15 +5569,22 @@ fn v7_every_admitted_width_audits_and_round_trips_for_every_output() {
         )
         .expect("Span exact");
         for image in [
-            emit(&exists, EmitLimits::default()).expect("Exists v7"),
-            emit(&selected, EmitLimits::default()).expect("SelectedEnd v7"),
-            emit(&span, EmitLimits::default()).expect("Span v7"),
+            emit_with_backend(&exists, SearchBackendPolicy::AsimdV8, EmitLimits::default())
+                .expect("Exists v8"),
+            emit_with_backend(
+                &selected,
+                SearchBackendPolicy::AsimdV8,
+                EmitLimits::default(),
+            )
+            .expect("SelectedEnd v8"),
+            emit_with_backend(&span, SearchBackendPolicy::AsimdV8, EmitLimits::default())
+                .expect("Span v8"),
         ] {
-            assert_eq!(image.backend_version(), BackendVersion::SEARCH_V7);
-            let manifest = image.search_manifest().expect("sealed v7 manifest");
+            assert_eq!(image.backend_version(), BackendVersion::SEARCH_V8);
+            let manifest = image.search_manifest().expect("sealed v8 manifest");
             assert_eq!(
                 manifest.candidate_policy_version,
-                u16::from(width != 0) * 3,
+                u16::from(width != 0) * 4,
                 "candidate-policy eligibility at width {width}"
             );
             assert_eq!(
@@ -4495,12 +5603,12 @@ fn v7_every_admitted_width_audits_and_round_trips_for_every_output() {
                 "fourth-column eligibility at width {width}"
             );
 
-            let report = audit(&image).expect("independent whole-template v7 audit");
+            let report = audit(&image).expect("independent whole-template v8 audit");
             assert_eq!(
                 (report.decode_passes, report.source_identity_rebuilds),
                 (1, 1)
             );
-            let decoded = decode(image.code()).expect("v7 image decodes");
+            let decoded = decode(image.code()).expect("v8 image decodes");
             assert_eq!(decoded.len() * 4, image.code().len());
             for (encoded, instruction) in image.code().chunks_exact(4).zip(decoded) {
                 let word = u32::from_le_bytes(
@@ -4514,7 +5622,7 @@ fn v7_every_admitted_width_audits_and_round_trips_for_every_output() {
                     "instruction round trip at literal width {width}"
                 );
             }
-            let aot = image.to_aot(AotLimits::default()).expect("bounded v7 AOT");
+            let aot = image.to_aot(AotLimits::default()).expect("bounded v8 AOT");
             assert_eq!(aot.identity(), image.artifact_identity());
         }
     }
@@ -6170,6 +7278,24 @@ fn decoder_matches_independently_assembled_instruction_words() {
             },
         ),
         (
+            0xad40_0440,
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 0,
+                second_destination: 1,
+                base: 2,
+                offset: 0,
+            },
+        ),
+        (
+            0xad5f_8440,
+            DecodedInstruction::LoadVectorPair128 {
+                first_destination: 0,
+                second_destination: 1,
+                base: 2,
+                offset: 1008,
+            },
+        ),
+        (
             0x6e21_8c00,
             DecodedInstruction::CompareEqualBytes16 {
                 destination: 0,
@@ -6297,6 +7423,24 @@ fn decoder_matches_independently_assembled_instruction_words() {
             },
         ),
         (
+            0x2542_4021,
+            DecodedInstruction::SveAndPredicateBytesSetFlags {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+        ),
+        (
+            0x2503_4031,
+            DecodedInstruction::SveBitClearPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 3,
+            },
+        ),
+        (
             0x2550_c020,
             DecodedInstruction::SveTestPredicateBytes {
                 predicate: 0,
@@ -6306,6 +7450,14 @@ fn decoder_matches_independently_assembled_instruction_words() {
         (
             0x2590_4023,
             DecodedInstruction::SveBreakBeforeBytes {
+                destination: 3,
+                predicate: 0,
+                source: 1,
+            },
+        ),
+        (
+            0x2510_4023,
+            DecodedInstruction::SveBreakAfterBytes {
                 destination: 3,
                 predicate: 0,
                 source: 1,
@@ -6325,6 +7477,16 @@ fn decoder_matches_independently_assembled_instruction_words() {
         assert_eq!(decoded, expected);
         assert_eq!(crate::decode::canonical_word(decoded), Some(word));
     }
+    assert_eq!(
+        crate::decode::canonical_word(DecodedInstruction::LoadVectorPair128 {
+            first_destination: 1,
+            second_destination: 1,
+            base: 2,
+            offset: 0,
+        }),
+        None,
+        "pair loads with aliased destinations are noncanonical"
+    );
 }
 
 #[test]
@@ -6512,6 +7674,12 @@ fn written_gpr_policy_covers_every_admitted_instruction_form() {
         DecodedInstruction::LoadVector128 {
             destination: 0,
             base: 1,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 1,
+            base: 2,
             offset: 0,
         },
         DecodedInstruction::DuplicateByte16 {
@@ -6740,6 +7908,12 @@ fn every_explicit_gpr_role(register: u8) -> Vec<DecodedInstruction> {
         },
         DecodedInstruction::LoadVector128 {
             destination: 0,
+            base: register,
+            offset: 0,
+        },
+        DecodedInstruction::LoadVectorPair128 {
+            first_destination: 0,
+            second_destination: 1,
             base: register,
             offset: 0,
         },
@@ -7204,6 +8378,21 @@ impl SimMachine<'_> {
                     value.copy_from_slice(bytes);
                     self.vectors[usize::from(destination)] = value;
                 }
+                DecodedInstruction::LoadVectorPair128 {
+                    first_destination,
+                    second_destination,
+                    base,
+                    offset,
+                } => {
+                    let address = self.get(base).wrapping_add(u64::from(offset));
+                    let bytes = self.load(address, 32)?;
+                    let mut first = [0_u8; 16];
+                    let mut second = [0_u8; 16];
+                    first.copy_from_slice(&bytes[..16]);
+                    second.copy_from_slice(&bytes[16..]);
+                    self.vectors[usize::from(first_destination)] = first;
+                    self.vectors[usize::from(second_destination)] = second;
+                }
                 DecodedInstruction::DuplicateByte16 {
                     destination,
                     source,
@@ -7389,6 +8578,41 @@ impl SimMachine<'_> {
                         & self.predicates[usize::from(left)]
                         & self.predicates[usize::from(right)];
                 }
+                DecodedInstruction::SveAndPredicateBytesSetFlags {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    let result = self.predicates[usize::from(predicate)]
+                        & self.predicates[usize::from(left)]
+                        & self.predicates[usize::from(right)];
+                    self.predicates[usize::from(destination)] = result;
+                    self.zero = result == 0;
+                }
+                DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    let result = self.predicates[usize::from(predicate)]
+                        & self.predicates[usize::from(left)]
+                        & !self.predicates[usize::from(right)];
+                    self.predicates[usize::from(destination)] = result;
+                    self.zero = result == 0;
+                }
+                DecodedInstruction::SveBitClearPredicateBytes {
+                    destination,
+                    predicate,
+                    left,
+                    right,
+                } => {
+                    self.predicates[usize::from(destination)] = self.predicates
+                        [usize::from(predicate)]
+                        & self.predicates[usize::from(left)]
+                        & !self.predicates[usize::from(right)];
+                }
                 DecodedInstruction::SveTestPredicateBytes { predicate, tested } => {
                     self.zero = self.predicates[usize::from(predicate)]
                         & self.predicates[usize::from(tested)]
@@ -7408,6 +8632,21 @@ impl SimMachine<'_> {
                         1_u16.checked_shl(first).unwrap_or(0).wrapping_sub(1)
                     };
                     self.predicates[usize::from(destination)] = active & before;
+                }
+                DecodedInstruction::SveBreakAfterBytes {
+                    destination,
+                    predicate,
+                    source,
+                } => {
+                    let active = self.predicates[usize::from(predicate)];
+                    let matches = active & self.predicates[usize::from(source)];
+                    let through = if matches == 0 {
+                        u16::MAX
+                    } else {
+                        let first_after = matches.trailing_zeros() + 1;
+                        1_u16.checked_shl(first_after).unwrap_or(0).wrapping_sub(1)
+                    };
+                    self.predicates[usize::from(destination)] = active & through;
                 }
                 DecodedInstruction::SveCountPredicateBytes {
                     destination,
@@ -7583,8 +8822,8 @@ fn instruction_shapes_are_small_and_simd_is_visible() {
     let short = emit(&short, EmitLimits::default()).expect("short image");
     let long = emit(&long, EmitLimits::default()).expect("long image");
     let class = emit(&class, EmitLimits::default()).expect("class image");
-    assert!(short.code().len() < 640);
-    assert!(long.code().len() < 768);
+    assert!(short.code().len() < 1_024);
+    assert!(long.code().len() < 1_152);
     assert!(class.code().len() < 1_024);
     assert!(audit(&short).expect("short audit").vector_instructions >= 4);
     assert!(audit(&long).expect("long audit").vector_instructions >= 8);

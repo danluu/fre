@@ -210,9 +210,12 @@ dependencies = [
 name = "fre-jit-runtime"
 version = "0.1.0"
 dependencies = [
+ "fre",
  "fre-jit-aarch64",
  "fre-kernel-ir",
+ "fre-target-features",
  "libc",
+ "sha2",
 ]
 
 [[package]]
@@ -239,6 +242,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "fre-exact-alloc",
+ "fre-kernel-ir",
  "fre-simd-kernels",
  "memchr",
  "regex",

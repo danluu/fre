@@ -26,17 +26,27 @@ impl BackendVersion {
     pub const SEARCH_V6: Self = Self(6);
     /// Exact per-lane recovery with ranked, staged four-column filtering.
     pub const SEARCH_V7: Self = Self(7);
+    /// Lazy 64-candidate screening with the V7 staged recovery fallback.
+    pub const SEARCH_V8: Self = Self(8);
     /// SVE exact-literal screening with exactly sixteen active byte lanes.
-    ///
-    /// Tag 8 remains reserved for the separately developed Search V8 wire
-    /// contract; these opt-in backends do not change [`Self::SEARCH_CURRENT`].
     pub const SEARCH_SVE16_V1: Self = Self(9);
     /// SVE2 exact-literal screening with exactly sixteen active byte lanes.
     pub const SEARCH_SVE2_16_V1: Self = Self(10);
+    /// V8 screening with SVE confirmation and V8-equivalent cold-tail layout.
+    ///
+    /// Tags 11 through 18 remain reserved for the historical experimental
+    /// sequence that led to this candidate.
+    pub const SEARCH_SVE16_V6: Self = Self(19);
+    /// Candidate fixed-VL16 SVE2 search with paired ASIMD screening and
+    /// predicate-preserving five-column recovery.
+    ///
+    /// Tag 20 remains reserved for the rejected uniform-literal experiment.
+    /// Historical tags 11 through 20 are never reused by this contract.
+    pub const SEARCH_SVE2_FIXED16_V2: Self = Self(21);
     /// Compatibility name for the original search backend.
     pub const SEARCH_LEGACY: Self = Self::SEARCH_V1;
     /// Current search backend and AOT wire contract.
-    pub const SEARCH_CURRENT: Self = Self::SEARCH_V7;
+    pub const SEARCH_CURRENT: Self = Self::SEARCH_V8;
     /// Explicit tag assigned to the unchanged aggregate contract by c4d.
     pub const AGGREGATE_V1: Self = Self(1);
     /// Historical pre-c4d tag for the same aggregate machine-code contract.
@@ -235,6 +245,23 @@ pub struct NativeImage {
     pub(crate) aggregate: Option<AggregateManifest>,
 }
 
+/// Immutable search image carrying the emitter's successful whole-image audit.
+///
+/// Only this crate can construct the wrapper, and construction occurs
+/// immediately after the independent final audit. The wrapper exposes no
+/// mutable access to its image, so a publisher may rely on the attestation
+/// without letting an arbitrary [`NativeImage`] bypass its normal audits.
+///
+/// ```compile_fail
+/// use fre_jit_aarch64::{AuditedNativeImage, NativeImage};
+///
+/// fn forge(image: NativeImage) -> AuditedNativeImage {
+///     AuditedNativeImage(image)
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditedNativeImage(NativeImage);
+
 /// Sealed semantic and backend envelope for one search image.
 ///
 /// This is deliberately distinct from instruction-shape inference. The
@@ -263,6 +290,11 @@ pub(crate) struct SearchManifest {
     pub(crate) verification_offset: u16,
     /// Selected fourth-byte verification offset, or `u16::MAX` when absent.
     pub(crate) quaternary_offset: u16,
+    /// Selected fifth-byte verification offset, or `u16::MAX` when absent.
+    ///
+    /// This field is serialized only by [`BackendVersion::SEARCH_SVE2_FIXED16_V2`];
+    /// every older search tag retains its byte-for-byte AOT layout.
+    pub(crate) quinary_offset: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,6 +421,24 @@ impl NativeImage {
         encode_aot(self, &mut |chunk| bytes.extend_from_slice(chunk))?;
         debug_assert_eq!(bytes.len(), required);
         Ok(AotArtifact(bytes.into_boxed_slice()))
+    }
+}
+
+impl AuditedNativeImage {
+    pub(crate) const fn from_emitter_audit(image: NativeImage) -> Self {
+        Self(image)
+    }
+
+    /// Borrow the immutable image authenticated by the emitter.
+    #[must_use]
+    pub const fn as_image(&self) -> &NativeImage {
+        &self.0
+    }
+
+    /// Discard the reusable audit attestation and recover the plain image.
+    #[must_use]
+    pub fn into_image(self) -> NativeImage {
+        self.0
     }
 }
 
@@ -566,18 +616,22 @@ impl fmt::Display for ArtifactIdentity {
 pub(crate) fn aot_size(image: &NativeImage) -> Result<usize, EmitError> {
     // Search v3 and later add an independently authenticated, source-bound
     // semantic envelope. V5 and later include the sealed verification offset;
-    // V7 and the fixed-lane SVE backends also include the sealed fourth
-    // ranked offset.
+    // V7, V8, and the original fixed-lane SVE backends also include the sealed
+    // fourth ranked offset. Search tag 21 alone adds a fifth ranked offset.
     // Aggregate serialization retains its separate four-byte extension and
     // does not inherit the search wire contract.
     let manifest_bytes = if image.aggregate.is_some() {
         4
     } else if image.search.is_some() {
-        if matches!(
+        if image.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2 {
+            56
+        } else if matches!(
             image.backend_version,
             BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
         ) {
             54
         } else if matches!(
@@ -623,44 +677,31 @@ fn enforce(resource: ResourceKind, required: usize, limit: u64) -> Result<(), Em
 
 fn aot_magic(image: &NativeImage) -> Result<&'static [u8; 8], EmitError> {
     if image.aggregate.is_some() {
-        Ok(b"FREA64A\x01")
-    } else if image.search.is_some() {
-        match image.backend_version {
-            BackendVersion::SEARCH_V3 => Ok(b"FREA64\0\x03"),
-            BackendVersion::SEARCH_V4 => Ok(b"FREA64\0\x04"),
-            BackendVersion::SEARCH_V5 => Ok(b"FREA64\0\x05"),
-            BackendVersion::SEARCH_V6 => Ok(b"FREA64\0\x06"),
-            BackendVersion::SEARCH_V7 => Ok(b"FREA64\0\x07"),
-            BackendVersion::SEARCH_SVE16_V1 => Ok(b"FREA64\0\x09"),
-            BackendVersion::SEARCH_SVE2_16_V1 => Ok(b"FREA64\0\x0a"),
-            _ => Err(EmitError::InternalInvariant),
-        }
-    } else {
-        Ok(b"FREA64\0\x01")
+        return Ok(b"FREA64A\x01");
+    }
+    if image.search.is_none() {
+        return Ok(b"FREA64\0\x01");
+    }
+    match image.backend_version {
+        BackendVersion::SEARCH_V3 => Ok(b"FREA64\0\x03"),
+        BackendVersion::SEARCH_V4 => Ok(b"FREA64\0\x04"),
+        BackendVersion::SEARCH_V5 => Ok(b"FREA64\0\x05"),
+        BackendVersion::SEARCH_V6 => Ok(b"FREA64\0\x06"),
+        BackendVersion::SEARCH_V7 => Ok(b"FREA64\0\x07"),
+        BackendVersion::SEARCH_V8 => Ok(b"FREA64\0\x08"),
+        BackendVersion::SEARCH_SVE16_V1 => Ok(b"FREA64\0\x09"),
+        BackendVersion::SEARCH_SVE2_16_V1 => Ok(b"FREA64\0\x0a"),
+        BackendVersion::SEARCH_SVE16_V6 => Ok(b"FREA64\0\x13"),
+        BackendVersion::SEARCH_SVE2_FIXED16_V2 => Ok(b"FREA64\0\x15"),
+        _ => Err(EmitError::InternalInvariant),
     }
 }
 
-fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
-    let aggregate = image.aggregate;
-    let search = image.search;
-    write(aot_magic(image)?);
-    write(&image.backend_version.0.to_le_bytes());
-    write(&[
-        image.target.architecture,
-        u8::from(image.target.little_endian),
-        image.target.pointer_width,
-        image.target.abi,
-        aggregate.map_or_else(
-            || output_tag(image.output),
-            |value| aggregate_tag(value.output),
-        ),
-        0,
-    ]);
-    write(&image.target.features.bits().to_le_bytes());
-    if let Some(manifest) = aggregate {
+fn encode_aot_manifest(image: &NativeImage, write: &mut impl FnMut(&[u8])) {
+    if let Some(manifest) = image.aggregate {
         write(manifest.source_identity.as_bytes());
         write(&manifest.literal_bytes.to_le_bytes());
-    } else if let Some(manifest) = search {
+    } else if let Some(manifest) = image.search {
         // Retain the legacy source field and also bind the sealed manifest's
         // copy. Audit requires equality; encoding both makes either mutation
         // change the artifact identity.
@@ -682,23 +723,51 @@ fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), 
             BackendVersion::SEARCH_V5
                 | BackendVersion::SEARCH_V6
                 | BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         ) {
             write(&manifest.verification_offset.to_le_bytes());
         }
         if matches!(
             image.backend_version,
             BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         ) {
             write(&manifest.quaternary_offset.to_le_bytes());
+        }
+        if image.backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2 {
+            write(&manifest.quinary_offset.to_le_bytes());
         }
         write(manifest.source_identity.as_bytes());
     } else {
         write(image.source_identity.as_bytes());
     }
+}
+
+fn encode_aot(image: &NativeImage, write: &mut impl FnMut(&[u8])) -> Result<(), EmitError> {
+    let aggregate = image.aggregate;
+    write(aot_magic(image)?);
+    write(&image.backend_version.0.to_le_bytes());
+    write(&[
+        image.target.architecture,
+        u8::from(image.target.little_endian),
+        image.target.pointer_width,
+        image.target.abi,
+        aggregate.map_or_else(
+            || output_tag(image.output),
+            |value| aggregate_tag(value.output),
+        ),
+        0,
+    ]);
+    write(&image.target.features.bits().to_le_bytes());
+    encode_aot_manifest(image, write);
     write(&image.layout.code_alignment.to_le_bytes());
     write(&image.layout.rodata_alignment.to_le_bytes());
     write(&image.layout.rodata_from_code_start.to_le_bytes());

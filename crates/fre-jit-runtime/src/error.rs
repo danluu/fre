@@ -75,6 +75,13 @@ pub enum PublishError {
     CpuFeatureUnavailable {
         feature: &'static str,
     },
+    CpuTuningUnavailable {
+        required: &'static str,
+    },
+    SveVectorLengthMismatch {
+        expected: u16,
+        actual: Option<u16>,
+    },
     OutputContractMismatch {
         expected: OutputKind,
         actual: OutputKind,
@@ -128,6 +135,34 @@ impl std::error::Error for PublishError {
             Self::ImageAudit(error) => Some(error),
             Self::ImageIdentity(error) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Failure to establish a current-thread contract for a published kernel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelThreadContractError {
+    /// The host capability query itself could not run.
+    HostCapabilities(PublishError),
+    /// A fixed-VL SVE/SVE2 kernel requires a different current-thread vector
+    /// length.
+    RequiredSveVectorLengthUnavailable {
+        required_bytes: u16,
+        actual_bytes: Option<u16>,
+    },
+}
+
+impl fmt::Display for KernelThreadContractError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "native search thread contract failed: {self:?}")
+    }
+}
+
+impl std::error::Error for KernelThreadContractError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HostCapabilities(error) => Some(error),
+            Self::RequiredSveVectorLengthUnavailable { .. } => None,
         }
     }
 }

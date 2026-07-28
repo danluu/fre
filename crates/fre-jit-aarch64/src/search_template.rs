@@ -232,6 +232,21 @@ impl Template {
         });
     }
 
+    fn load_vector_pair128(
+        &mut self,
+        first_destination: u8,
+        second_destination: u8,
+        base: u8,
+        offset: u16,
+    ) {
+        self.push(DecodedInstruction::LoadVectorPair128 {
+            first_destination,
+            second_destination,
+            base,
+            offset,
+        });
+    }
+
     fn dup_byte16(&mut self, destination: u8, source: u8) {
         self.push(DecodedInstruction::DuplicateByte16 {
             destination,
@@ -344,12 +359,50 @@ impl Template {
         });
     }
 
+    fn sve_and_predicate_bytes_set_flags(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) {
+        self.push(DecodedInstruction::SveAndPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        });
+    }
+
+    fn sve_bit_clear_predicate_bytes_set_flags(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) {
+        self.push(DecodedInstruction::SveBitClearPredicateBytesSetFlags {
+            destination,
+            predicate,
+            left,
+            right,
+        });
+    }
+
     fn sve_test_predicate_bytes(&mut self, predicate: u8, tested: u8) {
         self.push(DecodedInstruction::SveTestPredicateBytes { predicate, tested });
     }
 
     fn sve_break_before_bytes(&mut self, destination: u8, predicate: u8, source: u8) {
         self.push(DecodedInstruction::SveBreakBeforeBytes {
+            destination,
+            predicate,
+            source,
+        });
+    }
+
+    fn sve_break_after_bytes(&mut self, destination: u8, predicate: u8, source: u8) {
+        self.push(DecodedInstruction::SveBreakAfterBytes {
             destination,
             predicate,
             source,
@@ -697,6 +750,12 @@ fn emit_exact(
         }
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1 => {
             emit_exact_candidates_sve16(template, manifest, literal, none, found)
+        }
+        BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE16_V6 => {
+            emit_exact_candidates_v8(template, manifest, literal, none, found)
+        }
+        BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
+            emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
         _ => Err(AuditError::InvalidSearchManifest),
     }
@@ -1549,6 +1608,612 @@ fn emit_exact_candidates_sve16(
 
     template.bind(tail)?;
     emit_scalar_candidates_v2(template, literal, none, found)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independent v8 template reconstructs the wide lazy screen and historical staged fallback without sharing emitter control flow"
+)]
+fn emit_exact_candidates_v8(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let primary_offset = manifest.primary_offset;
+    let secondary_offset =
+        (manifest.secondary_offset != u16::MAX).then_some(manifest.secondary_offset);
+    let verification_offset =
+        (manifest.verification_offset != u16::MAX).then_some(manifest.verification_offset);
+    let quaternary_offset =
+        (manifest.quaternary_offset != u16::MAX).then_some(manifest.quaternary_offset);
+    let wide = template.new_label(LabelKind::Loop);
+    let wide_advance = template.new_label(LabelKind::Internal);
+    let secondary_only = secondary_offset.map(|_| template.new_label(LabelKind::Loop));
+    let secondary_only_advance = secondary_offset.map(|_| template.new_label(LabelKind::Internal));
+    let narrow_setup = template.new_label(LabelKind::Internal);
+    let narrow = template.new_label(LabelKind::Loop);
+    let advance = template.new_label(LabelKind::Internal);
+    let recover = template.new_label(LabelKind::SlowPath);
+    let lane_loop = template.new_label(LabelKind::Loop);
+    let candidate_miss = template.new_label(LabelKind::Internal);
+    let tail_setup = template.new_label(LabelKind::SlowPath);
+    let wide_second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
+    let second_filter = secondary_offset.map(|_| template.new_label(LabelKind::SlowPath));
+    let third_filter = verification_offset.map(|_| template.new_label(LabelKind::SlowPath));
+    let fourth_filter = quaternary_offset.map(|_| template.new_label(LabelKind::SlowPath));
+    let filters_cover_zero = primary_offset == 0
+        || secondary_offset == Some(0)
+        || verification_offset == Some(0)
+        || quaternary_offset == Some(0);
+    let sve_confirmation =
+        manifest.backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() >= 16;
+
+    template.load_byte(11, 8, primary_offset);
+    template.dup_byte16(1, 11);
+    if let Some(offset) = secondary_offset {
+        template.load_byte(11, 8, offset);
+        template.dup_byte16(3, 11);
+    }
+    if let Some(offset) = verification_offset {
+        template.load_byte(11, 8, offset);
+        template.dup_byte16(5, 11);
+    }
+    if let Some(offset) = quaternary_offset {
+        template.load_byte(11, 8, offset);
+        template.dup_byte16(7, 11);
+    }
+    template.mov_imm64(14, 0x1111_1111_1111_1111);
+    template.add_reg(15, 9, 5);
+    if primary_offset != 0 {
+        template.add_imm(15, 15, primary_offset);
+    }
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.sub_reg(10, 6, 5);
+    template.cmp_imm64(10, 15);
+    template.branch_cond(Condition::CarryClear, tail_setup);
+    template.cmp_imm64(10, 63);
+    template.branch_cond(Condition::CarryClear, narrow_setup);
+    template.sub_imm(7, 6, 63);
+
+    template.bind(wide)?;
+    template.load_vector128(0, 15, 0);
+    template.compare_equal_bytes16(0, 0, 1);
+    template.load_vector128(2, 15, 16);
+    template.compare_equal_bytes16(2, 2, 1);
+    template.load_vector128(4, 15, 32);
+    template.compare_equal_bytes16(4, 4, 1);
+    template.load_vector128(6, 15, 48);
+    template.compare_equal_bytes16(6, 6, 1);
+    emit_four_block_presence_v8(template);
+    if let Some(wide_second_filter) = wide_second_filter {
+        template.compare_branch_zero(10, true, wide_second_filter);
+    } else {
+        template.compare_branch_zero(10, true, narrow_setup);
+    }
+
+    template.bind(wide_advance)?;
+    template.add_imm(5, 5, 64);
+    template.add_imm(15, 15, 64);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, wide);
+    template.branch(narrow_setup);
+
+    if let Some(wide_second_filter) = wide_second_filter {
+        let offset = secondary_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        let delta = offset.abs_diff(primary_offset);
+        template.bind(wide_second_filter)?;
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(18, 10, 0);
+        template.compare_equal_bytes16(18, 18, 3);
+        template.and_bytes16(0, 0, 18);
+        template.load_vector128(19, 10, 16);
+        template.compare_equal_bytes16(19, 19, 3);
+        template.and_bytes16(2, 2, 19);
+        template.load_vector128(20, 10, 32);
+        template.compare_equal_bytes16(20, 20, 3);
+        template.and_bytes16(4, 4, 20);
+        template.load_vector128(21, 10, 48);
+        template.compare_equal_bytes16(21, 21, 3);
+        template.and_bytes16(6, 6, 21);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, true, narrow_setup);
+    }
+
+    if let (Some(secondary_only), Some(secondary_only_advance), Some(offset)) =
+        (secondary_only, secondary_only_advance, secondary_offset)
+    {
+        template.bind(secondary_only_advance)?;
+        template.add_imm(5, 5, 64);
+        template.add_imm(15, 15, 64);
+        template.cmp_reg64(5, 7);
+        template.branch_cond(Condition::LowerOrSame, secondary_only);
+        template.branch(narrow_setup);
+
+        template.bind(secondary_only)?;
+        let delta = offset.abs_diff(primary_offset);
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(0, 10, 0);
+        template.compare_equal_bytes16(0, 0, 3);
+        template.load_vector128(2, 10, 16);
+        template.compare_equal_bytes16(2, 2, 3);
+        template.load_vector128(4, 10, 32);
+        template.compare_equal_bytes16(4, 4, 3);
+        template.load_vector128(6, 10, 48);
+        template.compare_equal_bytes16(6, 6, 3);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, false, secondary_only_advance);
+        template.load_vector128(18, 15, 0);
+        template.compare_equal_bytes16(18, 18, 1);
+        template.and_bytes16(0, 0, 18);
+        template.load_vector128(19, 15, 16);
+        template.compare_equal_bytes16(19, 19, 1);
+        template.and_bytes16(2, 2, 19);
+        template.load_vector128(20, 15, 32);
+        template.compare_equal_bytes16(20, 20, 1);
+        template.and_bytes16(4, 4, 20);
+        template.load_vector128(21, 15, 48);
+        template.compare_equal_bytes16(21, 21, 1);
+        template.and_bytes16(6, 6, 21);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, false, wide_advance);
+    }
+
+    template.bind(narrow_setup)?;
+    template.sub_imm(7, 6, 15);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, narrow);
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.branch(tail_setup);
+
+    template.bind(narrow)?;
+    template.load_vector128(0, 15, 0);
+    template.compare_equal_bytes16(0, 0, 1);
+    if let Some(second_filter) = second_filter {
+        template.unsigned_max_pairwise_bytes16(2, 0, 0);
+        template.move_vector_double_to64(10, 2);
+        template.compare_branch_zero(10, true, second_filter);
+    } else {
+        emit_sparse_lane_mask_v7(template);
+        template.compare_branch_zero(0, true, recover);
+    }
+
+    template.bind(advance)?;
+    template.add_imm(5, 5, 16);
+    template.add_imm(15, 15, 16);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, narrow);
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.branch(tail_setup);
+
+    if let Some(second_filter) = second_filter {
+        let offset = secondary_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        let delta = offset.abs_diff(primary_offset);
+        template.bind(second_filter)?;
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(2, 10, 0);
+        template.compare_equal_bytes16(2, 2, 3);
+        template.and_bytes16(0, 0, 2);
+        emit_sparse_lane_mask_v7(template);
+        template.compare_branch_zero(0, false, advance);
+        if let Some(third_filter) = third_filter {
+            emit_branch_if_mask_has_multiple(template, 0, 10, third_filter);
+        }
+        template.branch(recover);
+    }
+
+    if let Some(third_filter) = third_filter {
+        let offset = verification_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        let delta = offset.abs_diff(primary_offset);
+        template.bind(third_filter)?;
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(4, 10, 0);
+        template.compare_equal_bytes16(4, 4, 5);
+        template.and_bytes16(0, 0, 4);
+        emit_sparse_lane_mask_v7(template);
+        template.compare_branch_zero(0, false, advance);
+        if let Some(fourth_filter) = fourth_filter {
+            emit_branch_if_mask_has_multiple(template, 0, 10, fourth_filter);
+        }
+        template.branch(recover);
+    }
+
+    if let Some(fourth_filter) = fourth_filter {
+        let offset = quaternary_offset.ok_or(AuditError::InvalidSearchManifest)?;
+        let delta = offset.abs_diff(primary_offset);
+        template.bind(fourth_filter)?;
+        if offset > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector128(6, 10, 0);
+        template.compare_equal_bytes16(6, 6, 7);
+        template.and_bytes16(0, 0, 6);
+        emit_sparse_lane_mask_v7(template);
+        template.compare_branch_zero(0, true, recover);
+        template.branch(advance);
+    }
+
+    template.bind(recover)?;
+    if sve_confirmation {
+        template.sve_ptrue_bytes_vl16(0);
+        template.sve_load_bytes(31, 0, 8);
+    }
+    template.mov_reg(7, 5);
+    template.bind(lane_loop)?;
+    template.rbit(10, 0);
+    template.clz(10, 10);
+    template.lsr_imm(10, 10, 2);
+    template.add_reg(5, 7, 10);
+    if !filters_cover_zero {
+        template.load_byte_reg(10, 9, 5);
+        template.load_byte(11, 8, 0);
+        template.cmp_reg32(10, 11);
+        template.branch_cond(Condition::NotEqual, candidate_miss);
+    }
+    template.add_reg(15, 9, 5);
+    if sve_confirmation {
+        template.sve_load_bytes(16, 0, 15);
+        template.sve_compare_equal_bytes(1, 0, 16, 31);
+        template.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 1);
+        template.branch_cond(Condition::NotEqual, candidate_miss);
+        if literal.len() > 16 {
+            let remaining = literal
+                .len()
+                .checked_sub(16)
+                .ok_or(AuditError::ArithmeticOverflow)?;
+            template.add_imm(15, 15, 16);
+            template.add_imm(16, 8, 16);
+            emit_literal_equality_with_vectors(
+                template,
+                15,
+                16,
+                remaining,
+                candidate_miss,
+                16,
+                17,
+            )?;
+        }
+    } else if literal.len() == 16 {
+        emit_literal_equality_16_with_vectors(template, 15, 8, candidate_miss, 16, 17);
+    } else {
+        emit_literal_equality_with_vectors(template, 15, 8, literal.len(), candidate_miss, 16, 17)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(candidate_miss)?;
+    template.sub_imm(10, 0, 1);
+    template.and_reg(0, 0, 10);
+    template.compare_branch_zero(0, true, lane_loop);
+    template.add_imm(5, 7, 16);
+    template.add_reg(15, 9, 5);
+    if primary_offset != 0 {
+        template.add_imm(15, 15, primary_offset);
+    }
+    template.sub_imm(7, 6, 15);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, narrow);
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.branch(tail_setup);
+
+    if manifest.backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() == 16 {
+        template.mov_reg(10, 10);
+    }
+    template.bind(tail_setup)?;
+    emit_scalar_candidates_v2(template, literal, none, found)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independent tag21 template reconstructs paired wide screening, adaptive state, and retained SVE2 predicates without sharing emitter control flow"
+)]
+fn emit_exact_candidates_sve2_fixed16_v2(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    if literal.len() != 16 {
+        return Err(AuditError::InvalidSearchManifest);
+    }
+    let primary_offset = manifest.primary_offset;
+    let offsets = [
+        primary_offset,
+        (manifest.secondary_offset != u16::MAX)
+            .then_some(manifest.secondary_offset)
+            .ok_or(AuditError::InvalidSearchManifest)?,
+        (manifest.verification_offset != u16::MAX)
+            .then_some(manifest.verification_offset)
+            .ok_or(AuditError::InvalidSearchManifest)?,
+        (manifest.quaternary_offset != u16::MAX)
+            .then_some(manifest.quaternary_offset)
+            .ok_or(AuditError::InvalidSearchManifest)?,
+        (manifest.quinary_offset != u16::MAX)
+            .then_some(manifest.quinary_offset)
+            .ok_or(AuditError::InvalidSearchManifest)?,
+    ];
+    let filters_cover_zero = offsets.contains(&0);
+    let constants = [1_u8, 3, 5, 7, 22];
+    let wide = template.new_label(LabelKind::Loop);
+    let wide_advance = template.new_label(LabelKind::Internal);
+    let secondary_only = template.new_label(LabelKind::Loop);
+    let secondary_only_advance = template.new_label(LabelKind::Internal);
+    let wide_second_filter = template.new_label(LabelKind::SlowPath);
+    let wide_remaining_filters = template.new_label(LabelKind::SlowPath);
+    let wide_next_mask = template.new_label(LabelKind::Loop);
+    let wide_candidate = template.new_label(LabelKind::Loop);
+    let wide_candidate_miss = template.new_label(LabelKind::Internal);
+    let narrow_setup = template.new_label(LabelKind::Internal);
+    let narrow = template.new_label(LabelKind::Loop);
+    let advance = template.new_label(LabelKind::Internal);
+    let candidate = template.new_label(LabelKind::Loop);
+    let candidate_miss = template.new_label(LabelKind::Internal);
+    let tail_setup = template.new_label(LabelKind::SlowPath);
+
+    template.sve_ptrue_bytes_vl16(0);
+    for (&offset, &constant) in offsets.iter().zip(constants.iter()) {
+        let byte = literal
+            .get(usize::from(offset))
+            .copied()
+            .ok_or(AuditError::InvalidSearchManifest)?;
+        template.mov_imm64(11, u64::from(byte));
+        template.sve_duplicate_byte(constant, 11);
+    }
+    template.sve_load_bytes(31, 0, 8);
+    if !filters_cover_zero {
+        template.mov_imm64(11, u64::from(literal[0]));
+    }
+
+    template.add_reg(15, 9, 5);
+    if primary_offset != 0 {
+        template.add_imm(15, 15, primary_offset);
+    }
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.sub_reg(10, 6, 5);
+    template.cmp_imm64(10, 15);
+    template.branch_cond(Condition::CarryClear, tail_setup);
+    template.cmp_imm64(10, 63);
+    template.branch_cond(Condition::CarryClear, narrow_setup);
+    template.sub_imm(7, 6, 63);
+
+    template.bind(wide)?;
+    template.load_vector_pair128(0, 2, 15, 0);
+    template.load_vector_pair128(4, 6, 15, 32);
+    template.compare_equal_bytes16(0, 0, 1);
+    template.compare_equal_bytes16(2, 2, 1);
+    template.compare_equal_bytes16(4, 4, 1);
+    template.compare_equal_bytes16(6, 6, 1);
+    emit_four_block_presence_v8(template);
+    template.compare_branch_zero(10, true, wide_second_filter);
+
+    template.bind(wide_advance)?;
+    template.add_imm(5, 5, 64);
+    template.add_imm(15, 15, 64);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, wide);
+    template.branch(narrow_setup);
+
+    let secondary_delta = offsets[1].abs_diff(primary_offset);
+    template.bind(wide_second_filter)?;
+    if offsets[1] > primary_offset {
+        template.add_imm(10, 15, secondary_delta);
+    } else {
+        template.sub_imm(10, 15, secondary_delta);
+    }
+    template.load_vector_pair128(18, 19, 10, 0);
+    template.load_vector_pair128(20, 21, 10, 32);
+    template.compare_equal_bytes16(18, 18, 3);
+    template.and_bytes16(0, 0, 18);
+    template.compare_equal_bytes16(19, 19, 3);
+    template.and_bytes16(2, 2, 19);
+    template.compare_equal_bytes16(20, 20, 3);
+    template.and_bytes16(4, 4, 20);
+    template.compare_equal_bytes16(21, 21, 3);
+    template.and_bytes16(6, 6, 21);
+    emit_four_block_presence_v8(template);
+    template.compare_branch_zero(10, false, secondary_only_advance);
+    template.branch(wide_remaining_filters);
+
+    template.bind(secondary_only_advance)?;
+    template.add_imm(5, 5, 64);
+    template.add_imm(15, 15, 64);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, secondary_only);
+    template.branch(narrow_setup);
+
+    template.bind(secondary_only)?;
+    if offsets[1] > primary_offset {
+        template.add_imm(10, 15, secondary_delta);
+    } else {
+        template.sub_imm(10, 15, secondary_delta);
+    }
+    template.load_vector_pair128(0, 2, 10, 0);
+    template.load_vector_pair128(4, 6, 10, 32);
+    template.compare_equal_bytes16(0, 0, 3);
+    template.compare_equal_bytes16(2, 2, 3);
+    template.compare_equal_bytes16(4, 4, 3);
+    template.compare_equal_bytes16(6, 6, 3);
+    emit_four_block_presence_v8(template);
+    template.compare_branch_zero(10, false, secondary_only_advance);
+    template.load_vector_pair128(18, 19, 15, 0);
+    template.load_vector_pair128(20, 21, 15, 32);
+    template.compare_equal_bytes16(18, 18, 1);
+    template.and_bytes16(0, 0, 18);
+    template.compare_equal_bytes16(19, 19, 1);
+    template.and_bytes16(2, 2, 19);
+    template.compare_equal_bytes16(20, 20, 1);
+    template.and_bytes16(4, 4, 20);
+    template.compare_equal_bytes16(21, 21, 1);
+    template.and_bytes16(6, 6, 21);
+    emit_four_block_presence_v8(template);
+    template.compare_branch_zero(10, false, wide_advance);
+
+    template.bind(wide_remaining_filters)?;
+    for index in 2..offsets.len() {
+        let delta = offsets[index].abs_diff(primary_offset);
+        if offsets[index] > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.load_vector_pair128(18, 19, 10, 0);
+        template.load_vector_pair128(20, 21, 10, 32);
+        template.compare_equal_bytes16(18, 18, constants[index]);
+        template.and_bytes16(0, 0, 18);
+        template.compare_equal_bytes16(19, 19, constants[index]);
+        template.and_bytes16(2, 2, 19);
+        template.compare_equal_bytes16(20, 20, constants[index]);
+        template.and_bytes16(4, 4, 20);
+        template.compare_equal_bytes16(21, 21, constants[index]);
+        template.and_bytes16(6, 6, 21);
+        emit_four_block_presence_v8(template);
+        template.compare_branch_zero(10, false, wide_advance);
+    }
+
+    template.shift_right_narrow_halfwords_to_bytes8(16, 0);
+    template.move_vector_double_to64(0, 16);
+    template.mov_imm64(14, 0x1111_1111_1111_1111);
+    template.and_reg(0, 0, 14);
+    for (destination, source) in [(1_u8, 2_u8), (2, 4), (3, 6)] {
+        template.shift_right_narrow_halfwords_to_bytes8(16, source);
+        template.move_vector_double_to64(destination, 16);
+        template.and_reg(destination, destination, 14);
+    }
+    template.mov_reg(17, 5);
+    template.add_imm(16, 5, 64);
+    template.bind(wide_next_mask)?;
+    template.compare_branch_zero(0, true, wide_candidate);
+    template.add_imm(17, 17, 16);
+    template.cmp_reg64(17, 16);
+    template.branch_cond(Condition::CarrySet, wide_advance);
+    template.mov_reg(0, 1);
+    template.mov_reg(1, 2);
+    template.mov_reg(2, 3);
+    template.branch(wide_next_mask);
+
+    template.bind(wide_candidate)?;
+    template.rbit(10, 0);
+    template.clz(10, 10);
+    template.lsr_imm(10, 10, 2);
+    template.add_reg(13, 17, 10);
+    if !filters_cover_zero {
+        template.load_byte_reg(10, 9, 13);
+        template.cmp_reg32(10, 11);
+        template.branch_cond(Condition::NotEqual, wide_candidate_miss);
+    }
+    template.add_reg(10, 9, 13);
+    template.sve_load_bytes(30, 0, 10);
+    template.sve_compare_equal_bytes(2, 0, 30, 31);
+    template.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 2);
+    template.branch_cond(Condition::NotEqual, wide_candidate_miss);
+    template.add_reg(14, 13, 12);
+    template.branch(found);
+
+    template.bind(wide_candidate_miss)?;
+    template.sub_imm(10, 0, 1);
+    template.and_reg(0, 0, 10);
+    template.compare_branch_zero(0, true, wide_candidate);
+    template.branch(wide_next_mask);
+
+    template.bind(narrow_setup)?;
+    template.sub_imm(7, 6, 15);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, narrow);
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.branch(tail_setup);
+
+    template.bind(narrow)?;
+    template.sve_load_bytes(0, 0, 15);
+    template.sve2_match_bytes(1, 0, 0, constants[0]);
+    template.sve_test_predicate_bytes(0, 1);
+    template.branch_cond(Condition::Equal, advance);
+    for index in 1..offsets.len() {
+        let delta = offsets[index].abs_diff(primary_offset);
+        if offsets[index] > primary_offset {
+            template.add_imm(10, 15, delta);
+        } else {
+            template.sub_imm(10, 15, delta);
+        }
+        template.sve_load_bytes(0, 0, 10);
+        template.sve2_match_bytes(2, 0, 0, constants[index]);
+        template.sve_and_predicate_bytes_set_flags(1, 0, 1, 2);
+        template.branch_cond(Condition::Equal, advance);
+        if index < offsets.len().saturating_sub(1) {
+            template.sve_count_predicate_bytes(10, 0, 1);
+            template.cmp_imm64(10, 1);
+            template.branch_cond(Condition::LowerOrSame, candidate);
+        }
+    }
+    template.branch(candidate);
+
+    template.bind(candidate)?;
+    template.sve_break_before_bytes(3, 0, 1);
+    template.sve_count_predicate_bytes(10, 0, 3);
+    template.add_reg(13, 5, 10);
+    if !filters_cover_zero {
+        template.load_byte_reg(10, 9, 13);
+        template.cmp_reg32(10, 11);
+        template.branch_cond(Condition::NotEqual, candidate_miss);
+    }
+    template.add_reg(10, 9, 13);
+    template.sve_load_bytes(30, 0, 10);
+    template.sve_compare_equal_bytes(2, 0, 30, 31);
+    template.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 2);
+    template.branch_cond(Condition::NotEqual, candidate_miss);
+    template.add_reg(14, 13, 12);
+    template.branch(found);
+
+    template.bind(candidate_miss)?;
+    template.sve_break_after_bytes(3, 0, 1);
+    template.sve_bit_clear_predicate_bytes_set_flags(1, 0, 1, 3);
+    template.branch_cond(Condition::NotEqual, candidate);
+
+    template.bind(advance)?;
+    template.add_imm(5, 5, 16);
+    template.add_imm(15, 15, 16);
+    template.cmp_reg64(5, 7);
+    template.branch_cond(Condition::LowerOrSame, narrow);
+    template.cmp_reg64(5, 6);
+    template.branch_cond(Condition::Higher, none);
+    template.branch(tail_setup);
+
+    template.bind(tail_setup)?;
+    emit_scalar_candidates_v2(template, literal, none, found)
+}
+
+fn emit_four_block_presence_v8(template: &mut Template) {
+    template.unsigned_max_pairwise_bytes16(16, 0, 2);
+    template.unsigned_max_pairwise_bytes16(17, 4, 6);
+    template.unsigned_max_pairwise_bytes16(16, 16, 17);
+    template.unsigned_max_pairwise_bytes16(16, 16, 16);
+    template.move_vector_double_to64(10, 16);
 }
 
 fn emit_branch_if_mask_has_multiple(template: &mut Template, mask: u8, scratch: u8, target: Label) {

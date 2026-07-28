@@ -6,10 +6,10 @@ use fre_kernel_ir::{
 use memchr::arch::all::packedpair::Pair;
 
 use crate::{
-    ArithmeticSite, BackendVersion, BranchKind, CodeLabel, Condition, ConfirmationKind,
-    CpuFeatures, DataSymbol, EmitError, ImageLayout, ImageStats, LabelKind, NativeAggregateImage,
-    NativeImage, Relocation, RelocationKind, RelocationTarget, ResourceKind, TargetSpec,
-    UnsupportedReason,
+    ArithmeticSite, AuditedNativeImage, BackendVersion, BranchKind, CodeLabel, Condition,
+    ConfirmationKind, CpuFeatures, DataSymbol, EmitError, ImageLayout, ImageStats, LabelKind,
+    NativeAggregateImage, NativeImage, Relocation, RelocationKind, RelocationTarget, ResourceKind,
+    TargetSpec, UnsupportedReason,
     image::{AggregateManifest, DataSymbolKind, SearchManifest, SearchShape, aot_size},
 };
 
@@ -26,6 +26,9 @@ const V7_EXACT_RELOCATION_RESERVE: usize = 96;
 const SVE16_EXACT_CODE_RESERVE: usize = 1_536;
 const SVE16_EXACT_LABEL_RESERVE: usize = 48;
 const SVE16_EXACT_RELOCATION_RESERVE: usize = 96;
+const V8_EXACT_CODE_RESERVE: usize = 2_304;
+const V8_EXACT_LABEL_RESERVE: usize = 64;
+const V8_EXACT_RELOCATION_RESERVE: usize = 128;
 const CLASS_RELOCATION_RESERVE: usize = 96;
 const AGGREGATE_CODE_RESERVE: usize = 1_600;
 const AGGREGATE_LABEL_RESERVE: usize = 48;
@@ -34,8 +37,10 @@ const SEARCH_CANDIDATE_POLICY_NONE: u16 = 0;
 const SEARCH_CANDIDATE_POLICY_V1: u16 = 1;
 const SEARCH_CANDIDATE_POLICY_V2: u16 = 2;
 const SEARCH_CANDIDATE_POLICY_V3: u16 = 3;
+const SEARCH_CANDIDATE_POLICY_V4: u16 = 4;
 const SEARCH_CANDIDATE_POLICY_SVE16_V1: u16 = 5;
 const SEARCH_CANDIDATE_POLICY_SVE2_16_V1: u16 = 6;
+const SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2: u16 = 8;
 const SEARCH_CANDIDATE_BLOCK_WIDTH: u16 = 16;
 const SEARCH_CANDIDATE_OFFSET_NONE: u16 = u16::MAX;
 const SVE2_CLASS_TABLE_DATA_ID: u32 = 2;
@@ -52,32 +57,41 @@ pub const MAX_REPEATED_CONFIRM_BYTES: usize = 32;
 
 /// Explicit implementation policy for one search image.
 ///
-/// The default remains the qualified Advanced SIMD Search V7 backend. The
-/// fixed-lane SVE policies are opt-in until separate performance evidence
-/// justifies changing [`Self::CURRENT`].
+/// The default is Advanced SIMD Search V8. Qualification remains a separate
+/// facade concern: selecting a backend here stamps its exact machine-code
+/// contract but does not authorize production execution.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SearchBackendPolicy {
-    /// Advanced SIMD Search V7, including its authenticated AOT contract.
-    #[default]
+    /// Legacy Advanced SIMD Search V7.
     AsimdV7,
+    /// Advanced SIMD Search V8, including its authenticated AOT contract.
+    #[default]
+    AsimdV8,
     /// SVE screening with exactly sixteen active byte lanes.
     Sve16,
     /// SVE2 `MATCH` screening with exactly sixteen active byte lanes,
     /// including canonical ASCII classes with at most sixteen members.
     Sve2Fixed16,
+    /// Candidate V8 screening with fixed-lane SVE confirmation.
+    Sve16V6,
+    /// Candidate paired-ASIMD screening with fixed-lane SVE2 recovery.
+    Sve2Fixed16V2,
 }
 
 impl SearchBackendPolicy {
-    /// Current production policy. This remains V7 until separately promoted.
-    pub const CURRENT: Self = Self::AsimdV7;
+    /// Current source-final policy measured by the V8 qualification bridge.
+    pub const CURRENT: Self = Self::AsimdV8;
 
     /// Authenticated backend version selected by this policy.
     #[must_use]
     pub const fn backend_version(self) -> BackendVersion {
         match self {
             Self::AsimdV7 => BackendVersion::SEARCH_V7,
+            Self::AsimdV8 => BackendVersion::SEARCH_V8,
             Self::Sve16 => BackendVersion::SEARCH_SVE16_V1,
             Self::Sve2Fixed16 => BackendVersion::SEARCH_SVE2_16_V1,
+            Self::Sve16V6 => BackendVersion::SEARCH_SVE16_V6,
+            Self::Sve2Fixed16V2 => BackendVersion::SEARCH_SVE2_FIXED16_V2,
         }
     }
 }
@@ -149,13 +163,27 @@ pub fn emit_with_backend<O: Operation>(
     emit_search_version(program, limits, backend.backend_version())
 }
 
+/// Emit and retain the successful final whole-image audit as immutable
+/// typestate.
+///
+/// This is the trusted counterpart to [`emit_with_backend`] for a publisher
+/// that accepts [`AuditedNativeImage`]. Converting the result back to a plain
+/// image deliberately discards that publication capability.
+pub fn emit_audited_with_backend<O: Operation>(
+    program: &ValidatedProgram<O>,
+    backend: SearchBackendPolicy,
+    limits: EmitLimits,
+) -> Result<AuditedNativeImage, EmitError> {
+    emit_search_version_audited(program, limits, backend.backend_version())
+}
+
 /// Emit the opt-in SVE search backend with exactly sixteen active byte lanes.
 ///
 /// The physical architectural vector length may be larger; emitted code uses
 /// `PTRUE ..., VL16` and never changes thread vector-length state. This
 /// backend admits non-empty unanchored exact literals and the proved
 /// non-start-anchored singleton-class suffix family. Other shapes fail
-/// explicitly. [`emit`] remains the deterministic Search V7 default.
+/// explicitly. [`emit`] remains the deterministic Search V8 default.
 pub fn emit_sve16<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
@@ -176,6 +204,29 @@ pub fn emit_sve2_16<O: Operation>(
     emit_with_backend(program, SearchBackendPolicy::Sve2Fixed16, limits)
 }
 
+/// Emit the candidate V8-screening backend with fixed-lane SVE confirmation.
+///
+/// This policy admits only unanchored non-empty exact literals of at least
+/// sixteen bytes. It uses `PTRUE ..., VL16` and is not selected by [`emit`].
+pub fn emit_sve16_v6<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+) -> Result<NativeImage, EmitError> {
+    emit_with_backend(program, SearchBackendPolicy::Sve16V6, limits)
+}
+
+/// Emit the candidate paired-ASIMD/fixed-lane-SVE2 exact-16 backend.
+///
+/// This is an explicit candidate policy and never changes [`emit`] or
+/// [`SearchBackendPolicy::CURRENT`]. It admits only unanchored exact literals
+/// of exactly sixteen bytes and stamps the unique search tag 21 wire contract.
+pub fn emit_sve2_fixed16_v2<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+) -> Result<NativeImage, EmitError> {
+    emit_with_backend(program, SearchBackendPolicy::Sve2Fixed16V2, limits)
+}
+
 #[cfg(test)]
 pub(crate) fn emit_search_version_for_test<O: Operation>(
     program: &ValidatedProgram<O>,
@@ -185,15 +236,24 @@ pub(crate) fn emit_search_version_for_test<O: Operation>(
     emit_search_version(program, limits, backend_version)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the versioned search construction keeps one transaction from validation through authenticated image finalization"
-)]
 fn emit_search_version<O: Operation>(
     program: &ValidatedProgram<O>,
     limits: EmitLimits,
     backend_version: BackendVersion,
 ) -> Result<NativeImage, EmitError> {
+    emit_search_version_audited(program, limits, backend_version)
+        .map(AuditedNativeImage::into_image)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned search construction keeps one transaction from validation through authenticated image finalization"
+)]
+fn emit_search_version_audited<O: Operation>(
+    program: &ValidatedProgram<O>,
+    limits: EmitLimits,
+    backend_version: BackendVersion,
+) -> Result<AuditedNativeImage, EmitError> {
     if !matches!(
         backend_version,
         BackendVersion::SEARCH_V1
@@ -203,8 +263,11 @@ fn emit_search_version<O: Operation>(
             | BackendVersion::SEARCH_V5
             | BackendVersion::SEARCH_V6
             | BackendVersion::SEARCH_V7
+            | BackendVersion::SEARCH_V8
             | BackendVersion::SEARCH_SVE16_V1
             | BackendVersion::SEARCH_SVE2_16_V1
+            | BackendVersion::SEARCH_SVE16_V6
+            | BackendVersion::SEARCH_SVE2_FIXED16_V2
     ) {
         return Err(EmitError::InternalInvariant);
     }
@@ -228,6 +291,18 @@ fn emit_search_version<O: Operation>(
         backend_version,
         BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
     ) && !plan.is_fixed16_policy_shape(backend_version)
+    {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
+    if backend_version == BackendVersion::SEARCH_SVE16_V6 && !plan.is_sve16_v6_policy_shape() {
+        return Err(EmitError::Unsupported {
+            reason: UnsupportedReason::KernelShape,
+        });
+    }
+    if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+        && !plan.is_sve2_fixed16_v2_policy_shape()
     {
         return Err(EmitError::Unsupported {
             reason: UnsupportedReason::KernelShape,
@@ -315,6 +390,10 @@ fn emit_search_version<O: Operation>(
                 BackendVersion::SEARCH_SVE2_16_V1 => CpuFeatures::SVE
                     .union(CpuFeatures::SVE2)
                     .union(sve_confirmation_features),
+                BackendVersion::SEARCH_SVE16_V6 => CpuFeatures::SVE.union(CpuFeatures::ASIMD),
+                BackendVersion::SEARCH_SVE2_FIXED16_V2 => CpuFeatures::ASIMD
+                    .union(CpuFeatures::SVE)
+                    .union(CpuFeatures::SVE2),
                 _ if finalized.vector_instructions == 0 => CpuFeatures::NONE,
                 _ => CpuFeatures::ASIMD,
             },
@@ -337,8 +416,11 @@ fn emit_search_version<O: Operation>(
                 | BackendVersion::SEARCH_V5
                 | BackendVersion::SEARCH_V6
                 | BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         )
         .then_some(search_manifest),
         aggregate: None,
@@ -1033,6 +1115,8 @@ fn emit_plan(
                 .then_some(manifest.verification_offset),
             quaternary: (manifest.quaternary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
                 .then_some(manifest.quaternary_offset),
+            quinary: (manifest.quinary_offset != SEARCH_CANDIDATE_OFFSET_NONE)
+                .then_some(manifest.quinary_offset),
         });
     match plan {
         Plan::Exact { literal, anchors } => {
@@ -1076,10 +1160,13 @@ fn emit_plan(
     }
 }
 
-fn finalize_image(mut image: NativeImage, limits: EmitLimits) -> Result<NativeImage, EmitError> {
+fn finalize_image(
+    mut image: NativeImage,
+    limits: EmitLimits,
+) -> Result<AuditedNativeImage, EmitError> {
     charge_image_identity(&mut image, limits)?;
     crate::audit(&image).map_err(|_| EmitError::InternalInvariant)?;
-    Ok(image)
+    Ok(AuditedNativeImage::from_emitter_audit(image))
 }
 
 fn finalize_aggregate_image(
@@ -1141,12 +1228,13 @@ struct CandidateOffsets {
     secondary: Option<u16>,
     verification: Option<u16>,
     quaternary: Option<u16>,
+    quinary: Option<u16>,
 }
 
 mod v7_policy_scan_admission {
     use super::{
         ArithmeticSite, CandidateOffsets, EmitError, WorkMeter, candidate_byte_pair,
-        candidate_ranked_verification_offsets,
+        candidate_ranked_verification_offsets, candidate_ranked_verification_offsets_v2,
     };
 
     /// Move-only proof that both complete V7 policy scans were admitted.
@@ -1180,6 +1268,20 @@ mod v7_policy_scan_admission {
                 secondary,
                 verification,
                 quaternary,
+                quinary: None,
+            }
+        }
+
+        pub(super) fn select_offsets_v2(self) -> CandidateOffsets {
+            let (primary, secondary) = candidate_byte_pair(self.literal);
+            let (verification, quaternary, quinary) =
+                candidate_ranked_verification_offsets_v2(self.literal, primary, secondary);
+            CandidateOffsets {
+                primary,
+                secondary,
+                verification,
+                quaternary,
+                quinary,
             }
         }
     }
@@ -1188,6 +1290,34 @@ mod v7_policy_scan_admission {
 use v7_policy_scan_admission::Admission as V7PolicyScanAdmission;
 
 impl<'a> Plan<'a> {
+    const fn is_sve2_fixed16_v2_policy_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal,
+                anchors:
+                    AnchorFlags {
+                        start: false,
+                        end: false,
+                    },
+            } if literal.len() == 16
+        )
+    }
+
+    const fn is_sve16_v6_policy_shape(self) -> bool {
+        matches!(
+            self,
+            Self::Exact {
+                literal,
+                anchors:
+                    AnchorFlags {
+                        start: false,
+                        end: false,
+                    },
+            } if literal.len() >= 16
+        )
+    }
+
     fn is_fixed16_policy_shape(self, backend_version: BackendVersion) -> bool {
         match self {
             Self::Exact {
@@ -1291,6 +1421,20 @@ impl<'a> Plan<'a> {
             Self::Exact { .. }
                 if matches!(
                     backend_version,
+                    BackendVersion::SEARCH_V8
+                        | BackendVersion::SEARCH_SVE16_V6
+                        | BackendVersion::SEARCH_SVE2_FIXED16_V2
+                ) =>
+            {
+                Capacities {
+                    code: V8_EXACT_CODE_RESERVE,
+                    labels: V8_EXACT_LABEL_RESERVE,
+                    relocations: V8_EXACT_RELOCATION_RESERVE,
+                }
+            }
+            Self::Exact { .. }
+                if matches!(
+                    backend_version,
                     BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE2_16_V1
                 ) =>
             {
@@ -1324,8 +1468,11 @@ impl<'a> Plan<'a> {
         if !matches!(
             backend_version,
             BackendVersion::SEARCH_V7
+                | BackendVersion::SEARCH_V8
                 | BackendVersion::SEARCH_SVE16_V1
                 | BackendVersion::SEARCH_SVE2_16_V1
+                | BackendVersion::SEARCH_SVE16_V6
+                | BackendVersion::SEARCH_SVE2_FIXED16_V2
         ) || anchors.start
             || anchors.end
             || literal.is_empty()
@@ -1361,13 +1508,19 @@ impl<'a> Plan<'a> {
                 } else if matches!(
                     backend_version,
                     BackendVersion::SEARCH_V7
+                        | BackendVersion::SEARCH_V8
                         | BackendVersion::SEARCH_SVE16_V1
                         | BackendVersion::SEARCH_SVE2_16_V1
+                        | BackendVersion::SEARCH_SVE16_V6
+                        | BackendVersion::SEARCH_SVE2_FIXED16_V2
                 ) {
+                    let admission = v7_policy_scan_admission.ok_or(EmitError::InternalInvariant)?;
                     Some(
-                        v7_policy_scan_admission
-                            .ok_or(EmitError::InternalInvariant)?
-                            .select_offsets(),
+                        if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2 {
+                            admission.select_offsets_v2()
+                        } else {
+                            admission.select_offsets()
+                        },
                     )
                 } else {
                     if v7_policy_scan_admission.is_some() {
@@ -1385,6 +1538,7 @@ impl<'a> Plan<'a> {
                         secondary,
                         verification,
                         quaternary: None,
+                        quinary: None,
                     })
                 };
                 (
@@ -1420,6 +1574,7 @@ impl<'a> Plan<'a> {
                     }),
                     verification: None,
                     quaternary: None,
+                    quinary: None,
                 });
                 (SearchShape::ClassSuffix, anchors, suffix, candidate_policy)
             }
@@ -1431,6 +1586,7 @@ impl<'a> Plan<'a> {
             secondary_offset,
             verification_offset,
             quaternary_offset,
+            quinary_offset,
         ) = candidate_policy.map_or(
             (
                 SEARCH_CANDIDATE_POLICY_NONE,
@@ -1439,16 +1595,29 @@ impl<'a> Plan<'a> {
                 SEARCH_CANDIDATE_OFFSET_NONE,
                 SEARCH_CANDIDATE_OFFSET_NONE,
                 SEARCH_CANDIDATE_OFFSET_NONE,
+                SEARCH_CANDIDATE_OFFSET_NONE,
             ),
             |offsets| {
                 (
-                    if backend_version == BackendVersion::SEARCH_SVE2_16_V1
+                    if backend_version == BackendVersion::SEARCH_SVE2_FIXED16_V2
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_SVE2_FIXED16_V2
+                    } else if backend_version == BackendVersion::SEARCH_V8
+                        && shape == SearchShape::ExactLiteral
+                    {
+                        SEARCH_CANDIDATE_POLICY_V4
+                    } else if backend_version == BackendVersion::SEARCH_SVE2_16_V1
                         && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
                     {
                         SEARCH_CANDIDATE_POLICY_SVE2_16_V1
-                    } else if backend_version == BackendVersion::SEARCH_SVE16_V1
-                        && matches!(shape, SearchShape::ExactLiteral | SearchShape::ClassSuffix)
-                    {
+                    } else if matches!(
+                        backend_version,
+                        BackendVersion::SEARCH_SVE16_V1 | BackendVersion::SEARCH_SVE16_V6
+                    ) && matches!(
+                        shape,
+                        SearchShape::ExactLiteral | SearchShape::ClassSuffix
+                    ) {
                         SEARCH_CANDIDATE_POLICY_SVE16_V1
                     } else if backend_version == BackendVersion::SEARCH_V7
                         && shape == SearchShape::ExactLiteral
@@ -1468,6 +1637,7 @@ impl<'a> Plan<'a> {
                     offsets.secondary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                     offsets.verification.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                     offsets.quaternary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
+                    offsets.quinary.unwrap_or(SEARCH_CANDIDATE_OFFSET_NONE),
                 )
             },
         );
@@ -1484,6 +1654,7 @@ impl<'a> Plan<'a> {
             secondary_offset,
             verification_offset,
             quaternary_offset,
+            quinary_offset,
         })
     }
 }
@@ -1583,6 +1754,7 @@ fn emit_exact(
         secondary: secondary_offset,
         verification: verification_offset,
         quaternary: quaternary_offset,
+        quinary: quinary_offset,
     } = candidate_offsets.ok_or(EmitError::InternalInvariant)?;
     match backend_version {
         BackendVersion::SEARCH_V1 => {
@@ -1661,6 +1833,32 @@ fn emit_exact(
                 verification_offset,
                 quaternary_offset,
                 backend_version,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_V8 | BackendVersion::SEARCH_SVE16_V6 => {
+            emit_vector_candidate_skip_v8(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                backend_version,
+                none,
+                found,
+            )?;
+        }
+        BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
+            emit_vector_candidate_skip_sve2_fixed16_v2(
+                assembler,
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
                 none,
                 found,
             )?;
@@ -2458,6 +2656,662 @@ fn emit_vector_candidate_skip_sve16(
     emit_scalar_candidates_legacy(assembler, literal, true, none, found)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the versioned v8 graph keeps its lazy 64-candidate screen and immutable v7-compatible recovery explicit"
+)]
+fn emit_vector_candidate_skip_v8(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    backend_version: BackendVersion,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    let wide = assembler.new_label(LabelKind::Loop)?;
+    let wide_advance = assembler.new_label(LabelKind::Internal)?;
+    let secondary_only = secondary_offset
+        .map(|_| assembler.new_label(LabelKind::Loop))
+        .transpose()?;
+    let secondary_only_advance = secondary_offset
+        .map(|_| assembler.new_label(LabelKind::Internal))
+        .transpose()?;
+    let narrow_setup = assembler.new_label(LabelKind::Internal)?;
+    let narrow = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let recover = assembler.new_label(LabelKind::SlowPath)?;
+    let lane_loop = assembler.new_label(LabelKind::Loop)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+    let wide_second_filter = secondary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let second_filter = secondary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let third_filter = verification_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let fourth_filter = quaternary_offset
+        .map(|_| assembler.new_label(LabelKind::SlowPath))
+        .transpose()?;
+    let filters_cover_zero = primary_offset == 0
+        || secondary_offset == Some(0)
+        || verification_offset == Some(0)
+        || quaternary_offset == Some(0);
+    let sve_confirmation =
+        backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() >= 16;
+
+    assembler.load_byte(X11, X8, primary_offset)?;
+    assembler.dup_byte16(1, X11)?;
+    if let Some(offset) = secondary_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(3, X11)?;
+    }
+    if let Some(offset) = verification_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(5, X11)?;
+    }
+    if let Some(offset) = quaternary_offset {
+        assembler.load_byte(X11, X8, offset)?;
+        assembler.dup_byte16(7, X11)?;
+    }
+    // X14 remains dead until a successful return. The narrow recovery keeps
+    // the historical sparse-mask representation and v16/v17 confirmation
+    // temporaries. V8's wide screen uses only caller-saved v16-v21.
+    assembler.mov_imm64(X14, 0x1111_1111_1111_1111)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.cmp_imm64(X10, 63)?;
+    assembler.branch_cond(Condition::CarryClear, narrow_setup)?;
+    assembler.sub_imm(X7, X6, 63)?;
+
+    // Test four primary columns before loading any secondary data. A primary
+    // miss proves all 64 candidate starts impossible. A pair hit permanently
+    // enters the unchanged 16-wide staged recovery graph so pair-heavy inputs
+    // pay this wide probe only once.
+    assembler.bind(wide)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    assembler.load_vector128(2, X15, 16)?;
+    assembler.compare_equal_bytes16(2, 2, 1)?;
+    assembler.load_vector128(4, X15, 32)?;
+    assembler.compare_equal_bytes16(4, 4, 1)?;
+    assembler.load_vector128(6, X15, 48)?;
+    assembler.compare_equal_bytes16(6, 6, 1)?;
+    emit_four_block_presence_v8(assembler)?;
+    if let Some(wide_second_filter) = wide_second_filter {
+        assembler.compare_branch_zero(X10, true, wide_second_filter)?;
+    } else {
+        assembler.compare_branch_zero(X10, true, narrow_setup)?;
+    }
+
+    assembler.bind(wide_advance)?;
+    assembler.add_imm(X5, X5, 64)?;
+    assembler.add_imm(X15, X15, 64)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, wide)?;
+    assembler.branch(narrow_setup)?;
+
+    if let Some(wide_second_filter) = wide_second_filter {
+        let offset = secondary_offset.expect("wide second-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(wide_second_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(18, X10, 0)?;
+        assembler.compare_equal_bytes16(18, 18, 3)?;
+        assembler.and_bytes16(0, 0, 18)?;
+        assembler.load_vector128(19, X10, 16)?;
+        assembler.compare_equal_bytes16(19, 19, 3)?;
+        assembler.and_bytes16(2, 2, 19)?;
+        assembler.load_vector128(20, X10, 32)?;
+        assembler.compare_equal_bytes16(20, 20, 3)?;
+        assembler.and_bytes16(4, 4, 20)?;
+        assembler.load_vector128(21, X10, 48)?;
+        assembler.compare_equal_bytes16(21, 21, 3)?;
+        assembler.and_bytes16(6, 6, 21)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, true, narrow_setup)?;
+    }
+
+    // One primary-present/pair-empty group is enough to establish that the
+    // primary-only screen is the wrong discriminator for this haystack. Every
+    // match still requires the sealed secondary byte, so later groups first
+    // screen that column alone. A secondary hit lazily reloads the four
+    // primary columns and falls back permanently only when their intersection
+    // contains a real pair; a pair-empty recheck switches the next group back
+    // to primary-first screening.
+    if let (Some(secondary_only), Some(secondary_only_advance), Some(offset)) =
+        (secondary_only, secondary_only_advance, secondary_offset)
+    {
+        assembler.bind(secondary_only_advance)?;
+        assembler.add_imm(X5, X5, 64)?;
+        assembler.add_imm(X15, X15, 64)?;
+        assembler.cmp_reg64(X5, X7)?;
+        assembler.branch_cond(Condition::LowerOrSame, secondary_only)?;
+        assembler.branch(narrow_setup)?;
+
+        assembler.bind(secondary_only)?;
+        let delta = offset.abs_diff(primary_offset);
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(0, X10, 0)?;
+        assembler.compare_equal_bytes16(0, 0, 3)?;
+        assembler.load_vector128(2, X10, 16)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.load_vector128(4, X10, 32)?;
+        assembler.compare_equal_bytes16(4, 4, 3)?;
+        assembler.load_vector128(6, X10, 48)?;
+        assembler.compare_equal_bytes16(6, 6, 3)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
+        assembler.load_vector128(18, X15, 0)?;
+        assembler.compare_equal_bytes16(18, 18, 1)?;
+        assembler.and_bytes16(0, 0, 18)?;
+        assembler.load_vector128(19, X15, 16)?;
+        assembler.compare_equal_bytes16(19, 19, 1)?;
+        assembler.and_bytes16(2, 2, 19)?;
+        assembler.load_vector128(20, X15, 32)?;
+        assembler.compare_equal_bytes16(20, 20, 1)?;
+        assembler.and_bytes16(4, 4, 20)?;
+        assembler.load_vector128(21, X15, 48)?;
+        assembler.compare_equal_bytes16(21, 21, 1)?;
+        assembler.and_bytes16(6, 6, 21)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, wide_advance)?;
+    }
+
+    assembler.bind(narrow_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, narrow)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(narrow)?;
+    assembler.load_vector128(0, X15, 0)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    if let Some(second_filter) = second_filter {
+        assembler.unsigned_max_pairwise_bytes16(2, 0, 0)?;
+        assembler.move_vector_double_to64(X10, 2)?;
+        assembler.compare_branch_zero(X10, true, second_filter)?;
+    } else {
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+    }
+
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, narrow)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    if let Some(second_filter) = second_filter {
+        let offset = secondary_offset.expect("second-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(second_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(2, X10, 0)?;
+        assembler.compare_equal_bytes16(2, 2, 3)?;
+        assembler.and_bytes16(0, 0, 2)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, false, advance)?;
+        if let Some(third_filter) = third_filter {
+            emit_branch_if_mask_has_multiple(assembler, X0, X10, third_filter)?;
+        }
+        assembler.branch(recover)?;
+    }
+
+    if let Some(third_filter) = third_filter {
+        let offset = verification_offset.expect("third-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(third_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(4, X10, 0)?;
+        assembler.compare_equal_bytes16(4, 4, 5)?;
+        assembler.and_bytes16(0, 0, 4)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, false, advance)?;
+        if let Some(fourth_filter) = fourth_filter {
+            emit_branch_if_mask_has_multiple(assembler, X0, X10, fourth_filter)?;
+        }
+        assembler.branch(recover)?;
+    }
+
+    if let Some(fourth_filter) = fourth_filter {
+        let offset = quaternary_offset.expect("fourth-filter label requires an offset");
+        let delta = offset.abs_diff(primary_offset);
+        assembler.bind(fourth_filter)?;
+        if offset > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector128(6, X10, 0)?;
+        assembler.compare_equal_bytes16(6, 6, 7)?;
+        assembler.and_bytes16(0, 0, 6)?;
+        emit_sparse_lane_mask_v7(assembler)?;
+        assembler.compare_branch_zero(X0, true, recover)?;
+        assembler.branch(advance)?;
+    }
+
+    assembler.bind(recover)?;
+    if sve_confirmation {
+        assembler.sve_ptrue_bytes_vl16(0)?;
+        assembler.sve_load_bytes(31, 0, X8)?;
+    }
+    assembler.mov_reg(X7, X5)?;
+    assembler.bind(lane_loop)?;
+    assembler.rbit(X10, X0)?;
+    assembler.clz(X10, X10)?;
+    assembler.lsr_imm(X10, X10, 2)?;
+    assembler.add_reg(X5, X7, X10)?;
+    if !filters_cover_zero {
+        assembler.load_byte_reg(X10, X9, X5)?;
+        assembler.load_byte(X11, X8, 0)?;
+        assembler.cmp_reg32(X10, X11)?;
+        assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    }
+    assembler.add_reg(X15, X9, X5)?;
+    if sve_confirmation {
+        assembler.sve_load_bytes(16, 0, X15)?;
+        assembler.sve_compare_equal_bytes(1, 0, 16, 31)?;
+        assembler.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 1)?;
+        assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+        if literal.len() > 16 {
+            let remaining = literal
+                .len()
+                .checked_sub(16)
+                .ok_or(EmitError::InternalInvariant)?;
+            assembler.add_imm(X15, X15, 16)?;
+            assembler.add_imm(X16, X8, 16)?;
+            emit_literal_equality_with_vectors(
+                assembler,
+                X15,
+                X16,
+                remaining,
+                candidate_miss,
+                16,
+                17,
+            )?;
+        }
+    } else if literal.len() == 16 {
+        emit_literal_equality_16_with_vectors(assembler, X15, X8, candidate_miss, 16, 17)?;
+    } else {
+        emit_literal_equality_with_vectors(
+            assembler,
+            X15,
+            X8,
+            literal.len(),
+            candidate_miss,
+            16,
+            17,
+        )?;
+    }
+    assembler.mov_reg(X13, X5)?;
+    assembler.add_reg(X14, X5, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.sub_imm(X10, X0, 1)?;
+    assembler.and_reg(X0, X0, X10)?;
+    assembler.compare_branch_zero(X0, true, lane_loop)?;
+    assembler.add_imm(X5, X7, 16)?;
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, narrow)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    if backend_version == BackendVersion::SEARCH_SVE16_V6 && literal.len() == 16 {
+        // Every reachable predecessor branches directly to `tail_setup`.
+        // Keep the fixed-16 cold-tail address byte-identical to V8.
+        assembler.mov_reg(X10, X10)?;
+    }
+    assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the tag21 graph keeps paired wide screening, adaptive state, five authenticated columns, and retained-predicate recovery in one reviewable unit"
+)]
+fn emit_vector_candidate_skip_sve2_fixed16_v2(
+    assembler: &mut Assembler,
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+    verification_offset: Option<u16>,
+    quaternary_offset: Option<u16>,
+    quinary_offset: Option<u16>,
+    none: Label,
+    found: Label,
+) -> Result<(), EmitError> {
+    if literal.len() != 16 {
+        return Err(EmitError::InternalInvariant);
+    }
+    let offsets = [
+        primary_offset,
+        secondary_offset.ok_or(EmitError::InternalInvariant)?,
+        verification_offset.ok_or(EmitError::InternalInvariant)?,
+        quaternary_offset.ok_or(EmitError::InternalInvariant)?,
+        quinary_offset.ok_or(EmitError::InternalInvariant)?,
+    ];
+    let filters_cover_zero = offsets.contains(&0);
+    // Z8-Z15 are callee-saved. Keep every filter in the low caller-saved bank
+    // or the high caller-saved bank, outside V8's z16-z21 reducer temporaries.
+    let constants = [1_u8, 3, 5, 7, 22];
+    let wide = assembler.new_label(LabelKind::Loop)?;
+    let wide_advance = assembler.new_label(LabelKind::Internal)?;
+    let secondary_only = assembler.new_label(LabelKind::Loop)?;
+    let secondary_only_advance = assembler.new_label(LabelKind::Internal)?;
+    let wide_second_filter = assembler.new_label(LabelKind::SlowPath)?;
+    let wide_remaining_filters = assembler.new_label(LabelKind::SlowPath)?;
+    let wide_next_mask = assembler.new_label(LabelKind::Loop)?;
+    let wide_candidate = assembler.new_label(LabelKind::Loop)?;
+    let wide_candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let narrow_setup = assembler.new_label(LabelKind::Internal)?;
+    let narrow = assembler.new_label(LabelKind::Loop)?;
+    let advance = assembler.new_label(LabelKind::Internal)?;
+    let candidate = assembler.new_label(LabelKind::Loop)?;
+    let candidate_miss = assembler.new_label(LabelKind::Internal)?;
+    let tail_setup = assembler.new_label(LabelKind::SlowPath)?;
+
+    // The runtime admits this candidate only when the observed architectural
+    // vector length is sixteen bytes. P0 still seals the active-lane contract
+    // in the instruction stream and no vector-length state is mutated.
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    for (&offset, &constant) in offsets.iter().zip(constants.iter()) {
+        let byte = literal
+            .get(usize::from(offset))
+            .copied()
+            .ok_or(EmitError::InternalInvariant)?;
+        assembler.mov_imm64(X11, u64::from(byte))?;
+        assembler.sve_duplicate_byte(constant, X11)?;
+    }
+    // Exact confirmation never relies on MATCH membership semantics.
+    assembler.sve_load_bytes(31, 0, X8)?;
+    if !filters_cover_zero {
+        // Keep literal[0] live in X11 so dense false-positive streams can be
+        // rejected with one scalar load before paying for SVE confirmation.
+        assembler.mov_imm64(X11, u64::from(literal[0]))?;
+    }
+
+    assembler.add_reg(X15, X9, X5)?;
+    if primary_offset != 0 {
+        assembler.add_imm(X15, X15, primary_offset)?;
+    }
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.sub_reg(X10, X6, X5)?;
+    assembler.cmp_imm64(X10, 15)?;
+    assembler.branch_cond(Condition::CarryClear, tail_setup)?;
+    assembler.cmp_imm64(X10, 63)?;
+    assembler.branch_cond(Condition::CarryClear, narrow_setup)?;
+    assembler.sub_imm(X7, X6, 63)?;
+
+    // LDP Q halves the four-load front-end footprint while reading exactly the
+    // same authenticated 64-byte columns as V8.
+    assembler.bind(wide)?;
+    assembler.load_vector_pair128(0, 2, X15, 0)?;
+    assembler.load_vector_pair128(4, 6, X15, 32)?;
+    assembler.compare_equal_bytes16(0, 0, 1)?;
+    assembler.compare_equal_bytes16(2, 2, 1)?;
+    assembler.compare_equal_bytes16(4, 4, 1)?;
+    assembler.compare_equal_bytes16(6, 6, 1)?;
+    emit_four_block_presence_v8(assembler)?;
+    assembler.compare_branch_zero(X10, true, wide_second_filter)?;
+
+    assembler.bind(wide_advance)?;
+    assembler.add_imm(X5, X5, 64)?;
+    assembler.add_imm(X15, X15, 64)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, wide)?;
+    assembler.branch(narrow_setup)?;
+
+    let secondary_delta = offsets[1].abs_diff(primary_offset);
+    assembler.bind(wide_second_filter)?;
+    if offsets[1] > primary_offset {
+        assembler.add_imm(X10, X15, secondary_delta)?;
+    } else {
+        assembler.sub_imm(X10, X15, secondary_delta)?;
+    }
+    assembler.load_vector_pair128(18, 19, X10, 0)?;
+    assembler.load_vector_pair128(20, 21, X10, 32)?;
+    assembler.compare_equal_bytes16(18, 18, 3)?;
+    assembler.and_bytes16(0, 0, 18)?;
+    assembler.compare_equal_bytes16(19, 19, 3)?;
+    assembler.and_bytes16(2, 2, 19)?;
+    assembler.compare_equal_bytes16(20, 20, 3)?;
+    assembler.and_bytes16(4, 4, 20)?;
+    assembler.compare_equal_bytes16(21, 21, 3)?;
+    assembler.and_bytes16(6, 6, 21)?;
+    emit_four_block_presence_v8(assembler)?;
+    assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
+    assembler.branch(wide_remaining_filters)?;
+
+    // Retain V8's adaptive secondary-first state for primary-dense groups
+    // whose selected secondary column rejects every lane.
+    assembler.bind(secondary_only_advance)?;
+    assembler.add_imm(X5, X5, 64)?;
+    assembler.add_imm(X15, X15, 64)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, secondary_only)?;
+    assembler.branch(narrow_setup)?;
+
+    assembler.bind(secondary_only)?;
+    if offsets[1] > primary_offset {
+        assembler.add_imm(X10, X15, secondary_delta)?;
+    } else {
+        assembler.sub_imm(X10, X15, secondary_delta)?;
+    }
+    assembler.load_vector_pair128(0, 2, X10, 0)?;
+    assembler.load_vector_pair128(4, 6, X10, 32)?;
+    assembler.compare_equal_bytes16(0, 0, 3)?;
+    assembler.compare_equal_bytes16(2, 2, 3)?;
+    assembler.compare_equal_bytes16(4, 4, 3)?;
+    assembler.compare_equal_bytes16(6, 6, 3)?;
+    emit_four_block_presence_v8(assembler)?;
+    assembler.compare_branch_zero(X10, false, secondary_only_advance)?;
+    assembler.load_vector_pair128(18, 19, X15, 0)?;
+    assembler.load_vector_pair128(20, 21, X15, 32)?;
+    assembler.compare_equal_bytes16(18, 18, 1)?;
+    assembler.and_bytes16(0, 0, 18)?;
+    assembler.compare_equal_bytes16(19, 19, 1)?;
+    assembler.and_bytes16(2, 2, 19)?;
+    assembler.compare_equal_bytes16(20, 20, 1)?;
+    assembler.and_bytes16(4, 4, 20)?;
+    assembler.compare_equal_bytes16(21, 21, 1)?;
+    assembler.and_bytes16(6, 6, 21)?;
+    emit_four_block_presence_v8(assembler)?;
+    assembler.compare_branch_zero(X10, false, wide_advance)?;
+
+    // Do not discard an authenticated 64-lane primary/secondary mask. Screen
+    // the remaining three columns in place, then recover candidates from all
+    // four 16-lane quarters in source order.
+    assembler.bind(wide_remaining_filters)?;
+    for index in 2..offsets.len() {
+        let delta = offsets[index].abs_diff(primary_offset);
+        if offsets[index] > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.load_vector_pair128(18, 19, X10, 0)?;
+        assembler.load_vector_pair128(20, 21, X10, 32)?;
+        assembler.compare_equal_bytes16(18, 18, constants[index])?;
+        assembler.and_bytes16(0, 0, 18)?;
+        assembler.compare_equal_bytes16(19, 19, constants[index])?;
+        assembler.and_bytes16(2, 2, 19)?;
+        assembler.compare_equal_bytes16(20, 20, constants[index])?;
+        assembler.and_bytes16(4, 4, 20)?;
+        assembler.compare_equal_bytes16(21, 21, constants[index])?;
+        assembler.and_bytes16(6, 6, 21)?;
+        emit_four_block_presence_v8(assembler)?;
+        assembler.compare_branch_zero(X10, false, wide_advance)?;
+    }
+
+    // The wide recovery keeps one sparse 16-lane mask in each of x0-x3.
+    // Materialize its scalar lane selector only after every wide filter has
+    // retained a survivor. X14 is otherwise dead until a successful return.
+    assembler.shift_right_narrow_halfwords_to_bytes8(16, 0)?;
+    assembler.move_vector_double_to64(X0, 16)?;
+    assembler.mov_imm64(X14, 0x1111_1111_1111_1111)?;
+    assembler.and_reg(X0, X0, X14)?;
+    for (destination, source) in [(X1, 2_u8), (X2, 4), (X3, 6)] {
+        assembler.shift_right_narrow_halfwords_to_bytes8(16, source)?;
+        assembler.move_vector_double_to64(destination, 16)?;
+        assembler.and_reg(destination, destination, X14)?;
+    }
+    assembler.mov_reg(X17, X5)?;
+    assembler.add_imm(X16, X5, 64)?;
+    assembler.bind(wide_next_mask)?;
+    assembler.compare_branch_zero(X0, true, wide_candidate)?;
+    assembler.add_imm(X17, X17, 16)?;
+    assembler.cmp_reg64(X17, X16)?;
+    assembler.branch_cond(Condition::CarrySet, wide_advance)?;
+    assembler.mov_reg(X0, X1)?;
+    assembler.mov_reg(X1, X2)?;
+    assembler.mov_reg(X2, X3)?;
+    assembler.branch(wide_next_mask)?;
+
+    assembler.bind(wide_candidate)?;
+    assembler.rbit(X10, X0)?;
+    assembler.clz(X10, X10)?;
+    assembler.lsr_imm(X10, X10, 2)?;
+    assembler.add_reg(X13, X17, X10)?;
+    if !filters_cover_zero {
+        assembler.load_byte_reg(X10, X9, X13)?;
+        assembler.cmp_reg32(X10, X11)?;
+        assembler.branch_cond(Condition::NotEqual, wide_candidate_miss)?;
+    }
+    assembler.add_reg(X10, X9, X13)?;
+    assembler.sve_load_bytes(30, 0, X10)?;
+    assembler.sve_compare_equal_bytes(2, 0, 30, 31)?;
+    assembler.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 2)?;
+    assembler.branch_cond(Condition::NotEqual, wide_candidate_miss)?;
+    assembler.add_reg(X14, X13, X12)?;
+    assembler.branch(found)?;
+
+    assembler.bind(wide_candidate_miss)?;
+    assembler.sub_imm(X10, X0, 1)?;
+    assembler.and_reg(X0, X0, X10)?;
+    assembler.compare_branch_zero(X0, true, wide_candidate)?;
+    assembler.branch(wide_next_mask)?;
+
+    assembler.bind(narrow_setup)?;
+    assembler.sub_imm(X7, X6, 15)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, narrow)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(narrow)?;
+    assembler.sve_load_bytes(0, 0, X15)?;
+    assembler.sve2_match_bytes(1, 0, 0, constants[0])?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(Condition::Equal, advance)?;
+    for index in 1..offsets.len() {
+        let delta = offsets[index].abs_diff(primary_offset);
+        if offsets[index] > primary_offset {
+            assembler.add_imm(X10, X15, delta)?;
+        } else {
+            assembler.sub_imm(X10, X15, delta)?;
+        }
+        assembler.sve_load_bytes(0, 0, X10)?;
+        assembler.sve2_match_bytes(2, 0, 0, constants[index])?;
+        assembler.sve_and_predicate_bytes_set_flags(1, 0, 1, 2)?;
+        assembler.branch_cond(Condition::Equal, advance)?;
+        if index < offsets.len().saturating_sub(1) {
+            assembler.sve_count_predicate_bytes(X10, 0, 1)?;
+            assembler.cmp_imm64(X10, 1)?;
+            assembler.branch_cond(Condition::LowerOrSame, candidate)?;
+        }
+    }
+    assembler.branch(candidate)?;
+
+    assembler.bind(candidate)?;
+    assembler.sve_break_before_bytes(3, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X10, 0, 3)?;
+    assembler.add_reg(X13, X5, X10)?;
+    if !filters_cover_zero {
+        assembler.load_byte_reg(X10, X9, X13)?;
+        assembler.cmp_reg32(X10, X11)?;
+        assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    }
+    assembler.add_reg(X10, X9, X13)?;
+    assembler.sve_load_bytes(30, 0, X10)?;
+    assembler.sve_compare_equal_bytes(2, 0, 30, 31)?;
+    assembler.sve_bit_clear_predicate_bytes_set_flags(2, 0, 0, 2)?;
+    assembler.branch_cond(Condition::NotEqual, candidate_miss)?;
+    assembler.add_reg(X14, X13, X12)?;
+    assembler.branch(found)?;
+
+    // Remove the rejected leftmost lane while retaining every later survivor.
+    // No column is reloaded and the fifth constant remains live in z22.
+    assembler.bind(candidate_miss)?;
+    assembler.sve_break_after_bytes(3, 0, 1)?;
+    assembler.sve_bit_clear_predicate_bytes_set_flags(1, 0, 1, 3)?;
+    assembler.branch_cond(Condition::NotEqual, candidate)?;
+
+    assembler.bind(advance)?;
+    assembler.add_imm(X5, X5, 16)?;
+    assembler.add_imm(X15, X15, 16)?;
+    assembler.cmp_reg64(X5, X7)?;
+    assembler.branch_cond(Condition::LowerOrSame, narrow)?;
+    assembler.cmp_reg64(X5, X6)?;
+    assembler.branch_cond(Condition::Higher, none)?;
+    assembler.branch(tail_setup)?;
+
+    assembler.bind(tail_setup)?;
+    emit_scalar_candidates_legacy(assembler, literal, true, none, found)
+}
+
+fn emit_four_block_presence_v8(assembler: &mut Assembler) -> Result<(), EmitError> {
+    assembler.unsigned_max_pairwise_bytes16(16, 0, 2)?;
+    assembler.unsigned_max_pairwise_bytes16(17, 4, 6)?;
+    assembler.unsigned_max_pairwise_bytes16(16, 16, 17)?;
+    assembler.unsigned_max_pairwise_bytes16(16, 16, 16)?;
+    assembler.move_vector_double_to64(X10, 16)
+}
+
 fn emit_branch_if_mask_has_multiple(
     assembler: &mut Assembler,
     mask: u8,
@@ -2693,6 +3547,61 @@ fn candidate_ranked_verification_offsets(
         }
     }
     (selected[0], selected[1])
+}
+
+fn candidate_ranked_verification_offsets_v2(
+    literal: &[u8],
+    primary_offset: u16,
+    secondary_offset: Option<u16>,
+) -> (Option<u16>, Option<u16>, Option<u16>) {
+    // Exact-16 prefix near-misses agree through byte fourteen. Reserve the
+    // fifth authenticated column for byte fifteen unless the packed pair
+    // already covers it; that case retains all three ranked columns.
+    let terminal_offset = literal
+        .len()
+        .checked_sub(1)
+        .and_then(|offset| u16::try_from(offset).ok());
+    let force_terminal = terminal_offset
+        .is_some_and(|offset| offset != primary_offset && Some(offset) != secondary_offset);
+    let mut selected = [None; 3];
+    for (offset, &byte) in literal.iter().enumerate() {
+        let offset = u16::try_from(offset).expect("bounded repeated-confirmation offset fits u16");
+        if offset == primary_offset
+            || Some(offset) == secondary_offset
+            || (force_terminal && Some(offset) == terminal_offset)
+        {
+            continue;
+        }
+        let key = (V7_BYTE_FREQUENCY_RANK[usize::from(byte)], offset);
+        if selected[0].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            selected[2] = selected[1];
+            selected[1] = selected[0];
+            selected[0] = Some(offset);
+        } else if selected[1].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            selected[2] = selected[1];
+            selected[1] = Some(offset);
+        } else if selected[2].is_none_or(|current| {
+            let current_byte = literal[usize::from(current)];
+            key < (V7_BYTE_FREQUENCY_RANK[usize::from(current_byte)], current)
+        }) {
+            selected[2] = Some(offset);
+        }
+    }
+    (
+        selected[0],
+        selected[1],
+        if force_terminal {
+            terminal_offset
+        } else {
+            selected[2]
+        },
+    )
 }
 
 // Frozen memchr 2.8.3 packed-pair frequency order. V7 uses the same ranking
@@ -3831,6 +4740,28 @@ impl Assembler {
         )
     }
 
+    fn load_vector_pair128(
+        &mut self,
+        first_destination: u8,
+        second_destination: u8,
+        base: u8,
+        offset: u16,
+    ) -> Result<(), EmitError> {
+        debug_assert!(
+            first_destination != second_destination
+                && offset.is_multiple_of(16)
+                && offset / 16 < 64
+        );
+        self.emit_word(
+            0xad40_0000
+                | (u32::from(offset / 16) << 15)
+                | reg_field(second_destination, 10)
+                | reg_field(base, 5)
+                | u32::from(first_destination),
+            true,
+        )
+    }
+
     fn dup_byte16(&mut self, destination: u8, source: u8) -> Result<(), EmitError> {
         self.emit_word(
             0x4e01_0c00 | reg_field(source, 5) | u32::from(destination),
@@ -3884,6 +4815,24 @@ impl Assembler {
         )
     }
 
+    fn sve_bit_clear_predicate_bytes_set_flags(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7 && left <= 15 && right <= 15);
+        self.emit_word(
+            0x2540_4010
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
     fn sve2_match_bytes(
         &mut self,
         destination: u8,
@@ -3920,6 +4869,24 @@ impl Assembler {
         )
     }
 
+    fn sve_and_predicate_bytes_set_flags(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7 && left <= 15 && right <= 15);
+        self.emit_word(
+            0x2540_4000
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
     fn sve_test_predicate_bytes(&mut self, predicate: u8, tested: u8) -> Result<(), EmitError> {
         debug_assert!(predicate <= 7 && tested <= 15);
         self.emit_word(
@@ -3937,6 +4904,22 @@ impl Assembler {
         debug_assert!(destination <= 15 && predicate <= 7 && source <= 15);
         self.emit_word(
             0x2590_4000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_break_after_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), EmitError> {
+        debug_assert!(destination <= 15 && predicate <= 7 && source <= 15);
+        self.emit_word(
+            0x2510_4000
                 | (u32::from(predicate) << 10)
                 | (u32::from(source) << 5)
                 | u32::from(destination),
@@ -4407,8 +5390,8 @@ const fn condition_code(condition: Condition) -> u32 {
 mod encoding_tests {
     use super::{
         BranchKind, EmitError, MAX_REPEATED_CONFIRM_BYTES, RelocationKind, candidate_byte_pair,
-        candidate_ranked_verification_offsets, candidate_verification_offset, resolve_word,
-        signed_range,
+        candidate_ranked_verification_offsets, candidate_ranked_verification_offsets_v2,
+        candidate_verification_offset, resolve_word, signed_range,
     };
 
     #[test]
@@ -4429,6 +5412,18 @@ mod encoding_tests {
         assert_eq!(
             candidate_ranked_verification_offsets(b"0123456789abcdef", 7, Some(6)),
             (Some(8), Some(5))
+        );
+        assert_eq!(
+            candidate_ranked_verification_offsets_v2(b"0123456789abcdef", 7, Some(6)),
+            (Some(8), Some(5), Some(15))
+        );
+        let mut terminal_pair = [b'e'; 16];
+        terminal_pair[15] = 0x1f;
+        terminal_pair[4] = 0x1e;
+        assert_eq!(candidate_byte_pair(&terminal_pair), (15, Some(4)));
+        assert_eq!(
+            candidate_ranked_verification_offsets_v2(&terminal_pair, 15, Some(4)),
+            (Some(0), Some(1), Some(2))
         );
         let mut subtract = [b'e'; 16];
         subtract[8] = 0x1f;
