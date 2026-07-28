@@ -1484,8 +1484,7 @@ impl CurrentFreAggregateCompileArtifact {
         }
         match &self.inner {
             CurrentFreAggregateCompileArtifactInner::Single(regex) => {
-                let limits =
-                    current_fre_rebar_aggregate_run_limits(haystack.len(), regex.build_report())?;
+                let limits = current_fre_rebar_compile_run_limits(haystack.len(), regex)?;
                 regex
                     .verify_count(haystack, limits)
                     .map(|result| result.value())
@@ -1938,6 +1937,13 @@ fn build_current_fre_count_lifecycle(
             .map_err(|error| CompareError::new(format!("FRE count lifecycle build: {error}")))?;
         current_fre_rebar_validate_aggregate_identity(regex.build_report(), unicode, "count")?;
         let plan = aggregate_single_plan_label("count", regex.build_report());
+        let retained_upper_bounds = regex
+            .retained_full_window_upper_bounds(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE count lifecycle retained-owner preflight: {error}"
+                ))
+            })?;
         let fixed_absolute_prospective = regex
             .fixed_absolute_domain_full_window_prospective(haystack_len)
             .map_err(|error| {
@@ -1955,6 +1961,7 @@ fn build_current_fre_count_lifecycle(
         let limits = aggregate_run_limits_with_fixed_absolute(
             haystack_len,
             regex.build_report(),
+            retained_upper_bounds,
             fixed_absolute_prospective,
             fixed_absolute_composite,
             &RunLimits::default(),
@@ -2009,6 +2016,13 @@ fn build_current_fre_span_sum_lifecycle(
             "count-spans",
         )?;
         let plan = aggregate_single_plan_label("count-spans", regex.build_report());
+        let retained_upper_bounds = regex
+            .retained_full_window_upper_bounds(haystack_len)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "FRE span-sum lifecycle retained-owner preflight: {error}"
+                ))
+            })?;
         let fixed_absolute_prospective = regex
             .fixed_absolute_domain_full_window_prospective(haystack_len)
             .map_err(|error| {
@@ -2026,6 +2040,7 @@ fn build_current_fre_span_sum_lifecycle(
         let limits = aggregate_run_limits_with_fixed_absolute(
             haystack_len,
             regex.build_report(),
+            retained_upper_bounds,
             fixed_absolute_prospective,
             fixed_absolute_composite,
             &RunLimits::default(),
@@ -2538,7 +2553,11 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
 }
 
 /// Derive whole-operation limits for a report-authenticated aggregate plan.
-/// Fixed absolute-domain plans require the retained artifact and must use
+/// Every Unicode-scalar, prefix/class, literal/class-run/literal, bounded-
+/// context, and fixed absolute-domain plan requires the retained artifact.
+/// The copied report intentionally cannot distinguish scalar from private
+/// dispatched owners, so callers for any of those families must use
+/// [`current_fre_rebar_compile_run_limits`],
 /// [`current_fre_rebar_count_run_limits`] or
 /// [`current_fre_rebar_span_sum_run_limits`] instead.
 ///
@@ -2553,6 +2572,116 @@ pub fn current_fre_rebar_aggregate_run_limits(
         .map_err(|error| CompareError::new(error.message))
 }
 
+fn compile_run_limits_with_policy(
+    haystack_len: usize,
+    regex: &AggregateCompileRegex,
+    limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    let retained_upper_bounds = regex
+        .retained_full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE compile retained-owner preflight: {error}"))
+        })?;
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE compile fixed-domain preflight: {error}"))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE compile fixed-domain composite preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        retained_upper_bounds,
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        limits,
+    )
+}
+
+fn count_run_limits_with_policy(
+    haystack_len: usize,
+    regex: &AggregateCountRegex,
+    limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    let retained_upper_bounds = regex
+        .retained_full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE count retained-owner preflight: {error}"))
+        })?;
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE count fixed-domain preflight: {error}"))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE count fixed-domain composite preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        retained_upper_bounds,
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        limits,
+    )
+}
+
+fn span_sum_run_limits_with_policy(
+    haystack_len: usize,
+    regex: &AggregateSpanSumRegex,
+    limits: &RunLimits,
+) -> Result<AggregateRunLimits, ExecutionError> {
+    let retained_upper_bounds = regex
+        .retained_full_window_upper_bounds(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE span-sum retained-owner preflight: {error}"))
+        })?;
+    let fixed_absolute_prospective = regex
+        .fixed_absolute_domain_full_window_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!("FRE span-sum fixed-domain preflight: {error}"))
+        })?;
+    let fixed_absolute_composite = regex
+        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE span-sum fixed-domain composite preflight: {error}"
+            ))
+        })?;
+    aggregate_run_limits_with_fixed_absolute(
+        haystack_len,
+        regex.build_report(),
+        retained_upper_bounds,
+        fixed_absolute_prospective,
+        fixed_absolute_composite,
+        limits,
+    )
+}
+
+/// Derive exact verification limits from one retained compile artifact.
+///
+/// # Errors
+///
+/// Returns an authentication/resource error if the artifact cannot publish
+/// its source-free full-window envelopes.
+pub fn current_fre_rebar_compile_run_limits(
+    haystack_len: usize,
+    regex: &AggregateCompileRegex,
+) -> Result<AggregateRunLimits, CompareError> {
+    compile_run_limits_with_policy(haystack_len, regex, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
+}
+
 /// Derive exact operation limits from one retained count artifact, including
 /// its private fixed absolute-domain seal when that generic route is selected.
 ///
@@ -2564,24 +2693,8 @@ pub fn current_fre_rebar_count_run_limits(
     haystack_len: usize,
     regex: &AggregateCountRegex,
 ) -> Result<AggregateRunLimits, CompareError> {
-    let fixed_absolute_prospective = regex
-        .fixed_absolute_domain_full_window_prospective(haystack_len)
-        .map_err(|error| CompareError::new(format!("FRE count fixed-domain preflight: {error}")))?;
-    let fixed_absolute_composite = regex
-        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
-        .map_err(|error| {
-            CompareError::new(format!(
-                "FRE count fixed-domain composite preflight: {error}"
-            ))
-        })?;
-    aggregate_run_limits_with_fixed_absolute(
-        haystack_len,
-        regex.build_report(),
-        fixed_absolute_prospective,
-        fixed_absolute_composite,
-        &RunLimits::default(),
-    )
-    .map_err(|error| CompareError::new(error.message))
+    count_run_limits_with_policy(haystack_len, regex, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
 }
 
 /// Derive exact operation limits from one retained span-sum artifact,
@@ -2595,26 +2708,8 @@ pub fn current_fre_rebar_span_sum_run_limits(
     haystack_len: usize,
     regex: &AggregateSpanSumRegex,
 ) -> Result<AggregateRunLimits, CompareError> {
-    let fixed_absolute_prospective = regex
-        .fixed_absolute_domain_full_window_prospective(haystack_len)
-        .map_err(|error| {
-            CompareError::new(format!("FRE span-sum fixed-domain preflight: {error}"))
-        })?;
-    let fixed_absolute_composite = regex
-        .fixed_absolute_domain_full_window_composite_prospective(haystack_len)
-        .map_err(|error| {
-            CompareError::new(format!(
-                "FRE span-sum fixed-domain composite preflight: {error}"
-            ))
-        })?;
-    aggregate_run_limits_with_fixed_absolute(
-        haystack_len,
-        regex.build_report(),
-        fixed_absolute_prospective,
-        fixed_absolute_composite,
-        &RunLimits::default(),
-    )
-    .map_err(|error| CompareError::new(error.message))
+    span_sum_run_limits_with_policy(haystack_len, regex, &RunLimits::default())
+        .map_err(|error| CompareError::new(error.message))
 }
 
 /// Derive the exact whole-operation limits used by the authenticated
@@ -4845,8 +4940,7 @@ fn execute_composite_count_stage(
     require_composite_count_minimum_identity(regex.build_report(), minimum_match_bytes)?;
     require_composite_build_plan_identity(regex.build_report(), AggregateOperation::Count)?;
     charge_composite_build(&mut state.accounting, regex.build_report(), limits)?;
-    let operation_limits =
-        aggregate_run_limits(state.sequence.len(), regex.build_report(), run_limits)?;
+    let operation_limits = count_run_limits_with_policy(state.sequence.len(), &regex, run_limits)?;
     let result = regex
         .count(&state.sequence, operation_limits)
         .map_err(|error| {
@@ -5188,8 +5282,7 @@ fn fre_compile_verify(
         request.unicode,
         LiteralAggregateOperation::Count,
     )?;
-    let operation_limits =
-        aggregate_run_limits(request.haystack.len(), regex.build_report(), limits)?;
+    let operation_limits = compile_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
     let operation_limits = &operation_limits;
     let result = regex
         .verify_count(request.haystack, operation_limits)
@@ -6481,7 +6574,7 @@ fn execute_uniform_capture_scalar(
     } else {
         None
     };
-    let mut operation_limits = aggregate_run_limits(haystack.len(), regex.build_report(), limits)?;
+    let mut operation_limits = count_run_limits_with_policy(haystack.len(), regex, limits)?;
     if let Some(line_scan) = line_scan {
         let (remaining_work, _) = line_scan.remaining(limits)?;
         operation_limits.unicode_scalar.max_work =
@@ -7820,65 +7913,24 @@ fn scalar_binary_search_comparison_bound(mut ranges: usize) -> usize {
 }
 
 fn unicode_scalar_operation_limits(
-    haystack_len: usize,
-    build: fre::UnicodeScalarAggregateBuildAccounting,
+    upper: fre::UnicodeScalarAggregateUpperBounds,
     limits: &RunLimits,
 ) -> Result<UnicodeScalarAggregateReduceLimits, ExecutionError> {
-    let decode_byte_checks = checked_aggregate_mul(haystack_len, 4, "scalar decode checks")?;
-    let comparisons_per_scalar =
-        scalar_binary_search_comparison_bound(build.retained_non_ascii_ranges)
-            .checked_add(
-                usize::from(build.repetition.is_run() && build.retained_non_ascii_ranges != 0)
-                    .checked_mul(2)
-                    .ok_or_else(|| {
-                        ExecutionError::fault("FRE cached scalar comparison bound overflow")
-                    })?,
-            )
-            .ok_or_else(|| ExecutionError::fault("FRE cached scalar comparison bound overflow"))?;
-    let range_comparisons = checked_aggregate_mul(
-        haystack_len,
-        comparisons_per_scalar,
-        "scalar range comparisons",
-    )?;
-    let reducer_steps = if build.repetition.is_run() {
-        checked_aggregate_add(haystack_len, 1, "scalar run reducer steps")?
-    } else {
-        0
-    };
-    // This is the kernel's structural bound: byte examinations, membership
-    // tests and range comparisons. It is deliberately not described as an
-    // executed-CPU-instruction count.
-    let structural_work = checked_aggregate_add(
-        checked_aggregate_add(
-            decode_byte_checks,
-            haystack_len,
-            "scalar decode plus membership work",
-        )?,
-        range_comparisons,
-        "scalar total work",
-    )?;
-    let structural_work = checked_aggregate_add(
-        structural_work,
-        reducer_steps,
-        "scalar work plus run reduction",
-    )?;
-    let count = u64::try_from(haystack_len)
-        .map_err(|_| ExecutionError::fault("FRE scalar count bound does not fit u64"))?;
     let reducer_events = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
 
     Ok(UnicodeScalarAggregateReduceLimits {
-        max_input_bytes: haystack_len,
-        max_decode_byte_checks: decode_byte_checks,
-        max_membership_tests: haystack_len,
-        max_range_comparisons: range_comparisons,
-        max_reducer_steps: reducer_steps.min(reducer_events),
-        max_match_events: haystack_len.min(reducer_events),
-        max_count: count.min(limits.reducer_steps),
-        max_span_sum: count,
-        max_work: structural_work,
-        max_scratch_bytes: 0,
-        max_peak_bytes: build.persistent_bytes,
+        max_input_bytes: upper.input_bytes,
+        max_decode_byte_checks: upper.decode_byte_checks,
+        max_membership_tests: upper.membership_tests,
+        max_range_comparisons: upper.range_comparisons,
+        max_reducer_steps: upper.reducer_steps.min(reducer_events),
+        max_match_events: upper.match_events.min(reducer_events),
+        max_count: upper.count.min(limits.reducer_steps),
+        max_span_sum: upper.span_sum,
+        max_work: upper.work.min(limits.fre_aggregate_operation_work),
+        max_scratch_bytes: upper.scratch_bytes,
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
     })
 }
 
@@ -8195,131 +8247,23 @@ fn inactive_fixed_class_sandwich_operation_limits() -> FixedClassSandwichReduceL
     FixedClassSandwichReduceLimits::default()
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the adapter mirrors every kernel preflight dimension in one auditable source-free calculation"
-)]
 fn literal_class_run_literal_operation_limits(
-    haystack_len: usize,
-    build: LiteralClassRunLiteralBuildAccounting,
-    operation: AggregateOperation,
+    upper: fre::LiteralClassRunLiteralUpperBounds,
     limits: &RunLimits,
 ) -> Result<LiteralClassRunLiteralReduceLimits, ExecutionError> {
-    let anchor_bytes = build.prefix_bytes.max(build.suffix_bytes);
-    let opposite_literal_bytes = build.prefix_bytes.min(build.suffix_bytes);
-    let anchor_candidates = if haystack_len < anchor_bytes {
-        0
-    } else {
-        let remaining = haystack_len.checked_sub(anchor_bytes).ok_or_else(|| {
-            ExecutionError::fault("literal/class-run/literal anchor subtraction underflow")
-        })?;
-        checked_aggregate_add(remaining, 1, "literal/class-run/literal anchor candidates")?
-    };
-    let anchor_overlap = anchor_bytes.checked_sub(1).ok_or_else(|| {
-        ExecutionError::fault("literal/class-run/literal retained an empty anchor")
-    })?;
-    let repeated_anchor_bytes = checked_aggregate_mul(
-        anchor_candidates,
-        anchor_overlap,
-        "literal/class-run/literal overlapping anchor service",
-    )?;
-    let finder_scanned_bytes = checked_aggregate_add(
-        haystack_len,
-        repeated_anchor_bytes,
-        "literal/class-run/literal finder service",
-    )?;
-    let run_events = checked_aggregate_add(
-        haystack_len / 2,
-        haystack_len % 2,
-        "literal/class-run/literal run events",
-    )?;
-    let classifications = checked_aggregate_add(
-        haystack_len,
-        anchor_candidates,
-        "literal/class-run/literal class probes",
-    )?;
-    let literal_reads = checked_aggregate_mul(
-        run_events,
-        opposite_literal_bytes,
-        "literal/class-run/literal boundary reads",
-    )?;
-    let source_reads = [finder_scanned_bytes, classifications, literal_reads]
-        .into_iter()
-        .try_fold(0_usize, |total, term| {
-            checked_aggregate_add(total, term, "literal/class-run/literal source reads")
-        })?;
-    let minimum_width = checked_aggregate_add(
-        build.literal_bytes,
-        1,
-        "literal/class-run/literal minimum width",
-    )?;
-    let match_events = haystack_len
-        .checked_div(minimum_width)
-        .ok_or_else(|| ExecutionError::fault("literal/class-run/literal minimum is zero"))?;
-    let count = u64::try_from(match_events).map_err(|_| {
-        ExecutionError::fault("literal/class-run/literal count bound does not fit u64")
-    })?;
-    let span_sum = match operation {
-        AggregateOperation::Compile | AggregateOperation::Count => 0,
-        AggregateOperation::SpanSum => u64::try_from(haystack_len).map_err(|_| {
-            ExecutionError::fault("literal/class-run/literal span bound does not fit u64")
-        })?,
-        AggregateOperation::Spans => {
-            return Err(ExecutionError::fault(
-                "literal/class-run/literal plan retained a spans operation",
-            ));
-        }
-    };
-    let finder_call_work = checked_aggregate_mul(
-        anchor_candidates,
-        4,
-        "literal/class-run/literal finder call work",
-    )?;
-    let anchor_candidate_work = checked_aggregate_mul(
-        anchor_candidates,
-        4,
-        "literal/class-run/literal anchor candidate work",
-    )?;
-    let classification_work = checked_aggregate_mul(
-        classifications,
-        2,
-        "literal/class-run/literal classification work",
-    )?;
-    let comparison_work = checked_aggregate_mul(
-        literal_reads,
-        2,
-        "literal/class-run/literal comparison work",
-    )?;
-    let run_work = checked_aggregate_mul(run_events, 12, "literal/class-run/literal run work")?;
-    let match_work =
-        checked_aggregate_mul(match_events, 8, "literal/class-run/literal match work")?;
-    let work = [
-        finder_scanned_bytes,
-        finder_call_work,
-        anchor_candidate_work,
-        classification_work,
-        comparison_work,
-        run_work,
-        match_work,
-        16,
-    ]
-    .into_iter()
-    .try_fold(0_usize, |total, term| {
-        checked_aggregate_add(total, term, "literal/class-run/literal total work")
-    })?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
     Ok(LiteralClassRunLiteralReduceLimits {
-        max_input_bytes: haystack_len,
-        max_source_reads: source_reads,
-        max_work: work.min(limits.fre_aggregate_operation_work),
-        max_run_events: run_events,
-        max_match_events: match_events.min(reducer_limit),
-        max_count: count.min(limits.reducer_steps),
-        max_span_sum: span_sum,
-        max_scratch_bytes: 0,
-        max_persistent_bytes: build.persistent_bytes,
-        max_peak_bytes: build.peak_bytes.min(limits.fre_aggregate_peak_bytes),
+        max_input_bytes: upper.input_bytes,
+        max_source_reads: upper.source_reads,
+        max_work: upper.work.min(limits.fre_aggregate_operation_work),
+        max_run_events: upper.run_events,
+        max_match_events: upper.match_events.min(reducer_limit),
+        max_count: upper.count.min(limits.reducer_steps),
+        max_span_sum: upper.span_sum,
+        max_scratch_bytes: upper.scratch_bytes,
+        max_persistent_bytes: upper.persistent_bytes,
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
     })
 }
 
@@ -8519,29 +8463,17 @@ fn inactive_bounded_separated_fields_operation_limits() -> BoundedSeparatedField
 }
 
 fn prefix_class_alternation_operation_limits(
-    haystack_len: usize,
-    build: fre::PrefixClassAlternationBuildAccounting,
+    upper: fre::PrefixClassAlternationUpperBounds,
     limits: &RunLimits,
 ) -> Result<PrefixClassAlternationReduceLimits, ExecutionError> {
-    let work = checked_aggregate_add(
-        checked_aggregate_mul(haystack_len, 16, "prefix/class haystack work")?,
-        checked_aggregate_add(
-            checked_aggregate_mul(build.shape_units, 8, "prefix/class shape work")?,
-            64,
-            "prefix/class fixed work",
-        )?,
-        "prefix/class total work",
-    )?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE reducer limit does not fit usize"))?;
-    let count = u64::try_from(haystack_len)
-        .map_err(|_| ExecutionError::fault("FRE prefix/class count bound does not fit u64"))?;
     Ok(PrefixClassAlternationReduceLimits {
-        max_work: work.min(limits.fre_aggregate_operation_work),
-        max_match_events: haystack_len.min(reducer_limit),
-        max_count: count.min(limits.reducer_steps),
-        max_scratch_bytes: 0,
-        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        max_work: upper.work.min(limits.fre_aggregate_operation_work),
+        max_match_events: upper.match_events.min(reducer_limit),
+        max_count: upper.count.min(limits.reducer_steps),
+        max_scratch_bytes: upper.scratch_bytes,
+        max_peak_bytes: upper.peak_bytes.min(limits.fre_aggregate_peak_bytes),
     })
 }
 
@@ -8688,87 +8620,47 @@ fn inactive_bounded_literal_pair_operation_limits() -> fre::BoundedLiteralPairRe
 }
 
 fn bounded_context_operation_limits(
-    haystack_len: usize,
-    build: fre::BoundedContextBuildAccounting,
-    identity: AggregatePlanIdentity,
+    operation: AggregateOperation,
+    upper: fre::AggregateRetainedFullWindowUpperBounds,
     limits: &RunLimits,
 ) -> Result<fre::BoundedContextReduceLimits, ExecutionError> {
-    let tail = usize::try_from(build.tail_width)
-        .map_err(|_| ExecutionError::fault("FRE bounded-context tail width does not fit usize"))?;
-    let interval_records = haystack_len
-        .checked_div(
-            tail.checked_add(1)
-                .ok_or_else(|| ExecutionError::fault("FRE bounded-context tail overflow"))?,
-        )
-        .ok_or_else(|| ExecutionError::fault("FRE bounded-context interval denominator is zero"))?;
-    let interval_bytes =
-        checked_aggregate_mul(interval_records, 12, "bounded-context interval bytes")?;
-    let work = checked_aggregate_add(
-        checked_aggregate_add(
-            checked_aggregate_mul(haystack_len, 21, "bounded-context input work")?,
-            checked_aggregate_mul(build.literal_bytes, 11, "bounded-context literal work")?,
-            "bounded-context input plus literal work",
-        )?,
-        checked_aggregate_add(
-            checked_aggregate_mul(interval_bytes, 3, "bounded-context interval work")?,
-            40,
-            "bounded-context interval plus fixed work",
-        )?,
-        "bounded-context total work",
-    )?;
-    let AggregatePlanIdentity::BoundedContext(identity) = identity else {
-        return Err(ExecutionError::fault(
-            "FRE bounded-context accounting lacks bounded-context identity",
-        ));
-    };
-    let minimum_match = if identity.kernel.plan_id == fre::BOUNDED_AFFIX_PLAN_ID {
-        usize::try_from(build.prefix_width)
-            .ok()
-            .and_then(|value| value.checked_add(build.literal_bytes))
-            .and_then(|value| {
-                usize::try_from(build.tail_width)
-                    .ok()
-                    .and_then(|tail| value.checked_add(tail))
-            })
-    } else if identity.kernel.plan_id == fre::BOUNDED_CONTEXT_PLAN_ID {
-        usize::try_from(build.prefix_width)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| value.checked_add(build.literal_bytes))
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| {
-                usize::try_from(build.tail_width)
-                    .ok()
-                    .and_then(|tail| value.checked_add(tail))
-            })
-    } else {
-        return Err(ExecutionError::fault(
-            "FRE bounded-context accounting has unknown kernel identity",
-        ));
-    }
-    .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match overflow"))?;
-    let match_events = haystack_len
-        .checked_div(minimum_match)
-        .ok_or_else(|| ExecutionError::fault("FRE bounded-context minimum match is zero"))?;
-    let operation_value = if identity.kernel.operation_id == fre::BOUNDED_CONTEXT_COUNT_OPERATION_ID
-    {
-        u64::try_from(match_events)
-            .map_err(|_| ExecutionError::fault("FRE bounded-context count does not fit u64"))?
-    } else if identity.kernel.operation_id == fre::BOUNDED_CONTEXT_SPAN_SUM_OPERATION_ID {
-        u64::try_from(haystack_len)
-            .map_err(|_| ExecutionError::fault("FRE bounded-context span sum does not fit u64"))?
-    } else {
-        return Err(ExecutionError::fault(
-            "FRE bounded-context accounting has unknown operation identity",
-        ));
-    };
+    let (input_bytes, work, match_events, operation_value, scratch_bytes, peak_bytes) =
+        match (operation, upper) {
+            (
+                AggregateOperation::Compile | AggregateOperation::Count,
+                fre::AggregateRetainedFullWindowUpperBounds::BoundedContextCount(upper),
+            ) => (
+                upper.input_bytes,
+                upper.work,
+                upper.match_events,
+                upper.count,
+                upper.scratch_bytes,
+                upper.peak_bytes,
+            ),
+            (
+                AggregateOperation::SpanSum,
+                fre::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(upper),
+            ) => (
+                upper.input_bytes,
+                upper.work,
+                upper.match_events,
+                upper.span_sum,
+                upper.scratch_bytes,
+                upper.peak_bytes,
+            ),
+            _ => {
+                return Err(ExecutionError::fault(
+                    "FRE bounded-context retained-owner envelope is absent or transplanted",
+                ));
+            }
+        };
     Ok(fre::BoundedContextReduceLimits {
-        max_input_bytes: haystack_len,
+        max_input_bytes: input_bytes,
         max_work: work.min(limits.fre_aggregate_operation_work),
         max_match_events: match_events,
         max_count: operation_value.min(limits.reducer_steps),
-        max_scratch_bytes: interval_bytes.min(limits.fre_aggregate_scratch_bytes),
-        max_peak_bytes: limits.fre_aggregate_peak_bytes,
+        max_scratch_bytes: scratch_bytes.min(limits.fre_aggregate_scratch_bytes),
+        max_peak_bytes: peak_bytes.min(limits.fre_aggregate_peak_bytes),
     })
 }
 
@@ -9026,6 +8918,7 @@ fn guarded_ascii_word_operation_limits(
 fn aggregate_run_limits_with_fixed_absolute(
     haystack_len: usize,
     report: &AggregateBuildReport,
+    retained_upper_bounds: Option<fre::AggregateRetainedFullWindowUpperBounds>,
     fixed_absolute_prospective: Option<fre::FixedAbsoluteDomainProspective>,
     fixed_absolute_composite: Option<fre::AggregateFixedAbsoluteDomainResidualProspective>,
     limits: &RunLimits,
@@ -9035,6 +8928,18 @@ fn aggregate_run_limits_with_fixed_absolute(
     require_closed_required_internal_anchor_identity(report)?;
     require_closed_url_aggregate_identity(report)?;
     require_closed_construction_attempt(report)?;
+    let retained_bounds_required = matches!(
+        report.build,
+        AggregateBuildAccounting::UnicodeScalar(_)
+            | AggregateBuildAccounting::PrefixClassAlternation(_)
+            | AggregateBuildAccounting::LiteralClassRunLiteral(_)
+            | AggregateBuildAccounting::BoundedContext(_)
+    );
+    if retained_bounds_required != retained_upper_bounds.is_some() {
+        return Err(ExecutionError::fault(
+            "FRE retained direct-owner full-window envelope is absent or transplanted",
+        ));
+    }
     if matches!(
         report.build,
         AggregateBuildAccounting::FixedAbsoluteDomain(_)
@@ -9079,30 +8984,39 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
-        AggregateBuildAccounting::UnicodeScalar(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: unicode_scalar_operation_limits(haystack_len, build, limits)?,
-            word_run: inactive_word_run_operation_limits(),
-            literal_assertions: inactive_literal_assertions_operation_limits(),
-            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
-            token_phrase: inactive_token_phrase_operation_limits(),
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
-            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
-            bounded_context: inactive_bounded_context_operation_limits(),
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
+        AggregateBuildAccounting::UnicodeScalar(_) => {
+            let Some(fre::AggregateRetainedFullWindowUpperBounds::UnicodeScalar(upper)) =
+                retained_upper_bounds
+            else {
+                return Err(ExecutionError::fault(
+                    "FRE Unicode scalar retained-owner envelope is absent or transplanted",
+                ));
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: unicode_scalar_operation_limits(upper, limits)?,
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::WordRun(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
@@ -9336,63 +9250,74 @@ fn aggregate_run_limits_with_fixed_absolute(
                 )?,
             })
         }
-        AggregateBuildAccounting::PrefixClassAlternation(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            word_run: inactive_word_run_operation_limits(),
-            literal_assertions: inactive_literal_assertions_operation_limits(),
-            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
-            token_phrase: inactive_token_phrase_operation_limits(),
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: prefix_class_alternation_operation_limits(
-                haystack_len,
-                build,
-                limits,
-            )?,
-            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
-            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
-            bounded_context: inactive_bounded_context_operation_limits(),
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
-        AggregateBuildAccounting::LiteralClassRunLiteral(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            word_run: inactive_word_run_operation_limits(),
-            literal_assertions: inactive_literal_assertions_operation_limits(),
-            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
-            token_phrase: inactive_token_phrase_operation_limits(),
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            literal_class_run_literal: literal_class_run_literal_operation_limits(
-                haystack_len,
-                build,
-                report.operation,
-                limits,
-            )?,
-            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
-            bounded_context: inactive_bounded_context_operation_limits(),
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
+        AggregateBuildAccounting::PrefixClassAlternation(_) => {
+            let Some(fre::AggregateRetainedFullWindowUpperBounds::PrefixClassAlternation(upper)) =
+                retained_upper_bounds
+            else {
+                return Err(ExecutionError::fault(
+                    "FRE prefix/class retained-owner envelope is absent or transplanted",
+                ));
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: prefix_class_alternation_operation_limits(upper, limits)?,
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
+        AggregateBuildAccounting::LiteralClassRunLiteral(_) => {
+            let Some(fre::AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral(upper)) =
+                retained_upper_bounds
+            else {
+                return Err(ExecutionError::fault(
+                    "FRE literal/class-run/literal retained-owner envelope is absent or transplanted",
+                ));
+            };
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: literal_class_run_literal_operation_limits(
+                    upper, limits,
+                )?,
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: inactive_bounded_context_operation_limits(),
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::BoundedLiteralPair(build) => Ok(AggregateRunLimits {
             exact_literal: inactive_literal_operation_limits(limits),
             unicode_scalar: inactive_unicode_scalar_operation_limits(),
@@ -9423,35 +9348,35 @@ fn aggregate_run_limits_with_fixed_absolute(
                 limits,
             )?,
         }),
-        AggregateBuildAccounting::BoundedContext(build) => Ok(AggregateRunLimits {
-            exact_literal: inactive_literal_operation_limits(limits),
-            unicode_scalar: inactive_unicode_scalar_operation_limits(),
-            word_run: inactive_word_run_operation_limits(),
-            literal_assertions: inactive_literal_assertions_operation_limits(),
-            blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
-            token_phrase: inactive_token_phrase_operation_limits(),
-            fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
-            grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
-            bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
-            bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
-            prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
-            literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
-            bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
-            bounded_context: bounded_context_operation_limits(
-                haystack_len,
-                build,
-                report.plan_identity,
-                limits,
-            )?,
-            fixed_absolute: inactive_fixed_absolute_operation_limits(),
-            fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
-            finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
-            continuation: continuation_operation_limits(
-                haystack_len,
-                inactive_continuation_shape(),
-                limits,
-            )?,
-        }),
+        AggregateBuildAccounting::BoundedContext(_) => {
+            let upper = retained_upper_bounds.ok_or_else(|| {
+                ExecutionError::fault("FRE bounded-context retained-owner envelope is absent")
+            })?;
+            Ok(AggregateRunLimits {
+                exact_literal: inactive_literal_operation_limits(limits),
+                unicode_scalar: inactive_unicode_scalar_operation_limits(),
+                word_run: inactive_word_run_operation_limits(),
+                literal_assertions: inactive_literal_assertions_operation_limits(),
+                blocking_delimiter: inactive_blocking_delimiter_operation_limits(),
+                token_phrase: inactive_token_phrase_operation_limits(),
+                fixed_class_sandwich: inactive_fixed_class_sandwich_operation_limits(),
+                grapheme_scalar_dfa: inactive_grapheme_scalar_dfa_operation_limits(),
+                bounded_class_sequence: inactive_bounded_class_sequence_operation_limits(),
+                bounded_separated_fields: inactive_bounded_separated_fields_operation_limits(),
+                prefix_class_alternation: inactive_prefix_class_alternation_operation_limits(),
+                literal_class_run_literal: inactive_literal_class_run_literal_operation_limits(),
+                bounded_literal_pair: inactive_bounded_literal_pair_operation_limits(),
+                bounded_context: bounded_context_operation_limits(report.operation, upper, limits)?,
+                fixed_absolute: inactive_fixed_absolute_operation_limits(),
+                fixed_absolute_residual: inactive_fixed_absolute_residual_limits(),
+                finite_literal: ordered_literal_operation_limits(haystack_len, None, limits)?,
+                continuation: continuation_operation_limits(
+                    haystack_len,
+                    inactive_continuation_shape(),
+                    limits,
+                )?,
+            })
+        }
         AggregateBuildAccounting::FixedAbsoluteDomain(_) => {
             let AggregatePlanIdentity::FixedAbsoluteDomain(identity) = report.plan_identity else {
                 return Err(ExecutionError::fault(
@@ -9696,7 +9621,7 @@ fn aggregate_run_limits(
     report: &AggregateBuildReport,
     limits: &RunLimits,
 ) -> Result<AggregateRunLimits, ExecutionError> {
-    aggregate_run_limits_with_fixed_absolute(haystack_len, report, None, None, limits)
+    aggregate_run_limits_with_fixed_absolute(haystack_len, report, None, None, None, limits)
 }
 
 fn finite_plan_identity_matches(
@@ -12164,27 +12089,7 @@ fn fre_aggregate_count(
         request.unicode,
         LiteralAggregateOperation::Count,
     )?;
-    let fixed_absolute_prospective = regex
-        .fixed_absolute_domain_full_window_prospective(request.haystack.len())
-        .map_err(|error| {
-            ExecutionError::fault(format!(
-                "FRE fixed absolute-domain count preflight failed: {error}"
-            ))
-        })?;
-    let fixed_absolute_composite = regex
-        .fixed_absolute_domain_full_window_composite_prospective(request.haystack.len())
-        .map_err(|error| {
-            ExecutionError::fault(format!(
-                "FRE fixed absolute-domain count composite preflight failed: {error}"
-            ))
-        })?;
-    let operation_limits = aggregate_run_limits_with_fixed_absolute(
-        request.haystack.len(),
-        regex.build_report(),
-        fixed_absolute_prospective,
-        fixed_absolute_composite,
-        limits,
-    )?;
+    let operation_limits = count_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
     let operation_limits = &operation_limits;
     let actual = regex
         .count_value(request.haystack, operation_limits)
@@ -12218,27 +12123,7 @@ fn fre_aggregate_span_sum(
         request.unicode,
         LiteralAggregateOperation::SpanSum,
     )?;
-    let fixed_absolute_prospective = regex
-        .fixed_absolute_domain_full_window_prospective(request.haystack.len())
-        .map_err(|error| {
-            ExecutionError::fault(format!(
-                "FRE fixed absolute-domain span-sum preflight failed: {error}"
-            ))
-        })?;
-    let fixed_absolute_composite = regex
-        .fixed_absolute_domain_full_window_composite_prospective(request.haystack.len())
-        .map_err(|error| {
-            ExecutionError::fault(format!(
-                "FRE fixed absolute-domain span-sum composite preflight failed: {error}"
-            ))
-        })?;
-    let operation_limits = aggregate_run_limits_with_fixed_absolute(
-        request.haystack.len(),
-        regex.build_report(),
-        fixed_absolute_prospective,
-        fixed_absolute_composite,
-        limits,
-    )?;
+    let operation_limits = span_sum_run_limits_with_policy(request.haystack.len(), &regex, limits)?;
     let operation_limits = &operation_limits;
     let actual = regex
         .span_sum_value(request.haystack, operation_limits)
@@ -17584,7 +17469,7 @@ mod tests {
             let many_lines = (0..bytes)
                 .map(|index| if index.is_multiple_of(2) { b'a' } else { b'\n' })
                 .collect::<Vec<_>>();
-            let structural_work = aggregate_run_limits(bytes, regex.build_report(), &defaults)
+            let structural_work = count_run_limits_with_policy(bytes, &regex, &defaults)
                 .unwrap()
                 .unicode_scalar
                 .max_work;
@@ -21420,23 +21305,26 @@ mod tests {
     }
 
     #[test]
-    fn unicode_scalar_run_limits_are_derived_from_input_and_retained_ranges() {
-        let build = fre::UnicodeScalarAggregateBuildAccounting {
-            source_ranges: 9,
-            retained_non_ascii_ranges: 5,
-            ascii_scalars: 17,
-            repetition: fre::UnicodeScalarAggregateRepetition::ExactlyOne,
-            range_payload_bytes: 40,
-            work: 26,
-            ascii_classifier_build_work: 0,
-            ascii_classifier_bytes: 0,
-            dispatched_owner_bytes: 0,
-            temporary_capacity_bytes: 72,
-            scratch_bytes: 72,
+    fn unicode_scalar_run_limits_project_the_retained_owner_envelope() {
+        let upper = fre::UnicodeScalarAggregateUpperBounds {
+            input_bytes: 10,
+            ascii_block_classifications: 0,
+            ascii_block_classification_bytes: 0,
+            ascii_block_lookahead_bytes: 0,
+            decode_byte_checks: 40,
+            membership_tests: 10,
+            range_comparisons: 30,
+            binary_search_comparisons_per_scalar: 3,
+            reducer_steps: 0,
+            match_events: 10,
+            count: 10,
+            span_sum: 10,
+            work: 80,
+            scratch_bytes: 0,
             persistent_bytes: 123,
-            peak_bytes: 195,
+            peak_bytes: 123,
         };
-        let derived = unicode_scalar_operation_limits(10, build, &RunLimits::default()).unwrap();
+        let derived = unicode_scalar_operation_limits(upper, &RunLimits::default()).unwrap();
         assert_eq!(derived.max_input_bytes, 10);
         assert_eq!(derived.max_decode_byte_checks, 40);
         assert_eq!(derived.max_membership_tests, 10);
@@ -21452,11 +21340,14 @@ mod tests {
         assert_eq!(derived.max_scratch_bytes, 0);
         assert_eq!(derived.max_peak_bytes, 123);
 
-        let run_build = fre::UnicodeScalarAggregateBuildAccounting {
-            repetition: fre::UnicodeScalarAggregateRepetition::OneOrMoreGreedy,
-            ..build
+        let run_upper = fre::UnicodeScalarAggregateUpperBounds {
+            range_comparisons: 50,
+            binary_search_comparisons_per_scalar: 5,
+            reducer_steps: 11,
+            work: 111,
+            ..upper
         };
-        let run = unicode_scalar_operation_limits(10, run_build, &RunLimits::default()).unwrap();
+        let run = unicode_scalar_operation_limits(run_upper, &RunLimits::default()).unwrap();
         // Run plans may probe the cached non-ASCII range and its monotone
         // successor before falling back to the bounded binary search.
         assert_eq!(run.max_range_comparisons, 50);
@@ -21464,8 +21355,7 @@ mod tests {
         assert_eq!(run.max_work, 111);
 
         let capped = unicode_scalar_operation_limits(
-            10,
-            run_build,
+            run_upper,
             &RunLimits {
                 reducer_steps: 4,
                 ..RunLimits::default()
@@ -21477,6 +21367,261 @@ mod tests {
         assert_eq!(capped.max_reducer_steps, 4);
         assert_eq!(capped.max_range_comparisons, 50);
         assert_eq!(capped.max_work, 111);
+    }
+
+    #[test]
+    fn bounded_context_run_limits_bind_the_retained_owner_operation() {
+        let count = fre::BoundedContextUpperBounds {
+            input_bytes: 10,
+            literal_bytes: 2,
+            interval_records: 3,
+            interval_bytes: 24,
+            inspections: 20,
+            branches: 30,
+            comparisons: 40,
+            state_writes: 50,
+            work: 140,
+            match_events: 4,
+            count: 4,
+            scratch_bytes: 24,
+            persistent_bytes: 16,
+            peak_bytes: 40,
+        };
+        let span_sum = fre::BoundedContextSpanSumUpperBounds {
+            input_bytes: 10,
+            literal_bytes: 2,
+            interval_records: 3,
+            interval_bytes: 24,
+            inspections: 20,
+            branches: 30,
+            comparisons: 40,
+            state_writes: 50,
+            work: 140,
+            match_events: 4,
+            span_sum: 20,
+            scratch_bytes: 24,
+            persistent_bytes: 16,
+            peak_bytes: 40,
+        };
+        let defaults = RunLimits::default();
+
+        for operation in [AggregateOperation::Compile, AggregateOperation::Count] {
+            let derived = bounded_context_operation_limits(
+                operation,
+                fre::AggregateRetainedFullWindowUpperBounds::BoundedContextCount(count),
+                &defaults,
+            )
+            .expect("compile/count retain the count envelope");
+            assert_eq!(derived.max_count, count.count);
+        }
+        let derived = bounded_context_operation_limits(
+            AggregateOperation::SpanSum,
+            fre::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(span_sum),
+            &defaults,
+        )
+        .expect("span-sum retains the span-sum envelope");
+        assert_eq!(derived.max_count, span_sum.span_sum);
+
+        assert!(
+            bounded_context_operation_limits(
+                AggregateOperation::SpanSum,
+                fre::AggregateRetainedFullWindowUpperBounds::BoundedContextCount(count),
+                &defaults,
+            )
+            .is_err()
+        );
+        assert!(
+            bounded_context_operation_limits(
+                AggregateOperation::Count,
+                fre::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(span_sum),
+                &defaults,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one retained-artifact matrix binds every repaired direct family to its executable limits"
+    )]
+    fn retained_direct_owner_limits_project_actual_selected_artifacts() {
+        let defaults = RunLimits::default();
+
+        let prefix_haystack = b"abcz--xy7";
+        let prefix = current_fre_rebar_aggregate_builder(r"ab[a-z]+|xy[0-9]+", false, false)
+            .build_count()
+            .expect("prefix/class count artifact");
+        assert_eq!(
+            prefix.build_report().plan,
+            AggregatePlanKind::PrefixClassAlternation
+        );
+        let Some(fre::AggregateRetainedFullWindowUpperBounds::PrefixClassAlternation(prefix_upper)) =
+            prefix
+                .retained_full_window_upper_bounds(prefix_haystack.len())
+                .expect("prefix/class retained envelope")
+        else {
+            panic!("prefix/class artifact lost its retained envelope");
+        };
+        let prefix_limits =
+            current_fre_rebar_count_run_limits(prefix_haystack.len(), &prefix).unwrap();
+        assert_eq!(
+            prefix_limits.prefix_class_alternation.max_work,
+            prefix_upper.work
+        );
+        assert_eq!(
+            prefix.count_value(prefix_haystack, prefix_limits).unwrap(),
+            2
+        );
+        assert!(
+            current_fre_rebar_aggregate_run_limits(prefix_haystack.len(), prefix.build_report())
+                .is_err()
+        );
+        let prefix_one_below = count_run_limits_with_policy(
+            prefix_haystack.len(),
+            &prefix,
+            &RunLimits {
+                fre_aggregate_operation_work: prefix_upper.work - 1,
+                ..defaults.clone()
+            },
+        )
+        .unwrap();
+        assert!(
+            prefix
+                .count_value(prefix_haystack, prefix_one_below)
+                .is_err()
+        );
+
+        let literal_haystack = b"Sherlock Holmes--Sherlock\tHolmes";
+        let literal = current_fre_rebar_aggregate_builder(r"Sherlock\s+Holmes", false, false)
+            .build_count()
+            .expect("literal/class-run/literal count artifact");
+        assert_eq!(
+            literal.build_report().plan,
+            AggregatePlanKind::LiteralClassRunLiteral
+        );
+        let Some(fre::AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral(
+            literal_upper,
+        )) = literal
+            .retained_full_window_upper_bounds(literal_haystack.len())
+            .expect("literal/class-run/literal retained envelope")
+        else {
+            panic!("literal/class-run/literal artifact lost its retained envelope");
+        };
+        let literal_limits =
+            current_fre_rebar_count_run_limits(literal_haystack.len(), &literal).unwrap();
+        assert_eq!(
+            literal_limits.literal_class_run_literal.max_source_reads,
+            literal_upper.source_reads
+        );
+        assert_eq!(
+            literal
+                .count_value(literal_haystack, literal_limits)
+                .unwrap(),
+            2
+        );
+        let literal_one_below = count_run_limits_with_policy(
+            literal_haystack.len(),
+            &literal,
+            &RunLimits {
+                fre_aggregate_operation_work: literal_upper.work - 1,
+                ..defaults.clone()
+            },
+        )
+        .unwrap();
+        assert!(
+            literal
+                .count_value(literal_haystack, literal_one_below)
+                .is_err()
+        );
+
+        let literal_span = current_fre_rebar_aggregate_builder(r"Sherlock\s+Holmes", false, false)
+            .build_span_sum()
+            .expect("literal/class-run/literal span-sum artifact");
+        let Some(fre::AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral(
+            literal_span_upper,
+        )) = literal_span
+            .retained_full_window_upper_bounds(literal_haystack.len())
+            .expect("literal/class-run/literal span-sum retained envelope")
+        else {
+            panic!("literal/class-run/literal span-sum artifact lost its retained envelope");
+        };
+        let literal_span_limits =
+            current_fre_rebar_span_sum_run_limits(literal_haystack.len(), &literal_span).unwrap();
+        assert_eq!(
+            literal_span_limits.literal_class_run_literal.max_span_sum,
+            literal_span_upper.span_sum
+        );
+        assert_eq!(
+            literal_span
+                .span_sum_value(literal_haystack, literal_span_limits)
+                .unwrap(),
+            30
+        );
+
+        let bounded_haystack = b" ing  walking\t thing\n";
+        let bounded = current_fre_rebar_aggregate_builder(r"\s[A-Za-z]{0,12}ing\s", false, false)
+            .build_count()
+            .expect("bounded-context count artifact");
+        assert_eq!(
+            bounded.build_report().plan,
+            AggregatePlanKind::BoundedContext
+        );
+        let Some(fre::AggregateRetainedFullWindowUpperBounds::BoundedContextCount(bounded_upper)) =
+            bounded
+                .retained_full_window_upper_bounds(bounded_haystack.len())
+                .expect("bounded-context retained envelope")
+        else {
+            panic!("bounded-context artifact lost its retained envelope");
+        };
+        let bounded_limits =
+            current_fre_rebar_count_run_limits(bounded_haystack.len(), &bounded).unwrap();
+        assert_eq!(bounded_limits.bounded_context.max_work, bounded_upper.work);
+        assert_eq!(
+            bounded
+                .count_value(bounded_haystack, bounded_limits)
+                .unwrap(),
+            3
+        );
+        let bounded_one_below = count_run_limits_with_policy(
+            bounded_haystack.len(),
+            &bounded,
+            &RunLimits {
+                fre_aggregate_operation_work: bounded_upper.work - 1,
+                ..defaults.clone()
+            },
+        )
+        .unwrap();
+        assert!(
+            bounded
+                .count_value(bounded_haystack, bounded_one_below)
+                .is_err()
+        );
+
+        let bounded_span =
+            current_fre_rebar_aggregate_builder(r"\s[A-Za-z]{0,12}ing\s", false, false)
+                .build_span_sum()
+                .expect("bounded-context span-sum artifact");
+        let Some(fre::AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum(
+            bounded_span_upper,
+        )) = bounded_span
+            .retained_full_window_upper_bounds(bounded_haystack.len())
+            .expect("bounded-context span-sum retained envelope")
+        else {
+            panic!("bounded-context span-sum artifact lost its retained envelope");
+        };
+        let bounded_span_limits =
+            current_fre_rebar_span_sum_run_limits(bounded_haystack.len(), &bounded_span).unwrap();
+        assert_eq!(
+            bounded_span_limits.bounded_context.max_count,
+            bounded_span_upper.span_sum
+        );
+        assert_eq!(
+            bounded_span
+                .span_sum_value(bounded_haystack, bounded_span_limits)
+                .unwrap(),
+            21
+        );
     }
 
     #[test]

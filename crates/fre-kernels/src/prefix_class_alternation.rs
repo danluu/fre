@@ -62,7 +62,7 @@
 
 use core::{fmt, mem::size_of, ops::Range};
 
-use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
+use fre_exact_alloc::{CopyError, try_box_preserve};
 #[cfg(not(feature = "static-dispatch"))]
 use fre_simd_kernels::FeatureSet;
 use fre_simd_kernels::{
@@ -100,6 +100,15 @@ pub struct OperationIdentity {
     pub alternatives: usize,
     pub unicode: bool,
     pub non_overlapping: bool,
+}
+
+/// Physical class-extension implementation retained by a count plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReduceImplementation {
+    /// Scalar class extension.
+    Scalar,
+    /// One retained directional SIMD run scanner per alternative.
+    DispatchedRunScanners,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,6 +357,49 @@ pub struct ReduceAccounting {
 pub struct CountResult {
     pub count: u64,
     pub accounting: ReduceAccounting,
+}
+
+/// Derive the complete source-free count envelope for a retained implementation.
+fn derive_reduce_upper_bounds(
+    build: BuildAccounting,
+    haystack_len: usize,
+    implementation: ReduceImplementation,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let match_events = haystack_len;
+    let scanner_overhead = match implementation {
+        ReduceImplementation::Scalar => 0,
+        ReduceImplementation::DispatchedRunScanners => match_events
+            .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "run scanner classification overhead",
+            })?,
+    };
+    let work = haystack_len
+        .checked_mul(16)
+        .and_then(|work| {
+            build
+                .shape_units
+                .checked_mul(8)
+                .and_then(|shape| work.checked_add(shape))
+        })
+        .and_then(|work| work.checked_add(64))
+        .and_then(|work| work.checked_add(scanner_overhead))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "16N + 8Q + 64 + scanner overhead work bound",
+        })?;
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "match event bound as u64",
+    })?;
+    Ok(ReduceUpperBounds {
+        haystack_bytes: haystack_len,
+        shape_units: build.shape_units,
+        work,
+        match_events,
+        count,
+        scratch_bytes: 0,
+        persistent_bytes: build.persistent_bytes,
+        peak_bytes: build.persistent_bytes,
+    })
 }
 
 /// Capture-aware identity for the direct uniform-participation operation.
@@ -828,8 +880,7 @@ struct DispatchedPrefixClassAlternationOwner {
     run_scanners: RunScanners,
 }
 
-type RetainedDispatchedPrefixClassAlternationOwner =
-    ExactBoxOrUsize<DispatchedPrefixClassAlternationOwner>;
+type RetainedDispatchedPrefixClassAlternationOwner = Box<DispatchedPrefixClassAlternationOwner>;
 
 impl PrefixClassAlternationPlan {
     /// Whether this captured host can retain the fixed-16 SVE scanner pair.
@@ -1107,6 +1158,18 @@ impl PrefixClassAlternationPlan {
             unicode: false,
             non_overlapping: true,
         }
+    }
+
+    /// Publish the scalar plan's exact source-free full-window count envelope.
+    pub fn count_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(
+            self.build_accounting(),
+            haystack_len,
+            ReduceImplementation::Scalar,
+        )
     }
 
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
@@ -1709,62 +1772,36 @@ impl PrefixClassAlternationPlan {
         limits: ReduceLimits,
         run_scanners: bool,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let match_events = haystack_len;
-        let scanner_overhead = if run_scanners {
-            match_events
-                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "run scanner classification overhead",
-                })?
+        let implementation = if run_scanners {
+            ReduceImplementation::DispatchedRunScanners
         } else {
-            0
+            ReduceImplementation::Scalar
         };
-        let work = haystack_len
-            .checked_mul(16)
-            .and_then(|work| {
-                self.build
-                    .shape_units
-                    .checked_mul(8)
-                    .and_then(|shape| work.checked_add(shape))
-            })
-            .and_then(|work| work.checked_add(64))
-            .and_then(|work| work.checked_add(scanner_overhead))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "16N + 8Q + 64 + scanner overhead work bound",
-            })?;
-        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "match event bound as u64",
-        })?;
-        let scratch_bytes = 0;
-        let peak_bytes = self.build.persistent_bytes;
-        enforce_reduce(work, limits.max_work, ReduceResource::Work)?;
+        let upper =
+            derive_reduce_upper_bounds(self.build_accounting(), haystack_len, implementation)?;
+        enforce_reduce(upper.work, limits.max_work, ReduceResource::Work)?;
         enforce_reduce(
-            match_events,
+            upper.match_events,
             limits.max_match_events,
             ReduceResource::MatchEvents,
         )?;
-        if count > limits.max_count {
+        if upper.count > limits.max_count {
             return Err(ReduceError::CountLimit {
-                needed: count,
+                needed: upper.count,
                 limit: limits.max_count,
             });
         }
         enforce_reduce(
-            scratch_bytes,
+            upper.scratch_bytes,
             limits.max_scratch_bytes,
             ReduceResource::Scratch,
         )?;
-        enforce_reduce(peak_bytes, limits.max_peak_bytes, ReduceResource::Peak)?;
-        Ok(ReduceUpperBounds {
-            haystack_bytes: haystack_len,
-            shape_units: self.build.shape_units,
-            work,
-            match_events,
-            count,
-            scratch_bytes,
-            persistent_bytes: self.build.persistent_bytes,
-            peak_bytes,
-        })
+        enforce_reduce(
+            upper.peak_bytes,
+            limits.max_peak_bytes,
+            ReduceResource::Peak,
+        )?;
+        Ok(upper)
     }
 
     #[allow(
@@ -2117,6 +2154,19 @@ impl DispatchedPrefixClassAlternationPlan {
         }
     }
 
+    /// Publish the dispatched plan's exact source-free full-window count
+    /// envelope, including retained run-scanner classifications.
+    pub fn count_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(
+            self.build_accounting(),
+            haystack_len,
+            ReduceImplementation::DispatchedRunScanners,
+        )
+    }
+
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
         self.plan().count_with_run_scanners(
             haystack,
@@ -2231,9 +2281,7 @@ impl DispatchedPrefixClassAlternationPlan {
     }
 
     fn owner(&self) -> &DispatchedPrefixClassAlternationOwner {
-        self.owner
-            .boxed()
-            .expect("the dispatched plan retains its exact owner allocation")
+        self.owner.as_ref()
     }
 }
 
@@ -2280,16 +2328,14 @@ fn build_dispatched_prefix_class_owner(
         plan.build.peak_bytes = persistent_bytes;
         let owner = DispatchedPrefixClassAlternationOwner { plan, run_scanners };
         let owner_bytes = size_of::<DispatchedPrefixClassAlternationOwner>();
-        let owner = RetainedDispatchedPrefixClassAlternationOwner::try_from_boxed(owner).map_err(
-            |error| match error {
-                CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
-                    computation: "exact dispatched owner allocation layout",
-                },
-                CopyError::AllocationFailed => {
-                    BuildError::RunScannerAllocationFailed { bytes: owner_bytes }
-                }
+        let owner = try_box_preserve(owner).map_err(|(error, _owner)| match error {
+            CopyError::LayoutOverflow => BuildError::ArithmeticOverflow {
+                computation: "exact dispatched owner allocation layout",
             },
-        )?;
+            CopyError::AllocationFailed => {
+                BuildError::RunScannerAllocationFailed { bytes: owner_bytes }
+            }
+        })?;
         actual.allocations =
             actual
                 .allocations

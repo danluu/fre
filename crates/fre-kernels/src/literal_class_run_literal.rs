@@ -84,6 +84,19 @@ pub enum ClassScanIdentity {
     Run { variant_id: &'static str },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClassScanKind {
+    Scalar,
+    Fixed,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Operation {
+    Count,
+    SpanSum,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum AsciiClassScanner {
     Fixed(AsciiByteSetClassifier),
@@ -761,7 +774,7 @@ impl LiteralClassRunLiteralPlan {
         operation: Operation,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let upper = self.derive_upper_bounds(input_bytes, operation)?;
+        let upper = self.reduce_upper_bounds(input_bytes, operation)?;
         enforce_upper_bounds(upper, limits)?;
         Ok(upper)
     }
@@ -770,155 +783,32 @@ impl LiteralClassRunLiteralPlan {
         clippy::too_many_lines,
         reason = "the source-free preflight keeps every finder, class, literal, result, and resource bound adjacent"
     )]
-    fn derive_upper_bounds(
+    fn reduce_upper_bounds(
         &self,
         input_bytes: usize,
         operation: Operation,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let anchor_bytes = self.anchor.needle().len();
-        let opposite_literal_bytes = self.opposite_literal.len();
-        let anchor_candidates = input_bytes
-            .checked_sub(anchor_bytes)
-            .and_then(|remaining| remaining.checked_add(1))
-            .unwrap_or(0);
-        let finder_calls = anchor_candidates;
-        let repeated_anchor_bytes =
-            anchor_candidates
-                .checked_mul(anchor_bytes.checked_sub(1).ok_or(
-                    ReduceError::ArithmeticOverflow {
-                        computation: "nonempty anchor overlap width",
-                    },
-                )?)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "overlapping anchor finder service",
-                })?;
-        let finder_scanned_bytes = input_bytes.checked_add(repeated_anchor_bytes).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "complete anchor finder service",
-            },
-        )?;
-        let run_events = input_bytes / 2 + input_bytes % 2;
-        let logical_classifications =
-            input_bytes
-                .checked_add(anchor_candidates)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "class run plus adjacent class probes",
-                })?;
-        let classifications = match self.ascii_scanner {
-            // Every anchor occurrence can initiate one run scan. Complete
-            // vectors are logical run bytes. On failure, predicate-native
-            // leaves add at most 15 loaded lanes beyond the logical boundary;
-            // the fixed-width probe plus scalar recovery adds exactly 16.
-            Some(AsciiClassScanner::Run(_)) => logical_classifications
-                .checked_add(
-                    anchor_candidates
-                        .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "SIMD class-run recovery classification bound",
-                        })?,
-                )
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "SIMD class-run physical classification bound",
-                })?,
-            // A fixed classifier first proves 32 scalar members. Therefore no
-            // more than logical/32 scans reach its vector loop, and only one
-            // terminating 32-byte load per such scan can overread the run.
-            Some(AsciiClassScanner::Fixed(_)) => logical_classifications
-                .checked_div(SIMD_SCALAR_PROOF_BYTES)
-                .and_then(|terminating_vectors| terminating_vectors.checked_mul(31))
-                .and_then(|overread| logical_classifications.checked_add(overread))
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "fixed SIMD class-run physical classification bound",
-                })?,
-            None => logical_classifications,
+        let class_scan = match self.ascii_scanner {
+            Some(AsciiClassScanner::Fixed(_)) => ClassScanKind::Fixed,
+            Some(AsciiClassScanner::Run(_)) => ClassScanKind::Run,
+            None => ClassScanKind::Scalar,
         };
-        let literal_comparisons = run_events.checked_mul(opposite_literal_bytes).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "run events times opposite literal bytes",
-            },
-        )?;
-        let source_reads = finder_scanned_bytes
-            .checked_add(classifications)
-            .and_then(|value| value.checked_add(literal_comparisons))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "finder, class, and literal source reads",
-            })?;
-        let literal_bytes = self.build.literal_bytes;
-        let minimum_width =
-            literal_bytes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "minimum match width",
-                })?;
-        let match_events = input_bytes / minimum_width;
-        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "match event bound as u64",
-        })?;
-        let span_sum = match operation {
-            Operation::Count => 0,
-            Operation::SpanSum => {
-                u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
-                    computation: "input length as span-sum bound",
-                })?
-            }
-        };
-        let work = finder_scanned_bytes
-            .checked_mul(FINDER_SCAN_WORK)
-            .and_then(|value| {
-                finder_calls
-                    .checked_mul(FINDER_CALL_WORK)
-                    .and_then(|calls| value.checked_add(calls))
-            })
-            .and_then(|value| {
-                anchor_candidates
-                    .checked_mul(ANCHOR_CANDIDATE_WORK)
-                    .and_then(|candidates| value.checked_add(candidates))
-            })
-            .and_then(|value| {
-                classifications
-                    .checked_mul(CLASSIFICATION_WORK)
-                    .and_then(|classifications| value.checked_add(classifications))
-            })
-            .and_then(|value| {
-                literal_comparisons
-                    .checked_mul(LITERAL_COMPARISON_WORK)
-                    .and_then(|literal| value.checked_add(literal))
-            })
-            .and_then(|value| {
-                run_events
-                    .checked_mul(RUN_WORK)
-                    .and_then(|runs| value.checked_add(runs))
-            })
-            .and_then(|value| {
-                match_events
-                    .checked_mul(MATCH_WORK)
-                    .and_then(|matches| value.checked_add(matches))
-            })
-            .and_then(|value| value.checked_add(FIXED_REDUCE_WORK))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "complete reduction work bound",
-            })?;
-        let scratch_bytes = 0;
-        let persistent_bytes = self.build.persistent_bytes;
-        let peak_bytes = persistent_bytes;
-        Ok(ReduceUpperBounds {
-            input_bytes,
-            source_reads,
-            finder_scanned_bytes,
-            finder_calls,
-            anchor_candidates,
-            classifications,
-            literal_comparisons,
-            work,
-            run_events,
-            candidate_events: run_events,
-            match_events,
-            count,
-            span_sum,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        })
+        derive_reduce_upper_bounds(self.build, class_scan, input_bytes, operation)
+    }
+
+    /// Publish the exact source-free full-window count envelope retained by
+    /// this plan, including its selected scalar or SIMD class scanner.
+    pub fn count_upper_bounds(&self, input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+        self.reduce_upper_bounds(input_bytes, Operation::Count)
+    }
+
+    /// Publish the exact source-free full-window span-sum envelope retained by
+    /// this plan, including its selected scalar or SIMD class scanner.
+    pub fn span_sum_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        self.reduce_upper_bounds(input_bytes, Operation::SpanSum)
     }
 
     #[allow(
@@ -1131,10 +1021,156 @@ impl LiteralClassRunLiteralPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Operation {
-    Count,
-    SpanSum,
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source-free preflight keeps every finder, class, literal, result, and resource bound adjacent"
+)]
+fn derive_reduce_upper_bounds(
+    build: BuildAccounting,
+    class_scan: ClassScanKind,
+    input_bytes: usize,
+    operation: Operation,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let anchor_bytes = build.prefix_bytes.max(build.suffix_bytes);
+    let opposite_literal_bytes = build.prefix_bytes.min(build.suffix_bytes);
+    let anchor_candidates = input_bytes
+        .checked_sub(anchor_bytes)
+        .and_then(|remaining| remaining.checked_add(1))
+        .unwrap_or(0);
+    let finder_calls = anchor_candidates;
+    let repeated_anchor_bytes = anchor_candidates
+        .checked_mul(
+            anchor_bytes
+                .checked_sub(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "nonempty anchor overlap width",
+                })?,
+        )
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "overlapping anchor finder service",
+        })?;
+    let finder_scanned_bytes =
+        input_bytes
+            .checked_add(repeated_anchor_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "complete anchor finder service",
+            })?;
+    let run_events = input_bytes / 2 + input_bytes % 2;
+    let logical_classifications =
+        input_bytes
+            .checked_add(anchor_candidates)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "class run plus adjacent class probes",
+            })?;
+    let classifications = match class_scan {
+        ClassScanKind::Run => logical_classifications
+            .checked_add(
+                anchor_candidates
+                    .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "SIMD class-run recovery classification bound",
+                    })?,
+            )
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "SIMD class-run physical classification bound",
+            })?,
+        ClassScanKind::Fixed => logical_classifications
+            .checked_div(SIMD_SCALAR_PROOF_BYTES)
+            .and_then(|terminating_vectors| terminating_vectors.checked_mul(31))
+            .and_then(|overread| logical_classifications.checked_add(overread))
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "fixed SIMD class-run physical classification bound",
+            })?,
+        ClassScanKind::Scalar => logical_classifications,
+    };
+    let literal_comparisons =
+        run_events
+            .checked_mul(opposite_literal_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "run events times opposite literal bytes",
+            })?;
+    let source_reads = finder_scanned_bytes
+        .checked_add(classifications)
+        .and_then(|value| value.checked_add(literal_comparisons))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "finder, class, and literal source reads",
+        })?;
+    let minimum_width =
+        build
+            .literal_bytes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "minimum match width",
+            })?;
+    let match_events = input_bytes / minimum_width;
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "match event bound as u64",
+    })?;
+    let span_sum = match operation {
+        Operation::Count => 0,
+        Operation::SpanSum => {
+            u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
+                computation: "input length as span-sum bound",
+            })?
+        }
+    };
+    let work = finder_scanned_bytes
+        .checked_mul(FINDER_SCAN_WORK)
+        .and_then(|value| {
+            finder_calls
+                .checked_mul(FINDER_CALL_WORK)
+                .and_then(|calls| value.checked_add(calls))
+        })
+        .and_then(|value| {
+            anchor_candidates
+                .checked_mul(ANCHOR_CANDIDATE_WORK)
+                .and_then(|candidates| value.checked_add(candidates))
+        })
+        .and_then(|value| {
+            classifications
+                .checked_mul(CLASSIFICATION_WORK)
+                .and_then(|classifications| value.checked_add(classifications))
+        })
+        .and_then(|value| {
+            literal_comparisons
+                .checked_mul(LITERAL_COMPARISON_WORK)
+                .and_then(|literal| value.checked_add(literal))
+        })
+        .and_then(|value| {
+            run_events
+                .checked_mul(RUN_WORK)
+                .and_then(|runs| value.checked_add(runs))
+        })
+        .and_then(|value| {
+            match_events
+                .checked_mul(MATCH_WORK)
+                .and_then(|matches| value.checked_add(matches))
+        })
+        .and_then(|value| value.checked_add(FIXED_REDUCE_WORK))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "complete reduction work bound",
+        })?;
+    let scratch_bytes = 0;
+    let persistent_bytes = build.persistent_bytes;
+    let peak_bytes = persistent_bytes;
+    Ok(ReduceUpperBounds {
+        input_bytes,
+        source_reads,
+        finder_scanned_bytes,
+        finder_calls,
+        anchor_candidates,
+        classifications,
+        literal_comparisons,
+        work,
+        run_events,
+        candidate_events: run_events,
+        match_events,
+        count,
+        span_sum,
+        scratch_bytes,
+        persistent_bytes,
+        peak_bytes,
+    })
 }
 
 fn build_ascii_scanner(
@@ -2795,7 +2831,7 @@ mod tests {
     fn overflow_is_refused_before_source_traversal() {
         let plan = plan();
         assert!(matches!(
-            plan.preflight(usize::MAX, Operation::SpanSum, ReduceLimits::unlimited()),
+            plan.preflight(usize::MAX, Operation::SpanSum, ReduceLimits::unlimited(),),
             Err(ReduceError::ArithmeticOverflow { .. })
         ));
     }

@@ -25,14 +25,13 @@ use rebar_compare::{
     AUDITED_REBAR_REVISION, CandidateAdapter, CandidateOutcome, CandidateRequest, CompareError,
     CurrentFreAdapter, CurrentFreAggregateCompileArtifact, CurrentFreAggregateCompileLifecycle,
     CurrentFreAggregateOperationLifecycle, CurrentFreHotByteOperationLifecycle, InputReceipt,
-    REPORT_SCHEMA, RunLimits,
-    current_fre_rebar_aggregate_builder, current_fre_rebar_aggregate_compile_lifecycle,
-    current_fre_rebar_aggregate_many_builder, current_fre_rebar_aggregate_many_run_limits,
-    current_fre_rebar_aggregate_operation_lifecycle, current_fre_rebar_aggregate_run_limits,
-    current_fre_rebar_capture_lifecycle, current_fre_rebar_count_run_limits,
-    current_fre_rebar_hot_byte_operation_lifecycle, current_fre_rebar_portable_builder,
-    current_fre_rebar_search_limits, current_fre_rebar_span_sum_run_limits,
-    current_fre_rebar_validate_aggregate_identity,
+    REPORT_SCHEMA, RunLimits, current_fre_rebar_aggregate_builder,
+    current_fre_rebar_aggregate_compile_lifecycle, current_fre_rebar_aggregate_many_builder,
+    current_fre_rebar_aggregate_many_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
+    current_fre_rebar_capture_lifecycle, current_fre_rebar_compile_run_limits,
+    current_fre_rebar_count_run_limits, current_fre_rebar_hot_byte_operation_lifecycle,
+    current_fre_rebar_portable_builder, current_fre_rebar_search_limits,
+    current_fre_rebar_span_sum_run_limits, current_fre_rebar_validate_aggregate_identity,
     current_fre_rebar_validate_aggregate_many_identity,
     performance_contract::{
         CaptureLifecycleBoundary, CaptureLifecycleObservationIdentity,
@@ -726,8 +725,7 @@ fn model_compile(
             benchmark.unicode,
             expectations,
         )?;
-        let limits =
-            current_fre_rebar_aggregate_run_limits(haystack.len(), artifact.build_report())?;
+        let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
         let limits = &limits;
         let _ = artifact.verify_count(haystack, limits)?;
         if warmup_start.elapsed() >= benchmark.max_warmup_time {
@@ -749,8 +747,7 @@ fn model_compile(
             benchmark.unicode,
             expectations,
         )?;
-        let limits =
-            current_fre_rebar_aggregate_run_limits(haystack.len(), artifact.build_report())?;
+        let limits = current_fre_rebar_compile_run_limits(haystack.len(), &artifact)?;
         let limits = &limits;
         let count = artifact.verify_count(haystack, limits)?.value();
         samples.push(Sample { duration, count });
@@ -986,17 +983,15 @@ fn model_performance_raw(
                 },
             )
         }
-        "count-captures" | "grep-captures" => {
-            model_capture_performance_raw_with_measurement(
-                benchmark,
-                expectations,
-                |lifecycle, haystack| {
-                    let start = Instant::now();
-                    let actual = lifecycle.execute(haystack)?;
-                    Ok((start.elapsed(), actual))
-                },
-            )
-        }
+        "count-captures" | "grep-captures" => model_capture_performance_raw_with_measurement(
+            benchmark,
+            expectations,
+            |lifecycle, haystack| {
+                let start = Instant::now();
+                let actual = lifecycle.execute(haystack)?;
+                Ok((start.elapsed(), actual))
+            },
+        ),
         "regex-redux" => model_regex_redux_performance_raw_with_measurement(
             benchmark,
             expectations,

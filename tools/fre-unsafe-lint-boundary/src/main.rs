@@ -24,8 +24,8 @@ const SIMD_KERNELS_LIBRARY: &str = "fre_simd_kernels";
 const FORBID_ATTRIBUTE: &str = "#![forbid(unsafe_code)]";
 const DENY_ATTRIBUTE: &str = "#![deny(unsafe_code)]";
 const EXACT_ALLOC_SOURCE_SHA256: [u8; 32] = [
-    0x7e, 0x11, 0xb9, 0x8d, 0x42, 0x20, 0xff, 0x7b, 0xdc, 0x77, 0x55, 0xf9, 0x15, 0x39, 0x34, 0xd2,
-    0x15, 0x75, 0xba, 0x71, 0x13, 0x79, 0x02, 0x1d, 0xc8, 0x79, 0x27, 0xba, 0x1a, 0x0d, 0x34, 0x11,
+    0x29, 0xdf, 0x6f, 0x2e, 0x56, 0x96, 0xf9, 0x70, 0x5e, 0x5b, 0x48, 0x88, 0x7f, 0x52, 0x18, 0xfa,
+    0xf7, 0x6b, 0xc5, 0x97, 0xdc, 0x56, 0x50, 0xca, 0x39, 0xb1, 0x51, 0xdd, 0x01, 0xb5, 0xf7, 0x26,
 ];
 const EXACT_BOX_BORROW_REVIEWED_BLOCK: &str = r#"#[allow(
         unsafe_code,
@@ -39,6 +39,19 @@ const EXACT_BOX_BORROW_REVIEWED_BLOCK: &str = r#"#[allow(
         // SAFETY: the odd variant is created only from the exposed address of
         // a live, aligned `Box<T>` allocation retained exclusively by `self`.
         unsafe { ptr::with_exposed_provenance::<T>(address).as_ref() }
+    }"#;
+const EXACT_BOX_MUT_BORROW_REVIEWED_BLOCK: &str = r#"#[allow(
+        unsafe_code,
+        reason = "the exclusive handle borrow recovers only the exposed provenance of its live exclusively owned allocation"
+    )]
+    pub fn boxed_mut(&mut self) -> Option<&mut T> {
+        if self.encoded & 1 == 0 {
+            return None;
+        }
+        let address = self.encoded & !1;
+        // SAFETY: the odd variant exclusively owns this live allocation and
+        // `&mut self` prevents any overlapping borrow through the handle.
+        unsafe { ptr::with_exposed_provenance_mut::<T>(address).as_mut() }
     }"#;
 const EXACT_BOX_DROP_REVIEWED_BLOCK: &str = r#"#[allow(
         unsafe_code,
@@ -87,6 +100,31 @@ fn exact_box_or_usize_with<T>(
             encoded: typed.expose_provenance() | 1,
             marker: PhantomData,
         })
+    }
+}"#;
+const EXACT_PLAIN_BOX_REVIEWED_BLOCK: &str = r#"#[allow(
+    unsafe_code,
+    reason = "this reviewed function owns FRE's exact-layout single-value allocation boundary"
+)]
+fn exact_box_preserve_with<T>(value: T, force_failure: bool) -> Result<Box<T>, (CopyError, T)> {
+    if size_of::<T>() == 0 {
+        return Err((CopyError::LayoutOverflow, value));
+    }
+    let layout = Layout::new::<T>();
+    let allocation = if force_failure {
+        ptr::null_mut()
+    } else {
+        unsafe { alloc(layout) }
+    };
+    if allocation.is_null() {
+        return Err((CopyError::AllocationFailed, value));
+    }
+    // SAFETY: `alloc` returned a fresh allocation for exactly one `T`; the
+    // write initializes it and transfers unique ownership to the returned Box.
+    unsafe {
+        let typed = allocation.cast::<T>();
+        typed.write(value);
+        Ok(Box::from_raw(typed))
     }
 }"#;
 const EXACT_VEC_REVIEWED_BLOCK: &str = r#"#[allow(
@@ -168,15 +206,17 @@ fn copy_exact_with(bytes: &[u8], force_failure: bool) -> Result<Vec<u8>, CopyErr
         Ok(Vec::from_raw_parts(allocation, bytes.len(), bytes.len()))
     }
 }"#;
-const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 6] = [
+const EXACT_ALLOC_REVIEWED_BLOCKS: [&str; 8] = [
     EXACT_BOX_BORROW_REVIEWED_BLOCK,
+    EXACT_BOX_MUT_BORROW_REVIEWED_BLOCK,
     EXACT_BOX_DROP_REVIEWED_BLOCK,
     EXACT_BOX_CONSTRUCTION_REVIEWED_BLOCK,
+    EXACT_PLAIN_BOX_REVIEWED_BLOCK,
     EXACT_VEC_REVIEWED_BLOCK,
     ZEROED_EXACT_REVIEWED_BLOCK,
     COPY_EXACT_REVIEWED_BLOCK,
 ];
-const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 7;
+const EXACT_ALLOC_UNSAFE_CODE_SPELLINGS: usize = 9;
 const TARGET_FEATURES_UNSAFE_CODE_SPELLINGS: usize = 3;
 const TARGET_FEATURES_SOURCE_SHA256: [u8; 32] = [
     0x6f, 0x80, 0xcd, 0x38, 0x23, 0x9e, 0x5f, 0xed, 0x06, 0x40, 0x0c, 0x56, 0x3c, 0xc6, 0xb5, 0xea,

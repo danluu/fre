@@ -25,8 +25,9 @@ use fre_kernels::{
     BoundedContextCountResult, BoundedContextOperationIdentity, BoundedContextPlan,
     BoundedContextReduceAccounting, BoundedContextReduceError, BoundedContextReduceLimits,
     BoundedContextSpanSumAccounting, BoundedContextSpanSumLimits, BoundedContextSpanSumResult,
-    BoundedLiteralPairBuildAccounting, BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits,
-    BoundedLiteralPairCountResult, BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
+    BoundedContextSpanSumUpperBounds, BoundedContextUpperBounds, BoundedLiteralPairBuildAccounting,
+    BoundedLiteralPairBuildError, BoundedLiteralPairBuildLimits, BoundedLiteralPairCountResult,
+    BoundedLiteralPairOperationIdentity, BoundedLiteralPairPlan,
     BoundedLiteralPairReduceAccounting, BoundedLiteralPairReduceError,
     BoundedLiteralPairReduceLimits, BoundedLiteralPairSpanSumResult,
     BoundedSeparatedFieldsAlternativeSource, BoundedSeparatedFieldsAtomSource,
@@ -79,27 +80,28 @@ use fre_kernels::{
     LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralPlan,
     LiteralClassRunLiteralReduceAccounting, LiteralClassRunLiteralReduceError,
     LiteralClassRunLiteralReduceLimits, LiteralClassRunLiteralSpanSumResult,
-    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
-    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
-    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildAttemptActual,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
+    LiteralClassRunLiteralUpperBounds, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
+    OrderedLiteralAggregateBuildAttemptActual, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    OrderedLiteralCountPlan, OrderedLiteralSpanSumPlan,
     PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PrefixClassAlternationBuildAccounting,
     PrefixClassAlternationBuildError, PrefixClassAlternationBuildLimits,
     PrefixClassAlternationCountResult, PrefixClassAlternationOperationIdentity,
     PrefixClassAlternationPlan, PrefixClassAlternationReduceAccounting,
     PrefixClassAlternationReduceError, PrefixClassAlternationReduceLimits,
-    SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID,
-    SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, SimdDispatchContext,
-    SparseOrderedLiteralAggregateActualCounters, SparseOrderedLiteralAggregateBuildAccounting,
-    SparseOrderedLiteralAggregateBuildAttemptActual, SparseOrderedLiteralAggregateBuildError,
-    SparseOrderedLiteralAggregateBuildLimits, SparseOrderedLiteralAggregateReduceError,
-    SparseOrderedLiteralAggregateReduceLimits, SparseOrderedLiteralAggregateUpperBounds,
-    SparseOrderedLiteralCountPlan, SparseOrderedLiteralSpanSumPlan,
-    TOKEN_PHRASE_COUNT_OPERATION_ID, TOKEN_PHRASE_SPAN_SUM_OPERATION_ID,
-    TokenPhraseBuildAccounting, TokenPhraseBuildError, TokenPhraseBuildLimits,
-    TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
+    PrefixClassAlternationUpperBounds, SPARSE_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    SPARSE_ORDERED_LITERAL_COUNT_PLAN_ID, SPARSE_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    SimdDispatchContext, SparseOrderedLiteralAggregateActualCounters,
+    SparseOrderedLiteralAggregateBuildAccounting, SparseOrderedLiteralAggregateBuildAttemptActual,
+    SparseOrderedLiteralAggregateBuildError, SparseOrderedLiteralAggregateBuildLimits,
+    SparseOrderedLiteralAggregateReduceError, SparseOrderedLiteralAggregateReduceLimits,
+    SparseOrderedLiteralAggregateUpperBounds, SparseOrderedLiteralCountPlan,
+    SparseOrderedLiteralSpanSumPlan, TOKEN_PHRASE_COUNT_OPERATION_ID,
+    TOKEN_PHRASE_SPAN_SUM_OPERATION_ID, TokenPhraseBuildAccounting, TokenPhraseBuildError,
+    TokenPhraseBuildLimits, TokenPhraseCountResult, TokenPhraseOperationIdentity, TokenPhrasePlan,
     TokenPhraseReduceAccounting, TokenPhraseReduceError, TokenPhraseReduceLimits,
     TokenPhraseSpanSumResult, UnicodeScalarAggregateBuildAccounting,
     UnicodeScalarAggregateBuildError, UnicodeScalarAggregateBuildLimits,
@@ -107,7 +109,7 @@ use fre_kernels::{
     UnicodeScalarAggregateOperationIdentity, UnicodeScalarAggregatePlan,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSpanSumResult, Window,
+    UnicodeScalarAggregateSpanSumResult, UnicodeScalarAggregateUpperBounds, Window,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -210,6 +212,22 @@ pub enum AggregateOperation {
     Count,
     /// Checked sum of every complete match's byte length (`count-spans`).
     SpanSum,
+}
+
+/// Exact source-free full-window envelope published by an authenticated
+/// retained direct owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateRetainedFullWindowUpperBounds {
+    /// Established or dispatched Unicode scalar reducer.
+    UnicodeScalar(UnicodeScalarAggregateUpperBounds),
+    /// Established or dispatched two-branch prefix/class count reducer.
+    PrefixClassAlternation(PrefixClassAlternationUpperBounds),
+    /// Literal/class-run/literal count or span-sum reducer.
+    LiteralClassRunLiteral(LiteralClassRunLiteralUpperBounds),
+    /// Bounded-context count reducer.
+    BoundedContextCount(BoundedContextUpperBounds),
+    /// Bounded-context span-sum reducer.
+    BoundedContextSpanSum(BoundedContextSpanSumUpperBounds),
 }
 
 /// Construction-time aggregate plan policy.
@@ -12520,6 +12538,30 @@ enum AggregatePrefixClassAlternationEngine {
 }
 
 impl AggregatePrefixClassAlternationEngine {
+    fn build_accounting(&self) -> PrefixClassAlternationBuildAccounting {
+        match self {
+            Self::Established(engine) => engine.build_accounting(),
+            Self::Dispatched(engine) => engine.build_accounting(),
+        }
+    }
+
+    fn count_identity(&self) -> PrefixClassAlternationOperationIdentity {
+        match self {
+            Self::Established(engine) => engine.count_identity(),
+            Self::Dispatched(engine) => engine.count_identity(),
+        }
+    }
+
+    fn count_upper_bounds(
+        &self,
+        haystack_len: usize,
+    ) -> Result<PrefixClassAlternationUpperBounds, PrefixClassAlternationReduceError> {
+        match self {
+            Self::Established(engine) => engine.count_upper_bounds(haystack_len),
+            Self::Dispatched(engine) => engine.count_upper_bounds(haystack_len),
+        }
+    }
+
     fn count(
         &self,
         haystack: &[u8],
@@ -12926,6 +12968,224 @@ impl AggregatePlan {
         let (value, details) =
             self.exact_literal_span_sum_success(haystack_len, execution_limits, attempt)?;
         Ok(AggregateSpanSumExecution::ExactLiteral { value, details })
+    }
+
+    fn retained_bounds_report_closes(&self, expected_plan: AggregatePlanKind) -> bool {
+        self.report.plan == expected_plan
+            && self.report.build_limits == self.limits
+            && self.report.continuation_strategy.is_none()
+            && self.report.has_closed_construction_attempt()
+    }
+
+    /// Return the exact full-window envelope owned by one retained direct
+    /// reducer without borrowing or inspecting source.
+    ///
+    /// An unrelated retained engine returns `None`. Once one of the supported
+    /// engines is retained, every report, build, and operation mismatch is an
+    /// invariant error rather than an unauthenticated estimate.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive retained-owner dispatch keeps each report and operation authentication beside its exact bound query"
+    )]
+    fn retained_full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
+        match &self.engine {
+            AggregateEngine::UnicodeScalar(engine) => {
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained Unicode scalar owner has an unsupported operation",
+                        ));
+                    }
+                };
+                let (
+                    AggregatePlanIdentity::UnicodeScalar(identity),
+                    AggregateBuildAccounting::UnicodeScalar(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained Unicode scalar owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::UnicodeScalarClass)
+                    || identity.kernel != expected_identity
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained Unicode scalar owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .full_window_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::UnicodeScalar)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::UnicodeScalar)
+            }
+            AggregateEngine::DispatchedUnicodeScalar(engine) => {
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained dispatched Unicode scalar owner has an unsupported operation",
+                        ));
+                    }
+                };
+                let (
+                    AggregatePlanIdentity::UnicodeScalar(identity),
+                    AggregateBuildAccounting::UnicodeScalar(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained dispatched Unicode scalar owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::UnicodeScalarClass)
+                    || identity.kernel != expected_identity
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained dispatched Unicode scalar owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .full_window_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::UnicodeScalar)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::UnicodeScalar)
+            }
+            AggregateEngine::PrefixClassAlternation(engine) => {
+                if !matches!(
+                    self.operation(),
+                    AggregateOperation::Compile | AggregateOperation::Count
+                ) {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained prefix/class owner has an unsupported operation",
+                    ));
+                }
+                let (
+                    AggregatePlanIdentity::PrefixClassAlternation(identity),
+                    AggregateBuildAccounting::PrefixClassAlternation(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained prefix/class owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::PrefixClassAlternation)
+                    || identity.kernel != engine.count_identity()
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained prefix/class owner does not authenticate its published report",
+                    ));
+                }
+                engine
+                    .count_upper_bounds(input_bytes)
+                    .map(AggregateRetainedFullWindowUpperBounds::PrefixClassAlternation)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::PrefixClassAlternation)
+            }
+            AggregateEngine::LiteralClassRunLiteral(engine) => {
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained literal/class-run/literal owner has an unsupported operation",
+                        ));
+                    }
+                };
+                let (
+                    AggregatePlanIdentity::LiteralClassRunLiteral(identity),
+                    AggregateBuildAccounting::LiteralClassRunLiteral(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained literal/class-run/literal owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::LiteralClassRunLiteral)
+                    || identity.kernel != expected_identity
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained literal/class-run/literal owner does not authenticate its published report",
+                    ));
+                }
+                let upper = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_upper_bounds(input_bytes)
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_upper_bounds(input_bytes),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained literal/class-run/literal operation changed during authentication",
+                        ));
+                    }
+                };
+                upper
+                    .map(AggregateRetainedFullWindowUpperBounds::LiteralClassRunLiteral)
+                    .map(Some)
+                    .map_err(AggregateExecutionSource::LiteralClassRunLiteral)
+            }
+            AggregateEngine::BoundedContext(engine) => {
+                let expected_identity = match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => {
+                        engine.count_identity()
+                    }
+                    AggregateOperation::SpanSum => engine.span_sum_identity(),
+                    AggregateOperation::Spans => {
+                        return Err(AggregateExecutionSource::InternalInvariant(
+                            "retained bounded-context owner has an unsupported operation",
+                        ));
+                    }
+                };
+                let (
+                    AggregatePlanIdentity::BoundedContext(identity),
+                    AggregateBuildAccounting::BoundedContext(build),
+                ) = (self.report.plan_identity, self.report.build)
+                else {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained bounded-context owner does not match its published report",
+                    ));
+                };
+                if !self.retained_bounds_report_closes(AggregatePlanKind::BoundedContext)
+                    || identity.kernel != expected_identity
+                    || build != engine.build_accounting()
+                {
+                    return Err(AggregateExecutionSource::InternalInvariant(
+                        "retained bounded-context owner does not authenticate its published report",
+                    ));
+                }
+                match self.operation() {
+                    AggregateOperation::Compile | AggregateOperation::Count => engine
+                        .count_upper_bounds(input_bytes)
+                        .map(AggregateRetainedFullWindowUpperBounds::BoundedContextCount)
+                        .map(Some)
+                        .map_err(AggregateExecutionSource::BoundedContext),
+                    AggregateOperation::SpanSum => engine
+                        .span_sum_upper_bounds(input_bytes)
+                        .map(AggregateRetainedFullWindowUpperBounds::BoundedContextSpanSum)
+                        .map(Some)
+                        .map_err(AggregateExecutionSource::BoundedContext),
+                    AggregateOperation::Spans => Err(AggregateExecutionSource::InternalInvariant(
+                        "retained bounded-context operation changed during authentication",
+                    )),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Return the exact fixed-domain guard envelope for a complete original
@@ -17059,6 +17319,18 @@ impl AggregateCompileRegex {
         self.0.cache_identity(limits.borrow())
     }
 
+    /// Exact source-free full-window envelope published by the retained
+    /// direct owner. Compile artifacts bind this query to the count operation.
+    ///
+    /// An unrelated plan returns `None`; a retained-owner/report mismatch
+    /// fails closed.
+    pub fn retained_full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
+        self.0.retained_full_window_upper_bounds(input_bytes)
+    }
+
     /// Exact intrinsic fixed-domain guard envelope for complete-haystack
     /// verification, computed without source access or allocation.
     ///
@@ -17390,6 +17662,18 @@ impl AggregateCountRegex {
         self.0.cache_identity(limits.borrow())
     }
 
+    /// Exact source-free full-window count envelope published by the retained
+    /// direct owner.
+    ///
+    /// An unrelated plan returns `None`; a retained-owner/report mismatch
+    /// fails closed.
+    pub fn retained_full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
+        self.0.retained_full_window_upper_bounds(input_bytes)
+    }
+
     /// Exact intrinsic fixed-domain guard envelope for a complete haystack of
     /// `haystack_len` bytes, computed without source access or allocation.
     ///
@@ -17526,6 +17810,18 @@ impl AggregateSpanSumRegex {
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> AggregateCacheIdentity {
         self.0.cache_identity(limits.borrow())
+    }
+
+    /// Exact source-free full-window span-sum envelope published by the
+    /// retained direct owner.
+    ///
+    /// An unrelated plan returns `None`; a retained-owner/report mismatch
+    /// fails closed.
+    pub fn retained_full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<Option<AggregateRetainedFullWindowUpperBounds>, AggregateExecutionSource> {
+        self.0.retained_full_window_upper_bounds(input_bytes)
     }
 
     /// Exact intrinsic fixed-domain guard envelope for a complete haystack of

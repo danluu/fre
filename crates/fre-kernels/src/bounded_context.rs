@@ -298,6 +298,262 @@ pub struct ReduceUpperBounds {
     pub peak_bytes: usize,
 }
 
+fn run_scanner_recovery_bound_for_streams(
+    input_bytes: usize,
+    scanner_streams: usize,
+) -> Result<usize, ReduceError> {
+    // Every vector entry is preceded by a disjoint 16-member scalar proof.
+    // Thus each stream can enter the scanner at most floor(N/16) times.
+    let run_events = input_bytes / ASCII_NARROW_BYTES;
+    run_events
+        .checked_mul(scanner_streams)
+        .and_then(|value| value.checked_mul(SIMD_RUN_MAX_RESCAN_INSPECTIONS))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "run scanner recovery classification bound",
+        })
+}
+
+fn derive_bounded_affix_upper_bounds(
+    build: BuildAccounting,
+    input_bytes: usize,
+    scanner_recovery: usize,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let candidate_denominator =
+        build
+            .literal_bytes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix candidate denominator",
+            })?;
+    let suffix_candidates =
+        input_bytes
+            .checked_div(candidate_denominator)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix candidate bound",
+            })?;
+    let inspections = input_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(suffix_candidates))
+        .and_then(|value| value.checked_add(scanner_recovery))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix inspections",
+        })?;
+    let literal_comparisons = suffix_candidates.checked_mul(build.literal_bytes).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix literal comparisons",
+        },
+    )?;
+    let comparisons =
+        inspections
+            .checked_add(literal_comparisons)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix comparisons",
+            })?;
+    let branches = comparisons
+        .checked_add(input_bytes)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix branches",
+        })?;
+    let state_writes = input_bytes
+        .checked_mul(3)
+        .and_then(|value| {
+            suffix_candidates
+                .checked_mul(5)
+                .and_then(|term| value.checked_add(term))
+        })
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix state writes",
+        })?;
+    let work = inspections
+        .checked_add(comparisons)
+        .and_then(|value| value.checked_add(branches))
+        .and_then(|value| value.checked_add(state_writes))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "bounded-affix work",
+        })?;
+    let event_denominator =
+        build
+            .literal_bytes
+            .checked_add(2)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix event denominator",
+            })?;
+    let match_events =
+        input_bytes
+            .checked_div(event_denominator)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "bounded-affix event bound",
+            })?;
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "bounded-affix count bound",
+    })?;
+    Ok(ReduceUpperBounds {
+        input_bytes,
+        literal_bytes: build.literal_bytes,
+        interval_records: 0,
+        interval_bytes: 0,
+        inspections,
+        branches,
+        comparisons,
+        state_writes,
+        work,
+        match_events,
+        count,
+        scratch_bytes: 0,
+        persistent_bytes: build.persistent_bytes,
+        peak_bytes: build.persistent_bytes,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source-free envelope keeps every interval-stream resource dimension adjacent"
+)]
+fn derive_bounded_context_upper_bounds(
+    build: BuildAccounting,
+    input_bytes: usize,
+    scanner_recovery: usize,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let u32_max = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
+    if input_bytes > u32_max {
+        return Err(ReduceError::InputLimit {
+            needed: input_bytes,
+            limit: u32_max,
+        });
+    }
+    let tail_width =
+        usize::try_from(build.tail_width).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "tail width as usize",
+        })?;
+    let interval_records = input_bytes
+        .checked_div(
+            tail_width
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "interval denominator",
+                })?,
+        )
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "interval record bound",
+        })?;
+    let interval_bytes =
+        interval_records
+            .checked_mul(INTERVAL_BYTES)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "interval bytes",
+            })?;
+    let inspections = input_bytes
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(build.literal_bytes))
+        .and_then(|value| value.checked_add(scanner_recovery))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "inspection bound",
+        })?;
+    let branches = input_bytes
+        .checked_mul(8)
+        .and_then(|value| {
+            build
+                .literal_bytes
+                .checked_mul(4)
+                .and_then(|term| value.checked_add(term))
+        })
+        .and_then(|value| value.checked_add(16))
+        .and_then(|value| value.checked_add(scanner_recovery))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "branch bound",
+        })?;
+    let comparisons = input_bytes
+        .checked_mul(6)
+        .and_then(|value| {
+            build
+                .literal_bytes
+                .checked_mul(4)
+                .and_then(|term| value.checked_add(term))
+        })
+        .and_then(|value| value.checked_add(8))
+        .and_then(|value| value.checked_add(scanner_recovery))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "comparison bound",
+        })?;
+    let state_writes = input_bytes
+        .checked_mul(4)
+        .and_then(|value| {
+            build
+                .literal_bytes
+                .checked_mul(2)
+                .and_then(|term| value.checked_add(term))
+        })
+        .and_then(|value| value.checked_add(16))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "state-write bound",
+        })?;
+    let work = input_bytes
+        .checked_mul(21)
+        .and_then(|value| {
+            build
+                .literal_bytes
+                .checked_mul(11)
+                .and_then(|term| value.checked_add(term))
+        })
+        .and_then(|value| {
+            interval_bytes
+                .checked_mul(3)
+                .and_then(|term| value.checked_add(term))
+        })
+        .and_then(|value| value.checked_add(40))
+        .and_then(|value| {
+            scanner_recovery
+                .checked_mul(3)
+                .and_then(|term| value.checked_add(term))
+        })
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "execution work",
+        })?;
+    let minimum_match_bytes = usize::try_from(build.prefix_width)
+        .ok()
+        .and_then(|prefix| prefix.checked_add(1))
+        .and_then(|value| value.checked_add(build.literal_bytes))
+        .and_then(|value| value.checked_add(1))
+        .and_then(|value| {
+            usize::try_from(build.tail_width)
+                .ok()
+                .and_then(|tail| value.checked_add(tail))
+        })
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "minimum match bytes",
+        })?;
+    let match_events =
+        input_bytes
+            .checked_div(minimum_match_bytes)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "match event bound",
+            })?;
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "count bound",
+    })?;
+    let peak_bytes = build.persistent_bytes.checked_add(interval_bytes).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "execution peak bytes",
+        },
+    )?;
+    Ok(ReduceUpperBounds {
+        input_bytes,
+        literal_bytes: build.literal_bytes,
+        interval_records,
+        interval_bytes,
+        inspections,
+        branches,
+        comparisons,
+        state_writes,
+        work,
+        match_events,
+        count,
+        scratch_bytes: interval_bytes,
+        persistent_bytes: build.persistent_bytes,
+        peak_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReduceActualCounters {
     pub suffix_intervals: usize,
@@ -1391,15 +1647,7 @@ impl BoundedContextPlan {
                     computation: "bounded-context run scanner stream count",
                 })?
         };
-        // Every vector entry is preceded by a disjoint 16-member scalar proof.
-        // Thus each stream can enter the scanner at most floor(N/16) times.
-        let run_events = input_bytes / ASCII_NARROW_BYTES;
-        run_events
-            .checked_mul(scanner_streams)
-            .and_then(|value| value.checked_mul(SIMD_RUN_MAX_RESCAN_INSPECTIONS))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "run scanner recovery classification bound",
-            })
+        run_scanner_recovery_bound_for_streams(input_bytes, scanner_streams)
     }
 
     #[must_use]
@@ -1410,6 +1658,26 @@ impl BoundedContextPlan {
     #[must_use]
     pub const fn span_sum_identity(&self) -> OperationIdentity {
         self.identity(SPAN_SUM_OPERATION_ID)
+    }
+
+    /// Publish the exact source-free full-window count envelope retained by
+    /// this plan, including its selected SIMD scanner roles.
+    pub fn count_upper_bounds(&self, input_bytes: usize) -> Result<ReduceUpperBounds, ReduceError> {
+        let scanner_recovery = self.run_scanner_recovery_bound(input_bytes)?;
+        if self.bounded_affix {
+            derive_bounded_affix_upper_bounds(self.build, input_bytes, scanner_recovery)
+        } else {
+            derive_bounded_context_upper_bounds(self.build, input_bytes, scanner_recovery)
+        }
+    }
+
+    /// Publish the exact source-free full-window span-sum envelope retained by
+    /// this plan, including its selected SIMD scanner roles.
+    pub fn span_sum_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<SpanSumUpperBounds, ReduceError> {
+        span_sum_upper_bounds(self.count_upper_bounds(input_bytes)?, u64::MAX)
     }
 
     const fn identity(&self, operation_id: &'static str) -> OperationIdentity {
@@ -1805,112 +2073,27 @@ impl BoundedContextPlan {
         literal_bytes: usize,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let candidate_denominator =
-            literal_bytes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-affix candidate denominator",
-                })?;
-        // `RIGHT` is disjoint from `MIDDLE`, and every literal byte is in
-        // `MIDDLE`. An attempted suffix therefore consumes at least the
-        // literal bytes plus its terminating right byte; attempts cannot
-        // overlap. This bounds both slice comparisons and prefix probes.
-        let suffix_candidates = input_bytes.checked_div(candidate_denominator).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix candidate bound",
-            },
-        )?;
-        let scanner_recovery = self.run_scanner_recovery_bound(input_bytes)?;
-        let inspections = input_bytes
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(suffix_candidates))
-            .and_then(|value| value.checked_add(scanner_recovery))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix inspections",
-            })?;
-        let literal_comparisons = suffix_candidates.checked_mul(literal_bytes).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix literal comparisons",
-            },
-        )?;
-        let comparisons = inspections.checked_add(literal_comparisons).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix comparisons",
-            },
-        )?;
-        let branches =
-            comparisons
-                .checked_add(input_bytes)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-affix branches",
-                })?;
-        let state_writes = input_bytes
-            .checked_mul(3)
-            .and_then(|value| {
-                suffix_candidates
-                    .checked_mul(5)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix state writes",
-            })?;
-        let work = inspections
-            .checked_add(comparisons)
-            .and_then(|value| value.checked_add(branches))
-            .and_then(|value| value.checked_add(state_writes))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix work",
-            })?;
-        if work > limits.max_work {
+        debug_assert_eq!(literal_bytes, self.build.literal_bytes);
+        let upper = self.count_upper_bounds(input_bytes)?;
+        if upper.work > limits.max_work {
             return Err(ReduceError::WorkLimit {
-                needed: work,
+                needed: upper.work,
                 limit: limits.max_work,
             });
         }
-        let event_denominator =
-            literal_bytes
-                .checked_add(2)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-affix event denominator",
-                })?;
-        let event_bound =
-            input_bytes
-                .checked_div(event_denominator)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-affix event bound",
-                })?;
-        if event_bound > limits.max_match_events {
+        if upper.match_events > limits.max_match_events {
             return Err(ReduceError::MatchEventsLimit {
-                needed: event_bound,
+                needed: upper.match_events,
                 limit: limits.max_match_events,
             });
         }
-        let count_bound =
-            u64::try_from(event_bound).map_err(|_| ReduceError::ArithmeticOverflow {
-                computation: "bounded-affix count bound",
-            })?;
-        if count_bound > limits.max_count {
+        if upper.count > limits.max_count {
             return Err(ReduceError::CountLimit {
-                needed: count_bound,
+                needed: upper.count,
                 limit: limits.max_count,
             });
         }
-        Ok(ReduceUpperBounds {
-            input_bytes,
-            literal_bytes,
-            interval_records: 0,
-            interval_bytes: 0,
-            inspections,
-            branches,
-            comparisons,
-            state_writes,
-            work,
-            match_events: event_bound,
-            count: count_bound,
-            scratch_bytes: 0,
-            persistent_bytes: self.build.persistent_bytes,
-            peak_bytes: self.build.persistent_bytes,
-        })
+        Ok(upper)
     }
 
     fn bounded_affix_span_sum_preflight(
@@ -1940,153 +2123,30 @@ impl BoundedContextPlan {
                 limit: limits.max_input_bytes.min(u32_max),
             });
         }
-        let literal_bytes = self.finder.needle().len();
-        let tail_width =
-            usize::try_from(self.tail_width).map_err(|_| ReduceError::ArithmeticOverflow {
-                computation: "tail width as usize",
-            })?;
-        let interval_records = input_bytes
-            .checked_div(
-                tail_width
-                    .checked_add(1)
-                    .ok_or(ReduceError::ArithmeticOverflow {
-                        computation: "interval denominator",
-                    })?,
-            )
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "interval record bound",
-            })?;
-        let interval_bytes = interval_records.checked_mul(INTERVAL_BYTES).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "interval bytes",
-            },
-        )?;
-        let scanner_recovery = self.run_scanner_recovery_bound(input_bytes)?;
-        let inspections = input_bytes
-            .checked_mul(3)
-            .and_then(|value| value.checked_add(literal_bytes))
-            .and_then(|value| value.checked_add(scanner_recovery))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "inspection bound",
-            })?;
-        let branches = input_bytes
-            .checked_mul(8)
-            .and_then(|value| {
-                literal_bytes
-                    .checked_mul(4)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .and_then(|value| value.checked_add(16))
-            .and_then(|value| value.checked_add(scanner_recovery))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "branch bound",
-            })?;
-        let comparisons = input_bytes
-            .checked_mul(6)
-            .and_then(|value| {
-                literal_bytes
-                    .checked_mul(4)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .and_then(|value| value.checked_add(8))
-            .and_then(|value| value.checked_add(scanner_recovery))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "comparison bound",
-            })?;
-        let state_writes = input_bytes
-            .checked_mul(4)
-            .and_then(|value| {
-                literal_bytes
-                    .checked_mul(2)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .and_then(|value| value.checked_add(16))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "state-write bound",
-            })?;
-        let work = input_bytes
-            .checked_mul(21)
-            .and_then(|value| {
-                literal_bytes
-                    .checked_mul(11)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .and_then(|value| {
-                interval_bytes
-                    .checked_mul(3)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .and_then(|value| value.checked_add(40))
-            .and_then(|value| {
-                scanner_recovery
-                    .checked_mul(3)
-                    .and_then(|term| value.checked_add(term))
-            })
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "execution work",
-            })?;
-        let minimum_match_bytes = usize::try_from(self.prefix_width)
-            .ok()
-            .and_then(|prefix| prefix.checked_add(1))
-            .and_then(|value| value.checked_add(literal_bytes))
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| {
-                usize::try_from(self.tail_width)
-                    .ok()
-                    .and_then(|tail| value.checked_add(tail))
-            })
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "minimum match bytes",
-            })?;
-        let match_events = input_bytes.checked_div(minimum_match_bytes).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "match event bound",
-            },
-        )?;
-        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "count bound",
-        })?;
-        let peak_bytes = self
-            .build
-            .persistent_bytes
-            .checked_add(interval_bytes)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "execution peak bytes",
-            })?;
-        enforce_reduce(work, limits.max_work, ReduceResource::Work)?;
+        let upper = self.count_upper_bounds(input_bytes)?;
+        enforce_reduce(upper.work, limits.max_work, ReduceResource::Work)?;
         enforce_reduce(
-            match_events,
+            upper.match_events,
             limits.max_match_events,
             ReduceResource::MatchEvents,
         )?;
-        if count > limits.max_count {
+        if upper.count > limits.max_count {
             return Err(ReduceError::CountLimit {
-                needed: count,
+                needed: upper.count,
                 limit: limits.max_count,
             });
         }
         enforce_reduce(
-            interval_bytes,
+            upper.scratch_bytes,
             limits.max_scratch_bytes,
             ReduceResource::Scratch,
         )?;
-        enforce_reduce(peak_bytes, limits.max_peak_bytes, ReduceResource::Peak)?;
-        Ok(ReduceUpperBounds {
-            input_bytes,
-            literal_bytes,
-            interval_records,
-            interval_bytes,
-            inspections,
-            branches,
-            comparisons,
-            state_writes,
-            work,
-            match_events,
-            count,
-            scratch_bytes: interval_bytes,
-            persistent_bytes: self.build.persistent_bytes,
-            peak_bytes,
-        })
+        enforce_reduce(
+            upper.peak_bytes,
+            limits.max_peak_bytes,
+            ReduceResource::Peak,
+        )?;
+        Ok(upper)
     }
 
     fn span_sum_preflight(

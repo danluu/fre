@@ -59,6 +59,15 @@ pub enum Operation {
     SpanSum,
 }
 
+/// Physical ASCII classification implementation retained by the plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReduceImplementation {
+    /// Scalar UTF-8 stream with bitmap membership.
+    Scalar,
+    /// Fixed-32 ASCII block classification with UTF-8 fallback.
+    DispatchedAsciiBlock32,
+}
+
 /// Root HIR shape reduced by the scalar stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Repetition {
@@ -332,6 +341,93 @@ pub struct ReduceAccounting {
     pub window: Window,
     pub upper_bounds: ReduceUpperBounds,
     pub actual: ReduceActualCounters,
+}
+
+/// Derive the complete source-free reduction envelope for one implementation.
+fn derive_reduce_upper_bounds(
+    build: BuildAccounting,
+    input_bytes: usize,
+    implementation: ReduceImplementation,
+) -> Result<ReduceUpperBounds, ReduceError> {
+    let ascii_block_classifications = match implementation {
+        ReduceImplementation::Scalar => 0,
+        ReduceImplementation::DispatchedAsciiBlock32 => input_bytes / ASCII_WIDE_BYTES,
+    };
+    let ascii_block_classification_bytes = ascii_block_classifications
+        .checked_mul(ASCII_WIDE_BYTES)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "ASCII block classification byte upper bound",
+        })?;
+    let ascii_block_lookahead_bytes = ascii_block_classification_bytes;
+    let decode_byte_checks = input_bytes
+        .checked_mul(4)
+        .and_then(|checks| checks.checked_add(ascii_block_lookahead_bytes))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "decode byte check upper bound",
+        })?;
+    let binary_search_comparisons_per_scalar =
+        binary_search_comparison_bound(build.retained_non_ascii_ranges)
+            .checked_add(
+                usize::from(build.repetition.is_run() && build.retained_non_ascii_ranges != 0)
+                    .checked_mul(2)
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "cached range comparison allowance",
+                    })?,
+            )
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "cached range comparison upper bound",
+            })?;
+    let membership_tests = input_bytes.checked_add(ascii_block_lookahead_bytes).ok_or(
+        ReduceError::ArithmeticOverflow {
+            computation: "membership test upper bound",
+        },
+    )?;
+    let range_comparisons = input_bytes
+        .checked_mul(binary_search_comparisons_per_scalar)
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "range comparison upper bound",
+        })?;
+    let reducer_steps = if build.repetition.is_run() {
+        input_bytes
+            .checked_add(1)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "run reducer transition upper bound",
+            })?
+    } else {
+        0
+    };
+    let match_events = input_bytes;
+    let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "count upper bound",
+    })?;
+    let span_sum = u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
+        computation: "span sum upper bound",
+    })?;
+    let work = decode_byte_checks
+        .checked_add(membership_tests)
+        .and_then(|value| value.checked_add(range_comparisons))
+        .and_then(|value| value.checked_add(reducer_steps))
+        .ok_or(ReduceError::ArithmeticOverflow {
+            computation: "execution work upper bound",
+        })?;
+    Ok(ReduceUpperBounds {
+        input_bytes,
+        ascii_block_classifications,
+        ascii_block_classification_bytes,
+        ascii_block_lookahead_bytes,
+        decode_byte_checks,
+        membership_tests,
+        range_comparisons,
+        binary_search_comparisons_per_scalar,
+        reducer_steps,
+        match_events,
+        count,
+        span_sum,
+        work,
+        scratch_bytes: 0,
+        persistent_bytes: build.persistent_bytes,
+        peak_bytes: build.persistent_bytes,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -923,6 +1019,14 @@ impl UnicodeScalarAggregatePlan {
         OperationIdentity::for_repetition(Operation::SpanSum, self.repetition)
     }
 
+    /// Publish the scalar plan's exact source-free full-window envelope.
+    pub fn full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(self.build, input_bytes, ReduceImplementation::Scalar)
+    }
+
     pub fn count(&self, haystack: &[u8], limits: ReduceLimits) -> Result<CountResult, ReduceError> {
         self.count_in(haystack, Window::full(haystack), limits)
     }
@@ -999,89 +1103,22 @@ impl UnicodeScalarAggregatePlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "window byte length",
                 })?;
-        let ascii_block_classifications = if ascii_blocks {
-            input_bytes / ASCII_WIDE_BYTES
+        let implementation = if ascii_blocks {
+            ReduceImplementation::DispatchedAsciiBlock32
         } else {
-            0
+            ReduceImplementation::Scalar
         };
-        let ascii_block_classification_bytes = ascii_block_classifications
-            .checked_mul(ASCII_WIDE_BYTES)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "ASCII block classification byte upper bound",
-            })?;
-        let ascii_block_lookahead_bytes = ascii_block_classification_bytes;
-        let decode_byte_checks = input_bytes
-            .checked_mul(4)
-            .and_then(|checks| checks.checked_add(ascii_block_lookahead_bytes))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "decode byte check upper bound",
-            })?;
-        let binary_search_comparisons_per_scalar =
-            binary_search_comparison_bound(self.non_ascii.len())
-                .checked_add(
-                    usize::from(self.repetition.is_run() && !self.non_ascii.is_empty())
-                        .checked_mul(2)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "cached range comparison allowance",
-                        })?,
-                )
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "cached range comparison upper bound",
-                })?;
-        let membership_tests = input_bytes.checked_add(ascii_block_lookahead_bytes).ok_or(
-            ReduceError::ArithmeticOverflow {
-                computation: "membership test upper bound",
-            },
-        )?;
-        let range_comparisons = input_bytes
-            .checked_mul(binary_search_comparisons_per_scalar)
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "range comparison upper bound",
-            })?;
-        let reducer_steps = if self.repetition.is_run() {
-            input_bytes
-                .checked_add(1)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "run reducer transition upper bound",
-                })?
-        } else {
-            0
-        };
-        let match_events = input_bytes;
-        let count = u64::try_from(match_events).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "count upper bound",
-        })?;
-        let span_sum = u64::try_from(input_bytes).map_err(|_| ReduceError::ArithmeticOverflow {
-            computation: "span sum upper bound",
-        })?;
-        let work = decode_byte_checks
-            .checked_add(membership_tests)
-            .and_then(|value| value.checked_add(range_comparisons))
-            .and_then(|value| value.checked_add(reducer_steps))
-            .ok_or(ReduceError::ArithmeticOverflow {
-                computation: "execution work upper bound",
-            })?;
-        let scratch_bytes = 0;
-        let persistent_bytes = self.build.persistent_bytes;
-        let peak_bytes = persistent_bytes;
-        let upper = ReduceUpperBounds {
-            input_bytes,
-            ascii_block_classifications,
-            ascii_block_classification_bytes,
-            ascii_block_lookahead_bytes,
-            decode_byte_checks,
-            membership_tests,
-            range_comparisons,
-            binary_search_comparisons_per_scalar,
-            reducer_steps,
-            match_events,
-            count,
-            span_sum,
-            work,
-            scratch_bytes,
-            persistent_bytes,
-            peak_bytes,
-        };
+        let upper = derive_reduce_upper_bounds(self.build, input_bytes, implementation)?;
+        let decode_byte_checks = upper.decode_byte_checks;
+        let membership_tests = upper.membership_tests;
+        let range_comparisons = upper.range_comparisons;
+        let reducer_steps = upper.reducer_steps;
+        let match_events = upper.match_events;
+        let count = upper.count;
+        let span_sum = upper.span_sum;
+        let work = upper.work;
+        let scratch_bytes = upper.scratch_bytes;
+        let peak_bytes = upper.peak_bytes;
         enforce_reduce(
             input_bytes,
             limits.max_input_bytes,
@@ -1835,6 +1872,19 @@ impl DispatchedUnicodeScalarAggregatePlan {
     #[must_use]
     pub const fn span_sum_identity(&self) -> OperationIdentity {
         OperationIdentity::for_dispatched_operation(Operation::SpanSum)
+    }
+
+    /// Publish the dispatched plan's exact source-free full-window envelope,
+    /// including fixed-32 classifier lookahead.
+    pub fn full_window_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<ReduceUpperBounds, ReduceError> {
+        derive_reduce_upper_bounds(
+            self.build_accounting(),
+            input_bytes,
+            ReduceImplementation::DispatchedAsciiBlock32,
+        )
     }
 
     /// Immutable SVE2-only decisions retained for fixed-16 and fixed-32 blocks.
