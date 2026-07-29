@@ -354,24 +354,30 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
 #[test]
 fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
     let k0 = portable("(?:ab)+", PlanSelection::ForceK0);
-    let mut accelerated = k0
+    let mut full = k0
         .search_session(SearchSessionLimits::unlimited())
         .expect("unlimited eligible K0 session");
-    let accelerated_setup = accelerated.workspace_setup_accounting().unwrap();
+    let full_setup = full.workspace_setup_accounting().unwrap();
+    let endpoint = k0
+        .endpoint_search_session(SearchSessionLimits::unlimited())
+        .expect("unlimited endpoint-only K0 session");
+    let endpoint_setup = endpoint.workspace_setup_accounting().unwrap();
+    assert!(full_setup.work() > endpoint_setup.work());
+    assert!(full_setup.retained_bytes() > endpoint_setup.retained_bytes());
     assert!(matches!(
-        accelerated.find(
+        full.find(
             b"zzabab",
             SearchLimits {
                 max_work: u64::MAX,
-                max_scratch_bytes: accelerated_setup.retained_bytes() - 1,
+                max_scratch_bytes: full_setup.retained_bytes() - 1,
             },
         ),
         Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
             needed,
             limit,
             ..
-        })) if needed == accelerated_setup.retained_bytes()
-            && limit == accelerated_setup.retained_bytes() - 1
+        })) if needed == full_setup.retained_bytes()
+            && limit == full_setup.retained_bytes() - 1
     ));
 
     let nullable = portable("(?:a)*", PlanSelection::ForceK0);
@@ -384,65 +390,129 @@ fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
             .workspace_setup_accounting()
             .unwrap()
             .retained_bytes()
-            < accelerated_setup.retained_bytes(),
+            < endpoint_setup.retained_bytes(),
         "minimum-length metadata must exclude nullable facade plans from the cache"
     );
 
-    let mut work_fallback = k0
+    let work_endpoint = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: accelerated_setup.work() - 1,
+            max_setup_work: full_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         })
-        .expect("optional cache work refusal must retain Pike admission");
-    let work_setup = work_fallback.workspace_setup_accounting().unwrap();
-    assert!(work_setup.work() < accelerated_setup.work());
+        .expect("reverse work refusal must retain endpoint acceleration");
     assert_eq!(
-        work_fallback
-            .selected_end(b"zzabab", SearchLimits::unlimited())
-            .unwrap()
-            .0,
-        Some(6)
+        work_endpoint.workspace_setup_accounting(),
+        Some(endpoint_setup)
     );
+    let ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: endpoint_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("endpoint work refusal must retain Pike admission");
+    let ordinary_setup = ordinary.workspace_setup_accounting().unwrap();
+    assert!(ordinary_setup.work() < endpoint_setup.work());
+
     k0.search_session(SearchSessionLimits {
-        max_setup_work: work_setup.work(),
-        max_scratch_bytes: work_setup.retained_bytes(),
+        max_setup_work: ordinary_setup.work(),
+        max_scratch_bytes: ordinary_setup.retained_bytes(),
     })
     .expect("exact ordinary setup boundary must succeed");
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
-            max_setup_work: work_setup.work() - 1,
+            max_setup_work: ordinary_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         }),
         Err(fre::SearchError::K0(
             K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed }
-        )) if limit == work_setup.work() - 1 && needed == work_setup.work()
+        )) if limit == ordinary_setup.work() - 1 && needed == ordinary_setup.work()
     ));
 
-    let scratch_fallback = k0
+    let scratch_endpoint = k0
         .search_session(SearchSessionLimits {
             max_setup_work: u64::MAX,
-            max_scratch_bytes: accelerated_setup.retained_bytes() - 1,
+            max_scratch_bytes: full_setup.retained_bytes() - 1,
         })
-        .expect("optional cache scratch refusal must retain Pike admission");
-    let scratch_setup = scratch_fallback.workspace_setup_accounting().unwrap();
-    assert!(scratch_setup.retained_bytes() < accelerated_setup.retained_bytes());
+        .expect("reverse scratch refusal must retain endpoint acceleration");
+    assert_eq!(
+        scratch_endpoint.workspace_setup_accounting(),
+        Some(endpoint_setup)
+    );
+    let scratch_ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: endpoint_setup.retained_bytes() - 1,
+        })
+        .expect("endpoint scratch refusal must retain Pike admission");
+    assert_eq!(
+        scratch_ordinary.workspace_setup_accounting(),
+        Some(ordinary_setup)
+    );
     k0.search_session(SearchSessionLimits {
-        max_setup_work: scratch_setup.work(),
-        max_scratch_bytes: scratch_setup.retained_bytes(),
+        max_setup_work: ordinary_setup.work(),
+        max_scratch_bytes: ordinary_setup.retained_bytes(),
     })
     .expect("exact ordinary scratch boundary must succeed");
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
             max_setup_work: u64::MAX,
-            max_scratch_bytes: scratch_setup.retained_bytes() - 1,
+            max_scratch_bytes: ordinary_setup.retained_bytes() - 1,
         }),
         Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
             needed,
             limit,
             ..
-        })) if needed == scratch_setup.retained_bytes()
-            && limit == scratch_setup.retained_bytes() - 1
+        })) if needed == ordinary_setup.retained_bytes()
+            && limit == ordinary_setup.retained_bytes() - 1
     ));
+}
+
+#[test]
+fn bidirectional_k0_session_matches_find_at_and_nonempty_iteration() {
+    let k0 = portable(r"(?:ab)+|a", PlanSelection::ForceK0);
+    let haystacks = [b"".as_slice(), b"xababaya", b"abab", b"\0ab\xffaba"];
+    let mut session = k0
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("bidirectional K0 session");
+
+    for haystack in haystacks {
+        for start in 0..=haystack.len() {
+            let expected = k0
+                .find_at(haystack, start, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            let actual = session
+                .find_at(haystack, start, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(
+                actual, expected,
+                "find_at mismatch source={haystack:?}, start={start}"
+            );
+        }
+
+        let mut expected = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(found) = k0
+            .find_at(haystack, cursor, SearchLimits::unlimited())
+            .unwrap()
+            .0
+        {
+            expected.push(found);
+            cursor = found.end();
+        }
+        let mut actual = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(found) = session
+            .find_at(haystack, cursor, SearchLimits::unlimited())
+            .unwrap()
+            .0
+        {
+            actual.push(found);
+            cursor = found.end();
+        }
+        assert_eq!(actual, expected, "iteration mismatch source={haystack:?}");
+    }
 }
 
 #[test]

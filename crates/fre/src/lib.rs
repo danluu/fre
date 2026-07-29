@@ -2708,14 +2708,12 @@ impl PortableRegex {
     ///
     /// K0 allocates and fully initializes one fixed-capacity workspace here.
     /// Eligible byte graphs with a statically known positive minimum length
-    /// also retain a bounded ordered lazy-DFA cache for existence and endpoint
-    /// operations. Assertion-bearing, nullable, and statically empty graphs
-    /// keep the ordinary workspace; span operations retain Pike execution.
-    /// The selected workspace's complete retained payload is preflighted on
-    /// every call, including span calls that do not consult the cache. Every
-    /// subsequent call reuses the selected storage without growing. Native
-    /// plans retain their existing operation-specific dispatch and need no
-    /// session storage.
+    /// retain bounded forward endpoint rows plus a separate reverse cache for
+    /// exact full-span recovery. Assertion-bearing, nullable, statically empty,
+    /// or resource-refused graphs keep the ordinary Pike workspace. Cache
+    /// selection is source-free and occurs before allocation; every subsequent
+    /// call reuses the selected storage without growing. Native plans retain
+    /// their existing operation-specific dispatch and need no session storage.
     ///
     /// # Errors
     ///
@@ -2727,13 +2725,50 @@ impl PortableRegex {
         &self,
         limits: SearchSessionLimits,
     ) -> Result<PortableSearchSession<'_>, SearchError> {
+        self.search_session_mode(limits, true)
+    }
+
+    /// Prepare a smaller reusable session for existence and endpoint
+    /// projections.
+    ///
+    /// Eligible K0 graphs retain only the ordered forward cache. Calling a
+    /// full-span method on the returned session remains correct but uses Pike;
+    /// callers that need `find`/iteration acceleration should use
+    /// [`Self::search_session`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same conditions as
+    /// [`Self::search_session`].
+    pub fn endpoint_search_session(
+        &self,
+        limits: SearchSessionLimits,
+    ) -> Result<PortableSearchSession<'_>, SearchError> {
+        self.search_session_mode(limits, false)
+    }
+
+    fn search_session_mode(
+        &self,
+        limits: SearchSessionLimits,
+        bidirectional: bool,
+    ) -> Result<PortableSearchSession<'_>, SearchError> {
         let plan = match &self.plan {
             PortablePlan::K0(automaton) => {
                 let workspace_limits = SearchSessionLimits {
                     max_setup_work: limits.max_setup_work,
                     max_scratch_bytes: limits.max_scratch_bytes,
                 };
-                let accelerate = matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0)
+                let positive =
+                    matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
+                let full_fits = bidirectional
+                    && positive
+                    && automaton
+                        .bidirectional_workspace_layout()
+                        .is_ok_and(|layout| {
+                            layout.construction_work() <= workspace_limits.max_setup_work
+                                && layout.logical_bytes() <= workspace_limits.max_scratch_bytes
+                        });
+                let endpoints_fit = positive
                     && automaton
                         .accelerated_workspace_layout()
                         .is_ok_and(|layout| {
@@ -2744,7 +2779,9 @@ impl PortableRegex {
                 // allocating. Once accelerated construction begins, propagate
                 // every failure so a partial attempt cannot disappear from
                 // successful setup accounting.
-                let workspace = if accelerate {
+                let workspace = if full_fits {
+                    K0Workspace::new_bidirectional(automaton, workspace_limits)?
+                } else if endpoints_fit {
                     K0Workspace::new_accelerated(automaton, workspace_limits)?
                 } else {
                     K0Workspace::new(automaton, workspace_limits)?

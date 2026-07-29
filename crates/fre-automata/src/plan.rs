@@ -482,6 +482,21 @@ impl Automaton {
         WorkspaceLayout::for_accelerated_automaton(self)
     }
 
+    /// Compute the fixed reusable-workspace shape for endpoint acceleration
+    /// plus reverse full-span recovery.
+    ///
+    /// Ineligible graphs return the ordinary Pike layout. Callers that only
+    /// need existence or endpoint projections should use
+    /// [`Self::accelerated_workspace_layout`] to avoid reverse storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::ArithmeticOverflow`] if its byte or work charge
+    /// cannot be represented.
+    pub fn bidirectional_workspace_layout(&self) -> Result<WorkspaceLayout, SearchError> {
+        WorkspaceLayout::for_bidirectional_automaton(self)
+    }
+
     /// Bind this graph to an output contract without adding a runtime mode flag
     /// to the K0 loop.
     #[must_use]
