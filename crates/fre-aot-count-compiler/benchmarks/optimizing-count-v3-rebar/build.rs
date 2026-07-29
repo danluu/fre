@@ -25,15 +25,18 @@ use fre_aot_count_compiler::{
     inspect_count_implementation_object_v3, publish_count_implementation_object_elf_v2,
     publish_count_implementation_object_macho_v2,
 };
-use fre_aot_count_contract::v3::inspect_static_count_expectation_v3;
+use fre_aot_count_contract::v3::{
+    CountGeneralEligibilityTupleV3, inspect_static_count_expectation_v3,
+};
 use fre_aot_optimizer::{CountV3RequiredIsa, CountV3TuningClass};
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use inventory::{CompilerArtifactInput, Inventory, digest_fields, hex, parse_hex_32};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const BINARY: &str = "fre-optimizing-count-v3-rebar";
-const REGISTRY_SCHEMA: &str = "fre.optimizing-count-v3.compiled-artifact-registry.v1";
+const REGISTRY_SCHEMA: &str = "fre.optimizing-count-v3.compiled-artifact-registry.v2";
 const PORTABLE_RECEIPT_SCHEMA: &str = "fre.optimizing-count-v3.portable-compiled-recipe-receipt.v1";
 const PORTABLE_PAYLOAD_SCHEMA: &str = "fre.optimizing-count-v3.portable-compiled-recipe-payload.v1";
 const PORTABLE_METADATA_SCHEMA: &str =
@@ -51,6 +54,43 @@ const RESOURCE_CLAIM_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-RESOURCE-CLAIM\0\
 const V2_OBJECT_BINDING_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-V2-CONTROL-BINDING\0\x01";
 const PORTABLE_RECEIPT_IDENTITY_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-PORTABLE-RECEIPT\0\x01";
 const SOURCE_SET_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-RUNNER-SOURCE-SET\0\x01";
+const GENERAL_ELIGIBILITY_TUPLE_KEYS_V3: [&str; 35] = [
+    "compiler_version",
+    "metadata_version",
+    "image_schema_version",
+    "backend_version",
+    "algorithm_version",
+    "auditor_version",
+    "kir_semantics_version",
+    "kir_abi_version",
+    "recipe_schema_version",
+    "optimizer_version",
+    "tuning_class_id",
+    "strategy_id",
+    "schedule_id",
+    "register_plan_id",
+    "literal_bytes",
+    "filter_len",
+    "sparse_group_count",
+    "match_stride",
+    "periodic_stride",
+    "call_abi_schema",
+    "abi_kind",
+    "status_bits",
+    "output_kind",
+    "architecture",
+    "little_endian",
+    "pointer_width",
+    "target_abi",
+    "object_format",
+    "required_isa_id",
+    "actual_features",
+    "allowed_features",
+    "candidate_block_starts",
+    "vector_bytes",
+    "sve_vector_length_bytes",
+    "max_literal_bytes",
+];
 
 fn main() {
     if let Err(error) = run() {
@@ -284,6 +324,7 @@ struct EngineArtifact {
 #[derive(Clone, Debug)]
 struct V3Artifact {
     engine: EngineArtifact,
+    general_eligibility_tuple: Value,
     expectation_file_path: PathBuf,
     expectation_file_sha256: String,
     expectation_bytes_sha256: String,
@@ -302,6 +343,125 @@ struct PublishedV2 {
     payload_sha256: [u8; 32],
     payload_bytes: usize,
     code_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GeneralEligibilityTupleRegistryV3 {
+    compiler_version: u16,
+    metadata_version: u16,
+    image_schema_version: u16,
+    backend_version: u16,
+    algorithm_version: u16,
+    auditor_version: u16,
+    kir_semantics_version: u16,
+    kir_abi_version: u16,
+    recipe_schema_version: u16,
+    optimizer_version: u16,
+    tuning_class_id: u8,
+    strategy_id: u8,
+    schedule_id: u8,
+    register_plan_id: u8,
+    literal_bytes: u32,
+    filter_len: u8,
+    sparse_group_count: u8,
+    match_stride: u8,
+    periodic_stride: u8,
+    call_abi_schema: u16,
+    abi_kind: u8,
+    status_bits: u8,
+    output_kind: u8,
+    architecture: u8,
+    little_endian: bool,
+    pointer_width: u8,
+    target_abi: u8,
+    object_format: u8,
+    required_isa_id: u8,
+    actual_features: u64,
+    allowed_features: u64,
+    candidate_block_starts: u8,
+    vector_bytes: u16,
+    sve_vector_length_bytes: u16,
+    max_literal_bytes: u16,
+}
+
+impl From<CountGeneralEligibilityTupleV3> for GeneralEligibilityTupleRegistryV3 {
+    fn from(tuple: CountGeneralEligibilityTupleV3) -> Self {
+        let CountGeneralEligibilityTupleV3 {
+            compiler_version,
+            metadata_version,
+            image_schema_version,
+            backend_version,
+            algorithm_version,
+            auditor_version,
+            kir_semantics_version,
+            kir_abi_version,
+            recipe_schema_version,
+            optimizer_version,
+            tuning_class_id,
+            strategy_id,
+            schedule_id,
+            register_plan_id,
+            literal_bytes,
+            filter_len,
+            sparse_group_count,
+            match_stride,
+            periodic_stride,
+            call_abi_schema,
+            abi_kind,
+            status_bits,
+            output_kind,
+            architecture,
+            little_endian,
+            pointer_width,
+            target_abi,
+            object_format,
+            required_isa_id,
+            actual_features,
+            allowed_features,
+            candidate_block_starts,
+            vector_bytes,
+            sve_vector_length_bytes,
+            max_literal_bytes,
+        } = tuple;
+        Self {
+            compiler_version,
+            metadata_version,
+            image_schema_version,
+            backend_version,
+            algorithm_version,
+            auditor_version,
+            kir_semantics_version,
+            kir_abi_version,
+            recipe_schema_version,
+            optimizer_version,
+            tuning_class_id,
+            strategy_id,
+            schedule_id,
+            register_plan_id,
+            literal_bytes,
+            filter_len,
+            sparse_group_count,
+            match_stride,
+            periodic_stride,
+            call_abi_schema,
+            abi_kind,
+            status_bits,
+            output_kind,
+            architecture,
+            little_endian,
+            pointer_width,
+            target_abi,
+            object_format: object_format.wire_id(),
+            required_isa_id,
+            actual_features,
+            allowed_features,
+            candidate_block_starts,
+            vector_bytes,
+            sve_vector_length_bytes,
+            max_literal_bytes,
+        }
+    }
 }
 
 fn compile_artifact(
@@ -483,6 +643,11 @@ fn compile_artifact(
     let expectation = compiled_v3.expectation();
     let expectation_claim = inspect_static_count_expectation_v3(expectation)
         .map_err(|error| format!("inspect Count-v3 expectation: {error}"))?;
+    let compiled_eligibility = compiled_v3
+        .general_eligibility_tuple()
+        .map_err(|error| format!("project compiled Count-v3 eligibility tuple: {error}"))?;
+    let inspected_eligibility = inspection.metadata().general_eligibility_tuple();
+    let expectation_eligibility = expectation_claim.metadata().general_eligibility_tuple();
     if expectation_claim.semantic_binding_identity() != &input.semantic_binding_identity
         || expectation_claim.planning_receipt_identity() != &input.planning_receipt_identity
         || expectation_claim.compile_identity() != object.compile_identity()
@@ -493,6 +658,19 @@ fn compile_artifact(
             input.pattern_input_id
         ));
     }
+    if compiled_eligibility != inspected_eligibility {
+        return Err(format!(
+            "compiled Count-v3 eligibility tuple differs from inspected object metadata for {}",
+            input.pattern_input_id
+        ));
+    }
+    if expectation_eligibility != inspected_eligibility {
+        return Err(format!(
+            "Count-v3 expectation eligibility tuple differs from inspected object metadata for {}",
+            input.pattern_input_id
+        ));
+    }
+    let general_eligibility_tuple = general_eligibility_tuple_registry(inspected_eligibility)?;
     let compile_identity = hex(object.compile_identity());
     let expectation_symbol = format!("{EXPECTATION_SYMBOL_PREFIX}{compile_identity}");
     let expectation_object = match target.object_format {
@@ -532,6 +710,7 @@ fn compile_artifact(
             code_bytes: Some(inspection.code().len()),
             receipt_identity: None,
         },
+        general_eligibility_tuple,
         expectation_file_path,
         expectation_file_sha256,
         expectation_bytes_sha256: sha256_hex(expectation),
@@ -929,6 +1108,7 @@ fn engine_registry(engine: &str, artifact: &EngineArtifact, v3: Option<&V3Artifa
         "expectation_file_sha256": v3.map(|value| value.expectation_file_sha256.as_str()),
         "expectation_identity": v3.map(|value| value.expectation_identity.as_str()),
         "expectation_symbol": v3.map(|value| value.expectation_symbol.as_str()),
+        "general_eligibility_tuple": v3.map(|value| &value.general_eligibility_tuple),
         "metadata_sha256": artifact.metadata_sha256,
         "object_bytes": artifact.object_bytes,
         "object_identity": artifact.object_identity,
@@ -940,6 +1120,35 @@ fn engine_registry(engine: &str, artifact: &EngineArtifact, v3: Option<&V3Artifa
         "runtime_authority": if v3.is_some() { "qualification-private" } else { "control" },
         "optimizer_receipt_identity": v3.map(|value| value.optimizer_receipt_identity.as_str()),
     })
+}
+
+fn general_eligibility_tuple_registry(
+    tuple: CountGeneralEligibilityTupleV3,
+) -> Result<Value, String> {
+    let projected = GeneralEligibilityTupleRegistryV3::from(tuple);
+    let value = serde_json::to_value(&projected)
+        .map_err(|error| format!("serialize general eligibility tuple: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or("general eligibility tuple did not serialize as an object")?;
+    if object.len() != GENERAL_ELIGIBILITY_TUPLE_KEYS_V3.len()
+        || GENERAL_ELIGIBILITY_TUPLE_KEYS_V3
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return Err(format!(
+            "general eligibility tuple projection does not have the exact {} wire fields",
+            GENERAL_ELIGIBILITY_TUPLE_KEYS_V3.len()
+        ));
+    }
+    let decoded: GeneralEligibilityTupleRegistryV3 = serde_json::from_value(value.clone())
+        .map_err(|error| format!("validate general eligibility tuple projection: {error}"))?;
+    if decoded != projected {
+        return Err(
+            "general eligibility tuple projection changed on strict round trip".to_string(),
+        );
+    }
+    Ok(value)
 }
 
 fn generate_bindings(

@@ -43,9 +43,28 @@ identity-suffixed. The expectation is placed in
 `__FRE_CONST,__fre_expect` on Mach-O or the read-only allocated
 `.fre.expect` section on ELF.
 
-The build script writes `compiled-artifacts.json` in `OUT_DIR`. It records
+The build script writes
+`fre.optimizing-count-v3.compiled-artifact-registry.v2` as
+`compiled-artifacts.json` in `OUT_DIR`. It records
 source, object, payload, metadata, expectation, optimizer-input, and
 domain-separated provenance identities without any cell attribution.
+Every `count-v3-aot` engine row also contains
+`general_eligibility_tuple`, the exact 35-field
+`CountGeneralEligibilityTupleV3` wire projection. Numeric fields retain their
+wire integers, `little_endian` is a boolean, and `object_format` is its numeric
+wire ID (`1` for Mach-O arm64 or `2` for ELF64 AArch64). The build derives this
+projection from independently inspected object metadata and requires exact
+equality with both `FocusedCompiledCountV3::general_eligibility_tuple()` and
+the separately inspected static-expectation metadata. Control engine rows
+carry `null`.
+
+Eventual promotion does not enumerate Rebar cases, patterns, literals, or
+artifact IDs. For each target, it joins evidence-passing eligible artifact IDs
+to this authenticated registry, applies the separately qualified long-scan
+routing floor, and deduplicates the complete tuple values into reviewed source
+authority rows. Tuple equality alone does not enforce the haystack-length
+floor.
+
 Compile elapsed time and compiler peak RSS are process-level target-receipt
 facts and must be captured by the external frozen build controller; they are
 not nondeterministically embedded in this receipt.

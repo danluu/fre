@@ -196,6 +196,14 @@ One source-bound final-image transaction must prove:
 Compiler output, a linker success, a benchmark result, and a qualification row
 are not production authority individually.
 
+Each evidence artifact exposes the complete artifact-independent
+`CountGeneralEligibilityTupleV3` reconstructed from inspected metadata and
+cross-checked against its static expectation. Reviewed production rows are the
+deduplicated tuples of artifacts that pass the complete evidence gates, not a
+list of benchmark literals or artifact IDs. Workload gates such as the
+qualified long-scan input floor remain separate construction-time routing
+conditions.
+
 ## Non-overfitting evidence protocol
 
 The evidence corpus has three disjoint classes:

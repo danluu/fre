@@ -9,8 +9,8 @@ use fre_aot_count_contract::v3::{
     inspect_static_count_expectation_v3,
 };
 use fre_aot_optimizer::{
-    CountV3RequiredIsa, CountV3TuningClass, encode_count_recipe_v3,
-    inspect_count_v3_optimizer_receipt,
+    COUNT_V3_OPTIMIZER_VERSION, COUNT_V3_RECIPE_SCHEMA_VERSION, CountV3RequiredIsa,
+    CountV3TuningClass, encode_count_recipe_v3, inspect_count_v3_optimizer_receipt,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use sha2::{Digest, Sha256};
@@ -120,12 +120,26 @@ fn complete_recipe_literal_and_optimizer_receipt_are_retained() {
         .expect("strict optimizer receipt");
     let expectation =
         inspect_static_count_expectation_v3(compiled.expectation()).expect("strict v3 expectation");
+    let eligibility = metadata.general_eligibility_tuple();
     assert_eq!(
         expectation.metadata().general_eligibility_tuple(),
+        eligibility
+    );
+    assert_eq!(
         compiled
             .general_eligibility_tuple()
-            .expect("eligibility tuple")
+            .expect("eligibility tuple"),
+        eligibility
     );
+    assert_eq!(eligibility.object_format, CountObjectFormatV3::Elf64Aarch64);
+    assert_eq!(eligibility.literal_bytes, 6);
+    assert_eq!(
+        eligibility.recipe_schema_version,
+        COUNT_V3_RECIPE_SCHEMA_VERSION
+    );
+    assert_eq!(eligibility.optimizer_version, COUNT_V3_OPTIMIZER_VERSION);
+    assert!(eligibility.little_endian);
+    assert_eq!(eligibility.pointer_width, 64);
     assert_eq!(compiled.runtime_authority(), RuntimeAuthorityV3::Absent);
 }
 
