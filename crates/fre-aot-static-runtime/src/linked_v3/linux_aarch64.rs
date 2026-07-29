@@ -2,10 +2,30 @@ use std::{fs::File, io::Read};
 
 use fre_aot_aarch64::AotCountCpuFeatures;
 
+#[cfg(feature = "count-v3-qualification-private")]
+use crate::StaticCountSveThreadContractErrorV3;
 use crate::StaticCountVerifyErrorV3;
 
 const HARD_MAX_PROC_MAPS_BYTES_V3: usize = 4 << 20;
 pub(super) const VM_QUERY_INPUT_BYTES_UPPER_BOUND_V3: u32 = (4 << 20) + 1;
+#[cfg(feature = "count-v3-qualification-private")]
+const AT_HWCAP_V3: libc::c_ulong = 16;
+#[cfg(feature = "count-v3-qualification-private")]
+const AT_HWCAP2_V3: libc::c_ulong = 26;
+#[cfg(feature = "count-v3-qualification-private")]
+const AARCH64_HWCAP_SVE_V3: libc::c_ulong = 0x0040_0000;
+#[cfg(feature = "count-v3-qualification-private")]
+const AARCH64_HWCAP2_SVE2_V3: libc::c_ulong = 0x0000_0002;
+#[cfg(feature = "count-v3-qualification-private")]
+const PR_SVE_SET_VL_V3: libc::c_int = 50;
+#[cfg(feature = "count-v3-qualification-private")]
+const PR_SVE_GET_VL_V3: libc::c_int = 51;
+#[cfg(feature = "count-v3-qualification-private")]
+const PR_SVE_VL_LEN_MASK_V3: libc::c_int = 0xffff;
+#[cfg(feature = "count-v3-qualification-private")]
+const COUNT_V3_SVE_VECTOR_BYTES: u16 = 16;
+#[cfg(feature = "count-v3-qualification-private")]
+const PRCTL_ZERO_V3: libc::c_ulong = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RegionPurposeV3 {
@@ -139,7 +159,7 @@ fn require_protection(
     }
 }
 
-pub(super) fn require_host_contract(
+pub(super) fn require_asimd_host_contract(
     actual_features: u64,
     sve_vector_length_bytes: u16,
 ) -> Result<(), StaticCountVerifyErrorV3> {
@@ -150,8 +170,8 @@ pub(super) fn require_host_contract(
     {
         return Err(StaticCountVerifyErrorV3::RequiredCpuFeaturesUnavailable);
     }
-    // This movable handle is deliberately ASIMD-only. Any future SVE/SVE2
-    // row needs a same-thread, non-Send/non-Sync exact-VL session.
+    // This movable handle is deliberately ASIMD-only. Any production
+    // SVE/SVE2 promotion needs its own source-authorized same-thread session.
     if features.contains(AotCountCpuFeatures::SVE)
         || features.contains(AotCountCpuFeatures::SVE2)
         || sve_vector_length_bytes != 0
@@ -159,6 +179,137 @@ pub(super) fn require_host_contract(
         return Err(StaticCountVerifyErrorV3::RequiredCpuFeaturesUnavailable);
     }
     Ok(())
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+pub(super) fn require_sve_host_contract(
+    actual_features: u64,
+    required_isa_id: u8,
+    sve_vector_length_bytes: u16,
+) -> Result<(), StaticCountVerifyErrorV3> {
+    let (hwcap, hwcap2) = host_hwcap_v3();
+    let exact_features = match required_isa_id {
+        2 => actual_features == AotCountCpuFeatures::SVE.bits(),
+        3 => {
+            actual_features
+                == AotCountCpuFeatures::SVE
+                    .union(AotCountCpuFeatures::SVE2)
+                    .bits()
+        }
+        _ => false,
+    };
+    if sve_vector_length_bytes != COUNT_V3_SVE_VECTOR_BYTES
+        || !exact_features
+        || hwcap & AARCH64_HWCAP_SVE_V3 == 0
+    {
+        return Err(StaticCountVerifyErrorV3::RequiredCpuFeaturesUnavailable);
+    }
+    if required_isa_id == 3 && hwcap2 & AARCH64_HWCAP2_SVE2_V3 == 0 {
+        return Err(StaticCountVerifyErrorV3::RequiredCpuFeaturesUnavailable);
+    }
+    require_current_thread_sve_vl16_v3().map_err(|_| {
+        StaticCountVerifyErrorV3::RequiredSveVectorLengthUnavailable {
+            required_bytes: COUNT_V3_SVE_VECTOR_BYTES,
+        }
+    })
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+#[allow(
+    unsafe_code,
+    reason = "Linux auxv is the immutable kernel-provided architectural feature boundary"
+)]
+fn host_hwcap_v3() -> (libc::c_ulong, libc::c_ulong) {
+    // SAFETY: getauxval reads the immutable process auxiliary vector.
+    unsafe { (libc::getauxval(AT_HWCAP_V3), libc::getauxval(AT_HWCAP2_V3)) }
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+#[allow(
+    unsafe_code,
+    reason = "PR_SVE_GET_VL reads only the calling thread's architectural SVE state"
+)]
+fn current_thread_sve_vector_bytes_v3() -> Result<u16, StaticCountSveThreadContractErrorV3> {
+    // SAFETY: PR_SVE_GET_VL ignores all four unsigned-long arguments.
+    let raw = unsafe {
+        libc::prctl(
+            PR_SVE_GET_VL_V3,
+            PRCTL_ZERO_V3,
+            PRCTL_ZERO_V3,
+            PRCTL_ZERO_V3,
+            PRCTL_ZERO_V3,
+        )
+    };
+    if raw < 0 {
+        return Err(
+            StaticCountSveThreadContractErrorV3::SveVectorLengthQueryFailed {
+                errno: std::io::Error::last_os_error().raw_os_error(),
+            },
+        );
+    }
+    u16::try_from(raw & PR_SVE_VL_LEN_MASK_V3).map_err(|_| {
+        StaticCountSveThreadContractErrorV3::RequiredSveVectorLengthUnavailable {
+            required_bytes: COUNT_V3_SVE_VECTOR_BYTES,
+            actual_bytes: None,
+        }
+    })
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+pub(super) fn require_current_thread_sve_vl16_v3() -> Result<(), StaticCountSveThreadContractErrorV3>
+{
+    let actual = current_thread_sve_vector_bytes_v3()?;
+    if actual == COUNT_V3_SVE_VECTOR_BYTES {
+        Ok(())
+    } else {
+        Err(
+            StaticCountSveThreadContractErrorV3::RequiredSveVectorLengthUnavailable {
+                required_bytes: COUNT_V3_SVE_VECTOR_BYTES,
+                actual_bytes: Some(actual),
+            },
+        )
+    }
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+#[allow(
+    unsafe_code,
+    reason = "qualification changes only this thread's SVE VL and immediately checks the result"
+)]
+pub(super) fn configure_current_thread_sve_vl16_v3()
+-> Result<u16, StaticCountSveThreadContractErrorV3> {
+    let (hwcap, _) = host_hwcap_v3();
+    if hwcap & AARCH64_HWCAP_SVE_V3 == 0 {
+        return Err(StaticCountSveThreadContractErrorV3::RequiredSveUnavailable);
+    }
+    // SAFETY: no inherit/on-exec flags are requested; only this thread changes.
+    let status = unsafe {
+        libc::prctl(
+            PR_SVE_SET_VL_V3,
+            libc::c_ulong::from(COUNT_V3_SVE_VECTOR_BYTES),
+            PRCTL_ZERO_V3,
+            PRCTL_ZERO_V3,
+            PRCTL_ZERO_V3,
+        )
+    };
+    if status < 0 {
+        return Err(
+            StaticCountSveThreadContractErrorV3::SveVectorLengthSetFailed {
+                errno: std::io::Error::last_os_error().raw_os_error(),
+            },
+        );
+    }
+    let actual = current_thread_sve_vector_bytes_v3()?;
+    if actual == COUNT_V3_SVE_VECTOR_BYTES {
+        Ok(actual)
+    } else {
+        Err(
+            StaticCountSveThreadContractErrorV3::RequiredSveVectorLengthUnavailable {
+                required_bytes: COUNT_V3_SVE_VECTOR_BYTES,
+                actual_bytes: Some(actual),
+            },
+        )
+    }
 }
 
 #[cfg(test)]

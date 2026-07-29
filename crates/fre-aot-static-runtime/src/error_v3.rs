@@ -163,3 +163,71 @@ impl From<AggregateExecuteError> for StaticCountCallErrorV3 {
         Self::Preflight(value)
     }
 }
+
+/// Current-thread Linux SVE contract failure for Count-v3 qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StaticCountSveThreadContractErrorV3 {
+    UnsupportedHost,
+    RequiredSveUnavailable,
+    RequiredSve2Unavailable,
+    SveVectorLengthQueryFailed {
+        errno: Option<i32>,
+    },
+    SveVectorLengthSetFailed {
+        errno: Option<i32>,
+    },
+    RequiredSveVectorLengthUnavailable {
+        required_bytes: u16,
+        actual_bytes: Option<u16>,
+    },
+}
+
+impl fmt::Display for StaticCountSveThreadContractErrorV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE Count-v3 SVE current-thread contract failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for StaticCountSveThreadContractErrorV3 {}
+
+/// Failure at the qualification-only same-thread SVE/SVE2 call boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StaticCountSveCallErrorV3 {
+    ThreadContract(StaticCountSveThreadContractErrorV3),
+    Count(StaticCountCallErrorV3),
+}
+
+impl fmt::Display for StaticCountSveCallErrorV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE Count-v3 SVE qualification call failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for StaticCountSveCallErrorV3 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ThreadContract(error) => Some(error),
+            Self::Count(error) => Some(error),
+        }
+    }
+}
+
+impl From<StaticCountSveThreadContractErrorV3> for StaticCountSveCallErrorV3 {
+    fn from(value: StaticCountSveThreadContractErrorV3) -> Self {
+        Self::ThreadContract(value)
+    }
+}
+
+impl From<StaticCountCallErrorV3> for StaticCountSveCallErrorV3 {
+    fn from(value: StaticCountCallErrorV3) -> Self {
+        Self::Count(value)
+    }
+}

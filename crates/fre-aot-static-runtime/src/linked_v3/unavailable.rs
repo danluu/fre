@@ -1,3 +1,5 @@
+#[cfg(feature = "count-v3-qualification-private")]
+use crate::StaticCountSveThreadContractErrorV3;
 use crate::StaticCountVerifyErrorV3;
 
 pub(super) const VM_QUERY_INPUT_BYTES_UPPER_BOUND_V3: u32 = 0;
@@ -21,7 +23,7 @@ pub(super) fn verify_range(
     }
 }
 
-pub(super) fn require_host_contract(
+pub(super) fn require_asimd_host_contract(
     _actual_features: u64,
     _sve_vector_length_bytes: u16,
 ) -> Result<(), StaticCountVerifyErrorV3> {
@@ -30,4 +32,29 @@ pub(super) fn require_host_contract(
     } else {
         Err(StaticCountVerifyErrorV3::LinkedCountV3FeatureDisabled)
     }
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+pub(super) fn require_sve_host_contract(
+    _actual_features: u64,
+    _required_isa_id: u8,
+    _sve_vector_length_bytes: u16,
+) -> Result<(), StaticCountVerifyErrorV3> {
+    if cfg!(feature = "linked-count-v3") {
+        Err(StaticCountVerifyErrorV3::UnsupportedHost)
+    } else {
+        Err(StaticCountVerifyErrorV3::LinkedCountV3FeatureDisabled)
+    }
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+pub(super) fn require_current_thread_sve_vl16_v3() -> Result<(), StaticCountSveThreadContractErrorV3>
+{
+    Err(StaticCountSveThreadContractErrorV3::UnsupportedHost)
+}
+
+#[cfg(feature = "count-v3-qualification-private")]
+pub(super) fn configure_current_thread_sve_vl16_v3()
+-> Result<u16, StaticCountSveThreadContractErrorV3> {
+    Err(StaticCountSveThreadContractErrorV3::UnsupportedHost)
 }

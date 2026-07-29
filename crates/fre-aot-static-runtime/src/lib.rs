@@ -7,9 +7,13 @@
 //! value-only handle. Its artifact-independent production authority is exact
 //! full-tuple source data and begins empty. The default-off qualification path
 //! has disjoint address/handle APIs and cannot populate production authority.
-//! The current movable handle is ASIMD-only; future SVE/SVE2 support requires
-//! a separate same-thread exact-VL session because Linux SVE VL is mutable per
-//! thread.
+//! The movable production and qualification handles are ASIMD-only. The
+//! qualification-private Linux AArch64 surface has a separate SVE/SVE2 handle
+//! and same-thread exact-VL16 session; neither type implements `Send` or
+//! `Sync`. It rechecks VL16 immediately before every native call and grants no
+//! production authority. Any later evidence promotion must add a separately
+//! reviewed, source-authorized production same-thread SVE surface; it must not
+//! broaden the movable ASIMD handle.
 //! The independent Search-v1 Span architecture uses a JIT- and compiler-neutral
 //! 584-byte expectation contract. Its literal source qualification table is
 //! checked before any final-image pointer is used, every identity is matched,
@@ -59,7 +63,10 @@ pub use error::{
     StaticSearchSpanCallErrorV1, StaticSearchSpanContractFieldV1,
     StaticSearchSpanThreadContractErrorV1, StaticSearchSpanVerifyErrorV1, StaticVerifyError,
 };
-pub use error_v3::{StaticCountCallErrorV3, StaticCountContractFieldV3, StaticCountVerifyErrorV3};
+pub use error_v3::{
+    StaticCountCallErrorV3, StaticCountContractFieldV3, StaticCountSveCallErrorV3,
+    StaticCountSveThreadContractErrorV3, StaticCountVerifyErrorV3,
+};
 #[cfg(feature = "linked-hardware-matrix-v2")]
 #[doc(hidden)]
 pub use linked::invoke_raw_count_hardware_matrix_v2;
@@ -83,7 +90,11 @@ pub use linked_v3::{
 #[doc(hidden)]
 pub use linked_v3::{
     StaticCountQualificationFacadeBindingV3, StaticCountQualificationLinkedAddressesV3,
-    VerifiedStaticCountQualificationV3, adopt_linked_static_count_qualification_v3,
+    StaticCountSveQualificationFacadeBindingV3, StaticCountSveQualificationLinkedAddressesV3,
+    StaticCountSveQualificationSessionV3, VerifiedStaticCountQualificationV3,
+    VerifiedStaticCountSveQualificationV3, adopt_linked_static_count_qualification_v3,
+    adopt_linked_static_count_sve_qualification_v3,
+    configure_current_thread_sve_vl16_for_count_v3_qualification,
 };
 pub use search_call::{
     RawSearchCallV1, RawSearchResultV1, SEARCH_END_POISON_V1, SEARCH_START_POISON_V1,

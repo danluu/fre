@@ -193,13 +193,17 @@ pub use aggregate_construction::{
     AggregateConstructionStageDisposition, AggregateConstructionStateError,
     AggregateConstructionTerminal, AggregateConstructionTransition,
 };
-#[cfg(feature = "count-v3-aot-qualification-private")]
-#[doc(hidden)]
-pub use aggregate_count_aot_v3::AggregateCountExactLiteralAotQualificationV3;
 #[cfg(feature = "explicit-count-v3-aot")]
 pub use aggregate_count_aot_v3::{
     AggregateCountExactLiteralAotBindErrorV3, AggregateCountExactLiteralAotExecutionErrorV3,
     AggregateCountExactLiteralAotV3,
+};
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub use aggregate_count_aot_v3::{
+    AggregateCountExactLiteralAotQualificationV3,
+    AggregateCountExactLiteralAotSveQualificationSessionV3,
+    AggregateCountExactLiteralAotSveQualificationV3,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,

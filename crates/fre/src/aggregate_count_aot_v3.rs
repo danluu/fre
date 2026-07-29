@@ -4,13 +4,19 @@
 //! native route; a refusal leaves the original portable owner available to the
 //! caller as its construction-time fallback. No call performs artifact lookup,
 //! target dispatch, compilation, recipe selection, or code audit.
+//! The movable production facade remains ASIMD-only. Any later SVE/SVE2
+//! evidence promotion requires a separate source-authorized production
+//! same-thread facade/session rather than broadening that handle.
 
 use core::fmt;
 
 use fre_aot_static_runtime::{StaticCountCallErrorV3, VerifiedStaticCountV3};
 #[cfg(feature = "count-v3-aot-qualification-private")]
 use fre_aot_static_runtime::{
-    StaticCountQualificationFacadeBindingV3, VerifiedStaticCountQualificationV3,
+    StaticCountQualificationFacadeBindingV3, StaticCountSveCallErrorV3,
+    StaticCountSveQualificationFacadeBindingV3, StaticCountSveQualificationSessionV3,
+    StaticCountSveThreadContractErrorV3, VerifiedStaticCountQualificationV3,
+    VerifiedStaticCountSveQualificationV3,
 };
 use fre_kernel_ir::AggregateExecutionLimits;
 
@@ -63,6 +69,9 @@ pub enum AggregateCountExactLiteralAotExecutionErrorV3 {
         required: u128,
     },
     Native(StaticCountCallErrorV3),
+    #[cfg(feature = "count-v3-aot-qualification-private")]
+    #[doc(hidden)]
+    SveQualificationNative(StaticCountSveCallErrorV3),
 }
 
 impl fmt::Display for AggregateCountExactLiteralAotExecutionErrorV3 {
@@ -78,6 +87,8 @@ impl std::error::Error for AggregateCountExactLiteralAotExecutionErrorV3 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Native(error) => Some(error),
+            #[cfg(feature = "count-v3-aot-qualification-private")]
+            Self::SveQualificationNative(error) => Some(error),
             _ => None,
         }
     }
@@ -86,6 +97,13 @@ impl std::error::Error for AggregateCountExactLiteralAotExecutionErrorV3 {
 impl From<StaticCountCallErrorV3> for AggregateCountExactLiteralAotExecutionErrorV3 {
     fn from(value: StaticCountCallErrorV3) -> Self {
         Self::Native(value)
+    }
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl From<StaticCountSveCallErrorV3> for AggregateCountExactLiteralAotExecutionErrorV3 {
+    fn from(value: StaticCountSveCallErrorV3) -> Self {
+        Self::SveQualificationNative(value)
     }
 }
 
@@ -244,6 +262,166 @@ impl<'binding> AggregateCountExactLiteralAotQualificationV3<'binding> {
     #[must_use]
     pub const fn verified_handle(&self) -> &VerifiedStaticCountQualificationV3 {
         self.verified
+    }
+}
+
+/// Qualification-only fixed-VL SVE/SVE2 facade.
+///
+/// This type exposes no direct count method. A caller must open a same-thread
+/// session, and the static runtime rechecks exact VL16 immediately before
+/// every native branch. This facade and its adopter are type-disjoint from
+/// both production and movable ASIMD qualification.
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub struct AggregateCountExactLiteralAotSveQualificationV3<'binding> {
+    portable_owner: &'binding AggregateCountRegex,
+    verified: &'binding VerifiedStaticCountSveQualificationV3,
+    checked: CheckedBindingV3,
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl fmt::Debug for AggregateCountExactLiteralAotSveQualificationV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotSveQualificationV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field("eligibility_tuple", &self.verified.eligibility_tuple())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl<'binding> AggregateCountExactLiteralAotSveQualificationV3<'binding> {
+    /// Project the live fixed-policy owner into the borrowed proof required by
+    /// the SVE/SVE2-only qualification adopter.
+    pub fn adoption_binding(
+        portable_owner: &'binding AggregateCountRegex,
+    ) -> Result<
+        StaticCountSveQualificationFacadeBindingV3<'binding>,
+        AggregateCountExactLiteralAotBindErrorV3,
+    > {
+        let candidate = portable_owner
+            .exact_literal_aot_planned_candidate()
+            .ok_or(
+                AggregateCountExactLiteralAotBindErrorV3::PortableOwnerIsNotFixedPolicyExactLiteralCandidate,
+            )?;
+        Ok(StaticCountSveQualificationFacadeBindingV3::new(
+            candidate.literal(),
+            *candidate.semantic_binding_identity().as_bytes(),
+            *candidate.planning_receipt_identity().as_bytes(),
+        ))
+    }
+
+    pub fn bind(
+        portable_owner: &'binding AggregateCountRegex,
+        verified: &'binding VerifiedStaticCountSveQualificationV3,
+    ) -> Result<Self, AggregateCountExactLiteralAotBindErrorV3> {
+        let checked = check_binding_v3(
+            portable_owner.exact_literal_aot_planned_candidate(),
+            verified.literal(),
+            verified.semantic_binding_identity(),
+            verified.planning_receipt_identity(),
+        )?;
+        Ok(Self {
+            portable_owner,
+            verified,
+            checked,
+        })
+    }
+
+    /// Open a session bound to this calling thread after checking exact SVE
+    /// VL16. The returned token cannot move to or be shared with another
+    /// thread.
+    pub fn begin_current_thread_session(
+        &self,
+    ) -> Result<
+        AggregateCountExactLiteralAotSveQualificationSessionV3<'_>,
+        StaticCountSveThreadContractErrorV3,
+    > {
+        Ok(AggregateCountExactLiteralAotSveQualificationSessionV3 {
+            portable_owner: self.portable_owner,
+            native: self.verified.begin_current_thread_session()?,
+            checked: self.checked,
+        })
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountSveQualificationV3 {
+        self.verified
+    }
+}
+
+/// Same-thread invocation token for Count-v3 SVE/SVE2 qualification.
+///
+/// The embedded runtime token makes this value neither `Send` nor `Sync`.
+/// Exact VL16 is checked again immediately before each native call.
+///
+/// ```compile_fail,E0277
+/// use fre::AggregateCountExactLiteralAotSveQualificationSessionV3;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<AggregateCountExactLiteralAotSveQualificationSessionV3<'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre::AggregateCountExactLiteralAotSveQualificationSessionV3;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<AggregateCountExactLiteralAotSveQualificationSessionV3<'static>>();
+/// ```
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub struct AggregateCountExactLiteralAotSveQualificationSessionV3<'session> {
+    portable_owner: &'session AggregateCountRegex,
+    native: StaticCountSveQualificationSessionV3<'session>,
+    checked: CheckedBindingV3,
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl fmt::Debug for AggregateCountExactLiteralAotSveQualificationSessionV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotSveQualificationSessionV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field(
+                "eligibility_tuple",
+                &self.native.handle().eligibility_tuple(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl AggregateCountExactLiteralAotSveQualificationSessionV3<'_> {
+    /// Count through the authenticated SVE/SVE2 image after the incumbent
+    /// facade preflight and the runtime's immediate per-call VL16 recheck.
+    #[inline]
+    pub fn count_value(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+        let upper = preflight_v3(self.checked, haystack.len(), limits.borrow())?;
+        self.native
+            .count(haystack, exact_runtime_limits_v3(upper))
+            .map_err(Into::into)
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountSveQualificationV3 {
+        self.native.handle()
     }
 }
 
