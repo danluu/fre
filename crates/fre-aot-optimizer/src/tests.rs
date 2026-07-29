@@ -183,6 +183,18 @@ fn optimization_is_pattern_only_and_has_no_haystack_channel() {
 }
 
 #[test]
+fn recipe_literal_identity_is_explicitly_domain_separated() {
+    let literal = b"literal-identity";
+    let optimized = optimize(literal);
+    let plain_sha256: [u8; 32] = Sha256::digest(literal).into();
+    assert_eq!(
+        optimized.recipe().literal_identity(),
+        &compute_count_v3_literal_identity(literal)
+    );
+    assert_ne!(optimized.recipe().literal_identity(), &plain_sha256);
+}
+
+#[test]
 fn width_and_portfolio_are_hard_bounded() {
     let literal = *b"0123456789abcdefghijklmnopqrstuv";
     let program = program(&literal);

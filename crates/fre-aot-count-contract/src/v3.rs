@@ -12,7 +12,7 @@ use fre_aot_aarch64::{
 };
 use fre_aot_optimizer::{
     COUNT_V3_OPTIMIZER_VERSION, COUNT_V3_RECIPE_CANONICAL_BYTES, COUNT_V3_RECIPE_SCHEMA_VERSION,
-    inspect_count_recipe_v3,
+    compute_count_v3_literal_identity, inspect_count_recipe_v3,
 };
 use sha2::{Digest, Sha256};
 
@@ -559,8 +559,8 @@ fn validate_embedded_manifests(
 
     let inspected = inspect_count_recipe_v3(&metadata.canonical_recipe)
         .map_err(|_| metadata_error("canonical recipe"))?;
-    let literal_identity: [u8; 32] =
-        Sha256::digest(&metadata.literal_manifest[..literal_len]).into();
+    let literal_identity =
+        compute_count_v3_literal_identity(&metadata.literal_manifest[..literal_len]);
     if metadata.recipe_schema_version != COUNT_V3_RECIPE_SCHEMA_VERSION
         || metadata.optimizer_version != COUNT_V3_OPTIMIZER_VERSION
         || inspected.program_identity() != &metadata.program_identity

@@ -9,8 +9,8 @@ use fre_aot_count_contract::v3::{
 use fre_aot_optimizer::{
     COUNT_V3_MAX_LITERAL_BYTES, COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES, CountRecipeV3,
     CountV3OptimizerLimits, CountV3OptimizerReceipt, CountV3RequiredIsa, CountV3TuningClass,
-    encode_count_recipe_v3, encode_count_v3_optimizer_receipt, inspect_count_v3_optimizer_receipt,
-    optimize_count_v3, validate_count_recipe_v3,
+    compute_count_v3_literal_identity, encode_count_recipe_v3, encode_count_v3_optimizer_receipt,
+    inspect_count_v3_optimizer_receipt, optimize_count_v3, validate_count_recipe_v3,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use sha2::{Digest, Sha256};
@@ -289,7 +289,8 @@ pub fn compile_count_v3(
         });
     }
     require_candidate_identities(request.semantic_candidate)?;
-    let literal_identity: [u8; 32] = Sha256::digest(request.literal).into();
+    let live_literal_identity: [u8; 32] = Sha256::digest(request.literal).into();
+    let recipe_literal_identity = compute_count_v3_literal_identity(request.literal);
     let program = build_exact_aggregate::<Count>(request.literal, limits.kernel_ir)?;
     let optimized = optimize_count_v3(&program, request.target.tuning_class, limits.optimizer)?;
     let recipe = *optimized.recipe();
@@ -308,7 +309,7 @@ pub fn compile_count_v3(
     let image_recipe = image.recipe_manifest();
     if image.source_identity() != program.cache_identity()
         || image.literal_manifest().literal() != request.literal
-        || image_recipe.literal_identity() != literal_identity
+        || image_recipe.literal_identity() != recipe_literal_identity
         || image_recipe.recipe_identity() != *recipe.identity().as_bytes()
         || image_recipe.canonical_recipe() != &encode_count_recipe_v3(&recipe)
         || image_recipe.required_isa_id() != request.target.required_isa.wire_id()
@@ -326,7 +327,7 @@ pub fn compile_count_v3(
     )?;
     let expectation = build_expectation(
         &request,
-        literal_identity,
+        live_literal_identity,
         *program.cache_identity().as_bytes(),
         *image.artifact_identity().as_bytes(),
         *recipe.identity().as_bytes(),

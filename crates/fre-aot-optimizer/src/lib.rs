@@ -751,6 +751,15 @@ pub fn optimize_count_v3(
     optimize_impl(program, tuning, limits)
 }
 
+/// Domain-separated identity used by every Count-v3 optimizer recipe.
+///
+/// This intentionally differs from the plain SHA-256 literal digest used by
+/// source and facade expectation contracts.
+#[must_use]
+pub fn compute_count_v3_literal_identity(literal: &[u8]) -> [u8; 32] {
+    literal_identity(literal)
+}
+
 /// Canonical fixed-size encoding used to independently bind a recipe.
 #[must_use]
 pub fn encode_count_recipe_v3(recipe: &CountRecipeV3) -> [u8; COUNT_V3_RECIPE_CANONICAL_BYTES] {
