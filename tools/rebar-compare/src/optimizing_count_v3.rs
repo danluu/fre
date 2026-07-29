@@ -98,6 +98,7 @@ pub struct OptimizingCountV3ArtifactInput {
     pub literal_sha256: String,
     pub literal_bytes: usize,
     pub semantic_binding_identity: String,
+    pub planning_receipt_identity: String,
 }
 
 /// One eligible compiled Rebar cell. Attribution is intentionally separate
@@ -277,9 +278,9 @@ pub fn inventory_optimizing_count_v3(
                 job.id
             )));
         }
-        let candidate = regex.exact_literal_aot_candidate().ok_or_else(|| {
+        let candidate = regex.exact_literal_aot_planned_candidate().ok_or_else(|| {
             CompareError::new(format!(
-                "selected Count-v3 job {} lacks an authenticated AOT candidate",
+                "selected Count-v3 job {} lacks the authenticated fixed-policy AOT candidate",
                 job.id
             ))
         })?;
@@ -331,6 +332,7 @@ pub fn inventory_optimizing_count_v3(
         let pattern_input_id = format!("pattern-{pattern_semantics_identity}");
         let literal_sha256 = sha256(literal);
         let semantic_binding_identity = hex(candidate.semantic_binding_identity().as_bytes());
+        let planning_receipt_identity = hex(candidate.planning_receipt_identity().as_bytes());
         let artifact = OptimizingCountV3ArtifactInput {
             schema: OPTIMIZING_COUNT_V3_ARTIFACT_INPUT_SCHEMA.to_string(),
             pattern_input_id: pattern_input_id.clone(),
@@ -345,6 +347,7 @@ pub fn inventory_optimizing_count_v3(
             literal_sha256: literal_sha256.clone(),
             literal_bytes: literal.len(),
             semantic_binding_identity,
+            planning_receipt_identity,
         };
         match artifacts.insert(pattern_input_id.clone(), artifact.clone()) {
             Some(previous) if previous != artifact => {
@@ -607,6 +610,7 @@ mod tests {
             literal_sha256: "67".repeat(32),
             literal_bytes: 6,
             semantic_binding_identity: "78".repeat(32),
+            planning_receipt_identity: "89".repeat(32),
         };
         let value = serde_json::to_value(artifact).expect("serialize artifact input");
         let object = value.as_object().expect("artifact input object");
