@@ -31,7 +31,7 @@ pub use glue::{
 };
 pub use object::{
     CountImplementationInspectionV2, CountImplementationObjectV2, CountObjectLimitsV2,
-    inspect_count_implementation_object_v2,
+    inspect_count_implementation_object_v2, publish_count_implementation_object_macho_v2,
 };
 pub use object_elf_v2::{
     CountImplementationInspectionElfV2, CountImplementationObjectElfV2,

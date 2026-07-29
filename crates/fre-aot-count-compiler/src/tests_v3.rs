@@ -14,7 +14,7 @@ use crate::{
     CountCompileLimitsV3, CountCompileRequestV3, CountCompileTargetV3, CountObjectFormatV3,
     CountObjectLimitsV2, CountSemanticCandidateV3, RuntimeAuthorityV3, compile_count_v3,
     inspect_count_implementation_object_elf_v2, inspect_count_implementation_object_v3,
-    publish_count_implementation_object_elf_v2,
+    publish_count_implementation_object_elf_v2, publish_count_implementation_object_macho_v2,
 };
 
 fn candidate() -> CountSemanticCandidateV3 {
@@ -147,6 +147,26 @@ fn linux_v2_control_wrapper_preserves_v2_metadata_and_payload() {
         CountObjectLimitsV2::default(),
     )
     .expect("strict v2 ELF inspection");
+    assert_eq!(view.metadata_bytes(), object.metadata_bytes());
+    assert_eq!(&view.payload()[..image.code().len()], image.code());
+}
+
+#[test]
+fn local_v2_control_wrapper_is_raw_and_self_inspecting() {
+    let program =
+        build_exact_aggregate::<Count>(b"needle", ValidateLimits::default()).expect("Count KIR");
+    let image = emit_count_v2(&program, CountEmitLimitsV2::default()).expect("Count-v2 image");
+    let object = publish_count_implementation_object_macho_v2(
+        &image,
+        [10; 32],
+        CountObjectLimitsV2::default(),
+    )
+    .expect("qualification v2 Mach-O");
+    let view = crate::inspect_count_implementation_object_v2(
+        object.as_bytes(),
+        CountObjectLimitsV2::default(),
+    )
+    .expect("strict v2 Mach-O inspection");
     assert_eq!(view.metadata_bytes(), object.metadata_bytes());
     assert_eq!(&view.payload()[..image.code().len()], image.code());
 }

@@ -382,6 +382,19 @@ pub(crate) fn emit_count_implementation_object_v2(
     })
 }
 
+/// Publish one raw deterministic Count-v2 Mach-O object for an offline
+/// same-source qualification control.
+///
+/// This is packaging only. The object and its self-hashes carry no signature,
+/// final-image row, or runtime-adoption authority.
+pub fn publish_count_implementation_object_macho_v2(
+    image: &AotCountImageV2,
+    binding_identity: [u8; 32],
+    limits: CountObjectLimitsV2,
+) -> Result<CountImplementationObjectV2, CountCompileErrorV2> {
+    emit_count_implementation_object_v2(image, binding_identity, limits)
+}
+
 /// Strictly inspect a deterministic Count-v2 implementation object.
 pub fn inspect_count_implementation_object_v2(
     bytes: &[u8],
