@@ -85,9 +85,12 @@ prefix, and total bounds are `M`, `p + r`, and `N + r`. It has no candidate
 search, prefilter, scratch, search allocation, or fallback.
 
 This path is selected only by `ForceForwardAnchored` when extraction proves an
-absolute end. Forced start-only construction retains
-`anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22`, and `Auto`
-retains its pre-existing strategy for both shapes. Exact singleton-class
+absolute end. Forced start-only construction uses
+`anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-bitset-prefix31-inline.v23`, and `Auto`
+retains its pre-existing strategy selection for both shapes. Arbitrary ASCII
+bitsets verify the first 32-byte block before searching the remaining window
+for a suffix witness, so a short malformed anchored prefix can reject without
+a whole-window prefilter call. Exact singleton-class
 candidate prefixes from 32 through 65,536 bytes use the same dedicated
 equality-only 32-byte verifier used above the former activation floor. Pair candidate
 prefixes from 16 through 65,536 bytes use safe 16-byte membership blocks that

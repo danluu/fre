@@ -24,11 +24,11 @@ use memchr::{memchr, memrchr};
 use crate::Window;
 
 /// Stable identity of this exact proof and execution strategy.
-pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22";
+pub const PLAN_ID: &str = "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-bitset-prefix31-inline.v23";
 
 /// Stable identity of the opt-in ASCII `Bitset` directional-run reuse.
 pub const ASCII_BITSET_RUN_PLAN_ID: &str =
-    "anchored-class-suffix.forward-v22.ascii-bitset-directional-run16.v1";
+    "anchored-class-suffix.forward-v23.ascii-bitset-prefix31-directional-run16.v2";
 
 /// Stable identity of the absolute-end fixed-boundary verifier.
 pub const ABSOLUTE_END_FIXED_PLAN_ID: &str = "anchored-class-suffix.absolute-end-fixed-single1-range128-threshold128-range64-threshold64-suffix-first-hybrid.v6";
@@ -1224,66 +1224,109 @@ impl ForwardAnchoredPlan {
             if !self.class.contains(first_byte) {
                 return Ok((None, accounting));
             }
-            // Small exact classes can use any suffix-first witness as an
-            // upper bound on the first outsider. The helper partitions long
-            // tails into an asymmetric scalar front, reverse back, and
-            // untouched middle without overlap; controls retain their
-            // first-candidate forward search.
-            let uses_edge_witness = matches!(
-                self.implementation,
-                ClassImplementation::Pair { .. }
-                    | ClassImplementation::Triple { .. }
-                    | ClassImplementation::Quad { .. }
-                    | ClassImplementation::Quint { .. }
-            );
-            // On short Pair/Quad tails, a suffix-first byte in the
-            // middle is common enough that searching the reverse 32-byte
-            // edge first is pure extra work. One forward native search also
-            // returns the authoritative first outsider. Keep Quint isolated
-            // on its measured edge geometry and retain that geometry for all
-            // longer tails.
-            let uses_short_forward_witness = searched.len().saturating_sub(1)
-                <= SHORT_FORWARD_WITNESS_MAX
-                && matches!(
-                    self.implementation,
-                    ClassImplementation::Pair { .. } | ClassImplementation::Quad { .. }
-                );
-            let (relative_candidate, prefilter_calls) = if uses_short_forward_witness {
-                (memchr(self.suffix[0], &searched[1..]), 1)
-            } else if uses_edge_witness {
-                asymmetric_suffix_witness(self.suffix[0], &searched[1..])?
+            // Establish a small exact prefix before searching the complete
+            // window for the suffix witness. Anchored records with a short
+            // malformed leading run can then fail at their first outsider
+            // instead of paying a whole-window suffix search. The probe uses
+            // the scalar bitset classifier, where a suffix-first whole-window
+            // search is otherwise the only cheap witness, so an optional run
+            // scanner retains its single-call physical-overread envelope for
+            // the remaining tail. Exact small classes keep their established
+            // geometry.
+            let probe_end = if self.implementation == ClassImplementation::Bitset {
+                RANGE_BLOCK.min(searched.len())
             } else {
-                (memchr(self.suffix[0], &searched[1..]), 1)
+                1
             };
-            accounting.prefilter_calls = prefilter_calls;
-            let Some(relative_candidate) = relative_candidate else {
-                return Ok((None, accounting));
-            };
-            let candidate =
-                relative_candidate
+            let probe_boundary = if probe_end == 1 {
+                1
+            } else {
+                let (relative_probe_boundary, probe_examined) =
+                    self.scan_prefix(&searched[1..probe_end])?;
+                accounting.prefix_bytes_examined = accounting
+                    .prefix_bytes_examined
+                    .checked_add(probe_examined)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "leading prefix probe examinations",
+                    })?;
+                relative_probe_boundary
                     .checked_add(1)
                     .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "leading prefix probe boundary",
+                    })?
+            };
+            if probe_boundary < probe_end {
+                probe_boundary
+            } else {
+                // Small exact classes can use any suffix-first witness as an
+                // upper bound on the first outsider. The helper partitions long
+                // tails into an asymmetric scalar front, reverse back, and
+                // untouched middle without overlap; controls retain their
+                // first-candidate forward search.
+                let uses_edge_witness = matches!(
+                    self.implementation,
+                    ClassImplementation::Pair { .. }
+                        | ClassImplementation::Triple { .. }
+                        | ClassImplementation::Quad { .. }
+                        | ClassImplementation::Quint { .. }
+                );
+                // On short Pair/Quad tails, a suffix-first byte in the
+                // middle is common enough that searching the reverse 32-byte
+                // edge first is pure extra work. One forward native search also
+                // returns the authoritative first outsider. Keep Quint isolated
+                // on its measured edge geometry and retain that geometry for all
+                // longer tails.
+                let uses_short_forward_witness = searched.len().saturating_sub(probe_end)
+                    <= SHORT_FORWARD_WITNESS_MAX
+                    && matches!(
+                        self.implementation,
+                        ClassImplementation::Pair { .. } | ClassImplementation::Quad { .. }
+                    );
+                let witness_source = &searched[probe_end..];
+                let (relative_candidate, prefilter_calls) = if uses_short_forward_witness {
+                    (memchr(self.suffix[0], witness_source), 1)
+                } else if uses_edge_witness {
+                    asymmetric_suffix_witness(self.suffix[0], witness_source)?
+                } else {
+                    (memchr(self.suffix[0], witness_source), 1)
+                };
+                accounting.prefilter_calls = prefilter_calls;
+                let Some(relative_candidate) = relative_candidate else {
+                    return Ok((None, accounting));
+                };
+                let candidate = relative_candidate.checked_add(probe_end).ok_or(
+                    SearchError::ArithmeticOverflow {
                         computation: "native prefilter candidate",
+                    },
+                )?;
+                // `candidate` is already known to contain `suffix[0]`, which is
+                // outside the class by construction. Validate only the prefix
+                // before it so a valid candidate never enters failed-block
+                // recovery merely to rediscover that known boundary.
+                let validation_start = if probe_end == 1 { 0 } else { probe_end };
+                let (relative_boundary, examined) = self.scan_candidate_prefix_with_run_scanner(
+                    &searched[validation_start..candidate],
+                    bitset_scanner,
+                )?;
+                accounting.prefix_bytes_examined = accounting
+                    .prefix_bytes_examined
+                    .checked_add(examined)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "actual prefix examinations",
                     })?;
-            // `candidate` is already known to contain `suffix[0]`, which is
-            // outside the class by construction. Validate only the prefix
-            // before it so a valid candidate never enters failed-block
-            // recovery merely to rediscover that known boundary.
-            let (boundary, examined) = self
-                .scan_candidate_prefix_with_run_scanner(&searched[..candidate], bitset_scanner)?;
-            accounting.prefix_bytes_examined = accounting
-                .prefix_bytes_examined
-                .checked_add(examined)
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "actual prefix examinations",
-                })?;
-            // A forward witness is the first suffix-first byte, so an earlier
-            // outsider cannot begin the suffix. An edge witness may be later;
-            // there the scanner's returned first outsider is authoritative.
-            if (!uses_edge_witness || uses_short_forward_witness) && boundary != candidate {
-                return Ok((None, accounting));
+                let boundary = relative_boundary.checked_add(validation_start).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "post-probe prefix boundary",
+                    },
+                )?;
+                // A forward witness is the first suffix-first byte, so an earlier
+                // outsider cannot begin the suffix. An edge witness may be later;
+                // there the scanner's returned first outsider is authoritative.
+                if (!uses_edge_witness || uses_short_forward_witness) && boundary != candidate {
+                    return Ok((None, accounting));
+                }
+                boundary
             }
-            boundary
         };
 
         let end =
@@ -3932,7 +3975,7 @@ mod tests {
         let pair = plan(ByteClass::from_bytes(b" \t \t"), b"Z", false);
         assert_eq!(
             pair.plan_id(),
-            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-inline.v22"
+            "anchored-class-suffix.single-candidate32-65536-equality32-pair-candidate16-4096-neon16-swar8-tail-extension4097-65536-cold-entry-triple-candidate-swar8x4-cold-recovery32-range-swar1-short72-pair-quad-forward-middle-equality5-candidate-reduce32-short-front8-back8-middle40-63-asymmetric-scalar8-reverse32-bitset-prefix31-inline.v23"
         );
         assert_eq!(
             pair.implementation(),
@@ -5108,6 +5151,7 @@ mod tests {
         assert_eq!(cases[1].0.implementation(), ClassImplementation::Bitset);
 
         for (plan, members, wrong) in cases {
+            let bitset = plan.implementation() == ClassImplementation::Bitset;
             for candidate in [1_usize, 4, 31, 32, 33, 63, 64, 65] {
                 let mut haystack: Vec<u8> = (0..candidate)
                     .map(|index| members[index % members.len()])
@@ -5115,10 +5159,11 @@ mod tests {
                 haystack.extend_from_slice(plan.suffix());
                 let (span, accounting) = plan.find(&haystack, SearchLimits::unlimited()).unwrap();
                 assert_eq!(span, Some((0, haystack.len())));
-                assert_eq!(accounting.prefix_bytes_examined, candidate + 1);
+                let expected_examined = candidate + usize::from(!bitset || candidate < RANGE_BLOCK);
+                assert_eq!(accounting.prefix_bytes_examined, expected_examined);
                 assert_eq!(
                     accounting.prefilter_calls,
-                    usize::from(haystack.len() >= 32)
+                    usize::from(haystack.len() >= 32 && !(bitset && candidate < RANGE_BLOCK))
                 );
             }
 
@@ -5138,9 +5183,33 @@ mod tests {
                 .find(&earlier_wrong, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(span, None);
-            assert_eq!(accounting.prefilter_calls, 1);
-            assert!(!accounting.suffix_confirmation_attempted);
+            assert_eq!(accounting.prefilter_calls, usize::from(!bitset));
+            assert_eq!(accounting.suffix_confirmation_attempted, bitset);
         }
+    }
+
+    #[test]
+    fn bitset_probe_rejects_a_short_anchored_run_before_whole_window_prefiltering() {
+        let plan = plan(
+            ByteClass::from_bytes(b"/abcdefghijklmnopqrstuvwxyz"),
+            b"Z",
+            false,
+        );
+        assert_eq!(plan.implementation(), ClassImplementation::Bitset);
+
+        let mut absent = vec![b'!'; 65_521];
+        absent[..11].copy_from_slice(b"/srv/cacheY");
+        let (span, accounting) = plan.find(&absent, SearchLimits::unlimited()).unwrap();
+        assert_eq!(span, None);
+        assert_eq!(accounting.prefilter_calls, 0);
+        assert_eq!(accounting.prefix_bytes_examined, 11);
+        assert!(accounting.suffix_confirmation_attempted);
+
+        absent[10] = b'Z';
+        let (span, accounting) = plan.find(&absent, SearchLimits::unlimited()).unwrap();
+        assert_eq!(span, Some((0, 11)));
+        assert_eq!(accounting.prefilter_calls, 0);
+        assert_eq!(accounting.prefix_bytes_examined, 11);
     }
 
     #[test]
