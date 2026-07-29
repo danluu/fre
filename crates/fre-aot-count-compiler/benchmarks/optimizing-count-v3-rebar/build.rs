@@ -178,6 +178,54 @@ impl BuildAuthority {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PromotionBinding {
+    proposal_sha256: String,
+    manifest_sha256: String,
+    authority_source_sha256: String,
+}
+
+impl PromotionBinding {
+    fn from_environment(
+        authority: BuildAuthority,
+        manifest_dir: &Path,
+    ) -> Result<Option<Self>, String> {
+        let proposal_variable = "FRE_COUNT_V3_PROMOTION_PROPOSAL_SHA256";
+        let manifest_variable = "FRE_COUNT_V3_PROMOTION_MANIFEST_SHA256";
+        if authority == BuildAuthority::QualificationPrivate {
+            if env::var_os(proposal_variable).is_some() || env::var_os(manifest_variable).is_some()
+            {
+                return Err(
+                    "qualification-private build refuses production proposal/manifest inputs"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        }
+        let proposal_sha256 = required_hex_environment(proposal_variable)?;
+        let manifest_sha256 = required_hex_environment(manifest_variable)?;
+        let authority_source =
+            manifest_dir.join("../../../fre-aot-static-runtime/src/support_v3.rs");
+        println!("cargo:rerun-if-changed={}", authority_source.display());
+        let source = read_regular_file(&authority_source, MAX_SOURCE_FILE_BYTES, false)?;
+        let source_text = std::str::from_utf8(&source).map_err(|error| {
+            format!("Count-v3 production authority source is not UTF-8: {error}")
+        })?;
+        let source_manifest = parse_promotion_manifest_atom(source_text)?;
+        if hex(&source_manifest) != manifest_sha256 {
+            return Err(
+                "Count-v3 runtime source manifest atom differs from the reviewed promotion manifest"
+                    .to_string(),
+            );
+        }
+        Ok(Some(Self {
+            proposal_sha256,
+            manifest_sha256,
+            authority_source_sha256: sha256_hex(&source),
+        }))
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         panic!("optimizing Count-v3 Rebar builder refused: {error}");
@@ -194,6 +242,8 @@ fn run() -> Result<(), String> {
         "FRE_COUNT_V3_TUNING_CLASS",
         "FRE_COUNT_V3_REQUIRED_ISA",
         "FRE_COUNT_V3_BUILD_AUTHORITY",
+        "FRE_COUNT_V3_PROMOTION_PROPOSAL_SHA256",
+        "FRE_COUNT_V3_PROMOTION_MANIFEST_SHA256",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -212,6 +262,7 @@ fn run() -> Result<(), String> {
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
     let out_dir = required_path("OUT_DIR")?;
     let authority = BuildAuthority::from_environment()?;
+    let promotion = PromotionBinding::from_environment(authority, &manifest_dir)?;
     let target = TargetConfig::from_environment()?;
     println!("cargo:rustc-check-cfg=cfg(fre_count_v3_neon)");
     println!("cargo:rustc-check-cfg=cfg(fre_count_v3_sve)");
@@ -260,6 +311,7 @@ fn run() -> Result<(), String> {
         &source_receipt,
         &compiled,
         authority,
+        promotion.as_ref(),
     );
     let registry_bytes = serde_json::to_vec(&registry)
         .map_err(|error| format!("serialize compiled artifact registry: {error}"))?;
@@ -1109,6 +1161,7 @@ fn build_registry(
     source_receipt: &Value,
     compiled: &[CompiledArtifact],
     authority: BuildAuthority,
+    promotion: Option<&PromotionBinding>,
 ) -> Value {
     let compiled_patterns: Vec<Value> = compiled
         .iter()
@@ -1178,10 +1231,24 @@ fn build_registry(
         "tuning_class": target.tuning_class_name,
     });
     if authority.is_production() {
+        let promotion =
+            promotion.expect("production build established its reviewed promotion binding");
         let object = registry
             .as_object_mut()
             .expect("registry literal is an object");
         object.insert("build_authority".to_string(), json!(authority.name()));
+        object.insert(
+            "promotion_authority_source_sha256".to_string(),
+            json!(promotion.authority_source_sha256),
+        );
+        object.insert(
+            "promotion_manifest_sha256".to_string(),
+            json!(promotion.manifest_sha256),
+        );
+        object.insert(
+            "promotion_proposal_sha256".to_string(),
+            json!(promotion.proposal_sha256),
+        );
         object.insert(
             "cells".to_string(),
             Value::Array(
@@ -1201,6 +1268,11 @@ fn build_registry(
                     })
                     .collect(),
             ),
+        );
+    } else {
+        assert!(
+            promotion.is_none(),
+            "qualification build cannot carry a production promotion binding"
         );
     }
     registry
@@ -1538,6 +1610,56 @@ fn build_authority_binding_sha256(authority: &str, registry_sha256: &str) -> Str
     hasher.update(registry_bytes);
     hasher.update(registry_sha256.as_bytes());
     hex(&hasher.finalize())
+}
+
+fn parse_promotion_manifest_atom(source: &str) -> Result<[u8; 32], String> {
+    let marker = "const COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256: [u8; 32] = [";
+    let mut starts = source.match_indices(marker);
+    let (_, first_tail) = starts
+        .next()
+        .ok_or("Count-v3 runtime source lacks its promotion manifest atom")?;
+    if starts.next().is_some() {
+        return Err("Count-v3 runtime source repeats its promotion manifest atom".to_string());
+    }
+    let body_start = first_tail
+        .checked_add(marker.len())
+        .ok_or("promotion manifest atom offset overflow")?;
+    let tail = source
+        .get(body_start..)
+        .ok_or("promotion manifest atom starts outside source")?;
+    let body_end = tail
+        .find("];")
+        .ok_or("Count-v3 runtime promotion manifest atom is unterminated")?;
+    let body = &tail[..body_end];
+    let mut output = [0_u8; 32];
+    let mut count = 0_usize;
+    for raw in body.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if count >= output.len()
+            || token.len() != 4
+            || !token.starts_with("0x")
+            || !token[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(
+                "Count-v3 runtime promotion manifest atom is not exactly 32 byte literals"
+                    .to_string(),
+            );
+        }
+        output[count] = u8::from_str_radix(&token[2..], 16)
+            .map_err(|_| "Count-v3 runtime promotion manifest atom has invalid hex")?;
+        count = count
+            .checked_add(1)
+            .ok_or("promotion manifest atom byte count overflow")?;
+    }
+    if count != output.len() || output.iter().all(|byte| *byte == 0) {
+        return Err(
+            "Count-v3 runtime promotion manifest atom is empty, zero, or incomplete".to_string(),
+        );
+    }
+    Ok(output)
 }
 
 fn eligibility_tuple_source_v3(tuple: CountGeneralEligibilityTupleV3) -> String {
@@ -1999,5 +2121,32 @@ mod tests {
         assert_eq!(qualification.len(), 64);
         assert_eq!(production.len(), 64);
         assert_eq!(other_registry.len(), 64);
+    }
+
+    #[test]
+    fn promotion_manifest_atom_requires_one_nonzero_exact_byte_array() {
+        let bytes = (0_u8..32)
+            .map(|byte| format!("0x{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source =
+            format!("const COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256: [u8; 32] = [{bytes}];");
+        let parsed = parse_promotion_manifest_atom(&source).expect("exact atom should parse");
+        assert_eq!(parsed, core::array::from_fn(|index| index as u8));
+
+        let zero = "0x00, ".repeat(32);
+        assert!(
+            parse_promotion_manifest_atom(&format!(
+                "const COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256: [u8; 32] = [{zero}];"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_promotion_manifest_atom(
+                "const COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256: [u8; 32] = [0x01];"
+            )
+            .is_err()
+        );
+        assert!(parse_promotion_manifest_atom(&format!("{source}\n{source}")).is_err());
     }
 }

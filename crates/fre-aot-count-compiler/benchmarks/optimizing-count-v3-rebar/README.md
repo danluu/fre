@@ -44,6 +44,12 @@ The build is fail-closed and accepts these environment variables:
   `neoverse-v2-v3`.
 - `FRE_COUNT_V3_REQUIRED_ISA`: `neon`, `sve-vl16`, or `sve2-vl16`. The selected
   optimizer/backend must independently emit that exact ISA row.
+- `FRE_COUNT_V3_PROMOTION_PROPOSAL_SHA256` and
+  `FRE_COUNT_V3_PROMOTION_MANIFEST_SHA256`: required only for a production
+  build. They are the full-file digests (including the final LF) of the
+  reviewed proposal and manifest. The manifest digest must also equal the
+  nonzero manifest atom installed beside the exact source-authority tuple
+  rows. Qualification builds refuse both variables.
 
 A qualification build must use both
 `FRE_COUNT_V3_BUILD_AUTHORITY=qualification-private` and
@@ -77,8 +83,10 @@ Production uses the distinct
 `fre.optimizing-count-v3.production-confirmation-artifact-registry.v1`
 schema. It adds the frozen cell join needed by the post-promotion controller,
 marks qualification authority absent, and marks production authority as
-requiring reviewed source tuples. Both binaries embed their exact build
-authority and a domain-separated hash binding it to the registry digest.
+requiring reviewed source tuples. It also embeds the proposal and manifest
+digests plus the digest of the exact runtime source file that holds the
+manifest atom and tuple rows. Both binaries embed their exact build authority
+and a domain-separated hash binding it to the registry digest.
 
 Eventual promotion does not enumerate Rebar cases, patterns, literals, or
 artifact IDs. For each target, it joins evidence-passing eligible artifact IDs
@@ -160,7 +168,7 @@ explicit set of promoted cells. Its plan is exact compact sorted JSON with no
 trailing newline:
 
 ```json
-{"cells":[{"cell_id":"CELL","iterations":1000000}],"haystack_dir":"/absolute/content-addressed-haystacks","minimum_elapsed_ns":1000000000,"repetitions":30,"runner":{"path":"/absolute/sealed/fre-optimizing-count-v3-rebar","registry_sha256":"64-lower-hex","sha256":"64-lower-hex","timeout_seconds":120},"schema":"fre.optimizing-count-v3.production-confirmation-plan.v1","target_contract_sha256":"64-lower-hex","target_id":"TARGET","timing_wrapper":{"argv":["/absolute/sealed/wrapper","run-timing","--"],"executable_sha256":"64-lower-hex"}}
+{"cells":[{"cell_id":"CELL","iterations":1000000}],"haystack_dir":"/absolute/content-addressed-haystacks","minimum_elapsed_ns":1000000000,"promotion":{"manifest_path":"/absolute/promotion-manifest.json","manifest_sha256":"64-lower-hex","proposal_path":"/absolute/promotion-proposal.json","proposal_sha256":"64-lower-hex"},"repetitions":30,"runner":{"path":"/absolute/sealed/fre-optimizing-count-v3-rebar","registry_sha256":"64-lower-hex","sha256":"64-lower-hex","timeout_seconds":120},"schema":"fre.optimizing-count-v3.production-confirmation-plan.v1","target_contract_sha256":"64-lower-hex","target_id":"TARGET","timing_wrapper":{"argv":["/absolute/sealed/wrapper","run-timing","--"],"contract":"full-lifetime-holder-no-child-on-exit-75-v1","executable_sha256":"64-lower-hex"}}
 ```
 
 Run or resume it with:
@@ -178,11 +186,22 @@ WRAPPER_PREFIX RUNNER (correctness|measure) CELL ENGINE ITERATIONS
 ```
 
 Thus the admission holder covers the runner's full lifetime; there is no
-probe/release race. If the wrapper returns 75, the denial is fsynced and the
-controller immediately returns 75 without waiting or retrying. A later
+probe/release race. The declared wrapper contract requires exit 75 to mean
+that no runner child was started. The controller accepts 75 only with empty
+stdout, fsyncs the denial, and immediately returns 75 without waiting or
+retrying. It never retains or replaces a sample from a denied launch. A later
 invocation resumes the exact journal prefix. The controller never searches
 `PATH`, waits for an idle host, or signals unrelated work. A timeout kills only
 the new process group containing its own wrapper and runner.
+
+Before scheduling anything, the controller authenticates the exact
+LF-terminated promotion proposal and manifest from the plan. It closes the
+manifest projection and global qualified-tuple set over the proposal, selects
+the exact target, checks the production registry/binary promotion hashes, and
+requires every selected cell's complete 35-field tuple to byte-match a
+qualified class for that target. The registry must expose one current portable
+control, one current Count-v2 control, and one real production Count-v3 row per
+compiled pattern; controls cannot carry a production tuple.
 
 All selected cells are authorized in fresh processes before any correctness or
 timing process starts. Any unpromoted tuple or other authorization failure is
@@ -197,10 +216,14 @@ The create-only sealed summary contains every paired elapsed value and reports:
 - the exact integer-product test
   `Count-v3/faster-current-control < 4/5`;
 - at least `ceil(4 * repetitions / 5)` strict paired wins per cell; and
-- the aggregate ratio and exact `< 4/5` result across all retained cells.
+- the same exact ratio and at-least-80%-wins gates per tuple and for the target
+  aggregate across all retained cells; and
+- exact balanced coverage of all six engine orders.
 
-The summary status is `pass` only when every cell, every source tuple, and the
-aggregate pass those gates. Its payload hash, plan hash, journal hash, registry
-hash, source-set hash, runner hash, and timing-wrapper hash make the result
-independently replayable. This confirmation is downstream of promotion; it
-does not replace held-out qualification evidence or create source authority.
+The summary status is `pass` only when every cell, every source tuple, the
+target aggregate, and the six-order balance pass those gates. It reports the
+selected cell IDs and binds the qualification ID/spec, qualification artifact
+registry, proposal, manifest, production-authority source, payload, plan,
+journal, production registry, source set, runner, and timing wrapper. This
+confirmation is downstream of promotion; it does not replace held-out
+qualification evidence or create source authority.

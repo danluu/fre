@@ -597,16 +597,41 @@ fn validate_embedded_authority() -> Result<(), RunnerError> {
         ));
     }
     #[cfg(feature = "qualification-private")]
-    if object.contains_key("build_authority") {
+    if [
+        "build_authority",
+        "cells",
+        "promotion_authority_source_sha256",
+        "promotion_manifest_sha256",
+        "promotion_proposal_sha256",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field))
+    {
         return Err(RunnerError::new(
-            "qualification registry unexpectedly gained a production build-authority field",
+            "qualification registry unexpectedly gained production-only authority fields",
         ));
     }
     #[cfg(feature = "production")]
-    if object.get("build_authority").and_then(Value::as_str) != Some(COMPILED_BUILD_AUTHORITY) {
-        return Err(RunnerError::new(
-            "production registry lacks its exact build-authority field",
-        ));
+    {
+        if object.get("build_authority").and_then(Value::as_str) != Some(COMPILED_BUILD_AUTHORITY) {
+            return Err(RunnerError::new(
+                "production registry lacks its exact build-authority field",
+            ));
+        }
+        for (field, label) in [
+            (
+                "promotion_authority_source_sha256",
+                "promotion authority source SHA-256",
+            ),
+            ("promotion_manifest_sha256", "promotion manifest SHA-256"),
+            ("promotion_proposal_sha256", "promotion proposal SHA-256"),
+        ] {
+            let value = object
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| RunnerError::new(format!("production registry lacks {label}")))?;
+            require_lower_hex_64(value, label)?;
+        }
     }
 
     let patterns = object

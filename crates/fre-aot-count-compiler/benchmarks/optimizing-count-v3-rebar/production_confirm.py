@@ -26,6 +26,11 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 PLAN_SCHEMA = "fre.optimizing-count-v3.production-confirmation-plan.v1"
+PROMOTION_PROPOSAL_SCHEMA = "fre.optimizing-count-v3.promotion-proposal.v3"
+PROMOTION_MANIFEST_SCHEMA = "fre.optimizing-count-v3.promotion-manifest.v1"
+QUALIFIED_TUPLE_SET_SCHEMA = (
+    "fre.optimizing-count-v3.qualified-eligibility-tuples.v1"
+)
 REGISTRY_SCHEMA = (
     "fre.optimizing-count-v3.production-confirmation-artifact-registry.v1"
 )
@@ -67,6 +72,7 @@ MAXIMUM_SAMPLE_NS = 120_000_000_000
 MAXIMUM_CELLS = 1_024
 MAXIMUM_PROCESS_OUTPUT_BYTES = 1_048_576
 MAXIMUM_PLAN_BYTES = 4 * 1_048_576
+MAXIMUM_PROMOTION_BYTES = 64 * 1_048_576
 MAXIMUM_JOURNAL_BYTES = 512 * 1_048_576
 MAXIMUM_RUNNER_BYTES = 512 * 1_048_576
 MAXIMUM_WRAPPER_BYTES = 32 * 1_048_576
@@ -75,6 +81,45 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,95}$")
 RESULT_DOMAIN = b"fre.optimizing-count-v3.production-confirmation.result.v1\0"
 WORK_DOMAIN = b"fre.optimizing-count-v3.production-confirmation.work.v1\0"
+LONG_SCAN_POLICY = "minimum-haystack-4096-bytes-v1"
+TIMING_WRAPPER_CONTRACT = "full-lifetime-holder-no-child-on-exit-75-v1"
+GENERAL_ELIGIBILITY_FIELDS = (
+    "compiler_version",
+    "metadata_version",
+    "image_schema_version",
+    "backend_version",
+    "algorithm_version",
+    "auditor_version",
+    "kir_semantics_version",
+    "kir_abi_version",
+    "recipe_schema_version",
+    "optimizer_version",
+    "tuning_class_id",
+    "strategy_id",
+    "schedule_id",
+    "register_plan_id",
+    "literal_bytes",
+    "filter_len",
+    "sparse_group_count",
+    "match_stride",
+    "periodic_stride",
+    "call_abi_schema",
+    "abi_kind",
+    "status_bits",
+    "output_kind",
+    "architecture",
+    "little_endian",
+    "pointer_width",
+    "target_abi",
+    "object_format",
+    "required_isa_id",
+    "actual_features",
+    "allowed_features",
+    "candidate_block_starts",
+    "vector_bytes",
+    "sve_vector_length_bytes",
+    "max_literal_bytes",
+)
 
 
 class ConfirmationError(RuntimeError):
@@ -181,6 +226,51 @@ def _load_canonical_json(path: Path, maximum: int, label: str) -> tuple[dict[str
     return value, bytes_value
 
 
+def _load_canonical_json_file(
+    path: Path, maximum: int, label: str
+) -> tuple[dict[str, Any], bytes]:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        fail(f"stat {label}: {error}")
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size < 3
+        or before.st_size > maximum
+    ):
+        fail(f"{label} is not one bounded regular file")
+    try:
+        bytes_value = path.read_bytes()
+        after = path.stat()
+    except OSError as error:
+        fail(f"read {label}: {error}")
+    if (
+        len(bytes_value) != before.st_size
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        fail(f"{label} changed while reading")
+    if not bytes_value.endswith(b"\n") or bytes_value[:-1].find(b"\n") >= 0:
+        fail(f"{label} is not one LF-terminated canonical JSON object")
+    value = require_object(decode_json(bytes_value[:-1], label), label)
+    if canonical_json_bytes(value) + b"\n" != bytes_value:
+        fail(f"{label} is not exact compact sorted canonical JSON plus LF")
+    return value, bytes_value
+
+
+def _canonical_absolute_path(raw_path: Any, label: str) -> Path:
+    path = Path(require_string(raw_path, label))
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        fail(f"resolve {label}: {error}")
+    if not path.is_absolute() or resolved != path:
+        fail(f"{label} is not absolute and canonical")
+    return path
+
+
 def _seal_executable(
     raw_path: Any,
     expected_sha256: Any,
@@ -257,6 +347,7 @@ def validate_plan(value: dict[str, Any]) -> dict[str, Any]:
             "cells",
             "haystack_dir",
             "minimum_elapsed_ns",
+            "promotion",
             "repetitions",
             "runner",
             "schema",
@@ -304,8 +395,40 @@ def validate_plan(value: dict[str, Any]) -> dict[str, Any]:
     if timeout_seconds * 1_000_000_000 <= minimum_elapsed_ns:
         fail("runner timeout must exceed the retained minimum elapsed time")
 
+    promotion = require_object(value["promotion"], "promotion")
+    exact_keys(
+        promotion,
+        {
+            "manifest_path",
+            "manifest_sha256",
+            "proposal_path",
+            "proposal_sha256",
+        },
+        "promotion",
+    )
+    proposal_path = _canonical_absolute_path(
+        promotion["proposal_path"], "promotion proposal path"
+    )
+    manifest_path = _canonical_absolute_path(
+        promotion["manifest_path"], "promotion manifest path"
+    )
+    proposal_sha256 = require_string(
+        promotion["proposal_sha256"], "promotion proposal SHA-256", HEX64
+    )
+    manifest_sha256 = require_string(
+        promotion["manifest_sha256"], "promotion manifest SHA-256", HEX64
+    )
+    if proposal_path == manifest_path:
+        fail("promotion proposal and manifest paths are not distinct")
+
     wrapper = require_object(value["timing_wrapper"], "timing wrapper")
-    exact_keys(wrapper, {"argv", "executable_sha256"}, "timing wrapper")
+    exact_keys(
+        wrapper,
+        {"argv", "contract", "executable_sha256"},
+        "timing wrapper",
+    )
+    if wrapper["contract"] != TIMING_WRAPPER_CONTRACT:
+        fail("timing-wrapper contract differs from the no-child-on-75 protocol")
     argv = require_list(wrapper["argv"], "timing-wrapper argv", 64)
     normalized_argv = []
     for ordinal, argument in enumerate(argv):
@@ -361,7 +484,14 @@ def validate_plan(value: dict[str, Any]) -> dict[str, Any]:
         },
         "timing_wrapper": {
             "argv": normalized_argv,
+            "contract": TIMING_WRAPPER_CONTRACT,
             "executable_sha256": wrapper_sha256,
+        },
+        "promotion": {
+            "manifest_path": manifest_path,
+            "manifest_sha256": manifest_sha256,
+            "proposal_path": proposal_path,
+            "proposal_sha256": proposal_sha256,
         },
         "haystack_dir": haystack_dir,
         "cells": normalized_cells,
@@ -411,6 +541,358 @@ def _one_json_line(bytes_value: bytes, label: str) -> dict[str, Any]:
     return require_object(decode_json(bytes_value[:-1], label), label)
 
 
+def _validate_eligibility_tuple(value: Any, label: str) -> dict[str, Any]:
+    row = require_object(value, label)
+    exact_keys(row, GENERAL_ELIGIBILITY_FIELDS, label)
+    for field in GENERAL_ELIGIBILITY_FIELDS:
+        if field == "little_endian":
+            if row[field] is not True:
+                fail(f"{label}.little_endian is not true")
+        elif type(row[field]) is not int or not 0 <= row[field] <= (1 << 64) - 1:
+            fail(f"{label}.{field} is not a canonical unsigned integer")
+    if not 1 <= row["literal_bytes"] <= 32:
+        fail(f"{label}.literal_bytes is outside the Count-v3 bound")
+    if not 1 <= row["max_literal_bytes"] <= (1 << 16) - 1:
+        fail(f"{label}.max_literal_bytes is outside the Count-v3 bound")
+    if row["literal_bytes"] > row["max_literal_bytes"]:
+        fail(f"{label} literal width exceeds max_literal_bytes")
+    if row["actual_features"] & ~row["allowed_features"]:
+        fail(f"{label}.actual_features escapes allowed_features")
+    return dict(row)
+
+
+def _validated_qualified_target(
+    raw: Any, label: str
+) -> tuple[dict[str, Any], dict[bytes, dict[str, Any]]]:
+    target = require_object(raw, label)
+    exact_keys(
+        target,
+        {
+            "evaluated_class_manifest_sha256",
+            "evaluated_classes",
+            "evaluated_families",
+            "qualified_classes",
+            "qualified_families",
+            "rejected_classes",
+            "rejected_families",
+            "target_id",
+            "target_receipt_sha256",
+        },
+        label,
+    )
+    require_string(target["target_id"], f"{label}.target_id", SAFE_ID)
+    require_string(
+        target["target_receipt_sha256"],
+        f"{label}.target_receipt_sha256",
+        HEX64,
+    )
+    require_string(
+        target["evaluated_class_manifest_sha256"],
+        f"{label}.evaluated_class_manifest_sha256",
+        HEX64,
+    )
+    classes = require_list(
+        target["qualified_classes"], f"{label}.qualified_classes", 65_536
+    )
+    qualified: dict[bytes, dict[str, Any]] = {}
+    for ordinal, raw_class in enumerate(classes):
+        class_label = f"{label}.qualified_classes[{ordinal}]"
+        result = require_object(raw_class, class_label)
+        exact_keys(
+            result,
+            {
+                "exact_tuple_gate_result",
+                "family_gate_result",
+                "general_eligibility_tuple",
+                "scan_generalization_family",
+                "state",
+            },
+            class_label,
+        )
+        exact_gate = require_object(
+            result["exact_tuple_gate_result"],
+            f"{class_label}.exact_tuple_gate_result",
+        )
+        family_gate = require_object(
+            result["family_gate_result"],
+            f"{class_label}.family_gate_result",
+        )
+        require_object(
+            result["scan_generalization_family"],
+            f"{class_label}.scan_generalization_family",
+        )
+        if (
+            result["state"] != "pass"
+            or exact_gate.get("state") != "pass"
+            or family_gate.get("state") != "pass"
+        ):
+            fail(f"{class_label} is not an explicit exact-and-family pass")
+        eligibility = _validate_eligibility_tuple(
+            result["general_eligibility_tuple"],
+            f"{class_label}.general_eligibility_tuple",
+        )
+        encoded = canonical_json_bytes(eligibility)
+        if encoded in qualified:
+            fail(f"{label} repeats a qualified eligibility tuple")
+        qualified[encoded] = eligibility
+    evaluated_classes = require_uint(
+        target["evaluated_classes"], 1, 65_536, f"{label}.evaluated_classes"
+    )
+    rejected_classes = require_uint(
+        target["rejected_classes"], 0, 65_536, f"{label}.rejected_classes"
+    )
+    qualified_families = require_uint(
+        target["qualified_families"], 1, 65_536, f"{label}.qualified_families"
+    )
+    rejected_families = require_uint(
+        target["rejected_families"], 0, 65_536, f"{label}.rejected_families"
+    )
+    evaluated_families = require_uint(
+        target["evaluated_families"], 1, 65_536, f"{label}.evaluated_families"
+    )
+    if evaluated_classes != len(classes) + rejected_classes:
+        fail(f"{label} class counts do not close")
+    if evaluated_families != qualified_families + rejected_families:
+        fail(f"{label} family counts do not close")
+    return dict(target), qualified
+
+
+def load_promotion(
+    plan: Mapping[str, Any], registry: Mapping[str, Any]
+) -> dict[str, Any]:
+    proposal, proposal_bytes = _load_canonical_json_file(
+        plan["promotion"]["proposal_path"],
+        MAXIMUM_PROMOTION_BYTES,
+        "promotion proposal",
+    )
+    manifest, manifest_bytes = _load_canonical_json_file(
+        plan["promotion"]["manifest_path"],
+        MAXIMUM_PROMOTION_BYTES,
+        "promotion manifest",
+    )
+    if sha256_bytes(proposal_bytes) != plan["promotion"]["proposal_sha256"]:
+        fail("promotion proposal digest differs from the plan")
+    if sha256_bytes(manifest_bytes) != plan["promotion"]["manifest_sha256"]:
+        fail("promotion manifest digest differs from the plan")
+
+    exact_keys(
+        proposal,
+        {
+            "class_gate_policy",
+            "long_scan_policy",
+            "production_authority",
+            "qualification_id",
+            "qualification_state",
+            "scan_generalization_family_policy",
+            "schema",
+            "spec_sha256",
+            "targets",
+        },
+        "promotion proposal",
+    )
+    qualification_id = require_string(
+        proposal["qualification_id"], "promotion qualification ID", SAFE_ID
+    )
+    spec_sha256 = require_string(
+        proposal["spec_sha256"], "promotion spec SHA-256", HEX64
+    )
+    if (
+        proposal["schema"] != PROMOTION_PROPOSAL_SCHEMA
+        or proposal["qualification_state"] != "candidate"
+        or proposal["production_authority"] != "absent"
+        or proposal["long_scan_policy"] != LONG_SCAN_POLICY
+    ):
+        fail("promotion proposal is not the closed review-only long-scan candidate")
+    require_object(proposal["class_gate_policy"], "proposal class-gate policy")
+    require_object(
+        proposal["scan_generalization_family_policy"],
+        "proposal scan-generalization-family policy",
+    )
+    proposal_targets: dict[str, dict[str, Any]] = {}
+    target_tuples: dict[str, dict[bytes, dict[str, Any]]] = {}
+    all_proposal_tuples: dict[bytes, dict[str, Any]] = {}
+    previous_target = ""
+    for ordinal, raw_target in enumerate(
+        require_list(proposal["targets"], "proposal targets", 256)
+    ):
+        target, qualified = _validated_qualified_target(
+            raw_target, f"proposal targets[{ordinal}]"
+        )
+        target_id = target["target_id"]
+        if target_id <= previous_target or target_id in proposal_targets:
+            fail("proposal targets are not in canonical unique target-ID order")
+        previous_target = target_id
+        proposal_targets[target_id] = target
+        target_tuples[target_id] = qualified
+        all_proposal_tuples.update(qualified)
+    target_id = plan["target_id"]
+    if target_id not in proposal_targets:
+        fail("plan target has no qualified promotion-proposal target")
+
+    exact_keys(
+        manifest,
+        {
+            "bundle",
+            "long_scan_policy",
+            "production_authority",
+            "qualification_id",
+            "qualified_tuple_set",
+            "schema",
+            "source_freeze",
+            "toolchain",
+            "trusted_spec",
+            "verifier_projection",
+        },
+        "promotion manifest",
+    )
+    if (
+        manifest["schema"] != PROMOTION_MANIFEST_SCHEMA
+        or manifest["qualification_id"] != qualification_id
+        or manifest["production_authority"] != "absent"
+        or manifest["long_scan_policy"] != LONG_SCAN_POLICY
+    ):
+        fail("promotion manifest identity or review-only authority differs")
+    trusted_spec = require_object(manifest["trusted_spec"], "manifest trusted spec")
+    exact_keys(trusted_spec, {"bytes", "sha256"}, "manifest trusted spec")
+    require_uint(
+        trusted_spec["bytes"], 1, MAXIMUM_PROMOTION_BYTES, "trusted spec bytes"
+    )
+    if require_string(
+        trusted_spec["sha256"], "manifest trusted-spec SHA-256", HEX64
+    ) != spec_sha256:
+        fail("proposal spec digest differs from the manifest trust anchor")
+
+    projection = require_object(
+        manifest["verifier_projection"], "manifest verifier projection"
+    )
+    exact_keys(
+        projection,
+        {
+            "bytes",
+            "class_gate_policy",
+            "file",
+            "scan_generalization_family_policy",
+            "schema",
+            "sha256",
+            "targets",
+        },
+        "manifest verifier projection",
+    )
+    if (
+        projection["schema"] != PROMOTION_PROPOSAL_SCHEMA
+        or projection["file"] != "promotion-proposal.json"
+        or projection["bytes"] != len(proposal_bytes)
+        or projection["sha256"] != plan["promotion"]["proposal_sha256"]
+        or projection["class_gate_policy"] != proposal["class_gate_policy"]
+        or projection["scan_generalization_family_policy"]
+        != proposal["scan_generalization_family_policy"]
+    ):
+        fail("manifest verifier projection differs from the authenticated proposal")
+    projected_targets = require_list(
+        projection["targets"], "manifest projected targets", 256
+    )
+    if len(projected_targets) != len(proposal_targets):
+        fail("manifest and proposal target counts differ")
+    target_artifact_registry_sha256 = ""
+    projected_ids: list[str] = []
+    for ordinal, raw_target in enumerate(projected_targets):
+        projected = require_object(
+            raw_target, f"manifest projected targets[{ordinal}]"
+        )
+        expected_fields = set(proposal_targets[next(iter(proposal_targets))])
+        exact_keys(
+            projected,
+            expected_fields | {"artifact_registry_sha256"},
+            f"manifest projected targets[{ordinal}]",
+        )
+        projected_id = require_string(
+            projected["target_id"], "manifest projected target ID", SAFE_ID
+        )
+        if projected_id not in proposal_targets:
+            fail("manifest projection contains an unknown target")
+        projected_ids.append(projected_id)
+        projected_copy = dict(projected)
+        artifact_registry_sha256 = require_string(
+            projected_copy.pop("artifact_registry_sha256"),
+            "qualification artifact-registry SHA-256",
+            HEX64,
+        )
+        if projected_copy != proposal_targets[projected_id]:
+            fail("manifest target projection differs from the proposal target")
+        if projected_id == target_id:
+            target_artifact_registry_sha256 = artifact_registry_sha256
+    if projected_ids != list(proposal_targets):
+        fail("manifest projected targets are not the proposal target sequence")
+    if not target_artifact_registry_sha256:
+        fail("manifest lacks the selected target projection")
+
+    tuple_set = require_object(
+        manifest["qualified_tuple_set"], "manifest qualified tuple set"
+    )
+    exact_keys(
+        tuple_set,
+        {"count", "schema", "sha256", "sort", "tuples"},
+        "manifest qualified tuple set",
+    )
+    raw_tuples = require_list(
+        tuple_set["tuples"], "manifest qualified tuples", 65_536
+    )
+    manifest_tuples: dict[bytes, dict[str, Any]] = {}
+    encoded_order: list[bytes] = []
+    for ordinal, raw_tuple in enumerate(raw_tuples):
+        eligibility = _validate_eligibility_tuple(
+            raw_tuple, f"manifest qualified tuples[{ordinal}]"
+        )
+        encoded = canonical_json_bytes(eligibility)
+        if encoded in manifest_tuples:
+            fail("manifest repeats a qualified tuple")
+        encoded_order.append(encoded)
+        manifest_tuples[encoded] = eligibility
+    tuple_payload = {
+        "schema": QUALIFIED_TUPLE_SET_SCHEMA,
+        "sort": "canonical-json-bytes-v1",
+        "tuples": raw_tuples,
+    }
+    if (
+        tuple_set["schema"] != QUALIFIED_TUPLE_SET_SCHEMA
+        or tuple_set["sort"] != "canonical-json-bytes-v1"
+        or require_uint(
+            tuple_set["count"], 1, 65_536, "manifest qualified tuple count"
+        )
+        != len(raw_tuples)
+        or require_string(
+            tuple_set["sha256"], "manifest qualified tuple-set SHA-256", HEX64
+        )
+        != sha256_bytes(canonical_json_bytes(tuple_payload))
+        or encoded_order != sorted(encoded_order)
+        or set(manifest_tuples) != set(all_proposal_tuples)
+    ):
+        fail("manifest qualified tuple-set closure differs from the proposal")
+
+    for field, expected in [
+        ("promotion_manifest_sha256", plan["promotion"]["manifest_sha256"]),
+        ("promotion_proposal_sha256", plan["promotion"]["proposal_sha256"]),
+    ]:
+        if require_string(registry.get(field), f"registry {field}", HEX64) != expected:
+            fail(f"production registry {field} differs from the plan")
+    authority_source_sha256 = require_string(
+        registry.get("promotion_authority_source_sha256"),
+        "registry promotion authority source SHA-256",
+        HEX64,
+    )
+    return {
+        "authority_source_sha256": authority_source_sha256,
+        "manifest_sha256": plan["promotion"]["manifest_sha256"],
+        "proposal_sha256": plan["promotion"]["proposal_sha256"],
+        "qualification_artifact_registry_sha256": (
+            target_artifact_registry_sha256
+        ),
+        "qualification_id": qualification_id,
+        "qualified_target_tuples": target_tuples[target_id],
+        "spec_sha256": spec_sha256,
+    }
+
+
 def load_registry(
     plan: Mapping[str, Any],
     runner_seal: Mapping[str, Any],
@@ -426,7 +908,7 @@ def load_registry(
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         fail(f"inventory runner failed: {error}")
-    if returncode != 0 or (item["kind"] == "authorization" and stderr):
+    if returncode != 0 or stderr:
         fail(f"inventory runner exited {returncode} or wrote stderr")
     registry = _one_json_line(stdout, "production registry")
     registry_bytes = stdout[:-1]
@@ -448,6 +930,9 @@ def load_registry(
             "inventory_sha256",
             "object_format",
             "production_authority",
+            "promotion_authority_source_sha256",
+            "promotion_manifest_sha256",
+            "promotion_proposal_sha256",
             "qualification_authority",
             "required_isa",
             "schema",
@@ -472,7 +957,9 @@ def load_registry(
 
 
 def index_registry(
-    registry: Mapping[str, Any], selected: Sequence[Mapping[str, Any]]
+    registry: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    qualified_target_tuples: Mapping[bytes, Mapping[str, Any]],
 ) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
     raw_cells = require_list(registry["cells"], "registry cells", 16_384)
     cells: dict[str, dict[str, Any]] = {}
@@ -556,39 +1043,86 @@ def index_registry(
             ),
         }
 
-    pattern_tuples: dict[str, Any] = {}
-    for ordinal, raw in enumerate(
-        require_list(registry["compiled_patterns"], "compiled patterns", 16_384)
-    ):
+    pattern_tuples: dict[str, dict[str, Any]] = {}
+    compiled_patterns = require_list(
+        registry["compiled_patterns"], "compiled patterns", 16_384
+    )
+    for ordinal, raw in enumerate(compiled_patterns):
         pattern = require_object(raw, f"compiled patterns[{ordinal}]")
+        exact_keys(
+            pattern,
+            {
+                "claim_derivations",
+                "engines",
+                "input_policy",
+                "optimizer_input_sha256",
+                "pattern_input_id",
+                "pattern_sha256",
+                "planning_receipt_identity",
+                "semantic_binding_identity",
+            },
+            f"compiled patterns[{ordinal}]",
+        )
         pattern_sha256 = require_string(
             pattern.get("pattern_sha256"), "compiled pattern SHA-256", HEX64
         )
-        v3_rows = [
-            require_object(row, "compiled engine row")
-            for row in require_list(pattern.get("engines"), "compiled engines", 3)
-            if require_object(row, "compiled engine row").get("engine") == "count-v3-aot"
-        ]
-        if len(v3_rows) != 1:
-            fail("compiled pattern lacks one Count-v3 engine row")
-        v3 = v3_rows[0]
-        if v3.get("runtime_authority") != "production":
-            fail("compiled Count-v3 row is not production-authority typed")
-        eligibility = require_object(
-            v3.get("general_eligibility_tuple"), "general eligibility tuple"
-        )
         if pattern_sha256 in pattern_tuples:
             fail("compiled pattern registry repeats a pattern SHA-256")
+        engines = require_list(pattern.get("engines"), "compiled engines", 3)
+        if len(engines) != len(ENGINES):
+            fail("compiled pattern does not have exactly three engine rows")
+        rows = [
+            require_object(row, f"compiled patterns[{ordinal}] engine row")
+            for row in engines
+        ]
+        labels = [row.get("engine") for row in rows]
+        if labels != list(ENGINES):
+            fail("compiled engine rows differ from the canonical control/v3 matrix")
+        for row in rows[:2]:
+            if (
+                row.get("runtime_authority") != "control"
+                or row.get("general_eligibility_tuple") is not None
+            ):
+                fail("compiled current-control row gained production authority")
+        v3 = rows[2]
+        if (
+            v3.get("runtime_authority") != "production"
+            or v3.get("engine") != "count-v3-aot"
+        ):
+            fail("compiled Count-v3 row is not production-authority typed")
+        eligibility = _validate_eligibility_tuple(
+            v3.get("general_eligibility_tuple"), "general eligibility tuple"
+        )
         pattern_tuples[pattern_sha256] = eligibility
+
+    distinct_artifacts = require_uint(
+        registry["distinct_artifacts"], 1, 16_384, "distinct artifacts"
+    )
+    if (
+        distinct_artifacts != len(pattern_tuples)
+        or len(artifacts) != len(pattern_tuples) * len(ENGINES)
+        or set(artifacts)
+        != {
+            (pattern_sha256, engine)
+            for pattern_sha256 in pattern_tuples
+            for engine in ENGINES
+        }
+    ):
+        fail("production registry does not close over one three-engine artifact matrix")
 
     for cell in cells.values():
         pattern = cell["pattern_sha256"]
         if pattern not in pattern_tuples:
             fail("selected cell lacks a compiled eligibility tuple")
-        cell["eligibility_tuple"] = pattern_tuples[pattern]
-        cell["eligibility_tuple_sha256"] = sha256_bytes(
-            canonical_json_bytes(pattern_tuples[pattern])
-        )
+        eligibility = pattern_tuples[pattern]
+        encoded = canonical_json_bytes(eligibility)
+        if encoded not in qualified_target_tuples:
+            fail(
+                "selected cell tuple is not an exact qualified tuple for the "
+                "proposal target"
+            )
+        cell["eligibility_tuple"] = eligibility
+        cell["eligibility_tuple_sha256"] = sha256_bytes(encoded)
         for engine in ENGINES:
             if (pattern, engine) not in artifacts:
                 fail("selected cell lacks the complete three-engine artifact matrix")
@@ -1023,6 +1557,23 @@ def _run_item(
         fail(f"runner launch failed and was sealed: {error}")
     stderr_sha256 = sha256_bytes(stderr)
     if returncode == TEMPORARY_UNAVAILABLE and item["kind"] != "authorization":
+        if stdout:
+            _journal_append(
+                journal,
+                {
+                    "kind": "failure",
+                    "nonce": nonce,
+                    "plan_sha256": plan_sha256,
+                    "response": None,
+                    "runner_stderr_sha256": stderr_sha256,
+                    "schema": JOURNAL_RESULT_SCHEMA,
+                    "sequence": item["sequence"],
+                },
+            )
+            fail(
+                "timing wrapper returned 75 after producing child output; "
+                "sample replacement is forbidden"
+            )
         _journal_append(
             journal,
             {
@@ -1036,7 +1587,7 @@ def _run_item(
             },
         )
         return TEMPORARY_UNAVAILABLE
-    if returncode != 0 or stderr:
+    if returncode != 0 or (item["kind"] == "authorization" and stderr):
         _journal_append(
             journal,
             {
@@ -1129,6 +1680,7 @@ def derive_summary(
     plan: Mapping[str, Any],
     plan_sha256: str,
     registry: Mapping[str, Any],
+    promotion: Mapping[str, Any],
     journal: Path,
     successful: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
     cells: Mapping[str, Mapping[str, Any]],
@@ -1151,6 +1703,8 @@ def derive_summary(
     aggregate_v3: list[int] = []
     aggregate_faster: list[int] = []
     aggregate_portable: list[int] = []
+    aggregate_wins = 0
+    order_counts = {">".join(order): 0 for order in ORDERS}
     tuple_accumulator: dict[str, dict[str, Any]] = {}
     for selected in plan["cells"]:
         cell = cells[selected["cell_id"]]
@@ -1158,6 +1712,7 @@ def derive_summary(
         faster_values = []
         portable_values = []
         samples = []
+        cell_order_counts = {">".join(order): 0 for order in ORDERS}
         wins = 0
         for repetition in range(1, plan["repetitions"] + 1):
             portable = measurements[(cell["cell_id"], repetition, "portable-current")]
@@ -1169,6 +1724,9 @@ def derive_summary(
             v3_values.append(v3)
             if v3 < faster:
                 wins += 1
+            order = ">".join(ORDERS[(repetition - 1) % len(ORDERS)])
+            cell_order_counts[order] += 1
+            order_counts[order] += 1
             samples.append(
                 {
                     "count_v2_elapsed_ns": v2,
@@ -1178,6 +1736,7 @@ def derive_summary(
                         if portable <= v2
                         else "count-v2-current"
                     ),
+                    "order": order,
                     "portable_elapsed_ns": portable,
                     "repetition": repetition,
                 }
@@ -1190,6 +1749,7 @@ def derive_summary(
             "faster_control_ratio": f"{_geomean_ratio(v3_values, faster_values):.9f}",
             "input_bytes": cell["input_bytes"],
             "iterations": selected["iterations"],
+            "order_counts": cell_order_counts,
             "paired_samples": samples,
             "pattern_sha256": cell["pattern_sha256"],
             "portable_ratio": f"{_geomean_ratio(v3_values, portable_values):.9f}",
@@ -1202,6 +1762,7 @@ def derive_summary(
         aggregate_v3.extend(v3_values)
         aggregate_faster.extend(faster_values)
         aggregate_portable.extend(portable_values)
+        aggregate_wins += wins
         accumulator = tuple_accumulator.setdefault(
             cell["eligibility_tuple_sha256"],
             {
@@ -1245,24 +1806,42 @@ def derive_summary(
         )
 
     aggregate_strict = _strict_four_fifths(aggregate_v3, aggregate_faster)
+    aggregate_required_wins = (4 * len(aggregate_v3) + 4) // 5
+    aggregate_wins_pass = aggregate_wins >= aggregate_required_wins
+    expected_order_count = (
+        len(plan["cells"]) * plan["repetitions"] // len(ORDERS)
+    )
+    all_orders_balanced = all(
+        count == expected_order_count for count in order_counts.values()
+    )
     all_cells_pass = all(row["status"] == "pass" for row in cell_summaries)
     all_tuples_pass = all(row["status"] == "pass" for row in tuple_summaries)
+    target_pass = aggregate_strict and aggregate_wins_pass
     status = (
         "pass"
-        if aggregate_strict and all_cells_pass and all_tuples_pass
+        if target_pass
+        and all_cells_pass
+        and all_tuples_pass
+        and all_orders_balanced
         else "fail"
     )
     journal_bytes = journal.read_bytes()
     return {
-        "aggregate": {
+        "target_aggregate": {
             "faster_control_ratio": (
                 f"{_geomean_ratio(aggregate_v3, aggregate_faster):.9f}"
             ),
+            "order_counts": order_counts,
             "paired_samples": len(aggregate_v3),
             "portable_ratio": (
                 f"{_geomean_ratio(aggregate_v3, aggregate_portable):.9f}"
             ),
+            "required_strict_paired_wins": aggregate_required_wins,
+            "status": "pass" if target_pass and all_orders_balanced else "fail",
             "strict_faster_control_ratio_below_four_fifths": aggregate_strict,
+            "strict_paired_wins": aggregate_wins,
+            "six_order_rotation_balanced": all_orders_balanced,
+            "target_id": plan["target_id"],
         },
         "build_authority": "production",
         "cells": cell_summaries,
@@ -1273,6 +1852,7 @@ def derive_summary(
                 {cells[row["cell_id"]]["pattern_sha256"] for row in plan["cells"]}
             ),
             "retained_measurements": expected_measurements,
+            "selected_cell_ids": [row["cell_id"] for row in plan["cells"]],
         },
         "journal_sha256": sha256_bytes(journal_bytes),
         "measurement_policy": (
@@ -1280,6 +1860,16 @@ def derive_summary(
         ),
         "minimum_elapsed_ns": plan["minimum_elapsed_ns"],
         "plan_sha256": plan_sha256,
+        "promotion_authority_source_sha256": promotion[
+            "authority_source_sha256"
+        ],
+        "promotion_manifest_sha256": promotion["manifest_sha256"],
+        "promotion_proposal_sha256": promotion["proposal_sha256"],
+        "qualification_artifact_registry_sha256": promotion[
+            "qualification_artifact_registry_sha256"
+        ],
+        "qualification_id": promotion["qualification_id"],
+        "qualification_spec_sha256": promotion["spec_sha256"],
         "registry_sha256": plan["runner"]["registry_sha256"],
         "repetitions": plan["repetitions"],
         "runner_sha256": plan["runner"]["sha256"],
@@ -1297,6 +1887,7 @@ def derive_summary(
         "timing_wrapper_argv_sha256": sha256_bytes(
             canonical_json_bytes(plan["timing_wrapper"]["argv"])
         ),
+        "timing_wrapper_contract": plan["timing_wrapper"]["contract"],
         "timing_wrapper_executable_sha256": plan["timing_wrapper"][
             "executable_sha256"
         ],
@@ -1349,7 +1940,12 @@ def run(plan_path: Path, journal: Path, summary_path: Path) -> int:
     environment = dict(os.environ)
     environment["FRE_COUNT_V3_HAYSTACK_DIR"] = str(plan["haystack_dir"])
     registry = load_registry(plan, runner_seal, environment)
-    cells, artifacts = index_registry(registry, plan["cells"])
+    promotion = load_promotion(plan, registry)
+    cells, artifacts = index_registry(
+        registry,
+        plan["cells"],
+        promotion["qualified_target_tuples"],
+    )
     scheduled = schedule(
         plan["cells"], plan["repetitions"], cells, artifacts
     )
@@ -1398,6 +1994,7 @@ def run(plan_path: Path, journal: Path, summary_path: Path) -> int:
         plan,
         plan_sha256,
         registry,
+        promotion,
         journal,
         successful,
         cells,
