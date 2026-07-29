@@ -1904,10 +1904,12 @@ impl CompiledRegex {
     /// Attempt the reusable ordered-DFA continuation route for a value-only
     /// Count.
     ///
-    /// `Ok(None)` is a source-free structural refusal. An admitted call learns
-    /// direct transitions in its caller workspace. Cache saturation carries
-    /// the current ordered frontier inline without rereading an earlier source
-    /// position or restarting through the incumbent.
+    /// `Ok(None)` is a source-free structural or fixed-resource refusal. An
+    /// admitted call learns direct transitions in its caller workspace and
+    /// enforces value work as observed, so it can return an exact resource
+    /// error after source access. Cache saturation carries the current ordered
+    /// frontier inline without rereading an earlier source position or
+    /// restarting through the incumbent.
     #[doc(hidden)]
     pub fn count_value_with_sweep_workspace(
         &self,
@@ -2392,8 +2394,8 @@ impl CompiledRegex {
     /// Attempt the reusable ordered-DFA continuation route for a value-only
     /// matched-byte sum.
     ///
-    /// See [`Self::count_value_with_sweep_workspace`] for the source-free
-    /// refusal and no-replay saturation contract.
+    /// See [`Self::count_value_with_sweep_workspace`] for the fixed-resource
+    /// refusal, observed-work, and no-replay saturation contract.
     #[doc(hidden)]
     pub fn span_sum_value_with_sweep_workspace(
         &self,
@@ -2458,7 +2460,6 @@ impl CompiledRegex {
                 .minimum_match_bytes
                 .is_none_or(|minimum| minimum == 0)
             || self.program.root_assertion().is_some()
-            || self.program.contains_scalar_transition()
             || self.program.contains_assertion()
             || self.program.contains_unicode_word_boundary()
             || self.program.start_domain.is_sparse()

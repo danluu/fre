@@ -1,4 +1,4 @@
-//! Persistent lazy-DFA workspace for byte-only continuation reductions.
+//! Persistent lazy-DFA workspace for byte and scalar continuation reductions.
 //!
 //! Eligible value calls carry their ordered frontier through one forward
 //! direct-index transition cache. Count consumes selected endpoints directly;
@@ -138,16 +138,17 @@ pub(crate) enum SweepOutcome {
     Complete(SweepValue),
 }
 
-/// Execute an assertion-free, non-nullable byte program through its
+/// Execute an assertion-free, non-nullable byte/scalar program through its
 /// persistent ordered lazy DFA.
 ///
-/// `Ok(None)` is a source-free structural or resource refusal. Cold
-/// preparation and mandatory execution are admitted together. Optional
-/// transition learning uses only remaining speculative work; if it or the
-/// fixed cache fills, execution carries the ordered frontier forward inline
-/// from the current source position. It never rereads a prefix or restarts
-/// through the incumbent. The saturated cache is dropped after the operation,
-/// so the next call selects its incumbent source-free.
+/// `Ok(None)` is a source-free structural or fixed-resource refusal. Value-only
+/// execution is observed-work bounded and can return the caller's exact
+/// resource error after source access. Optional transition learning uses only
+/// remaining speculative work; if it or the fixed cache fills, execution
+/// carries the ordered frontier forward inline from the current source
+/// position. It never rereads a prefix or restarts through the incumbent. The
+/// saturated cache is dropped after the operation, so the next call selects
+/// its incumbent source-free.
 pub(crate) fn reduce_lazy(
     plan_id: PlanId,
     program: &Program,

@@ -7221,8 +7221,8 @@ fn certify_continuation_nonaccepting_run(
         unsupported |= matches!(inst, Inst::ConsumeScalar { .. } | Inst::Assert { .. });
     }
     if unsupported {
-        // These programs cannot select the byte-only sweep. Avoid publishing
-        // a proof for an execution domain that the proof does not model.
+        // Avoid publishing a finite run proof for scalar and assertion
+        // transitions that this byte-edge certificate does not model.
         return Ok(None);
     }
     const ACCEPTS: usize = 1_usize << (usize::BITS - 1);

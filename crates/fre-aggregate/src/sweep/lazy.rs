@@ -1,4 +1,4 @@
-//! Persistent ordered lazy DFA for ordinary byte continuations.
+//! Persistent ordered lazy DFA for ordinary byte and scalar continuations.
 //!
 //! A DFA state is an ordered set of consuming Thompson instructions. The
 //! ordering is the VM's leftmost-first priority order. A second state bit says
@@ -23,7 +23,7 @@ use fre_exact_alloc::{CopyError, ExactVec};
 
 use crate::compile::PlanId;
 use crate::error::{add, enforce, mul};
-use crate::program::{ByteSet, Inst, Program};
+use crate::program::{ByteSet, Inst, Program, ScalarSet, decode_first_scalar};
 use crate::{Error, OperationLimits, Resource};
 
 use super::{
@@ -32,14 +32,18 @@ use super::{
 };
 
 const BYTE_ALPHABET: usize = 256;
+const SCALAR_LEAD_BASE: u8 = 0xC2;
+const SCALAR_LEAD_SLOTS: usize = 51;
 const MAX_DFA_STATES: usize = 1_024;
 const MAX_DFA_ITEMS: usize = 1 << 20;
 const CELL_ACCEPT: u32 = 1 << 31;
 const CELL_STATE_MASK: u32 = CELL_ACCEPT - 1;
 const CELL_UNFILLED: u32 = u32::MAX;
+const SCALAR_KEY_NONE: u32 = 0x11_0000;
+const SCALAR_KEY_UNFILLED: u32 = u32::MAX;
 const NO_STATE: u32 = u32::MAX;
 #[cfg(test)]
-const FIXED_ARENA_ALLOCATIONS: usize = 20;
+const FIXED_ARENA_ALLOCATIONS: usize = 26;
 
 #[cfg(test)]
 pub(super) mod test_fault {
@@ -113,6 +117,9 @@ pub(super) mod test_fault {
 #[derive(Debug, Default)]
 struct LazyCache {
     rows: ExactVec<u32>,
+    scalar_keys: ExactVec<u32>,
+    scalar_alt_keys: ExactVec<u32>,
+    scalar_alt_cells: ExactVec<u32>,
     offsets: ExactVec<usize>,
     lengths: ExactVec<u32>,
     modes: ExactVec<u8>,
@@ -126,6 +133,9 @@ impl LazyCache {
     const fn new() -> Self {
         Self {
             rows: ExactVec::new(),
+            scalar_keys: ExactVec::new(),
+            scalar_alt_keys: ExactVec::new(),
+            scalar_alt_cells: ExactVec::new(),
             offsets: ExactVec::new(),
             lengths: ExactVec::new(),
             modes: ExactVec::new(),
@@ -142,8 +152,12 @@ impl LazyCache {
         total_bytes: usize,
     ) -> Result<Self, Error> {
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        let scalar_key_cells = mul(state_capacity, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
         Ok(Self {
             rows: reserved_slots(row_cells, total_bytes)?,
+            scalar_keys: reserved_slots(scalar_key_cells, total_bytes)?,
+            scalar_alt_keys: reserved_slots(scalar_key_cells, total_bytes)?,
+            scalar_alt_cells: reserved_slots(scalar_key_cells, total_bytes)?,
             offsets: reserved_slots(state_capacity, total_bytes)?,
             lengths: reserved_slots(state_capacity, total_bytes)?,
             modes: reserved_slots(state_capacity, total_bytes)?,
@@ -161,7 +175,26 @@ impl LazyCache {
         meter: &mut SweepMeter,
     ) -> Result<(), Error> {
         let row_cells = mul(state_capacity, BYTE_ALPHABET, Resource::ScratchBytes)?;
+        let scalar_key_cells = mul(state_capacity, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?;
         initialize_slots(&mut self.rows, row_cells, CELL_UNFILLED, meter)?;
+        initialize_slots(
+            &mut self.scalar_keys,
+            scalar_key_cells,
+            SCALAR_KEY_UNFILLED,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.scalar_alt_keys,
+            scalar_key_cells,
+            SCALAR_KEY_UNFILLED,
+            meter,
+        )?;
+        initialize_slots(
+            &mut self.scalar_alt_cells,
+            scalar_key_cells,
+            CELL_UNFILLED,
+            meter,
+        )?;
         initialize_slots(&mut self.offsets, state_capacity, 0_usize, meter)?;
         initialize_slots(&mut self.lengths, state_capacity, 0_u32, meter)?;
         initialize_slots(&mut self.modes, state_capacity, 0_u8, meter)?;
@@ -244,6 +277,93 @@ impl LazyCache {
             .ok_or(Error::InternalInvariant(
                 "lazy DFA transition cell outside direct-index table",
             ))? = cell;
+        Ok(())
+    }
+
+    #[inline]
+    fn scalar_cell(&self, state: u32, byte: u8, scalar: Option<char>) -> Result<u32, Error> {
+        let state = usize::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit usize"))?;
+        if state >= self.state_len {
+            return Err(Error::InternalInvariant(
+                "lazy DFA scalar transition source outside cache",
+            ));
+        }
+        let lead = scalar_lead_slot(byte)?;
+        let key_index = add(
+            mul(state, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?,
+            lead,
+            Resource::ScratchBytes,
+        )?;
+        let key = scalar.map_or(SCALAR_KEY_NONE, u32::from);
+        if self.scalar_keys.get(key_index).copied() == Some(key) {
+            return self.cell(
+                u32::try_from(state)
+                    .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit u32"))?,
+                byte,
+            );
+        }
+        if self.scalar_alt_keys.get(key_index).copied() == Some(key) {
+            return self
+                .scalar_alt_cells
+                .get(key_index)
+                .copied()
+                .ok_or(Error::InternalInvariant(
+                    "lazy DFA alternate scalar cell outside cache",
+                ));
+        }
+        Ok(CELL_UNFILLED)
+    }
+
+    #[inline]
+    fn set_scalar_cell(
+        &mut self,
+        state: u32,
+        byte: u8,
+        scalar: Option<char>,
+        cell: u32,
+    ) -> Result<(), Error> {
+        let state_index = usize::try_from(state)
+            .map_err(|_| Error::InternalInvariant("lazy DFA state ID does not fit usize"))?;
+        if state_index >= self.state_len {
+            return Err(Error::InternalInvariant(
+                "lazy DFA scalar transition source outside cache",
+            ));
+        }
+        let lead = scalar_lead_slot(byte)?;
+        let key_index = add(
+            mul(state_index, SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?,
+            lead,
+            Resource::ScratchBytes,
+        )?;
+        let key = scalar.map_or(SCALAR_KEY_NONE, u32::from);
+        let primary = self
+            .scalar_keys
+            .get(key_index)
+            .copied()
+            .ok_or(Error::InternalInvariant(
+                "lazy DFA scalar transition key outside cache",
+            ))?;
+        let alternate =
+            self.scalar_alt_keys
+                .get(key_index)
+                .copied()
+                .ok_or(Error::InternalInvariant(
+                    "lazy DFA alternate scalar key outside cache",
+                ))?;
+        if primary == key || primary == SCALAR_KEY_UNFILLED {
+            self.set_cell(state, byte, cell)?;
+            self.scalar_keys[key_index] = key;
+        } else if alternate == key || alternate == SCALAR_KEY_UNFILLED {
+            self.scalar_alt_cells[key_index] = cell;
+            self.scalar_alt_keys[key_index] = key;
+        } else if key & 1 == 0 {
+            self.set_cell(state, byte, cell)?;
+            self.scalar_keys[key_index] = key;
+        } else {
+            self.scalar_alt_cells[key_index] = cell;
+            self.scalar_alt_keys[key_index] = key;
+        }
         Ok(())
     }
 
@@ -378,8 +498,33 @@ impl LazyCache {
             size_of::<u32>(),
             Resource::ScratchBytes,
         )?;
+        let scalar_cache = add(
+            add(
+                mul(
+                    self.scalar_keys.capacity(),
+                    size_of::<u32>(),
+                    Resource::ScratchBytes,
+                )?,
+                mul(
+                    self.scalar_alt_keys.capacity(),
+                    size_of::<u32>(),
+                    Resource::ScratchBytes,
+                )?,
+                Resource::ScratchBytes,
+            )?,
+            mul(
+                self.scalar_alt_cells.capacity(),
+                size_of::<u32>(),
+                Resource::ScratchBytes,
+            )?,
+            Resource::ScratchBytes,
+        )?;
         add(
-            add(rows, offsets, Resource::ScratchBytes)?,
+            add(
+                add(rows, scalar_cache, Resource::ScratchBytes)?,
+                offsets,
+                Resource::ScratchBytes,
+            )?,
             add(
                 add(lengths, modes, Resource::ScratchBytes)?,
                 items,
@@ -571,7 +716,11 @@ impl Workspace {
         // any ordinal can therefore select the incumbent with zero abandoned
         // optional work.
         let epsilon_edges = mul(states, 2, Resource::ScratchBytes)?;
-        let consume_edges = states;
+        // A scalar-consuming instruction can dispatch to one successor per
+        // UTF-8 width. Reserving four incoming edges per program state keeps
+        // the reverse graph exact-allocation and bounded without expanding
+        // scalar classes into byte tries.
+        let consume_edges = mul(states, 4, Resource::ScratchBytes)?;
         let item_capacity = mul(states, state_capacity, Resource::ScratchBytes)?
             .min(max_items)
             .max(states);
@@ -711,12 +860,21 @@ impl Workspace {
                     meter.charge_work(1)?;
                     increment_edge_count(&mut self.reverse_consume_offsets, *next, states)?;
                 }
+                Inst::ConsumeScalar { next_by_width, .. } => {
+                    for (ordinal, &next) in next_by_width.iter().enumerate() {
+                        if next_by_width[..ordinal].contains(&next) {
+                            continue;
+                        }
+                        meter.charge_work(1)?;
+                        increment_edge_count(&mut self.reverse_consume_offsets, next, states)?;
+                    }
+                }
                 Inst::Unfilled => {
                     return Err(Error::InternalInvariant(
                         "lazy continuation reached an unfilled program state",
                     ));
                 }
-                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                Inst::Assert { .. } => {
                     return Err(Error::InternalInvariant(
                         "lazy continuation admitted an unsupported instruction",
                     ));
@@ -772,29 +930,55 @@ impl Workspace {
             .copy_from_slice(&self.reverse_consume_offsets[..states]);
         for (pc, inst) in program.insts.iter().enumerate() {
             meter.charge_work(1)?;
-            if let Inst::Consume { bytes, next } = inst {
-                meter.charge_work(1)?;
-                let source = u32::try_from(pc).map_err(|_| {
-                    Error::InternalInvariant("program state does not fit lazy DFA item")
-                })?;
-                let slot = *self.cursors.get(*next).ok_or(Error::InternalInvariant(
-                    "reverse consume destination outside cursor table",
-                ))?;
-                *self
-                    .reverse_consume_sources
-                    .get_mut(slot)
-                    .ok_or(Error::InternalInvariant(
-                        "reverse consume source outside edge arena",
-                    ))? = source;
-                *self
-                    .reverse_consume_bytes
-                    .get_mut(slot)
-                    .ok_or(Error::InternalInvariant(
-                        "reverse consume byte set outside edge arena",
-                    ))? = *bytes;
-                self.cursors[*next] = add(slot, 1, Resource::ScratchBytes)?;
+            match inst {
+                Inst::Consume { bytes, next } => {
+                    meter.charge_work(1)?;
+                    self.fill_reverse_consume(*next, pc, *bytes)?;
+                }
+                Inst::ConsumeScalar { next_by_width, .. } => {
+                    for (ordinal, &next) in next_by_width.iter().enumerate() {
+                        if next_by_width[..ordinal].contains(&next) {
+                            continue;
+                        }
+                        meter.charge_work(1)?;
+                        self.fill_reverse_consume(next, pc, ByteSet::empty())?;
+                    }
+                }
+                Inst::Unfilled
+                | Inst::Fail
+                | Inst::Match
+                | Inst::Assert { .. }
+                | Inst::Split { .. }
+                | Inst::RootSplit { .. } => {}
             }
         }
+        Ok(())
+    }
+
+    fn fill_reverse_consume(
+        &mut self,
+        next: usize,
+        pc: usize,
+        bytes: ByteSet,
+    ) -> Result<(), Error> {
+        let source = u32::try_from(pc)
+            .map_err(|_| Error::InternalInvariant("program state does not fit lazy DFA item"))?;
+        let slot = *self.cursors.get(next).ok_or(Error::InternalInvariant(
+            "reverse consume destination outside cursor table",
+        ))?;
+        *self
+            .reverse_consume_sources
+            .get_mut(slot)
+            .ok_or(Error::InternalInvariant(
+                "reverse consume source outside edge arena",
+            ))? = source;
+        *self
+            .reverse_consume_bytes
+            .get_mut(slot)
+            .ok_or(Error::InternalInvariant(
+                "reverse consume byte set outside edge arena",
+            ))? = bytes;
+        self.cursors[next] = add(slot, 1, Resource::ScratchBytes)?;
         Ok(())
     }
 
@@ -981,7 +1165,7 @@ impl Workspace {
             match program.instruction(pc)? {
                 Inst::Fail => {}
                 Inst::Match => return Ok(true),
-                Inst::Consume { .. } => {
+                Inst::Consume { .. } | Inst::ConsumeScalar { .. } => {
                     self.push_scratch(u32::try_from(pc).map_err(|_| {
                         Error::InternalInvariant("program state does not fit lazy DFA item")
                     })?)?;
@@ -1006,7 +1190,7 @@ impl Workspace {
                         "lazy forward closure reached an unfilled state",
                     ));
                 }
-                Inst::ConsumeScalar { .. } | Inst::Assert { .. } => {
+                Inst::Assert { .. } => {
                     return Err(Error::InternalInvariant(
                         "lazy forward closure reached an unsupported instruction",
                     ));
@@ -1127,8 +1311,7 @@ pub(super) fn reduce(
     limits: OperationLimits,
     workspace: &mut Workspace,
 ) -> Result<Option<SweepOutcome>, Error> {
-    if program.contains_scalar_transition()
-        || program.contains_assertion()
+    if program.contains_assertion()
         || program.contains_unicode_word_boundary()
         || program.start_domain.is_sparse()
     {
@@ -1161,41 +1344,12 @@ pub(super) fn reduce(
         Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let runtime = match run_upper_bounds(
-        local_len,
-        program.execution_state_work(),
-        fixed.max_nonaccepting_run,
-        minimum_match_bytes,
-    ) {
-        Ok(runtime) => runtime,
-        // An optional accelerator without a representable complete bound is
-        // source-free ineligible; arithmetic must not replace an incumbent
-        // operation that can still fit its own limits.
-        Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let runtime_work = match kind {
-        SweepKind::Count => runtime.count_work,
-        SweepKind::SpanSum => runtime.span_sum_work,
-    };
-    let runtime_sequential = match kind {
-        SweepKind::Count => runtime.count_sequential_bytes,
-        SweepKind::SpanSum => runtime.span_sum_sequential_bytes,
-    };
-    if runtime_sequential > limits.max_sequential_bytes {
-        return Ok(None);
-    }
     let preparation_upper = if workspace.plan_id == Some(plan_id) {
         0
     } else {
         fixed.preparation_work
     };
-    let mandatory_work = match add(preparation_upper, runtime_work, Resource::ExecutionWork) {
-        Ok(work) => work,
-        Err(Error::ArithmeticOverflow { .. }) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    if mandatory_work > limits.max_work {
+    if preparation_upper > limits.max_work {
         return Ok(None);
     }
     let (admitted, preparation_work) = workspace.prepare(plan_id, program, limits)?;
@@ -1203,19 +1357,21 @@ pub(super) fn reduce(
         return Ok(None);
     }
     let local = &haystack[range];
-    let residual_work = limits
-        .max_work
-        .checked_sub(
-            add(preparation_work, runtime_work, Resource::ExecutionWork).map_err(|_| {
-                Error::ArithmeticOverflow {
-                    resource: Resource::ExecutionWork,
-                }
-            })?,
-        )
-        .ok_or(Error::InternalInvariant(
-            "continuation preflight lost mandatory work reservation",
-        ))?;
-    let cache_work = residual_work.min(fixed.learning_work);
+    let residual_work =
+        limits
+            .max_work
+            .checked_sub(preparation_work)
+            .ok_or(Error::InternalInvariant(
+                "continuation preparation exceeded its admitted work",
+            ))?;
+    // Value-only execution is already observed-work bounded: unlike a
+    // receipt-bearing operation, it may return the caller's exact resource
+    // error after source access. Keep half of the remaining allowance for
+    // mandatory frontier progress and use at most the other half to learn
+    // reusable transitions. This lets programs with an unbounded
+    // non-accepting continuation use the DFA without claiming a false linear
+    // completion bound.
+    let cache_work = (residual_work / 2).min(fixed.learning_work);
     let mut meter = SweepMeter::with_cache_budget(limits, cache_work);
     meter.charge_work(preparation_work)?;
     let result = execute_prepared(program, local, kind, workspace, &mut meter);
@@ -1240,6 +1396,7 @@ fn execute_prepared(
     let mut position = cursor;
     let mut state = workspace.load_forward_initial(meter)?;
     let mut pending_end = None;
+    let scalar_program = program.contains_scalar_transition();
 
     loop {
         if position == local.len() {
@@ -1252,7 +1409,7 @@ fn execute_prepared(
                 cursor,
                 end,
                 kind,
-                program.entry,
+                program,
                 &mut prefix,
                 workspace,
                 meter,
@@ -1268,18 +1425,31 @@ fn execute_prepared(
             continue;
         }
 
-        meter.charge_sequential(1)?;
         meter.charge_work(1)?;
-        let byte = *local.get(position).ok_or(Error::InternalInvariant(
+        let source = local.get(position..).ok_or(Error::InternalInvariant(
             "lazy forward source position outside input",
         ))?;
+        let (byte, cacheable) = source_byte(scalar_program, source, meter)?;
         let transition = match state {
-            ForwardState::Cached(cached) => {
-                build_forward_transition(program, cached, byte, workspace, meter)?
-            }
-            ForwardState::Inline { pending } => {
-                build_inline_forward_transition(program, byte, pending, workspace, meter)?
-            }
+            ForwardState::Cached(cached) => build_forward_transition(
+                program,
+                cached,
+                byte,
+                source,
+                scalar_program,
+                cacheable,
+                workspace,
+                meter,
+            )?,
+            ForwardState::Inline { pending } => build_inline_forward_transition(
+                program,
+                byte,
+                source,
+                scalar_program,
+                pending,
+                workspace,
+                meter,
+            )?,
         };
         position = add(position, 1, Resource::Boundaries)?;
         let (accepted, next) = match transition {
@@ -1318,7 +1488,7 @@ fn execute_prepared(
             cursor,
             end,
             kind,
-            program.entry,
+            program,
             &mut prefix,
             workspace,
             meter,
@@ -1334,14 +1504,31 @@ fn build_forward_transition(
     program: &Program,
     state: u32,
     byte: u8,
+    source: &[u8],
+    scalar_program: bool,
+    cacheable: bool,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
 ) -> Result<Transition, Error> {
-    let cached = workspace.forward.cell(state, byte)?;
+    let scalar = if cacheable {
+        None
+    } else {
+        source_scalar(scalar_program, byte, source)
+    };
+    let cached = if cacheable {
+        workspace.forward.cell(state, byte)?
+    } else {
+        workspace.forward.scalar_cell(state, byte, scalar)?
+    };
     if cached != CELL_UNFILLED {
         return Ok(Transition::Ready(cached));
     }
 
+    let scalar = if cacheable {
+        source_scalar(scalar_program, byte, source)
+    } else {
+        scalar
+    };
     let (_, length, pending) = workspace.forward.state_bounds(state)?;
     workspace.begin_closure(meter)?;
     let mut accepted = false;
@@ -1358,10 +1545,20 @@ fn build_forward_transition(
                     break;
                 }
             }
+            Inst::ConsumeScalar {
+                scalars,
+                next_by_width,
+            } => {
+                if let Some(next) = scalar_successor(scalars, next_by_width, scalar, meter)?
+                    && workspace.expand_forward(program, next, meter)?
+                {
+                    accepted = true;
+                    break;
+                }
+            }
             Inst::Unfilled
             | Inst::Fail
             | Inst::Match
-            | Inst::ConsumeScalar { .. }
             | Inst::Assert { .. }
             | Inst::Split { .. }
             | Inst::RootSplit { .. } => {
@@ -1397,17 +1594,26 @@ fn build_forward_transition(
         }
     };
     let cell = encoded | if accepted { CELL_ACCEPT } else { 0 };
-    workspace.forward.set_cell(state, byte, cell)?;
+    if cacheable {
+        workspace.forward.set_cell(state, byte, cell)?;
+    } else {
+        workspace
+            .forward
+            .set_scalar_cell(state, byte, scalar, cell)?;
+    }
     Ok(Transition::Ready(cell))
 }
 
 fn build_inline_forward_transition(
     program: &Program,
     byte: u8,
+    source: &[u8],
+    scalar_program: bool,
     pending: bool,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
 ) -> Result<Transition, Error> {
+    let scalar = source_scalar(scalar_program, byte, source);
     let length = workspace.frontier_len;
     workspace.begin_closure(meter)?;
     let mut accepted = false;
@@ -1430,10 +1636,20 @@ fn build_inline_forward_transition(
                     break;
                 }
             }
+            Inst::ConsumeScalar {
+                scalars,
+                next_by_width,
+            } => {
+                if let Some(next) = scalar_successor(scalars, next_by_width, scalar, meter)?
+                    && workspace.expand_forward(program, next, meter)?
+                {
+                    accepted = true;
+                    break;
+                }
+            }
             Inst::Unfilled
             | Inst::Fail
             | Inst::Match
-            | Inst::ConsumeScalar { .. }
             | Inst::Assert { .. }
             | Inst::Split { .. }
             | Inst::RootSplit { .. } => {
@@ -1464,7 +1680,7 @@ fn commit(
     cursor: usize,
     end: usize,
     kind: SweepKind,
-    program_entry: usize,
+    program: &Program,
     prefix: &mut SweepValue,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
@@ -1475,7 +1691,7 @@ fn commit(
         ));
     }
     let start = if kind == SweepKind::SpanSum {
-        reverse_start(haystack, cursor, end, program_entry, workspace, meter)?
+        reverse_start(haystack, cursor, end, program, workspace, meter)?
     } else {
         end
     };
@@ -1505,29 +1721,44 @@ fn reverse_start(
     haystack: &[u8],
     cursor: usize,
     end: usize,
-    program_entry: usize,
+    program: &Program,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
 ) -> Result<usize, Error> {
-    let entry = u32::try_from(program_entry)
+    let entry = u32::try_from(program.entry)
         .map_err(|_| Error::InternalInvariant("reverse entry does not fit u32"))?;
     let mut state = workspace.load_reverse_initial(meter)?;
     let mut best = None;
     let mut position = end;
+    let scalar_program = program.contains_scalar_transition();
     while position > cursor {
         position -= 1;
-        meter.charge_sequential(1)?;
         meter.charge_work(1)?;
-        let byte = *haystack.get(position).ok_or(Error::InternalInvariant(
+        let source = haystack.get(position..end).ok_or(Error::InternalInvariant(
             "lazy reverse source position outside input",
         ))?;
+        let (byte, cacheable) = source_byte(scalar_program, source, meter)?;
         let transition = match state {
-            ForwardState::Cached(cached) => {
-                build_reverse_transition(cached, byte, entry, workspace, meter)?
-            }
-            ForwardState::Inline { .. } => {
-                build_inline_reverse_transition(byte, entry, workspace, meter)?
-            }
+            ForwardState::Cached(cached) => build_reverse_transition(
+                program,
+                cached,
+                byte,
+                source,
+                scalar_program,
+                cacheable,
+                entry,
+                workspace,
+                meter,
+            )?,
+            ForwardState::Inline { .. } => build_inline_reverse_transition(
+                program,
+                byte,
+                source,
+                scalar_program,
+                entry,
+                workspace,
+                meter,
+            )?,
         };
         let (accepted, next) = match transition {
             Transition::Ready(cell) => {
@@ -1560,16 +1791,34 @@ fn reverse_start(
 }
 
 fn build_reverse_transition(
+    program: &Program,
     state: u32,
     byte: u8,
+    source: &[u8],
+    scalar_program: bool,
+    cacheable: bool,
     entry: u32,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
 ) -> Result<Transition, Error> {
-    let cached = workspace.reverse.cell(state, byte)?;
+    let scalar = if cacheable {
+        None
+    } else {
+        source_scalar(scalar_program, byte, source)
+    };
+    let cached = if cacheable {
+        workspace.reverse.cell(state, byte)?
+    } else {
+        workspace.reverse.scalar_cell(state, byte, scalar)?
+    };
     if cached != CELL_UNFILLED {
         return Ok(Transition::Ready(cached));
     }
+    let scalar = if cacheable {
+        source_scalar(scalar_program, byte, source)
+    } else {
+        scalar
+    };
     let (_, length, _) = workspace.reverse.state_bounds(state)?;
     workspace.begin_closure(meter)?;
     for ordinal in 0..length {
@@ -1591,21 +1840,25 @@ fn build_reverse_transition(
             ))?;
         for edge in start..end {
             meter.charge_work(1)?;
-            if workspace
-                .reverse_consume_bytes
-                .get(edge)
-                .copied()
-                .ok_or(Error::InternalInvariant(
-                    "reverse consume byte set outside graph",
-                ))?
-                .contains(byte)
-            {
-                workspace.expand_reverse(
-                    *workspace.reverse_consume_sources.get(edge).ok_or(
-                        Error::InternalInvariant("reverse consume source outside graph"),
-                    )?,
-                    meter,
-                )?;
+            let source =
+                *workspace
+                    .reverse_consume_sources
+                    .get(edge)
+                    .ok_or(Error::InternalInvariant(
+                        "reverse consume source outside graph",
+                    ))?;
+            if reverse_consume_matches(
+                program,
+                source,
+                destination,
+                byte,
+                scalar,
+                workspace.reverse_consume_bytes.get(edge).copied().ok_or(
+                    Error::InternalInvariant("reverse consume byte set outside graph"),
+                )?,
+                meter,
+            )? {
+                workspace.expand_reverse(source, meter)?;
             }
         }
     }
@@ -1640,16 +1893,26 @@ fn build_reverse_transition(
         }
     };
     let cell = encoded | if accepts { CELL_ACCEPT } else { 0 };
-    workspace.reverse.set_cell(state, byte, cell)?;
+    if cacheable {
+        workspace.reverse.set_cell(state, byte, cell)?;
+    } else {
+        workspace
+            .reverse
+            .set_scalar_cell(state, byte, scalar, cell)?;
+    }
     Ok(Transition::Ready(cell))
 }
 
 fn build_inline_reverse_transition(
+    program: &Program,
     byte: u8,
+    source: &[u8],
+    scalar_program: bool,
     entry: u32,
     workspace: &mut Workspace,
     meter: &mut SweepMeter,
 ) -> Result<Transition, Error> {
+    let scalar = source_scalar(scalar_program, byte, source);
     let length = workspace.frontier_len;
     workspace.begin_closure(meter)?;
     for ordinal in 0..length {
@@ -1673,21 +1936,25 @@ fn build_inline_reverse_transition(
             ))?;
         for edge in start..end {
             meter.charge_work(1)?;
-            if workspace
-                .reverse_consume_bytes
-                .get(edge)
-                .copied()
-                .ok_or(Error::InternalInvariant(
-                    "inline reverse consume byte set outside graph",
-                ))?
-                .contains(byte)
-            {
-                workspace.expand_reverse(
-                    *workspace.reverse_consume_sources.get(edge).ok_or(
-                        Error::InternalInvariant("inline reverse consume source outside graph"),
-                    )?,
-                    meter,
-                )?;
+            let source =
+                *workspace
+                    .reverse_consume_sources
+                    .get(edge)
+                    .ok_or(Error::InternalInvariant(
+                        "inline reverse consume source outside graph",
+                    ))?;
+            if reverse_consume_matches(
+                program,
+                source,
+                destination,
+                byte,
+                scalar,
+                workspace.reverse_consume_bytes.get(edge).copied().ok_or(
+                    Error::InternalInvariant("inline reverse consume byte set outside graph"),
+                )?,
+                meter,
+            )? {
+                workspace.expand_reverse(source, meter)?;
             }
         }
     }
@@ -1702,6 +1969,128 @@ fn build_inline_reverse_transition(
         accepted: accepts,
         pending: false,
     })
+}
+
+#[inline]
+fn source_byte(
+    scalar_program: bool,
+    source: &[u8],
+    meter: &mut SweepMeter,
+) -> Result<(u8, bool), Error> {
+    let byte = *source.first().ok_or(Error::InternalInvariant(
+        "lazy continuation source position outside input",
+    ))?;
+    if !scalar_program {
+        meter.charge_sequential(1)?;
+        return Ok((byte, true));
+    }
+
+    // A scalar transition inspects at most one complete UTF-8 scalar. The
+    // first byte is included in this charge rather than counted once for the
+    // byte symbol and again for the scalar symbol.
+    meter.charge_sequential(scalar_source_accesses(source))?;
+    // Valid multi-byte lead bytes do not identify a scalar by themselves, so
+    // their transition requires the scalar-authenticated side key.
+    // Continuation and invalid lead bytes always decode to no scalar and remain
+    // safe in the ordinary byte-keyed cells.
+    let cacheable = !matches!(byte, 0xC2..=0xF4);
+    Ok((byte, cacheable))
+}
+
+#[inline]
+fn scalar_lead_slot(byte: u8) -> Result<usize, Error> {
+    if !matches!(byte, 0xC2..=0xF4) {
+        return Err(Error::InternalInvariant(
+            "lazy scalar cache received a non-lead byte",
+        ));
+    }
+    Ok(usize::from(byte - SCALAR_LEAD_BASE))
+}
+
+#[inline]
+fn source_scalar(scalar_program: bool, byte: u8, source: &[u8]) -> Option<char> {
+    if !scalar_program {
+        None
+    } else if byte.is_ascii() {
+        Some(char::from(byte))
+    } else {
+        decode_first_scalar(source)
+    }
+}
+
+#[inline]
+fn scalar_source_accesses(bytes: &[u8]) -> usize {
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    let width = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return 1,
+    };
+    if bytes.len() < width { 1 } else { width }
+}
+
+fn scalar_successor(
+    scalars: &ScalarSet,
+    next_by_width: &[usize; 4],
+    scalar: Option<char>,
+    meter: &mut SweepMeter,
+) -> Result<Option<usize>, Error> {
+    let Some(scalar) = scalar else {
+        return Ok(None);
+    };
+    if !scalars.contains_with(scalar, || meter.charge_work(1))? {
+        return Ok(None);
+    }
+    let width_index = scalar
+        .len_utf8()
+        .checked_sub(1)
+        .ok_or(Error::InternalInvariant(
+            "Unicode scalar has zero byte width",
+        ))?;
+    next_by_width
+        .get(width_index)
+        .copied()
+        .map(Some)
+        .ok_or(Error::InternalInvariant(
+            "Unicode scalar width outside lazy dispatch",
+        ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "reverse byte/scalar edge authentication is kept in one audited helper"
+)]
+fn reverse_consume_matches(
+    program: &Program,
+    source: u32,
+    destination: usize,
+    byte: u8,
+    scalar: Option<char>,
+    byte_set: ByteSet,
+    meter: &mut SweepMeter,
+) -> Result<bool, Error> {
+    let source = usize::try_from(source)
+        .map_err(|_| Error::InternalInvariant("reverse consume source does not fit usize"))?;
+    match program.instruction(source)? {
+        Inst::Consume { .. } => Ok(byte_set.contains(byte)),
+        Inst::ConsumeScalar {
+            scalars,
+            next_by_width,
+        } => Ok(scalar_successor(scalars, next_by_width, scalar, meter)?
+            .is_some_and(|next| next == destination)),
+        Inst::Unfilled
+        | Inst::Fail
+        | Inst::Match
+        | Inst::Assert { .. }
+        | Inst::Split { .. }
+        | Inst::RootSplit { .. } => Err(Error::InternalInvariant(
+            "reverse consume graph retained a non-consuming source",
+        )),
+    }
 }
 
 const fn complete_value(value: SweepValue, kind: SweepKind) -> SweepValue {
@@ -1911,6 +2300,7 @@ fn prospective_upper_bounds_with_run(
         Resource::ScratchBytes,
     )?;
     let epsilon_edges = mul(states, 2, Resource::ScratchBytes)?;
+    let consume_edges = mul(states, 4, Resource::ScratchBytes)?;
     let item_capacity = mul(states, state_capacity, Resource::ScratchBytes)?
         .min(max_items)
         .max(states);
@@ -1918,12 +2308,16 @@ fn prospective_upper_bounds_with_run(
         states,
         stack_slots,
         epsilon_edges,
-        states,
+        consume_edges,
         state_capacity,
         item_capacity,
     )?;
     let table_cells = mul(
-        mul(state_capacity, BYTE_ALPHABET, Resource::TableCells)?,
+        mul(
+            state_capacity,
+            BYTE_ALPHABET + SCALAR_LEAD_SLOTS,
+            Resource::TableCells,
+        )?,
         2,
         Resource::TableCells,
     )?;
@@ -1935,12 +2329,16 @@ fn prospective_upper_bounds_with_run(
     // prefix sums, closure expansion, heapsort, binary search and both initial
     // state copies.
     let workspace_slots = add(
-        mul(states, 12, Resource::ExecutionWork)?,
+        mul(states, 18, Resource::ExecutionWork)?,
         3,
         Resource::ExecutionWork,
     )?;
     let one_cache_slots = add(
-        mul(state_capacity, BYTE_ALPHABET + 3, Resource::ExecutionWork)?,
+        mul(
+            state_capacity,
+            BYTE_ALPHABET + 3 * SCALAR_LEAD_SLOTS + 3,
+            Resource::ExecutionWork,
+        )?,
         item_capacity,
         Resource::ExecutionWork,
     )?;
@@ -2021,7 +2419,16 @@ pub(super) fn run_upper_bounds(
             mul(terms, half_endpoints, Resource::SequentialBytes)?
         }
     };
-    let span_sum_sequential_bytes = add(forward_visits, input_bytes, Resource::SequentialBytes)?;
+    // A scalar-capable transition may inspect one complete UTF-8 scalar at a
+    // byte boundary. The fixed envelope is public and state-count-only, so it
+    // conservatively covers four source-byte accesses per forward or reverse
+    // transition even when the concrete program is byte-only.
+    let count_sequential_bytes = mul(forward_visits, 4, Resource::SequentialBytes)?;
+    let span_sum_sequential_bytes = add(
+        count_sequential_bytes,
+        mul(input_bytes, 4, Resource::SequentialBytes)?,
+        Resource::SequentialBytes,
+    )?;
     let forward_step = add(execution_state_work, 2, Resource::ExecutionWork)?;
     // Inline reverse closure plus its linear acceptance probe is bounded by
     // twice the certified complete-program state work and one source unit.
@@ -2061,7 +2468,7 @@ pub(super) fn run_upper_bounds(
     Ok(ContinuationSweepRunUpperBounds {
         count_work,
         span_sum_work,
-        count_sequential_bytes: forward_visits,
+        count_sequential_bytes,
         span_sum_sequential_bytes,
     })
 }
@@ -2116,7 +2523,15 @@ fn logical_workspace_bytes(
             Resource::ScratchBytes,
         )?,
         add(
-            mul(dfa_states, size_of::<usize>(), Resource::ScratchBytes)?,
+            add(
+                mul(dfa_states, size_of::<usize>(), Resource::ScratchBytes)?,
+                mul(
+                    mul(dfa_states, 3 * SCALAR_LEAD_SLOTS, Resource::ScratchBytes)?,
+                    size_of::<u32>(),
+                    Resource::ScratchBytes,
+                )?,
+                Resource::ScratchBytes,
+            )?,
             add(
                 mul(dfa_states, size_of::<u32>(), Resource::ScratchBytes)?,
                 add(
@@ -2240,6 +2655,21 @@ mod tests {
         CompiledRegex::from_hir_erasing_captures_for_whole_match(
             &hir,
             RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn compiled_unicode(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .unicode(true)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
             CompileLimits::default(),
         )
         .unwrap()
@@ -2394,6 +2824,58 @@ mod tests {
     }
 
     #[test]
+    fn scalar_lazy_dfa_is_differential_across_widths_ranges_and_invalid_bytes() {
+        let cases = [
+            (
+                r"[éè]+",
+                b"\xC3\xAA--\xC3\xA9\xC3\xA8--\xC3\x28--\xC3\xA9".as_slice(),
+            ),
+            (
+                r"[AéΩ🦀]+",
+                b"xA\xC3\xA9\xCE\xA9\xF0\x9F\xA6\x80y--\xCE\xA9A".as_slice(),
+            ),
+            (
+                r"(?:\p{Greek}{1,3}|[éè]+|[0-9]+)",
+                b"\xCE\xA9\xCE\xB4--123--\xC3\xA9\xC3\xA8--\xFF--\xCE\xB1".as_slice(),
+            ),
+        ];
+        for (pattern, haystack) in cases {
+            let regex = compiled_unicode(pattern);
+            assert!(regex.program.contains_scalar_transition());
+            let mut count_workspace = Workspace::new();
+            let mut sum_workspace = Workspace::new();
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let range = start..end;
+                    let want = expected(&regex, haystack, range.clone());
+                    let count = complete(
+                        &regex,
+                        haystack,
+                        range.clone(),
+                        SweepKind::Count,
+                        &mut count_workspace,
+                    );
+                    let sum = complete(
+                        &regex,
+                        haystack,
+                        range,
+                        SweepKind::SpanSum,
+                        &mut sum_workspace,
+                    );
+                    assert_eq!(
+                        count.count, want.count,
+                        "count pattern={pattern:?} start={start} end={end}"
+                    );
+                    assert_eq!(
+                        sum.span_sum, want.span_sum,
+                        "span pattern={pattern:?} start={start} end={end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bounded_rewind_certificate_and_generic_adversary_bound_are_exact() {
         let regex = compiled("(?:a.*z|a)");
         assert_eq!(regex.program.continuation_nonaccepting_run(), None);
@@ -2438,7 +2920,7 @@ mod tests {
                 regex.minimum_match_bytes.unwrap(),
             )
             .unwrap();
-            assert_eq!(sequential, upper.span_sum_sequential_bytes);
+            assert!(sequential <= upper.span_sum_sequential_bytes);
         }
     }
 
@@ -2446,14 +2928,14 @@ mod tests {
     fn authenticated_minimum_width_tightens_match_and_suffix_walk_bounds() {
         let one_byte = run_upper_bounds(100, 15, Some(3), 1).unwrap();
         let ten_bytes = run_upper_bounds(100, 15, Some(3), 10).unwrap();
-        assert_eq!(one_byte.count_sequential_bytes, 500);
-        assert_eq!(ten_bytes.count_sequential_bytes, 140);
+        assert_eq!(one_byte.count_sequential_bytes, 2_000);
+        assert_eq!(ten_bytes.count_sequential_bytes, 560);
         assert!(ten_bytes.count_work < one_byte.count_work);
 
         let generic_one_byte = run_upper_bounds(100, 15, None, 1).unwrap();
         let generic_ten_bytes = run_upper_bounds(100, 15, None, 10).unwrap();
-        assert_eq!(generic_one_byte.count_sequential_bytes, 5_050);
-        assert_eq!(generic_ten_bytes.count_sequential_bytes, 550);
+        assert_eq!(generic_one_byte.count_sequential_bytes, 20_200);
+        assert_eq!(generic_ten_bytes.count_sequential_bytes, 2_200);
         assert!(generic_ten_bytes.span_sum_work < generic_one_byte.span_sum_work);
     }
 
@@ -2829,7 +3311,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_one_below_refuses_source_free_instead_of_replacing_incumbent() {
+    fn pessimistic_runtime_upper_is_not_a_source_free_value_refusal() {
         let pattern = "abcdefghijklmnopq";
         let regex = compiled(pattern);
         let haystack = pattern.as_bytes();
@@ -2875,7 +3357,7 @@ mod tests {
             Some(SweepOutcome::Complete(_))
         ));
         exact_count.max_work -= 1;
-        assert_eq!(
+        assert!(matches!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
@@ -2887,8 +3369,8 @@ mod tests {
                 &mut count_workspace,
             )
             .unwrap(),
-            None
-        );
+            Some(SweepOutcome::Complete(_))
+        ));
 
         let mut exact_sum = OperationLimits::default();
         exact_sum.max_work = runtime.span_sum_work;
@@ -2907,8 +3389,8 @@ mod tests {
             .unwrap(),
             Some(SweepOutcome::Complete(_))
         ));
-        exact_sum.max_sequential_bytes -= 1;
-        assert_eq!(
+        exact_sum.max_sequential_bytes = 0;
+        assert!(matches!(
             reduce(
                 regex.plan_id(),
                 &regex.program,
@@ -2918,14 +3400,16 @@ mod tests {
                 regex.minimum_match_bytes,
                 exact_sum,
                 &mut sum_workspace,
-            )
-            .unwrap(),
-            None
-        );
+            ),
+            Err(Error::ResourceLimit {
+                resource: Resource::SequentialBytes,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn cold_preparation_and_mandatory_runtime_are_preflighted_together() {
+    fn cold_preparation_is_preflighted_but_value_runtime_is_observed() {
         let pattern = "abcdefghijklmnopq";
         let regex = compiled(pattern);
         let haystack = pattern.as_bytes();
@@ -2965,9 +3449,27 @@ mod tests {
             Some(SweepOutcome::Complete(_))
         ));
 
-        let mut one_below = exact;
-        one_below.max_work -= 1;
-        let mut one_below_workspace = Workspace::new();
+        let mut below_pessimistic_runtime = exact;
+        below_pessimistic_runtime.max_work -= 1;
+        let mut observed_workspace = Workspace::new();
+        assert!(matches!(
+            reduce(
+                regex.plan_id(),
+                &regex.program,
+                haystack,
+                0..haystack.len(),
+                SweepKind::Count,
+                regex.minimum_match_bytes,
+                below_pessimistic_runtime,
+                &mut observed_workspace,
+            )
+            .unwrap(),
+            Some(SweepOutcome::Complete(_))
+        ));
+
+        let mut below_fixed_preparation = exact;
+        below_fixed_preparation.max_work = fixed.preparation_work - 1;
+        let mut refused_workspace = Workspace::new();
         assert_eq!(
             reduce(
                 regex.plan_id(),
@@ -2976,13 +3478,13 @@ mod tests {
                 0..haystack.len(),
                 SweepKind::Count,
                 regex.minimum_match_bytes,
-                one_below,
-                &mut one_below_workspace,
+                below_fixed_preparation,
+                &mut refused_workspace,
             )
             .unwrap(),
             None
         );
-        assert_eq!(one_below_workspace.plan_id, None);
+        assert_eq!(refused_workspace.plan_id, None);
     }
 
     #[test]

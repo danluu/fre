@@ -248,7 +248,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -701,10 +701,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible Unicode-off mirrored bounded-chunk SpanSum operations use the event/rank route only when its worst-case event storage, source-read, work, and allocation envelope is admitted and its work bound strictly beats the incumbent frontier; arithmetic-, policy-, allocation-, or economics-refused calls retain the fixed frontier before source access",
         );
         identity.identity.push_str(
-            "; persistent-continuation-sweep-v3 binds caller-owned fixed forward/reverse DFA arenas to one authenticated plan, an exact compile-certified maximum-nonaccepting-run and positive-minimum-match-width runtime envelope, source-free all-or-nothing fixed and mandatory admission, bounded speculative transition learning with current-frontier inline handoff and no replay, a plan-bound sticky-disabled marker after refusal or saturation, source-independent dominance by retained state/byte value reducers, and source-independent incumbent precedence for one-owner shared-fixed candidates whose unchecked local anchor and source-wide mandatory byte sets are disjoint",
+            "; persistent-continuation-sweep-v4 binds caller-owned fixed forward/reverse byte-and-scalar DFA arenas to one authenticated plan, an exact compile-certified maximum-nonaccepting-run and positive-minimum-match-width runtime envelope, source-free fixed-resource admission followed by exact observed-work value execution, bounded speculative transition learning with current-frontier inline handoff and no replay, scalar-authenticated multi-byte lead cells, a plan-bound sticky-disabled marker after refusal or saturation, source-independent dominance by retained state/byte value reducers, and source-independent incumbent precedence for one-owner shared-fixed candidates whose unchecked local anchor and source-wide mandatory byte sets are disjoint",
         );
         identity.availability.push_str(
-            "; eligible nonnullable assertion-free Unicode-off ordinary one-pattern continuation Count and SpanSum operations may reuse the persistent sweep; nullable or zero-width, Unicode or scalar, assertion, sparse-start, internal-anchor, state/byte-value-incumbent, disjoint-global-candidate-incumbent, small-program, policy- or allocation-refused, and other operations retain the incumbent continuation route without execution-time replay",
+            "; eligible nonnullable assertion-free ordinary byte/scalar one-pattern continuation Count and SpanSum operations may reuse the persistent sweep; nullable or zero-width, assertion, UTF-8-prevalidation, sparse-start, internal-anchor, state/byte-value-incumbent, disjoint-global-candidate-incumbent, small-program, fixed-policy- or allocation-refused, and other operations retain the incumbent continuation route without execution-time replay",
         );
         identity.identity.push_str(
             "; impossible-match-domain-v1 retains canonical HIR byte minimum/maximum plus mandatory absolute Start/End proof in the construction-owned cache identity, terminates Count/SpanSum full/value/workspace/counter APIs source-free for empty language, N<minimum, or absolute-whole N>maximum, records at most two compiler-bounded proof checks with zero source reads and operation allocations, and leaves Compile verification on its untimed Compile identity without this Count/SpanSum-only receipt",
@@ -10510,9 +10510,9 @@ fn continuation_operation_limits_with_sweep(
                 "FRE continuation sweep envelope is attached to a non-value route",
             ));
         }
-        if shape.has_scalar_transitions || shape.requires_utf8_validation {
+        if shape.requires_utf8_validation {
             return Err(ExecutionError::fault(
-                "FRE continuation sweep envelope is attached to a scalar continuation route",
+                "FRE continuation sweep envelope is attached to a UTF-8 prevalidation route",
             ));
         }
         let expected = fre::continuation_sweep_upper_bounds(program_states).map_err(|error| {
@@ -10600,77 +10600,32 @@ fn continuation_operation_limits_with_sweep(
         "operation work with prefixes",
     )?;
     let sweep_workspace_bytes = sweep.map_or(0, |bounds| bounds.workspace_bytes);
-    let sweep_runtime = match sweep
+    let sweep_fixed_work = sweep
         .map(|bounds| {
-            fre::continuation_sweep_run_upper_bounds(
-                bounds,
-                haystack_len,
-                shape.execution_state_work,
-            )
-        })
-        .transpose()
-    {
-        Ok(runtime) => runtime,
-        Err(fre::AggregateEngineError::ArithmeticOverflow { .. }) => None,
-        Err(error) => {
-            return Err(ExecutionError::fault(format!(
-                "FRE continuation sweep runtime bounds: {error}"
-            )));
-        }
-    };
-    let sweep_required_work = sweep
-        .zip(sweep_runtime)
-        .map(|(bounds, runtime)| {
-            let mandatory_work = match operation {
-                AggregateOperation::Count => runtime.count_work,
-                AggregateOperation::SpanSum => runtime.span_sum_work,
-                AggregateOperation::Compile | AggregateOperation::Spans => {
-                    return Err(ExecutionError::fault(
-                        "FRE continuation sweep envelope is attached to a non-value route",
-                    ));
-                }
-            };
             checked_aggregate_add(
-                checked_aggregate_add(
-                    bounds.preparation_work,
-                    mandatory_work,
-                    "continuation sweep preparation plus mandatory work",
-                )?,
+                bounds.preparation_work,
                 bounds.learning_work,
-                "continuation sweep total work",
+                "continuation sweep fixed preparation and learning work",
             )
-        })
-        .transpose()?;
-    let sweep_required_sequential = sweep_runtime
-        .map(|runtime| match operation {
-            AggregateOperation::Count => Ok(runtime.count_sequential_bytes),
-            AggregateOperation::SpanSum => Ok(runtime.span_sum_sequential_bytes),
-            AggregateOperation::Compile | AggregateOperation::Spans => Err(ExecutionError::fault(
-                "FRE continuation sweep envelope is attached to a non-value route",
-            )),
         })
         .transpose()?;
     let sweep_enabled = sweep.is_some()
-        && sweep_runtime.is_some()
         && sweep_workspace_bytes <= limits.fre_aggregate_random_access_bytes
         && sweep_workspace_bytes <= limits.fre_aggregate_scratch_bytes
         && sweep_workspace_bytes <= limits.fre_aggregate_peak_bytes
-        && sweep_required_work
-            .is_some_and(|required| required <= limits.fre_aggregate_operation_work)
-        && sweep_required_sequential
-            .is_some_and(|required| required <= limits.fre_aggregate_sequential_bytes);
+        && sweep_fixed_work.is_some_and(|required| required <= limits.fre_aggregate_operation_work);
     let sweep_table_cells = if sweep_enabled {
         sweep.map_or(0, |bounds| bounds.table_cells)
     } else {
         0
     };
     let route_work_upper = if sweep_enabled {
-        work_upper.max(sweep_required_work.unwrap_or_default())
+        limits.fre_aggregate_operation_work
     } else {
         work_upper
     };
     let route_sequential_upper = if sweep_enabled {
-        sequential_upper.max(sweep_required_sequential.unwrap_or_default())
+        limits.fre_aggregate_sequential_bytes
     } else {
         sequential_upper
     };
@@ -23912,21 +23867,21 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(
             identity
                 .identity
-                .contains("persistent-continuation-sweep-v3 binds caller-owned fixed")
+                .contains("persistent-continuation-sweep-v4 binds caller-owned fixed")
         );
         assert!(
-            current_fre_adapter_id().contains("-persistent-continuation-sweep-v3-"),
+            current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"),
             "runner/schedule adapter key must version the persistent physical route"
         );
         assert!(
             identity
                 .availability
-                .contains("ordinary one-pattern continuation Count and SpanSum")
+                .contains("ordinary byte/scalar one-pattern continuation Count and SpanSum")
         );
         assert!(identity.availability.contains("state/byte-value-incumbent"));
         assert!(
@@ -27565,7 +27520,7 @@ mod tests {
             &count_policy,
         )
         .unwrap();
-        assert_eq!(span_under_count_policy.max_table_cells, 0);
+        assert_eq!(span_under_count_policy.max_table_cells, sweep.table_cells);
         let cached_frontier = cached_frontier_limits(5, 11, 1).unwrap();
         assert_eq!(cached_frontier.random, 2_162_704);
         assert_eq!(cached_frontier.scratch, 2_162_704);
@@ -27580,17 +27535,14 @@ mod tests {
         assert_eq!(derived.max_log_bytes, 11);
         assert_eq!(
             derived.max_sequential_bytes,
-            runtime.span_sum_sequential_bytes
+            run.fre_aggregate_sequential_bytes
         );
         assert_eq!(derived.max_match_events, 22);
         assert_eq!(derived.max_output_matches, 11);
         assert_eq!(derived.max_output_bytes, 0);
         assert_eq!(derived.max_span_sum, 10);
         assert_eq!(derived.max_peak_bytes, sweep.workspace_bytes);
-        assert_eq!(
-            derived.max_work,
-            sweep.preparation_work + runtime.span_sum_work + sweep.learning_work
-        );
+        assert_eq!(derived.max_work, run.fre_aggregate_operation_work);
 
         assert!(
             continuation_operation_limits_with_sweep(
@@ -27606,7 +27558,7 @@ mod tests {
             .is_err()
         );
 
-        let one_below_policies = [
+        for policy in [
             RunLimits {
                 fre_aggregate_sequential_bytes: derived.max_sequential_bytes - 1,
                 ..RunLimits::default()
@@ -27615,6 +27567,24 @@ mod tests {
                 fre_aggregate_operation_work: derived.max_work - 1,
                 ..RunLimits::default()
             },
+        ] {
+            let observed = continuation_operation_limits_with_sweep(
+                10,
+                conservative_continuation_shape(5).unwrap(),
+                Some(sweep),
+                AggregateOperation::SpanSum,
+                &policy,
+            )
+            .unwrap();
+            assert_eq!(observed.max_table_cells, sweep.table_cells);
+            assert_eq!(
+                observed.max_sequential_bytes,
+                policy.fre_aggregate_sequential_bytes
+            );
+            assert_eq!(observed.max_work, policy.fre_aggregate_operation_work);
+        }
+
+        let one_below_fixed_policies = [
             RunLimits {
                 fre_aggregate_random_access_bytes: derived.max_random_access_bytes - 1,
                 ..RunLimits::default()
@@ -27628,7 +27598,7 @@ mod tests {
                 ..RunLimits::default()
             },
         ];
-        for policy in one_below_policies {
+        for policy in one_below_fixed_policies {
             let one_below = continuation_operation_limits_with_sweep(
                 10,
                 conservative_continuation_shape(5).unwrap(),

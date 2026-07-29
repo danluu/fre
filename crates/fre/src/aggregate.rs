@@ -20783,10 +20783,11 @@ impl core::iter::FusedIterator for AggregateSearchStepIter<'_> {}
 /// Caller-owned scratch for repeated value-only count operations.
 ///
 /// Dense finite-literal plans retain their DP allocation here. Eligible
-/// byte-only continuation plans retain observed ordered transitions in a
+/// byte/scalar continuation plans retain observed ordered transitions in a
 /// fixed arena. A saturated cache completes the current operation inline and
-/// becomes a compact disabled marker; resource-ineligible calls select the
-/// incumbent before source access. Other selected plans ignore the workspace.
+/// becomes a compact disabled marker; fixed-resource-ineligible calls select
+/// the incumbent before source access. Other selected plans ignore the
+/// workspace.
 #[derive(Debug, Default)]
 pub struct AggregateCountWorkspace {
     dense_finite: OrderedLiteralCountWorkspace,
@@ -20808,7 +20809,7 @@ impl AggregateCountWorkspace {
         self.dense_finite.retained_bytes()
     }
 
-    /// Bytes retained for an eligible byte-only continuation sweep.
+    /// Bytes retained for an eligible byte/scalar continuation sweep.
     #[must_use]
     pub const fn retained_continuation_bytes(&self) -> Option<usize> {
         self.continuation.retained_bytes()
@@ -20837,7 +20838,7 @@ impl AggregateSpanSumWorkspace {
         self.dense_finite.retained_bytes()
     }
 
-    /// Bytes retained for an eligible byte-only continuation sweep.
+    /// Bytes retained for an eligible byte/scalar continuation sweep.
     #[must_use]
     pub const fn retained_continuation_bytes(&self) -> Option<usize> {
         self.continuation.retained_bytes()
@@ -20953,10 +20954,12 @@ impl AggregateCountRegex {
     /// dense finite-literal scratch in a caller-owned workspace.
     ///
     /// The first dense call performs the same allocation and initialization
-    /// as [`Self::count_value`]. Eligible byte-only continuation plans may
-    /// instead select a persistent ordered transition sweep after complete
-    /// source-free resource admission. A refusal uses [`Self::count_value`]'s
-    /// incumbent route; saturation completes inline without source replay.
+    /// as [`Self::count_value`]. Eligible byte/scalar continuation plans may
+    /// instead select a persistent ordered transition sweep after source-free
+    /// fixed-resource admission. Value execution enforces observed work and
+    /// can return its exact resource error after source access. A fixed
+    /// refusal uses [`Self::count_value`]'s incumbent route; saturation
+    /// completes inline without source replay.
     pub fn count_value_with_workspace(
         &self,
         haystack: &[u8],
