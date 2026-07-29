@@ -1,5 +1,10 @@
 use core::mem::size_of;
 
+use fre_simd_kernels::{
+    AsciiByteSet, AsciiByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES,
+    ASCII_WIDE_BYTES,
+};
+
 use crate::{
     Automaton, EdgeKind, MatchSpan, ResourceKind, SearchAccounting, SearchError, SearchLimits,
     SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -158,6 +163,8 @@ pub struct K0Workspace {
     roots_len: usize,
     stack: Vec<Thread>,
     stack_len: usize,
+    start_set: Option<AsciiByteSet>,
+    start_classifier: Option<AsciiByteSetClassifier>,
     retained_bytes: usize,
     construction: SetupAccounting,
 }
@@ -222,6 +229,8 @@ impl K0Workspace {
             roots_len: 0,
             stack,
             stack_len: 0,
+            start_set: None,
+            start_classifier: None,
             retained_bytes,
             construction,
         })
@@ -473,6 +482,15 @@ fn execute(
     let mut pending = None;
 
     loop {
+        if pending.is_none() && workspace.roots_len == 0 {
+            if let Some(classifier) = workspace.start_classifier.as_ref() {
+                position =
+                    next_start_candidate(classifier, haystack, position, window.end(), &mut meter)?;
+                if position == window.end() {
+                    break;
+                }
+            }
+        }
         boundaries = boundaries
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
@@ -534,6 +552,174 @@ fn execute(
     })
 }
 
+#[derive(Clone, Copy)]
+struct StartByteProof {
+    set: Option<AsciiByteSet>,
+    work: u64,
+}
+
+fn derive_ascii_start_set(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+) -> Result<StartByteProof, SearchError> {
+    workspace.stack_len = 0;
+    workspace.generation =
+        workspace
+            .generation
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-byte proof generation",
+            })?;
+    workspace.push_stack(Thread {
+        state: automaton.start,
+        start: 0,
+    })?;
+    let mut words = [0_u64; 2];
+    let mut work = 0_u64;
+
+    while let Some(thread) = workspace.pop_stack() {
+        let state = thread.state;
+        work = work.saturating_add(1);
+        let state_index = crate::plan::plan_index(state);
+        if workspace.seen_at[state_index] == workspace.generation {
+            continue;
+        }
+        workspace.seen_at[state_index] = workspace.generation;
+
+        match automaton.roles[state_index] {
+            // A nullable root must still examine every boundary.
+            StateRole::Accept => {
+                workspace.stack_len = 0;
+                return Ok(StartByteProof { set: None, work });
+            }
+            StateRole::Consume => {
+                for edge in automaton.state_edges(state) {
+                    work = work.saturating_add(1);
+                    let start = automaton.byte_starts[edge];
+                    let end = automaton.byte_ends[edge];
+                    // ASCII classifiers deliberately treat high bytes as
+                    // nonmembers. Disable the proof if any high byte can
+                    // begin a match.
+                    if end >= 0x80 {
+                        workspace.stack_len = 0;
+                        return Ok(StartByteProof { set: None, work });
+                    }
+                    insert_ascii_range(&mut words, start, end);
+                }
+            }
+            StateRole::Split => {
+                for edge in automaton.state_edges(state).rev() {
+                    work = work.saturating_add(1);
+                    // Assertions vary by boundary and therefore cannot be
+                    // skipped by a source-independent start-byte proof.
+                    if automaton.edge_kinds[edge] != EdgeKind::Epsilon {
+                        workspace.stack_len = 0;
+                        return Ok(StartByteProof { set: None, work });
+                    }
+                    workspace.push_stack(Thread {
+                        state: automaton.edge_targets[edge],
+                        start: 0,
+                    })?;
+                }
+            }
+        }
+    }
+    let set = AsciiByteSet::from_words(words);
+    Ok(StartByteProof {
+        set: (set != AsciiByteSet::ALL).then_some(set),
+        work,
+    })
+}
+
+fn insert_ascii_range(words: &mut [u64; 2], start: u8, end: u8) {
+    let start_word = usize::from(start / 64);
+    let end_word = usize::from(end / 64);
+    let start_bit = u32::from(start % 64);
+    let end_bit = u32::from(end % 64);
+    let end_shift = 63_u32
+        .checked_sub(end_bit)
+        .expect("a byte-range bit index is at most 63");
+    if start_word == end_word {
+        words[start_word] |= (u64::MAX << start_bit) & (u64::MAX >> end_shift);
+        return;
+    }
+    words[start_word] |= u64::MAX << start_bit;
+    words[end_word] |= u64::MAX >> end_shift;
+}
+
+fn next_start_candidate(
+    classifier: &AsciiByteSetClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+        meter.charge(
+            u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"),
+            position,
+        )?;
+        let block_end =
+            position
+                .checked_add(ASCII_WIDE_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "wide start-classifier block end",
+                })?;
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked wide classifier extent");
+        let members = classifier.classify_32(block).member_mask();
+        if members != 0 {
+            let offset =
+                usize::try_from(members.trailing_zeros()).expect("wide classifier lane fits usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "wide start-classifier candidate",
+                });
+        }
+        position = block_end;
+    }
+    if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
+        meter.charge(
+            u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"),
+            position,
+        )?;
+        let block_end =
+            position
+                .checked_add(ASCII_NARROW_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "narrow start-classifier block end",
+                })?;
+        let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked narrow classifier extent");
+        let members = classifier.classify_16(block).member_mask();
+        if members != 0 {
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("narrow classifier lane fits usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "narrow start-classifier candidate",
+                });
+        }
+        position = block_end;
+    }
+    while position < end {
+        meter.charge(1, position)?;
+        if classifier.set().contains(haystack[position]) {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-classifier position",
+            })?;
+    }
+    Ok(end)
+}
+
 fn prepare_invocation(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
@@ -571,7 +757,8 @@ fn prepare_invocation(
     let required_generations = window
         .end()
         .checked_sub(window.start())
-        .and_then(|length| length.checked_add(1))
+        // One proof generation precedes the ordinary boundary generations.
+        .and_then(|length| length.checked_add(2))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "required boundary generations",
         })?;
@@ -582,6 +769,15 @@ fn prepare_invocation(
     let mut meter = WorkMeter::new(limits.max_work, setup.work);
     workspace.begin_invocation(required_generations, &mut meter, setup, window.start())?;
     let setup_work = meter.consumed;
+    let start_proof = derive_ascii_start_set(automaton, workspace)?;
+    meter.charge(start_proof.work, window.start())?;
+    if start_proof.set != workspace.start_set {
+        let classifier_work = u64::try_from(ASCII_CLASSIFIER_BUILD_WORK)
+            .expect("ASCII classifier construction work fits u64");
+        meter.charge(classifier_work, window.start())?;
+        workspace.start_classifier = start_proof.set.map(AsciiByteSetClassifier::new);
+        workspace.start_set = start_proof.set;
+    }
     Ok((meter, setup_work))
 }
 
@@ -917,8 +1113,8 @@ mod tests {
 
     use super::{scratch_bytes, WorkMeter};
     use crate::{
-        Automaton, CompileLimits, EdgeKind, RawPlan, SearchError, SearchLimits, Span, StateRole,
-        WorkspaceLimits,
+        Automaton, CompileLimits, EdgeKind, K0Workspace, RawPlan, SearchError, SearchLimits,
+        SearchWindow, Span, StateRole, WorkspaceLimits,
     };
 
     #[test]
@@ -995,5 +1191,142 @@ mod tests {
             automaton.stats().states() * size_of::<u64>()
         );
         assert_eq!(report.into_output().unwrap().end(), 1);
+    }
+
+    #[test]
+    fn sparse_ascii_root_skips_impossible_starts_and_preserves_the_span() {
+        let automaton = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 2, 2],
+                edge_targets: vec![1, 2],
+                edge_kinds: vec![EdgeKind::ByteRange, EdgeKind::ByteRange],
+                byte_starts: vec![b'0', b'/'],
+                byte_ends: vec![b'9', b'/'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+
+        let mut haystack = vec![b'x'; 96];
+        haystack.extend_from_slice(b"5/");
+        automaton
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let report = automaton
+            .prepare::<Span>()
+            .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        let accounting = report.accounting();
+        let found = report.into_output().unwrap();
+        assert_eq!((found.start(), found.end()), (96, 98));
+        assert_eq!(
+            workspace
+                .start_classifier
+                .as_ref()
+                .expect("ASCII digit root should retain a classifier")
+                .set()
+                .words(),
+            [0x03ff_0000_0000_0000, 0]
+        );
+        assert_eq!(accounting.boundaries(), 3);
+        assert!(accounting.transition_work() < 120);
+    }
+
+    #[test]
+    fn ranged_sparse_root_keeps_original_offsets() {
+        let automaton = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 1],
+                edge_targets: vec![1],
+                edge_kinds: vec![EdgeKind::ByteRange],
+                byte_starts: vec![b'a'],
+                byte_ends: vec![b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let haystack = b"a...............................a";
+        let report = automaton
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                haystack,
+                SearchWindow::new(1, haystack.len()),
+                &mut workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let found = report.into_output().unwrap();
+        assert_eq!((found.start(), found.end()), (32, 33));
+    }
+
+    #[test]
+    fn nullable_asserted_and_high_byte_roots_decline_skipping() {
+        let nullable = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Accept],
+                edge_offsets: vec![0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut nullable_workspace =
+            K0Workspace::new(&nullable, WorkspaceLimits::unlimited()).unwrap();
+        nullable
+            .prepare::<Span>()
+            .search_with_workspace(b"", &mut nullable_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert!(nullable_workspace.start_classifier.is_none());
+
+        let asserted = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 2, 2],
+                edge_targets: vec![1, 2],
+                edge_kinds: vec![EdgeKind::AssertLineStartLf, EdgeKind::ByteRange],
+                byte_starts: vec![0, b'a'],
+                byte_ends: vec![0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut asserted_workspace =
+            K0Workspace::new(&asserted, WorkspaceLimits::unlimited()).unwrap();
+        asserted
+            .prepare::<Span>()
+            .search_with_workspace(b"a", &mut asserted_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert!(asserted_workspace.start_classifier.is_none());
+
+        let high = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 1],
+                edge_targets: vec![1],
+                edge_kinds: vec![EdgeKind::ByteRange],
+                byte_starts: vec![0x80],
+                byte_ends: vec![0xff],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut high_workspace = K0Workspace::new(&high, WorkspaceLimits::unlimited()).unwrap();
+        high.prepare::<Span>()
+            .search_with_workspace(&[0x80], &mut high_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert!(high_workspace.start_classifier.is_none());
     }
 }

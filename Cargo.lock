@@ -133,6 +133,7 @@ dependencies = [
 name = "fre-automata"
 version = "0.1.0"
 dependencies = [
+ "fre-simd-kernels",
  "regex-syntax",
 ]
 

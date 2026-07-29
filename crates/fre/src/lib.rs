@@ -4532,6 +4532,38 @@ mod tests {
     }
 
     #[test]
+    fn k0_session_retains_a_general_ascii_root_classifier() {
+        let pattern = r"([0-9][0-9]?)/([0-9][0-9]?)/([0-9][0-9]([0-9][0-9])?)";
+        let fre = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .expect("bounded date shape belongs to portable K0");
+        assert_eq!(fre.build_report().plan, PlanKind::K0);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut session = fre
+            .search_session(super::SearchSessionLimits::unlimited())
+            .unwrap();
+
+        let mut haystack = vec![b'x'; 4_096];
+        haystack.extend_from_slice(b" 1/2/2024 tail");
+        let expected = upstream
+            .find(&haystack)
+            .map(|matched| (matched.start(), matched.end()));
+        let (actual, accounting) = session.find(&haystack, SearchLimits::unlimited()).unwrap();
+        assert_eq!(
+            actual.map(|matched| (matched.start(), matched.end())),
+            expected
+        );
+        let SearchAccounting::K0(accounting) = accounting else {
+            panic!("date shape should report K0 accounting");
+        };
+        assert!(accounting.boundaries() < 32);
+    }
+
+    #[test]
     fn finite_planner_work_limit_is_an_exact_preselection_boundary() {
         let pattern = "(?:ab|cd)(?:e|f)";
         let baseline = PortableBuilder::new(pattern)

@@ -3,6 +3,7 @@ use fre_automata::{
     MalformedPlan, MatchSpan, OutputContract, RawPlan, ResourceKind, SearchError, SearchLimits,
     SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
+use fre_simd_kernels::ASCII_CLASSIFIER_BUILD_WORK;
 
 #[derive(Clone)]
 struct State {
@@ -694,9 +695,16 @@ fn reusable_workspace_is_allocation_free_and_matches_cold_calls() {
                 .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(reused.output(), cold.output());
-            assert_eq!(
-                reused.accounting().transition_work(),
-                cold.accounting().transition_work()
+            let build_work =
+                u64::try_from(ASCII_CLASSIFIER_BUILD_WORK).expect("classifier work fits u64");
+            let transition_delta = cold
+                .accounting()
+                .transition_work()
+                .checked_sub(reused.accounting().transition_work())
+                .expect("reused transition work cannot exceed a cold call");
+            assert!(
+                transition_delta == 0 || transition_delta == build_work,
+                "a cold call may differ only by one classifier build"
             );
             assert_eq!(reused.accounting().setup_work(), 3);
             assert_eq!(
@@ -765,6 +773,9 @@ fn workspace_limits_and_exact_reuse_boundaries_are_enforced() {
     )
     .unwrap();
     let retained = workspace.retained_bytes();
+    plan.prepare::<Span>()
+        .search_with_workspace(b"zabc", &mut workspace, SearchLimits::unlimited())
+        .unwrap();
     let successful = plan
         .prepare::<Span>()
         .search_with_workspace(b"zabc", &mut workspace, SearchLimits::unlimited())

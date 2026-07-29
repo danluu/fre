@@ -1,5 +1,7 @@
 use core::{marker::PhantomData, mem::size_of};
 
+use fre_simd_kernels::ASCII_CLASSIFIER_BUILD_WORK;
+
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 
 /// The structural role of a Thompson state.
@@ -368,7 +370,7 @@ impl Automaton {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "work-bound consume charge",
             })?;
-        boundaries
+        let automaton = boundaries
             .checked_mul(closure)
             .and_then(|value| {
                 input
@@ -377,6 +379,32 @@ impl Automaton {
             })
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "conservative transition work bound",
+            })?;
+        // Every invocation reauthenticates the assertion-free ASCII root
+        // against the current automaton before using a workspace-cached
+        // classifier. A shape-compatible workspace may need to rebuild the
+        // complete 128-byte-domain classifier.
+        let start_proof = u64::try_from(self.stats.states)
+            .ok()
+            .and_then(|states| states.checked_mul(2))
+            .and_then(|states| {
+                u64::try_from(self.stats.edges)
+                    .ok()
+                    .and_then(|edges| edges.checked_mul(2))
+                    .and_then(|edges| states.checked_add(edges))
+            })
+            .and_then(|work| {
+                u64::try_from(ASCII_CLASSIFIER_BUILD_WORK)
+                    .ok()
+                    .and_then(|classifier| work.checked_add(classifier))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-byte proof work bound",
+            })?;
+        automaton
+            .checked_add(start_proof)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "transition work with start-byte proof",
             })
     }
 

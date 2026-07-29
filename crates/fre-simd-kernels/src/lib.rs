@@ -70,6 +70,12 @@ pub const ASCII_NARROW_BYTES: usize = 16;
 /// Number of bytes consumed by the wide classifier operation.
 pub const ASCII_WIDE_BYTES: usize = 32;
 
+/// Exact abstract work used to compile one ASCII classifier.
+///
+/// Construction traverses the complete ASCII domain and selects the narrow
+/// and wide leaves, regardless of the selected scalar or vector variants.
+pub const ASCII_CLASSIFIER_BUILD_WORK: usize = 128 + 2 + 2;
+
 const ASCII_WORD_SET: AsciiByteSet =
     AsciiByteSet::from_words([0x03ff_0000_0000_0000, 0x07ff_fffe_87ff_fffe]);
 const ASCII_SPACE_VALUES: [u8; ASCII_NARROW_BYTES] = [
