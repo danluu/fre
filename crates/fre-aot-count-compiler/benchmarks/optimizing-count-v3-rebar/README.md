@@ -62,7 +62,9 @@ accepted. The former links Mach-O objects; the latter links ELF64/AArch64
 objects. Count-v3 expectation, metadata, and payload symbols are
 identity-suffixed. The expectation is placed in
 `__FRE_CONST,__fre_expect` on Mach-O or the read-only allocated
-`.fre.expect` section on ELF.
+`.rodata.fre.expect` input section on ELF. Linux links explicitly separate
+code and read-only data load segments; the linked expectation must therefore
+reside in an R-only, non-executable `PT_LOAD`.
 
 The qualification build script writes
 `fre.optimizing-count-v3.compiled-artifact-registry.v2` as

@@ -23,10 +23,13 @@ const ELF_HEADER_BYTES: usize = 64;
 const ELF_SECTION_HEADER_BYTES: usize = 64;
 const ELF_SECTION_HEADERS: usize = 5;
 const ELF_SYMBOL_BYTES: usize = 24;
-const ELF_SHSTRTAB: &[u8] = b"\0.fre.expect\0.symtab\0.strtab\0.shstrtab\0";
+// Use the conventional `.rodata.*` namespace instead of an orphan allocated
+// section. Both GNU ld and LLD collect this input into their read-only output
+// section; the final link also requests separate code/data PT_LOAD segments.
+const ELF_SHSTRTAB: &[u8] = b"\0.rodata.fre.expect\0.symtab\0.strtab\0.shstrtab\0";
 
 const _: () = assert!(MACH_HEADER_BYTES + MACH_LOAD_COMMAND_BYTES <= MACH_CONTENT_OFFSET);
-const _: () = assert!(ELF_SHSTRTAB.len() == 39);
+const _: () = assert!(ELF_SHSTRTAB.len() == 46);
 
 pub fn macho(expectation: &[u8], symbol: &str) -> Result<Vec<u8>, String> {
     if expectation.len() != EXPECTATION_BYTES {
@@ -220,7 +223,7 @@ pub fn elf(expectation: &[u8], symbol: &str) -> Result<Vec<u8>, String> {
     writer.bytes(&[0; ELF_SECTION_HEADER_BYTES])?;
     writer.elf_section(1, 1, 0x2, expectation_offset, expectation.len(), 0, 0, 8, 0)?;
     writer.elf_section(
-        13,
+        20,
         2,
         0,
         symbol_offset,
@@ -230,8 +233,8 @@ pub fn elf(expectation: &[u8], symbol: &str) -> Result<Vec<u8>, String> {
         8,
         ELF_SYMBOL_BYTES,
     )?;
-    writer.elf_section(21, 3, 0, string_offset, string_bytes, 0, 0, 1, 0)?;
-    writer.elf_section(29, 3, 0, shstrtab_offset, ELF_SHSTRTAB.len(), 0, 0, 1, 0)?;
+    writer.elf_section(28, 3, 0, string_offset, string_bytes, 0, 0, 1, 0)?;
+    writer.elf_section(36, 3, 0, shstrtab_offset, ELF_SHSTRTAB.len(), 0, 0, 1, 0)?;
     if writer.position() != section_header_offset + ELF_SECTION_HEADER_BYTES * ELF_SECTION_HEADERS {
         return Err("ELF section-header layout mismatch".to_string());
     }
@@ -248,6 +251,108 @@ fn validate_symbol(symbol: &str) -> Result<(), String> {
         Err("expectation symbol is not canonical".to_string())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXPECTATION_BYTES, elf};
+
+    const ELF_HEADER_BYTES: usize = 64;
+    const ELF_SECTION_HEADER_BYTES: usize = 64;
+    const ELF_SYMBOL_BYTES: usize = 24;
+
+    fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("u16 field"))
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("u32 field"))
+    }
+
+    fn u64_at(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("u64 field"))
+    }
+
+    fn section_offset(bytes: &[u8], index: usize) -> usize {
+        let table = usize::try_from(u64_at(bytes, 40)).expect("section-table offset");
+        table + index * ELF_SECTION_HEADER_BYTES
+    }
+
+    fn section_name(bytes: &[u8], index: usize) -> &str {
+        let names_index = usize::from(u16_at(bytes, 62));
+        let names = section_offset(bytes, names_index);
+        let names_file_offset =
+            usize::try_from(u64_at(bytes, names + 24)).expect("section-name file offset");
+        let name_offset =
+            usize::try_from(u32_at(bytes, section_offset(bytes, index))).expect("section name");
+        let start = names_file_offset + name_offset;
+        let end = bytes[start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|relative| start + relative)
+            .expect("terminated section name");
+        std::str::from_utf8(&bytes[start..end]).expect("ASCII section name")
+    }
+
+    #[test]
+    fn elf_expectation_is_conventional_read_only_input() {
+        let expectation = [0x5a; EXPECTATION_BYTES];
+        let symbol = "fre_aot_count_expectation_v3_test";
+        let object = elf(&expectation, symbol).expect("ELF expectation object");
+
+        assert_eq!(&object[..7], b"\x7fELF\x02\x01\x01");
+        assert_eq!(u16_at(&object, 16), 1);
+        assert_eq!(u16_at(&object, 18), 183);
+        assert_eq!(u16_at(&object, 52), ELF_HEADER_BYTES as u16);
+        assert_eq!(u16_at(&object, 58), ELF_SECTION_HEADER_BYTES as u16);
+        assert_eq!(u16_at(&object, 60), 5);
+        assert_eq!(section_name(&object, 1), ".rodata.fre.expect");
+
+        let expectation_section = section_offset(&object, 1);
+        assert_eq!(u32_at(&object, expectation_section + 4), 1);
+        assert_eq!(u64_at(&object, expectation_section + 8), 0x2);
+        assert_eq!(
+            u64_at(&object, expectation_section + 32),
+            EXPECTATION_BYTES as u64
+        );
+        assert_eq!(u64_at(&object, expectation_section + 48), 8);
+
+        let expectation_file_offset =
+            usize::try_from(u64_at(&object, expectation_section + 24)).expect("file offset");
+        assert_eq!(
+            &object[expectation_file_offset..expectation_file_offset + EXPECTATION_BYTES],
+            expectation
+        );
+    }
+
+    #[test]
+    fn elf_expectation_symbol_remains_global_hidden_object() {
+        let symbol = "fre_aot_count_expectation_v3_test";
+        let object = elf(&[0xa5; EXPECTATION_BYTES], symbol).expect("ELF expectation object");
+        let symbol_section = section_offset(&object, 2);
+        assert_eq!(section_name(&object, 2), ".symtab");
+        assert_eq!(
+            u64_at(&object, symbol_section + 56),
+            ELF_SYMBOL_BYTES as u64
+        );
+        let symbol_table_offset =
+            usize::try_from(u64_at(&object, symbol_section + 24)).expect("symbol-table offset");
+        let definition = symbol_table_offset + ELF_SYMBOL_BYTES;
+        assert_eq!(u32_at(&object, definition), 1);
+        assert_eq!(object[definition + 4], 0x11);
+        assert_eq!(object[definition + 5], 2);
+        assert_eq!(u16_at(&object, definition + 6), 1);
+        assert_eq!(u64_at(&object, definition + 8), 0);
+        assert_eq!(u64_at(&object, definition + 16), EXPECTATION_BYTES as u64);
+
+        let string_section = section_offset(&object, 3);
+        let string_table_offset =
+            usize::try_from(u64_at(&object, string_section + 24)).expect("string-table offset");
+        assert_eq!(
+            &object[string_table_offset + 1..string_table_offset + 1 + symbol.len()],
+            symbol.as_bytes()
+        );
     }
 }
 

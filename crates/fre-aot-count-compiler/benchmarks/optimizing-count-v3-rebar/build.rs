@@ -350,9 +350,12 @@ fn run() -> Result<(), String> {
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-reproducible");
     } else {
         // The deterministic hand-written ELF inputs intentionally contain
-        // only their contract sections. Pin the final executable's stack
-        // policy explicitly instead of inheriting a linker's legacy fallback
-        // for objects without `.note.GNU-stack`.
+        // only their contract sections. Collect `.rodata.fre.expect` into a
+        // page-disjoint read-only PT_LOAD instead of permitting an orphan
+        // allocated section to inherit executable permissions. Pin the final
+        // executable's stack policy too instead of inheriting a linker's
+        // legacy fallback for objects without `.note.GNU-stack`.
+        println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-z,separate-code");
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-z,noexecstack");
     }
     Ok(())
