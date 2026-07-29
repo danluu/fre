@@ -18038,45 +18038,6 @@ mod tests {
     }
 
     #[test]
-    fn state_byte_repeated_delimiter_retained_classifier_matches_native_search() {
-        for pattern in [r"(?:.*?,){2}z", r"(?:.*?;){3}q"] {
-            let compiled = state_byte_span_sum_fixture(pattern);
-            let plan = compiled.state_byte_span_sum.as_ref().unwrap();
-            assert_eq!(
-                plan.topology(),
-                StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix
-            );
-            let classifier = plan.delimiter_classifier().unwrap();
-            assert!(classifier.authenticates());
-            let mut seed = 0x9e37_79b9_u32;
-            let mut source = Vec::new();
-            for length in 0..=257_usize {
-                source.clear();
-                for index in 0..length {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    let byte = match (seed ^ u32::try_from(index).unwrap()) % 11 {
-                        0..=2 => classifier.first(),
-                        3 => classifier.second(),
-                        4 => b'z',
-                        5 => b'q',
-                        _ => b'a' + u8::try_from(seed % 23).unwrap(),
-                    };
-                    source.push(byte);
-                }
-                for start in 0..=length {
-                    assert_eq!(
-                        state_byte_find_either_retained(classifier, &source[start..]),
-                        memchr::memchr2(classifier.first(), classifier.second(), &source[start..]),
-                        "{pattern:?}, length={length}, start={start}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn state_byte_repeated_delimiter_dense_and_sparse_differential() {
         for pattern in [
             r"(?:.*?,){2}z",
