@@ -263,15 +263,7 @@ fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
                     else {
                         panic!("forced K0 returned another accounting family")
                     };
-                    assert_eq!(
-                        reused_accounting.transition_work(),
-                        cold_accounting.transition_work()
-                    );
-                    assert_eq!(reused_accounting.boundaries(), cold_accounting.boundaries());
-                    assert_eq!(
-                        reused_accounting.scratch_bytes(),
-                        cold_accounting.scratch_bytes()
-                    );
+                    assert!(!cold_accounting.setup().reused());
                     assert!(reused_accounting.setup().reused());
                     assert_eq!(reused_accounting.setup().allocated_bytes(), 0);
                     assert_eq!(
@@ -303,32 +295,83 @@ fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
 #[test]
 fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispatch() {
     let k0 = portable(r"\b[0-9A-Za-z_]+\b", PlanSelection::ForceK0);
-    let probe = k0
+    let full = k0
         .search_session(SearchSessionLimits::unlimited())
         .expect("unlimited K0 session");
-    let setup = probe.workspace_setup_accounting().unwrap();
-    let error = k0
+    let full_setup = full.workspace_setup_accounting().unwrap();
+    let endpoint = k0
+        .endpoint_search_session(SearchSessionLimits::unlimited())
+        .expect("unlimited endpoint-only K0 session");
+    let endpoint_setup = endpoint.workspace_setup_accounting().unwrap();
+    assert!(full_setup.work() > endpoint_setup.work());
+    assert!(full_setup.retained_bytes() > endpoint_setup.retained_bytes());
+
+    let work_endpoint = k0
         .search_session(SearchSessionLimits {
-            max_setup_work: setup.work() - 1,
+            max_setup_work: full_setup.work() - 1,
             max_scratch_bytes: usize::MAX,
         })
-        .expect_err("one-below setup work must refuse");
+        .expect("reverse work refusal must retain contextual endpoint acceleration");
+    assert_eq!(
+        work_endpoint.workspace_setup_accounting(),
+        Some(endpoint_setup)
+    );
+    let ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: endpoint_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("endpoint work refusal must retain Pike admission");
+    let ordinary_setup = ordinary.workspace_setup_accounting().unwrap();
+    assert!(ordinary_setup.work() < endpoint_setup.work());
+
+    k0.search_session(SearchSessionLimits {
+        max_setup_work: ordinary_setup.work(),
+        max_scratch_bytes: ordinary_setup.retained_bytes(),
+    })
+    .expect("exact ordinary setup boundary must succeed");
     assert!(matches!(
-        error,
-        fre::SearchError::K0(K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
-            if limit == setup.work() - 1 && needed == setup.work()
+        k0.search_session(SearchSessionLimits {
+            max_setup_work: ordinary_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        }),
+        Err(fre::SearchError::K0(
+            K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed }
+        )) if limit == ordinary_setup.work() - 1 && needed == ordinary_setup.work()
     ));
+
+    let scratch_endpoint = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: full_setup.retained_bytes() - 1,
+        })
+        .expect("reverse scratch refusal must retain contextual endpoint acceleration");
+    assert_eq!(
+        scratch_endpoint.workspace_setup_accounting(),
+        Some(endpoint_setup)
+    );
+    let scratch_ordinary = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: endpoint_setup.retained_bytes() - 1,
+        })
+        .expect("endpoint scratch refusal must retain Pike admission");
+    assert_eq!(
+        scratch_ordinary.workspace_setup_accounting(),
+        Some(ordinary_setup)
+    );
     assert!(matches!(
         k0.search_session(SearchSessionLimits {
             max_setup_work: u64::MAX,
-            max_scratch_bytes: setup.retained_bytes() - 1,
+            max_scratch_bytes: ordinary_setup.retained_bytes() - 1,
         }),
         Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
             needed,
             limit,
             ..
         }))
-            if needed == setup.retained_bytes() && limit == setup.retained_bytes() - 1
+            if needed == ordinary_setup.retained_bytes()
+                && limit == ordinary_setup.retained_bytes() - 1
     ));
 
     let literal = portable("Sherlock", PlanSelection::Auto);

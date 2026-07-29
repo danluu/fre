@@ -149,6 +149,31 @@ impl EdgeKind {
     pub(crate) const fn is_zero_width(self) -> bool {
         !matches!(self, Self::ByteRange)
     }
+
+    pub(crate) const fn assertion_bit(self) -> Option<u32> {
+        let ordinal = match self {
+            Self::Epsilon | Self::ByteRange => return None,
+            Self::AssertHaystackStart => 0,
+            Self::AssertHaystackEnd => 1,
+            Self::AssertLineStartLf => 2,
+            Self::AssertLineEndLf => 3,
+            Self::AssertLineStartCrlf => 4,
+            Self::AssertLineEndCrlf => 5,
+            Self::AssertWordAscii => 6,
+            Self::AssertWordAsciiNegate => 7,
+            Self::AssertWordStartAscii => 8,
+            Self::AssertWordEndAscii => 9,
+            Self::AssertWordStartHalfAscii => 10,
+            Self::AssertWordEndHalfAscii => 11,
+            Self::AssertWordUnicode => 12,
+            Self::AssertWordUnicodeNegate => 13,
+            Self::AssertWordStartUnicode => 14,
+            Self::AssertWordEndUnicode => 15,
+            Self::AssertWordStartHalfUnicode => 16,
+            Self::AssertWordEndHalfUnicode => 17,
+        };
+        Some(1_u32 << ordinal)
+    }
 }
 
 /// Mutable interchange form accepted from a future lowering layer.
@@ -195,6 +220,7 @@ pub struct PlanStats {
     edges: usize,
     zero_width_edges: usize,
     assertion_edges: usize,
+    assertion_kinds: u32,
     consuming_edges: usize,
     storage_bytes: usize,
     validation_work: usize,
@@ -218,6 +244,10 @@ impl PlanStats {
 
     pub(crate) const fn assertion_edges(self) -> usize {
         self.assertion_edges
+    }
+
+    pub(crate) const fn assertion_kinds(self) -> u32 {
+        self.assertion_kinds
     }
 
     #[must_use]
@@ -363,6 +393,7 @@ pub(crate) struct StartFilterProof {
     pub(crate) scanner: Option<StartPositionScanner>,
     pub(crate) guard: Option<StartPositionClass>,
     pub(crate) force_haystack_start: bool,
+    pub(crate) relaxed_nullable: bool,
 }
 
 /// Immutable structure-of-arrays prioritized Thompson graph.
@@ -683,12 +714,14 @@ struct Shape {
 fn validate_raw(raw: &RawPlan, limits: CompileLimits) -> Result<PlanStats, CompileError> {
     let shape = validate_shape(raw, limits)?;
     validate_offsets(&raw.edge_offsets, shape.edges)?;
-    let (zero_width_edges, assertion_edges, consuming_edges) = validate_graph(raw, shape.states)?;
+    let (zero_width_edges, assertion_edges, assertion_kinds, consuming_edges) =
+        validate_graph(raw, shape.states)?;
     Ok(PlanStats {
         states: shape.states,
         edges: shape.edges,
         zero_width_edges,
         assertion_edges,
+        assertion_kinds,
         consuming_edges,
         storage_bytes: shape.storage_bytes,
         validation_work: shape.validation_work,
@@ -782,9 +815,13 @@ fn validate_edge_array_lengths(raw: &RawPlan, edges: usize) -> Result<(), Compil
     Ok(())
 }
 
-fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize, usize), CompileError> {
+fn validate_graph(
+    raw: &RawPlan,
+    states: usize,
+) -> Result<(usize, usize, u32, usize), CompileError> {
     let mut zero_width_edges = 0usize;
     let mut assertion_edges = 0usize;
+    let mut assertion_kinds = 0_u32;
     let mut consuming_edges = 0usize;
     let mut has_accept = false;
     for state in 0..states {
@@ -812,6 +849,9 @@ fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize, usize),
                 if raw.edge_kinds[edge] != EdgeKind::Epsilon {
                     assertion_edges =
                         checked_edge_increment(assertion_edges, "assertion edge count")?;
+                    assertion_kinds |= raw.edge_kinds[edge]
+                        .assertion_bit()
+                        .expect("validated non-epsilon zero-width edge is an assertion");
                 }
             }
         }
@@ -819,7 +859,12 @@ fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize, usize),
     if !has_accept {
         return Err(MalformedPlan::MissingAcceptState.into());
     }
-    Ok((zero_width_edges, assertion_edges, consuming_edges))
+    Ok((
+        zero_width_edges,
+        assertion_edges,
+        assertion_kinds,
+        consuming_edges,
+    ))
 }
 
 /// Returns true for a consuming edge and false for a zero-width edge.

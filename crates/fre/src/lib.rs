@@ -2708,9 +2708,11 @@ impl PortableRegex {
     ///
     /// K0 allocates and fully initializes one fixed-capacity workspace here.
     /// Eligible byte graphs with a statically known positive minimum length
-    /// retain bounded forward endpoint rows plus a separate reverse cache for
-    /// exact full-span recovery. Assertion-bearing, nullable, statically empty,
-    /// or resource-refused graphs keep the ordinary Pike workspace. Cache
+    /// retain a bounded forward endpoint cache plus a separate reverse cache
+    /// for exact full-span recovery. Assertion-free graphs use direct byte
+    /// rows; assertion-bearing graphs key transitions by the exact
+    /// enabled-assertion mask at each boundary. Nullable, statically empty, or
+    /// resource-refused graphs keep the ordinary Pike workspace. Cache
     /// selection is source-free and occurs before allocation; every subsequent
     /// call reuses the selected storage without growing. Native plans retain
     /// their existing operation-specific dispatch and need no session storage.
