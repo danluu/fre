@@ -4362,6 +4362,33 @@ impl PortableSearchSession<'_> {
             }
         }
     }
+
+    fn find_iter_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
+            }
+            PortableSearchSessionPlan::K0 {
+                automaton,
+                workspace,
+            } => {
+                let report = automaton
+                    .prepare::<Span>()
+                    .search_at_with_workspace_cursor(haystack, start, workspace, limits)?;
+                let accounting = report.accounting();
+                let matched = report.into_output().map(|span| Match {
+                    start: span.start(),
+                    end: span.end(),
+                });
+                Ok((matched, SearchAccounting::K0(accounting)))
+            }
+        }
+    }
 }
 
 /// Fallible iterator over every non-overlapping byte match.
@@ -4473,11 +4500,9 @@ impl Iterator for PortableMatches<'_, '_> {
             if let Err(error) = self.begin_search() {
                 return Some(self.fail(error));
             }
-            let searched = self.session.find_window(
-                self.haystack,
-                SearchWindow::new(self.start, self.haystack.len()),
-                self.limits.search,
-            );
+            let searched = self
+                .session
+                .find_iter_at(self.haystack, self.start, self.limits.search);
             let (matched, search_accounting) = match searched {
                 Ok(result) => result,
                 Err(error) => return Some(self.fail(PortableFindIterError::Search(error))),

@@ -223,6 +223,34 @@ enum WorkspaceMode {
     Bidirectional,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpanCursorBinding {
+    automaton_identity: u64,
+    limits: SearchLimits,
+}
+
+// The cursor may borrow only the automaton-owned proof or the static decline.
+// A proof whose optional owner was resource-refused remains unprepared, so the
+// next search repeats and charges derivation instead of retaining hidden work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SpanCursorStartProof {
+    #[default]
+    Unprepared,
+    AutomatonOwned,
+    Ordinary,
+}
+
+// Source-independent facts that are invariant across suffix searches using
+// one workspace. Haystack bytes and the changing start remain call-local.
+#[derive(Clone, Copy, Debug, Default)]
+struct SpanCursorCache {
+    binding: Option<SpanCursorBinding>,
+    start_proof: SpanCursorStartProof,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+    contextual: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Thread {
     state: u32,
@@ -1493,6 +1521,7 @@ pub struct K0Workspace {
     stack_len: usize,
     lazy: LazyWorkspace,
     reverse: ReverseWorkspace,
+    span_cursor: SpanCursorCache,
     retained_bytes: usize,
     construction: SetupAccounting,
 }
@@ -1610,6 +1639,7 @@ impl K0Workspace {
             stack_len: 0,
             lazy,
             reverse,
+            span_cursor: SpanCursorCache::default(),
             retained_bytes,
             construction,
         })
@@ -1858,6 +1888,63 @@ pub(crate) fn search_with_workspace(
     )
 }
 
+pub(crate) fn search_span_with_workspace_cursor(
+    automaton: &Automaton,
+    haystack: &[u8],
+    start: usize,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+) -> Result<UntypedReport, SearchError> {
+    let window = SearchWindow::new(start, haystack.len());
+    validate_window(haystack, window)?;
+    let cursor = prepare_span_cursor(automaton, workspace, limits)?;
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, setup_work) = prepare_prevalidated_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        cursor.may_use_lazy,
+        cursor.may_use_reverse,
+    )?;
+    let start_proof = match cursor.start_proof {
+        SpanCursorStartProof::AutomatonOwned => {
+            let proof =
+                automaton
+                    .start_filter_proof
+                    .get()
+                    .ok_or(SearchError::InternalInvariant {
+                        detail: "cursor lost its automaton-owned start-filter proof",
+                    })?;
+            InvocationStartProof::Published(proof)
+        }
+        SpanCursorStartProof::Ordinary => {
+            InvocationStartProof::Published(&ORDINARY_START_FILTER_PROOF)
+        }
+        SpanCursorStartProof::Unprepared => {
+            prepare_start_filter(automaton, workspace, &mut meter, window.start())?
+        }
+    };
+    let report = execute_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        OutputContract::Span,
+        cursor.may_use_lazy,
+        cursor.may_use_reverse,
+        cursor.contextual,
+        meter,
+        setup_work,
+        start_proof,
+    )?;
+    workspace.span_cursor.start_proof = retained_span_cursor_start_proof(automaton);
+    Ok(report)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1869,7 +1956,7 @@ fn execute(
     window: SearchWindow,
     workspace: &mut K0Workspace,
     limits: SearchLimits,
-    mut setup: SetupAccounting,
+    setup: SetupAccounting,
     contract: OutputContract,
     allow_lazy: bool,
 ) -> Result<UntypedReport, SearchError> {
@@ -1882,7 +1969,9 @@ fn execute(
         && workspace.reverse.is_bound_to(automaton);
     let may_use_lazy =
         allow_lazy && workspace.lazy.is_allocated() && (!wants_span || may_use_reverse);
-    let (mut meter, mut setup_work) = prepare_invocation(
+    let contextual = automaton.stats().assertion_edges() != 0;
+    let mut setup = setup;
+    let (mut meter, setup_work) = prepare_invocation(
         automaton,
         workspace,
         window,
@@ -1891,6 +1980,45 @@ fn execute(
         may_use_lazy,
         may_use_reverse,
     )?;
+    let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
+    execute_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        contract,
+        may_use_lazy,
+        may_use_reverse,
+        contextual,
+        meter,
+        setup_work,
+        start_proof,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the shared Pike/lazy entry authenticates one complete invocation"
+)]
+fn execute_prepared(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    mut setup: SetupAccounting,
+    contract: OutputContract,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+    contextual: bool,
+    mut meter: WorkMeter,
+    mut setup_work: u64,
+    start_proof: InvocationStartProof<'_>,
+) -> Result<UntypedReport, SearchError> {
+    let wants_span = matches!(contract, OutputContract::Span);
     // Cache learning is optional work. Preserve the ordinary reusable-work
     // certificate by reserving its complete transition allowance before any
     // initial-state publication or speculative interning. Unlimited callers
@@ -1919,8 +2047,6 @@ fn execute(
     } else {
         ordinary_core_reserve
     };
-    let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
-    let contextual = automaton.stats().assertion_edges() != 0;
     // Unlike direct byte rows, a contextual hit still evaluates the assertion
     // symbol and probes a bounded associative store. Admit that fixed work
     // source-free before reading the haystack or mutating contextual state.
@@ -4901,6 +5027,89 @@ fn prepare_invocation(
         });
     }
 
+    prepare_prevalidated_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+    )
+}
+
+fn prepare_span_cursor(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+) -> Result<SpanCursorCache, SearchError> {
+    let binding = SpanCursorBinding {
+        automaton_identity: automaton.identity(),
+        limits,
+    };
+    if workspace.span_cursor.binding == Some(binding) {
+        if workspace.span_cursor.start_proof == SpanCursorStartProof::Unprepared {
+            workspace.span_cursor.start_proof = retained_span_cursor_start_proof(automaton);
+        }
+        return Ok(workspace.span_cursor);
+    }
+
+    let required_layout = WorkspaceLayout::for_automaton(automaton)?;
+    if required_layout.states != workspace.layout.states
+        || required_layout.edges != workspace.layout.edges
+        || required_layout.zero_width_edges != workspace.layout.zero_width_edges
+        || required_layout.closure_slots != workspace.layout.closure_slots
+    {
+        return Err(SearchError::WorkspaceLayoutMismatch {
+            required_states: required_layout.states,
+            actual_states: workspace.layout.states,
+            required_edges: required_layout.edges,
+            actual_edges: workspace.layout.edges,
+            required_zero_width_edges: required_layout.zero_width_edges,
+            actual_zero_width_edges: workspace.layout.zero_width_edges,
+        });
+    }
+    if workspace.retained_bytes > limits.max_scratch_bytes {
+        return Err(SearchError::ResourceLimit {
+            resource: ResourceKind::ScratchBytes,
+            needed: workspace.retained_bytes,
+            limit: limits.max_scratch_bytes,
+        });
+    }
+
+    let may_use_reverse = workspace.lazy.is_allocated()
+        && workspace.reverse.is_allocated()
+        && workspace.reverse.is_bound_to(automaton);
+    let cursor = SpanCursorCache {
+        binding: Some(binding),
+        start_proof: retained_span_cursor_start_proof(automaton),
+        may_use_lazy: workspace.lazy.is_allocated() && may_use_reverse,
+        may_use_reverse,
+        contextual: automaton.stats().assertion_edges() != 0,
+    };
+    workspace.span_cursor = cursor;
+    Ok(cursor)
+}
+
+fn retained_span_cursor_start_proof(automaton: &Automaton) -> SpanCursorStartProof {
+    if automaton.start_filter_proof.get().is_some() {
+        SpanCursorStartProof::AutomatonOwned
+    } else if automaton.start_filter_proof.allocation_failed() {
+        SpanCursorStartProof::Ordinary
+    } else {
+        SpanCursorStartProof::Unprepared
+    }
+}
+
+fn prepare_prevalidated_invocation(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
     let required_generations = window
         .end()
         .checked_sub(window.start())

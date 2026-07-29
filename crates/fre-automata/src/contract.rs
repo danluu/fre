@@ -379,3 +379,35 @@ impl<O: Operation> TypedPlan<'_, O> {
         ))
     }
 }
+
+impl TypedPlan<'_, Span> {
+    /// Search a complete-haystack suffix in one non-overlapping traversal.
+    ///
+    /// The workspace retains source-independent span invocation facts after
+    /// the first call. The original haystack remains intact so assertions
+    /// inspect the same context as [`Self::search_window_with_workspace`].
+    /// Logical reset, generation-rollover preflight, work limits, and result
+    /// accounting still apply independently to every suffix search.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range, workspace, and resource
+    /// contract as [`Self::search_window_with_workspace`].
+    #[doc(hidden)]
+    pub fn search_at_with_workspace_cursor(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        workspace: &mut K0Workspace,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<Option<MatchSpan>>, SearchError> {
+        let report = crate::k0::search_span_with_workspace_cursor(
+            self.automaton,
+            haystack,
+            start,
+            workspace,
+            limits,
+        )?;
+        Ok(SearchReport::new(report.found, report.accounting))
+    }
+}
