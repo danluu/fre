@@ -176,10 +176,7 @@ impl Engine {
         }
     }
 
-    const fn artifact_file(
-        self,
-        artifact: &ArtifactDescriptor,
-    ) -> (&'static str, &'static str) {
+    const fn artifact_file(self, artifact: &ArtifactDescriptor) -> (&'static str, &'static str) {
         match self {
             Self::PortableCurrent => (
                 artifact.portable_artifact_file_path,
@@ -449,9 +446,10 @@ fn validate_embedded_tables() -> Result<(), RunnerError> {
             "embedded cells are not in canonical unique cell-ID order",
         ));
     }
-    if ARTIFACTS.windows(2).any(|pair| {
-        pair[0].pattern_input_id >= pair[1].pattern_input_id
-    }) {
+    if ARTIFACTS
+        .windows(2)
+        .any(|pair| pair[0].pattern_input_id >= pair[1].pattern_input_id)
+    {
         return Err(RunnerError::new(
             "embedded artifacts are not in canonical unique pattern-input order",
         ));
@@ -466,11 +464,20 @@ fn validate_embedded_tables() -> Result<(), RunnerError> {
     for artifact in ARTIFACTS {
         for (label, value) in [
             ("portable artifact ID", artifact.portable_artifact_id),
-            ("portable artifact SHA-256", artifact.portable_artifact_file_sha256),
+            (
+                "portable artifact SHA-256",
+                artifact.portable_artifact_file_sha256,
+            ),
             ("Count-v2 artifact ID", artifact.v2_artifact_id),
-            ("Count-v2 artifact SHA-256", artifact.v2_artifact_file_sha256),
+            (
+                "Count-v2 artifact SHA-256",
+                artifact.v2_artifact_file_sha256,
+            ),
             ("Count-v3 artifact ID", artifact.v3_artifact_id),
-            ("Count-v3 artifact SHA-256", artifact.v3_artifact_file_sha256),
+            (
+                "Count-v3 artifact SHA-256",
+                artifact.v3_artifact_file_sha256,
+            ),
         ] {
             require_lower_hex_64(value, label)?;
         }
@@ -580,6 +587,17 @@ fn authenticate_selected_artifact(
             "selected engine artifact digest differs from the build registry",
         ));
     }
+    let parent_after = fs::symlink_metadata(parent)
+        .map_err(|error| RunnerError::new(format!("restat artifact root: {error}")))?;
+    if parent_after.file_type().is_symlink()
+        || !parent_after.is_dir()
+        || parent_after.dev() != parent_metadata.dev()
+        || parent_after.ino() != parent_metadata.ino()
+    {
+        return Err(RunnerError::new(
+            "selected artifact root changed during authentication",
+        ));
+    }
     Ok(())
 }
 
@@ -634,11 +652,17 @@ fn read_stable_regular(
         || after.dev() != opened.dev()
         || after.ino() != opened.ino()
         || after.len() != opened.len()
+        || after.nlink() != 1
+        || require_read_only && after.mode() & 0o222 != 0
         || after.mtime() != opened.mtime()
         || after.mtime_nsec() != opened.mtime_nsec()
         || path_after.file_type().is_symlink()
+        || !path_after.is_file()
         || path_after.dev() != opened.dev()
         || path_after.ino() != opened.ino()
+        || path_after.len() != opened.len()
+        || path_after.nlink() != 1
+        || require_read_only && path_after.mode() & 0o222 != 0
     {
         return Err(RunnerError::new(format!(
             "{} changed while reading",
