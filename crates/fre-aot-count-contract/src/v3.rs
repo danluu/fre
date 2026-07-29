@@ -40,6 +40,8 @@ pub const COUNT_ABI_KIND_V3: u8 = 2;
 pub const COUNT_OUTPUT_KIND_V3: u8 = 1;
 
 pub const AOT_COUNT_AUDITOR_VERSION_V3: u16 = 1;
+pub const METADATA_ACTUAL_FEATURES_OFFSET_V3: usize = 56;
+pub const METADATA_TARGET_IDENTITY_OFFSET_V3: usize = 576;
 pub const METADATA_COMPILE_IDENTITY_OFFSET_V3: usize = 608;
 
 const METADATA_MAGIC_V3: [u8; 8] = *b"FREOM64\x03";
@@ -50,6 +52,9 @@ const TARGET_IDENTITY_DOMAIN_V3: &[u8] = b"FRE-AOT-COUNT-TARGET-IDENTITY\0\x03";
 pub const RECIPE_CANONICAL_BYTES_V3: usize = COUNT_V3_RECIPE_CANONICAL_BYTES;
 const PADDED_LITERAL_BYTES_V3: usize = 32;
 
+const _: () = assert!(METADATA_ACTUAL_FEATURES_OFFSET_V3 + 8 <= METADATA_BYTES_V3);
+const _: () =
+    assert!(METADATA_TARGET_IDENTITY_OFFSET_V3 + 32 == METADATA_COMPILE_IDENTITY_OFFSET_V3);
 const _: () = assert!(METADATA_COMPILE_IDENTITY_OFFSET_V3 + 32 == METADATA_BYTES_V3);
 const _: () = assert!(
     STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3 + METADATA_BYTES_V3
@@ -771,7 +776,7 @@ fn required_features_for_isa(required_isa_id: u8) -> Option<AotCountCpuFeatures>
     match required_isa_id {
         1 => Some(AotCountCpuFeatures::ASIMD),
         2 => Some(AotCountCpuFeatures::SVE),
-        3 => Some(AotCountCpuFeatures::SVE2),
+        3 => Some(AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2)),
         _ => None,
     }
 }
@@ -915,6 +920,8 @@ mod tests {
 
     #[test]
     fn fixed_offsets_are_self_consistent() {
+        assert_eq!(METADATA_ACTUAL_FEATURES_OFFSET_V3, 56);
+        assert_eq!(METADATA_TARGET_IDENTITY_OFFSET_V3, 576);
         assert_eq!(METADATA_COMPILE_IDENTITY_OFFSET_V3 + 32, METADATA_BYTES_V3);
         assert_eq!(
             STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3 + METADATA_BYTES_V3,
@@ -938,5 +945,50 @@ mod tests {
         );
         assert_eq!(CountObjectFormatV3::from_wire(0), None);
         assert_eq!(CountObjectFormatV3::from_wire(3), None);
+    }
+
+    #[test]
+    fn required_isa_feature_closures_are_exact() {
+        assert_eq!(
+            required_features_for_isa(1).map(AotCountCpuFeatures::bits),
+            Some(AotCountCpuFeatures::ASIMD.bits())
+        );
+        assert_eq!(
+            required_features_for_isa(2).map(AotCountCpuFeatures::bits),
+            Some(AotCountCpuFeatures::SVE.bits())
+        );
+        assert_eq!(
+            required_features_for_isa(3).map(AotCountCpuFeatures::bits),
+            Some(
+                AotCountCpuFeatures::SVE
+                    .union(AotCountCpuFeatures::SVE2)
+                    .bits()
+            )
+        );
+        assert_eq!(required_features_for_isa(0), None);
+        assert_eq!(required_features_for_isa(4), None);
+    }
+
+    #[test]
+    fn sve2_requirement_rejects_each_one_bit_near_miss() {
+        let required = required_features_for_isa(3)
+            .expect("closed SVE2 ISA row")
+            .bits();
+        assert_eq!(
+            required,
+            AotCountCpuFeatures::SVE.bits() | AotCountCpuFeatures::SVE2.bits()
+        );
+        for removed in [
+            AotCountCpuFeatures::SVE.bits(),
+            AotCountCpuFeatures::SVE2.bits(),
+        ] {
+            let mutated = required ^ removed;
+            assert_ne!(
+                mutated & required,
+                required,
+                "removing either prerequisite feature must fail closure"
+            );
+        }
+        assert_eq!(required & required, required);
     }
 }

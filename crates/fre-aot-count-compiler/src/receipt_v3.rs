@@ -10,7 +10,7 @@ use fre_aot_optimizer::{
     COUNT_V3_MAX_LITERAL_BYTES, COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES, CountRecipeV3,
     CountV3OptimizerLimits, CountV3OptimizerReceipt, CountV3RequiredIsa, CountV3TuningClass,
     compute_count_v3_literal_identity, encode_count_recipe_v3, encode_count_v3_optimizer_receipt,
-    inspect_count_v3_optimizer_receipt, optimize_count_v3, validate_count_recipe_v3,
+    inspect_count_v3_optimizer_receipt, optimize_count_v3_for_isa, validate_count_recipe_v3,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 use sha2::{Digest, Sha256};
@@ -292,7 +292,12 @@ pub fn compile_count_v3(
     let live_literal_identity: [u8; 32] = Sha256::digest(request.literal).into();
     let recipe_literal_identity = compute_count_v3_literal_identity(request.literal);
     let program = build_exact_aggregate::<Count>(request.literal, limits.kernel_ir)?;
-    let optimized = optimize_count_v3(&program, request.target.tuning_class, limits.optimizer)?;
+    let optimized = optimize_count_v3_for_isa(
+        &program,
+        request.target.tuning_class,
+        request.target.required_isa,
+        limits.optimizer,
+    )?;
     let recipe = *optimized.recipe();
     let optimizer_receipt = *optimized.receipt();
     if !optimizer_receipt.authenticates()

@@ -1,14 +1,19 @@
 use fre_aot_aarch64::{
-    CountEmitLimitsV2, CountEmitLimitsV3, audit_count_mapped_code_v3, emit_count_v2,
+    AotCountCpuFeatures, AotCountTargetSpec, CountEmitLimitsV2, CountEmitLimitsV3,
+    SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3, audit_count_mapped_code_v3, emit_count_v2,
 };
 use fre_aot_count_contract::v3::{
-    METADATA_BYTES_V3, inspect_count_metadata_v3, inspect_static_count_expectation_v3,
+    METADATA_ACTUAL_FEATURES_OFFSET_V3, METADATA_BYTES_V3, METADATA_TARGET_IDENTITY_OFFSET_V3,
+    STATIC_COUNT_EXPECTATION_IDENTITY_OFFSET_V3, STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3,
+    compute_count_target_identity_v3, inspect_count_metadata_v3,
+    inspect_static_count_expectation_v3,
 };
 use fre_aot_optimizer::{
     CountV3RequiredIsa, CountV3TuningClass, encode_count_recipe_v3,
     inspect_count_v3_optimizer_receipt,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
+use sha2::{Digest, Sha256};
 
 use crate::{
     CountCompileLimitsV3, CountCompileRequestV3, CountCompileTargetV3, CountObjectFormatV3,
@@ -30,6 +35,13 @@ fn candidate() -> CountSemanticCandidateV3 {
 }
 
 fn compile(format: CountObjectFormatV3) -> crate::FocusedCompiledCountV3 {
+    compile_for_isa(format, CountV3RequiredIsa::Aarch64Neon128)
+}
+
+fn compile_for_isa(
+    format: CountObjectFormatV3,
+    required_isa: CountV3RequiredIsa,
+) -> crate::FocusedCompiledCountV3 {
     compile_count_v3(
         CountCompileRequestV3 {
             literal: b"needle",
@@ -37,7 +49,7 @@ fn compile(format: CountObjectFormatV3) -> crate::FocusedCompiledCountV3 {
             target: CountCompileTargetV3 {
                 object_format: format,
                 tuning_class: CountV3TuningClass::GenericAarch64,
-                required_isa: CountV3RequiredIsa::Aarch64Neon128,
+                required_isa,
             },
         },
         CountCompileLimitsV3::default(),
@@ -115,6 +127,72 @@ fn complete_recipe_literal_and_optimizer_receipt_are_retained() {
             .expect("eligibility tuple")
     );
     assert_eq!(compiled.runtime_authority(), RuntimeAuthorityV3::Absent);
+}
+
+#[test]
+fn sve2_expectation_rejects_each_missing_prerequisite_feature() {
+    let compiled = compile_for_isa(
+        CountObjectFormatV3::Elf64Aarch64,
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+    );
+    let original_metadata =
+        inspect_count_metadata_v3(compiled.implementation_object().metadata_bytes())
+            .expect("valid SVE2 metadata");
+    let complete_features = AotCountCpuFeatures::SVE
+        .union(AotCountCpuFeatures::SVE2)
+        .bits();
+    assert_eq!(original_metadata.actual_features(), complete_features);
+    let support = SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[2];
+    assert_eq!(support.allowed_features.bits(), complete_features);
+
+    for removed in [
+        AotCountCpuFeatures::SVE.bits(),
+        AotCountCpuFeatures::SVE2.bits(),
+    ] {
+        let mutated_features = complete_features ^ removed;
+        let mut expectation = *compiled.expectation();
+        let actual_start =
+            STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3 + METADATA_ACTUAL_FEATURES_OFFSET_V3;
+        expectation[actual_start..actual_start + 8]
+            .copy_from_slice(&mutated_features.to_le_bytes());
+        let target = AotCountTargetSpec {
+            architecture: original_metadata.architecture(),
+            little_endian: original_metadata.little_endian(),
+            pointer_width: original_metadata.pointer_width(),
+            abi: original_metadata.target_abi(),
+            features: AotCountCpuFeatures::from_bits(mutated_features)
+                .expect("known one-bit SVE2 near miss"),
+        };
+        let target_identity = compute_count_target_identity_v3(
+            original_metadata.object_format(),
+            support,
+            target,
+            original_metadata.tuning_class_id(),
+            original_metadata.register_plan_id(),
+            original_metadata.required_isa_id(),
+        );
+        let target_start =
+            STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3 + METADATA_TARGET_IDENTITY_OFFSET_V3;
+        expectation[target_start..target_start + 32].copy_from_slice(&target_identity);
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"FRE-AOT-STATIC-COUNT-EXPECTATION-IDENTITY\0\x03");
+        hasher.update(&expectation[..STATIC_COUNT_EXPECTATION_IDENTITY_OFFSET_V3]);
+        let expectation_identity: [u8; 32] = hasher.finalize().into();
+        expectation[STATIC_COUNT_EXPECTATION_IDENTITY_OFFSET_V3..]
+            .copy_from_slice(&expectation_identity);
+
+        let metadata: &[u8; METADATA_BYTES_V3] = expectation
+            [STATIC_COUNT_EXPECTATION_METADATA_OFFSET_V3
+                ..STATIC_COUNT_EXPECTATION_IDENTITY_OFFSET_V3]
+            .try_into()
+            .expect("fixed metadata range");
+        inspect_count_metadata_v3(metadata)
+            .expect("near miss remains an internally canonical metadata claim");
+        let error = inspect_static_count_expectation_v3(&expectation)
+            .expect_err("SVE2 expectation must require both SVE and SVE2");
+        assert_eq!(error.at(), "metadata expectation binding");
+    }
 }
 
 #[test]
