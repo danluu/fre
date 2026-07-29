@@ -2351,6 +2351,21 @@ fn emit_multi_specialized_v3(
     let sparse_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
     let sparse_hit = assembler.new_label(LabelKindV3::Internal)?;
     let sparse_first_half = assembler.new_label(LabelKindV3::Internal)?;
+    let wide_batch = if strategy != LoweringStrategyV3::PeriodicRun {
+        Some(assembler.new_label(LabelKindV3::VectorLoop)?)
+    } else {
+        None
+    };
+    let wide_batch_empty = if wide_batch.is_some() {
+        Some(assembler.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
+    let wide_batch_hit = if wide_batch.is_some() {
+        Some(assembler.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
     let last_offset = u8::try_from(literal.len() - 1).expect("bounded nonempty literal");
     let semantic_secondary_offset = if filter.offsets[0] == last_offset {
         0
@@ -2437,6 +2452,10 @@ fn emit_multi_specialized_v3(
     assembler.cmp_reg64(X3, X4)?;
     assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X5, X4, X3)?;
+    if let Some(wide_batch) = wide_batch {
+        assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+        assembler.branch_cond(ConditionV3::CarrySet, wide_batch)?;
+    }
     assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
     assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
     assembler.add_reg(X15, X0, X3)?;
@@ -2487,6 +2506,122 @@ fn emit_multi_specialized_v3(
     assembler.bind(block_advance)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(vector)?;
+
+    if let (Some(wide_batch), Some(wide_batch_empty), Some(wide_batch_hit)) =
+        (wide_batch, wide_batch_empty, wide_batch_hit)
+    {
+        // Start every long non-periodic iteration with eight primary masks.
+        // An empty union skips all 128 candidate starts after one reduction.
+        // A nonempty union retains the exact masks so the other pattern-only
+        // filter columns can refine them without rescanning the primary.
+        assembler.bind(wide_batch)?;
+        assembler.add_reg(X15, X0, X3)?;
+        assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+            let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
+                CountAotError::ArithmeticOverflow {
+                    site: CountAotArithmeticSite::CodeOffset,
+                },
+            )?;
+            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                .expect("eight wide primary masks");
+            assembler.load_vector128_offset(mask, X8, offset)?;
+            assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+        }
+        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, 0, 1)?;
+        assembler.unsigned_max_across_bytes16(1, 1)?;
+        assembler.move_vector_byte_to32(X8, 1)?;
+        assembler.cmp_imm64(X8, 0)?;
+        assembler.branch_cond(ConditionV3::Equal, wide_batch_empty)?;
+
+        // Refine column-major only after the primary union proves useful.
+        // The final union is reduced once, independently of filter count.
+        for index in 1..usize::from(filter.len) {
+            assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+            for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+                let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
+                    CountAotError::ArithmeticOverflow {
+                        site: CountAotArithmeticSite::CodeOffset,
+                    },
+                )?;
+                let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                    .expect("eight wide composite masks");
+                assembler.load_vector128_offset(0, X8, offset)?;
+                assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
+                assembler.and_bytes16(mask, mask, 0)?;
+            }
+        }
+        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, 0, 1)?;
+        assembler.unsigned_max_across_bytes16(1, 1)?;
+        assembler.move_vector_byte_to32(X8, 1)?;
+        assembler.cmp_imm64(X8, 0)?;
+        assembler.branch_cond(ConditionV3::NotEqual, wide_batch_hit)?;
+
+        assembler.bind(wide_batch_empty)?;
+        assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3)?;
+        assembler.branch(vector)?;
+
+        // Build the four pair masks expected by the shared earliest-region
+        // classifier. It returns to the complete 16-start candidate path.
+        assembler.bind(wide_batch_hit)?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_01_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 1,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_23_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_45_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_67_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.branch(sparse_hit)?;
+    }
 
     // A primary-empty ordinary block enters a single-column 128-start scan.
     // Every hit-bearing group returns through the shared classifier to the
