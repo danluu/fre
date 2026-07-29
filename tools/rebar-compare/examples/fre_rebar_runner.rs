@@ -81,8 +81,9 @@ fn main() -> Result<(), DynError> {
                 let target = bound_env("FRE_TARGET", option_env!("FRE_TARGET"))?;
                 let simd_capabilities = SimdDispatchContext::capture().capabilities();
                 println!(
-                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain=44 aggregate-many-explain={} aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
+                    "{RUNNER_SCHEMA} protocol=stratified-v1 adapter={} report={REPORT_SCHEMA} aggregate-explain={} aggregate-many-explain={} aggregate-many=compile+count+count-spans+count-captures performance-raw=all-supported facade-explain=1 rebar={AUDITED_REBAR_REVISION} package={} canonical-sha={canonical_sha} canonical-tree={canonical_tree} engine-sha={engine_sha} engine-tree={engine_tree} runner-sha={runner_sha} runner-tree={runner_tree} lock={lock} profile={profile} toolchain={toolchain} target={target} simd-dispatch={} simd-architecture={:?} simd-feature-bits={:032x}",
                     current_fre_adapter_id(),
+                    fre::AGGREGATE_EXPLAIN_SCHEMA_VERSION,
                     fre::AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION,
                     env!("CARGO_PKG_VERSION"),
                     simd_dispatch_profile().name(),

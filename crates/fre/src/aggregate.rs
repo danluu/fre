@@ -211,7 +211,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 44;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 45;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -233,14 +233,20 @@ pub enum AggregateOperation {
     SpanSum,
 }
 
-/// Why the authenticated whole-match byte domain proves that an invocation
-/// cannot produce a match.
+/// Why an authenticated whole-match byte-domain proof can complete without
+/// source access. All reasons except
+/// [`Self::NonemptyAlternativesBelowMinimumBytes`] produce no matches; that
+/// reason proves the exact byte-boundary empty-match stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateImpossibleMatchReason {
     /// The canonical HIR denotes the empty language.
     EmptyLanguage,
     /// Every match consumes more bytes than the complete haystack contains.
     BelowMinimumBytes,
+    /// Every nonempty top-level alternative consumes more bytes than the
+    /// complete haystack contains, leaving an unconditional empty alternative
+    /// as the only possible leftmost-first match.
+    NonemptyAlternativesBelowMinimumBytes,
     /// Absolute text-start/text-end assertions require the match to consume the
     /// complete haystack, which is longer than every string in the language.
     AboveAbsoluteMaximumBytes,
@@ -256,18 +262,47 @@ pub enum AggregateImpossibleMatchReason {
 struct AggregateMatchDomainProof {
     minimum_match_bytes: Option<usize>,
     maximum_match_bytes: Option<usize>,
-    absolute_whole_input: bool,
+    /// Minimum byte width across every nonempty top-level alternative when
+    /// captures erase to one alternation containing an unconditional `Empty`
+    /// arm. This proof is deliberately byte-mode only: every byte boundary is
+    /// then an eligible empty-match boundary without source inspection.
+    ///
+    /// Bit zero records the pre-existing absolute-whole-input proof and the
+    /// remaining bits store this positive minimum. Keeping both facts in one
+    /// word preserves the construction owner's allocation size class.
+    domain_flags: usize,
 }
 
+const EMPTY_ALTERNATIVE_BRANCH_CHECKS: u8 = 2;
+const ABSOLUTE_WHOLE_INPUT_FLAG: usize = 1;
+
 impl AggregateMatchDomainProof {
-    fn from_hir(hir: &Hir) -> Self {
+    fn from_hir(hir: &Hir, unicode: bool) -> Self {
         let properties = hir.properties();
+        let absolute_whole_input = properties.look_set_prefix().contains(Look::Start)
+            && properties.look_set_suffix().contains(Look::End);
+        let empty_alternative_minimum = if unicode {
+            None
+        } else {
+            empty_alternative_nonempty_minimum_bytes(hir)
+        };
+        let encoded_empty_alternative_minimum = empty_alternative_minimum
+            .and_then(|minimum| minimum.checked_mul(2))
+            .unwrap_or(0);
         Self {
             minimum_match_bytes: properties.minimum_len(),
             maximum_match_bytes: properties.maximum_len(),
-            absolute_whole_input: properties.look_set_prefix().contains(Look::Start)
-                && properties.look_set_suffix().contains(Look::End),
+            domain_flags: encoded_empty_alternative_minimum | usize::from(absolute_whole_input),
         }
+    }
+
+    const fn absolute_whole_input(&self) -> bool {
+        self.domain_flags & ABSOLUTE_WHOLE_INPUT_FLAG != 0
+    }
+
+    const fn empty_alternative_nonempty_minimum_bytes(&self) -> Option<usize> {
+        let minimum = self.domain_flags >> 1;
+        if minimum == 0 { None } else { Some(minimum) }
     }
 
     #[inline]
@@ -278,7 +313,7 @@ impl AggregateMatchDomainProof {
         if input_bytes < minimum {
             return Some((AggregateImpossibleMatchReason::BelowMinimumBytes, 1));
         }
-        if self.absolute_whole_input
+        if self.absolute_whole_input()
             && self
                 .maximum_match_bytes
                 .is_some_and(|maximum| input_bytes > maximum)
@@ -287,10 +322,63 @@ impl AggregateMatchDomainProof {
         }
         None
     }
+
+    #[inline]
+    fn empty_alternative_only(&self, input_bytes: usize) -> Option<usize> {
+        let minimum = self.empty_alternative_nonempty_minimum_bytes()?;
+        (input_bytes < minimum).then_some(minimum)
+    }
 }
 
-/// Source-free operation receipt for an impossible whole-match byte domain.
-/// Terminal success reports retain this proof before any source access.
+/// Prove that transparent root captures enclose one ordered top-level
+/// alternation with at least one unconditional empty arm and no other nullable
+/// arm. Empty-language arms are irrelevant; every remaining arm contributes
+/// its canonical minimum byte width.
+///
+/// Construction accounting owns this bounded inspection through the
+/// authenticated syntax/HIR admission: it visits only an already-admitted
+/// transparent root chain and its top-level arms, reads cached constant-time
+/// properties, performs no recursion, and allocates nothing.
+fn empty_alternative_nonempty_minimum_bytes(mut hir: &Hir) -> Option<usize> {
+    while let HirKind::Capture(capture) = hir.kind() {
+        hir = capture.sub.as_ref();
+    }
+    let HirKind::Alternation(alternatives) = hir.kind() else {
+        return None;
+    };
+    let mut saw_unconditional_empty = false;
+    let mut nonempty_minimum = None;
+    for alternative in alternatives {
+        let mut branch = alternative;
+        while let HirKind::Capture(capture) = branch.kind() {
+            branch = capture.sub.as_ref();
+        }
+        if matches!(branch.kind(), HirKind::Empty) {
+            saw_unconditional_empty = true;
+            continue;
+        }
+        let Some(minimum) = alternative.properties().minimum_len() else {
+            // A canonical empty-language arm can never alter ordered matching.
+            continue;
+        };
+        if minimum == 0 {
+            // A nullable assertion, repetition or compound arm is not an
+            // unconditional empty alternative and can affect priority.
+            return None;
+        }
+        nonempty_minimum =
+            Some(nonempty_minimum.map_or(minimum, |current: usize| current.min(minimum)));
+    }
+    if saw_unconditional_empty {
+        nonempty_minimum
+    } else {
+        None
+    }
+}
+
+/// Source-free operation receipt for a terminal whole-match byte domain.
+/// Terminal success reports retain either an exact no-match proof or an exact
+/// byte-boundary empty-match proof before any source access.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateMatchDomainExecutionReceipt {
     proof: AggregateMatchDomainProof,
@@ -298,6 +386,8 @@ pub struct AggregateMatchDomainExecutionReceipt {
     input_bytes: usize,
     reason: AggregateImpossibleMatchReason,
     branch_checks: u8,
+    value: u64,
+    empty_match_count: usize,
 }
 
 impl AggregateMatchDomainExecutionReceipt {
@@ -321,9 +411,16 @@ impl AggregateMatchDomainExecutionReceipt {
         self.proof.maximum_match_bytes
     }
 
+    /// Minimum width of every nonempty top-level alternative when an
+    /// unconditional empty arm is the only possible match.
+    #[must_use]
+    pub const fn empty_alternative_nonempty_minimum_bytes(&self) -> Option<usize> {
+        self.proof.empty_alternative_nonempty_minimum_bytes()
+    }
+
     #[must_use]
     pub const fn absolute_whole_input(&self) -> bool {
-        self.proof.absolute_whole_input
+        self.proof.absolute_whole_input()
     }
 
     #[must_use]
@@ -331,7 +428,7 @@ impl AggregateMatchDomainExecutionReceipt {
         self.reason
     }
 
-    /// Fixed proof predicates charged before the terminal zero result. The
+    /// Fixed proof predicates charged before the terminal result. The
     /// compiler-bounded preflight charges at most two; this is logical
     /// accounting rather than a claim about emitted CPU branches.
     #[must_use]
@@ -352,10 +449,30 @@ impl AggregateMatchDomainExecutionReceipt {
         0
     }
 
+    /// Exact operation value established by the source-free proof.
+    #[must_use]
+    pub const fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Exact number of empty matches selected at byte boundaries. This is zero
+    /// for the pre-existing no-match domain reasons.
+    #[must_use]
+    pub const fn empty_match_count(&self) -> usize {
+        self.empty_match_count
+    }
+
+    /// Exact constant operation work charged by the source-free proof.
+    #[must_use]
+    pub fn operation_work(&self) -> usize {
+        usize::from(self.branch_checks)
+    }
+
     fn new(
         proof: &AggregateMatchDomainProof,
         operation: AggregateOperation,
         input_bytes: usize,
+        limits: &AggregateRunLimits,
     ) -> Option<Self> {
         if !matches!(
             operation,
@@ -363,13 +480,40 @@ impl AggregateMatchDomainExecutionReceipt {
         ) {
             return None;
         }
-        let (reason, branch_checks) = proof.impossible(input_bytes)?;
+        if let Some((reason, branch_checks)) = proof.impossible(input_bytes) {
+            return Some(Self {
+                proof: *proof,
+                operation,
+                input_bytes,
+                reason,
+                branch_checks,
+                value: 0,
+                empty_match_count: 0,
+            });
+        }
+        proof.empty_alternative_only(input_bytes)?;
+        let empty_match_count = input_bytes.checked_add(1)?;
+        let continuation = limits.continuation;
+        if empty_match_count > continuation.max_boundaries
+            || empty_match_count > continuation.max_match_events
+            || empty_match_count > continuation.max_output_matches
+            || usize::from(EMPTY_ALTERNATIVE_BRANCH_CHECKS) > continuation.max_work
+        {
+            return None;
+        }
+        let value = match operation {
+            AggregateOperation::Count => u64::try_from(empty_match_count).ok()?,
+            AggregateOperation::SpanSum => 0,
+            AggregateOperation::Compile | AggregateOperation::Spans => return None,
+        };
         Some(Self {
             proof: *proof,
             operation,
             input_bytes,
-            reason,
-            branch_checks,
+            reason: AggregateImpossibleMatchReason::NonemptyAlternativesBelowMinimumBytes,
+            branch_checks: EMPTY_ALTERNATIVE_BRANCH_CHECKS,
+            value,
+            empty_match_count,
         })
     }
 
@@ -377,10 +521,11 @@ impl AggregateMatchDomainExecutionReceipt {
         &self,
         proof: &AggregateMatchDomainProof,
         operation: AggregateOperation,
+        limits: &AggregateRunLimits,
     ) -> bool {
         self.proof == *proof
             && self.operation == operation
-            && Self::new(proof, operation, self.input_bytes).as_ref() == Some(self)
+            && Self::new(proof, operation, self.input_bytes, limits).as_ref() == Some(self)
     }
 }
 
@@ -7111,8 +7256,9 @@ impl AggregateExactLiteralExecutionDetails {
     reason = "exact audited success retains its independent receipt inline so the operation remains allocation-free"
 )]
 pub enum AggregateExecutionDetails {
-    /// Source-free proof that the complete haystack is outside the canonical
-    /// HIR's byte-length domain.
+    /// Source-free proof that the complete haystack is outside either the
+    /// canonical HIR's complete match domain or every nonempty top-level
+    /// alternative's byte-length domain.
     ImpossibleMatchDomain(AggregateMatchDomainExecutionReceipt),
     /// Exact-literal accounting, independent receipt, and construction seal.
     ExactLiteral(AggregateExactLiteralExecutionDetails),
@@ -7497,8 +7643,10 @@ impl AggregateExecutionReport {
         &self.details
     }
 
-    /// Return the source-free impossible-domain receipt when this invocation
-    /// terminated before inspecting the haystack.
+    /// Return the source-free match-domain receipt when this invocation
+    /// terminated before inspecting the haystack. The legacy method name also
+    /// covers the case where only unconditional empty matches remain because
+    /// every nonempty alternative is impossible.
     #[must_use]
     pub const fn impossible_match_domain_receipt(
         &self,
@@ -7509,14 +7657,21 @@ impl AggregateExecutionReport {
         }
     }
 
-    /// Authenticate an impossible-domain receipt against the exact
-    /// construction owner and canonical HIR-derived proof.
+    /// Authenticate a source-free domain receipt against the exact
+    /// construction owner, invocation limits, and canonical HIR-derived proof.
     #[must_use]
     pub fn has_closed_impossible_match_domain_attempt(&self) -> bool {
         self.impossible_match_domain_receipt()
             .is_some_and(|receipt| {
                 self.identity.has_closed_construction_attempt()
-                    && receipt.authenticates(&self.identity.match_domain, self.identity.operation)
+                    && receipt.authenticates(
+                        &self.identity.match_domain,
+                        self.identity.operation,
+                        &self.identity.execution_limits,
+                    )
+                    && (receipt.reason()
+                        != AggregateImpossibleMatchReason::NonemptyAlternativesBelowMinimumBytes
+                        || self.identity.plan == AggregatePlanKind::ContinuationProgram)
             })
     }
 
@@ -8359,7 +8514,7 @@ impl AggregateBuilder {
         let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
         expected_fixed_absolute_profile.options.unicode = unicode;
         let fixed_absolute_profile = self.profile == expected_fixed_absolute_profile;
-        let match_domain = AggregateMatchDomainProof::from_hir(&rust.hir);
+        let match_domain = AggregateMatchDomainProof::from_hir(&rust.hir, unicode);
         let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
             AggregateBuildError::InternalInvariant {
                 operation,
@@ -14394,17 +14549,34 @@ impl AggregatePlan {
     fn impossible_match_domain_receipt(
         &self,
         input_bytes: usize,
+        limits: &AggregateRunLimits,
     ) -> Option<AggregateMatchDomainExecutionReceipt> {
-        AggregateMatchDomainExecutionReceipt::new(&self.match_domain, self.operation(), input_bytes)
+        let receipt = AggregateMatchDomainExecutionReceipt::new(
+            &self.match_domain,
+            self.operation(),
+            input_bytes,
+            limits,
+        )?;
+        if receipt.reason() == AggregateImpossibleMatchReason::NonemptyAlternativesBelowMinimumBytes
+            && !matches!(self.engine, AggregateEngine::Continuation(_))
+        {
+            return None;
+        }
+        Some(receipt)
     }
 
     #[inline]
-    fn impossible_match_domain_value(&self, input_bytes: usize) -> Option<u64> {
+    fn impossible_match_domain_value(
+        &self,
+        input_bytes: usize,
+        limits: &AggregateRunLimits,
+    ) -> Option<u64> {
         debug_assert!(matches!(
             self.operation(),
             AggregateOperation::Count | AggregateOperation::SpanSum
         ));
-        self.match_domain.impossible(input_bytes).map(|_| 0)
+        self.impossible_match_domain_receipt(input_bytes, limits)
+            .map(|receipt| receipt.value())
     }
 
     fn continuation_sweep_upper_bounds(
@@ -15460,11 +15632,25 @@ impl AggregatePlan {
         receipt: AggregateMatchDomainExecutionReceipt,
     ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
         let identity = self.cache_identity(execution_limits);
-        if !receipt.authenticates(&identity.match_domain, identity.operation) {
+        if !receipt.authenticates(
+            &identity.match_domain,
+            identity.operation,
+            &identity.execution_limits,
+        ) {
             return Err(self.execution_error(
                 execution_limits,
                 AggregateExecutionSource::InternalInvariant(
                     "impossible match-domain receipt differs from its construction-owned proof",
+                ),
+            ));
+        }
+        if receipt.reason() == AggregateImpossibleMatchReason::NonemptyAlternativesBelowMinimumBytes
+            && identity.plan != AggregatePlanKind::ContinuationProgram
+        {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "empty-alternative match-domain receipt escaped its continuation owner",
                 ),
             ));
         }
@@ -15527,7 +15713,7 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<AggregateCountExecution, AggregateExecutionError> {
-        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len()) {
+        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len(), limits) {
             return Ok(AggregateCountExecution::ImpossibleMatchDomain(receipt));
         }
         match &self.engine {
@@ -16001,7 +16187,7 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
-        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len()) {
+        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len(), limits) {
             return Ok(AggregateSpanSumExecution::ImpossibleMatchDomain(receipt));
         }
         match &self.engine {
@@ -16739,7 +16925,7 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
             return Ok(value);
         }
         match &self.engine {
@@ -16783,7 +16969,7 @@ impl AggregatePlan {
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::FiniteCount(engine) => {
-                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
                     return Ok(value);
                 }
                 self.execute_dense_finite_count_value_with_workspace(
@@ -16794,7 +16980,7 @@ impl AggregatePlan {
                 )
             }
             AggregateEngine::Continuation(engine) => {
-                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
                     return Ok(value);
                 }
                 match engine.count_value_with_sweep_workspace(
@@ -17149,7 +17335,7 @@ impl AggregatePlan {
                 }
             });
         };
-        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
             return Ok(AggregateValueCounterResult {
                 value,
                 continuation_receipt: None,
@@ -17391,7 +17577,7 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
-        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
             return Ok(value);
         }
         match &self.engine {
@@ -17432,7 +17618,7 @@ impl AggregatePlan {
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
             AggregateEngine::FiniteSpanSum(engine) => {
-                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
                     return Ok(value);
                 }
                 self.execute_dense_finite_span_sum_value_with_workspace(
@@ -17443,7 +17629,7 @@ impl AggregatePlan {
                 )
             }
             AggregateEngine::Continuation(engine) => {
-                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
                     return Ok(value);
                 }
                 match engine.span_sum_value_with_sweep_workspace(
@@ -17819,7 +18005,7 @@ impl AggregatePlan {
                 }
             });
         };
-        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len(), limits) {
             return Ok(AggregateValueCounterResult {
                 value,
                 continuation_receipt: None,
@@ -17890,7 +18076,7 @@ enum AggregateCountExecution {
 impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
-            Self::ImpossibleMatchDomain(_) => 0,
+            Self::ImpossibleMatchDomain(receipt) => receipt.value(),
             Self::UnicodeScalar(result) => result.count,
             Self::WordRun(result) => result.count,
             Self::LiteralAssertions(result) => result.count,
@@ -18083,7 +18269,7 @@ enum AggregateSpanSumExecution {
 impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
-            Self::ImpossibleMatchDomain(_) => 0,
+            Self::ImpossibleMatchDomain(receipt) => receipt.value(),
             Self::UnicodeScalar(result) => result.span_sum,
             Self::WordRun(result) => result.span_sum,
             Self::LiteralAssertions(result) => result.span_sum,

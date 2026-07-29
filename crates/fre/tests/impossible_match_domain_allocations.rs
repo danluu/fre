@@ -31,7 +31,10 @@ fn impossible_match_domain_value_paths_allocate_nothing_body() {
     };
     let count = builder(r"^\w{30}$").build_count().unwrap();
     let span_sum = builder(r"^\w{30}$").build_span_sum().unwrap();
+    let empty_alternative_count = builder(r"(?:A+){100}|").build_count().unwrap();
+    let empty_alternative_span_sum = builder(r"(?:A+){100}|").build_span_sum().unwrap();
     let haystack = [b'a'; 52];
+    let empty_alternative_haystack = [b'A'; 99];
     let limits = AggregateRunLimits::default();
     let mut count_workspace = AggregateCountWorkspace::new();
     let mut span_workspace = AggregateSpanSumWorkspace::new();
@@ -61,6 +64,44 @@ fn impossible_match_domain_value_paths_allocate_nothing_body() {
     assert_eq!(
         span_sum
             .span_sum_value_with_counters(&haystack, limits)
+            .unwrap()
+            .value(),
+        0
+    );
+    assert_eq!(
+        empty_alternative_count
+            .count_value(&empty_alternative_haystack, limits)
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        empty_alternative_span_sum
+            .span_sum_value(&empty_alternative_haystack, limits)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        empty_alternative_count
+            .count_value_with_workspace(&empty_alternative_haystack, limits, &mut count_workspace)
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        empty_alternative_span_sum
+            .span_sum_value_with_workspace(&empty_alternative_haystack, limits, &mut span_workspace)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        empty_alternative_count
+            .count_value_with_counters(&empty_alternative_haystack, limits)
+            .unwrap()
+            .value(),
+        100
+    );
+    assert_eq!(
+        empty_alternative_span_sum
+            .span_sum_value_with_counters(&empty_alternative_haystack, limits)
             .unwrap()
             .value(),
         0

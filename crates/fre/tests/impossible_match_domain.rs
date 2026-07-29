@@ -38,9 +38,13 @@ fn assert_receipt(
     assert_eq!(receipt.input_bytes(), input_bytes);
     assert_eq!(receipt.minimum_match_bytes(), minimum);
     assert_eq!(receipt.maximum_match_bytes(), maximum);
+    assert_eq!(receipt.empty_alternative_nonempty_minimum_bytes(), None);
     assert_eq!(receipt.absolute_whole_input(), absolute_whole_input);
     assert_eq!(receipt.reason(), reason);
     assert_eq!(receipt.branch_checks(), branch_checks);
+    assert_eq!(receipt.operation_work(), usize::from(branch_checks));
+    assert_eq!(receipt.value(), 0);
+    assert_eq!(receipt.empty_match_count(), 0);
     assert_eq!(receipt.source_bytes_read(), 0);
     assert_eq!(receipt.operation_allocations(), 0);
 }
