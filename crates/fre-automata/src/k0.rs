@@ -4416,6 +4416,12 @@ struct StartClassSelection {
     guard: Option<StartPositionClass>,
 }
 
+// The original proof considered positions zero through seven. Preserve its
+// equal-cardinality choices exactly: byte-set cardinality does not predict
+// source frequency, so a newly proved deeper class must be strictly smaller
+// before it displaces an established scanner or guard.
+const START_FILTER_STABLE_TIE_POSITION_COUNT: u8 = 8;
+
 const fn scanner_tie_rank(offset: u8) -> (bool, u8) {
     // Root first avoids hot-path rewind. Among later positions, deeper scans a
     // shorter suffix and rejects truncated windows earlier.
@@ -4454,6 +4460,7 @@ fn select_start_classes(
             Some((best_cardinality, best_class)) => {
                 cardinality < best_cardinality
                     || (cardinality == best_cardinality
+                        && class.offset < START_FILTER_STABLE_TIE_POSITION_COUNT
                         && scanner_tie_rank(class.offset) > scanner_tie_rank(best_class.offset))
             }
         };
@@ -4486,7 +4493,9 @@ fn select_start_classes(
             None => true,
             Some((best_cardinality, best_class)) => {
                 cardinality < best_cardinality
-                    || (cardinality == best_cardinality && class.offset > best_class.offset)
+                    || (cardinality == best_cardinality
+                        && class.offset < START_FILTER_STABLE_TIE_POSITION_COUNT
+                        && class.offset > best_class.offset)
             }
         };
         if replace {
@@ -6763,6 +6772,63 @@ mod tests {
                 set: byte_set(b"Y"),
             },
             "the deepest equal class wins only when offset zero is not tied"
+        );
+
+        let mut extended_scanner_tie = [ByteSet::ALL; START_FILTER_POSITION_COUNT];
+        extended_scanner_tie[5] = byte_set(b"Y");
+        extended_scanner_tie[15] = byte_set(b"Z");
+        let mut extended_scanner_meter = WorkMeter::new(u64::MAX, 0);
+        let selected = super::select_start_classes(
+            &extended_scanner_tie,
+            &mut extended_scanner_meter,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.scanner,
+            StartPositionClass {
+                offset: 5,
+                set: byte_set(b"Y"),
+            },
+            "extended equal-cardinality positions must not displace the stable scanner"
+        );
+
+        let mut extended_guard_tie = [ByteSet::ALL; START_FILTER_POSITION_COUNT];
+        extended_guard_tie[0] = byte_set(b"Q");
+        extended_guard_tie[5] = byte_set(b"Y");
+        extended_guard_tie[15] = byte_set(b"Z");
+        let mut extended_guard_meter = WorkMeter::new(u64::MAX, 0);
+        let selected =
+            super::select_start_classes(&extended_guard_tie, &mut extended_guard_meter, 0)
+                .unwrap();
+        assert_eq!(selected.scanner.offset, 0);
+        assert_eq!(
+            selected.guard,
+            Some(StartPositionClass {
+                offset: 5,
+                set: byte_set(b"Y"),
+            }),
+            "extended equal-cardinality positions must not displace the stable guard"
+        );
+
+        let mut strict_extended_improvement = [ByteSet::ALL; START_FILTER_POSITION_COUNT];
+        strict_extended_improvement[0] = byte_set(b"QR");
+        strict_extended_improvement[5] = byte_set(b"YZ");
+        strict_extended_improvement[15] = byte_set(b"!");
+        let mut strict_improvement_meter = WorkMeter::new(u64::MAX, 0);
+        let selected = super::select_start_classes(
+            &strict_extended_improvement,
+            &mut strict_improvement_meter,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.scanner,
+            StartPositionClass {
+                offset: 15,
+                set: byte_set(b"!"),
+            },
+            "a strictly smaller extended class remains eligible"
         );
     }
 
