@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Canonical recipe schema emitted by this optimizer.
 pub const COUNT_V3_RECIPE_SCHEMA_VERSION: u16 = 3;
 /// Version of the deterministic portfolio and cost model.
-pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 1;
+pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 2;
 /// Maximum number of filter columns in one recipe.
 pub const COUNT_V3_MAX_FILTER_OFFSETS: usize = 4;
 /// Maximum exact-literal width consumed by Count-v3.
@@ -70,6 +70,9 @@ pub enum CountV3Strategy {
     EndpointDense = 3,
     /// Period-aware run scanner followed by exact confirmation.
     PeriodicRun = 4,
+    /// Every literal byte is a filter column and the literal cannot overlap
+    /// itself, so equality lanes can be counted without candidate recovery.
+    DirectExactMask = 5,
 }
 
 impl CountV3Strategy {
@@ -88,6 +91,7 @@ pub enum CountV3ScheduleId {
     SparseColumnsV1 = 2,
     EndpointDenseV1 = 3,
     PeriodicRunV1 = 4,
+    DirectExactMaskV1 = 5,
 }
 
 impl CountV3ScheduleId {
@@ -1240,6 +1244,13 @@ fn count_portfolio(
                 at: "periodic portfolio count",
             })?;
     }
+    if direct_exact_mask_filters(literal, facts).is_some() {
+        count = count
+            .checked_add(1)
+            .ok_or(CountV3OptimizeError::ArithmeticOverflow {
+                at: "direct exact-mask portfolio count",
+            })?;
+    }
     Ok(count)
 }
 
@@ -1308,9 +1319,8 @@ fn build_portfolio(
             at: "portfolio exact allocation bytes",
         },
     )?;
-    let mut candidates = ExactVec::try_with_capacity(expected_count).map_err(|_| {
-        CountV3OptimizeError::PortfolioAllocationFailed { requested_bytes }
-    })?;
+    let mut candidates = ExactVec::try_with_capacity(expected_count)
+        .map_err(|_| CountV3OptimizeError::PortfolioAllocationFailed { requested_bytes })?;
     let incumbent_filters = incumbent_filters(literal)?;
     push_candidate(
         &mut candidates,
@@ -1386,6 +1396,19 @@ fn build_portfolio(
             work,
         )?;
     }
+    if let Some((filters, filter_count)) = direct_exact_mask_filters(literal, facts) {
+        push_candidate(
+            &mut candidates,
+            literal,
+            facts,
+            multiplicity,
+            CountV3Strategy::DirectExactMask,
+            CountV3ScheduleId::DirectExactMaskV1,
+            &filters[..filter_count],
+            0,
+            work,
+        )?;
+    }
     if candidates.len() != expected_count {
         return Err(CountV3OptimizeError::InvalidGeneratedRecipe);
     }
@@ -1442,6 +1465,23 @@ fn incumbent_filters(
     Ok((filters, count))
 }
 
+fn direct_exact_mask_filters(
+    literal: &[u8],
+    facts: CountV3LiteralFacts,
+) -> Option<([u8; COUNT_V3_MAX_FILTER_OFFSETS], usize)> {
+    let width = literal.len();
+    if !(2..=COUNT_V3_MAX_FILTER_OFFSETS).contains(&width)
+        || usize::from(facts.minimum_period) != width
+    {
+        return None;
+    }
+    let mut filters = [0_u8; COUNT_V3_MAX_FILTER_OFFSETS];
+    for (offset, slot) in filters[..width].iter_mut().enumerate() {
+        *slot = u8::try_from(offset).ok()?;
+    }
+    Some((filters, width))
+}
+
 fn periodic_filters(
     literal: &[u8],
     facts: CountV3LiteralFacts,
@@ -1495,7 +1535,7 @@ fn estimate_costs(
             false_positive: 1250 + width * 8,
             matches: 850 + width * 9,
             tail: 350 + width * 3,
-            code_size: 220 + width * 4,
+            code_size: 320 + width * 4,
         },
         CountV3Strategy::SparseRareColumns => CountV3CostVector {
             sparse: (1180_u32.saturating_sub(discrimination.saturating_mul(2))).max(180)
@@ -1508,27 +1548,35 @@ fn estimate_costs(
                 + width * 4,
             matches: 930 + width * 10 + filter_count * 24,
             tail: 390 + width * 3 + filter_count * 15,
-            code_size: 300 + width * 7 + filter_count * 44,
+            code_size: 430 + width * 7 + filter_count * 44,
         },
         CountV3Strategy::EndpointDense => CountV3CostVector {
-            sparse: (980_u32.saturating_sub(discrimination / 2)).max(300) + width * 3,
+            sparse: (720_u32.saturating_sub(discrimination / 2)).max(220) + width * 3,
             dense: (900_u32.saturating_sub(discrimination / 2)).max(260) + width * 4 + maximum * 4,
             false_positive: (1120_u32.saturating_sub(discrimination)).max(220) + width * 5,
             matches: 790 + width * 8 + filter_count * 18,
             tail: 290 + width * 2 + filter_count * 10,
-            code_size: 280 + width * 6 + filter_count * 32,
+            code_size: 410 + width * 6 + filter_count * 32,
         },
         CountV3Strategy::PeriodicRun => {
             let period_gain = overlap.saturating_mul(18);
             CountV3CostVector {
-                sparse: (880_u32.saturating_sub(period_gain / 2)).max(260) + width * 3,
+                sparse: (520_u32.saturating_sub(period_gain / 2)).max(180) + width * 3,
                 dense: (760_u32.saturating_sub(period_gain)).max(180) + period * 8,
                 false_positive: (940_u32.saturating_sub(period_gain)).max(200) + width * 3,
                 matches: (650_u32.saturating_sub(period_gain / 2)).max(220) + period * 10,
                 tail: 360 + period * 4,
-                code_size: 380 + width * 8 + period * 6,
+                code_size: 510 + width * 8 + period * 6,
             }
         }
+        CountV3Strategy::DirectExactMask => CountV3CostVector {
+            sparse: 160 + width * 10,
+            dense: 180 + width * 12,
+            false_positive: 150 + width * 8,
+            matches: 170 + width * 6,
+            tail: 210 + width * 5,
+            code_size: 340 + width * 28,
+        },
     };
     Ok(vector)
 }
@@ -1742,9 +1790,7 @@ fn identity_bytes_hashed(literal_bytes: usize) -> Result<u64, CountV3OptimizeErr
         .and_then(|value| value.checked_add(RECIPE_IDENTITY_DOMAIN.len()))
         .and_then(|value| value.checked_add(COUNT_V3_RECIPE_CANONICAL_BYTES))
         .and_then(|value| value.checked_add(RECEIPT_IDENTITY_DOMAIN.len()))
-        .and_then(|value| {
-            value.checked_add(COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES - 32)
-        })
+        .and_then(|value| value.checked_add(COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES - 32))
         .ok_or(CountV3OptimizeError::ArithmeticOverflow {
             at: "identity bytes hashed",
         })?;
@@ -1804,10 +1850,7 @@ fn encode_receipt(
         bytes[cursor..cursor + 8].copy_from_slice(&value.to_le_bytes());
         cursor += 8;
     }
-    debug_assert_eq!(
-        cursor,
-        COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES - 32
-    );
+    debug_assert_eq!(cursor, COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES - 32);
     if !zero_identity {
         bytes[cursor..].copy_from_slice(receipt.identity.as_bytes());
     }
@@ -1830,7 +1873,11 @@ fn inspect_optimizer_receipt(
         1 => CountV3TuningClass::GenericAarch64,
         2 => CountV3TuningClass::AppleMSeries,
         3 => CountV3TuningClass::NeoverseV2V3,
-        value => return Err(CountV3OptimizerReceiptDecodeError::UnknownTuningClass(value)),
+        value => {
+            return Err(CountV3OptimizerReceiptDecodeError::UnknownTuningClass(
+                value,
+            ));
+        }
     };
     if bytes[13] != 0 {
         return Err(CountV3OptimizerReceiptDecodeError::NonCanonicalPadding);
@@ -2030,6 +2077,7 @@ fn inspect_recipe(
         2 => CountV3Strategy::SparseRareColumns,
         3 => CountV3Strategy::EndpointDense,
         4 => CountV3Strategy::PeriodicRun,
+        5 => CountV3Strategy::DirectExactMask,
         value => return Err(CountV3RecipeDecodeError::UnknownStrategy(value)),
     };
     let schedule_id = match bytes[14] {
@@ -2037,6 +2085,7 @@ fn inspect_recipe(
         2 => CountV3ScheduleId::SparseColumnsV1,
         3 => CountV3ScheduleId::EndpointDenseV1,
         4 => CountV3ScheduleId::PeriodicRunV1,
+        5 => CountV3ScheduleId::DirectExactMaskV1,
         value => return Err(CountV3RecipeDecodeError::UnknownSchedule(value)),
     };
     let register_plan_id = match bytes[15] {
@@ -2059,6 +2108,7 @@ fn inspect_recipe(
         CountV3Strategy::SparseRareColumns => CountV3ScheduleId::SparseColumnsV1,
         CountV3Strategy::EndpointDense => CountV3ScheduleId::EndpointDenseV1,
         CountV3Strategy::PeriodicRun => CountV3ScheduleId::PeriodicRunV1,
+        CountV3Strategy::DirectExactMask => CountV3ScheduleId::DirectExactMaskV1,
     };
     let isa_plan_matches = matches!(
         (register_plan_id, required_isa),
@@ -2261,6 +2311,7 @@ fn validate_recipe(
         CountV3Strategy::SparseRareColumns => CountV3ScheduleId::SparseColumnsV1,
         CountV3Strategy::EndpointDense => CountV3ScheduleId::EndpointDenseV1,
         CountV3Strategy::PeriodicRun => CountV3ScheduleId::PeriodicRunV1,
+        CountV3Strategy::DirectExactMask => CountV3ScheduleId::DirectExactMaskV1,
     };
     if recipe.schedule_id != expected_schedule {
         return Err(CountV3RecipeValidationError::StrategySchedule);
@@ -2365,6 +2416,10 @@ fn validate_recipe(
                     && recipe.periodic_stride == analysis.facts.minimum_period
             }
         }
+        CountV3Strategy::DirectExactMask => direct_exact_mask_filters(literal, analysis.facts)
+            .is_some_and(|(filters, count)| {
+                recipe.filter_offsets() == &filters[..count] && recipe.periodic_stride == 0
+            }),
     };
     if !legal_strategy {
         return Err(CountV3RecipeValidationError::FilterOffsets);

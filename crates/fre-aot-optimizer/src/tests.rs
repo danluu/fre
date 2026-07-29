@@ -152,6 +152,34 @@ fn literal_facts_use_kmp_minimum_period_and_self_overlap() {
 }
 
 #[test]
+fn short_non_overlapping_literals_select_direct_exact_masks() {
+    for literal in [&b"ab"[..], &b"abc"[..], &b"abcd"[..]] {
+        let optimized = optimize(literal);
+        assert_eq!(
+            optimized.recipe().strategy(),
+            CountV3Strategy::DirectExactMask
+        );
+        assert_eq!(
+            optimized.recipe().schedule_id(),
+            CountV3ScheduleId::DirectExactMaskV1
+        );
+        assert_eq!(
+            optimized.recipe().filter_offsets(),
+            &[0, 1, 2, 3][..literal.len()]
+        );
+        assert_eq!(
+            optimized.facts().minimum_period(),
+            u8::try_from(literal.len()).unwrap()
+        );
+    }
+
+    assert_ne!(
+        optimize(b"aaa").recipe().strategy(),
+        CountV3Strategy::DirectExactMask
+    );
+}
+
+#[test]
 fn binary_literals_are_not_text_normalized() {
     let literal = [
         0x00, 0xff, 0x80, 0x00, 0x7f, 0x01, 0xfe, 0x80, 0x11, 0xee, 0x22, 0xdd,

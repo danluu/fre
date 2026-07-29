@@ -1,5 +1,6 @@
 use fre_aot_optimizer::{
-    CountV3OptimizerLimits, CountV3TuningClass, encode_count_recipe_v3, optimize_count_v3,
+    CountV3OptimizerLimits, CountV3Strategy, CountV3TuningClass, encode_count_recipe_v3,
+    optimize_count_v3,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 
@@ -7,7 +8,7 @@ use crate::{
     AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1,
     AOT_COUNT_BACKEND_VERSION_V2, AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_IMAGE_SCHEMA_VERSION_V3,
     AotCountCpuFeatures, AotCountImageViewV3, AotCountMappedMetadataV3, CountAotError,
-    CountAotResource, CountEmitLimitsV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
+    CountAotResource, CountEmitLimitsV3, LabelKindV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
     audit_count_image_v3, audit_count_image_view_v3, audit_count_mapped_code_v3, emit_count_v3,
     emit_v3::IDENTITY_DOMAIN_V3, prospective_count_v3,
 };
@@ -32,7 +33,7 @@ fn optimized(
 fn v3_versions_and_identity_domain_are_disjoint() {
     assert_eq!(AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, 3);
     assert_eq!(AOT_COUNT_BACKEND_VERSION_V3.0, 0xa003);
-    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 5);
+    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 6);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V2);
     assert_eq!(IDENTITY_DOMAIN_V3.last(), Some(&3));
@@ -58,6 +59,7 @@ fn selected_recipes_emit_and_independently_audit_across_widths() {
         &b""[..],
         &b"x"[..],
         &b"aa"[..],
+        &b"abc"[..],
         &b"needle"[..],
         &b"abababab"[..],
         &b"0123456789abcdef"[..],
@@ -124,6 +126,63 @@ fn selected_recipes_emit_and_independently_audit_across_widths() {
             image.build_receipt().audit
         );
     }
+}
+
+#[test]
+fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
+    let (direct_program, direct_optimized) = optimized(b"abc");
+    assert_eq!(
+        direct_optimized.recipe().strategy(),
+        CountV3Strategy::DirectExactMask
+    );
+    let direct = emit_count_v3(
+        &direct_program,
+        direct_optimized.recipe(),
+        CountEmitLimitsV3::default(),
+    )
+    .unwrap();
+    assert_eq!(direct.build_receipt().audit.simd_candidate_blocks, 0);
+    assert_eq!(direct.build_receipt().audit.sparse_lane_recoveries, 0);
+    assert_eq!(
+        direct
+            .labels()
+            .iter()
+            .filter(|label| label.kind == LabelKindV3::VectorLoop)
+            .count(),
+        2
+    );
+
+    let (periodic_program, periodic_optimized) = optimized(b"aeaeaeaeae");
+    assert_eq!(
+        periodic_optimized.recipe().strategy(),
+        CountV3Strategy::PeriodicRun
+    );
+    let periodic = emit_count_v3(
+        &periodic_program,
+        periodic_optimized.recipe(),
+        CountEmitLimitsV3::default(),
+    )
+    .unwrap();
+    assert!(
+        periodic
+            .labels()
+            .iter()
+            .filter(|label| label.kind == LabelKindV3::VectorLoop)
+            .count()
+            >= 2
+    );
+    assert!(
+        periodic
+            .labels()
+            .iter()
+            .filter(|label| label.kind == LabelKindV3::CandidateLoop)
+            .count()
+            >= 2
+    );
+    assert_eq!(
+        audit_count_image_v3(&periodic_program, periodic_optimized.recipe(), &periodic).unwrap(),
+        periodic.build_receipt().audit
+    );
 }
 
 #[test]
