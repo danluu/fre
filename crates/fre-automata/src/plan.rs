@@ -3,18 +3,34 @@ use std::sync::OnceLock;
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 
-/// Exact abstract work to count the members in both ASCII bitmap words.
-pub(crate) const ASCII_START_BITMAP_POPULATION_WORK: usize = 2;
+/// Number of exact consumed-byte positions retained by the bounded start
+/// filter. Offset zero is the scanner; offsets one through three are eligible
+/// to supply one candidate guard.
+pub(crate) const START_FILTER_POSITION_COUNT: usize = 4;
+/// Largest consumed-byte offset inspected by the bounded start filter.
+pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
+/// Maximum candidate guards retained by one immutable start-filter proof.
+pub(crate) const START_FILTER_MAX_GUARDS: usize = 1;
+/// Exact abstract work to count the members in all four byte-bitmap words.
+pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
 /// Exact abstract work to extract one small-scanner member from the bitmap.
-pub(crate) const ASCII_START_MEMBER_EXTRACTION_WORK: usize = 1;
+pub(crate) const BYTE_START_MEMBER_EXTRACTION_WORK: usize = 1;
 /// Largest cardinality represented by direct `memchr` scanners.
-pub(crate) const ASCII_START_SMALL_MAX_MEMBERS: usize = 3;
+pub(crate) const BYTE_START_SMALL_MAX_MEMBERS: usize = 3;
 /// Exact abstract work to retain a broad bitmap scanner.
-pub(crate) const ASCII_START_SET_SCANNER_SELECTION_WORK: usize = 1;
-/// Conservative selection bound: two bitmap populations plus the largest
-/// one-to-three-member extraction. Retaining a broad bitmap costs one.
-pub(crate) const ASCII_START_MAX_SELECTION_WORK: usize = ASCII_START_BITMAP_POPULATION_WORK
-    + ASCII_START_SMALL_MAX_MEMBERS * ASCII_START_MEMBER_EXTRACTION_WORK;
+pub(crate) const BYTE_START_SET_SCANNER_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compare one later position with the incumbent guard.
+pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
+/// Largest later-position byte class selective enough to retain as a guard.
+/// Sixty-four members are one quarter of the complete 256-byte domain.
+pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
+/// Conservative selection bound: population plus the largest one-to-three
+/// member extraction for offset zero, then population and comparison for
+/// every eligible guard offset.
+pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = BYTE_START_BITMAP_POPULATION_WORK
+    + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK
+    + START_FILTER_MAX_OFFSET
+        * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_GUARD_SELECTION_WORK);
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,9 +254,9 @@ impl SearchWindow {
 /// cold workspace construction, while a reusable call charges only logical
 /// reset (and, extremely rarely, generation-table clearing) before transitions.
 /// The first successful search on an immutable [`Automaton`] also charges its
-/// ASCII start-byte proof and scanner selection. The automaton retains that
-/// result, so later calls do not repeat or charge that work; conservative work
-/// bounds cover the first-use case.
+/// bounded full-byte start-filter proof and scanner/guard selection. The
+/// automaton retains that result, so later calls do not repeat or charge that
+/// work; conservative work bounds cover the first-use case.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
     pub max_work: u64,
@@ -266,45 +282,58 @@ impl Default for SearchLimits {
     }
 }
 
-/// Fixed ASCII start-byte bitmap retained by the portable scanner.
+/// Fixed full-byte bitmap retained by the portable start filter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AsciiStartSet([u64; 2]);
+pub(crate) struct ByteSet([u64; 4]);
 
-impl AsciiStartSet {
-    pub(crate) const ALL: Self = Self([u64::MAX; 2]);
+impl ByteSet {
+    pub(crate) const EMPTY: Self = Self([0; 4]);
+    pub(crate) const ALL: Self = Self([u64::MAX; 4]);
 
-    pub(crate) const fn from_words(words: [u64; 2]) -> Self {
+    pub(crate) const fn from_words(words: [u64; 4]) -> Self {
         Self(words)
     }
 
-    pub(crate) const fn words(self) -> [u64; 2] {
+    pub(crate) const fn words(self) -> [u64; 4] {
         self.0
     }
 
     pub(crate) fn contains(self, byte: u8) -> bool {
-        if !byte.is_ascii() {
-            return false;
-        }
         let word = usize::from(byte / 64);
         let bit = u32::from(byte % 64);
         self.0[word] & (1_u64 << bit) != 0
     }
+
+    pub(crate) fn cardinality(self) -> u32 {
+        self.0
+            .into_iter()
+            .map(u64::count_ones)
+            .fold(0_u32, u32::saturating_add)
+    }
 }
 
-/// Immutable scanner selected from a proved ASCII start-byte set.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum AsciiStartScanner {
+/// Immutable scanner selected from a proved offset-zero byte set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartScanner {
     Empty,
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
-    Set(AsciiStartSet),
+    Set(ByteSet),
 }
 
-/// Immutable ASCII root proof derived and published after a successful search.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AsciiStartProof {
-    pub(crate) scanner: Option<AsciiStartScanner>,
+/// One sound byte class at an exact consumed-byte offset after match start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartPositionClass {
+    pub(crate) offset: u8,
+    pub(crate) set: ByteSet,
+}
+
+/// Immutable bounded start-filter proof published after a successful search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartFilterProof {
+    pub(crate) scanner: Option<StartScanner>,
+    pub(crate) guard: Option<StartPositionClass>,
     pub(crate) force_haystack_start: bool,
 }
 
@@ -318,7 +347,7 @@ pub struct Automaton {
     pub(crate) edge_kinds: Box<[EdgeKind]>,
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
-    pub(crate) ascii_start_proof: OnceLock<AsciiStartProof>,
+    pub(crate) start_filter_proof: OnceLock<StartFilterProof>,
     line_terminator: u8,
     stats: PlanStats,
 }
@@ -336,7 +365,7 @@ impl Clone for Automaton {
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
             // to derive.
-            ascii_start_proof: OnceLock::new(),
+            start_filter_proof: OnceLock::new(),
             line_terminator: self.line_terminator,
             stats: self.stats,
         }
@@ -363,7 +392,7 @@ impl Automaton {
             edge_kinds: raw.edge_kinds.into_boxed_slice(),
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
-            ascii_start_proof: OnceLock::new(),
+            start_filter_proof: OnceLock::new(),
             line_terminator: b'\n',
             stats,
         })
@@ -373,9 +402,9 @@ impl Automaton {
     ///
     /// The byte is immutable after publication and adds no heap storage. Raw
     /// standalone automata default to LF; profile-aware facades call this
-    /// before exposing the validated plan. A retained ASCII start proof cannot
-    /// depend on this byte: encountering a line assertion disables that proof,
-    /// while an absolute haystack-start edge is independent of this setting.
+    /// before exposing the validated plan. A retained start-filter proof cannot
+    /// depend on this byte: context assertions are relaxed while proving byte
+    /// classes, while an absolute haystack-start edge is handled separately.
     #[must_use]
     pub const fn with_line_terminator(mut self, line_terminator: u8) -> Self {
         self.line_terminator = line_terminator;
@@ -463,30 +492,52 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // its assertion-free ASCII root and selects a scanner. Later
-        // invocations read the automaton-owned result. The bound remains valid
-        // for either a cold or initialized automaton.
-        let start_proof = u64::try_from(self.stats.states)
+        // up to four exact-position byte classes and selects a scanner plus
+        // one guard. Each depth may inspect a state twice and a consuming edge
+        // twice while building the next frontier, in addition to the ordinary
+        // edge inspection. Later invocations read the automaton-owned result.
+        let start_proof_per_position = u64::try_from(self.stats.states)
             .ok()
             .and_then(|states| states.checked_mul(2))
             .and_then(|states| {
                 u64::try_from(self.stats.edges)
                     .ok()
-                    .and_then(|edges| edges.checked_mul(2))
+                    .and_then(|edges| edges.checked_mul(3))
                     .and_then(|edges| states.checked_add(edges))
             })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter per-position proof work bound",
+            })?;
+        let start_proof = start_proof_per_position
+            .checked_mul(u64::try_from(START_FILTER_POSITION_COUNT).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "start-filter position count conversion",
+                }
+            })?)
             .and_then(|work| {
-                u64::try_from(ASCII_START_MAX_SELECTION_WORK)
+                u64::try_from(START_FILTER_MAX_SELECTION_WORK)
                     .ok()
                     .and_then(|selection| work.checked_add(selection))
             })
             .ok_or(SearchError::ArithmeticOverflow {
-                computation: "start-byte proof work bound",
+                computation: "start-filter proof work bound",
+            })?;
+        // A retained guard can pass at every candidate and therefore add work
+        // on top of the full all-boundaries automaton bound.
+        let guard = input
+            .checked_mul(u64::try_from(START_FILTER_MAX_GUARDS).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "start-filter guard count conversion",
+                }
+            })?)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter guard work bound",
             })?;
         automaton
             .checked_add(start_proof)
+            .and_then(|work| work.checked_add(guard))
             .ok_or(SearchError::ArithmeticOverflow {
-                computation: "transition work with start-byte proof",
+                computation: "transition work with start-filter proof",
             })
     }
 

@@ -359,9 +359,13 @@ fn portable_search_session_recovers_after_per_call_limit_failures() {
         .expect("unlimited K0 session");
     let setup = session.workspace_setup_accounting().unwrap();
     let haystack = b"--alpha_123--";
+    let cold = session
+        .find(haystack, SearchLimits::unlimited())
+        .expect("cold reused search initializes immutable specialization");
     let expected = session
         .find(haystack, SearchLimits::unlimited())
-        .expect("baseline reused search");
+        .expect("warm baseline reused search");
+    assert_eq!(cold.0, expected.0);
     let SearchAccounting::K0(expected_accounting) = expected.1 else {
         panic!("forced K0 returned another accounting family")
     };

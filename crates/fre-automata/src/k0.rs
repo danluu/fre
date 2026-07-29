@@ -4,9 +4,11 @@ use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
     plan::{
-        AsciiStartProof, AsciiStartScanner, AsciiStartSet, ASCII_START_BITMAP_POPULATION_WORK,
-        ASCII_START_MEMBER_EXTRACTION_WORK, ASCII_START_SET_SCANNER_SELECTION_WORK,
-        ASCII_START_SMALL_MAX_MEMBERS,
+        ByteSet, StartFilterProof, StartPositionClass, StartScanner,
+        BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
+        BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+        START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
+        START_FILTER_POSITION_COUNT,
     },
     Automaton, EdgeKind, MatchSpan, ResourceKind, SearchAccounting, SearchError, SearchLimits,
     SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -474,9 +476,9 @@ fn execute(
     validate_window(haystack, window)?;
     let (mut meter, setup_work) =
         prepare_invocation(automaton, workspace, window, limits, &mut setup)?;
-    let start_proof =
-        prepare_ascii_start_scanner(automaton, workspace, &mut meter, window.start())?;
+    let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
     let start_scanner = start_proof.proof().scanner.as_ref();
+    let start_guard = start_proof.proof().guard.as_ref();
     let force_haystack_start = start_proof.proof().force_haystack_start;
 
     let mut position = window.start();
@@ -495,6 +497,7 @@ fn execute(
                         haystack,
                         position,
                         window.end(),
+                        start_guard,
                         &mut meter,
                     )?;
                     if position == window.end() {
@@ -566,116 +569,200 @@ fn execute(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct StartByteProof {
-    set: Option<AsciiStartSet>,
+struct StartPositionProof {
+    sets: [ByteSet; START_FILTER_POSITION_COUNT],
+    length: usize,
     force_haystack_start: bool,
 }
 
-impl StartByteProof {
+impl StartPositionProof {
     const fn disabled() -> Self {
         Self {
-            set: None,
+            sets: [ByteSet::EMPTY; START_FILTER_POSITION_COUNT],
+            length: 0,
             force_haystack_start: false,
         }
     }
 }
 
-fn derive_ascii_start_set(
+fn derive_start_position_classes(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     position: usize,
-) -> Result<StartByteProof, SearchError> {
+) -> Result<StartPositionProof, SearchError> {
+    let result = derive_start_position_classes_inner(automaton, workspace, meter, position);
+    // The proof borrows the invocation's fixed workspace, but none of its
+    // temporary logical entries may become live K0 execution state.
+    workspace.current_len = 0;
+    workspace.roots_len = 0;
     workspace.stack_len = 0;
-    workspace.generation =
-        workspace
-            .generation
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "start-byte proof generation",
-            })?;
-    workspace.push_stack(Thread {
-        state: automaton.start,
-        start: 0,
-    })?;
-    let mut words = [0_u64; 2];
+    result
+}
+
+fn derive_start_position_classes_inner(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<StartPositionProof, SearchError> {
+    let mut sets = [ByteSet::EMPTY; START_FILTER_POSITION_COUNT];
     let mut force_haystack_start = false;
+    workspace.current_len = 0;
+    workspace.roots_len = 0;
+    workspace.stack_len = 0;
 
-    while let Some(thread) = workspace.pop_stack() {
-        meter.charge(1, position)?;
-        let state = thread.state;
-        let state_index = crate::plan::plan_index(state);
-        if workspace.seen_at[state_index] == workspace.generation {
-            continue;
-        }
-        workspace.seen_at[state_index] = workspace.generation;
+    for depth in 0..START_FILTER_POSITION_COUNT {
+        begin_start_proof_depth(workspace)?;
+        let frontier_len = if depth == 0 { 1 } else { workspace.roots_len };
+        let mut reached_accept = false;
+        let mut words = [0_u64; 4];
 
-        match automaton.roles[state_index] {
-            // A nullable root must still examine every boundary.
-            StateRole::Accept => {
-                workspace.stack_len = 0;
-                return Ok(StartByteProof::disabled());
-            }
-            StateRole::Consume => {
-                for edge in automaton.state_edges(state) {
-                    meter.charge(1, position)?;
-                    let start = automaton.byte_starts[edge];
-                    let end = automaton.byte_ends[edge];
-                    // ASCII scanners deliberately treat high bytes as
-                    // nonmembers. Disable the proof if any high byte can
-                    // begin a match.
-                    if end >= 0x80 {
-                        workspace.stack_len = 0;
-                        return Ok(StartByteProof::disabled());
-                    }
-                    insert_ascii_range(&mut words, start, end);
+        for frontier_index in 0..frontier_len {
+            workspace.stack_len = 0;
+            let state = if depth == 0 {
+                automaton.start
+            } else {
+                workspace.roots[frontier_index].state
+            };
+            workspace.push_stack(Thread { state, start: 0 })?;
+
+            while let Some(thread) = workspace.pop_stack() {
+                meter.charge(1, position)?;
+                let state = thread.state;
+                let state_index = crate::plan::plan_index(state);
+                if workspace.seen_at[state_index] == workspace.generation {
+                    continue;
                 }
-            }
-            StateRole::Split => {
-                for edge in automaton.state_edges(state).rev() {
-                    meter.charge(1, position)?;
-                    match automaton.edge_kinds[edge] {
-                        EdgeKind::Epsilon => {
+                workspace.seen_at[state_index] = workspace.generation;
+
+                match automaton.roles[state_index] {
+                    StateRole::Accept => {
+                        reached_accept = true;
+                        break;
+                    }
+                    StateRole::Consume => {
+                        workspace.push_current(thread)?;
+                        for edge in automaton.state_edges(state) {
+                            meter.charge(1, position)?;
+                            insert_byte_range(
+                                &mut words,
+                                automaton.byte_starts[edge],
+                                automaton.byte_ends[edge],
+                            );
+                        }
+                    }
+                    StateRole::Split => {
+                        for edge in automaton.state_edges(state).rev() {
+                            meter.charge(1, position)?;
+                            if automaton.edge_kinds[edge] == EdgeKind::AssertHaystackStart {
+                                // Boundary zero is evaluated without filtering;
+                                // every scanner-selected boundary is nonzero.
+                                if depth == 0 {
+                                    force_haystack_start = true;
+                                }
+                                continue;
+                            }
+                            // Every other assertion is conservatively relaxed
+                            // to epsilon. This only enlarges the byte class.
                             workspace.push_stack(Thread {
                                 state: automaton.edge_targets[edge],
                                 start: 0,
                             })?;
                         }
-                        // This edge is statically disabled at every candidate
-                        // boundary except original haystack start. The full
-                        // root is evaluated at zero, so its target need not
-                        // constrain the scanner for later boundaries.
-                        EdgeKind::AssertHaystackStart => {
-                            force_haystack_start = true;
-                        }
-                        // Every other assertion varies among nonzero
-                        // boundaries and therefore refuses this proof.
-                        _ => {
-                            workspace.stack_len = 0;
-                            return Ok(StartByteProof::disabled());
-                        }
                     }
                 }
             }
+            if reached_accept {
+                break;
+            }
+        }
+
+        // If a path can accept after exactly `depth` consumed bytes, no byte
+        // at this or any later offset is required by every match.
+        if reached_accept {
+            return Ok(StartPositionProof {
+                sets,
+                length: depth,
+                force_haystack_start,
+            });
+        }
+
+        let set = ByteSet::from_words(words);
+        sets[depth] = set;
+        if set == ByteSet::EMPTY {
+            // No nonzero-start path can consume the next required byte, so no
+            // such path can ever accept.
+            sets[0] = ByteSet::EMPTY;
+            return Ok(StartPositionProof {
+                sets,
+                length: 1,
+                force_haystack_start,
+            });
+        }
+        let next_depth = depth
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter next proof depth",
+            })?;
+        if next_depth == START_FILTER_POSITION_COUNT {
+            return Ok(StartPositionProof {
+                sets,
+                length: START_FILTER_POSITION_COUNT,
+                force_haystack_start,
+            });
+        }
+
+        // Build the exact consumed-depth frontier for the next class. Revisit
+        // and charge every consuming edge before retaining its target.
+        retain_next_start_frontier(automaton, workspace, meter, position)?;
+    }
+
+    Ok(StartPositionProof::disabled())
+}
+
+fn begin_start_proof_depth(workspace: &mut K0Workspace) -> Result<(), SearchError> {
+    workspace.generation =
+        workspace
+            .generation
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter proof generation",
+            })?;
+    workspace.current_len = 0;
+    Ok(())
+}
+
+fn retain_next_start_frontier(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<(), SearchError> {
+    workspace.roots_len = 0;
+    for current_index in 0..workspace.current_len {
+        let state = workspace.current[current_index].state;
+        for edge in automaton.state_edges(state) {
+            meter.charge(1, position)?;
+            workspace.push_root(Thread {
+                state: automaton.edge_targets[edge],
+                start: 0,
+            })?;
         }
     }
-    let set = AsciiStartSet::from_words(words);
-    Ok(StartByteProof {
-        set: (set != AsciiStartSet::ALL).then_some(set),
-        force_haystack_start,
-    })
+    Ok(())
 }
 
 // Boxing the cold pending proof would add an allocation outside the authenticated
 // workspace accounting. The warm published variant remains a borrowed pointer.
 #[allow(clippy::large_enum_variant)]
 enum InvocationStartProof<'a> {
-    Published(&'a AsciiStartProof),
-    Pending(AsciiStartProof),
+    Published(&'a StartFilterProof),
+    Pending(StartFilterProof),
 }
 
 impl InvocationStartProof<'_> {
-    const fn proof(&self) -> &AsciiStartProof {
+    const fn proof(&self) -> &StartFilterProof {
         match self {
             Self::Published(proof) => proof,
             Self::Pending(proof) => proof,
@@ -686,103 +773,149 @@ impl InvocationStartProof<'_> {
         if let Self::Pending(proof) = self {
             // A concurrent successful invocation may already have published
             // the same proof for this immutable automaton.
-            let _ = automaton.ascii_start_proof.set(proof);
+            let _ = automaton.start_filter_proof.set(proof);
         }
     }
 }
 
-fn prepare_ascii_start_scanner<'a>(
+fn prepare_start_filter<'a>(
     automaton: &'a Automaton,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
     position: usize,
 ) -> Result<InvocationStartProof<'a>, SearchError> {
-    if let Some(proof) = automaton.ascii_start_proof.get() {
+    if let Some(proof) = automaton.start_filter_proof.get() {
         return Ok(InvocationStartProof::Published(proof));
     }
 
-    let start_proof = derive_ascii_start_set(automaton, workspace, meter, position)?;
-    let scanner = if let Some(set) = start_proof.set {
-        Some(ascii_start_scanner(set, meter, position)?)
+    let position_proof = derive_start_position_classes(automaton, workspace, meter, position)?;
+    let guard = select_start_guard(
+        &position_proof.sets[..position_proof.length],
+        meter,
+        position,
+    )?;
+    let scanner = if position_proof.length != 0 {
+        let root = position_proof.sets[0];
+        let scanner = byte_start_scanner(root, meter, position)?;
+        (root != ByteSet::ALL || guard.is_some()).then_some(scanner)
     } else {
         None
     };
 
-    let proof = AsciiStartProof {
+    let proof = StartFilterProof {
         // The forced boundary matters only when skipping is enabled.
-        force_haystack_start: scanner.is_some() && start_proof.force_haystack_start,
+        force_haystack_start: scanner.is_some() && position_proof.force_haystack_start,
         scanner,
+        guard: scanner.and(guard),
     };
     // Publish only after the entire search succeeds. A racing successful
     // caller may win first; both values come from the same immutable graph.
     Ok(InvocationStartProof::Pending(proof))
 }
 
-fn ascii_start_scanner(
-    set: AsciiStartSet,
+fn select_start_guard(
+    sets: &[ByteSet],
     meter: &mut WorkMeter,
     position: usize,
-) -> Result<AsciiStartScanner, SearchError> {
-    let [low, high] = set.words();
+) -> Result<Option<StartPositionClass>, SearchError> {
+    let mut best: Option<(u32, StartPositionClass)> = None;
+    for (offset, &set) in sets.iter().enumerate().skip(1) {
+        meter.charge(
+            u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
+                .expect("byte bitmap population work fits u64"),
+            position,
+        )?;
+        let cardinality = set.cardinality();
+        meter.charge(
+            u64::try_from(START_FILTER_GUARD_SELECTION_WORK)
+                .expect("guard selection work fits u64"),
+            position,
+        )?;
+        if cardinality > START_FILTER_GUARD_MAX_CARDINALITY {
+            continue;
+        }
+        let class = StartPositionClass {
+            offset: u8::try_from(offset).expect("bounded start-filter offset fits u8"),
+            set,
+        };
+        let replace = match best {
+            None => true,
+            Some((best_cardinality, best_class)) => {
+                cardinality < best_cardinality
+                    || (cardinality == best_cardinality && class.offset > best_class.offset)
+            }
+        };
+        if replace {
+            best = Some((cardinality, class));
+        }
+    }
+    Ok(best.map(|(_, class)| class))
+}
+
+fn byte_start_scanner(
+    set: ByteSet,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<StartScanner, SearchError> {
     meter.charge(
-        u64::try_from(ASCII_START_BITMAP_POPULATION_WORK)
-            .expect("ASCII bitmap population work fits u64"),
+        u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
+            .expect("byte bitmap population work fits u64"),
         position,
     )?;
-    let cardinality = low.count_ones().saturating_add(high.count_ones());
+    let cardinality = set.cardinality();
     if cardinality == 0 {
-        return Ok(AsciiStartScanner::Empty);
+        return Ok(StartScanner::Empty);
     }
-    if usize::try_from(cardinality).expect("ASCII cardinality fits usize")
-        <= ASCII_START_SMALL_MAX_MEMBERS
+    if usize::try_from(cardinality).expect("byte cardinality fits usize")
+        <= BYTE_START_SMALL_MAX_MEMBERS
     {
         let extraction_work = usize::try_from(cardinality)
             .ok()
-            .and_then(|members| members.checked_mul(ASCII_START_MEMBER_EXTRACTION_WORK))
+            .and_then(|members| members.checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK))
             .and_then(|work| u64::try_from(work).ok())
             .ok_or(SearchError::ArithmeticOverflow {
-                computation: "small ASCII start-scanner extraction work",
+                computation: "small byte start-scanner extraction work",
             })?;
         meter.charge(extraction_work, position)?;
-        let mut bytes = [0_u8; ASCII_START_SMALL_MAX_MEMBERS];
+        let mut bytes = [0_u8; BYTE_START_SMALL_MAX_MEMBERS];
         let mut length = 0usize;
-        for (word_index, mut word) in [low, high].into_iter().enumerate() {
+        for (word_index, mut word) in set.words().into_iter().enumerate() {
             while word != 0 {
                 let bit = word.trailing_zeros();
                 let byte = word_index
                     .checked_mul(64)
                     .and_then(|offset| u8::try_from(offset).ok())
-                    .expect("ASCII word offset fits u8")
-                    .checked_add(u8::try_from(bit).expect("ASCII word bit fits u8"))
-                    .expect("ASCII byte fits u8");
+                    .expect("byte word offset fits u8")
+                    .checked_add(u8::try_from(bit).expect("byte word bit fits u8"))
+                    .expect("byte bitmap member fits u8");
                 *bytes
                     .get_mut(length)
-                    .expect("small ASCII scanner retains at most three bytes") = byte;
+                    .expect("small byte scanner retains at most three bytes") = byte;
                 length = length
                     .checked_add(1)
-                    .expect("small ASCII scanner cardinality fits usize");
+                    .expect("small byte scanner cardinality fits usize");
                 word &= word
                     .checked_sub(1)
-                    .expect("the small ASCII scanner word is nonzero");
+                    .expect("the small byte scanner word is nonzero");
             }
         }
         return Ok(match bytes[..length] {
-            [byte] => AsciiStartScanner::One(byte),
-            [first, second] => AsciiStartScanner::Two(first, second),
-            [first, second, third] => AsciiStartScanner::Three(first, second, third),
-            _ => unreachable!("one-to-three-byte ASCII set has matching scanner cardinality"),
+            [byte] => StartScanner::One(byte),
+            [first, second] => StartScanner::Two(first, second),
+            [first, second, third] => StartScanner::Three(first, second, third),
+            _ => unreachable!("one-to-three-byte set has matching scanner cardinality"),
         });
     }
 
     meter.charge(
-        u64::try_from(ASCII_START_SET_SCANNER_SELECTION_WORK)
-            .expect("ASCII bitmap scanner selection work fits u64"),
+        u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK)
+            .expect("byte bitmap scanner selection work fits u64"),
         position,
     )?;
-    Ok(AsciiStartScanner::Set(set))
+    Ok(StartScanner::Set(set))
 }
 
-fn insert_ascii_range(words: &mut [u64; 2], start: u8, end: u8) {
+fn insert_byte_range(words: &mut [u64; 4], start: u8, end: u8) {
     let start_word = usize::from(start / 64);
     let end_word = usize::from(end / 64);
     let start_bit = u32::from(start % 64);
@@ -795,36 +928,74 @@ fn insert_ascii_range(words: &mut [u64; 2], start: u8, end: u8) {
         return;
     }
     words[start_word] |= u64::MAX << start_bit;
+    for word in &mut words[start_word + 1..end_word] {
+        *word = u64::MAX;
+    }
     words[end_word] |= u64::MAX >> end_shift;
 }
 
 fn next_start_candidate(
-    scanner: &AsciiStartScanner,
+    scanner: &StartScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    guard: Option<&StartPositionClass>,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    let mut search = position;
+    loop {
+        let candidate = next_scanner_candidate(scanner, haystack, search, end, meter)?;
+        let Some(guard) = guard else {
+            return Ok(candidate);
+        };
+        if candidate == end {
+            return Ok(end);
+        }
+        let guard_position = candidate.checked_add(usize::from(guard.offset)).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "start-filter guard position",
+            },
+        )?;
+        meter.charge(1, candidate)?;
+        if guard_position >= end {
+            return Ok(end);
+        }
+        if guard.set.contains(haystack[guard_position]) {
+            return Ok(candidate);
+        }
+        search = candidate
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter next candidate",
+            })?;
+    }
+}
+
+fn next_scanner_candidate(
+    scanner: &StartScanner,
     haystack: &[u8],
     position: usize,
     end: usize,
     meter: &mut WorkMeter,
 ) -> Result<usize, SearchError> {
     match scanner {
-        AsciiStartScanner::Empty => Ok(end),
-        AsciiStartScanner::One(byte) => {
+        StartScanner::Empty => Ok(end),
+        StartScanner::One(byte) => {
             next_small_start_candidate(haystack, position, end, meter, |source| {
                 memchr(*byte, source)
             })
         }
-        AsciiStartScanner::Two(first, second) => {
+        StartScanner::Two(first, second) => {
             next_small_start_candidate(haystack, position, end, meter, |source| {
                 memchr2(*first, *second, source)
             })
         }
-        AsciiStartScanner::Three(first, second, third) => {
+        StartScanner::Three(first, second, third) => {
             next_small_start_candidate(haystack, position, end, meter, |source| {
                 memchr3(*first, *second, *third, source)
             })
         }
-        AsciiStartScanner::Set(set) => {
-            next_set_start_candidate(*set, haystack, position, end, meter)
-        }
+        StartScanner::Set(set) => next_set_start_candidate(*set, haystack, position, end, meter),
     }
 }
 
@@ -886,7 +1057,7 @@ fn next_small_start_candidate(
 }
 
 fn next_set_start_candidate(
-    set: AsciiStartSet,
+    set: ByteSet,
     haystack: &[u8],
     mut position: usize,
     end: usize,
@@ -943,8 +1114,10 @@ fn prepare_invocation(
     let required_generations = window
         .end()
         .checked_sub(window.start())
-        // One proof generation precedes the ordinary boundary generations.
-        .and_then(|length| length.checked_add(2))
+        // Up to four proof generations precede one generation for the initial
+        // boundary and one for every admitted byte.
+        .and_then(|length| length.checked_add(START_FILTER_POSITION_COUNT))
+        .and_then(|length| length.checked_add(1))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "required boundary generations",
         })?;
@@ -1295,9 +1468,11 @@ mod tests {
     use super::{scratch_bytes, WorkMeter, INVOCATION_RESET_WORK};
     use crate::{
         plan::{
-            AsciiStartProof, AsciiStartScanner, AsciiStartSet, ASCII_START_BITMAP_POPULATION_WORK,
-            ASCII_START_MEMBER_EXTRACTION_WORK, ASCII_START_SET_SCANNER_SELECTION_WORK,
-            ASCII_START_SMALL_MAX_MEMBERS,
+            ByteSet, StartFilterProof, StartPositionClass, StartScanner,
+            BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
+            BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+            START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
+            START_FILTER_POSITION_COUNT,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, K0Workspace, RawPlan, SearchError,
         SearchLimits, SearchWindow, Span, StateRole, WorkspaceLimits,
@@ -1321,6 +1496,92 @@ mod tests {
                 edge_kinds: vec![EdgeKind::ByteRange; bytes.len()],
                 byte_starts: bytes.to_vec(),
                 byte_ends: bytes.to_vec(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn byte_chain(ranges: &[(u8, u8)]) -> Automaton {
+        assert!(!ranges.is_empty());
+        let edge_offset_slots = ranges
+            .len()
+            .checked_add(2)
+            .expect("test chain offset count fits usize");
+        let mut edge_offsets = Vec::with_capacity(edge_offset_slots);
+        for offset in 0..=ranges.len() {
+            edge_offsets.push(u32::try_from(offset).expect("test chain fits u32"));
+        }
+        edge_offsets.push(u32::try_from(ranges.len()).expect("test chain fits u32"));
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: (0..ranges.len())
+                    .map(|_| StateRole::Consume)
+                    .chain(core::iter::once(StateRole::Accept))
+                    .collect(),
+                edge_offsets,
+                edge_targets: (1..=ranges.len())
+                    .map(|target| u32::try_from(target).expect("test chain fits u32"))
+                    .collect(),
+                edge_kinds: vec![EdgeKind::ByteRange; ranges.len()],
+                byte_starts: ranges.iter().map(|&(start, _)| start).collect(),
+                byte_ends: ranges.iter().map(|&(_, end)| end).collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn factored_q_ab_z() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 4],
+                edge_targets: vec![1, 2, 2, 3],
+                edge_kinds: vec![EdgeKind::ByteRange; 4],
+                byte_starts: vec![b'Q', b'a', b'b', b'Z'],
+                byte_ends: vec![b'Q', b'a', b'b', b'Z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn expanded_q_ab_z() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 5, 6, 7, 8, 8],
+                edge_targets: vec![1, 4, 2, 3, 7, 5, 6, 7],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'Q', b'a', b'Z', b'Q', b'b', b'Z'],
+                byte_ends: vec![0, 0, b'Q', b'a', b'Z', b'Q', b'b', b'Z'],
             },
             CompileLimits::default(),
         )
@@ -1523,11 +1784,12 @@ mod tests {
         .unwrap()
     }
 
-    fn pin_without_ascii_start_proof(automaton: &Automaton) {
+    fn pin_without_start_filter(automaton: &Automaton) {
         automaton
-            .ascii_start_proof
-            .set(AsciiStartProof {
+            .start_filter_proof
+            .set(StartFilterProof {
                 scanner: None,
+                guard: None,
                 force_haystack_start: false,
             })
             .expect("fresh reference automaton");
@@ -1557,7 +1819,7 @@ mod tests {
         reference: &Automaton,
         haystacks: &[Vec<u8>],
     ) {
-        pin_without_ascii_start_proof(reference);
+        pin_without_start_filter(reference);
         let mut specialized_workspace =
             K0Workspace::new(specialized, WorkspaceLimits::unlimited()).unwrap();
         let mut reference_workspace =
@@ -1621,34 +1883,72 @@ mod tests {
         }
     }
 
-    fn ascii_set(bytes: &[u8]) -> AsciiStartSet {
-        let mut words = [0_u64; 2];
-        for &byte in bytes {
-            assert!(byte < 0x80, "test start sets must be ASCII");
-            super::insert_ascii_range(&mut words, byte, byte);
-        }
-        AsciiStartSet::from_words(words)
+    fn assert_chain_filter_matches_unspecialized(
+        name: &str,
+        ranges: &[(u8, u8)],
+        expected: StartFilterProof,
+        haystacks: &[Vec<u8>],
+    ) -> Automaton {
+        let specialized = byte_chain(ranges);
+        let reference = byte_chain(ranges);
+        assert_all_windows_match_unspecialized(name, &specialized, &reference, haystacks);
+        assert_eq!(
+            specialized
+                .start_filter_proof
+                .get()
+                .expect("exhaustive search publishes proof"),
+            &expected
+        );
+        specialized
     }
 
-    fn scanner_for(bytes: &[u8]) -> AsciiStartScanner {
+    fn byte_set(bytes: &[u8]) -> ByteSet {
+        let mut words = [0_u64; 4];
+        for &byte in bytes {
+            super::insert_byte_range(&mut words, byte, byte);
+        }
+        ByteSet::from_words(words)
+    }
+
+    fn byte_range_set(start: u8, end: u8) -> ByteSet {
+        let mut words = [0_u64; 4];
+        super::insert_byte_range(&mut words, start, end);
+        ByteSet::from_words(words)
+    }
+
+    fn scanner_for(bytes: &[u8]) -> StartScanner {
         let mut meter = WorkMeter::new(u64::MAX, 0);
-        let scanner = super::ascii_start_scanner(ascii_set(bytes), &mut meter, 0).unwrap();
+        let scanner = super::byte_start_scanner(byte_set(bytes), &mut meter, 0).unwrap();
         let expected_build_work = expected_scanner_selection_work(bytes.len());
         assert_eq!(meter.consumed, expected_build_work);
         scanner
     }
 
     fn expected_scanner_selection_work(members: usize) -> u64 {
-        let selection = if members <= ASCII_START_SMALL_MAX_MEMBERS {
+        let selection = if members <= BYTE_START_SMALL_MAX_MEMBERS {
             members
-                .checked_mul(ASCII_START_MEMBER_EXTRACTION_WORK)
+                .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                 .unwrap()
         } else {
-            ASCII_START_SET_SCANNER_SELECTION_WORK
+            BYTE_START_SET_SCANNER_SELECTION_WORK
         };
         u64::try_from(
-            ASCII_START_BITMAP_POPULATION_WORK
+            BYTE_START_BITMAP_POPULATION_WORK
                 .checked_add(selection)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn expected_guard_selection_work(positions: usize) -> u64 {
+        u64::try_from(
+            positions
+                .saturating_sub(1)
+                .checked_mul(
+                    BYTE_START_BITMAP_POPULATION_WORK
+                        .checked_add(START_FILTER_GUARD_SELECTION_WORK)
+                        .unwrap(),
+                )
                 .unwrap(),
         )
         .unwrap()
@@ -1677,7 +1977,8 @@ mod tests {
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
         let mut meter = WorkMeter::new(1, 0);
         let error =
-            super::derive_ascii_start_set(&automaton, &mut workspace, &mut meter, 23).unwrap_err();
+            super::derive_start_position_classes(&automaton, &mut workspace, &mut meter, 23)
+                .unwrap_err();
         assert!(matches!(
             error,
             SearchError::WorkLimitExceeded {
@@ -1708,10 +2009,10 @@ mod tests {
             let expected = expected_scanner_selection_work(bytes.len());
 
             let mut population_refusal = WorkMeter::new(
-                u64::try_from(ASCII_START_BITMAP_POPULATION_WORK.checked_sub(1).unwrap()).unwrap(),
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK.checked_sub(1).unwrap()).unwrap(),
                 0,
             );
-            let error = super::ascii_start_scanner(ascii_set(bytes), &mut population_refusal, 17)
+            let error = super::byte_start_scanner(byte_set(bytes), &mut population_refusal, 17)
                 .unwrap_err();
             assert!(matches!(
                 error,
@@ -1721,33 +2022,32 @@ mod tests {
                     position: 17,
                     ..
                 } if requested
-                    == u64::try_from(ASCII_START_BITMAP_POPULATION_WORK).unwrap()
+                    == u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
             ));
 
             let mut exact = WorkMeter::new(expected, 0);
-            super::ascii_start_scanner(ascii_set(bytes), &mut exact, 17).unwrap();
+            super::byte_start_scanner(byte_set(bytes), &mut exact, 17).unwrap();
             assert_eq!(exact.consumed, expected);
 
             let mut one_below = WorkMeter::new(expected.checked_sub(1).unwrap(), 0);
-            let error =
-                super::ascii_start_scanner(ascii_set(bytes), &mut one_below, 17).unwrap_err();
+            let error = super::byte_start_scanner(byte_set(bytes), &mut one_below, 17).unwrap_err();
             let expected_tail = if bytes.is_empty() {
-                u64::try_from(ASCII_START_BITMAP_POPULATION_WORK).unwrap()
-            } else if bytes.len() <= ASCII_START_SMALL_MAX_MEMBERS {
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
+            } else if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
                 u64::try_from(
                     bytes
                         .len()
-                        .checked_mul(ASCII_START_MEMBER_EXTRACTION_WORK)
+                        .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                         .unwrap(),
                 )
                 .unwrap()
             } else {
-                u64::try_from(ASCII_START_SET_SCANNER_SELECTION_WORK).unwrap()
+                u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK).unwrap()
             };
             let expected_consumed = if bytes.is_empty() {
                 0
             } else {
-                u64::try_from(ASCII_START_BITMAP_POPULATION_WORK).unwrap()
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
             };
             assert!(matches!(
                 error,
@@ -1762,8 +2062,225 @@ mod tests {
     }
 
     #[test]
-    fn ascii_start_scanners_match_scalar_reference_for_every_window() {
-        let scanner_sets: &[&[u8]] = &[&[], b"a", b"ac", b"ac\x7f", b"abcd", b"\x3f\x40AB"];
+    fn byte_range_bitmap_matches_every_scalar_bound_pair() {
+        for start in 0_u8..=u8::MAX {
+            for end in start..=u8::MAX {
+                let mut words = [0_u64; 4];
+                super::insert_byte_range(&mut words, start, end);
+                let set = ByteSet::from_words(words);
+                for byte in 0_u8..=u8::MAX {
+                    assert_eq!(
+                        set.contains(byte),
+                        (start..=end).contains(&byte),
+                        "bitmap mismatch for {start:#04x}..={end:#04x} at {byte:#04x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guard_selection_is_exact_bounded_and_prefers_the_deepest_smallest_class() {
+        let sets = [
+            byte_set(b"Q"),
+            byte_set(b"ab"),
+            ByteSet::ALL,
+            byte_set(b"Z"),
+        ];
+        let expected = expected_guard_selection_work(sets.len());
+
+        let mut exact = WorkMeter::new(expected, 0);
+        assert_eq!(
+            super::select_start_guard(&sets, &mut exact, 19).unwrap(),
+            Some(StartPositionClass {
+                offset: 3,
+                set: byte_set(b"Z"),
+            })
+        );
+        assert_eq!(exact.consumed, expected);
+
+        let mut one_below = WorkMeter::new(expected - 1, 0);
+        let error = super::select_start_guard(&sets, &mut one_below, 19).unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::WorkLimitExceeded {
+                limit,
+                consumed: 14,
+                requested: 1,
+                position: 19,
+            } if limit == expected - 1
+        ));
+
+        let mut population_refusal = WorkMeter::new(3, 0);
+        let error = super::select_start_guard(&sets, &mut population_refusal, 23).unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::WorkLimitExceeded {
+                limit: 3,
+                consumed: 0,
+                requested: 4,
+                position: 23,
+            }
+        ));
+
+        let tied = [byte_set(b"Q"), byte_set(b"a"), ByteSet::ALL, byte_set(b"Z")];
+        let mut tied_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_start_guard(&tied, &mut tied_meter, 0)
+                .unwrap()
+                .expect("two selective later classes"),
+            StartPositionClass {
+                offset: 3,
+                set: byte_set(b"Z"),
+            }
+        );
+
+        let shallow_is_smaller = [
+            byte_set(b"Q"),
+            byte_set(b"a"),
+            ByteSet::ALL,
+            byte_set(b"YZ"),
+        ];
+        let mut shallow_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_start_guard(&shallow_is_smaller, &mut shallow_meter, 0)
+                .unwrap()
+                .expect("two selective later classes"),
+            StartPositionClass {
+                offset: 1,
+                set: byte_set(b"a"),
+            }
+        );
+
+        let all_later = [byte_set(b"Q"), ByteSet::ALL, ByteSet::ALL, ByteSet::ALL];
+        let mut all_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_start_guard(&all_later, &mut all_meter, 0).unwrap(),
+            None
+        );
+        assert_eq!(all_meter.consumed, expected);
+    }
+
+    #[test]
+    fn guard_selectivity_gate_retains_64_and_declines_65_through_256() {
+        let maximum_eligible = byte_range_set(0, 63);
+        assert_eq!(
+            maximum_eligible.cardinality(),
+            START_FILTER_GUARD_MAX_CARDINALITY
+        );
+        let mut maximum_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_start_guard(&[byte_set(b"Q"), maximum_eligible], &mut maximum_meter, 0,)
+                .unwrap(),
+            Some(StartPositionClass {
+                offset: 1,
+                set: maximum_eligible,
+            })
+        );
+        assert_eq!(maximum_meter.consumed, expected_guard_selection_work(2));
+
+        for broad in [byte_range_set(0, 64), byte_range_set(0, 254), ByteSet::ALL] {
+            assert!(broad.cardinality() > START_FILTER_GUARD_MAX_CARDINALITY);
+            let mut broad_meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::select_start_guard(&[byte_set(b"Q"), broad], &mut broad_meter, 0,).unwrap(),
+                None
+            );
+            assert_eq!(broad_meter.consumed, expected_guard_selection_work(2));
+        }
+
+        let broad_then_tied_eligible = [
+            byte_set(b"Q"),
+            byte_range_set(0, 64),
+            byte_set(b"Z"),
+            byte_set(b"Y"),
+        ];
+        let mut eligible_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_start_guard(&broad_then_tied_eligible, &mut eligible_meter, 0,).unwrap(),
+            Some(StartPositionClass {
+                offset: 3,
+                set: byte_set(b"Y"),
+            })
+        );
+        assert_eq!(
+            eligible_meter.consumed,
+            expected_guard_selection_work(broad_then_tied_eligible.len())
+        );
+    }
+
+    #[test]
+    fn guarded_scanner_honors_window_end_and_exact_incremental_work() {
+        let scanner = StartScanner::One(b'a');
+        let guard = StartPositionClass {
+            offset: 1,
+            set: byte_set(b"b"),
+        };
+        let haystack = b"_aaab_";
+
+        let mut exact = WorkMeter::new(6, 0);
+        assert_eq!(
+            super::next_start_candidate(&scanner, haystack, 1, 5, Some(&guard), &mut exact,)
+                .unwrap(),
+            3
+        );
+        assert_eq!(exact.consumed, 6);
+
+        let mut one_below = WorkMeter::new(5, 0);
+        let error =
+            super::next_start_candidate(&scanner, haystack, 1, 5, Some(&guard), &mut one_below)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::WorkLimitExceeded {
+                limit: 5,
+                consumed: 5,
+                requested: 1,
+                position: 3,
+            }
+        ));
+
+        let mut clipped = WorkMeter::new(6, 0);
+        assert_eq!(
+            super::next_start_candidate(&scanner, haystack, 1, 4, Some(&guard), &mut clipped,)
+                .unwrap(),
+            4
+        );
+        assert_eq!(clipped.consumed, 6);
+
+        let high_and_nul = StartPositionClass {
+            offset: 2,
+            set: byte_set(&[0, 0xff]),
+        };
+        let mut high_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate(
+                &StartScanner::Set(byte_set(&[0x80, 0xfe])),
+                &[0x80, b'x', 0xff, 0xfe, b'x', 0],
+                0,
+                6,
+                Some(&high_and_nul),
+                &mut high_meter,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(high_meter.consumed, 2);
+    }
+
+    #[test]
+    fn byte_start_scanners_match_scalar_reference_for_every_window() {
+        let scanner_sets: &[&[u8]] = &[
+            &[],
+            b"\0",
+            b"a",
+            b"ac",
+            b"ac\x7f",
+            b"\x80\xff",
+            b"\0a\xff",
+            b"abcd",
+            b"\x3f\x40AB",
+        ];
         let mut haystacks = bounded_words(
             &[
                 b'?', b'@', b'A', b'B', b'a', b'b', b'c', b'd', b'x', 0x7f, 0x80, 0xff,
@@ -1792,9 +2309,10 @@ mod tests {
                             .find(|&position| bytes.contains(&haystack[position]))
                             .unwrap_or(end);
                         let mut meter = WorkMeter::new(u64::MAX, 0);
-                        let actual =
-                            super::next_start_candidate(&scanner, haystack, start, end, &mut meter)
-                                .unwrap();
+                        let actual = super::next_start_candidate(
+                            &scanner, haystack, start, end, None, &mut meter,
+                        )
+                        .unwrap();
                         assert_eq!(
                             actual, expected,
                             "scanner {bytes:?} disagreed in {start}..{end} of {haystack:?}"
@@ -1818,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn full_ascii_root_declines_start_scanning() {
+    fn full_byte_root_declines_start_filtering() {
         let automaton = Automaton::from_raw(
             RawPlan {
                 start: 0,
@@ -1827,7 +2345,7 @@ mod tests {
                 edge_targets: vec![1],
                 edge_kinds: vec![EdgeKind::ByteRange],
                 byte_starts: vec![0],
-                byte_ends: vec![0x7f],
+                byte_ends: vec![0xff],
             },
             CompileLimits::default(),
         )
@@ -1838,11 +2356,283 @@ mod tests {
             .search_with_workspace(b"\xffA", &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let proof = automaton
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("successful search publishes the declined proof");
         assert!(proof.scanner.is_none());
         assert!(!proof.force_haystack_start);
+    }
+
+    #[test]
+    fn full_byte_root_with_broad_later_class_disables_the_filter() {
+        let automaton = byte_chain(&[(0, 0xff), (0, 64)]);
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let source = vec![0_u8; 257];
+        let report = automaton
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(report.output(), &Some(crate::MatchSpan::new(0, 2)));
+        assert!(report.accounting().boundaries() > 0);
+        assert_eq!(
+            automaton
+                .start_filter_proof
+                .get()
+                .expect("successful search publishes declined filter"),
+            &StartFilterProof {
+                scanner: None,
+                guard: None,
+                force_haystack_start: false,
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_position_guards_match_unspecialized_search_on_dense_and_binary_inputs() {
+        let mut haystacks = bounded_words(&[0, b'Q', b'Z', b'x', 0x7f, 0x80, 0xfe, 0xff], 3);
+        haystacks.extend([
+            vec![b'Q'; 129],
+            vec![0xff; 129],
+            {
+                let mut source = vec![b'Q'; 129];
+                source[64] = b'Z';
+                source
+            },
+            {
+                let mut source = vec![0xff; 129];
+                source[63] = 0;
+                source
+            },
+            vec![0, 0x80, 0, 0xff, b'Q', 0, b'Z'],
+        ]);
+
+        let q_any_z = assert_chain_filter_matches_unspecialized(
+            "selective-root-dense-middle",
+            &[(b'Q', b'Q'), (0, 0xff), (b'Z', b'Z')],
+            StartFilterProof {
+                scanner: Some(StartScanner::One(b'Q')),
+                guard: Some(StartPositionClass {
+                    offset: 2,
+                    set: byte_set(b"Z"),
+                }),
+                force_haystack_start: false,
+            },
+            &haystacks,
+        );
+
+        let all_then_z = assert_chain_filter_matches_unspecialized(
+            "all-byte-root-with-selective-guard",
+            &[(0, 0xff), (b'Z', b'Z')],
+            StartFilterProof {
+                scanner: Some(StartScanner::Set(ByteSet::ALL)),
+                guard: Some(StartPositionClass {
+                    offset: 1,
+                    set: byte_set(b"Z"),
+                }),
+                force_haystack_start: false,
+            },
+            &haystacks,
+        );
+
+        let high_then_nul = assert_chain_filter_matches_unspecialized(
+            "high-byte-root-with-nul-guard",
+            &[(0x80, 0xff), (0, 0), (0xfe, 0xff)],
+            StartFilterProof {
+                scanner: Some(StartScanner::Set(ByteSet::from_words([
+                    0,
+                    0,
+                    u64::MAX,
+                    u64::MAX,
+                ]))),
+                guard: Some(StartPositionClass {
+                    offset: 1,
+                    set: byte_set(&[0]),
+                }),
+                force_haystack_start: false,
+            },
+            &haystacks,
+        );
+
+        for (name, automaton, source) in [
+            ("all-Q", &q_any_z, vec![b'Q'; 129]),
+            ("all-high", &high_then_nul, vec![0xff; 129]),
+            ("all-byte-root", &all_then_z, vec![b'x'; 129]),
+        ] {
+            let mut workspace = K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            let report = automaton
+                .prepare::<Span>()
+                .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+                .unwrap();
+            assert!(report.output().is_none(), "{name} unexpectedly matched");
+            assert_eq!(
+                report.accounting().boundaries(),
+                0,
+                "{name} should be rejected by the root-plus-guard filter"
+            );
+            assert!(
+                report.accounting().work()
+                    <= automaton
+                        .conservative_reused_work_bound(source.len())
+                        .unwrap(),
+                "{name} exceeded its conservative work certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn passing_guard_candidates_respect_cold_and_warm_work_bounds() {
+        let automaton = byte_chain(&[(b'Q', b'Q'), (0, 0xff), (b'Z', b'Z'), (b'A', b'Z')]);
+        let source = b"QxZx".repeat(64);
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let bound = automaton
+            .conservative_reused_work_bound(source.len())
+            .unwrap();
+
+        let cold = automaton
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert!(cold.output().is_none());
+        assert!(cold.accounting().boundaries() > 0);
+        assert!(cold.accounting().work() <= bound);
+
+        let warm = automaton
+            .prepare::<Span>()
+            .search_with_workspace(&source, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm.output(), cold.output());
+        assert!(warm.accounting().boundaries() > 0);
+        assert!(warm.accounting().work() <= bound);
+        assert!(warm.accounting().work() < cold.accounting().work());
+    }
+
+    #[test]
+    fn an_accepting_shorter_branch_prevents_an_unsound_later_guard() {
+        fn q_or_qxz() -> Automaton {
+            Automaton::from_raw(
+                RawPlan {
+                    start: 0,
+                    roles: vec![
+                        StateRole::Split,
+                        StateRole::Consume,
+                        StateRole::Accept,
+                        StateRole::Consume,
+                        StateRole::Consume,
+                        StateRole::Consume,
+                    ],
+                    edge_offsets: vec![0, 2, 3, 3, 4, 5, 6],
+                    edge_targets: vec![1, 3, 2, 4, 5, 2],
+                    edge_kinds: vec![
+                        EdgeKind::Epsilon,
+                        EdgeKind::Epsilon,
+                        EdgeKind::ByteRange,
+                        EdgeKind::ByteRange,
+                        EdgeKind::ByteRange,
+                        EdgeKind::ByteRange,
+                    ],
+                    byte_starts: vec![0, 0, b'Q', b'Q', b'x', b'Z'],
+                    byte_ends: vec![0, 0, b'Q', b'Q', b'x', b'Z'],
+                },
+                CompileLimits::default(),
+            )
+            .unwrap()
+        }
+
+        let specialized = q_or_qxz();
+        let reference = q_or_qxz();
+        let mut haystacks = bounded_words(&[b'Q', b'x', b'Z', 0xff], 3);
+        haystacks.push(b"xxxxQxxxx".to_vec());
+        assert_all_windows_match_unspecialized(
+            "accept-truncates-position-proof",
+            &specialized,
+            &reference,
+            &haystacks,
+        );
+        assert_eq!(
+            specialized
+                .start_filter_proof
+                .get()
+                .expect("exhaustive search publishes proof"),
+            &StartFilterProof {
+                scanner: Some(StartScanner::One(b'Q')),
+                guard: None,
+                force_haystack_start: false,
+            }
+        );
+    }
+
+    #[test]
+    fn equivalent_factored_and_expanded_topologies_retain_the_same_filter() {
+        let mut haystacks = bounded_words(&[0, b'Q', b'a', b'b', b'Z', 0xff], 3);
+        haystacks.extend([
+            b"QQQQQQQQQQQQ".to_vec(),
+            b"xxQaZxxQbZ".to_vec(),
+            vec![0xff, b'Q', b'a', b'Z', 0, b'Q', b'b', b'Z'],
+        ]);
+
+        let factored = factored_q_ab_z();
+        let factored_reference = factored_q_ab_z();
+        assert_all_windows_match_unspecialized(
+            "factored-position-classes",
+            &factored,
+            &factored_reference,
+            &haystacks,
+        );
+        let expanded = expanded_q_ab_z();
+        let expanded_reference = expanded_q_ab_z();
+        assert_all_windows_match_unspecialized(
+            "expanded-position-classes",
+            &expanded,
+            &expanded_reference,
+            &haystacks,
+        );
+
+        let expected = StartFilterProof {
+            scanner: Some(StartScanner::One(b'Q')),
+            guard: Some(StartPositionClass {
+                offset: 2,
+                set: byte_set(b"Z"),
+            }),
+            force_haystack_start: false,
+        };
+        assert_eq!(factored.start_filter_proof.get(), Some(&expected));
+        assert_eq!(expanded.start_filter_proof.get(), Some(&expected));
+
+        let mut factored_workspace =
+            K0Workspace::new(&factored, WorkspaceLimits::unlimited()).unwrap();
+        let mut expanded_workspace =
+            K0Workspace::new(&expanded, WorkspaceLimits::unlimited()).unwrap();
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let factored_output = factored
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut factored_workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    let expanded_output = expanded
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut expanded_workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output();
+                    assert_eq!(
+                        factored_output, expanded_output,
+                        "equivalent topology mismatch for {haystack:?} in {start}..{end}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1856,14 +2646,15 @@ mod tests {
         for scanner in &scanners {
             let mut exact = WorkMeter::new(10, 7);
             assert_eq!(
-                super::next_start_candidate(scanner, b"_xxa_", 1, 4, &mut exact).unwrap(),
+                super::next_start_candidate(scanner, b"_xxa_", 1, 4, None, &mut exact).unwrap(),
                 3
             );
             assert_eq!(exact.consumed, 10);
 
             let mut before_candidate = WorkMeter::new(9, 7);
-            let error = super::next_start_candidate(scanner, b"_xxa_", 1, 4, &mut before_candidate)
-                .unwrap_err();
+            let error =
+                super::next_start_candidate(scanner, b"_xxa_", 1, 4, None, &mut before_candidate)
+                    .unwrap_err();
             assert!(matches!(
                 error,
                 SearchError::WorkLimitExceeded {
@@ -1876,14 +2667,15 @@ mod tests {
 
             let mut full_miss = WorkMeter::new(10, 7);
             assert_eq!(
-                super::next_start_candidate(scanner, b"_xxx_", 1, 4, &mut full_miss).unwrap(),
+                super::next_start_candidate(scanner, b"_xxx_", 1, 4, None, &mut full_miss).unwrap(),
                 4
             );
             assert_eq!(full_miss.consumed, 10);
 
             let mut partial_miss = WorkMeter::new(9, 7);
-            let error = super::next_start_candidate(scanner, b"_xxx_", 1, 4, &mut partial_miss)
-                .unwrap_err();
+            let error =
+                super::next_start_candidate(scanner, b"_xxx_", 1, 4, None, &mut partial_miss)
+                    .unwrap_err();
             assert!(matches!(
                 error,
                 SearchError::WorkLimitExceeded {
@@ -1895,8 +2687,8 @@ mod tests {
             ));
 
             let mut exhausted = WorkMeter::new(7, 7);
-            let error =
-                super::next_start_candidate(scanner, b"_xxx_", 1, 4, &mut exhausted).unwrap_err();
+            let error = super::next_start_candidate(scanner, b"_xxx_", 1, 4, None, &mut exhausted)
+                .unwrap_err();
             assert!(matches!(
                 error,
                 SearchError::WorkLimitExceeded {
@@ -1911,10 +2703,11 @@ mod tests {
         let mut empty_meter = WorkMeter::new(7, 7);
         assert_eq!(
             super::next_start_candidate(
-                &AsciiStartScanner::Empty,
+                &StartScanner::Empty,
                 b"_xxx_",
                 1,
                 4,
+                None,
                 &mut empty_meter,
             )
             .unwrap(),
@@ -1929,11 +2722,11 @@ mod tests {
             .search_with_workspace(b"x", &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let proof = absolute
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("successful absolute search publishes its proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(AsciiStartScanner::Empty)));
+        assert!(matches!(proof.scanner, Some(StartScanner::Empty)));
     }
 
     #[test]
@@ -1952,9 +2745,15 @@ mod tests {
                 .search_with_workspace(b"z", &mut workspace, SearchLimits::unlimited())
                 .unwrap();
             assert_eq!(cold.output(), warm.output());
-            let proof_work = 1_u64
-                .checked_add(u64::try_from(bytes.len()).unwrap())
-                .and_then(|work| work.checked_add(expected_scanner_selection_work(bytes.len())))
+            let graph_work = if bytes.is_empty() {
+                1
+            } else {
+                2_u64
+                    .checked_add(u64::try_from(bytes.len()).unwrap().checked_mul(2).unwrap())
+                    .unwrap()
+            };
+            let proof_work = graph_work
+                .checked_add(expected_scanner_selection_work(bytes.len()))
                 .unwrap();
             assert_eq!(
                 cold.accounting()
@@ -1964,26 +2763,25 @@ mod tests {
             );
 
             let proof = automaton
-                .ascii_start_proof
+                .start_filter_proof
                 .get()
                 .expect("successful search publishes the start scanner");
             let scanner = proof
                 .scanner
                 .as_ref()
-                .expect("an ASCII root enables start scanning");
+                .expect("a selective byte root enables start scanning");
             assert!(matches!(
                 (bytes, scanner),
-                (b"", AsciiStartScanner::Empty)
-                    | (b"a", AsciiStartScanner::One(b'a'))
-                    | (b"ab", AsciiStartScanner::Two(b'a', b'b'))
-                    | (b"abc", AsciiStartScanner::Three(b'a', b'b', b'c'))
-                    | (b"abcd", AsciiStartScanner::Set(_))
+                (b"", StartScanner::Empty)
+                    | (b"a", StartScanner::One(b'a'))
+                    | (b"ab", StartScanner::Two(b'a', b'b'))
+                    | (b"abc", StartScanner::Three(b'a', b'b', b'c'))
+                    | (b"abcd", StartScanner::Set(_))
             ));
 
             let mut meter = WorkMeter::new(u64::MAX, 0);
             let invocation =
-                super::prepare_ascii_start_scanner(&automaton, &mut workspace, &mut meter, 0)
-                    .unwrap();
+                super::prepare_start_filter(&automaton, &mut workspace, &mut meter, 0).unwrap();
             match invocation {
                 super::InvocationStartProof::Published(borrowed) => {
                     assert!(core::ptr::eq(borrowed, proof));
@@ -1997,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn ascii_start_specialization_is_once_per_automaton_and_clone() {
+    fn byte_start_specialization_is_once_per_automaton_and_clone() {
         let automaton = ascii_literal(b'a');
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
         let cold = automaton
@@ -2009,7 +2807,7 @@ mod tests {
             .search_with_workspace(b"zzza", &mut workspace, SearchLimits::unlimited())
             .unwrap();
         assert_eq!(cold.output(), warm.output());
-        let specialization_work = 2_u64
+        let specialization_work = 4_u64
             .checked_add(expected_scanner_selection_work(1))
             .unwrap();
         assert_eq!(
@@ -2019,13 +2817,12 @@ mod tests {
             Some(specialization_work)
         );
         let published = automaton
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("successful cold search publishes the proof");
         let mut cache_meter = WorkMeter::new(u64::MAX, 0);
         let cached =
-            super::prepare_ascii_start_scanner(&automaton, &mut workspace, &mut cache_meter, 0)
-                .unwrap();
+            super::prepare_start_filter(&automaton, &mut workspace, &mut cache_meter, 0).unwrap();
         match cached {
             super::InvocationStartProof::Published(borrowed) => {
                 assert!(
@@ -2041,7 +2838,7 @@ mod tests {
 
         let cloned = automaton.clone();
         assert!(
-            cloned.ascii_start_proof.get().is_none(),
+            cloned.start_filter_proof.get().is_none(),
             "cloning must not copy uncharged first-use specialization"
         );
         let mut clone_workspace = K0Workspace::new(&cloned, WorkspaceLimits::unlimited()).unwrap();
@@ -2067,14 +2864,13 @@ mod tests {
         let root = [b'a', b'b', b'c', b'd'];
         let automaton = ascii_root_bytes(&root);
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
-        // The root proof costs one state plus one operation per edge. Admit
-        // those plus invocation reset, then refuse before either bitmap
-        // population operation.
-        let proof_work = 1_u64
-            .checked_add(u64::try_from(root.len()).unwrap())
+        // The root proof visits its state and consuming edges, retains the
+        // next frontier with a second edge pass, then observes accept.
+        let proof_work = 2_u64
+            .checked_add(u64::try_from(root.len()).unwrap().checked_mul(2).unwrap())
             .unwrap();
         let admitted = INVOCATION_RESET_WORK.checked_add(proof_work).unwrap();
-        let population_work = u64::try_from(ASCII_START_BITMAP_POPULATION_WORK).unwrap();
+        let population_work = u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap();
         let error = automaton
             .prepare::<Span>()
             .search_with_workspace(
@@ -2095,9 +2891,9 @@ mod tests {
             } if consumed == admitted
                 && requested == population_work
         ));
-        assert!(automaton.ascii_start_proof.get().is_none());
+        assert!(automaton.start_filter_proof.get().is_none());
 
-        // Once both bitmap words are admitted and counted, retaining the
+        // Once all bitmap words are admitted and counted, retaining the
         // scalar set scanner is the next indivisible construction charge.
         let population_admitted = admitted.checked_add(population_work).unwrap();
         let error = automaton
@@ -2118,15 +2914,15 @@ mod tests {
                 requested,
                 ..
             } if consumed == population_admitted
-                && requested == u64::try_from(ASCII_START_SET_SCANNER_SELECTION_WORK).unwrap()
+                && requested == u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK).unwrap()
         ));
-        assert!(automaton.ascii_start_proof.get().is_none());
+        assert!(automaton.start_filter_proof.get().is_none());
 
-        // A small scanner charges its member extraction after the same two
+        // A small scanner charges its member extraction after the same four
         // population operations and likewise cannot publish on refusal.
         let small = ascii_literal(b'a');
         let mut small_workspace = K0Workspace::new(&small, WorkspaceLimits::unlimited()).unwrap();
-        let small_proof_work = 2_u64;
+        let small_proof_work = 4_u64;
         let small_extraction_limit = INVOCATION_RESET_WORK
             .checked_add(small_proof_work)
             .and_then(|work| work.checked_add(population_work))
@@ -2150,9 +2946,75 @@ mod tests {
                 ..
             } if consumed == small_extraction_limit
                 && requested
-                    == u64::try_from(ASCII_START_MEMBER_EXTRACTION_WORK).unwrap()
+                    == u64::try_from(BYTE_START_MEMBER_EXTRACTION_WORK).unwrap()
         ));
-        assert!(small.ascii_start_proof.get().is_none());
+        assert!(small.start_filter_proof.get().is_none());
+    }
+
+    #[test]
+    fn refused_guard_selection_does_not_publish_unpaid_specialization() {
+        let ranges = [(b'Q', b'Q'), (0, 0xff), (b'Z', b'Z')];
+        let measured = byte_chain(&ranges);
+        let mut measured_workspace =
+            K0Workspace::new(&measured, WorkspaceLimits::unlimited()).unwrap();
+        let mut proof_meter = WorkMeter::new(u64::MAX, 0);
+        let proof = super::derive_start_position_classes(
+            &measured,
+            &mut measured_workspace,
+            &mut proof_meter,
+            0,
+        )
+        .unwrap();
+        assert_eq!(proof.length, 3);
+
+        let guard_work = expected_guard_selection_work(proof.length);
+        let one_below_guard = INVOCATION_RESET_WORK
+            .checked_add(proof_meter.consumed)
+            .and_then(|work| work.checked_add(guard_work))
+            .and_then(|work| work.checked_sub(1))
+            .unwrap();
+        let automaton = byte_chain(&ranges);
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let error = automaton
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"QxZ",
+                &mut workspace,
+                SearchLimits {
+                    max_work: one_below_guard,
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position: 0,
+            } if limit == one_below_guard && consumed == one_below_guard
+        ));
+        assert!(
+            automaton.start_filter_proof.get().is_none(),
+            "a refused guard comparison must not publish a partial proof"
+        );
+
+        automaton
+            .prepare::<Span>()
+            .search_with_workspace(b"QxZ", &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            automaton
+                .start_filter_proof
+                .get()
+                .expect("successful retry publishes complete proof")
+                .guard,
+            Some(StartPositionClass {
+                offset: 2,
+                set: byte_set(b"Z"),
+            })
+        );
     }
 
     #[test]
@@ -2160,8 +3022,8 @@ mod tests {
         let root = [b'a', b'b', b'c', b'd'];
         let automaton = ascii_root_bytes(&root);
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
-        let proof_work = 1_u64
-            .checked_add(u64::try_from(root.len()).unwrap())
+        let proof_work = 2_u64
+            .checked_add(u64::try_from(root.len()).unwrap().checked_mul(2).unwrap())
             .unwrap();
         let specialization_admitted = INVOCATION_RESET_WORK
             .checked_add(proof_work)
@@ -2192,7 +3054,7 @@ mod tests {
                 if consumed > specialization_admitted
         ));
         assert!(
-            automaton.ascii_start_proof.get().is_none(),
+            automaton.start_filter_proof.get().is_none(),
             "a search that pays specialization but later fails must not publish it"
         );
 
@@ -2200,7 +3062,7 @@ mod tests {
             .prepare::<Span>()
             .search_with_workspace(b"za", &mut workspace, SearchLimits::unlimited())
             .unwrap();
-        assert!(automaton.ascii_start_proof.get().is_some());
+        assert!(automaton.start_filter_proof.get().is_some());
         let warm = automaton
             .prepare::<Span>()
             .search_with_workspace(b"za", &mut workspace, SearchLimits::unlimited())
@@ -2240,7 +3102,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(clone_error, SearchError::WorkLimitExceeded { .. }));
-        assert!(cloned.ascii_start_proof.get().is_none());
+        assert!(cloned.start_filter_proof.get().is_none());
     }
 
     #[test]
@@ -2306,16 +3168,16 @@ mod tests {
             "a racing caller must either derive and fully charge or use the published proof"
         );
         assert!(reports.iter().any(|(_, work)| *work == cold_work));
-        assert!(automaton.ascii_start_proof.get().is_some());
+        assert!(automaton.start_filter_proof.get().is_some());
     }
 
     #[test]
-    fn every_non_absolute_start_assertion_disables_the_start_scanner_proof() {
+    fn every_non_absolute_start_assertion_is_conservatively_relaxed() {
         let absolute = assertion_or_colon(EdgeKind::AssertHaystackStart);
         let mut absolute_workspace =
             K0Workspace::new(&absolute, WorkspaceLimits::unlimited()).unwrap();
         let mut absolute_meter = WorkMeter::new(u64::MAX, 0);
-        let proof = super::derive_ascii_start_set(
+        let proof = super::derive_start_position_classes(
             &absolute,
             &mut absolute_workspace,
             &mut absolute_meter,
@@ -2323,12 +3185,9 @@ mod tests {
         )
         .unwrap();
         assert!(proof.force_haystack_start);
-        assert_eq!(
-            proof.set.expect("colon sibling remains skippable").words(),
-            [1_u64 << u32::from(b':'), 0]
-        );
+        assert_eq!(proof.sets[0].words(), [1_u64 << u32::from(b':'), 0, 0, 0]);
 
-        let refused = [
+        let relaxed = [
             EdgeKind::AssertHaystackEnd,
             EdgeKind::AssertLineStartLf,
             EdgeKind::AssertLineEndLf,
@@ -2347,17 +3206,20 @@ mod tests {
             EdgeKind::AssertWordStartHalfUnicode,
             EdgeKind::AssertWordEndHalfUnicode,
         ];
-        for assertion in refused {
+        for assertion in relaxed {
             let automaton = assertion_or_colon(assertion);
             let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
             let mut meter = WorkMeter::new(u64::MAX, 0);
             let proof =
-                super::derive_ascii_start_set(&automaton, &mut workspace, &mut meter, 0).unwrap();
-            assert!(
-                proof.set.is_none(),
-                "{} unexpectedly retained a scanner set",
+                super::derive_start_position_classes(&automaton, &mut workspace, &mut meter, 0)
+                    .unwrap();
+            assert_eq!(
+                proof.sets[0],
+                byte_set(b"a:"),
+                "{} did not conservatively retain both roots",
                 assertion.name()
             );
+            assert_eq!(proof.length, 1);
             assert!(
                 !proof.force_haystack_start,
                 "{} unexpectedly retained an absolute-start exception",
@@ -2383,11 +3245,18 @@ mod tests {
         );
 
         let proof = specialized
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("exhaustive successful search publishes the proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(AsciiStartScanner::One(b':'))));
+        assert!(matches!(proof.scanner, Some(StartScanner::One(b':'))));
+        assert_eq!(
+            proof.guard,
+            Some(StartPositionClass {
+                offset: 1,
+                set: byte_set(b"a"),
+            })
+        );
 
         let mut workspace = K0Workspace::new(&specialized, WorkspaceLimits::unlimited()).unwrap();
         let at_zero = specialized
@@ -2481,18 +3350,26 @@ mod tests {
             .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let proof = automaton
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("successful search publishes the proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(AsciiStartScanner::One(b':'))));
+        assert!(matches!(proof.scanner, Some(StartScanner::One(b':'))));
+        assert_eq!(
+            proof.guard,
+            Some(StartPositionClass {
+                offset: 3,
+                set: byte_set(b"o"),
+            })
+        );
 
         let warm = automaton
             .prepare::<Span>()
             .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
             .unwrap();
-        let specialization_work = 5_u64
-            .checked_add(expected_scanner_selection_work(1))
+        let specialization_work = 14_u64
+            .checked_add(expected_guard_selection_work(4))
+            .and_then(|work| work.checked_add(expected_scanner_selection_work(1)))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -2557,29 +3434,38 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, SearchError::WorkLimitExceeded { .. }));
         assert!(
-            unpublished.ascii_start_proof.get().is_none(),
+            unpublished.start_filter_proof.get().is_none(),
             "a failed cold search must not publish the absolute-start proof"
         );
     }
 
     #[test]
     fn generation_rollover_is_preflighted_and_accounted_as_setup() {
-        let automaton = Automaton::from_raw(
-            RawPlan {
-                start: 0,
-                roles: vec![StateRole::Consume, StateRole::Accept],
-                edge_offsets: vec![0, 1, 1],
-                edge_targets: vec![1],
-                edge_kinds: vec![EdgeKind::ByteRange],
-                byte_starts: vec![b'a'],
-                byte_ends: vec![b'a'],
-            },
-            CompileLimits::default(),
+        let required_generations = u64::try_from(
+            1_usize
+                .checked_add(START_FILTER_POSITION_COUNT)
+                .and_then(|count| count.checked_add(1))
+                .unwrap(),
         )
         .unwrap();
+        let no_reset = ascii_literal(b'a');
+        let mut no_reset_workspace =
+            K0Workspace::new(&no_reset, WorkspaceLimits::unlimited()).unwrap();
+        no_reset_workspace.generation = u64::MAX.checked_sub(required_generations).unwrap();
+        let no_reset_report = no_reset
+            .prepare::<Span>()
+            .search_with_workspace(b"a", &mut no_reset_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(no_reset_report.accounting().setup_work(), 3);
+        assert_eq!(no_reset_report.accounting().setup().initialized_bytes(), 0);
+
+        let automaton = ascii_literal(b'a');
         let mut workspace =
             super::K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).expect("workspace");
-        workspace.generation = u64::MAX;
+        workspace.generation = u64::MAX
+            .checked_sub(required_generations.checked_sub(1).unwrap())
+            .unwrap();
+        let before_reset = workspace.generation;
 
         let reset_work = 3_u64
             .checked_add(u64::try_from(automaton.stats().states()).unwrap())
@@ -2596,7 +3482,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, SearchError::WorkLimitExceeded { .. }));
-        assert_eq!(workspace.generation, u64::MAX);
+        assert_eq!(workspace.generation, before_reset);
 
         let report = automaton
             .prepare::<Span>()
@@ -2648,17 +3534,17 @@ mod tests {
         assert_eq!((found.start(), found.end()), (96, 98));
         assert_eq!(
             automaton
-                .ascii_start_proof
+                .start_filter_proof
                 .get()
                 .expect("start proof should be initialized")
                 .scanner
                 .as_ref()
                 .and_then(|scanner| match scanner {
-                    AsciiStartScanner::Set(set) => Some(set.words()),
+                    StartScanner::Set(set) => Some(set.words()),
                     _ => None,
                 })
-                .expect("ASCII digit root should retain a bitmap scanner"),
-            [0x03ff_0000_0000_0000, 0]
+                .expect("digit root should retain a bitmap scanner"),
+            [0x03ff_0000_0000_0000, 0, 0, 0]
         );
         assert_eq!(accounting.boundaries(), 3);
         assert!(accounting.transition_work() < 120);
@@ -2695,7 +3581,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_asserted_and_high_byte_roots_decline_skipping() {
+    fn nullable_declines_while_asserted_and_high_byte_roots_filter() {
         let nullable = Automaton::from_raw(
             RawPlan {
                 start: 0,
@@ -2727,7 +3613,7 @@ mod tests {
             Some(1)
         );
         assert!(nullable
-            .ascii_start_proof
+            .start_filter_proof
             .get()
             .expect("nullable proof should be initialized")
             .scanner
@@ -2752,12 +3638,14 @@ mod tests {
             .prepare::<Span>()
             .search_with_workspace(b"a", &mut asserted_workspace, SearchLimits::unlimited())
             .unwrap();
-        assert!(asserted
-            .ascii_start_proof
-            .get()
-            .expect("asserted proof should be initialized")
-            .scanner
-            .is_none());
+        assert!(matches!(
+            asserted
+                .start_filter_proof
+                .get()
+                .expect("asserted proof should be initialized")
+                .scanner,
+            Some(StartScanner::One(b'a'))
+        ));
 
         let high = Automaton::from_raw(
             RawPlan {
@@ -2776,11 +3664,17 @@ mod tests {
         high.prepare::<Span>()
             .search_with_workspace(&[0x80], &mut high_workspace, SearchLimits::unlimited())
             .unwrap();
-        assert!(high
-            .ascii_start_proof
-            .get()
-            .expect("high-byte proof should be initialized")
-            .scanner
-            .is_none());
+        assert_eq!(
+            high.start_filter_proof
+                .get()
+                .expect("high-byte proof should be initialized")
+                .scanner,
+            Some(StartScanner::Set(ByteSet::from_words([
+                0,
+                0,
+                u64::MAX,
+                u64::MAX,
+            ])))
+        );
     }
 }
