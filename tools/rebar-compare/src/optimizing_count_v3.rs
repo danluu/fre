@@ -7,7 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use fre::AggregatePlanKind;
+use fre::{
+    AggregateBuildLimits, AggregateBuilder, AggregatePlanKind, AggregatePlanSelection,
+    AggregateStrategy,
+};
 use rebar_expand::Manifest;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,8 +18,8 @@ use sha2::{Digest, Sha256};
 use super::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateOperationInner, FRE_ADAPTER, Loader,
     REPORT_SCHEMA, RUST_ADAPTER, Report, RunConfig, Status,
-    current_fre_rebar_aggregate_operation_lifecycle, read_limited, report_bytes, sha256,
-    validate_manifest, verify_sidecar_hash,
+    RunLimits, aggregate_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
+    read_limited, report_bytes, sha256, validate_manifest, verify_sidecar_hash,
 };
 
 /// Closed schema for an authenticated, untimed Count-v3 candidate inventory.
@@ -46,6 +49,7 @@ unicode=off-or-nonempty-exact-utf8-literal\n\
 case_insensitive=false\n\
 semantic_receipt=pass\n\
 candidate_plan=aggregate-exact-literal\n\
+compiler_plan=fixed-aot-count-exact-literal-v1\n\
 literal_bytes=1..32\n\
 input_bytes=1..\n";
 const SEMANTIC_OPTIONS_DOMAIN: &[u8] =
@@ -144,9 +148,10 @@ pub struct OptimizingCountV3Inventory {
 /// Authenticate the pinned manifest and current semantic report, then project
 /// the complete untimed Count-v3 candidate universe.
 ///
-/// This function performs ordinary facade construction and one correctness
-/// execution for selected cells, but it never compiles AOT code and never
-/// measures elapsed time.
+/// This function performs ordinary facade construction as the current
+/// semantic control, then separately reconstructs the fixed-policy facade
+/// owner required by the AOT compiler and executes both once for correctness.
+/// It never compiles AOT code and never measures elapsed time.
 pub fn inventory_optimizing_count_v3(
     config: &RunConfig,
     semantic_report: &Report,
@@ -278,14 +283,14 @@ pub fn inventory_optimizing_count_v3(
                 job.id
             )));
         }
-        let candidate = regex.exact_literal_aot_planned_candidate().ok_or_else(|| {
+        let current_candidate = regex.exact_literal_aot_candidate().ok_or_else(|| {
             CompareError::new(format!(
-                "selected Count-v3 job {} lacks the authenticated fixed-policy AOT candidate",
+                "selected Count-v3 job {} lacks its authenticated exact-literal candidate",
                 job.id
             ))
         })?;
-        let literal = candidate.literal();
-        if literal.is_empty() {
+        let current_literal = current_candidate.literal();
+        if current_literal.is_empty() {
             decisions.push(decision(
                 &safe_job_id,
                 &job.id,
@@ -294,7 +299,7 @@ pub fn inventory_optimizing_count_v3(
             ));
             continue;
         }
-        if literal.len() > 32 {
+        if current_literal.len() > 32 {
             decisions.push(decision(
                 &safe_job_id,
                 &job.id,
@@ -325,6 +330,69 @@ pub fn inventory_optimizing_count_v3(
                 "selected Count-v3 manifest job lost its single-pattern shape",
             ));
         };
+        let fixed_regex = AggregateBuilder::new(pattern.clone())
+            .unicode(job.regex.unicode)
+            .case_insensitive(false)
+            .limits(AggregateBuildLimits::aot_count_exact_literal_v1())
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .strategy(AggregateStrategy::ReverseSequentialRows)
+            .build_count()
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "selected Count-v3 job {} fixed-policy facade build: {error}",
+                    job.id
+                ))
+            })?;
+        if fixed_regex.build_report().plan != AggregatePlanKind::ExactLiteral {
+            return Err(CompareError::new(format!(
+                "selected Count-v3 job {} fixed-policy facade selected a different plan",
+                job.id
+            )));
+        }
+        let candidate = fixed_regex
+            .exact_literal_aot_planned_candidate()
+            .ok_or_else(|| {
+                CompareError::new(format!(
+                    "selected Count-v3 job {} lacks the authenticated fixed-policy AOT candidate",
+                    job.id
+                ))
+            })?;
+        let literal = candidate.literal();
+        // The semantic-binding receipt intentionally includes plan selection,
+        // so the ordinary Auto control and the forced AOT owner have distinct
+        // receipts. Their retained literal and independent executions must
+        // instead close over the same source/options and oracle value.
+        if literal != current_literal {
+            return Err(CompareError::new(format!(
+                "selected Count-v3 job {} current and fixed-policy retained literals differ",
+                job.id
+            )));
+        }
+        let fixed_limits = aggregate_run_limits(
+            loaded.haystack.len(),
+            fixed_regex.build_report(),
+            &RunLimits::default(),
+        )
+        .map_err(|error| {
+            CompareError::new(format!(
+                "selected Count-v3 job {} fixed-policy run limits: {}",
+                job.id, error.message
+            ))
+        })?;
+        let fixed_observed = fixed_regex
+            .count_value(&loaded.haystack, fixed_limits)
+            .map_err(|error| {
+                CompareError::new(format!(
+                    "selected Count-v3 job {} fixed-policy correctness execution: {error}",
+                    job.id
+                ))
+            })?;
+        if fixed_observed != observed {
+            return Err(CompareError::new(format!(
+                "selected Count-v3 job {} fixed-policy value {fixed_observed} differs from current value {observed}",
+                job.id
+            )));
+        }
         let pattern_sha256 =
             qualified_pattern_identity(&pattern_descriptor.sha256, job.regex.unicode);
         let pattern_semantics_identity =
