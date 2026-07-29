@@ -164,6 +164,12 @@ fn run() -> Result<(), String> {
     if target.object_format == CountObjectFormatV3::MachOArm64 {
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-segprot,__FRE_CONST,r,r");
         println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-reproducible");
+    } else {
+        // The deterministic hand-written ELF inputs intentionally contain
+        // only their contract sections. Pin the final executable's stack
+        // policy explicitly instead of inheriting a linker's legacy fallback
+        // for objects without `.note.GNU-stack`.
+        println!("cargo:rustc-link-arg-bin={BINARY}=-Wl,-z,noexecstack");
     }
     Ok(())
 }
