@@ -501,22 +501,23 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
         CountEmitLimitsV3::default(),
     )
     .unwrap();
-    assert!(
+    assert_eq!(
         periodic
             .labels()
             .iter()
             .filter(|label| label.kind == LabelKindV3::VectorLoop)
-            .count()
-            >= 2
+            .count(),
+        1
     );
-    assert!(
+    assert_eq!(
         periodic
             .labels()
             .iter()
             .filter(|label| label.kind == LabelKindV3::CandidateLoop)
-            .count()
-            >= 2
+            .count(),
+        2
     );
+    assert_eq!(periodic.build_receipt().audit.staged_filter_checks, 0);
     assert_eq!(
         audit_count_image_v3(&periodic_program, periodic_optimized.recipe(), &periodic).unwrap(),
         periodic.build_receipt().audit
@@ -525,8 +526,11 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
 
 #[test]
 fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
-    let (program, optimized) = optimized(b"abababab");
-    assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+    let (program, optimized) = optimized(b"not-periodic");
+    assert_eq!(
+        optimized.recipe().strategy(),
+        CountV3Strategy::SparseRareColumns
+    );
     let image = emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
     let decoded = decoded_v3(&image);
 
@@ -786,8 +790,11 @@ fn sve_primary_empty_batch_advances_128_starts_with_closed_quarter_reentry() {
         (CountV3RequiredIsa::Aarch64SveVl16, false),
         (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
     ] {
-        let (program, optimized) = optimized_for(b"abababab", required_isa);
-        assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+        let (program, optimized) = optimized_for(b"not-periodic", required_isa);
+        assert_eq!(
+            optimized.recipe().strategy(),
+            CountV3Strategy::SparseRareColumns
+        );
         let image =
             emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
         let decoded = decoded_v3(&image);

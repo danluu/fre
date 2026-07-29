@@ -18,7 +18,7 @@ fn optimize(literal: &[u8]) -> OptimizedCountV3 {
 
 #[test]
 fn selection_and_every_identity_are_deterministic() {
-    assert_eq!(COUNT_V3_OPTIMIZER_VERSION, 6);
+    assert_eq!(COUNT_V3_OPTIMIZER_VERSION, 7);
     let left_program = program(b"header: x-fre-request-id");
     let right_program = program(b"header: x-fre-request-id");
     let left = optimize_count_v3(
@@ -97,7 +97,7 @@ fn explicit_isa_plans_are_sealed_before_recipe_identity() {
 }
 
 #[test]
-fn sve_costs_follow_the_shared_lowering_instead_of_strategy_labels() {
+fn nonperiodic_sve_costs_follow_the_shared_lowering_instead_of_strategy_labels() {
     let literal = b"target-aware-recipe";
     let mut work = Work::default();
     let analysis = analyze_literal(literal, &mut work).expect("literal analysis");
@@ -157,7 +157,7 @@ fn sve_costs_follow_the_shared_lowering_instead_of_strategy_labels() {
 }
 
 #[test]
-fn periodic_portfolio_competes_over_every_bounded_filter_prefix() {
+fn periodic_portfolio_uses_the_complete_bounded_filter() {
     let literal = b"abababab";
     let mut work = Work::default();
     let analysis = analyze_literal(literal, &mut work).expect("periodic literal analysis");
@@ -185,7 +185,7 @@ fn periodic_portfolio_competes_over_every_bounded_filter_prefix() {
         .filter(|candidate| candidate.strategy == CountV3Strategy::PeriodicRun)
         .map(|candidate| candidate.filter_count)
         .collect::<Vec<_>>();
-    assert_eq!(periodic_filter_counts, vec![2, 3, 4]);
+    assert_eq!(periodic_filter_counts, vec![4]);
 }
 
 #[test]

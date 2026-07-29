@@ -106,6 +106,7 @@ pub(crate) struct LoweringRecipeV3 {
     pub(crate) filter: Option<CandidateFilterV3>,
     pub(crate) confirmation_order: [u8; 32],
     pub(crate) confirmation_len: u8,
+    pub(crate) periodic_stride: u8,
 }
 
 impl LoweringRecipeV3 {
@@ -733,6 +734,7 @@ fn project_recipe_v3(
             filter,
             confirmation_order,
             confirmation_len: u8::try_from(order.len()).expect("bounded literal width"),
+            periodic_stride: recipe.periodic_stride(),
         },
         manifest,
     ))
@@ -1433,13 +1435,20 @@ pub(crate) fn canonical_template_v3(
                             emit_direct_exact_mask_v3(&mut assembler, literal, filter, done)?;
                         }
                         LoweringStrategyV3::SparseRareColumns
-                        | LoweringStrategyV3::EndpointDense
-                        | LoweringStrategyV3::PeriodicRun => emit_multi_specialized_v3(
+                        | LoweringStrategyV3::EndpointDense => emit_multi_specialized_v3(
                             &mut assembler,
                             literal,
                             filter,
                             recipe.confirmation_order(),
                             recipe.strategy,
+                            done,
+                        )?,
+                        LoweringStrategyV3::PeriodicRun => emit_periodic_neon_v3(
+                            &mut assembler,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.periodic_stride,
                             done,
                         )?,
                     }
@@ -1449,6 +1458,19 @@ pub(crate) fn canonical_template_v3(
                 let sve2 = recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16;
                 if literal.len() == 1 || recipe.strategy == LoweringStrategyV3::DirectExactMask {
                     emit_sve_direct_exact_v3(&mut assembler, literal, sve2, done)?;
+                } else if recipe.strategy == LoweringStrategyV3::PeriodicRun {
+                    let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
+                        at: "missing v3 periodic SVE candidate filter",
+                    })?;
+                    emit_periodic_sve_v3(
+                        &mut assembler,
+                        literal,
+                        filter,
+                        recipe.confirmation_order(),
+                        recipe.periodic_stride,
+                        sve2,
+                        done,
+                    )?;
                 } else {
                     let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
                         at: "missing v3 SVE candidate filter",
@@ -1964,6 +1986,136 @@ fn emit_sve_filtered_v3(
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X3, width)?;
     assembler.branch(tail)?;
+    assembler.bind(tail_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(tail)
+}
+
+/// Fixed-VL16 SVE/SVE2 periodic scan.
+///
+/// The sealed periodic recipe supplies a complete structural filter (the
+/// first period boundary, its successor, and both literal boundaries where
+/// distinct). Every filter column is intersected before the single predicate
+/// test, so common period bytes cannot enter scalar confirmation on their own.
+/// A confirmed match enters a straight non-overlapping successor run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed periodic predicate and successor graph is intentionally explicit"
+)]
+fn emit_periodic_sve_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    filter: CandidateFilterV3,
+    confirmation_order: &[u8],
+    periodic_stride: u8,
+    sve2: bool,
+    done: LabelV3,
+) -> Result<(), CountAotError> {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+        return Err(CountAotError::InternalInvariant {
+            at: "invalid periodic SVE stride",
+        });
+    }
+    let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
+    let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let advance = assembler.new_label(LabelKindV3::Internal)?;
+    let match_run = assembler.new_label(LabelKindV3::CandidateLoop)?;
+    let match_run_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
+        site: CountAotArithmeticSite::CodeOffset,
+    })?;
+    let constants = [2_u8, 3, 16, 17];
+
+    assembler.mov_imm64_minimal(X13, 0)?;
+    assembler.cmp_imm64(X1, width)?;
+    assembler.branch_cond(ConditionV3::CarryClear, done)?;
+    assembler.sub_imm(X4, X1, width)?;
+    assembler.mov_imm64_minimal(X3, 0)?;
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        assembler.mov_imm64_minimal(X8, u64::from(literal[usize::from(offset)]))?;
+        assembler.sve_duplicate_byte(constants[index], X8)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, tail)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        let base = if offset == 0 {
+            X15
+        } else {
+            assembler.add_imm(X8, X15, u16::from(offset))?;
+            X8
+        };
+        assembler.sve_load_bytes(0, 0, base)?;
+        let destination = if index == 0 { 1 } else { 2 };
+        emit_sve_compare_bytes_v3(assembler, destination, 0, 0, constants[index], sve2)?;
+        if index != 0 {
+            assembler.sve_and_predicate_bytes(1, 0, 1, 2)?;
+        }
+    }
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::Equal, advance)?;
+
+    assembler.bind(candidate)?;
+    assembler.sve_break_before_bytes(3, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X7, 0, 3)?;
+    assembler.add_reg(X5, X3, X7)?;
+    assembler.add_reg(X15, X0, X5)?;
+    emit_scalar_confirmation_sve_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        filter.offsets(),
+        X15,
+        candidate_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X5, width)?;
+    assembler.branch(match_run)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.sve_break_after_bytes(3, 0, 1)?;
+    assembler.sve_bit_clear_predicate_bytes_set_flags(1, 0, 1, 3)?;
+    assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
+    assembler.bind(advance)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(match_run)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    emit_scalar_confirmation_sve_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        &[],
+        X15,
+        match_run_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X3, width)?;
+    assembler.branch(match_run)?;
+    assembler.bind(match_run_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(tail)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    emit_scalar_confirmation_sve_v3(assembler, literal, confirmation_order, &[], X15, tail_miss)?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X3, width)?;
+    assembler.branch(match_run)?;
     assembler.bind(tail_miss)?;
     assembler.add_imm(X3, X3, 1)?;
     assembler.branch(tail)
@@ -2937,6 +3089,179 @@ fn emit_multi_specialized_v3(
     assembler.add_imm(X13, X13, 1)?;
     assembler.add_imm(X3, X3, width)?;
     assembler.branch(match_run.unwrap_or(vector))?;
+    assembler.bind(scalar_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(scalar)
+}
+
+/// NEON periodic scan with one complete-filter reduction per 16 starts.
+///
+/// Periodic literals deliberately bypass the generic staged sparse graph:
+/// their repeated bytes make a one-column absence classifier unreliable.
+/// Intersecting the complete sealed period filter first both removes false
+/// candidate storms and leaves a compact lane-recovery loop. Confirmed matches
+/// enter the exact non-overlapping successor run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the closed periodic mask and successor graph is intentionally explicit"
+)]
+fn emit_periodic_neon_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    filter: CandidateFilterV3,
+    confirmation_order: &[u8],
+    periodic_stride: u8,
+    done: LabelV3,
+) -> Result<(), CountAotError> {
+    if periodic_stride == 0 || usize::from(periodic_stride) >= literal.len() {
+        return Err(CountAotError::InternalInvariant {
+            at: "invalid periodic NEON stride",
+        });
+    }
+    let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
+    let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let advance = assembler.new_label(LabelKindV3::Internal)?;
+    let match_run = assembler.new_label(LabelKindV3::CandidateLoop)?;
+    let match_run_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let scalar = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let scalar_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
+        site: CountAotArithmeticSite::CodeOffset,
+    })?;
+    let value_registers = [X10, X11, X12, X14];
+    let vector_registers = [2_u8, 3, 16, 17];
+
+    assembler.mov_imm64_minimal(X13, 0)?;
+    assembler.cmp_imm64(X1, width)?;
+    assembler.branch_cond(ConditionV3::CarryClear, done)?;
+    assembler.sub_imm(X4, X1, width)?;
+    assembler.mov_imm64_minimal(X3, 0)?;
+    for index in 0..usize::from(filter.len) {
+        let offset = usize::from(filter.offsets[index]);
+        assembler.mov_imm64_minimal(value_registers[index], u64::from(literal[offset]))?;
+        assembler.dup_byte16(vector_registers[index], value_registers[index])?;
+    }
+    assembler.mov_imm64_minimal(X17, SPARSE_NIBBLE_BITS_V3)?;
+
+    for (chunk_index, chunk) in literal.chunks_exact(16).enumerate() {
+        let mut low = [0_u8; 8];
+        let mut high = [0_u8; 8];
+        low.copy_from_slice(&chunk[..8]);
+        high.copy_from_slice(&chunk[8..]);
+        let vector_register =
+            u8::try_from(21_usize + chunk_index).expect("at most two full vectors");
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(low))?;
+        assembler.move_x_to_vector_double(vector_register, X8)?;
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(high))?;
+        assembler.insert_x_to_vector_double_lane1(vector_register, X8)?;
+    }
+    let full_vector_bytes = literal.len() / 16 * 16;
+    for (tail_index, chunk) in literal[full_vector_bytes..].chunks_exact(8).enumerate() {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(chunk);
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(bytes))?;
+        let global_chunk = full_vector_bytes / 8 + tail_index;
+        assembler.move_x_to_vector_double(
+            u8::try_from(4_usize + global_chunk).expect("at most four double chunks"),
+            X8,
+        )?;
+    }
+    if let Some(suffix_offset) = overlapping_suffix_offset_v3(literal.len()) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&literal[suffix_offset..]);
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(bytes))?;
+        assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X5, X4, X3)?;
+    assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for index in 0..usize::from(filter.len) {
+        let mask_register = if index == 0 { 0 } else { 1 };
+        assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+        assembler.load_vector128(mask_register, X8)?;
+        assembler.compare_equal_bytes16(mask_register, mask_register, vector_registers[index])?;
+        if index != 0 {
+            assembler.and_bytes16(0, 0, 1)?;
+        }
+    }
+    assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
+    assembler.move_vector_double_to64(X6, 0)?;
+    assembler.and_reg(X6, X6, X17)?;
+    assembler.cmp_imm64(X6, 0)?;
+    assembler.branch_cond(ConditionV3::Equal, advance)?;
+
+    assembler.bind(candidate)?;
+    assembler.reverse_bits(X7, X6)?;
+    assembler.count_leading_zeros(X7, X7)?;
+    assembler.sub_imm(X16, X6, 1)?;
+    assembler.and_reg(X6, X6, X16)?;
+    assembler.lsr_imm(X7, X7, 2)?;
+    assembler.add_reg(X5, X3, X7)?;
+    assembler.add_reg(X15, X0, X5)?;
+    emit_confirmation_ordered_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        filter.offsets(),
+        X15,
+        candidate_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X5, width)?;
+    assembler.branch(match_run)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.cmp_imm64(X6, 0)?;
+    assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
+    assembler.bind(advance)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(match_run)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    emit_confirmation_ordered_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        &[],
+        X15,
+        match_run_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X3, width)?;
+    assembler.branch(match_run)?;
+    assembler.bind(match_run_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(scalar)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for index in 0..usize::from(filter.len) {
+        assembler.load_byte(X8, X15, u16::from(filter.offsets[index]))?;
+        assembler.cmp_reg32(X8, value_registers[index])?;
+        assembler.branch_cond(ConditionV3::NotEqual, scalar_miss)?;
+    }
+    emit_confirmation_ordered_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        filter.offsets(),
+        X15,
+        scalar_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X3, width)?;
+    assembler.branch(match_run)?;
     assembler.bind(scalar_miss)?;
     assembler.add_imm(X3, X3, 1)?;
     assembler.branch(scalar)

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Canonical recipe schema emitted by this optimizer.
 pub const COUNT_V3_RECIPE_SCHEMA_VERSION: u16 = 3;
 /// Version of the deterministic portfolio and cost model.
-pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 6;
+pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 7;
 /// Maximum number of filter columns in one recipe.
 pub const COUNT_V3_MAX_FILTER_OFFSETS: usize = 4;
 /// Maximum exact-literal width consumed by Count-v3.
@@ -1263,12 +1263,12 @@ fn count_portfolio(
         }
     }
     if usize::from(facts.minimum_period) < literal.len() {
-        let (_, filter_count) = periodic_filters(literal, facts, multiplicity)?;
-        count = count.checked_add(filter_count.saturating_sub(1)).ok_or(
-            CountV3OptimizeError::ArithmeticOverflow {
+        let _ = periodic_filters(literal, facts, multiplicity)?;
+        count = count
+            .checked_add(1)
+            .ok_or(CountV3OptimizeError::ArithmeticOverflow {
                 at: "periodic portfolio count",
-            },
-        )?;
+            })?;
     }
     if direct_exact_mask_filters(literal, facts).is_some() {
         count = count
@@ -1412,20 +1412,18 @@ fn build_portfolio(
     }
     if usize::from(facts.minimum_period) < literal.len() {
         let (filters, filter_count) = periodic_filters(literal, facts, multiplicity)?;
-        for selected_filter_count in 2..=filter_count {
-            push_candidate(
-                &mut candidates,
-                literal,
-                facts,
-                multiplicity,
-                required_isa,
-                CountV3Strategy::PeriodicRun,
-                CountV3ScheduleId::PeriodicRunV1,
-                &filters[..selected_filter_count],
-                facts.minimum_period,
-                work,
-            )?;
-        }
+        push_candidate(
+            &mut candidates,
+            literal,
+            facts,
+            multiplicity,
+            required_isa,
+            CountV3Strategy::PeriodicRun,
+            CountV3ScheduleId::PeriodicRunV1,
+            &filters[..filter_count],
+            facts.minimum_period,
+            work,
+        )?;
     }
     if let Some((filters, filter_count)) = direct_exact_mask_filters(literal, facts) {
         push_candidate(
@@ -1742,13 +1740,10 @@ fn estimate_neon_direct_costs(width: u32) -> CountV3CostVector {
 
 /// Model the graph the SVE backend actually emits.
 ///
-/// Unlike the NEON backend, every non-direct strategy currently shares one
-/// predicate-filter/scalar-confirmation template and none has a periodic
-/// successor run. Keeping this model independent of the strategy label
-/// prevents a semantic tag from receiving performance credit for a graph that
-/// is not present in the emitted code. SVE2's `MATCH` schedule is charged as a
-/// more complex comparison than baseline `CMPEQ`; the bounded portfolio may
-/// consequently choose fewer filter columns on that target.
+/// Periodic recipes use a distinct closed-filter graph with one predicate test
+/// and a non-overlapping successor run. Other non-direct strategies retain the
+/// staged predicate-filter/scalar-confirmation graph. SVE2's `MATCH` schedule
+/// is charged as a more complex comparison than baseline `CMPEQ`.
 fn estimate_sve_costs(
     width: u32,
     filter_count: u32,
@@ -1772,6 +1767,30 @@ fn estimate_sve_costs(
 
     let confirmation_bytes = width.saturating_sub(filter_count);
     let compare_penalty = filter_count * match_compare_penalty;
+    if strategy == CountV3Strategy::PeriodicRun {
+        return CountV3CostVector {
+            sparse: (430_u32
+                .saturating_sub(discrimination)
+                .saturating_sub(primary_discrimination))
+            .max(120)
+                + width
+                + filter_count * 22
+                + compare_penalty * 8,
+            dense: (620_u32.saturating_sub(discrimination)).max(150)
+                + width * 4
+                + filter_count * 28
+                + compare_penalty * 12,
+            false_positive: (760_u32
+                .saturating_sub(discrimination.saturating_mul(2))
+                .saturating_sub(primary_discrimination))
+            .max(120)
+                + confirmation_bytes * 18
+                + compare_penalty * 8,
+            matches: 250 + width * 12 + filter_count * 12 + compare_penalty * 10,
+            tail: 220 + width * 24,
+            code_size: 300 + width * 10 + filter_count * 28,
+        };
+    }
     CountV3CostVector {
         sparse: (700_u32.saturating_sub(primary_discrimination.saturating_mul(3))).max(180)
             + width
