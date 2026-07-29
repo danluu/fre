@@ -27672,7 +27672,7 @@ mod tests {
     #[test]
     fn retained_value_artifact_authenticates_sweep_limits_without_widening_report_only_routes() {
         let policy = RunLimits::default();
-        let eligible = AggregateBuilder::new(r"Tom.{10,25}river|river.{10,25}Tom")
+        let eligible = AggregateBuilder::new(r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z")
             .profile(rebar_profile())
             .unicode(false)
             .limits(aggregate_build_limits(&policy))
@@ -27794,10 +27794,8 @@ mod tests {
 
     #[test]
     fn persistent_sweep_diagnostics_are_explicit_incumbent_projections() {
-        let pattern = r"Tom.{10,25}river|river.{10,25}Tom";
-        let mut haystack = b"Tom0123456789river".to_vec();
-        haystack.extend([b'-'; 30]);
-        haystack.extend_from_slice(b"river0123456789Tom");
+        let pattern = r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z";
+        let haystack = b"abcdefghijklmnopqqrstuvwxyzabcdefgz--qrstuvwxyzabcdefgz";
         let policy = RunLimits::default();
 
         let count_regex = AggregateBuilder::new(pattern)
@@ -27832,14 +27830,14 @@ mod tests {
             unreachable!()
         };
         assert_eq!(count_workspace.borrow().retained_continuation_bytes(), None);
-        assert_eq!(count.execute(&haystack).unwrap(), 2);
+        assert_eq!(count.execute(haystack).unwrap(), 2);
         assert!(
             count_workspace
                 .borrow()
                 .retained_continuation_bytes()
                 .is_some_and(|bytes| bytes > 0)
         );
-        let count_projection = count.execute_with_counters(&haystack).unwrap();
+        let count_projection = count.execute_with_counters(haystack).unwrap();
         assert_eq!(count_projection.value(), 2);
         assert!(matches!(
             count_projection.receipt_status(),
@@ -27879,15 +27877,15 @@ mod tests {
             unreachable!()
         };
         assert_eq!(span_workspace.borrow().retained_continuation_bytes(), None);
-        assert_eq!(span.execute(&haystack).unwrap(), 36);
+        assert_eq!(span.execute(haystack).unwrap(), 53);
         assert!(
             span_workspace
                 .borrow()
                 .retained_continuation_bytes()
                 .is_some_and(|bytes| bytes > 0)
         );
-        let span_projection = span.execute_with_counters(&haystack).unwrap();
-        assert_eq!(span_projection.value(), 36);
+        let span_projection = span.execute_with_counters(haystack).unwrap();
+        assert_eq!(span_projection.value(), 53);
         assert!(matches!(
             span_projection.receipt_status(),
             CurrentFreAggregateCounterReceiptStatus::IncumbentProjectionForUnreceiptedSweep

@@ -462,8 +462,8 @@ fn lazy_only_table_and_memory_limits_preserve_the_incumbent_result() {
 }
 
 fn lazy_only_table_and_memory_limits_preserve_the_incumbent_result_body() {
-    let pattern = r"Tom.{10,25}river|river.{10,25}Tom";
-    let haystack = b"Tom  went down to the river; river then met Tom";
+    let pattern = r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z";
+    let haystack = b"abcdefghijklmnopqqrstuvwxyzabcdefgz--qrstuvwxyzabcdefgz";
     let count = builder(pattern).build_count().unwrap();
     let limits = AggregateRunLimits::default();
     let expected = count.count_value(haystack, limits).unwrap();
