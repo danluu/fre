@@ -19715,37 +19715,6 @@ impl AggregateSpansRegex {
         self.0.build_report()
     }
 
-    /// Borrow the authenticated exact-literal input for AOT compilation.
-    ///
-    /// Returns `None` unless this count facade's closed construction report,
-    /// syntax/profile owner, selected plan identity, exact build accounting,
-    /// and live retained engine all authenticate the same exact-literal plan.
-    /// The literal is borrowed directly from that engine; source is never
-    /// reparsed and no alternate plan is admitted.
-    #[must_use]
-    pub fn exact_literal_aot_candidate(
-        &self,
-    ) -> Option<AggregateCountExactLiteralAotCandidate<'_>> {
-        self.0.count_exact_literal_aot_candidate()
-    }
-
-    /// Borrow the complete fixed-policy AOT planning proof.
-    ///
-    /// This is narrower than [`Self::exact_literal_aot_candidate`]: it also
-    /// requires the versioned default-limit, forced-exact,
-    /// reverse-sequential construction policy and a complete authenticated
-    /// syntax/construction P/A ledger.
-    #[must_use]
-    pub fn exact_literal_aot_planned_candidate(
-        &self,
-    ) -> Option<AggregateCountExactLiteralAotPlannedCandidate<'_>> {
-        let candidate = self.0.count_exact_literal_aot_candidate()?;
-        candidate
-            .planning
-            .is_some()
-            .then_some(AggregateCountExactLiteralAotPlannedCandidate(candidate))
-    }
-
     /// Minimum whole-match width derived from the authenticated construction HIR.
     #[must_use]
     pub const fn minimum_match_bytes(&self) -> Option<usize> {
@@ -20005,6 +19974,37 @@ impl AggregateCountRegex {
     #[must_use]
     pub const fn build_report(&self) -> &AggregateBuildReport {
         self.0.build_report()
+    }
+
+    /// Borrow the authenticated exact-literal input for AOT compilation.
+    ///
+    /// Returns `None` unless this count facade's closed construction report,
+    /// syntax/profile owner, selected plan identity, exact build accounting,
+    /// and live retained engine all authenticate the same exact-literal plan.
+    /// The literal is borrowed directly from that engine; source is never
+    /// reparsed and no alternate plan is admitted.
+    #[must_use]
+    pub fn exact_literal_aot_candidate(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotCandidate<'_>> {
+        self.0.count_exact_literal_aot_candidate()
+    }
+
+    /// Borrow the complete fixed-policy AOT planning proof.
+    ///
+    /// This is narrower than [`Self::exact_literal_aot_candidate`]: it also
+    /// requires the versioned default-limit, forced-exact,
+    /// reverse-sequential construction policy and a complete authenticated
+    /// syntax/construction P/A ledger.
+    #[must_use]
+    pub fn exact_literal_aot_planned_candidate(
+        &self,
+    ) -> Option<AggregateCountExactLiteralAotPlannedCandidate<'_>> {
+        let candidate = self.0.count_exact_literal_aot_candidate()?;
+        candidate
+            .planning
+            .is_some()
+            .then_some(AggregateCountExactLiteralAotPlannedCandidate(candidate))
     }
 
     /// Minimum whole-match width derived from the authenticated construction HIR.
