@@ -425,24 +425,44 @@ fn select_executor(
         Err(Error::ArithmeticOverflow { .. }) => None,
         Err(error) => return Err(error),
     };
+    let frontier = match frontier_prospective(program, plan, input_bytes) {
+        Ok(prospective) => prospective,
+        Err(error @ Error::ArithmeticOverflow { .. }) => {
+            if let Some(prospective) = events
+                && prospective.allocations <= allocation_limit
+                && prospective.enforce_limits(limits).is_ok()
+            {
+                return Ok(Selection {
+                    executor: SelectedExecutor::Events,
+                    prospective,
+                    physical_route: OperationPhysicalRoute::OrderedBoundedSpanSumEvents,
+                    prepublication_fallback: OperationPrepublicationFallback::None,
+                });
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     if let Some(prospective) = events
+        && prospective.work_bound < frontier.work_bound
         && prospective.allocations <= allocation_limit
         && prospective.enforce_limits(limits).is_ok()
     {
-        return Ok(Selection {
+        Ok(Selection {
             executor: SelectedExecutor::Events,
             prospective,
             physical_route: OperationPhysicalRoute::OrderedBoundedSpanSumEvents,
             prepublication_fallback: OperationPrepublicationFallback::None,
-        });
+        })
+    } else {
+        Ok(Selection {
+            executor: SelectedExecutor::Frontier,
+            prospective: frontier,
+            physical_route: OperationPhysicalRoute::OrderedBoundedSpanSum,
+            prepublication_fallback:
+                OperationPrepublicationFallback::OrderedBoundedEventsThenFrontier,
+        })
     }
-
-    Ok(Selection {
-        executor: SelectedExecutor::Frontier,
-        prospective: frontier_prospective(program, plan, input_bytes)?,
-        physical_route: OperationPhysicalRoute::OrderedBoundedSpanSum,
-        prepublication_fallback: OperationPrepublicationFallback::OrderedBoundedEventsThenFrontier,
-    })
 }
 
 fn event_prospective(
@@ -715,6 +735,13 @@ fn exact_occurrences(
     length: usize,
     allocation_bytes: usize,
 ) -> Result<ExactVec<AnchorOccurrence>, Error> {
+    #[cfg(test)]
+    if length != 0 && super::allocation_fault::should_fail() {
+        return Err(Error::AllocationFailed {
+            resource: Resource::ScratchBytes,
+            items: allocation_bytes,
+        });
+    }
     ExactVec::try_with_capacity(length).map_err(|error| match error {
         CopyError::LayoutOverflow => Error::ArithmeticOverflow {
             resource: Resource::ScratchBytes,
@@ -2095,24 +2122,248 @@ mod tests {
     fn ordered_bounded_span_sum_event_ranks_exhaust_all_byte_memberships() {
         // `_` is S-only, `a`/`b` are D-only, space is S∩D and `#` is outside
         // both classes. This independently exercises every algebraic category
-        // used by the event rank theorem.
+        // used by the event rank theorem, including complete inputs containing
+        // both retained anchors.
         let pattern = r"(?:a(?:[ _]*[ ab]+[ _]*){0,2}b)|(?:b(?:[ _]*[ ab]+[ _]*){0,2}a)";
         let compiled = compiled(pattern);
         assert_eq!(
             compiled.compile_accounting().ordered_bounded_span_sum_plans,
             1
         );
-        let alphabet = [b'_', b'a', b' ', b'#'];
+        let alphabet = [b'_', b'a', b'b', b' ', b'#'];
         let mut haystack = [0_u8; 6];
-        for encoded in 0_u32..4_096 {
+        for encoded in 0_u32..15_625 {
             let mut value = encoded;
             for byte in &mut haystack {
-                *byte = alphabet[usize::try_from(value & 3).unwrap()];
-                value >>= 2;
+                *byte = alphabet[usize::try_from(value % 5).unwrap()];
+                value /= 5;
             }
             let (event, frontier, _, _) = direct_event_and_frontier(&compiled, &haystack);
             assert_eq!(event, frontier, "haystack={haystack:?}");
             assert_eq!(event.1, oracle(pattern, &haystack), "haystack={haystack:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_economics_choose_zero_allocation_dense_frontier() {
+        let pattern = r"(?:a(?:_*[ab]+_*){0,1}b)|(?:b(?:_*[ab]+_*){0,1}a)";
+        let compiled = compiled(pattern);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        let input_bytes = 1_048_576;
+        let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
+        let frontier = frontier_prospective(&compiled.program, plan, input_bytes).unwrap();
+        assert!(events.work_bound > frontier.work_bound);
+        assert_eq!(events.allocations, 2);
+        assert_eq!(frontier.allocations, 0);
+
+        let selection = select_executor(
+            &compiled.program,
+            plan,
+            input_bytes,
+            OperationLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(selection.executor, SelectedExecutor::Frontier);
+        assert_eq!(selection.prospective, frontier);
+        assert_eq!(
+            selection.physical_route,
+            OperationPhysicalRoute::OrderedBoundedSpanSum
+        );
+        assert_eq!(
+            selection.prepublication_fallback,
+            OperationPrepublicationFallback::OrderedBoundedEventsThenFrontier
+        );
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_economics_threshold_covers_overlap_and_intersection() {
+        // The retained anchors `a` and `ab` overlap by prefix, while space is
+        // in both S and D. At this exact source-independent boundary the event
+        // upper changes from 2^20-1 to 2^20+1, adding one binary-search rank
+        // step and making the fixed frontier the strict work winner.
+        let pattern = r"(?:a(?:[ _]*[ ab]+[ _]*){0,1}ab)|(?:ab(?:[ _]*[ ab]+[ _]*){0,1}a)";
+        let compiled = compiled(pattern);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        let below = 524_288;
+        let threshold = below + 1;
+        let below_events = event_prospective(&compiled.program, plan, below).unwrap();
+        let below_frontier = frontier_prospective(&compiled.program, plan, below).unwrap();
+        let threshold_events = event_prospective(&compiled.program, plan, threshold).unwrap();
+        let threshold_frontier = frontier_prospective(&compiled.program, plan, threshold).unwrap();
+        assert_eq!(below_events.match_events, (1 << 20) - 1);
+        assert_eq!(threshold_events.match_events, (1 << 20) + 1);
+        assert!(below_events.work_bound < below_frontier.work_bound);
+        assert!(threshold_events.work_bound > threshold_frontier.work_bound);
+        assert_eq!(
+            select_executor(
+                &compiled.program,
+                plan,
+                below,
+                OperationLimits::default(),
+                usize::MAX,
+            )
+            .unwrap()
+            .executor,
+            SelectedExecutor::Events
+        );
+        let threshold_selection = select_executor(
+            &compiled.program,
+            plan,
+            threshold,
+            OperationLimits::default(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(threshold_selection.executor, SelectedExecutor::Frontier);
+        assert_eq!(threshold_selection.prospective.allocations, 0);
+
+        let mut haystack = vec![b'#'; threshold];
+        haystack[..4].copy_from_slice(b"a ab");
+        let expected = oracle(pattern, &haystack);
+        let fault = super::super::allocation_fault::arm(0);
+        let attempt = compiled
+            .span_sum_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(attempt.value, expected);
+        assert_eq!(
+            attempt.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::OrderedBoundedSpanSum)
+        );
+        assert_eq!(
+            attempt.receipt.identity.prepublication_fallback,
+            OperationPrepublicationFallback::OrderedBoundedEventsThenFrontier
+        );
+        assert_eq!(attempt.receipt.actual_allocations, 0);
+        assert_eq!(super::super::allocation_fault::calls(), 0);
+        assert!(attempt.receipt.authenticates_success());
+        drop(fault);
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_events_survive_frontier_prospective_overflow() {
+        let compiled = compiled(PATTERN);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        let input_bytes = usize::MAX / 512;
+        let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
+        assert!(matches!(
+            frontier_prospective(&compiled.program, plan, input_bytes),
+            Err(Error::ArithmeticOverflow { .. })
+        ));
+        let selection = select_executor(
+            &compiled.program,
+            plan,
+            input_bytes,
+            super::super::intrinsic_attempt_limits(),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(selection.executor, SelectedExecutor::Events);
+        assert_eq!(selection.prospective, events);
+        assert_eq!(
+            selection.physical_route,
+            OperationPhysicalRoute::OrderedBoundedSpanSumEvents
+        );
+        assert_eq!(
+            selection.prepublication_fallback,
+            OperationPrepublicationFallback::None
+        );
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_allocation_faults_close_exact_partial_ledgers() {
+        let compiled = compiled(PATTERN);
+        let haystack = b"red one blue; blue two red";
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        let prospective = event_prospective(&compiled.program, plan, haystack.len()).unwrap();
+        assert_eq!(
+            select_executor(
+                &compiled.program,
+                plan,
+                haystack.len(),
+                OperationLimits::default(),
+                usize::MAX,
+            )
+            .unwrap()
+            .executor,
+            SelectedExecutor::Events
+        );
+
+        let mut census = ExecutionAccounting {
+            scratch_peak_bytes: core::mem::size_of::<AnchorEvents>(),
+            peak_bytes: core::mem::size_of::<AnchorEvents>(),
+            ..ExecutionAccounting::default()
+        };
+        let mut first_count = 0_usize;
+        let mut second_count = 0_usize;
+        scan_anchor_candidates(plan, haystack, &mut census, |direction, _, _| {
+            if direction == 0 {
+                first_count += 1;
+            } else {
+                second_count += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(first_count, 0);
+        assert_ne!(second_count, 0);
+        let first_bytes = first_count * core::mem::size_of::<AnchorOccurrence>();
+        let second_bytes = second_count * core::mem::size_of::<AnchorOccurrence>();
+
+        for (ordinal, failed_items, committed_bytes) in
+            [(0, first_bytes, 0), (1, second_bytes, first_bytes)]
+        {
+            let fault = super::super::allocation_fault::arm(ordinal);
+            let failure = compiled
+                .span_sum_value_with_receipt(
+                    haystack,
+                    0..haystack.len(),
+                    Strategy::ReverseSequentialRows,
+                    OperationLimits::default(),
+                )
+                .unwrap_err();
+            assert_eq!(
+                failure.source,
+                Error::AllocationFailed {
+                    resource: Resource::ScratchBytes,
+                    items: failed_items,
+                }
+            );
+            assert_eq!(failure.receipt.prospective, Some(prospective));
+            assert_eq!(
+                failure.receipt.identity.physical_route,
+                Some(OperationPhysicalRoute::OrderedBoundedSpanSumEvents)
+            );
+            assert_eq!(
+                failure.receipt.identity.prepublication_fallback,
+                OperationPrepublicationFallback::None
+            );
+            let mut expected = census;
+            expected.scratch_peak_bytes += committed_bytes;
+            expected.peak_bytes = expected.scratch_peak_bytes;
+            assert_eq!(failure.receipt.actual, expected);
+            assert_eq!(failure.receipt.actual_allocations, ordinal);
+            assert!(prospective.contains(failure.receipt.actual));
+            assert_eq!(super::super::allocation_fault::calls(), ordinal + 1);
+            assert!(failure.closes());
+            drop(fault);
         }
     }
 
