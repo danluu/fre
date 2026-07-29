@@ -363,6 +363,8 @@ pub enum OperationPhysicalRoute {
     StartDomain,
     /// Source-independent mirrored finite-chunk `SpanSum` frontier.
     OrderedBoundedSpanSum,
+    /// Exact two-anchor event stream with algebraic bounded-middle ranks.
+    OrderedBoundedSpanSumEvents,
     /// Compiler-retained exact root zero-width assertion reducer.
     RootAssertion,
 }
@@ -376,6 +378,7 @@ pub enum OperationPrepublicationFallback {
     TerminalFrontierThenDense,
     DenseThenRequiredSuffix,
     DenseThenCachedFrontier,
+    OrderedBoundedEventsThenFrontier,
 }
 
 /// Work-admission mode used by a receipt-bearing execution attempt.
@@ -11503,6 +11506,7 @@ fn operation_identity(
         // independently typed so the two source-independent SpanSum proofs
         // can never authenticate the same operation identity.
         OperationPhysicalRoute::OrderedBoundedSpanSum => 181,
+        OperationPhysicalRoute::OrderedBoundedSpanSumEvents => 211,
         OperationPhysicalRoute::RootAssertion => 193,
     };
     let mut bytes = plan.bytes();
