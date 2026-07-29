@@ -12,6 +12,8 @@ pub const SEMANTIC_PROFILE: &str = concat!(
     "candidate-proven-exact-byte-equivalence-",
     "whole-haystack-nonoverlapping-count-v1"
 );
+pub const LONG_SCAN_POLICY_V1: &str = "minimum-haystack-4096-bytes-v1";
+pub const LONG_SCAN_MIN_INPUT_BYTES_V1: usize = 4_096;
 pub const MAX_INVENTORY_ROWS: usize = 16_384;
 pub const MAX_CELLS: usize = 4_096;
 
@@ -311,10 +313,10 @@ fn validate(inventory: &Inventory) -> Result<(), String> {
                 cell.cell_id
             ));
         }
-        if cell.input_bytes == 0 || cell.input_bytes > (1_usize << 40) {
+        if cell.input_bytes < LONG_SCAN_MIN_INPUT_BYTES_V1 || cell.input_bytes > (1_usize << 40) {
             return Err(format!(
-                "cell {} input byte length is invalid",
-                cell.cell_id
+                "cell {} input byte length is outside {LONG_SCAN_POLICY_V1}",
+                cell.cell_id,
             ));
         }
         if cell.pattern_len == 0

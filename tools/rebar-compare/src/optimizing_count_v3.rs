@@ -17,14 +17,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AUDITED_REBAR_REVISION, CompareError, CurrentFreAggregateOperationInner, FRE_ADAPTER, Loader,
-    REPORT_SCHEMA, RUST_ADAPTER, Report, RunConfig, Status,
-    RunLimits, aggregate_run_limits, current_fre_rebar_aggregate_operation_lifecycle,
-    read_limited, report_bytes, sha256, validate_manifest, verify_sidecar_hash,
+    REPORT_SCHEMA, RUST_ADAPTER, Report, RunConfig, RunLimits, Status, aggregate_run_limits,
+    current_fre_rebar_aggregate_operation_lifecycle, read_limited, report_bytes, sha256,
+    validate_manifest, verify_sidecar_hash,
 };
 
 /// Closed schema for an authenticated, untimed Count-v3 candidate inventory.
-pub const OPTIMIZING_COUNT_V3_INVENTORY_SCHEMA: &str =
-    "fre.optimizing-count-v3.inventory.v1";
+pub const OPTIMIZING_COUNT_V3_INVENTORY_SCHEMA: &str = "fre.optimizing-count-v3.inventory.v1";
 /// Pattern-only compiler-input row schema.
 pub const OPTIMIZING_COUNT_V3_ARTIFACT_INPUT_SCHEMA: &str =
     "fre.optimizing-count-v3.artifact-input.v1";
@@ -38,10 +37,13 @@ pub const OPTIMIZING_COUNT_V3_SEMANTIC_PROFILE: &str = concat!(
     "whole-haystack-nonoverlapping-count-v1"
 );
 /// Information policy required of every AOT compiler invocation.
-pub const OPTIMIZING_COUNT_V3_INPUT_POLICY: &str =
-    "pattern-semantic-options-target-only-v1";
+pub const OPTIMIZING_COUNT_V3_INPUT_POLICY: &str = "pattern-semantic-options-target-only-v1";
+/// Target-independent deployment envelope for long-running compiled Count.
+pub const OPTIMIZING_COUNT_V3_LONG_SCAN_POLICY_V1: &str = "minimum-haystack-4096-bytes-v1";
+/// Smallest haystack admitted by the versioned long-scan policy.
+pub const OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1: usize = 4_096;
 
-const SELECTOR_POLICY: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-SELECTOR\0\x01\
+const SELECTOR_POLICY_PREFIX_V2: &str = "FRE-OPTIMIZING-COUNT-V3-SELECTOR\0\x02\
 engine=rust/regex\n\
 model=count\n\
 patterns=1\n\
@@ -50,10 +52,9 @@ case_insensitive=false\n\
 semantic_receipt=pass\n\
 candidate_plan=aggregate-exact-literal\n\
 compiler_plan=fixed-aot-count-exact-literal-v1\n\
-literal_bytes=1..32\n\
-input_bytes=1..\n";
-const SEMANTIC_OPTIONS_DOMAIN: &[u8] =
-    b"FRE-OPTIMIZING-COUNT-V3-SEMANTIC-OPTIONS\0\x01";
+literal_bytes=1..32\n";
+const SHORT_INPUT_REASON_V1: &str = "input-shorter-than-4096-byte-long-scan-v1";
+const SEMANTIC_OPTIONS_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-SEMANTIC-OPTIONS\0\x01";
 const ARTIFACT_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-ARTIFACT\0\x01";
 const PATTERN_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-PATTERN\0\x01";
 const CELL_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-CELL\0\x01";
@@ -196,7 +197,8 @@ pub fn inventory_optimizing_count_v3(
         SEMANTIC_OPTIONS_DOMAIN,
         &[OPTIMIZING_COUNT_V3_SEMANTIC_PROFILE.as_bytes()],
     );
-    let selector_policy_sha256 = sha256(SELECTOR_POLICY);
+    let selector_policy = selector_policy_bytes_v2();
+    let selector_policy_sha256 = sha256(&selector_policy);
     let receipt_index = index_receipts(semantic_report)?;
     let manifest_root = config
         .manifest
@@ -234,8 +236,7 @@ pub fn inventory_optimizing_count_v3(
                     job.id
                 ))
             })?;
-        if rust_receipt.status != Status::Pass
-            || rust_receipt.actual != Some(rust_receipt.expected)
+        if rust_receipt.status != Status::Pass || rust_receipt.actual != Some(rust_receipt.expected)
         {
             return Err(CompareError::new(format!(
                 "pinned Rust oracle receipt {} is not a semantic pass",
@@ -291,12 +292,7 @@ pub fn inventory_optimizing_count_v3(
         })?;
         let current_literal = current_candidate.literal();
         if current_literal.is_empty() {
-            decisions.push(decision(
-                &safe_job_id,
-                &job.id,
-                false,
-                "literal-empty",
-            ));
+            decisions.push(decision(&safe_job_id, &job.id, false, "literal-empty"));
             continue;
         }
         if current_literal.len() > 32 {
@@ -308,9 +304,11 @@ pub fn inventory_optimizing_count_v3(
             ));
             continue;
         }
-        if loaded.haystack.is_empty() {
-            decisions.push(decision(&safe_job_id, &job.id, false, "input-empty"));
-            continue;
+        if loaded.haystack.len() < OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1 {
+            return Err(CompareError::new(format!(
+                "selected Count-v3 job {} escaped the long-scan input floor",
+                job.id
+            )));
         }
         let observed = lifecycle.execute(&loaded.haystack)?;
         if observed != job.expected.count || observed != fre_receipt.expected {
@@ -501,8 +499,21 @@ fn static_exclusion_reason(job: &rebar_expand::Job) -> Option<&'static str> {
     } else if job.regex.case_insensitive {
         Some("case-insensitive")
     } else {
-        None
+        long_scan_exclusion_reason(job.haystack.bytes)
     }
+}
+
+fn long_scan_exclusion_reason(input_bytes: usize) -> Option<&'static str> {
+    (input_bytes < OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1)
+        .then_some(SHORT_INPUT_REASON_V1)
+}
+
+fn selector_policy_bytes_v2() -> Vec<u8> {
+    format!(
+        "{SELECTOR_POLICY_PREFIX_V2}long_scan_policy={OPTIMIZING_COUNT_V3_LONG_SCAN_POLICY_V1}\n\
+         input_bytes={OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1}..\n"
+    )
+    .into_bytes()
 }
 
 fn index_receipts<'a>(
@@ -707,5 +718,24 @@ mod tests {
             digest_fields(b"domain-a", &[b"payload"]),
             digest_fields(b"domain-b", &[b"payload"])
         );
+    }
+
+    #[test]
+    fn long_scan_policy_closes_selector_boundaries_and_identity() {
+        assert_eq!(OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1, 4_096);
+        assert_eq!(
+            long_scan_exclusion_reason(4_095),
+            Some("input-shorter-than-4096-byte-long-scan-v1")
+        );
+        assert_eq!(long_scan_exclusion_reason(4_096), None);
+        assert_eq!(long_scan_exclusion_reason(4_097), None);
+        let policy = String::from_utf8(selector_policy_bytes_v2()).expect("selector policy UTF-8");
+        assert!(policy.starts_with("FRE-OPTIMIZING-COUNT-V3-SELECTOR\0\u{2}"));
+        assert!(policy.contains(&format!(
+            "long_scan_policy={OPTIMIZING_COUNT_V3_LONG_SCAN_POLICY_V1}\n"
+        )));
+        assert!(policy.ends_with(&format!(
+            "input_bytes={OPTIMIZING_COUNT_V3_LONG_SCAN_MIN_INPUT_BYTES_V1}..\n"
+        )));
     }
 }

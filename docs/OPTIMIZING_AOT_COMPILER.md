@@ -29,7 +29,9 @@ compilation:
 > Compile exact-literal, whole-haystack, non-overlapping Count programs to
 > AArch64 ASIMD code and enable only a target/workload envelope that proves
 > greater than 20% speedup across long-running compiled Rebar cases, while also
-> passing a frozen non-Rebar holdout and adversarial matrix.
+> passing a frozen non-Rebar holdout and adversarial matrix. The first
+> long-scan envelope is fixed at haystacks of at least 4,096 bytes before
+> splitting or timing.
 
 The broader objective is a typed regex Machine IR capable of compiling
 fixed-width windows, literal sets, class runs, small one-pass machines, and
@@ -266,7 +268,8 @@ After qualification, routing remains construction-time and fail-closed:
 
 1. normal semantic planning proves exact-literal whole-operation Count;
 2. literal width, operation, target, feature, tuning, and workload gates match a
-   reviewed production row;
+   reviewed production row, including the qualified target-independent
+   long-scan input floor;
 3. the production row authenticates the qualified compiler/backend/auditor,
    semantic envelope, target contract, and held-out evidence bundle rather than
    enumerating Rebar job or artifact identities;
