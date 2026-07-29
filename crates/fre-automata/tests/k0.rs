@@ -604,7 +604,13 @@ fn exact_work_and_scratch_limits_fail_before_overrun() {
         .prepare::<Span>()
         .search(b"a haystack", SearchLimits::unlimited())
         .unwrap();
+    let cold_charged = successful.accounting().work();
+    let successful = plan
+        .prepare::<Span>()
+        .search(b"a haystack", SearchLimits::unlimited())
+        .unwrap();
     let charged = successful.accounting().work();
+    assert!(cold_charged > charged);
     let exact = plan
         .prepare::<Span>()
         .search(
@@ -675,6 +681,9 @@ fn reusable_workspace_is_allocation_free_and_matches_cold_calls() {
     ];
 
     for plan in &plans {
+        plan.prepare::<Span>()
+            .search(b"", SearchLimits::unlimited())
+            .unwrap();
         let mut workspace = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
         let retained = workspace.retained_bytes();
         let construction = workspace.construction_accounting();

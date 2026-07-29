@@ -102,7 +102,10 @@ impl SearchAccounting {
         self.scratch_bytes
     }
 
-    /// Input boundaries examined, including the initial boundary.
+    /// Candidate input boundaries expanded by the automaton loop.
+    ///
+    /// A start scanner can prove that no candidate exists without expanding a
+    /// boundary, so a successful miss may report zero.
     #[must_use]
     pub const fn boundaries(self) -> usize {
         self.boundaries

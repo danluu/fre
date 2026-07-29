@@ -197,9 +197,11 @@ fn out_of_bounds_shortest_start_is_a_typed_cold_and_reused_error() {
 fn earliest_k0_work_limit_is_exact_and_never_returns_a_partial_offset() {
     let fre = portable("(?:ab)+", false, PlanSelection::ForceK0);
     let haystack = b"zzababab";
+    fre.shortest_match(haystack, SearchLimits::unlimited())
+        .expect("cold shortest search");
     let (expected, accounting) = fre
         .shortest_match(haystack, SearchLimits::unlimited())
-        .expect("unlimited shortest search");
+        .expect("warm unlimited shortest search");
     let SearchAccounting::K0(accounting) = accounting else {
         panic!("forced K0 returned native accounting");
     };

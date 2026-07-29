@@ -20,6 +20,7 @@ static-dispatch-arm-41-d84 = [
 
 [dependencies]
 fre-simd-kernels = { path = "../fre-simd-kernels" }
+memchr = "=2.8.3"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["unicode-perl"] }
 
 [lints]

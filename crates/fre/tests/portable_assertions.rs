@@ -241,6 +241,9 @@ fn reusable_portable_k0_session_matches_cold_assertions_over_all_windows() {
             construction.allocated_bytes(),
             construction.retained_bytes()
         );
+        regex
+            .find_window(b"", SearchWindow::new(0, 0), SearchLimits::unlimited())
+            .expect("warm K0 start proof");
 
         for &haystack in haystacks {
             for start in 0..=haystack.len() {
