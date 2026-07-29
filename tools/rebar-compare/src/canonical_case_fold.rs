@@ -714,8 +714,29 @@ fn normalize(
         .map_err(|_| ExecutionError::fault("failed to reserve canonical case-fold input buffer"))?;
     let mut index = 0_usize;
     while index < haystack.len() {
+        let byte = haystack[index];
+        if byte.is_ascii() {
+            let canonical = mappings[usize::from(byte)];
+            if canonical == UNMAPPED {
+                output.push(byte);
+            } else {
+                let canonical = u8::try_from(canonical).map_err(|_| {
+                    ExecutionError::fault(
+                        "canonical case-fold ASCII mapping is not a one-byte scalar",
+                    )
+                })?;
+                if !canonical.is_ascii() {
+                    return Err(ExecutionError::fault(
+                        "canonical case-fold ASCII mapping is not ASCII",
+                    ));
+                }
+                output.push(canonical);
+            }
+            index += 1;
+            continue;
+        }
         let Some(source) = decode_first_scalar(&haystack[index..]) else {
-            output.push(haystack[index]);
+            output.push(byte);
             index += 1;
             continue;
         };
@@ -1197,14 +1218,17 @@ mod tests {
 
     #[test]
     fn normalization_preserves_invalid_and_unmapped_multibyte_boundaries() {
-        let mappings = mapping_table(&[('а', 'А')]);
+        let mappings = mapping_table(&[('a', 'A'), ('а', 'А')]);
         let input = [
+            b'a', b'Z', // mapped and unmapped ASCII take the direct byte path
             0xC1, 0x80, // overlong lead plus continuation: both remain invalid
             0xD0, 0xB0, // valid Cyrillic small a: canonicalized in place
             0xD0, 0x00, // truncated two-byte scalar: copied byte-for-byte
             0xE0, 0xB0, 0x90, // valid three-byte scalar: outside the table
         ];
-        let expected = [0xC1, 0x80, 0xD0, 0x90, 0xD0, 0x00, 0xE0, 0xB0, 0x90];
+        let expected = [
+            b'A', b'Z', 0xC1, 0x80, 0xD0, 0x90, 0xD0, 0x00, 0xE0, 0xB0, 0x90,
+        ];
         assert_eq!(
             normalize(&input, &mappings, normalization_work(input.len()).unwrap()).unwrap(),
             expected
