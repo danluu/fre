@@ -596,4 +596,4 @@ const fn overflow(at: &'static str) -> CountCompileErrorV3 {
     CountCompileErrorV3::ArithmeticOverflow { at }
 }
 
-const _: () = assert!(AOT_COUNT_AUDITOR_VERSION_V3 == 1);
+const _: () = assert!(AOT_COUNT_AUDITOR_VERSION_V3 == 2);
