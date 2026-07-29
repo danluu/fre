@@ -352,6 +352,100 @@ fn portable_search_session_has_tight_k0_setup_limits_and_preserves_native_dispat
 }
 
 #[test]
+fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
+    let k0 = portable("(?:ab)+", PlanSelection::ForceK0);
+    let mut accelerated = k0
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("unlimited eligible K0 session");
+    let accelerated_setup = accelerated.workspace_setup_accounting().unwrap();
+    assert!(matches!(
+        accelerated.find(
+            b"zzabab",
+            SearchLimits {
+                max_work: u64::MAX,
+                max_scratch_bytes: accelerated_setup.retained_bytes() - 1,
+            },
+        ),
+        Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
+            needed,
+            limit,
+            ..
+        })) if needed == accelerated_setup.retained_bytes()
+            && limit == accelerated_setup.retained_bytes() - 1
+    ));
+
+    let nullable = portable("(?:a)*", PlanSelection::ForceK0);
+    assert_eq!(nullable.build_report().minimum_match_bytes, Some(0));
+    let nullable_session = nullable
+        .search_session(SearchSessionLimits::unlimited())
+        .expect("nullable K0 session");
+    assert!(
+        nullable_session
+            .workspace_setup_accounting()
+            .unwrap()
+            .retained_bytes()
+            < accelerated_setup.retained_bytes(),
+        "minimum-length metadata must exclude nullable facade plans from the cache"
+    );
+
+    let mut work_fallback = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: accelerated_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("optional cache work refusal must retain Pike admission");
+    let work_setup = work_fallback.workspace_setup_accounting().unwrap();
+    assert!(work_setup.work() < accelerated_setup.work());
+    assert_eq!(
+        work_fallback
+            .selected_end(b"zzabab", SearchLimits::unlimited())
+            .unwrap()
+            .0,
+        Some(6)
+    );
+    k0.search_session(SearchSessionLimits {
+        max_setup_work: work_setup.work(),
+        max_scratch_bytes: work_setup.retained_bytes(),
+    })
+    .expect("exact ordinary setup boundary must succeed");
+    assert!(matches!(
+        k0.search_session(SearchSessionLimits {
+            max_setup_work: work_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        }),
+        Err(fre::SearchError::K0(
+            K0SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed }
+        )) if limit == work_setup.work() - 1 && needed == work_setup.work()
+    ));
+
+    let scratch_fallback = k0
+        .search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: accelerated_setup.retained_bytes() - 1,
+        })
+        .expect("optional cache scratch refusal must retain Pike admission");
+    let scratch_setup = scratch_fallback.workspace_setup_accounting().unwrap();
+    assert!(scratch_setup.retained_bytes() < accelerated_setup.retained_bytes());
+    k0.search_session(SearchSessionLimits {
+        max_setup_work: scratch_setup.work(),
+        max_scratch_bytes: scratch_setup.retained_bytes(),
+    })
+    .expect("exact ordinary scratch boundary must succeed");
+    assert!(matches!(
+        k0.search_session(SearchSessionLimits {
+            max_setup_work: u64::MAX,
+            max_scratch_bytes: scratch_setup.retained_bytes() - 1,
+        }),
+        Err(fre::SearchError::K0(K0SearchError::ResourceLimit {
+            needed,
+            limit,
+            ..
+        })) if needed == scratch_setup.retained_bytes()
+            && limit == scratch_setup.retained_bytes() - 1
+    ));
+}
+
+#[test]
 fn portable_search_session_recovers_after_per_call_limit_failures() {
     let regex = portable(r"\b[0-9A-Za-z_]+\b", PlanSelection::ForceK0);
     let mut session = regex

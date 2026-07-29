@@ -10,11 +10,18 @@ use crate::{
         START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
         START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
     },
-    Automaton, EdgeKind, MatchSpan, ResourceKind, SearchAccounting, SearchError, SearchLimits,
-    SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
+    Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
+    SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
+const BYTE_ALPHABET: usize = 256;
+const LAZY_MAX_STATES: usize = 64;
+const LAZY_MAX_ITEMS: usize = 16_384;
+const LAZY_CELL_ACCEPT: u32 = 1 << 31;
+const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_ACCEPT - 1;
+const LAZY_CELL_UNFILLED: u32 = u32::MAX;
+const LAZY_NO_STATE: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Thread {
@@ -34,12 +41,22 @@ pub struct WorkspaceLayout {
     edges: usize,
     zero_width_edges: usize,
     closure_slots: usize,
+    lazy_state_capacity: usize,
+    lazy_item_capacity: usize,
     logical_bytes: usize,
     construction_work: u64,
 }
 
 impl WorkspaceLayout {
     pub(crate) fn for_automaton(automaton: &Automaton) -> Result<Self, SearchError> {
+        Self::for_automaton_mode(automaton, false)
+    }
+
+    pub(crate) fn for_accelerated_automaton(automaton: &Automaton) -> Result<Self, SearchError> {
+        Self::for_automaton_mode(automaton, true)
+    }
+
+    fn for_automaton_mode(automaton: &Automaton, enable_lazy: bool) -> Result<Self, SearchError> {
         let states = automaton.stats().states();
         let edges = automaton.stats().edges();
         let zero_width_edges = automaton.stats().zero_width_edges();
@@ -49,21 +66,46 @@ impl WorkspaceLayout {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "closure stack capacity",
                 })?;
-        let logical_bytes = scratch_bytes(states, edges, closure_slots)?;
-        let initialized_slots = states
+        let (lazy_state_capacity, lazy_item_capacity) = if enable_lazy {
+            lazy_capacities(automaton)?
+        } else {
+            (0, 0)
+        };
+        let pike_bytes = scratch_bytes(states, edges, closure_slots)?;
+        let lazy_bytes = lazy_scratch_bytes(states, lazy_state_capacity, lazy_item_capacity)?;
+        let logical_bytes =
+            pike_bytes
+                .checked_add(lazy_bytes)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "workspace logical bytes",
+                })?;
+        let pike_initialized_slots = states
             .checked_add(states)
             .and_then(|value| value.checked_add(edges))
             .and_then(|value| value.checked_add(closure_slots))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "workspace initialized slots",
             })?;
-        let non_empty_allocations = usize::from(states != 0)
+        let lazy_initialized_slots =
+            lazy_initialized_slots(states, lazy_state_capacity, lazy_item_capacity)?;
+        let initialized_slots = pike_initialized_slots
+            .checked_add(lazy_initialized_slots)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "workspace initialized slots",
+            })?;
+        let pike_allocations = usize::from(states != 0)
             .checked_add(usize::from(states != 0))
             .and_then(|value| value.checked_add(usize::from(edges != 0)))
             .and_then(|value| value.checked_add(usize::from(closure_slots != 0)))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "workspace allocation count",
             })?;
+        let lazy_allocations = if lazy_state_capacity == 0 { 0 } else { 8 };
+        let non_empty_allocations = pike_allocations.checked_add(lazy_allocations).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "workspace allocation count",
+            },
+        )?;
         let construction_operations = initialized_slots.checked_add(non_empty_allocations).ok_or(
             SearchError::ArithmeticOverflow {
                 computation: "workspace construction work",
@@ -79,6 +121,8 @@ impl WorkspaceLayout {
             edges,
             zero_width_edges,
             closure_slots,
+            lazy_state_capacity,
+            lazy_item_capacity,
             logical_bytes,
             construction_work,
         })
@@ -150,6 +194,417 @@ impl Default for WorkspaceLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyInterned {
+    State(u32),
+    BudgetDeclined,
+    CapacityFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyTransition {
+    Ready(u32),
+    Inline { accepted: bool, pending: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LazyState {
+    Cached(u32),
+    Inline { pending: bool },
+}
+
+/// Fixed ordered-subset rows owned by one exact immutable automaton session.
+///
+/// `modes` makes the pending selected-end bit part of state identity. The
+/// transition graph is consequently contract-neutral: existence and
+/// earliest-end stop on a cell's acceptance bit, while selected-end follows
+/// the same row until the higher-priority retained prefix dies. Full-span
+/// recovery is deliberately outside this first forward-only slice.
+#[derive(Debug)]
+struct LazyWorkspace {
+    automaton_identity: u64,
+    scratch: Vec<u32>,
+    scratch_len: usize,
+    frontier: Vec<u32>,
+    frontier_len: usize,
+    rows: Vec<u32>,
+    offsets: Vec<usize>,
+    lengths: Vec<u32>,
+    modes: Vec<u8>,
+    hashes: Vec<u64>,
+    items: Vec<u32>,
+    state_len: usize,
+    item_len: usize,
+    initial: u32,
+    initialized: bool,
+    declined: bool,
+    saturated: bool,
+}
+
+impl LazyWorkspace {
+    fn new(
+        automaton: &Automaton,
+        layout: WorkspaceLayout,
+        total_bytes: usize,
+    ) -> Result<Self, SearchError> {
+        let state_capacity = layout.lazy_state_capacity;
+        let item_capacity = layout.lazy_item_capacity;
+        if state_capacity == 0 {
+            return Ok(Self::disabled());
+        }
+        let row_cells =
+            state_capacity
+                .checked_mul(BYTE_ALPHABET)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA row cells",
+                })?;
+        Ok(Self {
+            automaton_identity: automaton.identity(),
+            scratch: allocate_slots(layout.states, 0_u32, total_bytes)?,
+            scratch_len: 0,
+            frontier: allocate_slots(layout.states, 0_u32, total_bytes)?,
+            frontier_len: 0,
+            rows: allocate_slots(row_cells, LAZY_CELL_UNFILLED, total_bytes)?,
+            offsets: allocate_slots(state_capacity, 0_usize, total_bytes)?,
+            lengths: allocate_slots(state_capacity, 0_u32, total_bytes)?,
+            modes: allocate_slots(state_capacity, 0_u8, total_bytes)?,
+            hashes: allocate_slots(state_capacity, 0_u64, total_bytes)?,
+            items: allocate_slots(item_capacity, 0_u32, total_bytes)?,
+            state_len: 0,
+            item_len: 0,
+            initial: LAZY_NO_STATE,
+            initialized: false,
+            declined: false,
+            saturated: false,
+        })
+    }
+
+    const fn disabled() -> Self {
+        Self {
+            automaton_identity: 0,
+            scratch: Vec::new(),
+            scratch_len: 0,
+            frontier: Vec::new(),
+            frontier_len: 0,
+            rows: Vec::new(),
+            offsets: Vec::new(),
+            lengths: Vec::new(),
+            modes: Vec::new(),
+            hashes: Vec::new(),
+            items: Vec::new(),
+            state_len: 0,
+            item_len: 0,
+            initial: LAZY_NO_STATE,
+            initialized: false,
+            declined: true,
+            saturated: false,
+        }
+    }
+
+    fn is_allocated(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
+    fn is_bound_to(&self, automaton: &Automaton) -> bool {
+        self.automaton_identity == automaton.identity()
+    }
+
+    fn retained_bytes(&self) -> Result<usize, SearchError> {
+        let scratch = capacity_bytes::<u32>(&self.scratch, "lazy DFA scratch bytes")?;
+        let frontier = capacity_bytes::<u32>(&self.frontier, "lazy DFA frontier bytes")?;
+        let rows = capacity_bytes::<u32>(&self.rows, "lazy DFA row bytes")?;
+        let offsets = capacity_bytes::<usize>(&self.offsets, "lazy DFA offset bytes")?;
+        let lengths = capacity_bytes::<u32>(&self.lengths, "lazy DFA length bytes")?;
+        let modes = capacity_bytes::<u8>(&self.modes, "lazy DFA mode bytes")?;
+        let hashes = capacity_bytes::<u64>(&self.hashes, "lazy DFA hash bytes")?;
+        let items = capacity_bytes::<u32>(&self.items, "lazy DFA item bytes")?;
+        scratch
+            .checked_add(frontier)
+            .and_then(|value| value.checked_add(rows))
+            .and_then(|value| value.checked_add(offsets))
+            .and_then(|value| value.checked_add(lengths))
+            .and_then(|value| value.checked_add(modes))
+            .and_then(|value| value.checked_add(hashes))
+            .and_then(|value| value.checked_add(items))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained lazy DFA bytes",
+            })
+    }
+
+    fn state_bounds(&self, state: u32) -> Result<(usize, usize, bool), SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy DFA state does not fit usize",
+        })?;
+        if state >= self.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA state is outside the retained cache",
+            });
+        }
+        let offset = *self
+            .offsets
+            .get(state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA state offset is outside metadata",
+            })?;
+        let length = usize::try_from(*self.lengths.get(state).ok_or(
+            SearchError::InternalInvariant {
+                detail: "lazy DFA state length is outside metadata",
+            },
+        )?)
+        .map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy DFA state length does not fit usize",
+        })?;
+        let end = offset
+            .checked_add(length)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA state item end",
+            })?;
+        if end > self.item_len || end > self.items.len() {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA state items are outside the retained arena",
+            });
+        }
+        let pending = *self
+            .modes
+            .get(state)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA state mode is outside metadata",
+            })?
+            != 0;
+        Ok((offset, length, pending))
+    }
+
+    fn item(&self, state: u32, ordinal: usize) -> Result<u32, SearchError> {
+        let (offset, length, _) = self.state_bounds(state)?;
+        if ordinal >= length {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA item ordinal is outside its state",
+            });
+        }
+        let item = offset
+            .checked_add(ordinal)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA item index",
+            })?;
+        self.items
+            .get(item)
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA item is outside the retained arena",
+            })
+    }
+
+    fn cell(&self, state: u32, byte: u8) -> Result<u32, SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy DFA transition state does not fit usize",
+        })?;
+        if state >= self.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA transition state is outside the cache",
+            });
+        }
+        let row = state
+            .checked_mul(BYTE_ALPHABET)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA transition row",
+            })?;
+        let cell_index =
+            row.checked_add(usize::from(byte))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA transition cell",
+                })?;
+        self.rows
+            .get(cell_index)
+            .copied()
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA transition cell is outside the direct table",
+            })
+    }
+
+    fn set_cell(&mut self, state: u32, byte: u8, cell: u32) -> Result<(), SearchError> {
+        let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "lazy DFA transition state does not fit usize",
+        })?;
+        if state >= self.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA transition source is outside the cache",
+            });
+        }
+        let row = state
+            .checked_mul(BYTE_ALPHABET)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA transition row",
+            })?;
+        let cell_index =
+            row.checked_add(usize::from(byte))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA transition cell",
+                })?;
+        *self
+            .rows
+            .get_mut(cell_index)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA transition cell is outside the direct table",
+            })? = cell;
+        Ok(())
+    }
+
+    fn intern_initial(
+        &mut self,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<u32, SearchError> {
+        let item_count = self.scratch_len;
+        if item_count == 0 || self.state_len != 0 || self.item_len != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA initial state has an invalid cache shape",
+            });
+        }
+        if self.offsets.is_empty() || item_count > self.items.len() {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA initial state exceeds its fixed arena",
+            });
+        }
+        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "lazy DFA initial item work",
+        })?;
+        meter.charge(item_work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], false);
+        meter.charge(item_work, position)?;
+        self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
+        self.offsets[0] = 0;
+        self.lengths[0] =
+            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
+                detail: "lazy DFA initial length does not fit u32",
+            })?;
+        self.modes[0] = 0;
+        self.hashes[0] = hash;
+        self.state_len = 1;
+        self.item_len = item_count;
+        self.scratch_len = 0;
+        Ok(0)
+    }
+
+    fn intern_speculative(
+        &mut self,
+        pending: bool,
+        meter: &mut WorkMeter,
+        core_reserve: u64,
+        position: usize,
+    ) -> Result<LazyInterned, SearchError> {
+        let item_count = self.scratch_len;
+        let item_end =
+            self.item_len
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA speculative item end",
+                })?;
+        let can_publish = self.state_len < self.offsets.len() && item_end <= self.items.len();
+
+        // Learning is optional. Require the complete worst-case comparison and
+        // publication allowance before doing any of it; otherwise continue
+        // from the already-advanced frontier inline.
+        let comparison = self
+            .state_len
+            .checked_mul(
+                item_count
+                    .checked_add(1)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "lazy DFA comparison work",
+                    })?,
+            )
+            .and_then(|work| work.checked_add(item_count))
+            .and_then(|work| work.checked_add(if can_publish { item_count } else { 0 }))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA learning work",
+            })?;
+        let comparison =
+            u64::try_from(comparison).map_err(|_| SearchError::ArithmeticOverflow {
+                computation: "lazy DFA learning work conversion",
+            })?;
+        let remaining = meter.remaining();
+        let Some(optional) = remaining.checked_sub(core_reserve) else {
+            return Ok(LazyInterned::BudgetDeclined);
+        };
+        if comparison > optional {
+            return Ok(LazyInterned::BudgetDeclined);
+        }
+
+        let item_work = u64::try_from(item_count).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "lazy DFA item work",
+        })?;
+        meter.charge(item_work, position)?;
+        let hash = lazy_hash(&self.scratch[..item_count], pending);
+        for state in 0..self.state_len {
+            meter.charge(1, position)?;
+            if self.modes[state] != u8::from(pending)
+                || self.hashes[state] != hash
+                || usize::try_from(self.lengths[state]).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA retained length does not fit usize",
+                    }
+                })? != item_count
+            {
+                continue;
+            }
+            let offset = self.offsets[state];
+            let end = offset
+                .checked_add(item_count)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA candidate state end",
+                })?;
+            meter.charge(item_work, position)?;
+            if self.items.get(offset..end) == Some(&self.scratch[..item_count]) {
+                self.scratch_len = 0;
+                return Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "lazy DFA state does not fit u32",
+                    }
+                })?));
+            }
+        }
+
+        if !can_publish {
+            return Ok(LazyInterned::CapacityFull);
+        }
+        meter.charge(item_work, position)?;
+        self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
+        let state = self.state_len;
+        self.offsets[state] = self.item_len;
+        self.lengths[state] =
+            u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
+                detail: "lazy DFA item count does not fit u32",
+            })?;
+        self.modes[state] = u8::from(pending);
+        self.hashes[state] = hash;
+        self.item_len = item_end;
+        self.state_len = self
+            .state_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA state count",
+            })?;
+        self.scratch_len = 0;
+        Ok(LazyInterned::State(u32::try_from(state).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "lazy DFA state does not fit u32",
+            }
+        })?))
+    }
+
+    fn retain_scratch_as_frontier(&mut self) -> Result<(), SearchError> {
+        if self.scratch_len > self.frontier.len() || self.scratch.len() != self.frontier.len() {
+            return Err(SearchError::InternalInvariant {
+                detail: "lazy DFA inline frontier exceeds its fixed arena",
+            });
+        }
+        core::mem::swap(&mut self.scratch, &mut self.frontier);
+        self.frontier_len = self.scratch_len;
+        self.scratch_len = 0;
+        Ok(())
+    }
+}
+
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
 ///
 /// All backing vectors retain their full initialized length. Separate logical
@@ -167,6 +622,7 @@ pub struct K0Workspace {
     roots_len: usize,
     stack: Vec<Thread>,
     stack_len: usize,
+    lazy: LazyWorkspace,
     retained_bytes: usize,
     construction: SetupAccounting,
 }
@@ -182,7 +638,35 @@ impl K0Workspace {
     /// Returns [`SearchError`] on arithmetic overflow, a setup/scratch limit,
     /// or a fallible allocation failure.
     pub fn new(automaton: &Automaton, limits: WorkspaceLimits) -> Result<Self, SearchError> {
-        let layout = WorkspaceLayout::for_automaton(automaton)?;
+        Self::new_mode(automaton, limits, false)
+    }
+
+    /// Allocate reusable K0 storage plus a bounded ordered lazy-DFA cache.
+    ///
+    /// Structurally ineligible automata retain exactly the ordinary Pike
+    /// workspace. Context-free byte automata add fixed-capacity storage that
+    /// never grows during a search; nullable and empty graphs discover their
+    /// immutable decline on the first endpoint call and then remain on Pike.
+    /// Facades with minimum-length metadata exclude those graphs before this
+    /// constructor. Span operations still use Pike execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] on arithmetic overflow, a setup/scratch limit,
+    /// or a fallible allocation failure.
+    pub fn new_accelerated(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+    ) -> Result<Self, SearchError> {
+        Self::new_mode(automaton, limits, true)
+    }
+
+    fn new_mode(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        enable_lazy: bool,
+    ) -> Result<Self, SearchError> {
+        let layout = WorkspaceLayout::for_automaton_mode(automaton, enable_lazy)?;
         if layout.construction_work > limits.max_setup_work {
             return Err(SearchError::WorkspaceSetupWorkLimitExceeded {
                 limit: limits.max_setup_work,
@@ -205,7 +689,8 @@ impl K0Workspace {
             Thread::default(),
             layout.logical_bytes,
         )?;
-        let retained_bytes = retained_bytes(&seen_at, &current, &roots, &stack)?;
+        let lazy = LazyWorkspace::new(automaton, layout, layout.logical_bytes)?;
+        let retained_bytes = retained_bytes(&seen_at, &current, &roots, &stack, &lazy)?;
         if retained_bytes > limits.max_scratch_bytes {
             return Err(SearchError::ResourceLimit {
                 resource: ResourceKind::ScratchBytes,
@@ -231,6 +716,7 @@ impl K0Workspace {
             roots_len: 0,
             stack,
             stack_len: 0,
+            lazy,
             retained_bytes,
             construction,
         })
@@ -270,6 +756,7 @@ impl K0Workspace {
         self.current_len = 0;
         self.roots_len = 0;
         self.stack_len = 0;
+        self.lazy.frontier_len = 0;
 
         if self.generation > u64::MAX.saturating_sub(required_generations) {
             let clear_work =
@@ -401,6 +888,10 @@ impl WorkMeter {
         self.consumed = next;
         Ok(())
     }
+
+    const fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.consumed)
+    }
 }
 
 pub(crate) fn search(
@@ -408,7 +899,7 @@ pub(crate) fn search(
     haystack: &[u8],
     window: SearchWindow,
     limits: SearchLimits,
-    earliest: bool,
+    contract: OutputContract,
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let layout = WorkspaceLayout::for_automaton(automaton)?;
@@ -441,7 +932,8 @@ pub(crate) fn search(
         &mut workspace,
         limits,
         setup,
-        earliest,
+        contract,
+        false,
     )
 }
 
@@ -451,7 +943,7 @@ pub(crate) fn search_with_workspace(
     window: SearchWindow,
     workspace: &mut K0Workspace,
     limits: SearchLimits,
-    earliest: bool,
+    contract: OutputContract,
 ) -> Result<UntypedReport, SearchError> {
     execute(
         automaton,
@@ -460,10 +952,15 @@ pub(crate) fn search_with_workspace(
         workspace,
         limits,
         SetupAccounting::empty(workspace.retained_bytes, true),
-        earliest,
+        contract,
+        true,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared Pike/lazy entry authenticates one complete invocation"
+)]
 fn execute(
     automaton: &Automaton,
     haystack: &[u8],
@@ -471,13 +968,61 @@ fn execute(
     workspace: &mut K0Workspace,
     limits: SearchLimits,
     mut setup: SetupAccounting,
-    earliest: bool,
+    contract: OutputContract,
+    allow_lazy: bool,
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
-    let (mut meter, setup_work) =
-        prepare_invocation(automaton, workspace, window, limits, &mut setup)?;
+    let may_use_lazy =
+        allow_lazy && !matches!(contract, OutputContract::Span) && workspace.lazy.is_allocated();
+    let (mut meter, setup_work) = prepare_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        may_use_lazy,
+    )?;
+    // Cache learning is optional work. Preserve the ordinary reusable-work
+    // certificate by reserving its complete transition allowance before any
+    // initial-state publication or speculative interning. Unlimited callers
+    // need no finite reserve.
+    let window_bytes =
+        window
+            .end()
+            .checked_sub(window.start())
+            .ok_or(SearchError::InternalInvariant {
+                detail: "validated search window has a descending range",
+            })?;
+    let lazy_core_reserve = if may_use_lazy && limits.max_work != u64::MAX {
+        automaton
+            .conservative_transition_work_bound(window_bytes)
+            .unwrap_or(u64::MAX)
+    } else {
+        0
+    };
     let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
-    let (pending, boundaries) = if let Some(scanner) = start_proof.proof().scanner.as_ref() {
+    let earliest = matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd
+    );
+    let lazy = if may_use_lazy {
+        execute_lazy_loop(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            &mut meter,
+            contract,
+            lazy_core_reserve,
+            start_proof.proof().scanner.as_ref(),
+            start_proof.proof().guard.as_ref(),
+        )?
+    } else {
+        None
+    };
+    let (pending, boundaries) = if let Some(result) = lazy {
+        result
+    } else if let Some(scanner) = start_proof.proof().scanner.as_ref() {
         execute_filtered_loop(
             automaton,
             haystack,
@@ -514,6 +1059,451 @@ fn execute(
             workspace.retained_bytes,
             boundaries,
         ),
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the forward loop keeps endpoint commitment and cache handoff together"
+)]
+fn execute_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+    core_reserve: u64,
+    scanner: Option<&StartPositionScanner>,
+    guard: Option<&StartPositionClass>,
+) -> Result<Option<(Option<MatchSpan>, usize)>, SearchError> {
+    if !matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd | OutputContract::SelectedEnd
+    ) || !prepare_lazy(automaton, workspace, meter, core_reserve, window.start())?
+    {
+        return Ok(None);
+    }
+
+    let earliest = matches!(
+        contract,
+        OutputContract::Exists | OutputContract::EarliestEnd
+    );
+    let initial = workspace.lazy.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized lazy DFA has no initial state",
+        });
+    }
+    // Even a physically full cache retains useful prefix rows. Start from the
+    // cached initial state and hand off only when an unfilled edge is reached.
+    let mut state = LazyState::Cached(initial);
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut pending_end = None;
+    let mut entered = false;
+
+    loop {
+        if pending_end.is_none() && state == LazyState::Cached(initial) {
+            if let Some(scanner) = scanner {
+                position =
+                    next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+                if position == window.end() {
+                    return Ok(Some((None, boundaries)));
+                }
+            }
+        }
+        if !entered {
+            boundaries = boundaries
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy DFA examined boundary count",
+                })?;
+            entered = true;
+        }
+        if position == window.end() {
+            return Ok(Some((
+                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                boundaries,
+            )));
+        }
+
+        // Charge the source step before indexing the validated window. A
+        // warmed transition therefore costs one unit and performs one direct
+        // row lookup; a cold transition additionally charges its closure and
+        // optional learning work.
+        meter.charge(1, position)?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "lazy DFA source position exceeded the validated window",
+            })?;
+        let transition = match state {
+            LazyState::Cached(cached) => build_lazy_cached_transition(
+                automaton,
+                cached,
+                byte,
+                workspace,
+                meter,
+                core_reserve,
+                position,
+            )?,
+            LazyState::Inline { pending } => {
+                build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
+            }
+        };
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA input position",
+            })?;
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA examined boundary count",
+            })?;
+
+        let (accepted, next) = match transition {
+            LazyTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(LazyState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "lazy DFA encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            LazyTransition::Inline { accepted, pending } => {
+                (accepted, Some(LazyState::Inline { pending }))
+            }
+        };
+        if accepted {
+            pending_end = Some(position);
+            if earliest {
+                return Ok(Some((
+                    Some(MatchSpan::new(window.start(), position)),
+                    boundaries,
+                )));
+            }
+        }
+        let Some(next) = next else {
+            return Ok(Some((
+                pending_end.map(|end| MatchSpan::new(window.start(), end)),
+                boundaries,
+            )));
+        };
+        state = next;
+    }
+}
+
+fn prepare_lazy(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<bool, SearchError> {
+    if !workspace.lazy.is_allocated()
+        || !workspace.lazy.is_bound_to(automaton)
+        || workspace.lazy.declined
+    {
+        return Ok(false);
+    }
+    if workspace.lazy.initialized {
+        return Ok(true);
+    }
+
+    let states =
+        u64::try_from(automaton.stats().states()).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "lazy DFA initial state count",
+        })?;
+    let epsilon_edges = u64::try_from(automaton.stats().zero_width_edges()).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "lazy DFA initial epsilon-edge count",
+        }
+    })?;
+    let initial_upper = states
+        .checked_mul(2)
+        .and_then(|work| {
+            epsilon_edges
+                .checked_mul(2)
+                .and_then(|edges| work.checked_add(edges))
+        })
+        .and_then(|work| work.checked_add(2))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA initial preparation work",
+        })?;
+    let remaining = meter.remaining();
+    let Some(optional) = remaining.checked_sub(core_reserve) else {
+        return Ok(false);
+    };
+    if initial_upper > optional {
+        return Ok(false);
+    }
+
+    begin_lazy_closure(workspace, meter, position)?;
+    let accepted = expand_lazy_root(automaton, automaton.start, workspace, meter, position)?;
+    if accepted || workspace.lazy.scratch_len == 0 {
+        // Nullable and empty-language graphs remain on Pike. This decision is
+        // immutable for the exact bound automaton and is therefore sticky.
+        workspace.lazy.scratch_len = 0;
+        workspace.lazy.declined = true;
+        return Ok(false);
+    }
+    let initial = workspace.lazy.intern_initial(meter, position)?;
+    workspace.lazy.initial = initial;
+    workspace.lazy.initialized = true;
+    Ok(true)
+}
+
+fn begin_lazy_closure(
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<(), SearchError> {
+    meter.charge(1, position)?;
+    workspace.lazy.scratch_len = 0;
+    workspace.stack_len = 0;
+    workspace.generation =
+        workspace
+            .generation
+            .checked_add(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "preflighted lazy DFA generation overflowed",
+            })?;
+    Ok(())
+}
+
+fn push_lazy_scratch(workspace: &mut K0Workspace, state: u32) -> Result<(), SearchError> {
+    *workspace
+        .lazy
+        .scratch
+        .get_mut(workspace.lazy.scratch_len)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "lazy DFA closure output exceeded automaton states",
+        })? = state;
+    workspace.lazy.scratch_len =
+        workspace
+            .lazy
+            .scratch_len
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA closure output length",
+            })?;
+    Ok(())
+}
+
+fn expand_lazy_root(
+    automaton: &Automaton,
+    root: u32,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<bool, SearchError> {
+    workspace.stack_len = 0;
+    workspace.push_stack(Thread {
+        state: root,
+        start: 0,
+    })?;
+    while let Some(thread) = workspace.pop_stack() {
+        meter.charge(1, position)?;
+        let state = crate::plan::plan_index(thread.state);
+        if workspace.seen_at[state] == workspace.generation {
+            continue;
+        }
+        workspace.seen_at[state] = workspace.generation;
+        match automaton.roles[state] {
+            StateRole::Accept => return Ok(true),
+            StateRole::Consume => push_lazy_scratch(workspace, thread.state)?,
+            StateRole::Split => {
+                for edge in automaton.state_edges(thread.state).rev() {
+                    meter.charge(1, position)?;
+                    if automaton.edge_kinds[edge] != EdgeKind::Epsilon {
+                        return Err(SearchError::InternalInvariant {
+                            detail: "lazy DFA reached a non-epsilon split edge",
+                        });
+                    }
+                    workspace.push_stack(Thread {
+                        state: automaton.edge_targets[edge],
+                        start: 0,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn build_lazy_cached_transition(
+    automaton: &Automaton,
+    state: u32,
+    byte: u8,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let cached = workspace.lazy.cell(state, byte)?;
+    if cached != LAZY_CELL_UNFILLED {
+        return Ok(LazyTransition::Ready(cached));
+    }
+
+    let (_, length, pending) = workspace.lazy.state_bounds(state)?;
+    begin_lazy_closure(workspace, meter, position)?;
+    let mut accepted = false;
+    'frontier: for ordinal in 0..length {
+        let consuming = workspace.lazy.item(state, ordinal)?;
+        for edge in automaton.state_edges(consuming) {
+            meter.charge(1, position)?;
+            if automaton.byte_starts[edge] <= byte
+                && byte <= automaton.byte_ends[edge]
+                && expand_lazy_root(
+                    automaton,
+                    automaton.edge_targets[edge],
+                    workspace,
+                    meter,
+                    position,
+                )?
+            {
+                accepted = true;
+                break 'frontier;
+            }
+        }
+    }
+    if !accepted
+        && !pending
+        && expand_lazy_root(automaton, automaton.start, workspace, meter, position)?
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "nonnullable lazy DFA accepted an injected empty match",
+        });
+    }
+    finish_lazy_cached_transition(
+        state,
+        byte,
+        accepted,
+        pending,
+        workspace,
+        meter,
+        core_reserve,
+        position,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "cache publication authenticates one complete transition and its work reserve"
+)]
+fn finish_lazy_cached_transition(
+    state: u32,
+    byte: u8,
+    accepted: bool,
+    pending: bool,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    core_reserve: u64,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let next_pending = pending || accepted;
+    let encoded = if workspace.lazy.scratch_len == 0 {
+        0
+    } else {
+        match workspace
+            .lazy
+            .intern_speculative(next_pending, meter, core_reserve, position)?
+        {
+            LazyInterned::State(next) => {
+                next.checked_add(1).ok_or(SearchError::InternalInvariant {
+                    detail: "lazy DFA encoded state overflowed",
+                })?
+            }
+            LazyInterned::BudgetDeclined => {
+                workspace.lazy.retain_scratch_as_frontier()?;
+                return Ok(LazyTransition::Inline {
+                    accepted,
+                    pending: next_pending,
+                });
+            }
+            LazyInterned::CapacityFull => {
+                workspace.lazy.saturated = true;
+                workspace.lazy.retain_scratch_as_frontier()?;
+                return Ok(LazyTransition::Inline {
+                    accepted,
+                    pending: next_pending,
+                });
+            }
+        }
+    };
+    let cell = encoded | if accepted { LAZY_CELL_ACCEPT } else { 0 };
+    workspace.lazy.set_cell(state, byte, cell)?;
+    Ok(LazyTransition::Ready(cell))
+}
+
+fn build_lazy_inline_transition(
+    automaton: &Automaton,
+    byte: u8,
+    pending: bool,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<LazyTransition, SearchError> {
+    let length = workspace.lazy.frontier_len;
+    begin_lazy_closure(workspace, meter, position)?;
+    let mut accepted = false;
+    'frontier: for ordinal in 0..length {
+        let consuming =
+            *workspace
+                .lazy
+                .frontier
+                .get(ordinal)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "lazy DFA inline frontier item is outside its arena",
+                })?;
+        for edge in automaton.state_edges(consuming) {
+            meter.charge(1, position)?;
+            if automaton.byte_starts[edge] <= byte
+                && byte <= automaton.byte_ends[edge]
+                && expand_lazy_root(
+                    automaton,
+                    automaton.edge_targets[edge],
+                    workspace,
+                    meter,
+                    position,
+                )?
+            {
+                accepted = true;
+                break 'frontier;
+            }
+        }
+    }
+    if !accepted
+        && !pending
+        && expand_lazy_root(automaton, automaton.start, workspace, meter, position)?
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "nonnullable inline lazy DFA accepted an injected empty match",
+        });
+    }
+    let next_pending = pending || accepted;
+    if workspace.lazy.scratch_len == 0 {
+        workspace.lazy.frontier_len = 0;
+        return Ok(LazyTransition::Ready(if accepted {
+            LAZY_CELL_ACCEPT
+        } else {
+            0
+        }));
+    }
+    workspace.lazy.retain_scratch_as_frontier()?;
+    Ok(LazyTransition::Inline {
+        accepted,
+        pending: next_pending,
     })
 }
 
@@ -1248,9 +2238,14 @@ fn prepare_invocation(
     window: SearchWindow,
     limits: SearchLimits,
     setup: &mut SetupAccounting,
+    may_use_lazy: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
     let required_layout = WorkspaceLayout::for_automaton(automaton)?;
-    if required_layout != workspace.layout {
+    if required_layout.states != workspace.layout.states
+        || required_layout.edges != workspace.layout.edges
+        || required_layout.zero_width_edges != workspace.layout.zero_width_edges
+        || required_layout.closure_slots != workspace.layout.closure_slots
+    {
         return Err(SearchError::WorkspaceLayoutMismatch {
             required_states: required_layout.states,
             actual_states: workspace.layout.states,
@@ -1283,6 +2278,9 @@ fn prepare_invocation(
         // boundary and one for every admitted byte.
         .and_then(|length| length.checked_add(START_FILTER_POSITION_COUNT))
         .and_then(|length| length.checked_add(1))
+        // An accelerated workspace may derive its immutable initial closure
+        // once before entering the per-byte loop.
+        .and_then(|length| length.checked_add(usize::from(may_use_lazy)))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "required boundary generations",
         })?;
@@ -1542,6 +2540,110 @@ fn unicode_assertion_matches(
     ))
 }
 
+fn lazy_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError> {
+    if automaton.stats().assertion_edges() != 0 {
+        return Ok((0, 0));
+    }
+    let states = automaton.stats().states();
+    if states == 0 || states > LAZY_MAX_ITEMS {
+        return Ok((0, 0));
+    }
+    let item_capacity = states
+        .checked_mul(LAZY_MAX_STATES)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA item capacity",
+        })?
+        .min(LAZY_MAX_ITEMS)
+        .max(states);
+    Ok((LAZY_MAX_STATES, item_capacity))
+}
+
+fn lazy_initialized_slots(
+    states: usize,
+    state_capacity: usize,
+    item_capacity: usize,
+) -> Result<usize, SearchError> {
+    if state_capacity == 0 {
+        return Ok(0);
+    }
+    let rows =
+        state_capacity
+            .checked_mul(BYTE_ALPHABET)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA initialized row slots",
+            })?;
+    states
+        .checked_mul(2)
+        .and_then(|slots| slots.checked_add(rows))
+        .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(item_capacity))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA initialized slots",
+        })
+}
+
+fn lazy_scratch_bytes(
+    states: usize,
+    state_capacity: usize,
+    item_capacity: usize,
+) -> Result<usize, SearchError> {
+    if state_capacity == 0 {
+        return Ok(0);
+    }
+    let rows =
+        state_capacity
+            .checked_mul(BYTE_ALPHABET)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA row cells",
+            })?;
+    let state_u32s = states
+        .checked_mul(2)
+        .and_then(|slots| slots.checked_add(rows))
+        .and_then(|slots| slots.checked_add(state_capacity))
+        .and_then(|slots| slots.checked_add(item_capacity))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA u32 slots",
+        })?;
+    let u32_bytes =
+        state_u32s
+            .checked_mul(size_of::<u32>())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA u32 bytes",
+            })?;
+    let offsets =
+        state_capacity
+            .checked_mul(size_of::<usize>())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA offset bytes",
+            })?;
+    let modes = state_capacity;
+    let hashes =
+        state_capacity
+            .checked_mul(size_of::<u64>())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "lazy DFA hash bytes",
+            })?;
+    u32_bytes
+        .checked_add(offsets)
+        .and_then(|bytes| bytes.checked_add(modes))
+        .and_then(|bytes| bytes.checked_add(hashes))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "lazy DFA scratch bytes",
+        })
+}
+
+fn lazy_hash(items: &[u32], pending: bool) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ u64::from(pending);
+    for &item in items {
+        hash ^= u64::from(item);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn scratch_bytes(states: usize, edges: usize, stack: usize) -> Result<usize, SearchError> {
     let seen = states
         .checked_mul(size_of::<u64>())
@@ -1593,6 +2695,7 @@ fn retained_bytes(
     current: &Vec<Thread>,
     roots: &Vec<Thread>,
     stack: &Vec<Thread>,
+    lazy: &LazyWorkspace,
 ) -> Result<usize, SearchError> {
     let seen = seen_at.capacity().checked_mul(size_of::<u64>()).ok_or(
         SearchError::ArithmeticOverflow {
@@ -1614,12 +2717,21 @@ fn retained_bytes(
             computation: "retained closure scratch bytes",
         },
     )?;
+    let lazy = lazy.retained_bytes()?;
     seen.checked_add(current)
         .and_then(|value| value.checked_add(roots))
         .and_then(|value| value.checked_add(stack))
+        .and_then(|value| value.checked_add(lazy))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "total retained scratch bytes",
         })
+}
+
+fn capacity_bytes<T>(vector: &Vec<T>, computation: &'static str) -> Result<usize, SearchError> {
+    vector
+        .capacity()
+        .checked_mul(size_of::<T>())
+        .ok_or(SearchError::ArithmeticOverflow { computation })
 }
 
 #[cfg(test)]
@@ -1639,8 +2751,9 @@ mod tests {
             START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
             START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, RawPlan, SearchError,
-        SearchLimits, SearchWindow, Span, StateRole, WorkspaceLimits,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, MatchSpan, RawPlan,
+        ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
+        WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -2020,6 +3133,84 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', 0, 0, b'a'],
                 byte_ends: vec![0, 0, b'a', 0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn a_plus(greedy: bool) -> Automaton {
+        let split_targets = if greedy { [0, 2] } else { [2, 0] };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 3, 3],
+                edge_targets: vec![1, split_targets[0], split_targets[1]],
+                edge_kinds: vec![EdgeKind::ByteRange, EdgeKind::Epsilon, EdgeKind::Epsilon],
+                byte_starts: vec![b'a', 0, 0],
+                byte_ends: vec![b'a', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn ordered_a_or_ab(long_first: bool) -> Automaton {
+        let (first, second) = if long_first { (1_u32, 4_u32) } else { (4, 1) };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4, 5, 5],
+                edge_targets: vec![first, second, 2, 3, 5],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b', b'a'],
+                byte_ends: vec![0, 0, b'a', b'b', b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn greedy_binary_pair_plus_then_80() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 6, 7, 7],
+                edge_targets: vec![1, 2, 3, 3, 0, 4, 5],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0x00, 0xff, 0, 0, 0x80],
+                byte_ends: vec![0, 0, 0x00, 0xff, 0, 0, 0x80],
             },
             CompileLimits::default(),
         )
@@ -4286,5 +5477,567 @@ mod tests {
                 scanner: StartScanner::Set(ByteSet::from_words([0, 0, u64::MAX, u64::MAX,])),
             })
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all four typed contracts share one exhaustive window matrix"
+    )]
+    fn ordered_lazy_dfa_is_exhaustively_differential_for_every_contract_and_window() {
+        let plans = [
+            a_plus(true),
+            a_plus(false),
+            ordered_a_or_ab(true),
+            ordered_a_or_ab(false),
+            greedy_a_plus_or_a(),
+            greedy_binary_pair_plus_then_80(),
+            byte_chain(&[(0x00, 0xff), (b'Z', b'Z')]),
+        ];
+        let haystacks = bounded_words(&[0x00, b'a', b'b', 0x80, 0xff], 4);
+        let mut checked = 0usize;
+
+        for plan in &plans {
+            let mut pike = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut accelerated =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            assert!(accelerated.retained_bytes() > pike.retained_bytes());
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let want_exists = plan
+                            .prepare::<Exists>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let got_exists = plan
+                            .prepare::<Exists>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            got_exists, want_exists,
+                            "exists mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
+                        );
+
+                        let want_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let got_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            got_earliest, want_earliest,
+                            "earliest mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
+                        );
+
+                        let want_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let got_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            got_selected, want_selected,
+                            "selected mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
+                        );
+
+                        let want_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        let got_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut accelerated,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(
+                            got_span, want_span,
+                            "span mismatch plan={plan:?}, source={haystack:?}, window={window:?}"
+                        );
+                        checked = checked.checked_add(1).unwrap();
+                    }
+                }
+            }
+            assert!(accelerated.lazy.initialized);
+            assert!(!accelerated.lazy.declined);
+        }
+        assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn span_is_a_typed_pike_fallback_and_declined_graphs_keep_the_old_layout() {
+        let eligible = a_plus(true);
+        let ordinary = eligible.workspace_layout().unwrap();
+        let accelerated = eligible.accelerated_workspace_layout().unwrap();
+        assert!(accelerated.logical_bytes() > ordinary.logical_bytes());
+        assert!(accelerated.construction_work() > ordinary.construction_work());
+
+        let mut workspace =
+            K0Workspace::new_accelerated(&eligible, WorkspaceLimits::unlimited()).unwrap();
+        let span = eligible
+            .prepare::<Span>()
+            .search_with_workspace(b"baaa", &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(span, Some(MatchSpan::new(1, 4)));
+        assert!(!workspace.lazy.initialized);
+        assert!(!workspace.lazy.declined);
+
+        let selected = eligible
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(b"baaa", &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(selected, Some(4));
+        assert!(workspace.lazy.initialized);
+
+        let asserted = assertion_or_colon(EdgeKind::AssertLineStartLf);
+        assert_eq!(
+            asserted.accelerated_workspace_layout().unwrap(),
+            asserted.workspace_layout().unwrap()
+        );
+        let ordinary_asserted = K0Workspace::new(&asserted, WorkspaceLimits::unlimited()).unwrap();
+        let accelerated_asserted =
+            K0Workspace::new_accelerated(&asserted, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            accelerated_asserted.retained_bytes(),
+            ordinary_asserted.retained_bytes()
+        );
+        assert!(!accelerated_asserted.lazy.is_allocated());
+
+        let nullable = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Accept],
+                edge_offsets: vec![0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let mut nullable_workspace =
+            K0Workspace::new_accelerated(&nullable, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            nullable
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(b"abc", &mut nullable_workspace, SearchLimits::unlimited(),)
+                .unwrap()
+                .into_output(),
+            Some(0)
+        );
+        assert!(nullable_workspace.lazy.declined);
+        assert!(!nullable_workspace.lazy.initialized);
+    }
+
+    #[test]
+    fn saturated_lazy_cache_continues_inline_without_replaying_and_stays_correct() {
+        let plan = greedy_a_plus_or_a();
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut accelerated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        // Retain only the mandatory initial state. The first transition that
+        // has a live successor must hand its just-computed frontier to inline
+        // execution.
+        accelerated.lazy.offsets.truncate(1);
+        accelerated.lazy.lengths.truncate(1);
+        accelerated.lazy.modes.truncate(1);
+        accelerated.lazy.hashes.truncate(1);
+
+        for haystack in [b"baaaaaax".as_slice(), b"aaaa", b"xaaaax", b"\xffaax"] {
+            let want = plan
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(haystack, &mut pike, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let got = plan
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(haystack, &mut accelerated, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(got, want, "saturated source={haystack:?}");
+        }
+        assert!(accelerated.lazy.saturated);
+        assert!(accelerated.lazy.initialized);
+    }
+
+    #[test]
+    fn transient_learning_budget_refusal_preserves_cached_rows_and_can_retry() {
+        let plan = a_plus(true);
+        let certified = plan.conservative_reused_work_bound(2).unwrap();
+        let mut fresh = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let fresh_retained = fresh.retained_bytes();
+        let certified_report = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(
+                b"aa",
+                &mut fresh,
+                SearchLimits {
+                    max_work: certified,
+                    max_scratch_bytes: fresh_retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(certified_report.output(), &Some(2));
+        assert!(certified_report.accounting().work() <= certified);
+        assert!(
+            !fresh.lazy.initialized,
+            "a fresh cache must leave the ordinary certificate reserved"
+        );
+
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(b"a", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(1)
+        );
+        let initial = workspace.lazy.initial;
+        let pending = workspace.lazy.cell(initial, b'a').unwrap() & super::LAZY_CELL_STATE_MASK;
+        let pending = pending.checked_sub(1).unwrap();
+        assert_eq!(
+            workspace.lazy.cell(pending, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        let retained = workspace.retained_bytes();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    b"aa",
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: certified,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(2)
+        );
+        assert!(!workspace.lazy.saturated);
+        assert_eq!(
+            workspace.lazy.cell(pending, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "a bound-certified call must decline optional learning"
+        );
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(b"aa", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(2)
+        );
+        assert_ne!(
+            workspace.lazy.cell(pending, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "a later call with surplus work must retry and publish the row"
+        );
+    }
+
+    #[test]
+    fn warmed_lazy_rows_remove_repeated_dense_pike_closure_work() {
+        let plan = a_plus(true);
+        let haystack = vec![b'a'; 4_096];
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut accelerated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        let pike = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut pike, SearchLimits::unlimited())
+            .unwrap();
+        let accelerated = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&haystack, &mut accelerated, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(accelerated.output(), pike.output());
+        assert!(
+            accelerated.accounting().transition_work() * 2 < pike.accounting().transition_work(),
+            "warmed rows should replace repeated ordered closure"
+        );
+    }
+
+    #[test]
+    fn accelerated_workspace_limits_and_optional_preparation_are_pre_source_exact() {
+        let plan = a_plus(true);
+        let layout = plan.accelerated_workspace_layout().unwrap();
+        let setup_error = K0Workspace::new_accelerated(
+            &plan,
+            WorkspaceLimits {
+                max_setup_work: layout.construction_work() - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            setup_error,
+            SearchError::WorkspaceSetupWorkLimitExceeded {
+                limit: layout.construction_work() - 1,
+                needed: layout.construction_work(),
+            }
+        );
+        let scratch_error = K0Workspace::new_accelerated(
+            &plan,
+            WorkspaceLimits {
+                max_setup_work: u64::MAX,
+                max_scratch_bytes: layout.logical_bytes() - 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            scratch_error,
+            SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            } if needed == layout.logical_bytes() && limit == layout.logical_bytes() - 1
+        ));
+
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        pin_without_start_filter(&plan);
+        let states = u64::try_from(plan.stats().states()).unwrap();
+        let epsilon = u64::try_from(plan.stats().zero_width_edges()).unwrap();
+        let initial_upper = states * 2 + epsilon * 2 + 2;
+        let limits = SearchLimits {
+            max_work: INVOCATION_RESET_WORK + initial_upper - 1,
+            max_scratch_bytes: workspace.retained_bytes(),
+        };
+        let mut setup = crate::SetupAccounting::empty(workspace.retained_bytes(), true);
+        let (mut meter, _) = super::prepare_invocation(
+            &plan,
+            &mut workspace,
+            SearchWindow::new(0, 4),
+            limits,
+            &mut setup,
+            true,
+        )
+        .unwrap();
+        assert!(!super::prepare_lazy(&plan, &mut workspace, &mut meter, 0, 0).unwrap());
+        assert_eq!(meter.consumed, INVOCATION_RESET_WORK);
+        assert!(!workspace.lazy.initialized);
+        assert!(!workspace.lazy.declined);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all accelerated endpoint contracts share the same exact-limit matrix"
+    )]
+    fn warmed_lazy_contracts_enforce_exact_and_one_below_work_limits() {
+        let plan = a_plus(true);
+        let haystack = b"baaaaa";
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+
+        let exists_work = plan
+            .prepare::<Exists>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert!(plan
+            .prepare::<Exists>()
+            .search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: exists_work,
+                    max_scratch_bytes: retained,
+                },
+            )
+            .unwrap()
+            .into_output());
+        assert!(matches!(
+            plan.prepare::<Exists>().search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: exists_work - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == exists_work - 1
+        ));
+
+        let earliest_work = plan
+            .prepare::<EarliestEnd>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<EarliestEnd>()
+                .search_with_workspace(
+                    haystack,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: earliest_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(2)
+        );
+        assert!(matches!(
+            plan.prepare::<EarliestEnd>().search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: earliest_work - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == earliest_work - 1
+        ));
+
+        let selected_work = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    haystack,
+                    &mut workspace,
+                    SearchLimits {
+                        max_work: selected_work,
+                        max_scratch_bytes: retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len())
+        );
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: selected_work - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == selected_work - 1
+        ));
+
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                haystack,
+                &mut workspace,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained - 1,
+                },
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == retained && limit == retained - 1
+        ));
+    }
+
+    #[test]
+    fn lazy_cache_is_bound_to_the_exact_immutable_automaton() {
+        let first = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let second = byte_chain(&[(b'a', b'a'), (b'c', b'c')]);
+        assert_eq!(first.workspace_layout(), second.workspace_layout());
+        let mut workspace =
+            K0Workspace::new_accelerated(&first, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            second
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(b"zac", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(3)
+        );
+        assert!(!workspace.lazy.initialized);
+        assert!(workspace.lazy.is_bound_to(&first));
+
+        assert_eq!(
+            first
+                .prepare::<SelectedEnd>()
+                .search_with_workspace(b"zab", &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(3)
+        );
+        assert!(workspace.lazy.initialized);
     }
 }

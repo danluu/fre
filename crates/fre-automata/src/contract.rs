@@ -207,9 +207,6 @@ pub trait Operation: sealed::Sealed {
     const CONTRACT: OutputContract;
 
     #[doc(hidden)]
-    const EARLIEST: bool;
-
-    #[doc(hidden)]
     fn project(found: Option<MatchSpan>) -> Self::Output;
 }
 
@@ -228,8 +225,6 @@ impl Operation for Exists {
     type Output = bool;
 
     const CONTRACT: OutputContract = OutputContract::Exists;
-    const EARLIEST: bool = true;
-
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.is_some()
     }
@@ -245,8 +240,6 @@ impl Operation for EarliestEnd {
     type Output = Option<usize>;
 
     const CONTRACT: OutputContract = OutputContract::EarliestEnd;
-    const EARLIEST: bool = true;
-
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.map(MatchSpan::end)
     }
@@ -262,8 +255,6 @@ impl Operation for SelectedEnd {
     type Output = Option<usize>;
 
     const CONTRACT: OutputContract = OutputContract::SelectedEnd;
-    const EARLIEST: bool = false;
-
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.map(MatchSpan::end)
     }
@@ -279,8 +270,6 @@ impl Operation for Span {
     type Output = Option<MatchSpan>;
 
     const CONTRACT: OutputContract = OutputContract::Span;
-    const EARLIEST: bool = false;
-
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found
     }
@@ -328,7 +317,7 @@ impl<O: Operation> TypedPlan<'_, O> {
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<SearchReport<O::Output>, SearchError> {
-        let report = crate::k0::search(self.automaton, haystack, window, limits, O::EARLIEST)?;
+        let report = crate::k0::search(self.automaton, haystack, window, limits, O::CONTRACT)?;
         Ok(SearchReport::new(
             O::project(report.found),
             report.accounting,
@@ -373,7 +362,7 @@ impl<O: Operation> TypedPlan<'_, O> {
             window,
             workspace,
             limits,
-            O::EARLIEST,
+            O::CONTRACT,
         )?;
         Ok(SearchReport::new(
             O::project(report.found),

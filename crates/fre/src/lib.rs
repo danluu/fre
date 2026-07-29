@@ -2706,10 +2706,16 @@ impl PortableRegex {
 
     /// Prepare allocation-free repeated searches over this immutable matcher.
     ///
-    /// K0 allocates and fully initializes one fixed-capacity workspace here;
-    /// every subsequent session call reuses it without growing. Native plans
-    /// retain their existing operation-specific dispatch and need no session
-    /// storage.
+    /// K0 allocates and fully initializes one fixed-capacity workspace here.
+    /// Eligible byte graphs with a statically known positive minimum length
+    /// also retain a bounded ordered lazy-DFA cache for existence and endpoint
+    /// operations. Assertion-bearing, nullable, and statically empty graphs
+    /// keep the ordinary workspace; span operations retain Pike execution.
+    /// The selected workspace's complete retained payload is preflighted on
+    /// every call, including span calls that do not consult the cache. Every
+    /// subsequent call reuses the selected storage without growing. Native
+    /// plans retain their existing operation-specific dispatch and need no
+    /// session storage.
     ///
     /// # Errors
     ///
@@ -2723,13 +2729,26 @@ impl PortableRegex {
     ) -> Result<PortableSearchSession<'_>, SearchError> {
         let plan = match &self.plan {
             PortablePlan::K0(automaton) => {
-                let workspace = K0Workspace::new(
-                    automaton,
-                    SearchSessionLimits {
-                        max_setup_work: limits.max_setup_work,
-                        max_scratch_bytes: limits.max_scratch_bytes,
-                    },
-                )?;
+                let workspace_limits = SearchSessionLimits {
+                    max_setup_work: limits.max_setup_work,
+                    max_scratch_bytes: limits.max_scratch_bytes,
+                };
+                let accelerate = matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0)
+                    && automaton
+                        .accelerated_workspace_layout()
+                        .is_ok_and(|layout| {
+                            layout.construction_work() <= workspace_limits.max_setup_work
+                                && layout.logical_bytes() <= workspace_limits.max_scratch_bytes
+                        });
+                // Select the optional cache from its source-free layout before
+                // allocating. Once accelerated construction begins, propagate
+                // every failure so a partial attempt cannot disappear from
+                // successful setup accounting.
+                let workspace = if accelerate {
+                    K0Workspace::new_accelerated(automaton, workspace_limits)?
+                } else {
+                    K0Workspace::new(automaton, workspace_limits)?
+                };
                 PortableSearchSessionPlan::K0 {
                     automaton,
                     workspace,

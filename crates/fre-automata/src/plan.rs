@@ -1,7 +1,20 @@
 use core::{marker::PhantomData, mem::size_of};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
+
+static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn next_automaton_identity() -> u64 {
+    NEXT_AUTOMATON_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("automaton identity space exhausted"))
+}
 
 /// Number of exact consumed-byte positions retained by the bounded start
 /// filter. Any of offsets zero through seven may supply the primary scanner;
@@ -181,6 +194,7 @@ pub struct PlanStats {
     states: usize,
     edges: usize,
     zero_width_edges: usize,
+    assertion_edges: usize,
     consuming_edges: usize,
     storage_bytes: usize,
     validation_work: usize,
@@ -200,6 +214,10 @@ impl PlanStats {
     #[must_use]
     pub const fn zero_width_edges(self) -> usize {
         self.zero_width_edges
+    }
+
+    pub(crate) const fn assertion_edges(self) -> usize {
+        self.assertion_edges
     }
 
     #[must_use]
@@ -350,6 +368,7 @@ pub(crate) struct StartFilterProof {
 /// Immutable structure-of-arrays prioritized Thompson graph.
 #[derive(Debug)]
 pub struct Automaton {
+    identity: u64,
     pub(crate) start: u32,
     pub(crate) roles: Box<[StateRole]>,
     pub(crate) edge_offsets: Box<[u32]>,
@@ -365,6 +384,7 @@ pub struct Automaton {
 impl Clone for Automaton {
     fn clone(&self) -> Self {
         Self {
+            identity: next_automaton_identity(),
             start: self.start,
             roles: self.roles.clone(),
             edge_offsets: self.edge_offsets.clone(),
@@ -395,6 +415,7 @@ impl Automaton {
     pub fn from_raw(raw: RawPlan, limits: CompileLimits) -> Result<Self, CompileError> {
         let stats = validate_raw(&raw, limits)?;
         Ok(Self {
+            identity: next_automaton_identity(),
             start: raw.start,
             roles: raw.roles.into_boxed_slice(),
             edge_offsets: raw.edge_offsets.into_boxed_slice(),
@@ -432,6 +453,10 @@ impl Automaton {
         self.stats
     }
 
+    pub(crate) const fn identity(&self) -> u64 {
+        self.identity
+    }
+
     /// Compute the fixed K0 workspace shape without allocating it.
     ///
     /// # Errors
@@ -440,6 +465,21 @@ impl Automaton {
     /// cannot be represented.
     pub fn workspace_layout(&self) -> Result<WorkspaceLayout, SearchError> {
         WorkspaceLayout::for_automaton(self)
+    }
+
+    /// Compute the fixed reusable-workspace shape including the bounded
+    /// ordered lazy-DFA accelerator when this graph is structurally eligible.
+    ///
+    /// Ineligible graphs return the same layout as [`Self::workspace_layout`].
+    /// Span searches do not use the accelerator; callers preparing a
+    /// span-only workspace should retain the ordinary layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::ArithmeticOverflow`] if its byte or work charge
+    /// cannot be represented.
+    pub fn accelerated_workspace_layout(&self) -> Result<WorkspaceLayout, SearchError> {
+        WorkspaceLayout::for_accelerated_automaton(self)
     }
 
     /// Bind this graph to an output contract without adding a runtime mode flag
@@ -628,11 +668,12 @@ struct Shape {
 fn validate_raw(raw: &RawPlan, limits: CompileLimits) -> Result<PlanStats, CompileError> {
     let shape = validate_shape(raw, limits)?;
     validate_offsets(&raw.edge_offsets, shape.edges)?;
-    let (zero_width_edges, consuming_edges) = validate_graph(raw, shape.states)?;
+    let (zero_width_edges, assertion_edges, consuming_edges) = validate_graph(raw, shape.states)?;
     Ok(PlanStats {
         states: shape.states,
         edges: shape.edges,
         zero_width_edges,
+        assertion_edges,
         consuming_edges,
         storage_bytes: shape.storage_bytes,
         validation_work: shape.validation_work,
@@ -726,8 +767,9 @@ fn validate_edge_array_lengths(raw: &RawPlan, edges: usize) -> Result<(), Compil
     Ok(())
 }
 
-fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize), CompileError> {
+fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize, usize), CompileError> {
     let mut zero_width_edges = 0usize;
+    let mut assertion_edges = 0usize;
     let mut consuming_edges = 0usize;
     let mut has_accept = false;
     for state in 0..states {
@@ -752,13 +794,17 @@ fn validate_graph(raw: &RawPlan, states: usize) -> Result<(usize, usize), Compil
             } else {
                 zero_width_edges =
                     checked_edge_increment(zero_width_edges, "zero-width edge count")?;
+                if raw.edge_kinds[edge] != EdgeKind::Epsilon {
+                    assertion_edges =
+                        checked_edge_increment(assertion_edges, "assertion edge count")?;
+                }
             }
         }
     }
     if !has_accept {
         return Err(MalformedPlan::MissingAcceptState.into());
     }
-    Ok((zero_width_edges, consuming_edges))
+    Ok((zero_width_edges, assertion_edges, consuming_edges))
 }
 
 /// Returns true for a consuming edge and false for a zero-width edge.
