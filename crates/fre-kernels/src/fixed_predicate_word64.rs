@@ -16,15 +16,16 @@ use memchr::{memchr, memchr2};
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate anchor-or-Shift-And strategy.
-pub const PLAN_ID: &str = "fixed-predicate-word64.fixed-anchor-or-shift-and.nonoverlap.v4";
+pub const PLAN_ID: &str =
+    "fixed-predicate-word64.fixed-anchor-selective-verification-or-shift-and.nonoverlap.v5";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v3";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v4";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v3";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v4";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
-pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 4;
+pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 5;
 /// Version of the partial-actual fixed-predicate construction ledger.
-pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 4;
+pub const BUILD_ATTEMPT_ACCOUNTING_VERSION: u32 = 5;
 /// Minimum fixed word width accepted by this closed kernel.
 pub const MIN_WIDTH: usize = 1;
 /// Maximum fixed word width representable by one Shift-And state.
@@ -885,6 +886,7 @@ pub struct FixedPredicateWord64Plan {
     width: usize,
     accepting_bit: u64,
     anchor: Anchor,
+    secondary_anchor: Option<Anchor>,
     build: BuildAccounting,
 }
 
@@ -936,6 +938,21 @@ impl Anchor {
                 second,
             } => (Reducer::TwoByteAnchor, offset, [first, second]),
             Self::ShiftAnd => (Reducer::ShiftAnd, 0, [0, 0]),
+        }
+    }
+
+    const fn offset(self) -> Option<u8> {
+        match self {
+            Self::One { offset, .. } | Self::Two { offset, .. } => Some(offset),
+            Self::ShiftAnd => None,
+        }
+    }
+
+    const fn matches(self, byte: u8) -> Option<bool> {
+        match self {
+            Self::One { byte: expected, .. } => Some(byte == expected),
+            Self::Two { first, second, .. } => Some(byte == first || byte == second),
+            Self::ShiftAnd => None,
         }
     }
 }
@@ -1117,9 +1134,11 @@ fn select_anchor(
     masks: &[u64; MASK_SLOTS],
     width: usize,
     tracker: &mut BuildAttemptTracker,
-) -> Result<Anchor, BuildError> {
+) -> Result<(Anchor, Option<Anchor>), BuildError> {
     let mut selected = Anchor::ShiftAnd;
     let mut selected_score = None;
+    let mut secondary_anchor = None;
+    let mut secondary_score = None;
     for position in 0..width {
         let shift = u32::try_from(position).map_err(|_| BuildError::ArithmeticOverflow {
             computation: "anchor position shift conversion",
@@ -1154,29 +1173,34 @@ fn select_anchor(
                     "nonempty anchor lost its frequency rank",
                 ))?;
             let score = (rank, members);
-            if selected_score.is_some_and(|prior| score > prior) {
-                continue;
-            }
-            selected_score = Some(score);
-            selected = if members == 1 {
+            let offset = u8::try_from(position)
+                .map_err(|_| BuildError::InternalInvariant("anchor offset exceeded one byte"))?;
+            let candidate = if members == 1 {
                 Anchor::One {
-                    offset: u8::try_from(position).map_err(|_| {
-                        BuildError::InternalInvariant("anchor offset exceeded one byte")
-                    })?,
+                    offset,
                     byte: bytes[0],
                 }
             } else {
                 Anchor::Two {
-                    offset: u8::try_from(position).map_err(|_| {
-                        BuildError::InternalInvariant("anchor offset exceeded one byte")
-                    })?,
+                    offset,
                     first: bytes[0],
                     second: bytes[1],
                 }
             };
+            if selected_score.is_some_and(|prior| score > prior) {
+                if secondary_score.is_none_or(|prior| score <= prior) {
+                    secondary_score = Some(score);
+                    secondary_anchor = Some(candidate);
+                }
+                continue;
+            }
+            secondary_score = selected_score;
+            secondary_anchor = selected.offset().map(|_| selected);
+            selected_score = Some(score);
+            selected = candidate;
         }
     }
-    Ok(selected)
+    Ok((selected, secondary_anchor))
 }
 
 fn actual_build_work(
@@ -1245,7 +1269,7 @@ impl FixedPredicateWord64Plan {
         let result = (|| {
             let preflight = preflight_build(positions, limits)?;
             let (masks, member_writes) = compile_masks(positions, &mut tracker)?;
-            let anchor = select_anchor(&masks, preflight.width, &mut tracker)?;
+            let (anchor, secondary_anchor) = select_anchor(&masks, preflight.width, &mut tracker)?;
             tracker.finish(preflight)?;
             let independently_counted_work = actual_build_work(
                 preflight.width,
@@ -1297,6 +1321,7 @@ impl FixedPredicateWord64Plan {
                 width: preflight.width,
                 accepting_bit,
                 anchor,
+                secondary_anchor,
                 build,
             })
         })();
@@ -1800,8 +1825,19 @@ impl FixedPredicateWord64Plan {
     ) -> Option<bool> {
         let end = start.checked_add(self.width)?;
         let candidate = haystack.get(start..end)?;
-        for (position, &byte) in candidate.iter().enumerate() {
+        let secondary = self.secondary_anchor;
+        let secondary_offset = secondary.and_then(Anchor::offset).map(usize::from);
+        if let Some(anchor) = secondary {
+            let position = secondary_offset?;
             if position == anchor_offset {
+                return None;
+            }
+            if !anchor.matches(*candidate.get(position)?)? {
+                return Some(false);
+            }
+        }
+        for (position, &byte) in candidate.iter().enumerate() {
+            if position == anchor_offset || Some(position) == secondary_offset {
                 continue;
             }
             let shift = u32::try_from(position).ok()?;
@@ -2000,9 +2036,26 @@ impl FixedPredicateWord64Plan {
         anchor_offset: usize,
         predicate_checks: &mut usize,
     ) -> Result<bool, ReduceError> {
-        for position in 0..self.width {
+        let end = start
+            .checked_add(self.width)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual predicate candidate end",
+            })?;
+        let candidate = haystack
+            .get(start..end)
+            .ok_or(ReduceError::InternalInvariant(
+                "fixed predicate candidate escaped the input",
+            ))?;
+        let secondary = self.secondary_anchor;
+        let secondary_offset = secondary.and_then(Anchor::offset).map(usize::from);
+        if let Some(anchor) = secondary {
+            let position = secondary_offset.ok_or(ReduceError::InternalInvariant(
+                "secondary anchor selected Shift-And",
+            ))?;
             if position == anchor_offset {
-                continue;
+                return Err(ReduceError::InternalInvariant(
+                    "secondary anchor duplicated the primary anchor",
+                ));
             }
             *predicate_checks =
                 predicate_checks
@@ -2010,27 +2063,58 @@ impl FixedPredicateWord64Plan {
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "actual predicate checks",
                     })?;
-            let index = start
-                .checked_add(position)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual predicate position",
-                })?;
-            let byte = *haystack.get(index).ok_or(ReduceError::InternalInvariant(
-                "fixed predicate candidate escaped the input",
-            ))?;
-            let shift = u32::try_from(position).map_err(|_| ReduceError::ArithmeticOverflow {
-                computation: "actual predicate bit shift",
-            })?;
-            let bit = 1_u64
-                .checked_shl(shift)
-                .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "actual predicate bit",
-                })?;
-            if self.masks[usize::from(byte)] & bit == 0 {
+            if !anchor
+                .matches(
+                    *candidate
+                        .get(position)
+                        .ok_or(ReduceError::InternalInvariant(
+                            "fixed predicate candidate escaped the input",
+                        ))?,
+                )
+                .ok_or(ReduceError::InternalInvariant(
+                    "secondary anchor selected Shift-And",
+                ))?
+            {
+                return Ok(false);
+            }
+        }
+        for position in 0..self.width {
+            if position == anchor_offset || Some(position) == secondary_offset {
+                continue;
+            }
+            if !self.anchor_candidate_position_matches(candidate, position, predicate_checks)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    fn anchor_candidate_position_matches(
+        &self,
+        candidate: &[u8],
+        position: usize,
+        predicate_checks: &mut usize,
+    ) -> Result<bool, ReduceError> {
+        *predicate_checks =
+            predicate_checks
+                .checked_add(1)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "actual predicate checks",
+                })?;
+        let byte = *candidate
+            .get(position)
+            .ok_or(ReduceError::InternalInvariant(
+                "fixed predicate candidate escaped the input",
+            ))?;
+        let shift = u32::try_from(position).map_err(|_| ReduceError::ArithmeticOverflow {
+            computation: "actual predicate bit shift",
+        })?;
+        let bit = 1_u64
+            .checked_shl(shift)
+            .ok_or(ReduceError::ArithmeticOverflow {
+                computation: "actual predicate bit",
+            })?;
+        Ok(self.masks[usize::from(byte)] & bit != 0)
     }
 
     fn finish_anchor_actual(
@@ -2387,6 +2471,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn secondary_exact_anchor_rejects_false_candidates_before_broad_predicates() {
+        const LOWER: &[(u8, u8)] = &[(b'a', b'z')];
+        const S: &[(u8, u8)] = &[(b's', b's')];
+        const H: &[(u8, u8)] = &[(b'h', b'h')];
+        const I: &[(u8, u8)] = &[(b'i', b'i')];
+        const N: &[(u8, u8)] = &[(b'n', b'n')];
+        const G: &[(u8, u8)] = &[(b'g', b'g')];
+        let predicates = [LOWER, S, H, I, N, G];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        let identity = plan.operation_identity(Operation::Count);
+        assert_eq!(identity.reducer, Reducer::OneByteAnchor);
+        assert_eq!(identity.anchor_offset, 5);
+        assert_eq!(identity.anchor_bytes, [b'g', 0]);
+        assert_eq!(
+            plan.secondary_anchor,
+            Some(Anchor::One {
+                offset: 2,
+                byte: b'h',
+            })
+        );
+
+        // Each primary `g` anchor fails the selective `h` check immediately.
+        // The preceding broad [a-z] predicate is never consulted.
+        let haystack = b"aaaaagaaaaag";
+        let counted = plan.count(haystack, ReduceLimits::unlimited()).unwrap();
+        assert_eq!(counted.count, 0);
+        assert_eq!(counted.accounting.actual.anchor_candidates, 2);
+        assert_eq!(counted.accounting.actual.predicate_checks, 2);
+        assert_eq!(
+            plan.count_value_success(haystack, ReduceLimits::unlimited()),
+            Some(0)
+        );
+        assert_eq!(
+            plan.span_sum_value_success(haystack, ReduceLimits::unlimited()),
+            Some(0)
+        );
+
+        let matching = b"ashing bshing zshing";
+        let expected = naive_count(matching, &predicates);
+        assert_eq!(expected, 3);
+        assert_eq!(
+            plan.count_value_success(matching, ReduceLimits::unlimited()),
+            Some(expected)
+        );
+        assert_eq!(
+            plan.span_sum_value_success(matching, ReduceLimits::unlimited()),
+            expected.checked_mul(6)
+        );
     }
 
     #[test]
