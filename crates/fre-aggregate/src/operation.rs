@@ -2845,7 +2845,7 @@ impl CompiledRegex {
         enforce(0, limits.max_scratch_bytes, Resource::ScratchBytes)?;
         enforce(0, limits.max_log_bytes, Resource::LogBytes)?;
         enforce(
-            local.len(),
+            envelope.sequential_bytes_bound,
             limits.max_sequential_bytes,
             Resource::SequentialBytes,
         )?;
@@ -4910,7 +4910,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
-            let factor = add(plan.literal().len(), 1, Resource::ExecutionWork)?;
+            let factor = add(plan.literal().len(), 3, Resource::ExecutionWork)?;
             mul(input_bytes, factor, Resource::ExecutionWork)?
         }
     };
@@ -4932,6 +4932,13 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
         }
     };
+    let sequential_bytes_bound = match plan.topology() {
+        StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
+            let factor = add(plan.literal().len(), 1, Resource::SequentialBytes)?;
+            mul(input_bytes, factor, Resource::SequentialBytes)?
+        }
+        _ => input_bytes,
+    };
     Ok(StateByteReducerEnvelope {
         boundaries,
         structural_work_bound,
@@ -4939,6 +4946,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         state_transition_bound,
         root_probe_bound,
         random_access_bytes_read,
+        sequential_bytes_bound,
     })
 }
 
@@ -4950,6 +4958,7 @@ struct StateByteReducerEnvelope {
     state_transition_bound: usize,
     root_probe_bound: usize,
     random_access_bytes_read: usize,
+    sequential_bytes_bound: usize,
 }
 
 fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
@@ -4966,7 +4975,7 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         root_probes: envelope.root_probe_bound.min(envelope.work_bound),
         successful_paths: input_bytes.min(envelope.work_bound),
         emitted_matches: input_bytes.min(envelope.work_bound),
-        sequential_bytes_read: input_bytes.min(envelope.work_bound),
+        sequential_bytes_read: envelope.sequential_bytes_bound.min(envelope.work_bound),
         random_access_bytes_read: envelope.random_access_bytes_read.min(envelope.work_bound),
         work: envelope.work_bound,
         ..ExecutionAccounting::default()
@@ -4982,7 +4991,7 @@ fn state_byte_reducer_prospective<const OBSERVED_WORK: bool>(
         random_access_bytes: 0,
         scratch_bytes: 0,
         log_bytes: 0,
-        sequential_bytes: input_bytes,
+        sequential_bytes: envelope.sequential_bytes_bound,
         match_events: input_bytes,
         output_matches: input_bytes,
         output_bytes: 0,
@@ -5240,36 +5249,79 @@ fn reduce_repeated_lazy_delimiter_suffix(
         ));
     }
 
+    // Search the mandatory suffix first. A source with no suffix can be
+    // rejected by one native literal scan without enumerating a potentially
+    // dense delimiter stream. When a suffix is preceded by the delimiter,
+    // advance the delimiter/barrier recurrence only through that candidate.
+    // The two monotone cursors never replay recurrence state; overlapping
+    // suffix searches are bounded by the retained literal width.
     let mut run_start = 0_usize;
-    let mut search = 0_usize;
+    let mut suffix_search = 0_usize;
+    let mut event_cursor = 0_usize;
     let mut delimiters = 0_usize;
     let mut matches = 0_usize;
     let mut span_sum = 0_usize;
-    while search < haystack.len() {
-        let Some((index, byte)) = state_byte_find_either(
-            *delimiter, barrier, haystack, search, work_limit, accounting,
-        )?
+    while suffix_search < haystack.len() {
+        let Some(suffix_start) =
+            state_byte_find_literal(suffix, haystack, suffix_search, work_limit, accounting)?
         else {
             break;
         };
-        search = add(index, 1, Resource::Boundaries)?;
-        if !state_byte_compare_cached(byte, *delimiter, work_limit, accounting)? {
-            if byte != barrier {
-                return Err(Error::InternalInvariant(
-                    "state-byte memchr2 returned an unrequested byte",
-                ));
+        suffix_search = add(suffix_start, 1, Resource::Boundaries)?;
+        let Some(delimiter_index) = suffix_start.checked_sub(1) else {
+            continue;
+        };
+        if !state_byte_compare_source(
+            haystack,
+            delimiter_index,
+            *delimiter,
+            work_limit,
+            accounting,
+        )? {
+            continue;
+        }
+
+        let recurrence_source = haystack
+            .get(..suffix_start)
+            .ok_or(Error::InternalInvariant(
+                "state-byte suffix candidate exceeds admitted source",
+            ))?;
+        while event_cursor < suffix_start {
+            let Some((index, byte)) = state_byte_find_either(
+                *delimiter,
+                barrier,
+                recurrence_source,
+                event_cursor,
+                work_limit,
+                accounting,
+            )?
+            else {
+                event_cursor = suffix_start;
+                break;
+            };
+            event_cursor = add(index, 1, Resource::Boundaries)?;
+            if state_byte_compare_cached(byte, *delimiter, work_limit, accounting)? {
+                delimiters = add(delimiters, 1, Resource::Boundaries)?;
+            } else {
+                if byte != barrier {
+                    return Err(Error::InternalInvariant(
+                        "state-byte memchr2 returned an unrequested byte",
+                    ));
+                }
+                run_start = event_cursor;
+                delimiters = 0;
             }
-            run_start = search;
-            delimiters = 0;
+        }
+        if event_cursor != suffix_start {
+            return Err(Error::InternalInvariant(
+                "state-byte suffix recurrence did not reach its candidate",
+            ));
+        }
+        if delimiters < plan.repeat_count() {
             continue;
         }
-        delimiters = add(delimiters, 1, Resource::Boundaries)?;
-        if delimiters < plan.repeat_count()
-            || !state_byte_suffix_matches(suffix, haystack, search, work_limit, accounting)?
-        {
-            continue;
-        }
-        let end = add(search, suffix.len(), Resource::Boundaries)?;
+
+        let end = add(suffix_start, suffix.len(), Resource::Boundaries)?;
         state_byte_event(work_limit, accounting)?;
         matches = add(matches, 1, Resource::OutputMatches)?;
         span_sum = add(
@@ -5279,7 +5331,8 @@ fn reduce_repeated_lazy_delimiter_suffix(
             ))?,
             Resource::SpanSum,
         )?;
-        search = end;
+        suffix_search = end;
+        event_cursor = end;
         run_start = end;
         delimiters = 0;
     }
@@ -5321,25 +5374,6 @@ fn state_byte_find_either(
         ));
     }
     Ok(None)
-}
-
-fn state_byte_suffix_matches(
-    suffix: &[u8],
-    haystack: &[u8],
-    start: usize,
-    work_limit: usize,
-    accounting: &mut impl StateByteMeter,
-) -> Result<bool, Error> {
-    if haystack.len().saturating_sub(start) < suffix.len() {
-        return Ok(false);
-    }
-    for (offset, &expected) in suffix.iter().enumerate() {
-        let index = add(start, offset, Resource::Boundaries)?;
-        if !state_byte_compare_source(haystack, index, expected, work_limit, accounting)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 fn reduce_greedy_prefix_literal_suffix(
@@ -17102,6 +17136,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repeated_lazy_delimiter_rejects_an_absent_suffix_with_one_literal_scan() {
+        let pattern = r"(?:.*?,){13}z";
+        let haystack = vec![b','; 16_384];
+        let compiled = state_byte_span_sum_fixture(pattern);
+        assert_eq!(
+            compiled
+                .state_byte_span_sum
+                .as_ref()
+                .map(StateByteSpanSumPlan::topology),
+            Some(StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix)
+        );
+        let result = compiled
+            .span_sum_value_with_receipt(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(result.value, 0);
+        assert_eq!(result.receipt.actual.work, haystack.len());
+        assert_eq!(result.receipt.actual.sequential_bytes_read, haystack.len());
+        assert_eq!(result.receipt.actual.random_access_bytes_read, 0);
+        assert_eq!(result.receipt.actual.root_probes, haystack.len());
+        assert!(result.receipt.authenticates_success());
     }
 
     #[test]
