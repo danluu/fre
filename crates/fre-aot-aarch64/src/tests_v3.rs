@@ -192,7 +192,10 @@ fn sve_direct_64_start_body_is_column_major_and_mul_vl_addressed() {
         (CountV3RequiredIsa::Aarch64SveVl16, false),
         (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
     ] {
-        let literal = b"abcd";
+        // Four distinct high-prevalence structural bytes keep the direct
+        // width-four graph selected even after rare-column recipes are allowed
+        // to compete with it.
+        let literal = b" \n\r\t";
         let (program, optimized) = optimized_for(literal, required_isa);
         assert_eq!(
             optimized.recipe().strategy(),

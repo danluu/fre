@@ -344,9 +344,19 @@ fn primary_filter_rank_is_pattern_only_and_encoding_structural() {
 }
 
 #[test]
-fn short_non_overlapping_literals_select_direct_exact_masks() {
-    for literal in [&b"ab"[..], &b"abc"[..], &b"abcd"[..]] {
-        let optimized = optimize(literal);
+fn width_two_retains_the_direct_exact_mask_on_every_isa() {
+    for required_isa in [
+        CountV3RequiredIsa::Aarch64Neon128,
+        CountV3RequiredIsa::Aarch64SveVl16,
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+    ] {
+        let optimized = optimize_count_v3_for_isa(
+            &program(b"ab"),
+            CountV3TuningClass::GenericAarch64,
+            required_isa,
+            CountV3OptimizerLimits::default(),
+        )
+        .expect("bounded width-two optimization");
         assert_eq!(
             optimized.recipe().strategy(),
             CountV3Strategy::DirectExactMask
@@ -355,20 +365,100 @@ fn short_non_overlapping_literals_select_direct_exact_masks() {
             optimized.recipe().schedule_id(),
             CountV3ScheduleId::DirectExactMaskV1
         );
-        assert_eq!(
-            optimized.recipe().filter_offsets(),
-            &[0, 1, 2, 3][..literal.len()]
-        );
-        assert_eq!(
-            optimized.facts().minimum_period(),
-            u8::try_from(literal.len()).unwrap()
-        );
+        assert_eq!(optimized.recipe().filter_offsets(), &[0, 1]);
+        assert_eq!(optimized.facts().minimum_period(), 2);
     }
 
     assert_ne!(
         optimize(b"aaa").recipe().strategy(),
         CountV3Strategy::DirectExactMask
     );
+}
+
+#[test]
+fn width_three_and_four_direct_masks_compete_with_filtered_recipes() {
+    for literal in [&b"abc"[..], &b"abcd"[..]] {
+        for required_isa in [
+            CountV3RequiredIsa::Aarch64Neon128,
+            CountV3RequiredIsa::Aarch64SveVl16,
+            CountV3RequiredIsa::Aarch64Sve2Vl16,
+        ] {
+            let mut work = Work::default();
+            let analysis = analyze_literal(literal, &mut work).expect("literal analysis");
+            let frontier =
+                build_column_frontier(literal, &analysis, &mut work).expect("column frontier");
+            let expected = count_portfolio(
+                literal,
+                analysis.facts,
+                &analysis.multiplicity,
+                &frontier,
+                &mut work,
+            )
+            .expect("portfolio count");
+            let mut candidates = build_portfolio(
+                literal,
+                analysis.facts,
+                &analysis.multiplicity,
+                &frontier,
+                required_isa,
+                expected,
+                &mut work,
+            )
+            .expect("portfolio");
+            mark_pareto(&mut candidates, &mut work).expect("Pareto marking");
+
+            assert!(
+                candidates.iter().any(|candidate| {
+                    candidate.strategy == CountV3Strategy::DirectExactMask && candidate.pareto
+                }),
+                "{required_isa:?} width {} lost its dense exact-mask option",
+                literal.len()
+            );
+            assert!(
+                candidates.iter().any(|candidate| {
+                    candidate.strategy != CountV3Strategy::DirectExactMask && candidate.pareto
+                }),
+                "{required_isa:?} width {} structurally suppressed every filtered option",
+                literal.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn short_literal_selection_uses_static_byte_classes_when_the_tradeoff_is_clear() {
+    for required_isa in [
+        CountV3RequiredIsa::Aarch64Neon128,
+        CountV3RequiredIsa::Aarch64SveVl16,
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+    ] {
+        for (common, rare) in [
+            (&b"abc"[..], &[0_u8, 1, 2][..]),
+            (&b"abcd"[..], &[0_u8, 1, 2, 3][..]),
+        ] {
+            let optimize_for = |literal: &[u8]| {
+                optimize_count_v3_for_isa(
+                    &program(literal),
+                    CountV3TuningClass::GenericAarch64,
+                    required_isa,
+                    CountV3OptimizerLimits::default(),
+                )
+                .expect("bounded short-literal optimization")
+            };
+            if common.len() == 3 {
+                assert_eq!(
+                    optimize_for(common).recipe().strategy(),
+                    CountV3Strategy::DirectExactMask,
+                    "{required_isa:?} should retain the width-three exact mask for common bytes"
+                );
+            }
+            assert_ne!(
+                optimize_for(rare).recipe().strategy(),
+                CountV3Strategy::DirectExactMask,
+                "{required_isa:?} should exploit a statically rare filtered column"
+            );
+        }
+    }
 }
 
 #[test]

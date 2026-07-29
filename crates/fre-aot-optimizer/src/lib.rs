@@ -1695,14 +1695,7 @@ fn estimate_costs(
                 code_size: 510 + width * 8 + period * 6 + filter_count * 32,
             }
         }
-        CountV3Strategy::DirectExactMask => CountV3CostVector {
-            sparse: 160 + width * 10,
-            dense: 180 + width * 12,
-            false_positive: 150 + width * 8,
-            matches: 170 + width * 6,
-            tail: 210 + width * 5,
-            code_size: 340 + width * 28,
-        },
+        CountV3Strategy::DirectExactMask => estimate_neon_direct_costs(width),
     };
     Ok(match required_isa {
         CountV3RequiredIsa::Aarch64Neon128 => vector,
@@ -1725,6 +1718,27 @@ fn estimate_costs(
     })
 }
 
+/// Model the fixed-width exact-mask graph from emitted instruction structure.
+///
+/// Width two is the direct schedule's sweet spot: two vector equality columns
+/// form a complete match mask without candidate recovery. Every additional
+/// column is nevertheless loaded and compared in all four 16-start blocks,
+/// even when the first byte is absent. A filtered recipe can instead amortize
+/// one rare column over its 128-start primary-empty scan. The extra sparse
+/// charge for widths three and four keeps that real tradeoff in the Pareto
+/// portfolio; the pattern-only prevalence model decides whether it is useful.
+fn estimate_neon_direct_costs(width: u32) -> CountV3CostVector {
+    let additional_columns = width.saturating_sub(2);
+    CountV3CostVector {
+        sparse: 240 + width * 70 + additional_columns * 320,
+        dense: 160 + width * 55,
+        false_positive: 190 + width * 52,
+        matches: 190 + width * 48,
+        tail: 200 + width * 32,
+        code_size: 300 + width * 56,
+    }
+}
+
 /// Model the graph the SVE backend actually emits.
 ///
 /// Unlike the NEON backend, every non-direct strategy currently shares one
@@ -1744,11 +1758,12 @@ fn estimate_sve_costs(
 ) -> CountV3CostVector {
     let match_compare_penalty = u32::from(sve2_match);
     if strategy == CountV3Strategy::DirectExactMask {
+        let additional_columns = width.saturating_sub(2);
         return CountV3CostVector {
-            sparse: 280 + width * (70 + match_compare_penalty * 12),
-            dense: 220 + width * (55 + match_compare_penalty * 10),
-            false_positive: 200 + width * (45 + match_compare_penalty * 8),
-            matches: 220 + width * (40 + match_compare_penalty * 8),
+            sparse: 260 + width * (70 + match_compare_penalty * 12) + additional_columns * 320,
+            dense: 190 + width * (60 + match_compare_penalty * 10),
+            false_positive: 180 + width * (54 + match_compare_penalty * 8),
+            matches: 190 + width * (48 + match_compare_penalty * 8),
             tail: 180 + width * 28,
             code_size: 320 + width * 36,
         };
