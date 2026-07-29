@@ -4895,8 +4895,8 @@ fn prepare_invocation(
     let required_generations = window
         .end()
         .checked_sub(window.start())
-        // Up to eight proof generations precede one generation for the initial
-        // boundary and one for every admitted byte.
+        // Up to sixteen proof generations precede one generation for the
+        // initial boundary and one for every admitted byte.
         .and_then(|length| length.checked_add(START_FILTER_POSITION_COUNT))
         .and_then(|length| length.checked_add(1))
         // An assertion-free accelerator derives one immutable initial
@@ -5585,7 +5585,8 @@ mod tests {
             BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
             BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
             START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-            START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
+            START_FILTER_MAX_OFFSET, START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+            START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, MatchSpan, RawPlan,
         ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
@@ -5653,10 +5654,7 @@ mod tests {
         .unwrap()
     }
 
-    fn absolute_byte_or_eight_byte_chain(
-        absolute: u8,
-        ranges: &[(u8, u8); START_FILTER_POSITION_COUNT],
-    ) -> Automaton {
+    fn absolute_byte_or_eight_byte_chain(absolute: u8, ranges: &[(u8, u8); 8]) -> Automaton {
         let mut byte_starts = vec![0, 0, absolute];
         byte_starts.extend(ranges.iter().map(|&(start, _)| start));
         let mut byte_ends = vec![0, 0, absolute];
@@ -6516,6 +6514,40 @@ mod tests {
     }
 
     #[test]
+    fn start_filter_depth_layout_and_selection_bound_cover_one_simd_block() {
+        assert_eq!(START_FILTER_POSITION_COUNT, ASCII_NARROW_BYTES);
+        assert_eq!(START_FILTER_POSITION_COUNT, 16);
+        assert_eq!(START_FILTER_MAX_OFFSET, 15);
+
+        let expected_selection_work = START_FILTER_POSITION_COUNT
+            .checked_mul(
+                BYTE_START_BITMAP_POPULATION_WORK
+                    .checked_add(START_FILTER_SCANNER_SELECTION_WORK)
+                    .unwrap(),
+            )
+            .and_then(|work| {
+                START_FILTER_MAX_OFFSET
+                    .checked_mul(START_FILTER_GUARD_SELECTION_WORK)
+                    .and_then(|guards| work.checked_add(guards))
+            })
+            .and_then(|work| work.checked_add(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK))
+            .unwrap();
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, expected_selection_work);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 227);
+
+        // All exact-position sets remain a transient cold stack value. The
+        // immutable owner still retains only its selected scanner and guard.
+        let expected_transient_bytes = START_FILTER_POSITION_COUNT
+            .checked_mul(size_of::<ByteSet>())
+            .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 2))
+            .unwrap();
+        assert_eq!(
+            size_of::<super::StartPositionProof>(),
+            expected_transient_bytes
+        );
+    }
+
+    #[test]
     fn start_proof_stops_at_the_exact_work_limit() {
         let automaton = ascii_root_bytes(b"abcdef");
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
@@ -6921,8 +6953,11 @@ mod tests {
     }
 
     #[test]
-    fn exact_position_scanners_zero_through_seven_match_every_window() {
-        let markers = [0, 0xff, b'Z', 0x80, b'!', 0x7f, b'/', 0xfe];
+    fn exact_position_scanners_zero_through_fifteen_match_every_window() {
+        let markers = [
+            0, 0xff, b'Z', 0x80, b'!', 0x7f, b'/', 0xfe, b'@', 0x81, b'#', 0x7e, b'_', 0x82, b'%',
+            0xfd,
+        ];
 
         for scanner_offset in 0..START_FILTER_POSITION_COUNT {
             let marker = markers[scanner_offset];
@@ -7023,6 +7058,90 @@ mod tests {
                 core::ptr::eq(proof, published),
                 "a warm call must borrow the original immutable proof"
             );
+        }
+    }
+
+    #[test]
+    fn exact_position_depth_thresholds_are_exact_and_correct() {
+        let proof_work = u64::try_from(
+            START_FILTER_POSITION_COUNT
+                .checked_mul(3)
+                .and_then(|work| work.checked_sub(1))
+                .unwrap(),
+        )
+        .unwrap();
+        let selection_work = expected_start_class_selection_work(START_FILTER_POSITION_COUNT);
+        let marker = 0xfe;
+
+        for scanner_offset in [7, 8, 15, 16] {
+            let eligible = scanner_offset <= START_FILTER_MAX_OFFSET;
+            let mut ranges = vec![(0, 0xff); START_FILTER_POSITION_COUNT + 1];
+            ranges[scanner_offset] = (marker, marker);
+            let mut valid = vec![b'x'; ranges.len()];
+            valid[scanner_offset] = marker;
+            let mut shifted = vec![b'?'; 3];
+            shifted.extend_from_slice(&valid);
+            shifted.extend_from_slice(b"tail");
+            let haystacks = vec![vec![], valid[..valid.len() - 1].to_vec(), valid, shifted];
+            let expected = StartFilterProof {
+                scanner: eligible.then_some(positioned_scanner(
+                    u8::try_from(scanner_offset).unwrap(),
+                    StartScanner::One(marker),
+                )),
+                guard: None,
+                force_haystack_start: false,
+                relaxed_nullable: false,
+            };
+            assert_chain_filter_matches_unspecialized(
+                &format!("exact-position-threshold-{scanner_offset}"),
+                &ranges,
+                expected,
+                &haystacks,
+            );
+
+            let measured = byte_chain(&ranges);
+            let mut workspace = K0Workspace::new(&measured, WorkspaceLimits::unlimited()).unwrap();
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let pending =
+                super::prepare_start_filter(&measured, &mut workspace, &mut meter, 37).unwrap();
+            assert_eq!(pending.proof(), &expected);
+            let expected_work = proof_work
+                .checked_add(selection_work)
+                .and_then(|work| {
+                    work.checked_add(if eligible {
+                        expected_scanner_construction_work(&[marker])
+                    } else {
+                        0
+                    })
+                })
+                .unwrap();
+            assert_eq!(
+                meter.consumed, expected_work,
+                "offset {scanner_offset} used unexpected proof work"
+            );
+
+            let refused = byte_chain(&ranges);
+            let mut refused_workspace =
+                K0Workspace::new(&refused, WorkspaceLimits::unlimited()).unwrap();
+            let one_below = expected_work.checked_sub(1).unwrap();
+            let mut refused_meter = WorkMeter::new(one_below, 0);
+            let Err(error) = super::prepare_start_filter(
+                &refused,
+                &mut refused_workspace,
+                &mut refused_meter,
+                37,
+            ) else {
+                panic!("one-below proof work unexpectedly succeeded");
+            };
+            assert!(matches!(
+                error,
+                SearchError::WorkLimitExceeded {
+                    limit,
+                    consumed,
+                    requested: 1,
+                    position: 37,
+                } if limit == one_below && consumed == one_below
+            ));
         }
     }
 

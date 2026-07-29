@@ -21,9 +21,9 @@ fn next_automaton_identity() -> u64 {
 }
 
 /// Number of exact consumed-byte positions retained by the bounded start
-/// filter. Any of offsets zero through seven may supply the primary scanner;
-/// at most one other position may supply a candidate guard.
-pub(crate) const START_FILTER_POSITION_COUNT: usize = 8;
+/// filter. Any of offsets zero through fifteen may supply the primary
+/// scanner; at most one other position may supply a candidate guard.
+pub(crate) const START_FILTER_POSITION_COUNT: usize = 16;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
 /// Maximum candidate guards retained by one immutable start-filter proof.
@@ -720,7 +720,7 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // up to eight exact-position byte classes and selects a scanner plus
+        // up to sixteen exact-position byte classes and selects a scanner plus
         // one guard. Each depth may inspect a state twice and a consuming edge
         // twice while building the next frontier, in addition to the ordinary
         // edge inspection. Later invocations read the automaton-owned result.
