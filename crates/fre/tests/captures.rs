@@ -3705,6 +3705,44 @@ fn aggregate_capture_routes_report_fanout_and_prepublication_history_fallback() 
 }
 
 #[test]
+fn line_batch_separator_proof_is_structural_and_context_free() {
+    let build = |pattern: &str| {
+        let mut limits = CaptureBuildLimits::default();
+        limits.required_literal = Some(CaptureRequiredLiteralBuildLimits::default());
+        CaptureBuilder::new(pattern)
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .expect("capture build")
+    };
+
+    let admitted = build(r"(ab)(c)?");
+    let proof = admitted
+        .line_batch_proof()
+        .expect("positive context-free HIR has an excluded ASCII separator");
+    assert!(proof.minimum_match_bytes > 0);
+    assert!(proof.planner_work > 0);
+    assert_eq!(
+        admitted.build_report().line_batch,
+        admitted.build_report().plan_identity.line_batch
+    );
+    assert_eq!(admitted.build_report().line_batch, Some(proof));
+
+    assert!(
+        build(r"(ab)$").line_batch_proof().is_none(),
+        "look assertions make independent domains context-sensitive"
+    );
+    assert!(
+        build(r"([\x00-\x7F]+)z").line_batch_proof().is_none(),
+        "a consumer covering every ASCII scalar leaves no separator"
+    );
+    assert!(
+        build(r"(a?)").line_batch_proof().is_none(),
+        "nullable matches cannot be unioned by positive-domain concatenation"
+    );
+}
+
+#[test]
 fn combined_peak_caps_retained_selector_output_plus_replay_scratch() {
     let regex = CaptureBuilder::new(r"(a)(b)?")
         .unicode(false)
@@ -4164,9 +4202,13 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
     assert_eq!(raw_accounting.raw_needles, 64);
     assert_eq!(raw_accounting.needles, 2);
     assert_eq!(raw_accounting.planner_work, 9_837);
+    let line_batch_work = active
+        .line_batch_proof()
+        .expect("raw-64 effective-two plan has an excluded ASCII separator")
+        .planner_work;
     assert_eq!(
         active.build_report().hir.work,
-        without_optional.build_report().hir.work + raw_accounting.planner_work
+        without_optional.build_report().hir.work + raw_accounting.planner_work + line_batch_work
     );
 
     let post_loop_refusal = CaptureRequiredLiteralBuildLimits {
@@ -4180,9 +4222,9 @@ fn required_literal_proof_shares_the_single_capture_parse_and_exact_limits() {
         .expect("post-loop optional failure preserves capture route");
     assert!(fallback.required_literal_plan().is_none());
     assert_eq!(
-        fallback.build_report().hir.work,
+        fallback.build_report().hir.work + line_batch_work,
         active.build_report().hir.work,
-        "post-loop optional failure lost cumulative planner work"
+        "post-loop optional failure lost cumulative required-literal planner work"
     );
     assert_eq!(
         fallback

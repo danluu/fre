@@ -194,6 +194,19 @@ pub struct OrderedRootCaptureManyProof {
     pub proof_work: usize,
 }
 
+/// Construction proof that independent line domains may be concatenated for
+/// capture-participation Count by inserting one non-consuming ASCII scalar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureLineBatchProof {
+    /// ASCII byte rejected by every consuming HIR atom.
+    pub separator: u8,
+    /// Positive whole-match minimum from the same canonical HIR.
+    pub minimum_match_bytes: usize,
+    /// Metered canonical-HIR work used to establish delimiter exclusion and
+    /// the absence of context-sensitive look assertions.
+    pub planner_work: usize,
+}
+
 /// Only permitted construction-time action when the fixed participation
 /// quotient cannot represent the complete capture schema.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +358,8 @@ pub struct CapturePlanIdentity {
     pub ordered_root_capture_many: Option<OrderedRootCaptureManyProof>,
     /// Optional generic required-any-literal proof sharing this exact syntax.
     pub required_literal: Option<CaptureRequiredLiteralIdentity>,
+    /// Optional separator theorem for exact independent-domain batching.
+    pub line_batch: Option<CaptureLineBatchProof>,
     /// Direct physical route and its declared U3 fallback, when selected.
     pub prefix_class_participation: Option<CapturePrefixClassParticipationIdentity>,
 }
@@ -369,6 +384,8 @@ pub struct CaptureBuildReport {
     pub ordered_root_capture_many: Option<OrderedRootCaptureManyProof>,
     /// Optional bounded required-literal construction receipt.
     pub required_literal: Option<CaptureRequiredLiteralBuildAccounting>,
+    /// Optional exact separator theorem for independent line batching.
+    pub line_batch: Option<CaptureLineBatchProof>,
     /// Additional canonical-HIR work used to accept or refuse the optional
     /// direct prefix/class route.
     pub prefix_class_participation_planner_work: usize,
@@ -2163,6 +2180,11 @@ impl CaptureBuilder {
         let selector_accounting = selector.compile_accounting();
         let uniform_participating_captures =
             capture_participation(&rust.hir, 1, &limits, &mut accounting)?.uniform;
+        let line_batch = if required_literal.is_some() {
+            capture_line_batch_proof(&rust.hir, &limits, &mut accounting)?
+        } else {
+            None
+        };
         if ordered_root_capture_many.is_some() && uniform_participating_captures != Some(1) {
             return Err(CaptureBuildError::InternalInvariant(
                 "ordered-root proof disagrees with participation analysis",
@@ -2240,6 +2262,7 @@ impl CaptureBuilder {
             required_literal: required_literal
                 .as_ref()
                 .map(|plan| plan.build_report().identity.clone()),
+            line_batch,
             prefix_class_participation: prefix_class_participation
                 .plan
                 .as_ref()
@@ -2379,6 +2402,7 @@ impl CaptureBuilder {
             required_literal: required_literal
                 .as_ref()
                 .map(|plan| plan.build_report().accounting),
+            line_batch,
             prefix_class_participation_planner_work: prefix_class_participation.planner_work,
             prefix_class_participation: prefix_class_participation_build,
             plan_identity,
@@ -2946,6 +2970,13 @@ impl CaptureRegex {
     #[must_use]
     pub const fn required_literal_plan(&self) -> Option<&CaptureRequiredLiteralPlan> {
         self.required_literal.as_ref()
+    }
+
+    /// Optional construction proof for concatenating independent positive-width
+    /// domains with a non-consuming ASCII separator.
+    #[must_use]
+    pub const fn line_batch_proof(&self) -> Option<CaptureLineBatchProof> {
+        self.report.plan_identity.line_batch
     }
 
     /// Exact cache identity for these execution limits.
@@ -3633,6 +3664,28 @@ impl CaptureRegex {
         haystack: &[u8],
         limits: CaptureRunLimits,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        self.count_captures_with_selector_work(haystack, limits, false)
+    }
+
+    /// Execute Count with exact observed selector-work admission. This is used
+    /// by a construction-certified independent-domain batch whose selector
+    /// economics can prefer the bounded frontier cache without changing the
+    /// ordinary Count route.
+    #[doc(hidden)]
+    pub fn count_captures_observed_selector(
+        &self,
+        haystack: &[u8],
+        limits: CaptureRunLimits,
+    ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
+        self.count_captures_with_selector_work(haystack, limits, true)
+    }
+
+    fn count_captures_with_selector_work(
+        &self,
+        haystack: &[u8],
+        limits: CaptureRunLimits,
+        observed_selector: bool,
+    ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let identity = self.cache_identity(limits);
         let mut selector_limits = limits.selector;
         selector_limits.max_peak_bytes = selector_limits
@@ -3749,7 +3802,13 @@ impl CaptureRegex {
                 combined_peak_bytes: selector_accounting.peak_bytes,
             });
         }
-        self.count_nonuniform_captures(haystack, &limits, selector_limits, identity)
+        self.count_nonuniform_captures(
+            haystack,
+            &limits,
+            selector_limits,
+            identity,
+            observed_selector,
+        )
     }
 
     #[allow(
@@ -3763,6 +3822,7 @@ impl CaptureRegex {
         limits: &CaptureRunLimits,
         selector_limits: SelectorOperationLimits,
         identity: CaptureCacheIdentity,
+        observed_selector: bool,
     ) -> Result<CaptureExecutionReport, CaptureExecutionError> {
         let use_participation_quotient = match identity.plan.plan {
             CapturePlanKind::LinearSelectorParticipationQuotientV1
@@ -3832,21 +3892,28 @@ impl CaptureRegex {
                 });
             }
         };
-        let selected = self
-            .selector
-            .admit_spans(
+        let selected = if observed_selector {
+            self.selector.admit_spans_observed_cached_when_amortized(
                 haystack,
                 0..haystack.len(),
                 SelectorStrategy::ReverseSequentialRows,
                 selector_limits,
             )
-            .map_err(|source| CaptureExecutionError {
-                identity: identity.clone(),
-                source: CaptureExecutionSource::Selector(source),
-                selector_receipt: None,
-                prefix_class_participation_receipt: None,
-                count_receipt: None,
-            })?;
+        } else {
+            self.selector.admit_spans(
+                haystack,
+                0..haystack.len(),
+                SelectorStrategy::ReverseSequentialRows,
+                selector_limits,
+            )
+        }
+        .map_err(|source| CaptureExecutionError {
+            identity: identity.clone(),
+            source: CaptureExecutionSource::Selector(source),
+            selector_receipt: None,
+            prefix_class_participation_receipt: None,
+            count_receipt: None,
+        })?;
         let selector_accounting = selected.accounting();
         let replay_scratch_limit = limits
             .max_combined_peak_bytes
@@ -5610,6 +5677,134 @@ fn zero_one_unit_language(
             Ok(Some(combined))
         }
     }
+}
+
+fn capture_line_batch_proof(
+    hir: &Hir,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+) -> Result<Option<CaptureLineBatchProof>, CaptureBuildError> {
+    let Some(minimum_match_bytes) = hir
+        .properties()
+        .minimum_len()
+        .filter(|minimum| *minimum > 0)
+    else {
+        return Ok(None);
+    };
+    let work_before = accounting.work;
+    let mut allowed = [u64::MAX; 2];
+    if !capture_line_batch_exclusions(hir, 1, limits, accounting, &mut allowed)? {
+        return Ok(None);
+    }
+    let separator = (u8::MIN..=0x7f).find(|byte| {
+        let index = usize::from(*byte) / 64;
+        let bit = usize::from(*byte) % 64;
+        allowed[index] & (1_u64 << bit) != 0
+    });
+    let Some(separator) = separator else {
+        return Ok(None);
+    };
+    let planner_work =
+        accounting
+            .work
+            .checked_sub(work_before)
+            .ok_or(CaptureBuildError::InternalInvariant(
+                "line-batch proof work moved backward",
+            ))?;
+    Ok(Some(CaptureLineBatchProof {
+        separator,
+        minimum_match_bytes,
+        planner_work,
+    }))
+}
+
+fn capture_line_batch_exclusions(
+    hir: &Hir,
+    depth: usize,
+    limits: &CaptureBuildLimits,
+    accounting: &mut CaptureHirAccounting,
+    allowed: &mut [u64; 2],
+) -> Result<bool, CaptureBuildError> {
+    if depth > limits.max_hir_depth {
+        return Ok(false);
+    }
+    charge_hir(accounting, 1, limits.max_hir_work)?;
+    match hir.kind() {
+        HirKind::Empty => Ok(true),
+        HirKind::Look(_) => Ok(false),
+        HirKind::Literal(literal) => {
+            charge_hir(accounting, literal.0.len(), limits.max_hir_work)?;
+            for &byte in literal.0.iter().filter(|byte| **byte < 0x80) {
+                clear_line_batch_separator(allowed, byte);
+            }
+            Ok(true)
+        }
+        HirKind::Class(Class::Bytes(class)) => {
+            charge_hir(accounting, class.ranges().len(), limits.max_hir_work)?;
+            for range in class.ranges() {
+                let start = range.start();
+                let end = range.end().min(0x7f);
+                if start <= end {
+                    for byte in start..=end {
+                        clear_line_batch_separator(allowed, byte);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        HirKind::Class(Class::Unicode(class)) => {
+            charge_hir(accounting, class.ranges().len(), limits.max_hir_work)?;
+            for range in class.ranges() {
+                let start = u32::from(range.start());
+                let end = u32::from(range.end()).min(0x7f);
+                if start <= end {
+                    for scalar in start..=end {
+                        let byte = u8::try_from(scalar).map_err(|_| {
+                            CaptureBuildError::InternalInvariant(
+                                "ASCII line-batch scalar did not fit u8",
+                            )
+                        })?;
+                        clear_line_batch_separator(allowed, byte);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        HirKind::Capture(capture) => capture_line_batch_exclusions(
+            capture.sub.as_ref(),
+            next_depth(depth)?,
+            limits,
+            accounting,
+            allowed,
+        ),
+        HirKind::Repetition(repetition) => capture_line_batch_exclusions(
+            repetition.sub.as_ref(),
+            next_depth(depth)?,
+            limits,
+            accounting,
+            allowed,
+        ),
+        HirKind::Concat(children) | HirKind::Alternation(children) => {
+            for child in children {
+                if !capture_line_batch_exclusions(
+                    child,
+                    next_depth(depth)?,
+                    limits,
+                    accounting,
+                    allowed,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn clear_line_batch_separator(allowed: &mut [u64; 2], byte: u8) {
+    let index = usize::from(byte) / 64;
+    let bit = usize::from(byte) % 64;
+    allowed[index] &= !(1_u64 << bit);
 }
 
 /// Prove only the cardinality needed by the reducer while charging this

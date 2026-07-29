@@ -1461,6 +1461,71 @@ impl CompiledRegex {
         })
     }
 
+    /// Admit observed-work spans through the bounded cached frontier only
+    /// when its complete fixed initialization is clearly amortized by the
+    /// generic dense continuation envelope. This source-independent route
+    /// choice is intended for enclosing reducers that have already proved
+    /// their own candidate-domain reduction.
+    #[doc(hidden)]
+    pub fn admit_spans_observed_cached_when_amortized(
+        &self,
+        haystack: &[u8],
+        range: Range<usize>,
+        strategy: Strategy,
+        limits: OperationLimits,
+    ) -> Result<AdmittedSpans, Error> {
+        let use_cached = if strategy == Strategy::ReverseSequentialRows
+            && range.start <= range.end
+            && range.end <= haystack.len()
+        {
+            let input_bytes =
+                range
+                    .end
+                    .checked_sub(range.start)
+                    .ok_or(Error::InternalInvariant(
+                        "validated cached span range reversed",
+                    ))?;
+            let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+            match Requirements::new::<true>(&self.program, boundaries, strategy, 2, limits) {
+                Ok(dense) => {
+                    cached_frontier_amortizes_dense(&self.program, boundaries, 2, limits, dense)?
+                        .is_some()
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+        let result = if use_cached {
+            let mut accounting = ExecutionAccounting::default();
+            let mut actual_allocations = 0_usize;
+            self.execute_tracked::<true>(
+                haystack,
+                range,
+                strategy,
+                OperationKind::Spans,
+                Some(GenericCountRoute::CachedFrontier),
+                limits,
+                &mut accounting,
+                &mut actual_allocations,
+                usize::MAX,
+                None,
+                None,
+                None,
+            )?
+        } else {
+            self.execute::<true>(haystack, range, strategy, OperationKind::Spans, limits)?
+        };
+        Ok(AdmittedSpans {
+            common: Common {
+                certificate: result.certificate,
+                accounting: result.accounting,
+                marker: PhantomData,
+            },
+            spans: result.spans,
+        })
+    }
+
     /// Admit and evaluate the ordinary construction-selected continuation
     /// Spans route while retaining one complete success or terminal P/A
     /// receipt.
@@ -3168,14 +3233,19 @@ impl CompiledRegex {
         let session_cache_active = session_cache.is_some();
         match forced_generic_count_route {
             Some(_)
-                if kind != OperationKind::Count
+                if (kind != OperationKind::Count
+                    && !(kind == OperationKind::Spans
+                        && attempt.is_none()
+                        && forced_generic_count_route
+                            == Some(GenericCountRoute::CachedFrontier)))
                     || (attempt.is_none()
                         && !(session_cache_active
                             && forced_generic_count_route
-                                == Some(GenericCountRoute::CachedFrontier))) =>
+                                == Some(GenericCountRoute::CachedFrontier))
+                        && kind == OperationKind::Count) =>
             {
                 return Err(Error::InternalInvariant(
-                    "generic Count route requires a receipt-bearing Count attempt",
+                    "forced generic route requires its authenticated operation boundary",
                 ));
             }
             Some(GenericCountRoute::TerminalFrontier)
@@ -4636,6 +4706,39 @@ fn dense_reduction_work_floor(program: &Program, boundaries: usize) -> Result<us
     let build = mul(per_boundary, boundaries, Resource::ExecutionWork)?;
     let scan = mul(boundaries, 4, Resource::ExecutionWork)?;
     add(build, scan, Resource::ExecutionWork)
+}
+
+// Cached rows pay a fixed, source-independent initialization before their
+// first transition hit. Do not speculate on a marginal win: select them
+// proactively only when that complete fixed cost occupies at most one eighth
+// of the already-admitted dense work envelope. The cached executor remains
+// bounded by the same caller policy and retains its exact observed-work
+// accounting; this gate only avoids making cache success depend on an
+// artificially low caller work limit.
+const CACHED_FRONTIER_DENSE_AMORTIZATION: usize = 8;
+
+fn cached_frontier_amortizes_dense(
+    program: &Program,
+    boundaries: usize,
+    passes: usize,
+    limits: OperationLimits,
+    dense: Requirements,
+) -> Result<Option<Requirements>, Error> {
+    let Some(cached) = Requirements::cached(program, boundaries, passes, limits)? else {
+        return Ok(None);
+    };
+    let initialization = cached
+        .cached_frontier
+        .ok_or(Error::InternalInvariant(
+            "cached requirements lost their frontier shape",
+        ))?
+        .initialization_work()?;
+    let amortized = mul(
+        initialization,
+        CACHED_FRONTIER_DENSE_AMORTIZATION,
+        Resource::ExecutionWork,
+    )?;
+    Ok((amortized < dense.work_bound).then_some(cached))
 }
 
 const fn fixed_continuation_beats_dense(
@@ -11584,10 +11687,11 @@ mod tests {
         OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
         RequiredLiteralScan, Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumPlan,
         StateByteSpanSumTopology, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol,
-        cached_compute_row, cached_frontier_words, cached_program_assertion_mask,
-        cached_retained_candidate_bit, compact_operation_allocation_count, decode,
-        dense_reduction_work_floor, encoded_width, exact_filled, fixed_continuation_beats_dense,
-        operation_identity, read_encoded, scan_required_literals, write_encoded,
+        cached_compute_row, cached_frontier_amortizes_dense, cached_frontier_words,
+        cached_program_assertion_mask, cached_retained_candidate_bit,
+        compact_operation_allocation_count, decode, dense_reduction_work_floor, encoded_width,
+        exact_filled, fixed_continuation_beats_dense, operation_identity, read_encoded,
+        scan_required_literals, write_encoded,
     };
 
     fn assert_byte_row_case_parity<const OBSERVED_WORK: bool, const SPLIT_DECISIONS: bool>(
@@ -15777,6 +15881,82 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn cached_frontier_economics_require_clear_fixed_cost_amortization() {
+        let pattern = "[ab]".repeat(80);
+        let hir = ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(&pattern)
+            .unwrap();
+        let compiled = CompiledRegex::from_hir(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let limits = OperationLimits::default();
+        let boundaries = 10_001;
+        let dense = Requirements::new::<true>(
+            &compiled.program,
+            boundaries,
+            Strategy::ReverseSequentialRows,
+            2,
+            limits,
+        )
+        .unwrap();
+        let cached =
+            cached_frontier_amortizes_dense(&compiled.program, boundaries, 2, limits, dense)
+                .unwrap()
+                .expect("large dense continuation must amortize fixed cache construction");
+        assert!(cached.cached_frontier.is_some());
+        let haystack = vec![b'a'; boundaries - 1];
+        let selected = compiled
+            .admit_spans_observed_cached_when_amortized(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .expect("amortized cached spans");
+        assert_eq!(
+            selected.certificate().physical_route,
+            OperationPhysicalRoute::CachedFrontier
+        );
+        let ordinary = compiled
+            .admit_spans_observed(
+                &haystack,
+                0..haystack.len(),
+                Strategy::ReverseSequentialRows,
+                limits,
+            )
+            .expect("ordinary observed spans");
+        assert_eq!(selected.as_slice(), ordinary.as_slice());
+
+        let short_boundaries = 2;
+        let short_dense = Requirements::new::<true>(
+            &compiled.program,
+            short_boundaries,
+            Strategy::ReverseSequentialRows,
+            2,
+            limits,
+        )
+        .unwrap();
+        assert!(
+            cached_frontier_amortizes_dense(
+                &compiled.program,
+                short_boundaries,
+                2,
+                limits,
+                short_dense,
+            )
+            .unwrap()
+            .is_none(),
+            "tiny inputs retain dense rows instead of speculating on cache hits"
+        );
     }
 
     #[test]

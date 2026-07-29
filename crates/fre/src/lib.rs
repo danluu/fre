@@ -281,7 +281,7 @@ pub use captures::{
     CaptureBuildError, CaptureBuildLimits, CaptureBuildReport, CaptureBuilder,
     CaptureCacheIdentity, CaptureExecutionError, CaptureExecutionReport, CaptureExecutionSource,
     CaptureHirAccounting, CaptureIterationError, CaptureIterationIdentity,
-    CaptureIterationPlanKind, CaptureIterationReport, CaptureOperation,
+    CaptureIterationPlanKind, CaptureIterationReport, CaptureLineBatchProof, CaptureOperation,
     CaptureParticipationQuotientFallback, CaptureParticipationQuotientProof, CapturePlanIdentity,
     CapturePlanKind, CapturePrefixClassParticipationIdentity, CaptureRegex, CaptureRunLimits,
     CaptureStreamSession, CaptureUnsupported, OrderedRootCaptureManyProof, OrderedRootUnitCover,

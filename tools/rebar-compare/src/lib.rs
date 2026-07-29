@@ -169,6 +169,9 @@ pub const CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN: &str = fre::STRING_QUOTE_PREFIX
 pub const CURRENT_FRE_CAPTURE_KEYWORDS_PLAN: &str = fre::WHITESPACE_AROUND_KEYWORDS_OPERATION_ID;
 /// Stable plan label for generic required-literal line pruning plus exact capture replay.
 pub const CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN: &str = fre::CAPTURE_REQUIRED_LITERAL_PLAN_ID;
+/// Stable plan label for certified independent-line packing plus exact capture Count.
+pub const CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN: &str =
+    "capture-required-literal-line-batch-cached-v1";
 /// Stable plan label for Unicode-off anchored ASCII separated fields.
 pub const CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN: &str =
     fre::ANCHORED_ASCII_SEPARATED_FIELDS_OPERATION_ID;
@@ -203,6 +206,7 @@ fn is_current_fre_capture_plan(plan: &str) -> bool {
             | CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN
             | CURRENT_FRE_CAPTURE_KEYWORDS_PLAN
             | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+            | CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN
             | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
             | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
             | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
@@ -227,6 +231,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
                 | CURRENT_FRE_CAPTURE_STRING_QUOTE_PLAN
                 | CURRENT_FRE_CAPTURE_KEYWORDS_PLAN
                 | CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN
+                | CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN
                 | CURRENT_FRE_CAPTURE_ASCII_SEPARATED_FIELDS_PLAN
                 | CURRENT_FRE_CAPTURE_ANCHORED_LINE_PLAN
                 | CURRENT_FRE_CAPTURE_WORD_RUN_PLAN
@@ -242,7 +247,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -3497,6 +3502,7 @@ enum CurrentFreCapturePreparation {
     AbsoluteFullCount(Box<AbsoluteFullCaptureRunLimits>),
     Count(Box<CaptureRunLimits>),
     Grep,
+    LineBatch { packed: Vec<u8>, separator: u8 },
     Stream(CaptureStreamSession),
     RuffGrep(Box<LineCaptureRunLimits>),
     AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
@@ -3563,6 +3569,12 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
+        if matches!(
+            self.preparation,
+            CurrentFreCapturePreparation::LineBatch { .. }
+        ) {
+            return CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN;
+        }
         if let CurrentFreCapturePreparation::Stream(session) = &self.preparation {
             return match session.operation_prospective().construction.projection {
                 CaptureStreamProjection::ParticipationMask => {
@@ -3638,6 +3650,12 @@ impl CurrentFreCaptureLifecycle {
             ) => execute_count_captures_with_limits(regex, haystack, run_limits),
             (CurrentFreCaptureRegex::General(regex), CurrentFreCapturePreparation::Grep) => {
                 execute_grep_captures(regex, haystack, &self.limits)
+            }
+            (
+                CurrentFreCaptureRegex::General(regex),
+                CurrentFreCapturePreparation::LineBatch { packed, separator },
+            ) => {
+                execute_line_batch_grep_captures(regex, haystack, &self.limits, packed, *separator)
             }
             (CurrentFreCaptureRegex::General(_), CurrentFreCapturePreparation::Stream(session)) => {
                 session
@@ -3739,6 +3757,11 @@ impl CurrentFreCaptureLifecycle {
             (_, CurrentFreCapturePreparation::AbsoluteFullCount(_)) => {
                 return Err(CompareError::new(
                     "absolute-full count preparation reached an incompatible capture artifact",
+                ));
+            }
+            (_, CurrentFreCapturePreparation::LineBatch { .. }) => {
+                return Err(CompareError::new(
+                    "line-batch preparation reached an incompatible capture artifact",
                 ));
             }
             (_, CurrentFreCapturePreparation::Stream(_)) => {
@@ -3902,10 +3925,27 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
             } else {
                 let general = capture_grep_regex_one(pattern, unicode, case_insensitive, &limits)
                     .map_err(|error| CompareError::new(error.message))?;
-                let preparation = if active_capture_required_literal_plan(&general).is_some() {
-                    // The certified required-literal route remains its own
-                    // generic lifecycle. A reusable stream is only selected
-                    // where it is the authenticated public operation route.
+                let preparation = if active_capture_required_literal_plan(&general).is_some()
+                    && general
+                        .build_report()
+                        .required_literal
+                        .is_some_and(|accounting| accounting.line_partition_safe)
+                    && let Some(proof) = general.line_batch_proof()
+                {
+                    let capacity = haystack_len.checked_add(1).ok_or_else(|| {
+                        CompareError::new("FRE line-batch capacity overflowed usize")
+                    })?;
+                    let mut packed = Vec::new();
+                    packed.try_reserve_exact(capacity).map_err(|_| {
+                        CompareError::new(format!(
+                            "FRE line-batch failed to reserve {capacity} bytes"
+                        ))
+                    })?;
+                    CurrentFreCapturePreparation::LineBatch {
+                        packed,
+                        separator: proof.separator,
+                    }
+                } else if active_capture_required_literal_plan(&general).is_some() {
                     CurrentFreCapturePreparation::Grep
                 } else {
                     let run_limits = capture_count_run_limits(&general, haystack_len, &limits)
@@ -9127,6 +9167,179 @@ fn execute_grep_captures(
         limits,
     )
     .map(|report| report.count)
+}
+
+fn execute_line_batch_grep_captures(
+    regex: &CaptureRegex,
+    haystack: &[u8],
+    limits: &RunLimits,
+    packed: &mut Vec<u8>,
+    separator: u8,
+) -> Result<u64, ExecutionError> {
+    let proof = regex.line_batch_proof().ok_or_else(|| {
+        ExecutionError::fault("FRE line-batch route lost its canonical-HIR separator proof")
+    })?;
+    if proof.separator != separator || proof.minimum_match_bytes == 0 {
+        return Err(ExecutionError::fault(
+            "FRE line-batch preparation diverged from its separator proof",
+        ));
+    }
+    let prefilter = active_capture_required_literal_plan(regex).ok_or_else(|| {
+        ExecutionError::fault("FRE line-batch route lost its required-literal proof")
+    })?;
+    let prospective = prefilter
+        .line_partition_prospective(haystack.len())
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE line-batch required-literal prospective failed: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ExecutionError::fault(
+                "FRE line-batch required-literal proof no longer excludes line delimiters",
+            )
+        })?;
+    if prospective.transitions_upper_bound > limits.fre_literal_linear_terms {
+        return Err(ExecutionError::unsupported(format!(
+            "FRE line-batch prefilter needs {} transitions, exceeding {}",
+            prospective.transitions_upper_bound, limits.fre_literal_linear_terms
+        )));
+    }
+    let mut selector = CaptureSelectorLedger::preflight_lf_and_required_literal(
+        haystack.len(),
+        prospective.transitions_upper_bound,
+        prospective.match_events_upper_bound,
+        limits,
+    )?;
+    let packed_upper = haystack
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE line-batch packed upper bound overflow"))?;
+    selector.charge(packed_upper, packed_upper, haystack.len(), limits)?;
+    let scan_limits = CaptureRequiredLiteralRunLimits {
+        max_transitions: limits.fre_literal_linear_terms,
+    };
+    let scan = prefilter
+        .line_partition_matches(haystack, scan_limits)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE line-batch required-literal scan violated preflight: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ExecutionError::fault("FRE line-batch required-literal scan changed route")
+        })?;
+    if scan.identity().plan != prefilter.build_report().identity
+        || scan.identity().build_limits != capture_required_literal_build_limits(limits)
+        || scan.identity().operation
+            != CaptureRequiredLiteralSearchOperation::LinePartitionMatchesV1
+        || scan.identity().run_limits != scan_limits
+        || scan.accounting() != prospective
+    {
+        return Err(ExecutionError::fault(
+            "FRE line-batch required-literal scan failed identity/P/A authentication",
+        ));
+    }
+
+    packed.clear();
+    let (reducer_limit, _) = capture_reducer_budget(limits)?;
+    let mut reducer_events = 0_usize;
+    let mut raw_cursor = 0_usize;
+    let mut matches = scan.peekable();
+    for raw_line in haystack.lines_with_terminator() {
+        let line_start = raw_cursor;
+        raw_cursor = raw_cursor
+            .checked_add(raw_line.len())
+            .ok_or_else(|| ExecutionError::fault("FRE line-batch raw cursor overflow"))?;
+        reducer_events =
+            checked_aggregate_add(reducer_events, 1, "FRE line-batch semantic line events")?;
+        if reducer_events > reducer_limit {
+            return Err(ExecutionError::unsupported(format!(
+                "FRE line-batch line events need {reducer_events}, exceeding {reducer_limit}"
+            )));
+        }
+        let line = if let Some(without_lf) = raw_line.strip_suffix(b"\n") {
+            without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+        } else {
+            raw_line
+        };
+        let line_end = line_start
+            .checked_add(line.len())
+            .ok_or_else(|| ExecutionError::fault("FRE line-batch line end overflow"))?;
+        let mut candidate = false;
+        while matches.peek().is_some_and(|&(start, _)| start < raw_cursor) {
+            let (start, end) = matches.next().ok_or_else(|| {
+                ExecutionError::fault("FRE line-batch peeked literal match disappeared")
+            })?;
+            if start < line_start || start >= end || end > line_end {
+                return Err(ExecutionError::fault(
+                    "FRE line-batch literal match escaped its semantic line",
+                ));
+            }
+            candidate = true;
+        }
+        if !candidate {
+            continue;
+        }
+        let required = packed
+            .len()
+            .checked_add(line.len())
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| ExecutionError::fault("FRE line-batch packed length overflow"))?;
+        if required > packed.capacity() {
+            return Err(ExecutionError::fault(format!(
+                "FRE line-batch needs {required} bytes, prepared capacity is {}",
+                packed.capacity()
+            )));
+        }
+        packed.extend_from_slice(line);
+        packed.push(separator);
+    }
+    if raw_cursor != haystack.len() || matches.next().is_some() {
+        return Err(ExecutionError::fault(
+            "FRE line-batch partition did not consume the complete source",
+        ));
+    }
+    if packed.is_empty() {
+        return Ok(0);
+    }
+
+    let (selector_work_remaining, selector_sequential_remaining) = selector.remaining(limits)?;
+    let event_remaining = reducer_limit
+        .checked_sub(reducer_events)
+        .ok_or_else(|| ExecutionError::fault("FRE line-batch reducer event underflow"))?;
+    let (_, work_limit) = capture_reducer_budget(limits)?;
+    let run_limits = capture_run_limits(
+        regex,
+        packed.len(),
+        regex.build_report().selector.into(),
+        selector_work_remaining,
+        selector_sequential_remaining,
+        event_remaining,
+        reducer_limit,
+        work_limit,
+        work_limit,
+        work_limit,
+        limits,
+    )?;
+    let result = regex
+        .count_captures_observed_selector(packed, run_limits)
+        .map_err(|error| {
+            capture_execution_error(
+                regex,
+                packed.len(),
+                &run_limits,
+                &error,
+                format!("FRE line-batch capture reducer refused execution: {error}"),
+            )
+        })?;
+    if !authenticates_direct_capture_success(regex, packed.len(), &run_limits, &result) {
+        return Err(ExecutionError::fault(
+            "FRE line-batch capture result failed identity/P/A authentication",
+        ));
+    }
+    u64::try_from(result.accounting.count)
+        .map_err(|_| ExecutionError::fault("FRE line-batch count does not fit u64"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20855,7 +21068,7 @@ mod tests {
         )
         .expect("grep-captures lifecycle");
         assert_eq!(grep.model(), "grep-captures");
-        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(grep.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
         assert_eq!(grep.execute(haystack).expect("first grep operation"), 12);
         assert_eq!(grep.execute(haystack).expect("steady grep operation"), 12);
 
@@ -21196,7 +21409,7 @@ mod tests {
                 haystack.len(),
             )
             .expect("effective singleton required-literal route");
-            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
             assert_eq!(
                 lifecycle.execute(haystack).expect("singleton execution"),
                 expected
@@ -21216,7 +21429,7 @@ mod tests {
             haystack.len(),
         )
         .expect("distinct effective antichain lifecycle");
-        assert_eq!(active.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert_eq!(active.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
         assert_eq!(
             active.execute(haystack).expect("prefilter execution"),
             expected
@@ -21276,6 +21489,25 @@ mod tests {
         for &(haystack, candidate_domains, line_domains, match_events) in cases {
             let expected =
                 grep_captures(&upstream, haystack, u64::MAX).expect("Rust grep-captures");
+            let mut lifecycle = current_fre_rebar_capture_lifecycle(
+                "grep-captures",
+                PATTERN,
+                false,
+                false,
+                haystack.len(),
+            )
+            .expect("certified line-batch lifecycle");
+            assert_eq!(lifecycle.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
+            assert_eq!(
+                lifecycle.execute(haystack).expect("first line batch"),
+                expected,
+                "first batch mismatch for {haystack:?}"
+            );
+            assert_eq!(
+                lifecycle.execute(haystack).expect("steady line batch"),
+                expected,
+                "steady batch mismatch for {haystack:?}"
+            );
             let first = execute_grep_captures_inner(Some(prefilter), &regex, haystack, &defaults)
                 .expect("first consolidated line execution");
             let steady = execute_grep_captures_inner(Some(prefilter), &regex, haystack, &defaults)
@@ -23356,7 +23588,7 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v53-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v3-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
         );
         assert!(
             identity
