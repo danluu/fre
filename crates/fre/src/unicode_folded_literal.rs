@@ -1,10 +1,11 @@
-//! Bounded whole-match reducers for one nonempty Unicode folded scalar sequence.
+//! Bounded whole-match reducers for nonempty Unicode folded scalar sequences.
 //!
 //! This facade is intentionally independent of aggregate-plan selection. It
 //! recognizes a canonical Rust-bytes HIR made only from transparent captures,
-//! concatenation, valid UTF-8 literals and small Unicode scalar classes. The
-//! retained folded-trie owner is built once; Count and matched-byte-sum
-//! operations use its start-ordered candidate stream without allocating.
+//! concatenation, valid UTF-8 literals, small Unicode scalar classes and one
+//! optional root ordered alternation. The retained folded-trie owner is built
+//! once; Count and matched-byte-sum operations use its start-ordered candidate
+//! stream without allocating.
 
 #![allow(
     clippy::large_enum_variant,
@@ -18,7 +19,7 @@ use fre_kernels::{
     FoldedLiteral, FoldedLiteralTrieBuildAccounting, FoldedLiteralTrieBuildAttempt,
     FoldedLiteralTrieBuildError, FoldedLiteralTrieBuildLimits, FoldedLiteralTriePlan,
     FoldedLiteralTrieScanAttemptError, FoldedLiteralTrieScanLimits, FoldedLiteralTrieScanReceipt,
-    FoldedLiteralTrieScanUpperBounds, FoldedScalarClass,
+    FoldedLiteralTrieScanUpperBounds, FoldedScalarClass, LiteralCandidate,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -29,15 +30,15 @@ use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Stable implementation identity for the product-facing folded-literal facade.
 pub const UNICODE_FOLDED_LITERAL_ALGORITHM_ID: &str =
-    "fre.unicode-folded-literal.fixed-column-guarded-memchr-trie.v2";
+    "fre.unicode-folded-literal.ordered-alt-fixed-column-trie.v3";
 /// Stable Count operation identity.
-pub const UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID: &str = "fre.unicode-folded-literal.count.v2";
+pub const UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID: &str = "fre.unicode-folded-literal.count.v3";
 /// Stable matched-byte-sum operation identity.
 pub const UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID: &str =
-    "fre.unicode-folded-literal.span-sum.v2";
+    "fre.unicode-folded-literal.span-sum.v3";
 
 const MAX_CLASS_MEMBERS: usize = 4;
-const REDUCER_WORK_PER_CANDIDATE: usize = 3;
+const REDUCER_WORK_PER_CANDIDATE: usize = 8;
 
 /// Operation fixed at construction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -99,6 +100,7 @@ impl Default for UnicodeFoldedLiteralBuildLimits {
 /// Exact completed HIR inspection/materialization census.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UnicodeFoldedLiteralPlannerAccounting {
+    pub patterns: usize,
     pub hir_nodes: usize,
     pub scalar_positions: usize,
     pub equivalent_scalars: usize,
@@ -425,24 +427,28 @@ impl_regex!(
 
 #[derive(Clone, Copy, Debug)]
 struct Shape {
+    patterns: usize,
     hir_nodes: usize,
     scalar_positions: usize,
     equivalent_scalars: usize,
     cartesian_sequences_saturated: usize,
     folded_classes: usize,
-    root_is_nonascii_fold: bool,
+    nonascii_fold_roots: usize,
+    empty_patterns: usize,
     work: usize,
 }
 
 impl Default for Shape {
     fn default() -> Self {
         Self {
+            patterns: 0,
             hir_nodes: 0,
             scalar_positions: 0,
             equivalent_scalars: 0,
-            cartesian_sequences_saturated: 1,
+            cartesian_sequences_saturated: 0,
             folded_classes: 0,
-            root_is_nonascii_fold: false,
+            nonascii_fold_roots: 0,
+            empty_patterns: 0,
             work: 0,
         }
     }
@@ -488,13 +494,13 @@ fn build(
             });
         }
     };
-    if shape.scalar_positions == 0 {
+    if shape.empty_patterns != 0 {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::Empty,
             planner: planner_accounting(shape, 0, 0),
         });
     }
-    if !shape.root_is_nonascii_fold {
+    if shape.nonascii_fold_roots != shape.patterns {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::RootIsNotNonAsciiFoldClass,
             planner: planner_accounting(shape, 0, 0),
@@ -516,10 +522,33 @@ fn build(
             structure: "folded scalar classes",
             items: shape.scalar_positions,
         })?;
-    materialize_hir(&rust.hir, &mut classes)?;
+    let mut literal_ends = Vec::<usize>::new();
+    literal_ends
+        .try_reserve_exact(shape.patterns)
+        .map_err(|_| UnicodeFoldedLiteralBuildError::AllocationFailed {
+            structure: "folded literal boundaries",
+            items: shape.patterns,
+        })?;
+    match rust.hir.kind() {
+        HirKind::Alternation(alternatives) => {
+            for alternative in alternatives {
+                materialize_hir(alternative, &mut classes)?;
+                literal_ends.push(classes.len());
+            }
+        }
+        _ => {
+            materialize_hir(&rust.hir, &mut classes)?;
+            literal_ends.push(classes.len());
+        }
+    }
     if classes.len() != shape.scalar_positions {
         return Err(UnicodeFoldedLiteralBuildError::Invariant {
             detail: "folded-literal inspection/materialization position mismatch",
+        });
+    }
+    if literal_ends.len() != shape.patterns {
+        return Err(UnicodeFoldedLiteralBuildError::Invariant {
+            detail: "folded-literal inspection/materialization pattern mismatch",
         });
     }
     let mut wrappers = Vec::<FoldedScalarClass<'_>>::new();
@@ -534,8 +563,30 @@ fn build(
             .iter()
             .map(|class| FoldedScalarClass::new(class.as_slice())),
     );
-    let literals = [FoldedLiteral::new(&wrappers)];
-    let planner_allocations = shape.scalar_positions.checked_add(2).ok_or(
+    let mut literals = Vec::<FoldedLiteral<'_>>::new();
+    literals.try_reserve_exact(shape.patterns).map_err(|_| {
+        UnicodeFoldedLiteralBuildError::AllocationFailed {
+            structure: "folded literal views",
+            items: shape.patterns,
+        }
+    })?;
+    let mut start = 0_usize;
+    for &end in &literal_ends {
+        let classes =
+            wrappers
+                .get(start..end)
+                .ok_or(UnicodeFoldedLiteralBuildError::Invariant {
+                    detail: "folded literal boundary is outside materialized classes",
+                })?;
+        literals.push(FoldedLiteral::new(classes));
+        start = end;
+    }
+    if start != wrappers.len() {
+        return Err(UnicodeFoldedLiteralBuildError::Invariant {
+            detail: "folded literal boundaries do not consume materialized classes",
+        });
+    }
+    let planner_allocations = shape.scalar_positions.checked_add(4).ok_or(
         UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
             computation: "folded planner allocation count",
         },
@@ -602,13 +653,29 @@ fn inspect_hir(
     hir: &Hir,
 ) -> Result<Result<Shape, UnicodeFoldedLiteralIneligibility>, UnicodeFoldedLiteralBuildError> {
     let mut shape = Shape::default();
-    if !inspect_sequence(hir, &mut shape)? {
-        return Ok(Err(UnicodeFoldedLiteralIneligibility::UnsupportedHir));
+    match hir.kind() {
+        HirKind::Alternation(alternatives) => {
+            shape.hir_nodes = checked_add(shape.hir_nodes, 1, "folded HIR nodes")?;
+            shape.work = checked_add(shape.work, 1, "folded inspection work")?;
+            shape.patterns = alternatives.len();
+            for alternative in alternatives {
+                if !inspect_literal(alternative, &mut shape)? {
+                    return Ok(Err(UnicodeFoldedLiteralIneligibility::UnsupportedHir));
+                }
+            }
+        }
+        _ => {
+            shape.patterns = 1;
+            if !inspect_literal(hir, &mut shape)? {
+                return Ok(Err(UnicodeFoldedLiteralIneligibility::UnsupportedHir));
+            }
+        }
     }
     let materialization_work = shape
         .hir_nodes
         .checked_add(shape.scalar_positions)
         .and_then(|work| work.checked_add(shape.equivalent_scalars))
+        .and_then(|work| work.checked_add(shape.patterns.checked_mul(2)?))
         .ok_or(UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
             computation: "folded materialization work",
         })?;
@@ -620,15 +687,39 @@ fn inspect_hir(
     Ok(Ok(shape))
 }
 
-fn inspect_sequence(hir: &Hir, shape: &mut Shape) -> Result<bool, UnicodeFoldedLiteralBuildError> {
+fn inspect_literal(hir: &Hir, shape: &mut Shape) -> Result<bool, UnicodeFoldedLiteralBuildError> {
+    let literal_start = shape.scalar_positions;
+    let mut cartesian_sequences = 1_usize;
+    let admitted = inspect_sequence(hir, shape, literal_start, &mut cartesian_sequences)?;
+    if !admitted {
+        return Ok(false);
+    }
+    if shape.scalar_positions == literal_start {
+        shape.empty_patterns = checked_add(shape.empty_patterns, 1, "empty folded patterns")?;
+        cartesian_sequences = 0;
+    }
+    shape.cartesian_sequences_saturated = shape
+        .cartesian_sequences_saturated
+        .saturating_add(cartesian_sequences);
+    Ok(true)
+}
+
+fn inspect_sequence(
+    hir: &Hir,
+    shape: &mut Shape,
+    literal_start: usize,
+    cartesian_sequences: &mut usize,
+) -> Result<bool, UnicodeFoldedLiteralBuildError> {
     shape.hir_nodes = checked_add(shape.hir_nodes, 1, "folded HIR nodes")?;
     shape.work = checked_add(shape.work, 1, "folded inspection work")?;
     match hir.kind() {
         HirKind::Empty => Ok(true),
-        HirKind::Capture(capture) => inspect_sequence(&capture.sub, shape),
+        HirKind::Capture(capture) => {
+            inspect_sequence(&capture.sub, shape, literal_start, cartesian_sequences)
+        }
         HirKind::Concat(children) => {
             for child in children {
-                if !inspect_sequence(child, shape)? {
+                if !inspect_sequence(child, shape, literal_start, cartesian_sequences)? {
                     return Ok(false);
                 }
             }
@@ -639,7 +730,7 @@ fn inspect_sequence(hir: &Hir, shape: &mut Shape) -> Result<bool, UnicodeFoldedL
                 return Ok(false);
             };
             for _ in text.chars() {
-                record_class(shape, 1, false)?;
+                record_class(shape, 1, false, cartesian_sequences)?;
             }
             Ok(true)
         }
@@ -656,10 +747,11 @@ fn inspect_sequence(hir: &Hir, shape: &mut Shape) -> Result<bool, UnicodeFoldedL
                 }
             }
             let folded = members > 1;
-            if shape.scalar_positions == 0 {
-                shape.root_is_nonascii_fold = folded && nonascii;
+            if shape.scalar_positions == literal_start && folded && nonascii {
+                shape.nonascii_fold_roots =
+                    checked_add(shape.nonascii_fold_roots, 1, "non-ASCII folded roots")?;
             }
-            record_class(shape, members, folded)?;
+            record_class(shape, members, folded, cartesian_sequences)?;
             Ok(true)
         }
         HirKind::Class(Class::Unicode(_) | Class::Bytes(_))
@@ -673,6 +765,7 @@ fn record_class(
     shape: &mut Shape,
     members: usize,
     folded: bool,
+    cartesian_sequences: &mut usize,
 ) -> Result<(), UnicodeFoldedLiteralBuildError> {
     shape.scalar_positions = checked_add(shape.scalar_positions, 1, "folded scalar positions")?;
     shape.equivalent_scalars = checked_add(
@@ -680,8 +773,7 @@ fn record_class(
         members,
         "folded equivalent scalars",
     )?;
-    shape.cartesian_sequences_saturated =
-        shape.cartesian_sequences_saturated.saturating_mul(members);
+    *cartesian_sequences = (*cartesian_sequences).saturating_mul(members);
     shape.folded_classes =
         checked_add(shape.folded_classes, usize::from(folded), "folded classes")?;
     Ok(())
@@ -788,6 +880,10 @@ fn planner_scratch_bytes(shape: Shape) -> Result<usize, UnicodeFoldedLiteralBuil
                     .checked_mul(size_of::<FoldedScalarClass<'_>>())?,
             )
         })
+        .and_then(|bytes| bytes.checked_add(shape.patterns.checked_mul(size_of::<usize>())?))
+        .and_then(|bytes| {
+            bytes.checked_add(shape.patterns.checked_mul(size_of::<FoldedLiteral<'_>>())?)
+        })
         .ok_or(UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
             computation: "folded planner scratch bytes",
         })
@@ -799,6 +895,7 @@ const fn planner_accounting(
     allocations: usize,
 ) -> UnicodeFoldedLiteralPlannerAccounting {
     UnicodeFoldedLiteralPlannerAccounting {
+        patterns: shape.patterns,
         hir_nodes: shape.hir_nodes,
         scalar_positions: shape.scalar_positions,
         equivalent_scalars: shape.equivalent_scalars,
@@ -872,38 +969,71 @@ fn execute(
     let mut reducer_steps = 0_usize;
     let mut count = 0_u64;
     let mut span_sum = 0_u64;
-    let mut arithmetic_overflow = false;
+    let mut reducer_overflow = false;
+    let mut commit_overflow = false;
+    let mut candidate_order_violation = false;
+    let mut pending = None::<LiteralCandidate>;
+    let mut commit = |candidate: LiteralCandidate| {
+        if candidate.start() < consumed_through {
+            return;
+        }
+        let Some(next_count) = count.checked_add(1) else {
+            commit_overflow = true;
+            return;
+        };
+        let Some(width) = candidate.end().checked_sub(candidate.start()) else {
+            commit_overflow = true;
+            return;
+        };
+        let Ok(width) = u64::try_from(width) else {
+            commit_overflow = true;
+            return;
+        };
+        let Some(next_span_sum) = span_sum.checked_add(width) else {
+            commit_overflow = true;
+            return;
+        };
+        count = next_count;
+        span_sum = next_span_sum;
+        consumed_through = candidate.end();
+    };
     let scan = plan
         .trie
         .scan(haystack, limits.scan, |candidate| {
             let Some(next_steps) = reducer_steps.checked_add(1) else {
-                arithmetic_overflow = true;
+                reducer_overflow = true;
                 return;
             };
             reducer_steps = next_steps;
-            if candidate.start() >= consumed_through {
-                let Some(next_count) = count.checked_add(1) else {
-                    arithmetic_overflow = true;
-                    return;
-                };
-                let Ok(width) = u64::try_from(candidate.end().saturating_sub(candidate.start()))
-                else {
-                    arithmetic_overflow = true;
-                    return;
-                };
-                let Some(next_span_sum) = span_sum.checked_add(width) else {
-                    arithmetic_overflow = true;
-                    return;
-                };
-                count = next_count;
-                span_sum = next_span_sum;
-                consumed_through = candidate.end();
+            match pending {
+                None => pending = Some(candidate),
+                Some(best) if candidate.start() == best.start() => {
+                    if candidate.pattern_index() < best.pattern_index() {
+                        pending = Some(candidate);
+                    }
+                }
+                Some(best) if candidate.start() > best.start() => {
+                    commit(best);
+                    pending = Some(candidate);
+                }
+                Some(_) => {
+                    candidate_order_violation = true;
+                }
             }
         })
         .map_err(UnicodeFoldedLiteralRunError::Scan)?;
-    if arithmetic_overflow {
+    if let Some(candidate) = pending {
+        commit(candidate);
+    }
+    drop(commit);
+    if reducer_overflow || commit_overflow {
         return Err(UnicodeFoldedLiteralRunError::ArithmeticOverflow {
             computation: "actual folded reducer counters",
+        });
+    }
+    if candidate_order_violation {
+        return Err(UnicodeFoldedLiteralRunError::Invariant {
+            detail: "folded candidate stream is not start ordered",
         });
     }
     if reducer_steps > upper.reducer_steps || count > upper.count || span_sum > upper.span_sum {

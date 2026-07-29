@@ -620,10 +620,10 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible wide Unicode-on case-insensitive literal alternatives use the same retained canonical Count route and plan identity in semantic and raw operation execution; span-sum retains its incumbent byte-span-preserving route",
         );
         identity.identity.push_str(
-            "; unicode-folded-literal-v2 construction-selects a bounded finite canonical case-fold trie from one eligible nonempty literal/class sequence, then count and span-sum reuse one allocation-free ranked fixed-column byte prefilter, a second source-independent fixed-column guard when available, and exact scalar-trie validation under explicit build and run receipts",
+            "; unicode-folded-literal-v3 construction-selects one bounded finite canonical case-fold trie from an eligible nonempty literal/class sequence or root ordered alternation, then count and span-sum reuse an allocation-free ranked fixed-column memchr or retained full-byte classifier, a second source-independent fixed-column guard when available, exact scalar-trie validation, and source-pattern priority reduction under explicit build and run receipts",
         );
         identity.availability.push_str(
-            "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences whose non-ASCII folded root has at most four canonical members and whose Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
+            "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences or root ordered alternatives whose non-ASCII folded roots each have at most four canonical members and whose combined Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
         );
         identity.identity.push_str(
             "; aggregate-many-total-byte-cover-v1 proves from canonical HIR alone that every pattern is nonnullable and that the one-byte slices of a look-free subset cover all 256 byte values, making ordered span sum exactly the haystack length without reading source bytes; aggregate-many-byte-unit-cover-session-v1 seals the same theorem into eligible Unicode-off capture-many continuation reports and binds caller-owned cached-frontier storage to one plan, source length, and exact policy",
@@ -2213,7 +2213,7 @@ pub fn current_fre_rebar_aggregate_operation_lifecycle(
     }
 }
 
-const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v2";
+const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v3";
 
 fn unicode_folded_literal_build_limits(
     limits: &RunLimits,
@@ -2234,7 +2234,7 @@ fn unicode_folded_literal_build_limits(
         max_planner_work: limits.fre_aggregate_compile_work,
         max_planner_scratch_bytes: limits.fre_aggregate_scratch_bytes,
         trie: FoldedLiteralTrieBuildLimits {
-            max_patterns: 1,
+            max_patterns: limits.patterns_per_job,
             max_scalar_positions: positions,
             max_equivalent_scalars: equivalents,
             max_states: states,
@@ -2406,6 +2406,21 @@ fn build_current_fre_count_lifecycle(
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     let run_limits = RunLimits::default();
+    if let [pattern] = patterns
+        && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle(
+            pattern,
+            unicode,
+            case_insensitive,
+            haystack_len,
+        )?
+    {
+        return Ok(CurrentFreAggregateOperationLifecycle {
+            model: CurrentFreAggregateOperationModel::Count,
+            plan: UNICODE_FOLDED_LITERAL_PLAN,
+            haystack_len,
+            inner: CurrentFreAggregateOperationInner::CountFolded(regex, limits),
+        });
+    }
     if let Some(lifecycle) = canonical_case_fold::try_build_count(
         patterns,
         unicode,
@@ -2424,21 +2439,6 @@ fn build_current_fre_count_lifecycle(
             plan: canonical_case_fold::PLAN,
             haystack_len,
             inner: CurrentFreAggregateOperationInner::CountCanonical(lifecycle),
-        });
-    }
-    if let [pattern] = patterns
-        && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle(
-            pattern,
-            unicode,
-            case_insensitive,
-            haystack_len,
-        )?
-    {
-        return Ok(CurrentFreAggregateOperationLifecycle {
-            model: CurrentFreAggregateOperationModel::Count,
-            plan: UNICODE_FOLDED_LITERAL_PLAN,
-            haystack_len,
-            inner: CurrentFreAggregateOperationInner::CountFolded(regex, limits),
         });
     }
     build_current_fre_count_lifecycle_incumbent(patterns, unicode, case_insensitive, haystack_len)
@@ -15741,10 +15741,10 @@ fn fre_aggregate_count(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_count(request, limits);
     }
-    if let Some(reduction) = canonical_case_fold::try_count(request, limits)? {
+    if let Some(reduction) = try_unicode_folded_literal_count(request, limits)? {
         return Ok(reduction);
     }
-    if let Some(reduction) = try_unicode_folded_literal_count(request, limits)? {
+    if let Some(reduction) = canonical_case_fold::try_count(request, limits)? {
         return Ok(reduction);
     }
     let pattern = one_fre_pattern(request)?;
@@ -25920,7 +25920,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_case_fold_count_routes_sherlock_semantic_and_raw_lifecycles_identically() {
+    fn folded_alternation_routes_sherlock_semantic_and_raw_lifecycles_identically() {
         // rebar-row:curated/02-literal-alternate/sherlock-casei-ru@rust/regex
         let pattern = "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти";
         let patterns = [pattern.to_string()];
@@ -25950,7 +25950,7 @@ mod tests {
                 &RunLimits::default(),
             ),
             expected,
-            canonical_case_fold::PLAN,
+            UNICODE_FOLDED_LITERAL_PLAN,
         );
 
         let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
@@ -25960,8 +25960,8 @@ mod tests {
             true,
             haystack.len(),
         )
-        .expect("retained canonical lifecycle");
-        assert_eq!(lifecycle.plan(), canonical_case_fold::PLAN);
+        .expect("retained folded-alternation lifecycle");
+        assert_eq!(lifecycle.plan(), UNICODE_FOLDED_LITERAL_PLAN);
         assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
         assert_eq!(lifecycle.execute(&haystack).unwrap(), expected);
         let counters = lifecycle.execute_with_counters(&haystack).unwrap();
@@ -25973,7 +25973,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_case_fold_retained_count_preserves_overlapping_root_priority() {
+    fn folded_alternation_retained_count_preserves_overlapping_root_priority() {
         let shorter_first = "ИРЕН|ИРЕНИРЕН|АААААААААА|ББББББББББ".to_string();
         let longer_first = "ИРЕНИРЕН|ИРЕН|АААААААААА|ББББББББББ".to_string();
         let haystack = "иренирен".as_bytes();
@@ -26000,7 +26000,7 @@ mod tests {
                     &RunLimits::default(),
                 ),
                 reference,
-                canonical_case_fold::PLAN,
+                UNICODE_FOLDED_LITERAL_PLAN,
             );
             let lifecycle = current_fre_rebar_aggregate_operation_lifecycle(
                 "count",
@@ -26009,8 +26009,8 @@ mod tests {
                 true,
                 haystack.len(),
             )
-            .expect("overlapping-root canonical lifecycle");
-            assert_eq!(lifecycle.plan(), canonical_case_fold::PLAN);
+            .expect("overlapping-root folded-alternation lifecycle");
+            assert_eq!(lifecycle.plan(), UNICODE_FOLDED_LITERAL_PLAN);
             assert_eq!(lifecycle.execute(haystack).unwrap(), reference);
         }
     }

@@ -76,6 +76,104 @@ fn russian_literal_selects_common_continuation_anchor_and_matches_reference() {
 }
 
 #[test]
+fn ordered_russian_alternatives_share_one_prefilter_and_match_reference() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let pattern = "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти";
+    let count = match UnicodeFoldedLiteralBuilder::new(pattern)
+        .case_insensitive(true)
+        .build_count()
+        .unwrap()
+    {
+        UnicodeFoldedLiteralBuildAttempt::Admitted(regex) => regex,
+        other @ UnicodeFoldedLiteralBuildAttempt::Ineligible { .. } => {
+            panic!("unexpected folded-literal attempt: {other:?}")
+        }
+    };
+    let span_sum = match UnicodeFoldedLiteralBuilder::new(pattern)
+        .case_insensitive(true)
+        .build_span_sum()
+        .unwrap()
+    {
+        UnicodeFoldedLiteralBuildAttempt::Admitted(regex) => regex,
+        other @ UnicodeFoldedLiteralBuildAttempt::Ineligible { .. } => {
+            panic!("unexpected folded-literal attempt: {other:?}")
+        }
+    };
+    assert_eq!(count.build_report().planner.patterns, 5);
+    assert_eq!(count.build_report().trie.patterns, 5);
+    assert!(count.build_report().trie.root_prefilter_needles > 0);
+    let mut haystack = vec![0xFF, 0x80];
+    haystack.extend_from_slice(
+        "ШЕРЛОК ХОЛМС/джон уотсон/ИРЕН АДЛЕР/инспектор лестрейд/ПРОФЕССОР МОРИАРТИ".as_bytes(),
+    );
+    haystack.extend_from_slice(&[0xF4, 0x90, 0x80, 0x80]);
+    let expected = oracle(pattern).find_iter(&haystack).collect::<Vec<_>>();
+    assert_eq!(
+        count
+            .execute(&haystack, UnicodeFoldedLiteralRunLimits::unlimited())
+            .unwrap()
+            .value,
+        u64::try_from(expected.len()).unwrap()
+    );
+    assert_eq!(
+        span_sum
+            .execute(&haystack, UnicodeFoldedLiteralRunLimits::unlimited())
+            .unwrap()
+            .value,
+        expected
+            .iter()
+            .map(|matched| u64::try_from(matched.len()).unwrap())
+            .sum::<u64>()
+    );
+}
+
+#[test]
+fn ordered_alternative_priority_beats_shorter_end_at_the_same_start() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    for pattern in ["ΣX|ς", "ς|ΣX"] {
+        let count = match UnicodeFoldedLiteralBuilder::new(pattern)
+            .case_insensitive(true)
+            .build_count()
+            .unwrap()
+        {
+            UnicodeFoldedLiteralBuildAttempt::Admitted(regex) => regex,
+            other @ UnicodeFoldedLiteralBuildAttempt::Ineligible { .. } => {
+                panic!("unexpected folded-literal attempt for {pattern:?}: {other:?}")
+            }
+        };
+        let span_sum = match UnicodeFoldedLiteralBuilder::new(pattern)
+            .case_insensitive(true)
+            .build_span_sum()
+            .unwrap()
+        {
+            UnicodeFoldedLiteralBuildAttempt::Admitted(regex) => regex,
+            other @ UnicodeFoldedLiteralBuildAttempt::Ineligible { .. } => {
+                panic!("unexpected folded-literal attempt for {pattern:?}: {other:?}")
+            }
+        };
+        let haystack = "σxσx".as_bytes();
+        let expected = oracle(pattern).find_iter(haystack).collect::<Vec<_>>();
+        assert_eq!(
+            count
+                .execute(haystack, UnicodeFoldedLiteralRunLimits::unlimited())
+                .unwrap()
+                .value,
+            u64::try_from(expected.len()).unwrap()
+        );
+        assert_eq!(
+            span_sum
+                .execute(haystack, UnicodeFoldedLiteralRunLimits::unlimited())
+                .unwrap()
+                .value,
+            expected
+                .iter()
+                .map(|matched| u64::try_from(matched.len()).unwrap())
+                .sum::<u64>()
+        );
+    }
+}
+
+#[test]
 fn arbitrary_bytes_match_regex_bytes_reference() {
     let _guard = TEST_LOCK.lock().unwrap();
     let pattern = "Ше";
@@ -189,7 +287,7 @@ fn adjacent_overlapping_candidates_reduce_like_find_iter() {
 }
 
 #[test]
-fn structural_misses_are_distinct_from_resource_failures() {
+fn structural_misses_wide_prefilters_and_resource_failures_are_distinct() {
     let _guard = TEST_LOCK.lock().unwrap();
     assert!(matches!(
         UnicodeFoldedLiteralBuilder::new("abc")
@@ -211,16 +309,17 @@ fn structural_misses_are_distinct_from_resource_failures() {
             ..
         }
     ));
-    assert!(matches!(
-        UnicodeFoldedLiteralBuilder::new("\u{0345}")
-            .case_insensitive(true)
-            .build_count()
-            .unwrap(),
-        UnicodeFoldedLiteralBuildAttempt::Ineligible {
-            reason: UnicodeFoldedLiteralIneligibility::NoUsefulRootPrefilter,
-            ..
+    let wide = match UnicodeFoldedLiteralBuilder::new("\u{0345}")
+        .case_insensitive(true)
+        .build_count()
+        .unwrap()
+    {
+        UnicodeFoldedLiteralBuildAttempt::Admitted(regex) => regex,
+        other @ UnicodeFoldedLiteralBuildAttempt::Ineligible { .. } => {
+            panic!("wide byte-set prefilter unexpectedly ineligible: {other:?}")
         }
-    ));
+    };
+    assert!(wide.build_report().trie.root_prefilter_needles > 3);
     assert!(matches!(
         UnicodeFoldedLiteralBuilder::new("Ше")
             .case_insensitive(true)
