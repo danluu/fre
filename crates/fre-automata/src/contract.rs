@@ -214,6 +214,11 @@ pub trait Operation: sealed::Sealed {
 }
 
 /// Boolean existence operation.
+///
+/// Unlike the selected-end and span contracts, existence does not depend on
+/// leftmost-first endpoint selection. The executor may therefore return at
+/// the first accepting boundary even while a higher-priority thread remains
+/// live.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Exists;
 
@@ -223,7 +228,7 @@ impl Operation for Exists {
     type Output = bool;
 
     const CONTRACT: OutputContract = OutputContract::Exists;
-    const EARLIEST: bool = false;
+    const EARLIEST: bool = true;
 
     fn project(found: Option<MatchSpan>) -> Self::Output {
         found.is_some()

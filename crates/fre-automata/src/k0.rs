@@ -1639,7 +1639,7 @@ mod tests {
             START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
             START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, K0Workspace, RawPlan, SearchError,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, RawPlan, SearchError,
         SearchLimits, SearchWindow, Span, StateRole, WorkspaceLimits,
     };
 
@@ -1994,6 +1994,60 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn greedy_a_plus_or_a() -> Automaton {
+        // (?:a+|a), with the greedy repetition first in priority order.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 5, 6, 6],
+                edge_targets: vec![1, 3, 2, 1, 4, 4],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', 0, 0, b'a'],
+                byte_ends: vec![0, 0, b'a', 0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn existence_stops_at_first_accepting_boundary() {
+        let automaton = greedy_a_plus_or_a();
+        let haystack = b"aaaaaaaa";
+
+        let exists = automaton
+            .prepare::<Exists>()
+            .search(haystack, SearchLimits::unlimited())
+            .unwrap();
+        let selected = automaton
+            .prepare::<Span>()
+            .search(haystack, SearchLimits::unlimited())
+            .unwrap();
+
+        assert_eq!(exists.output(), &true);
+        assert_eq!(
+            selected.output(),
+            &Some(crate::MatchSpan::new(0, haystack.len()))
+        );
+        assert_eq!(exists.accounting().boundaries(), 2);
+        assert_eq!(selected.accounting().boundaries(), 9);
+        assert!(exists.accounting().work() < selected.accounting().work());
     }
 
     fn pin_without_start_filter(automaton: &Automaton) {
