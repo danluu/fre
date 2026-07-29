@@ -2406,6 +2406,17 @@ impl CompiledRegex {
             // compiled route instead of allocating or consulting a sweep
             // workspace.
             || self.state_byte_span_sum.is_some()
+            // A disjoint shared-fixed/global candidate retains two independent
+            // mandatory byte domains: one source-wide scan can reject before
+            // the fixed candidate scan or any program verification. Feeding
+            // every byte through a DFA discards that construction theorem, so
+            // preserve the candidate economics for both value reductions
+            // without consulting or allocating a sweep workspace.
+            || self.candidate.as_ref().is_some_and(|plan| {
+                plan.fixed_continuation().is_none()
+                    && candidate::executable_for(&self.program)
+                    && candidate::has_disjoint_shared_fixed_global_filter(plan)
+            })
             // The incumbent two-row byte kernel is already dense and cheap
             // for very small programs. Avoid a persistent DFA workspace and
             // its first-call determinization until the program is large

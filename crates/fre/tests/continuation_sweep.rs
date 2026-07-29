@@ -217,6 +217,103 @@ fn state_byte_incumbent_dominates_sweep_without_touching_workspace_body() {
 }
 
 #[test]
+fn disjoint_shared_fixed_candidate_dominates_sweep_without_touching_workspace() {
+    std::thread::Builder::new()
+        .name("continuation-sweep-fixed-candidate-dominance".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(disjoint_shared_fixed_candidate_dominates_sweep_without_touching_workspace_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn disjoint_shared_fixed_candidate_dominates_sweep_without_touching_workspace_body() {
+    let haystack = b"bcdefghijklmnopq".repeat(32);
+    let limits = AggregateRunLimits::default();
+
+    // This source-independent shape retains an unchecked one-owner candidate
+    // at one fixed offset, a shared native anchor and a disjoint mandatory
+    // global byte set. The independent global proof rejects this source
+    // before any candidate verification.
+    for pattern in [r".efghijklmnopq[a-z]+[A-Z]"] {
+        let expected = oracle(pattern, &haystack);
+        let count = builder(pattern).build_count().unwrap();
+        let sum = builder(pattern).build_span_sum().unwrap();
+        assert_eq!(
+            count.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+        assert_eq!(
+            sum.build_report().plan,
+            AggregatePlanKind::ContinuationProgram
+        );
+        assert_eq!(
+            count.continuation_sweep_upper_bounds().unwrap(),
+            None,
+            "count pattern={pattern:?}"
+        );
+        assert_eq!(
+            sum.continuation_sweep_upper_bounds().unwrap(),
+            None,
+            "span sum pattern={pattern:?}"
+        );
+
+        let mut count_workspace = AggregateCountWorkspace::new();
+        let mut sum_workspace = AggregateSpanSumWorkspace::new();
+        assert_eq!(
+            count
+                .count_value_with_workspace(&haystack, limits, &mut count_workspace)
+                .unwrap(),
+            expected.0,
+            "count pattern={pattern:?}"
+        );
+        assert_eq!(
+            sum.span_sum_value_with_workspace(&haystack, limits, &mut sum_workspace)
+                .unwrap(),
+            expected.1,
+            "span sum pattern={pattern:?}"
+        );
+        assert_eq!(count_workspace.retained_continuation_bytes(), None);
+        assert_eq!(sum_workspace.retained_continuation_bytes(), None);
+    }
+
+    // A similarly wide continuation whose global proof overlaps its shared
+    // candidate anchor remains eligible and proves that the gate is not a
+    // pattern-length or source-content heuristic.
+    let control = r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z";
+    let count = builder(control).build_count().unwrap();
+    let sum = builder(control).build_span_sum().unwrap();
+    assert!(count.continuation_sweep_upper_bounds().unwrap().is_some());
+    assert!(sum.continuation_sweep_upper_bounds().unwrap().is_some());
+    let expected = oracle(control, &haystack);
+    let mut count_workspace = AggregateCountWorkspace::new();
+    let mut sum_workspace = AggregateSpanSumWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(&haystack, limits, &mut count_workspace)
+            .unwrap(),
+        expected.0
+    );
+    assert_eq!(
+        sum.span_sum_value_with_workspace(&haystack, limits, &mut sum_workspace)
+            .unwrap(),
+        expected.1
+    );
+    assert!(
+        count_workspace
+            .retained_continuation_bytes()
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(
+        sum_workspace
+            .retained_continuation_bytes()
+            .unwrap_or_default()
+            > 0
+    );
+}
+
+#[test]
 fn late_priority_adversary_preserves_value_without_restart() {
     std::thread::Builder::new()
         .name("continuation-sweep-late-priority".to_owned())

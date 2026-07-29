@@ -267,6 +267,36 @@ pub(crate) fn has_complete_shared_fixed_filter(plan: &Plan) -> bool {
         && plan.has_shared_fixed()
 }
 
+/// Whether an unchecked one-owner shared fixed scheduler has a genuinely
+/// independent source-wide mandatory filter.
+///
+/// Disjoint candidate and global byte sets prove that the global scan is not
+/// merely rechecking the fixed candidate anchor. It may therefore terminate
+/// an impossible source before the candidate scan or any program
+/// verification. A local or global relative check, overlapping byte domains,
+/// and multi-owner plans retain the ordinary route economics because this
+/// stronger separation theorem is absent.
+pub(crate) fn has_disjoint_shared_fixed_global_filter(plan: &Plan) -> bool {
+    let [entry] = &*plan.entries else {
+        return false;
+    };
+    if entry.check_len != 0 || entry.global_check_len != 0 || !plan.has_shared_fixed() {
+        return false;
+    }
+    let mut has_candidate = false;
+    let mut has_global = false;
+    for (&candidate, &global) in plan.buckets.iter().zip(plan.global_buckets.iter()) {
+        if candidate & 1 != 0 {
+            has_candidate = true;
+            if global & 1 != 0 {
+                return false;
+            }
+        }
+        has_global |= global & 1 != 0;
+    }
+    has_candidate && has_global
+}
+
 pub(crate) fn exact_drafts(capacity: usize) -> Result<ExactVec<Draft>, Error> {
     ExactVec::try_with_capacity(capacity)
         .map_err(|error| allocation_error(error, Resource::ProgramBytes, capacity))
@@ -2611,9 +2641,14 @@ mod tests {
     #[test]
     fn shared_fixed_candidate_skips_dense_prefix_when_global_suffix_is_absent() {
         let pattern = r".efghijklmnopq[a-z]+[A-Z]";
+        let overlapping = compiled(r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z");
         let compiled = compiled(pattern);
         let plan = compiled.candidate.as_ref().unwrap();
         assert!(plan.has_shared_fixed());
+        assert!(has_disjoint_shared_fixed_global_filter(plan));
+        assert!(!has_disjoint_shared_fixed_global_filter(
+            overlapping.candidate.as_ref().unwrap()
+        ));
         // The start-relative scheduler uses the dense trailing `q` from the
         // fixed prefix, while the complementary source-wide proof retains the
         // mandatory uppercase suffix. Keeping both assertions here proves
