@@ -133,7 +133,7 @@ use fre_syntax::{
     ParseSummary, RustProfile, SafetyEnvelope,
 };
 use regex_syntax::hir::{
-    Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind,
+    Class, ClassBytes, ClassBytesRange, ClassUnicode, ClassUnicodeRange, Hir, HirKind, Look,
 };
 
 use crate::{
@@ -211,7 +211,7 @@ pub use p16_grep_stream::{
 pub use fre_aggregate::Strategy as AggregateStrategy;
 
 /// Stable schema for aggregate facade reports and cache identities.
-pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 43;
+pub const AGGREGATE_EXPLAIN_SCHEMA_VERSION: u32 = 44;
 
 /// Version of the construction-owned direct-route protocol.
 pub const AGGREGATE_DIRECT_OWNER_ALGORITHM_VERSION: u32 = 2;
@@ -231,6 +231,157 @@ pub enum AggregateOperation {
     Count,
     /// Checked sum of every complete match's byte length (`count-spans`).
     SpanSum,
+}
+
+/// Why the authenticated whole-match byte domain proves that an invocation
+/// cannot produce a match.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateImpossibleMatchReason {
+    /// The canonical HIR denotes the empty language.
+    EmptyLanguage,
+    /// Every match consumes more bytes than the complete haystack contains.
+    BelowMinimumBytes,
+    /// Absolute text-start/text-end assertions require the match to consume the
+    /// complete haystack, which is longer than every string in the language.
+    AboveAbsoluteMaximumBytes,
+}
+
+/// Constant-time byte-domain proof retained from canonical HIR properties.
+///
+/// `regex-syntax` computes minimum and maximum lengths in bytes, including
+/// the 1--4 byte width of Unicode scalar classes. Only exact `Start` and `End`
+/// look assertions establish `absolute_whole_input`; line-oriented LF/CRLF
+/// assertions never do.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct AggregateMatchDomainProof {
+    minimum_match_bytes: Option<usize>,
+    maximum_match_bytes: Option<usize>,
+    absolute_whole_input: bool,
+}
+
+impl AggregateMatchDomainProof {
+    fn from_hir(hir: &Hir) -> Self {
+        let properties = hir.properties();
+        Self {
+            minimum_match_bytes: properties.minimum_len(),
+            maximum_match_bytes: properties.maximum_len(),
+            absolute_whole_input: properties.look_set_prefix().contains(Look::Start)
+                && properties.look_set_suffix().contains(Look::End),
+        }
+    }
+
+    #[inline]
+    fn impossible(&self, input_bytes: usize) -> Option<(AggregateImpossibleMatchReason, u8)> {
+        let Some(minimum) = self.minimum_match_bytes else {
+            return Some((AggregateImpossibleMatchReason::EmptyLanguage, 1));
+        };
+        if input_bytes < minimum {
+            return Some((AggregateImpossibleMatchReason::BelowMinimumBytes, 1));
+        }
+        if self.absolute_whole_input
+            && self
+                .maximum_match_bytes
+                .is_some_and(|maximum| input_bytes > maximum)
+        {
+            return Some((AggregateImpossibleMatchReason::AboveAbsoluteMaximumBytes, 2));
+        }
+        None
+    }
+}
+
+/// Source-free operation receipt for an impossible whole-match byte domain.
+/// Terminal success reports retain this proof before any source access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateMatchDomainExecutionReceipt {
+    proof: AggregateMatchDomainProof,
+    operation: AggregateOperation,
+    input_bytes: usize,
+    reason: AggregateImpossibleMatchReason,
+    branch_checks: u8,
+}
+
+impl AggregateMatchDomainExecutionReceipt {
+    #[must_use]
+    pub const fn operation(&self) -> AggregateOperation {
+        self.operation
+    }
+
+    #[must_use]
+    pub const fn input_bytes(&self) -> usize {
+        self.input_bytes
+    }
+
+    #[must_use]
+    pub const fn minimum_match_bytes(&self) -> Option<usize> {
+        self.proof.minimum_match_bytes
+    }
+
+    #[must_use]
+    pub const fn maximum_match_bytes(&self) -> Option<usize> {
+        self.proof.maximum_match_bytes
+    }
+
+    #[must_use]
+    pub const fn absolute_whole_input(&self) -> bool {
+        self.proof.absolute_whole_input
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> AggregateImpossibleMatchReason {
+        self.reason
+    }
+
+    /// Fixed proof predicates charged before the terminal zero result. The
+    /// compiler-bounded preflight charges at most two; this is logical
+    /// accounting rather than a claim about emitted CPU branches.
+    #[must_use]
+    pub const fn branch_checks(&self) -> u8 {
+        self.branch_checks
+    }
+
+    /// The proof never reads a source byte.
+    #[must_use]
+    pub const fn source_bytes_read(&self) -> usize {
+        0
+    }
+
+    /// The proof and receipt are inline and operation execution allocates
+    /// nothing.
+    #[must_use]
+    pub const fn operation_allocations(&self) -> usize {
+        0
+    }
+
+    fn new(
+        proof: &AggregateMatchDomainProof,
+        operation: AggregateOperation,
+        input_bytes: usize,
+    ) -> Option<Self> {
+        if !matches!(
+            operation,
+            AggregateOperation::Count | AggregateOperation::SpanSum
+        ) {
+            return None;
+        }
+        let (reason, branch_checks) = proof.impossible(input_bytes)?;
+        Some(Self {
+            proof: *proof,
+            operation,
+            input_bytes,
+            reason,
+            branch_checks,
+        })
+    }
+
+    fn authenticates(
+        &self,
+        proof: &AggregateMatchDomainProof,
+        operation: AggregateOperation,
+    ) -> bool {
+        self.proof == *proof
+            && self.operation == operation
+            && Self::new(proof, operation, self.input_bytes).as_ref() == Some(self)
+    }
 }
 
 /// Exact source-free full-window envelope published by an authenticated
@@ -2853,11 +3004,12 @@ struct AggregatePublishedReportSeal {
     captures_erased: usize,
     build: AggregateBuildAccounting,
     plan_identity: AggregatePlanIdentity,
+    match_domain: AggregateMatchDomainProof,
     retained_capacity_bytes: usize,
 }
 
 impl AggregatePublishedReportSeal {
-    fn from_report(report: &AggregateBuildReport) -> Self {
+    fn from_report(report: &AggregateBuildReport, match_domain: AggregateMatchDomainProof) -> Self {
         Self {
             schema_version: report.schema_version,
             syntax_key: Arc::downgrade(&report.syntax_key),
@@ -2892,6 +3044,7 @@ impl AggregatePublishedReportSeal {
             captures_erased: report.captures_erased,
             build: report.build,
             plan_identity: report.plan_identity,
+            match_domain,
             retained_capacity_bytes: report.retained_capacity_bytes,
         }
     }
@@ -2947,6 +3100,7 @@ impl AggregatePublishedReportSeal {
             && self.continuation_strategy == cache.continuation_strategy
             && self.capture_semantics == cache.capture_semantics
             && self.plan_identity == cache.plan_identity
+            && self.match_domain == cache.match_domain
             && self.build_limits == cache.build_limits
             && self.construction_stage == cache.construction_stage
     }
@@ -3609,6 +3763,7 @@ pub struct AggregateCacheIdentity {
     pub continuation_strategy: Option<AggregateStrategy>,
     pub capture_semantics: AggregateCaptureSemantics,
     pub plan_identity: AggregatePlanIdentity,
+    match_domain: AggregateMatchDomainProof,
     pub build_limits: AggregateBuildLimits,
     pub execution_limits: AggregateRunLimits,
 }
@@ -6956,6 +7111,9 @@ impl AggregateExactLiteralExecutionDetails {
     reason = "exact audited success retains its independent receipt inline so the operation remains allocation-free"
 )]
 pub enum AggregateExecutionDetails {
+    /// Source-free proof that the complete haystack is outside the canonical
+    /// HIR's byte-length domain.
+    ImpossibleMatchDomain(AggregateMatchDomainExecutionReceipt),
     /// Exact-literal accounting, independent receipt, and construction seal.
     ExactLiteral(AggregateExactLiteralExecutionDetails),
     /// Direct scalar stream's complete bounds and structural counters.
@@ -7047,7 +7205,9 @@ impl AggregateExecutionDetails {
             Self::GuardedAsciiWord(_) => Some(AggregateDirectRoute::GuardedAsciiWord),
             Self::GuardedUnicodeWord(_) => Some(AggregateDirectRoute::GuardedUnicodeWord),
             Self::FixedPredicateWord64(_) => Some(AggregateDirectRoute::FixedPredicateWord64),
-            Self::FixedAbsoluteDomain(_) | Self::Continuation { .. } => None,
+            Self::ImpossibleMatchDomain(_)
+            | Self::FixedAbsoluteDomain(_)
+            | Self::Continuation { .. } => None,
         }
     }
 }
@@ -7335,6 +7495,29 @@ impl AggregateExecutionReport {
     #[must_use]
     pub const fn details(&self) -> &AggregateExecutionDetails {
         &self.details
+    }
+
+    /// Return the source-free impossible-domain receipt when this invocation
+    /// terminated before inspecting the haystack.
+    #[must_use]
+    pub const fn impossible_match_domain_receipt(
+        &self,
+    ) -> Option<&AggregateMatchDomainExecutionReceipt> {
+        match &self.details {
+            AggregateExecutionDetails::ImpossibleMatchDomain(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+
+    /// Authenticate an impossible-domain receipt against the exact
+    /// construction owner and canonical HIR-derived proof.
+    #[must_use]
+    pub fn has_closed_impossible_match_domain_attempt(&self) -> bool {
+        self.impossible_match_domain_receipt()
+            .is_some_and(|receipt| {
+                self.identity.has_closed_construction_attempt()
+                    && receipt.authenticates(&self.identity.match_domain, self.identity.operation)
+            })
     }
 
     pub(crate) fn into_details(self) -> AggregateExecutionDetails {
@@ -8113,7 +8296,10 @@ impl AggregateBuilder {
             unreachable!("successful construction lost its transient cache-key owner");
         };
         drop(transient_cache_owner);
-        let report_seal = Arc::new(AggregatePublishedReportSeal::from_report(&plan.report));
+        let report_seal = Arc::new(AggregatePublishedReportSeal::from_report(
+            &plan.report,
+            plan.match_domain,
+        ));
         if let Err(error) = context
             .transaction
             .publish_selected(publication_effect, selected_plan)
@@ -8173,7 +8359,7 @@ impl AggregateBuilder {
         let mut expected_fixed_absolute_profile = RustProfile::rebar_1_12_4();
         expected_fixed_absolute_profile.options.unicode = unicode;
         let fixed_absolute_profile = self.profile == expected_fixed_absolute_profile;
-        let minimum_match_bytes = rust.hir.properties().minimum_len();
+        let match_domain = AggregateMatchDomainProof::from_hir(&rust.hir);
         let expected_nodes = usize::try_from(syntax.hir_nodes).map_err(|_| {
             AggregateBuildError::InternalInvariant {
                 operation,
@@ -8393,7 +8579,7 @@ impl AggregateBuilder {
             };
             return Ok(AggregatePlan {
                 engine,
-                minimum_match_bytes,
+                match_domain,
                 limits,
                 report,
             });
@@ -8675,7 +8861,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine,
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -8857,7 +9043,7 @@ impl AggregateBuilder {
                     } else {
                         AggregateEngine::WordRun(descriptor)
                     },
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9006,7 +9192,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::LiteralAssertions(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9163,7 +9349,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BlockingDelimiter(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9311,7 +9497,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::TokenPhrase(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9477,7 +9663,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::FixedClassSandwich(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9700,7 +9886,7 @@ impl AggregateBuilder {
             };
             return Ok(AggregatePlan {
                 engine: AggregateEngine::GraphemeScalarDfa(engine),
-                minimum_match_bytes,
+                match_domain,
                 limits,
                 report,
             });
@@ -9852,7 +10038,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedClassSequence(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -9999,7 +10185,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedSeparatedFields(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -10203,7 +10389,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::PackedBoundedPrefixCount(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -10370,7 +10556,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::PrefixClassAlternation(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -10532,7 +10718,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedLiteralPair(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -10686,7 +10872,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::ReverseInner(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -10858,7 +11044,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::LiteralClassRunLiteral(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -11022,7 +11208,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine: AggregateEngine::BoundedContext(engine),
-                        minimum_match_bytes,
+                        match_domain,
                         limits,
                         report,
                     });
@@ -11179,7 +11365,7 @@ impl AggregateBuilder {
                 };
                 return Ok(AggregatePlan {
                     engine: AggregateEngine::BoundedContext(engine),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -12113,7 +12299,7 @@ impl AggregateBuilder {
                     engine: AggregateEngine::FixedAbsoluteDomain(
                         AggregateFixedAbsoluteDomainEngine { guard, residual },
                     ),
-                    minimum_match_bytes,
+                    match_domain,
                     limits,
                     report,
                 });
@@ -12384,7 +12570,7 @@ impl AggregateBuilder {
                         };
                         return Ok(AggregatePlan {
                             engine,
-                            minimum_match_bytes,
+                            match_domain,
                             limits,
                             report,
                         });
@@ -12721,7 +12907,7 @@ impl AggregateBuilder {
                             };
                             return Ok(AggregatePlan {
                                 engine: AggregateEngine::GuardedUnicodeWord(engine),
-                                minimum_match_bytes,
+                                match_domain,
                                 limits,
                                 report,
                             });
@@ -12864,7 +13050,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine: AggregateEngine::GuardedAsciiWord(dictionary),
-                        minimum_match_bytes,
+                        match_domain,
                         limits,
                         report,
                     });
@@ -13263,7 +13449,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine,
-                        minimum_match_bytes,
+                        match_domain,
                         limits,
                         report,
                     });
@@ -13551,7 +13737,7 @@ impl AggregateBuilder {
                     };
                     return Ok(AggregatePlan {
                         engine,
-                        minimum_match_bytes,
+                        match_domain,
                         limits,
                         report,
                     });
@@ -13817,7 +14003,7 @@ impl AggregateBuilder {
                         };
                         return Ok(AggregatePlan {
                             engine: AggregateEngine::FixedPredicateWord64(engine),
-                            minimum_match_bytes,
+                            match_domain,
                             limits,
                             report,
                         });
@@ -14002,7 +14188,7 @@ impl AggregateBuilder {
         };
         Ok(AggregatePlan {
             engine: AggregateEngine::Continuation(engine),
-            minimum_match_bytes,
+            match_domain,
             limits,
             report,
         })
@@ -14154,7 +14340,7 @@ struct AggregateFixedAbsoluteDomainEngine {
 #[derive(Debug)]
 struct AggregatePlan {
     engine: AggregateEngine,
-    minimum_match_bytes: Option<usize>,
+    match_domain: AggregateMatchDomainProof,
     limits: AggregateBuildLimits,
     report: AggregateBuildReport,
 }
@@ -14201,7 +14387,24 @@ impl AggregatePlan {
     }
 
     const fn minimum_match_bytes(&self) -> Option<usize> {
-        self.minimum_match_bytes
+        self.match_domain.minimum_match_bytes
+    }
+
+    #[inline]
+    fn impossible_match_domain_receipt(
+        &self,
+        input_bytes: usize,
+    ) -> Option<AggregateMatchDomainExecutionReceipt> {
+        AggregateMatchDomainExecutionReceipt::new(&self.match_domain, self.operation(), input_bytes)
+    }
+
+    #[inline]
+    fn impossible_match_domain_value(&self, input_bytes: usize) -> Option<u64> {
+        debug_assert!(matches!(
+            self.operation(),
+            AggregateOperation::Count | AggregateOperation::SpanSum
+        ));
+        self.match_domain.impossible(input_bytes).map(|_| 0)
     }
 
     fn continuation_sweep_upper_bounds(
@@ -14246,6 +14449,7 @@ impl AggregatePlan {
             continuation_strategy: self.report.continuation_strategy,
             capture_semantics: self.report.capture_semantics,
             plan_identity: self.report.plan_identity,
+            match_domain: self.match_domain,
             build_limits: self.limits,
             execution_limits: *execution_limits,
         }
@@ -15250,12 +15454,44 @@ impl AggregatePlan {
         })
     }
 
+    fn impossible_match_domain_execution_report(
+        &self,
+        execution_limits: &AggregateRunLimits,
+        receipt: AggregateMatchDomainExecutionReceipt,
+    ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
+        let identity = self.cache_identity(execution_limits);
+        if !receipt.authenticates(&identity.match_domain, identity.operation) {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "impossible match-domain receipt differs from its construction-owned proof",
+                ),
+            ));
+        }
+        let report = AggregateExecutionReport {
+            identity,
+            details: AggregateExecutionDetails::ImpossibleMatchDomain(receipt),
+        };
+        if !report.has_closed_impossible_match_domain_attempt() {
+            return Err(self.execution_error(
+                execution_limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "impossible match-domain report failed construction closure",
+                ),
+            ));
+        }
+        Ok(report)
+    }
+
     fn publish_execution_report(
         &self,
         execution_limits: &AggregateRunLimits,
         details: AggregateExecutionDetails,
     ) -> Result<AggregateExecutionReport, AggregateExecutionError> {
         match details {
+            AggregateExecutionDetails::ImpossibleMatchDomain(receipt) => {
+                self.impossible_match_domain_execution_report(execution_limits, receipt)
+            }
             AggregateExecutionDetails::ExactLiteral(details) => {
                 self.direct_exact_execution_report(execution_limits, details)
             }
@@ -15291,6 +15527,9 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<AggregateCountExecution, AggregateExecutionError> {
+        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len()) {
+            return Ok(AggregateCountExecution::ImpossibleMatchDomain(receipt));
+        }
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
                 match engine.count_attempt(haystack, limits.exact_literal) {
@@ -15762,6 +16001,9 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<AggregateSpanSumExecution, AggregateExecutionError> {
+        if let Some(receipt) = self.impossible_match_domain_receipt(haystack.len()) {
+            return Ok(AggregateSpanSumExecution::ImpossibleMatchDomain(receipt));
+        }
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
                 match engine.span_sum_attempt(haystack, limits.exact_literal) {
@@ -16472,6 +16714,9 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+            return Ok(value);
+        }
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
                 self.execute_exact_literal_count_value(engine, haystack, limits)
@@ -16509,14 +16754,21 @@ impl AggregatePlan {
         continuation: &mut ContinuationSweepWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
-            AggregateEngine::FiniteCount(engine) => self
-                .execute_dense_finite_count_value_with_workspace(
+            AggregateEngine::FiniteCount(engine) => {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                    return Ok(value);
+                }
+                self.execute_dense_finite_count_value_with_workspace(
                     engine,
                     haystack,
                     limits,
                     dense_finite,
-                ),
+                )
+            }
             AggregateEngine::Continuation(engine) => {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                    return Ok(value);
+                }
                 match engine.count_value_with_sweep_workspace(
                     haystack,
                     Self::full_range(haystack),
@@ -16864,6 +17116,12 @@ impl AggregatePlan {
                 }
             });
         };
+        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+            return Ok(AggregateValueCounterResult {
+                value,
+                continuation_receipt: None,
+            });
+        }
         self.execute_continuation_count_value_with_counters(engine, haystack, limits)
     }
 
@@ -17100,6 +17358,9 @@ impl AggregatePlan {
         haystack: &[u8],
         limits: &AggregateRunLimits,
     ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+            return Ok(value);
+        }
         match &self.engine {
             AggregateEngine::ExactLiteral(engine) => {
                 self.execute_exact_literal_span_sum_value(engine, haystack, limits)
@@ -17137,14 +17398,21 @@ impl AggregatePlan {
         continuation: &mut ContinuationSweepWorkspace,
     ) -> Result<u64, AggregateExecutionError> {
         match &self.engine {
-            AggregateEngine::FiniteSpanSum(engine) => self
-                .execute_dense_finite_span_sum_value_with_workspace(
+            AggregateEngine::FiniteSpanSum(engine) => {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                    return Ok(value);
+                }
+                self.execute_dense_finite_span_sum_value_with_workspace(
                     engine,
                     haystack,
                     limits,
                     dense_finite,
-                ),
+                )
+            }
             AggregateEngine::Continuation(engine) => {
+                if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+                    return Ok(value);
+                }
                 match engine.span_sum_value_with_sweep_workspace(
                     haystack,
                     Self::full_range(haystack),
@@ -17514,6 +17782,12 @@ impl AggregatePlan {
                 }
             });
         };
+        if let Some(value) = self.impossible_match_domain_value(haystack.len()) {
+            return Ok(AggregateValueCounterResult {
+                value,
+                continuation_receipt: None,
+            });
+        }
         self.execute_continuation_span_sum_value_with_counters(engine, haystack, limits)
     }
 }
@@ -17523,6 +17797,7 @@ impl AggregatePlan {
     reason = "execution variants retain already-budgeted result receipts inline without a new allocation"
 )]
 enum AggregateCountExecution {
+    ImpossibleMatchDomain(AggregateMatchDomainExecutionReceipt),
     ExactLiteral {
         value: u64,
         details: AggregateExactLiteralExecutionDetails,
@@ -17578,6 +17853,7 @@ enum AggregateCountExecution {
 impl AggregateCountExecution {
     const fn value(&self) -> u64 {
         match self {
+            Self::ImpossibleMatchDomain(_) => 0,
             Self::UnicodeScalar(result) => result.count,
             Self::WordRun(result) => result.count,
             Self::LiteralAssertions(result) => result.count,
@@ -17606,8 +17882,15 @@ impl AggregateCountExecution {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive conversion preserves every audited engine's exact success accounting"
+    )]
     fn into_details(self) -> AggregateExecutionDetails {
         match self {
+            Self::ImpossibleMatchDomain(receipt) => {
+                AggregateExecutionDetails::ImpossibleMatchDomain(receipt)
+            }
             Self::ExactLiteral { details, .. } => AggregateExecutionDetails::ExactLiteral(details),
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
@@ -17718,6 +18001,7 @@ impl AggregateCountExecution {
     reason = "boxing would add an allocation to the operation whose complete accounting is retained inline"
 )]
 enum AggregateSpanSumExecution {
+    ImpossibleMatchDomain(AggregateMatchDomainExecutionReceipt),
     ExactLiteral {
         value: u64,
         details: AggregateExactLiteralExecutionDetails,
@@ -17762,6 +18046,7 @@ enum AggregateSpanSumExecution {
 impl AggregateSpanSumExecution {
     const fn value(&self) -> u64 {
         match self {
+            Self::ImpossibleMatchDomain(_) => 0,
             Self::UnicodeScalar(result) => result.span_sum,
             Self::WordRun(result) => result.span_sum,
             Self::LiteralAssertions(result) => result.span_sum,
@@ -17787,6 +18072,9 @@ impl AggregateSpanSumExecution {
 
     fn into_details(self) -> AggregateExecutionDetails {
         match self {
+            Self::ImpossibleMatchDomain(receipt) => {
+                AggregateExecutionDetails::ImpossibleMatchDomain(receipt)
+            }
             Self::ExactLiteral { details, .. } => AggregateExecutionDetails::ExactLiteral(details),
             Self::UnicodeScalar(result) => {
                 AggregateExecutionDetails::UnicodeScalar(result.accounting)
@@ -19991,7 +20279,9 @@ impl AggregateCompileRegex {
     /// Untimed semantic verification for compile-model qualification.
     ///
     /// This traverses the complete original haystack with the already
-    /// published plan and performs no compilation or fallback.
+    /// published plan and performs no compilation or fallback. It retains the
+    /// `Compile` operation identity and deliberately does not publish the
+    /// Count/SpanSum-only impossible-domain receipt.
     pub fn verify_count(
         &self,
         haystack: &[u8],
@@ -20463,7 +20753,9 @@ impl AggregateCountRegex {
     /// and, when that plan is a continuation, publish its immutable hot-path
     /// certificate and structural counters after the operation completes. The
     /// counter projection is optional and does not add a selector input,
-    /// construct a full attempt receipt, or construct an execution report.
+    /// construct a full attempt receipt, or construct an execution report. An
+    /// impossible-domain terminal success returns no continuation receipt
+    /// because the selected continuation never executes.
     pub fn count_value_with_counters(
         &self,
         haystack: &[u8],
@@ -20498,7 +20790,8 @@ impl AggregateCountResult {
 /// A direct selected plan retains the incumbent value-only behavior and has no
 /// continuation receipt. A continuation selected plan returns the same value
 /// and route as its ordinary value-only API, plus the hot-path certificate and
-/// counter receipt published after the completed operation.
+/// counter receipt published after the completed operation, unless the
+/// impossible-domain preflight terminates before that continuation executes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateValueCounterResult {
     value: u64,
@@ -20640,7 +20933,9 @@ impl AggregateSpanSumRegex {
     /// publish its immutable hot-path certificate and structural counters
     /// after the operation completes. The counter projection is optional and
     /// does not add a selector input, construct a full attempt receipt, or
-    /// construct an execution report.
+    /// construct an execution report. An impossible-domain terminal success
+    /// returns no continuation receipt because the selected continuation never
+    /// executes.
     pub fn span_sum_value_with_counters(
         &self,
         haystack: &[u8],
@@ -21741,7 +22036,13 @@ mod tests {
                     expected,
                     "pattern={pattern:?}, haystack={haystack:?}"
                 );
-                assert!(result.report().has_closed_direct_attempt());
+                if result.report().impossible_match_domain_receipt().is_some() {
+                    assert_eq!(expected, 0);
+                    assert!(result.report().has_closed_impossible_match_domain_attempt());
+                    assert!(!result.report().has_closed_direct_attempt());
+                } else {
+                    assert!(result.report().has_closed_direct_attempt());
+                }
             }
         }
     }

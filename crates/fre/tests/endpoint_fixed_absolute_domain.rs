@@ -52,7 +52,7 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
         168
     );
     assert_eq!(fre::AGGREGATE_CONTINUATION_MAX_ALLOCATIONS, 9);
-    // Schema 43 keeps the fixed-capacity construction ledger, full request,
+    // Schema 44 keeps the fixed-capacity construction ledger, full request,
     // typed source, terminal receipt, and exact inline terminal authentication
     // snapshots. These gates make a post-failure Box or an unreviewed further
     // inline copy visible rather than moving it outside construction accounting.
@@ -62,26 +62,26 @@ fn endpoint_public_error_and_audited_success_sizes_remain_bounded() {
     // error-path allocation. Enlarging these heavily nested terminal values
     // can exhaust a default test-thread stack when several large optional
     // builds coexist.
-    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 888);
+    assert_eq!(core::mem::size_of::<AggregateBuildError>(), 936);
     assert_eq!(
         core::mem::size_of::<AggregateConstructionAttemptError>(),
-        8_288
+        8_528
     );
-    assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_576);
-    assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 9_584);
+    assert_eq!(core::mem::size_of::<AggregateConstructionReceipt>(), 6_768);
+    assert_eq!(core::mem::size_of::<AggregateCacheIdentity>(), 10_016);
     assert_eq!(core::mem::size_of::<AggregateRunLimits>(), 1_496);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionError>(), 2_560);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 10_304);
-    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 392);
-    assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 224);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildReport>(), 10_832);
+    assert_eq!(core::mem::size_of::<fre::AggregateBuildAccounting>(), 440);
+    assert_eq!(core::mem::size_of::<fre::AggregatePlanIdentity>(), 416);
     // Exact success retains the independent kernel receipt beside accounting;
     // this is the public allocation-free ceiling for the enlarged enum.
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionDetails>(), 736);
     assert_eq!(core::mem::size_of::<fre::AggregateExecutionSource>(), 64);
     // Full public build/run provenance plus the closed construction
     // evidence remains fixed-size and adds no operation-time allocation.
-    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 10_336);
-    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 10_336);
+    assert_eq!(core::mem::size_of::<fre::AggregateCountResult>(), 10_768);
+    assert_eq!(core::mem::size_of::<fre::AggregateSpanSumResult>(), 10_768);
 }
 
 #[test]
@@ -547,7 +547,7 @@ fn endpoint_start_prefix_unicode_ascii_guard_charges_the_last_range_check() {
 }
 
 #[test]
-fn endpoint_scalar_guard_is_direct_outside_envelope_and_nested_inside() {
+fn endpoint_scalar_preflight_is_terminal_outside_envelope_and_guard_is_nested_inside() {
     let direct = rebar_builder(r"^.{249}$").build_count().unwrap();
     let oracle = rebar_builder(r"^.{249}$")
         .plan_selection(AggregatePlanSelection::ForceContinuation)
@@ -577,6 +577,12 @@ fn endpoint_scalar_guard_is_direct_outside_envelope_and_nested_inside() {
             .unwrap();
         assert_eq!(result.value(), expected, "len={}", haystack.len());
         match result.report().details() {
+            AggregateExecutionDetails::ImpossibleMatchDomain(receipt) => {
+                assert!(haystack.len() < 249 || haystack.len() > 996);
+                assert_eq!(receipt.source_bytes_read(), 0);
+                assert_eq!(receipt.operation_allocations(), 0);
+                assert!(result.report().has_closed_impossible_match_domain_attempt());
+            }
             AggregateExecutionDetails::FixedAbsoluteDomain(
                 AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard },
             ) => {
@@ -2082,10 +2088,10 @@ fn endpoint_scalar_complete_guard_has_no_hypothetical_composite_p() {
     assert_eq!(result.value(), 0);
     assert!(matches!(
         result.report().details(),
-        AggregateExecutionDetails::FixedAbsoluteDomain(
-            AggregateFixedAbsoluteDomainExecutionDetails::Direct { .. }
-        )
+        AggregateExecutionDetails::ImpossibleMatchDomain(_)
     ));
+    assert!(result.report().has_closed_impossible_match_domain_attempt());
+    assert!(!result.report().has_closed_direct_attempt());
 }
 
 #[test]

@@ -587,7 +587,8 @@ fn continuation_details(
             accounting,
             ..
         } => (certificate, accounting),
-        AggregateExecutionDetails::ExactLiteral(_)
+        AggregateExecutionDetails::ImpossibleMatchDomain(_)
+        | AggregateExecutionDetails::ExactLiteral(_)
         | AggregateExecutionDetails::UnicodeScalar(_)
         | AggregateExecutionDetails::WordRun(_)
         | AggregateExecutionDetails::LiteralAssertions(_)
