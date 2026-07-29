@@ -67,8 +67,9 @@ fre-optimizing-count-v3-rebar measure CELL_ID ENGINE ITERATIONS
 Both `correctness` and `measure` emit exactly one
 `fre.optimizing-count-v3.measurement-observation.v1` JSON object. It resolves
 the cell and artifact, loads and authenticates the haystack, builds/adopts the
-engine, and verifies its oracle value before starting the timer. The timed
-loop contains only the already-selected value call and checksum accumulation.
+engine, rehashes the selected sealed engine artifact and the executable, and
+verifies its oracle value before starting the timer. The timed loop contains
+only the already-selected value call and checksum accumulation.
 The correctness observation uses `iterations=1`, `searched_bytes=input_bytes`,
 and `elapsed_ns=0`; it otherwise has the same exact 15 fields as a measurement
 observation.
