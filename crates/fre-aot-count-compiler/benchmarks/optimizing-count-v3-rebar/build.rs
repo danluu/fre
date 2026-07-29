@@ -338,7 +338,7 @@ fn run() -> Result<(), String> {
         );
         println!(
             "cargo:rustc-link-arg-bin={BINARY}={}",
-            artifact.v3.artifact_file_path.display()
+            artifact.v3.engine.artifact_file_path.display()
         );
         println!(
             "cargo:rustc-link-arg-bin={BINARY}={}",
@@ -1615,13 +1615,13 @@ fn build_authority_binding_sha256(authority: &str, registry_sha256: &str) -> Str
 fn parse_promotion_manifest_atom(source: &str) -> Result<[u8; 32], String> {
     let marker = "const COUNT_V3_PROMOTION_BUNDLE_MANIFEST_SHA256: [u8; 32] = [";
     let mut starts = source.match_indices(marker);
-    let (_, first_tail) = starts
+    let (first_start, _) = starts
         .next()
         .ok_or("Count-v3 runtime source lacks its promotion manifest atom")?;
     if starts.next().is_some() {
         return Err("Count-v3 runtime source repeats its promotion manifest atom".to_string());
     }
-    let body_start = first_tail
+    let body_start = first_start
         .checked_add(marker.len())
         .ok_or("promotion manifest atom offset overflow")?;
     let tail = source

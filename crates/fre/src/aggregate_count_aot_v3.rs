@@ -868,16 +868,22 @@ fn require_limit<T>(
     required: T,
 ) -> Result<(), AggregateCountExactLiteralAotExecutionErrorV3>
 where
-    T: Copy + Ord + Into<u128>,
+    T: Copy + Ord + TryInto<u128>,
 {
     if required <= limit {
         Ok(())
     } else {
+        let limit = limit.try_into().map_err(|_| {
+            AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow { at: resource }
+        })?;
+        let required = required.try_into().map_err(|_| {
+            AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow { at: resource }
+        })?;
         Err(
             AggregateCountExactLiteralAotExecutionErrorV3::ResourceLimit {
                 resource,
-                limit: limit.into(),
-                required: required.into(),
+                limit,
+                required,
             },
         )
     }

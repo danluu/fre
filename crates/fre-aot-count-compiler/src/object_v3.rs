@@ -1464,7 +1464,7 @@ fn validate_metadata_compile_identity(
 }
 
 fn symbol_string_bytes(mach_external_prefix: bool) -> Result<usize, CountCompileErrorV3> {
-    let initial = if mach_external_prefix { 4 } else { 1 };
+    let initial: usize = if mach_external_prefix { 4 } else { 1 };
     [
         COUNT_ENTRY_SYMBOL_PREFIX_V3,
         COUNT_PAYLOAD_SYMBOL_PREFIX_V3,
