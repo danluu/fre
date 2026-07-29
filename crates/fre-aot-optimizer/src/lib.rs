@@ -8,6 +8,7 @@
 
 use core::{fmt, mem::size_of};
 
+use fre_exact_alloc::ExactVec;
 use fre_kernel_ir::{
     AggregateProgramIdentity, Count, ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES,
 };
@@ -520,6 +521,7 @@ pub enum CountV3OptimizeError {
     AllocationRequests { limit: u8, required: u8 },
     RetainedBytes { limit: usize, required: usize },
     IdentityBytesHashed { limit: u64, required: u64 },
+    PortfolioAllocationFailed { requested_bytes: usize },
     ArithmeticOverflow { at: &'static str },
     InvalidGeneratedRecipe,
 }
@@ -1211,8 +1213,15 @@ fn build_portfolio(
     frontier: &ColumnFrontier,
     expected_count: usize,
     work: &mut Work,
-) -> Result<Vec<Candidate>, CountV3OptimizeError> {
-    let mut candidates = Vec::with_capacity(expected_count);
+) -> Result<ExactVec<Candidate>, CountV3OptimizeError> {
+    let requested_bytes = expected_count.checked_mul(size_of::<Candidate>()).ok_or(
+        CountV3OptimizeError::ArithmeticOverflow {
+            at: "portfolio exact allocation bytes",
+        },
+    )?;
+    let mut candidates = ExactVec::try_with_capacity(expected_count).map_err(|_| {
+        CountV3OptimizeError::PortfolioAllocationFailed { requested_bytes }
+    })?;
     let incumbent_filters = incumbent_filters(literal)?;
     push_candidate(
         &mut candidates,
@@ -1296,7 +1305,7 @@ fn build_portfolio(
 
 #[allow(clippy::too_many_arguments)]
 fn push_candidate(
-    candidates: &mut Vec<Candidate>,
+    candidates: &mut ExactVec<Candidate>,
     literal: &[u8],
     facts: CountV3LiteralFacts,
     multiplicity: &[u8; 256],
@@ -1311,20 +1320,22 @@ fn push_candidate(
     filter_offsets[..filters.len()].copy_from_slice(filters);
     let costs = estimate_costs(literal, facts, multiplicity, strategy, filters)?;
     work.add(6)?;
-    candidates.push(Candidate {
-        strategy,
-        schedule,
-        filters: filter_offsets,
-        filter_count: to_u8(filters.len(), "candidate filter count")?,
-        periodic_stride,
-        costs,
-        ordinal: u16::try_from(candidates.len()).map_err(|_| {
-            CountV3OptimizeError::ArithmeticOverflow {
-                at: "candidate ordinal",
-            }
-        })?,
-        pareto: true,
-    });
+    candidates
+        .try_push(Candidate {
+            strategy,
+            schedule,
+            filters: filter_offsets,
+            filter_count: to_u8(filters.len(), "candidate filter count")?,
+            periodic_stride,
+            costs,
+            ordinal: u16::try_from(candidates.len()).map_err(|_| {
+                CountV3OptimizeError::ArithmeticOverflow {
+                    at: "candidate ordinal",
+                }
+            })?,
+            pareto: true,
+        })
+        .map_err(|_| CountV3OptimizeError::InvalidGeneratedRecipe)?;
     Ok(())
 }
 
