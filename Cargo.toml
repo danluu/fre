@@ -9,6 +9,7 @@ members = [
     "crates/fre-aot-count-contract",
     "crates/fre-aot-elf",
     "crates/fre-aot-macho",
+    "crates/fre-aot-optimizer",
     "crates/fre-aot-search-contract",
     "crates/fre-aot-static-prelink",
     "crates/fre-aot-static-runtime",
