@@ -1237,7 +1237,12 @@ fn audit_impl_v3(
                 ),
             )
         } else {
-            (1, 1, 0)
+            // Every specialized NEON graph has one UMAXV over its primary
+            // equality mask before it can enter the one-column sparse scan.
+            // This is a staged filter proof just as surely as the incumbent's
+            // optional third-column guard, and must be closed by the decoded
+            // summary instead of silently omitted from the receipt.
+            (1, 1, 1)
         };
     if relocation_index != image.relocations.len()
         || direct_branches != image.stats.relocations

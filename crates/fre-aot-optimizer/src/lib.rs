@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Canonical recipe schema emitted by this optimizer.
 pub const COUNT_V3_RECIPE_SCHEMA_VERSION: u16 = 3;
 /// Version of the deterministic portfolio and cost model.
-pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 3;
+pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 4;
 /// Maximum number of filter columns in one recipe.
 pub const COUNT_V3_MAX_FILTER_OFFSETS: usize = 4;
 /// Maximum exact-literal width consumed by Count-v3.
@@ -885,7 +885,13 @@ fn optimize_impl(
     let mut work = Work::default();
     let analysis = analyze_literal(literal, &mut work)?;
     let frontier = build_column_frontier(literal, &analysis, &mut work)?;
-    let portfolio_recipes = count_portfolio(literal, analysis.facts, &frontier, &mut work)?;
+    let portfolio_recipes = count_portfolio(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        &frontier,
+        &mut work,
+    )?;
     require_usize(
         portfolio_recipes,
         limits
@@ -930,6 +936,7 @@ fn optimize_impl(
         analysis.facts,
         &analysis.multiplicity,
         &frontier,
+        required_isa,
         portfolio_recipes,
         &mut work,
     )?;
@@ -1222,6 +1229,7 @@ fn column_rank(literal: &[u8], multiplicity: &[u8; 256], offset: u8) -> (u32, u8
 fn count_portfolio(
     literal: &[u8],
     facts: CountV3LiteralFacts,
+    multiplicity: &[u8; 256],
     frontier: &ColumnFrontier,
     work: &mut Work,
 ) -> Result<usize, CountV3OptimizeError> {
@@ -1254,11 +1262,12 @@ fn count_portfolio(
         }
     }
     if usize::from(facts.minimum_period) < literal.len() {
-        count = count
-            .checked_add(1)
-            .ok_or(CountV3OptimizeError::ArithmeticOverflow {
+        let (_, filter_count) = periodic_filters(literal, facts, multiplicity)?;
+        count = count.checked_add(filter_count.saturating_sub(1)).ok_or(
+            CountV3OptimizeError::ArithmeticOverflow {
                 at: "periodic portfolio count",
-            })?;
+            },
+        )?;
     }
     if direct_exact_mask_filters(literal, facts).is_some() {
         count = count
@@ -1327,6 +1336,7 @@ fn build_portfolio(
     facts: CountV3LiteralFacts,
     multiplicity: &[u8; 256],
     frontier: &ColumnFrontier,
+    required_isa: CountV3RequiredIsa,
     expected_count: usize,
     work: &mut Work,
 ) -> Result<ExactVec<Candidate>, CountV3OptimizeError> {
@@ -1343,6 +1353,7 @@ fn build_portfolio(
         literal,
         facts,
         multiplicity,
+        required_isa,
         CountV3Strategy::Incumbent,
         CountV3ScheduleId::IncumbentV2,
         &incumbent_filters.0[..incumbent_filters.1],
@@ -1357,6 +1368,7 @@ fn build_portfolio(
                     literal,
                     facts,
                     multiplicity,
+                    required_isa,
                     CountV3Strategy::SparseRareColumns,
                     CountV3ScheduleId::SparseColumnsV1,
                     filters,
@@ -1374,6 +1386,7 @@ fn build_portfolio(
             literal,
             facts,
             multiplicity,
+            required_isa,
             CountV3Strategy::EndpointDense,
             CountV3ScheduleId::EndpointDenseV1,
             &endpoints,
@@ -1387,6 +1400,7 @@ fn build_portfolio(
                 literal,
                 facts,
                 multiplicity,
+                required_isa,
                 CountV3Strategy::EndpointDense,
                 CountV3ScheduleId::EndpointDenseV1,
                 &filters,
@@ -1396,18 +1410,21 @@ fn build_portfolio(
         }
     }
     if usize::from(facts.minimum_period) < literal.len() {
-        let (filters, filter_count) = periodic_filters(literal, facts)?;
-        push_candidate(
-            &mut candidates,
-            literal,
-            facts,
-            multiplicity,
-            CountV3Strategy::PeriodicRun,
-            CountV3ScheduleId::PeriodicRunV1,
-            &filters[..filter_count],
-            facts.minimum_period,
-            work,
-        )?;
+        let (filters, filter_count) = periodic_filters(literal, facts, multiplicity)?;
+        for selected_filter_count in 2..=filter_count {
+            push_candidate(
+                &mut candidates,
+                literal,
+                facts,
+                multiplicity,
+                required_isa,
+                CountV3Strategy::PeriodicRun,
+                CountV3ScheduleId::PeriodicRunV1,
+                &filters[..selected_filter_count],
+                facts.minimum_period,
+                work,
+            )?;
+        }
     }
     if let Some((filters, filter_count)) = direct_exact_mask_filters(literal, facts) {
         push_candidate(
@@ -1415,6 +1432,7 @@ fn build_portfolio(
             literal,
             facts,
             multiplicity,
+            required_isa,
             CountV3Strategy::DirectExactMask,
             CountV3ScheduleId::DirectExactMaskV1,
             &filters[..filter_count],
@@ -1434,6 +1452,7 @@ fn push_candidate(
     literal: &[u8],
     facts: CountV3LiteralFacts,
     multiplicity: &[u8; 256],
+    required_isa: CountV3RequiredIsa,
     strategy: CountV3Strategy,
     schedule: CountV3ScheduleId,
     filters: &[u8],
@@ -1453,6 +1472,7 @@ fn push_candidate(
         literal,
         facts,
         multiplicity,
+        required_isa,
         strategy,
         &filter_offsets[..filters.len()],
     )?;
@@ -1549,6 +1569,7 @@ fn ranked_endpoint_pair(literal: &[u8], multiplicity: &[u8; 256]) -> [u8; 2] {
 fn periodic_filters(
     literal: &[u8],
     facts: CountV3LiteralFacts,
+    multiplicity: &[u8; 256],
 ) -> Result<([u8; COUNT_V3_MAX_FILTER_OFFSETS], usize), CountV3OptimizeError> {
     let mut filters = [0_u8; COUNT_V3_MAX_FILTER_OFFSETS];
     let mut count = 0_usize;
@@ -1563,6 +1584,12 @@ fn periodic_filters(
             count += 1;
         }
     }
+    canonicalize_filter_order(
+        literal,
+        multiplicity,
+        CountV3Strategy::PeriodicRun,
+        &mut filters[..count],
+    );
     Ok((filters, count))
 }
 
@@ -1570,6 +1597,7 @@ fn estimate_costs(
     literal: &[u8],
     facts: CountV3LiteralFacts,
     multiplicity: &[u8; 256],
+    required_isa: CountV3RequiredIsa,
     strategy: CountV3Strategy,
     filters: &[u8],
 ) -> Result<CountV3CostVector, CountV3OptimizeError> {
@@ -1643,21 +1671,28 @@ fn estimate_costs(
         },
         CountV3Strategy::PeriodicRun => {
             let period_gain = overlap.saturating_mul(18);
+            let additional_filters = filter_count.saturating_sub(2);
             CountV3CostVector {
                 sparse: (520_u32
                     .saturating_sub(period_gain / 2)
                     .saturating_sub(primary_discrimination))
                 .max(180)
-                    + width * 3,
-                dense: (760_u32.saturating_sub(period_gain)).max(180) + period * 8,
+                    + width * 3
+                    + additional_filters * 6,
+                dense: (760_u32.saturating_sub(period_gain)).max(180)
+                    + period * 8
+                    + additional_filters * 28,
                 false_positive: (940_u32
                     .saturating_sub(period_gain)
-                    .saturating_sub(primary_discrimination))
+                    .saturating_sub(primary_discrimination)
+                    .saturating_sub(discrimination))
                 .max(200)
                     + width * 3,
-                matches: (650_u32.saturating_sub(period_gain / 2)).max(220) + period * 10,
+                matches: (650_u32.saturating_sub(period_gain / 2)).max(220)
+                    + period * 10
+                    + additional_filters * 12,
                 tail: 360 + period * 4,
-                code_size: 510 + width * 8 + period * 6,
+                code_size: 510 + width * 8 + period * 6 + filter_count * 32,
             }
         }
         CountV3Strategy::DirectExactMask => CountV3CostVector {
@@ -1669,7 +1704,77 @@ fn estimate_costs(
             code_size: 340 + width * 28,
         },
     };
-    Ok(vector)
+    Ok(match required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => vector,
+        CountV3RequiredIsa::Aarch64SveVl16 => estimate_sve_costs(
+            width,
+            filter_count,
+            discrimination,
+            primary_discrimination,
+            strategy,
+            false,
+        ),
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => estimate_sve_costs(
+            width,
+            filter_count,
+            discrimination,
+            primary_discrimination,
+            strategy,
+            true,
+        ),
+    })
+}
+
+/// Model the graph the SVE backend actually emits.
+///
+/// Unlike the NEON backend, every non-direct strategy currently shares one
+/// predicate-filter/scalar-confirmation template and none has a periodic
+/// successor run. Keeping this model independent of the strategy label
+/// prevents a semantic tag from receiving performance credit for a graph that
+/// is not present in the emitted code. SVE2's `MATCH` schedule is charged as a
+/// more complex comparison than baseline `CMPEQ`; the bounded portfolio may
+/// consequently choose fewer filter columns on that target.
+fn estimate_sve_costs(
+    width: u32,
+    filter_count: u32,
+    discrimination: u32,
+    primary_discrimination: u32,
+    strategy: CountV3Strategy,
+    sve2_match: bool,
+) -> CountV3CostVector {
+    let match_compare_penalty = u32::from(sve2_match);
+    if strategy == CountV3Strategy::DirectExactMask {
+        return CountV3CostVector {
+            sparse: 280 + width * (70 + match_compare_penalty * 12),
+            dense: 220 + width * (55 + match_compare_penalty * 10),
+            false_positive: 200 + width * (45 + match_compare_penalty * 8),
+            matches: 220 + width * (40 + match_compare_penalty * 8),
+            tail: 180 + width * 28,
+            code_size: 320 + width * 36,
+        };
+    }
+
+    let confirmation_bytes = width.saturating_sub(filter_count);
+    let compare_penalty = filter_count * match_compare_penalty;
+    CountV3CostVector {
+        sparse: (700_u32.saturating_sub(primary_discrimination.saturating_mul(3))).max(180)
+            + width
+            + filter_count * 12
+            + compare_penalty * 10,
+        dense: (1100_u32.saturating_sub(discrimination)).max(260)
+            + width * 10
+            + filter_count * 55
+            + compare_penalty * 18,
+        false_positive: (1300_u32
+            .saturating_sub(discrimination.saturating_mul(2))
+            .saturating_sub(primary_discrimination))
+        .max(180)
+            + width * 8
+            + compare_penalty * 8,
+        matches: 760 + confirmation_bytes * 28 + filter_count * 20 + compare_penalty * 14,
+        tail: 260 + width * 26,
+        code_size: 360 + width * 12 + filter_count * 36,
+    }
 }
 
 fn mark_pareto(candidates: &mut [Candidate], work: &mut Work) -> Result<(), CountV3OptimizeError> {
@@ -2506,15 +2611,11 @@ fn validate_recipe(
             if period >= width {
                 false
             } else {
-                let mut expected = periodic_filters(literal, analysis.facts)
+                let expected = periodic_filters(literal, analysis.facts, &analysis.multiplicity)
                     .map_err(|_| CountV3RecipeValidationError::FilterOffsets)?;
-                canonicalize_filter_order(
-                    literal,
-                    &analysis.multiplicity,
-                    CountV3Strategy::PeriodicRun,
-                    &mut expected.0[..expected.1],
-                );
-                recipe.filter_offsets() == &expected.0[..expected.1]
+                let selected_count = recipe.filter_offsets().len();
+                (2..=expected.1).contains(&selected_count)
+                    && recipe.filter_offsets() == &expected.0[..selected_count]
                     && recipe.periodic_stride == analysis.facts.minimum_period
             }
         }
@@ -2548,6 +2649,7 @@ fn validate_recipe(
         literal,
         analysis.facts,
         &analysis.multiplicity,
+        recipe.required_isa,
         recipe.strategy,
         recipe.filter_offsets(),
     )

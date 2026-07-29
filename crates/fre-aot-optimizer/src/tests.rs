@@ -96,10 +96,102 @@ fn explicit_isa_plans_are_sealed_before_recipe_identity() {
 }
 
 #[test]
+fn sve_costs_follow_the_shared_lowering_instead_of_strategy_labels() {
+    let literal = b"target-aware-recipe";
+    let mut work = Work::default();
+    let analysis = analyze_literal(literal, &mut work).expect("literal analysis");
+    let filters = [0, u8::try_from(literal.len() - 1).expect("bounded literal")];
+
+    let sve_incumbent = estimate_costs(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        CountV3RequiredIsa::Aarch64SveVl16,
+        CountV3Strategy::Incumbent,
+        &filters,
+    )
+    .expect("SVE incumbent costs");
+    let sve_endpoint = estimate_costs(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        CountV3RequiredIsa::Aarch64SveVl16,
+        CountV3Strategy::EndpointDense,
+        &filters,
+    )
+    .expect("SVE endpoint costs");
+    assert_eq!(sve_incumbent, sve_endpoint);
+
+    let neon_incumbent = estimate_costs(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        CountV3RequiredIsa::Aarch64Neon128,
+        CountV3Strategy::Incumbent,
+        &filters,
+    )
+    .expect("NEON incumbent costs");
+    let neon_endpoint = estimate_costs(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        CountV3RequiredIsa::Aarch64Neon128,
+        CountV3Strategy::EndpointDense,
+        &filters,
+    )
+    .expect("NEON endpoint costs");
+    assert_ne!(neon_incumbent, neon_endpoint);
+
+    let sve2_endpoint = estimate_costs(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+        CountV3Strategy::EndpointDense,
+        &filters,
+    )
+    .expect("SVE2 endpoint costs");
+    assert!(sve2_endpoint.sparse > sve_endpoint.sparse);
+    assert!(sve2_endpoint.dense > sve_endpoint.dense);
+}
+
+#[test]
+fn periodic_portfolio_competes_over_every_bounded_filter_prefix() {
+    let literal = b"abababab";
+    let mut work = Work::default();
+    let analysis = analyze_literal(literal, &mut work).expect("periodic literal analysis");
+    let frontier = build_column_frontier(literal, &analysis, &mut work).expect("periodic frontier");
+    let expected = count_portfolio(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        &frontier,
+        &mut work,
+    )
+    .expect("periodic portfolio count");
+    let candidates = build_portfolio(
+        literal,
+        analysis.facts,
+        &analysis.multiplicity,
+        &frontier,
+        CountV3RequiredIsa::Aarch64Neon128,
+        expected,
+        &mut work,
+    )
+    .expect("periodic portfolio");
+    let periodic_filter_counts = candidates
+        .iter()
+        .filter(|candidate| candidate.strategy == CountV3Strategy::PeriodicRun)
+        .map(|candidate| candidate.filter_count)
+        .collect::<Vec<_>>();
+    assert_eq!(periodic_filter_counts, vec![2, 3, 4]);
+}
+
+#[test]
 fn canonical_inspection_and_decode_are_strict() {
-    let program = program(b"0123456789abcdef");
+    let source_program = program(b"0123456789abcdef");
     let optimized = optimize_count_v3(
-        &program,
+        &source_program,
         CountV3TuningClass::AppleMSeries,
         CountV3OptimizerLimits::default(),
     )
@@ -108,11 +200,11 @@ fn canonical_inspection_and_decode_are_strict() {
     let inspected = inspect_count_recipe_v3(&canonical).expect("canonical inspection");
     assert_eq!(
         inspected.program_identity(),
-        program.cache_identity().as_bytes()
+        source_program.cache_identity().as_bytes()
     );
     assert_eq!(inspected.identity(), optimized.recipe().identity());
     assert_eq!(
-        decode_count_recipe_v3(&program, &canonical).expect("strict decode"),
+        decode_count_recipe_v3(&source_program, &canonical).expect("strict decode"),
         *optimized.recipe()
     );
     let other_program = program(b"fedcba9876543210");
