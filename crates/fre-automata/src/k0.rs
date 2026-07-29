@@ -426,7 +426,11 @@ impl WorkspaceLayout {
             0
         } else {
             // The contextual store replaces the direct-row allocation.
-            8
+            7usize
+                .checked_add(usize::from(lazy_item_capacity != 0))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "lazy workspace allocation count",
+                })?
         };
         let reverse_allocations = if reverse_state_capacity == 0 {
             0
@@ -5511,14 +5515,15 @@ fn lazy_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError>
     if states == 0 || states > LAZY_MAX_ITEMS {
         return Ok((0, 0));
     }
-    let item_capacity = states
-        .checked_mul(LAZY_MAX_STATES)
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "lazy DFA item capacity",
-        })?
-        .min(LAZY_MAX_ITEMS)
-        .max(states);
-    Ok((LAZY_MAX_STATES, item_capacity))
+    let consuming = automaton.stats().consuming_states();
+    let state_capacity = forward_lazy_state_capacity(consuming);
+    let item_capacity = ordered_partial_permutation_item_capacity(
+        consuming,
+        2,
+        state_capacity,
+        "lazy DFA item capacity",
+    )?;
+    Ok((state_capacity, item_capacity))
 }
 
 fn reverse_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchError> {
@@ -5526,14 +5531,120 @@ fn reverse_capacities(automaton: &Automaton) -> Result<(usize, usize), SearchErr
     if consuming == 0 || consuming > LAZY_MAX_ITEMS {
         return Ok((0, 0));
     }
-    let item_capacity = consuming
-        .checked_mul(LAZY_MAX_STATES)
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "reverse lazy DFA item capacity",
-        })?
-        .min(LAZY_MAX_ITEMS)
-        .max(consuming);
-    Ok((LAZY_MAX_STATES, item_capacity))
+    let state_capacity =
+        reverse_lazy_state_capacity(consuming, automaton.stats().assertion_edges() != 0);
+    let item_capacity = ordered_partial_permutation_item_capacity(
+        consuming,
+        1,
+        state_capacity,
+        "reverse lazy DFA item capacity",
+    )?;
+    Ok((state_capacity, item_capacity))
+}
+
+/// Count distinct ordered nonempty subsets, capped at the retained row limit.
+///
+/// A closure generation admits each item at most once, but forward priority
+/// makes different orders distinct cache states. `modes` accounts for state
+/// identity outside the item sequence, while `empty_modes` admits only the
+/// semantically reachable empty identities.
+fn capped_ordered_partial_permutations(items: usize, modes: usize, empty_modes: usize) -> usize {
+    let mut total = empty_modes.min(LAZY_MAX_STATES);
+    let mut permutations = 1usize;
+    let mut length = 1usize;
+    while length <= items && total < LAZY_MAX_STATES {
+        let prior = length.saturating_sub(1);
+        let remaining = items.saturating_sub(prior);
+        permutations = permutations.saturating_mul(remaining).min(LAZY_MAX_STATES);
+        total = total
+            .saturating_add(permutations.saturating_mul(modes))
+            .min(LAZY_MAX_STATES);
+        length = length.saturating_add(1);
+    }
+    total
+}
+
+fn forward_lazy_state_capacity(consuming_states: usize) -> usize {
+    // Nonempty ordered subsets exist in both pending modes. Exactly one empty
+    // identity is retainable: the pending nullable initial state in a direct
+    // graph, or the nonpending restart state in a contextual graph.
+    capped_ordered_partial_permutations(consuming_states, 2, 1)
+}
+
+fn reverse_lazy_state_capacity(consuming_edges: usize, contextual: bool) -> usize {
+    if consuming_edges == 0 {
+        return 0;
+    }
+    // Reverse state identity is only its consuming-edge sequence. Contextual
+    // initialization can additionally retain one empty sequence when the
+    // current assertion mask disconnects every consuming predecessor.
+    capped_ordered_partial_permutations(consuming_edges, 1, usize::from(contextual))
+}
+
+/// Maximum aggregate item length of any retained set of distinct identities.
+///
+/// For five or more items, at least 64 full-length permutations exist, so the
+/// capped cache can consist entirely of maximum-length states. Smaller domains
+/// enumerate each length exactly and retain the longest identities first.
+fn ordered_partial_permutation_item_capacity(
+    items: usize,
+    modes: usize,
+    state_capacity: usize,
+    structure: &'static str,
+) -> Result<usize, SearchError> {
+    if items >= 5 {
+        return items
+            .checked_mul(state_capacity)
+            .map(|capacity| capacity.min(LAZY_MAX_ITEMS))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: structure,
+            });
+    }
+
+    let mut remaining_states = state_capacity;
+    let mut item_capacity = 0usize;
+    let mut length = items;
+    while length != 0 && remaining_states != 0 {
+        let mut permutations = 1usize;
+        for ordinal in 0..length {
+            let factor = items
+                .checked_sub(ordinal)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: structure,
+                })?;
+            permutations =
+                permutations
+                    .checked_mul(factor)
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: structure,
+                    })?;
+        }
+        let identities =
+            permutations
+                .checked_mul(modes)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: structure,
+                })?;
+        let selected = identities.min(remaining_states);
+        item_capacity = selected
+            .checked_mul(length)
+            .and_then(|items| item_capacity.checked_add(items))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: structure,
+            })?;
+        remaining_states =
+            remaining_states
+                .checked_sub(selected)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: structure,
+                })?;
+        length = length
+            .checked_sub(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: structure,
+            })?;
+    }
+    Ok(item_capacity.min(LAZY_MAX_ITEMS))
 }
 
 fn lazy_initialized_slots(
@@ -5938,6 +6049,22 @@ mod tests {
                 edge_kinds: vec![EdgeKind::ByteRange; ranges.len()],
                 byte_starts: ranges.iter().map(|&(start, _)| start).collect(),
                 byte_ends: ranges.iter().map(|&(_, end)| end).collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn zero_edge_consume() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
             },
             CompileLimits::default(),
         )
@@ -6504,6 +6631,538 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn ordered_partial_permutation_caps_match_exhaustive_state_identities() {
+        fn enumerate_nonempty_orders(used: &mut [bool], length: usize, lengths: &mut Vec<usize>) {
+            for item in 0..used.len() {
+                if used[item] {
+                    continue;
+                }
+                used[item] = true;
+                let next_length = length.checked_add(1).unwrap();
+                lengths.push(next_length);
+                enumerate_nonempty_orders(used, next_length, lengths);
+                used[item] = false;
+            }
+        }
+
+        let mut forward = Vec::new();
+        let mut forward_items = Vec::new();
+        let mut direct_reverse = Vec::new();
+        let mut reverse_items = Vec::new();
+        let mut contextual_reverse = Vec::new();
+        for items in 0..=6 {
+            let mut lengths = Vec::new();
+            enumerate_nonempty_orders(&mut vec![false; items], 0, &mut lengths);
+            let nonempty = lengths.len();
+            let expected_forward = nonempty
+                .checked_mul(2)
+                .and_then(|states| states.checked_add(1))
+                .unwrap()
+                .min(super::LAZY_MAX_STATES);
+            let expected_direct_reverse = if items == 0 {
+                0
+            } else {
+                nonempty.min(super::LAZY_MAX_STATES)
+            };
+            let expected_contextual_reverse = if items == 0 {
+                0
+            } else {
+                nonempty.checked_add(1).unwrap().min(super::LAZY_MAX_STATES)
+            };
+            let got_forward = super::forward_lazy_state_capacity(items);
+            let got_direct_reverse = super::reverse_lazy_state_capacity(items, false);
+            let got_contextual_reverse = super::reverse_lazy_state_capacity(items, true);
+            let mut forward_lengths = lengths.clone();
+            forward_lengths.extend_from_slice(&lengths);
+            forward_lengths.push(0);
+            forward_lengths.sort_unstable_by(|left, right| right.cmp(left));
+            let expected_forward_items = forward_lengths
+                .iter()
+                .take(expected_forward)
+                .copied()
+                .sum::<usize>()
+                .min(super::LAZY_MAX_ITEMS);
+            let mut direct_reverse_lengths = lengths.clone();
+            direct_reverse_lengths.sort_unstable_by(|left, right| right.cmp(left));
+            let expected_direct_reverse_items = direct_reverse_lengths
+                .iter()
+                .take(expected_direct_reverse)
+                .copied()
+                .sum::<usize>()
+                .min(super::LAZY_MAX_ITEMS);
+            let mut contextual_reverse_lengths = lengths;
+            contextual_reverse_lengths.push(0);
+            contextual_reverse_lengths.sort_unstable_by(|left, right| right.cmp(left));
+            let expected_contextual_reverse_items = contextual_reverse_lengths
+                .iter()
+                .take(expected_contextual_reverse)
+                .copied()
+                .sum::<usize>()
+                .min(super::LAZY_MAX_ITEMS);
+            let got_forward_items = super::ordered_partial_permutation_item_capacity(
+                items,
+                2,
+                got_forward,
+                "test forward items",
+            )
+            .unwrap();
+            let got_direct_reverse_items = super::ordered_partial_permutation_item_capacity(
+                items,
+                1,
+                got_direct_reverse,
+                "test direct reverse items",
+            )
+            .unwrap();
+            let got_contextual_reverse_items = super::ordered_partial_permutation_item_capacity(
+                items,
+                1,
+                got_contextual_reverse,
+                "test contextual reverse items",
+            )
+            .unwrap();
+            assert_eq!(got_forward, expected_forward, "forward items={items}");
+            assert_eq!(
+                got_forward_items, expected_forward_items,
+                "forward arena items={items}"
+            );
+            assert_eq!(
+                got_direct_reverse, expected_direct_reverse,
+                "direct reverse items={items}"
+            );
+            assert_eq!(
+                got_contextual_reverse, expected_contextual_reverse,
+                "contextual reverse items={items}"
+            );
+            assert_eq!(
+                got_direct_reverse_items, expected_direct_reverse_items,
+                "direct reverse arena items={items}"
+            );
+            assert_eq!(
+                got_contextual_reverse_items, expected_contextual_reverse_items,
+                "contextual reverse arena items={items}"
+            );
+            forward.push(got_forward);
+            forward_items.push(got_forward_items);
+            direct_reverse.push(got_direct_reverse);
+            reverse_items.push(got_direct_reverse_items);
+            contextual_reverse.push(got_contextual_reverse);
+        }
+        assert_eq!(forward, [1, 3, 9, 31, 64, 64, 64]);
+        assert_eq!(forward_items, [0, 2, 12, 66, 240, 320, 384]);
+        assert_eq!(direct_reverse, [0, 1, 4, 15, 64, 64, 64]);
+        assert_eq!(reverse_items, [0, 1, 6, 33, 196, 320, 384]);
+        assert_eq!(contextual_reverse, [0, 2, 5, 16, 64, 64, 64]);
+        assert_eq!(
+            super::forward_lazy_state_capacity(usize::MAX),
+            super::LAZY_MAX_STATES
+        );
+        assert_eq!(
+            super::reverse_lazy_state_capacity(usize::MAX, false),
+            super::LAZY_MAX_STATES
+        );
+        assert_eq!(
+            super::reverse_lazy_state_capacity(usize::MAX, true),
+            super::LAZY_MAX_STATES
+        );
+        assert_eq!(
+            super::ordered_partial_permutation_item_capacity(
+                super::LAZY_MAX_ITEMS,
+                2,
+                super::LAZY_MAX_STATES,
+                "test saturated forward items",
+            )
+            .unwrap(),
+            super::LAZY_MAX_ITEMS
+        );
+        for (items, expected) in [
+            (255, 255 * super::LAZY_MAX_STATES),
+            (256, super::LAZY_MAX_ITEMS),
+            (257, super::LAZY_MAX_ITEMS),
+        ] {
+            assert_eq!(
+                super::ordered_partial_permutation_item_capacity(
+                    items,
+                    2,
+                    super::LAZY_MAX_STATES,
+                    "test forward item cap transition",
+                )
+                .unwrap(),
+                expected,
+                "forward cap transition items={items}"
+            );
+            assert_eq!(
+                super::ordered_partial_permutation_item_capacity(
+                    items,
+                    1,
+                    super::LAZY_MAX_STATES,
+                    "test reverse item cap transition",
+                )
+                .unwrap(),
+                expected,
+                "reverse cap transition items={items}"
+            );
+        }
+        assert_eq!(
+            super::ordered_partial_permutation_item_capacity(
+                super::LAZY_MAX_ITEMS,
+                1,
+                super::LAZY_MAX_STATES,
+                "test saturated reverse items",
+            )
+            .unwrap(),
+            super::LAZY_MAX_ITEMS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the census, state proof, item arena, direct rows, contextual slots, and resource edges share one layout matrix"
+    )]
+    fn consuming_census_tightly_sizes_every_lazy_workspace_component() {
+        let terminal = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Accept],
+                edge_offsets: vec![0, 0],
+                edge_targets: vec![],
+                edge_kinds: vec![],
+                byte_starts: vec![],
+                byte_ends: vec![],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let cases = [
+            ("terminal", terminal, 0, 0, 1, 0, 0, 0),
+            ("zero-edge-consume", zero_edge_consume(), 1, 0, 3, 2, 0, 0),
+            ("one", byte_chain(&[(b'a', b'a')]), 1, 1, 3, 2, 1, 1),
+            (
+                "two",
+                byte_chain(&[(b'a', b'a'), (b'b', b'b')]),
+                2,
+                2,
+                9,
+                12,
+                4,
+                6,
+            ),
+            (
+                "three",
+                byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]),
+                3,
+                3,
+                31,
+                66,
+                15,
+                33,
+            ),
+            (
+                "four",
+                byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c'), (b'd', b'd')]),
+                4,
+                4,
+                64,
+                240,
+                64,
+                196,
+            ),
+        ];
+
+        for (
+            name,
+            plan,
+            consuming_states,
+            consuming_edges,
+            forward_states,
+            forward_items,
+            reverse_states,
+            reverse_items,
+        ) in cases
+        {
+            assert_eq!(
+                plan.stats().consuming_states(),
+                consuming_states,
+                "{name}: authenticated consuming-state census"
+            );
+            assert_eq!(
+                plan.stats().consuming_edges(),
+                consuming_edges,
+                "{name}: consuming-edge census"
+            );
+
+            let endpoint = plan.accelerated_workspace_layout().unwrap();
+            let ordinary = plan.workspace_layout().unwrap();
+            assert_eq!(
+                endpoint.lazy_state_capacity, forward_states,
+                "{name}: forward states"
+            );
+            assert_eq!(
+                endpoint.lazy_item_capacity, forward_items,
+                "{name}: forward items"
+            );
+            assert_eq!(endpoint.lazy_context_slots, 0, "{name}: direct forward");
+            let expected_lazy_bytes = super::lazy_scratch_bytes(
+                endpoint.states,
+                forward_states,
+                endpoint.lazy_item_capacity,
+                0,
+            )
+            .unwrap();
+            assert_eq!(
+                endpoint
+                    .logical_bytes()
+                    .checked_sub(ordinary.logical_bytes())
+                    .unwrap(),
+                expected_lazy_bytes,
+                "{name}: exact additional logical bytes"
+            );
+            let expected_lazy_work = super::lazy_initialized_slots(
+                endpoint.states,
+                forward_states,
+                endpoint.lazy_item_capacity,
+                0,
+            )
+            .unwrap()
+            .checked_add(7)
+            .and_then(|work| work.checked_add(usize::from(endpoint.lazy_item_capacity != 0)))
+            .and_then(|work| u64::try_from(work).ok())
+            .unwrap();
+            assert_eq!(
+                endpoint
+                    .construction_work()
+                    .checked_sub(ordinary.construction_work())
+                    .unwrap(),
+                expected_lazy_work,
+                "{name}: exact initialization and allocation work"
+            );
+            let exact_endpoint = K0Workspace::new_accelerated(
+                &plan,
+                WorkspaceLimits {
+                    max_setup_work: endpoint.construction_work(),
+                    max_scratch_bytes: endpoint.logical_bytes(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                exact_endpoint.lazy.rows.len(),
+                forward_states.checked_mul(super::BYTE_ALPHABET).unwrap(),
+                "{name}: forward row cells"
+            );
+            assert_eq!(
+                exact_endpoint.lazy.items.len(),
+                forward_items,
+                "{name}: forward item storage"
+            );
+            assert_eq!(
+                exact_endpoint.construction_accounting().work(),
+                endpoint.construction_work(),
+                "{name}: exact construction accounting"
+            );
+            assert!(matches!(
+                K0Workspace::new_accelerated(
+                    &plan,
+                    WorkspaceLimits {
+                        max_setup_work: endpoint.construction_work() - 1,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                ),
+                Err(SearchError::WorkspaceSetupWorkLimitExceeded { limit, needed })
+                    if limit == endpoint.construction_work() - 1
+                        && needed == endpoint.construction_work()
+            ));
+            assert!(matches!(
+                K0Workspace::new_accelerated(
+                    &plan,
+                    WorkspaceLimits {
+                        max_setup_work: u64::MAX,
+                        max_scratch_bytes: endpoint.logical_bytes() - 1,
+                    },
+                ),
+                Err(SearchError::ResourceLimit {
+                    resource: ResourceKind::ScratchBytes,
+                    needed,
+                    limit,
+                }) if needed == endpoint.logical_bytes()
+                    && limit == endpoint.logical_bytes() - 1
+            ));
+
+            let full = plan.bidirectional_workspace_layout().unwrap();
+            assert_eq!(
+                full.reverse_state_capacity, reverse_states,
+                "{name}: reverse states"
+            );
+            assert_eq!(
+                full.reverse_item_capacity, reverse_items,
+                "{name}: reverse items"
+            );
+            let exact_full =
+                K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+            assert_eq!(
+                exact_full.reverse.rows.len(),
+                reverse_states.checked_mul(super::BYTE_ALPHABET).unwrap(),
+                "{name}: reverse row cells"
+            );
+            assert_eq!(
+                exact_full.reverse.items.len(),
+                reverse_items,
+                "{name}: reverse item storage"
+            );
+            if reverse_states == 0 {
+                assert_eq!(full, endpoint, "{name}: no reverse frontier");
+            } else {
+                assert!(
+                    full.logical_bytes() > endpoint.logical_bytes(),
+                    "{name}: reverse storage"
+                );
+            }
+        }
+
+        let contextual = asserted_line_a();
+        assert_eq!(contextual.stats().consuming_states(), 1);
+        let endpoint = contextual.accelerated_workspace_layout().unwrap();
+        let full = contextual.bidirectional_workspace_layout().unwrap();
+        assert_eq!(endpoint.lazy_state_capacity, 3);
+        assert_eq!(endpoint.lazy_item_capacity, 2);
+        assert_eq!(endpoint.lazy_context_slots, CONTEXT_TRANSITION_SLOTS);
+        assert_eq!(full.reverse_state_capacity, 2);
+        assert_eq!(full.reverse_item_capacity, 1);
+        assert_eq!(full.reverse_context_slots, CONTEXT_TRANSITION_SLOTS);
+        let workspace =
+            K0Workspace::new_bidirectional(&contextual, WorkspaceLimits::unlimited()).unwrap();
+        assert!(workspace.lazy.rows.is_empty());
+        assert!(workspace.reverse.rows.is_empty());
+        assert_eq!(workspace.lazy.context.slots.len(), CONTEXT_TRANSITION_SLOTS);
+        assert_eq!(
+            workspace.reverse.context.slots.len(),
+            CONTEXT_TRANSITION_SLOTS
+        );
+    }
+
+    #[test]
+    fn zero_edge_consume_census_preserves_semantics_accounting_and_cache_capacity() {
+        let plan = zero_edge_consume();
+        let endpoint = plan.accelerated_workspace_layout().unwrap();
+        assert_eq!(plan.stats().consuming_states(), 1);
+        assert_eq!(plan.stats().consuming_edges(), 0);
+        assert_eq!(endpoint.lazy_state_capacity, 3);
+        assert_eq!(endpoint.lazy_item_capacity, 2);
+        assert_eq!(endpoint.reverse_state_capacity, 0);
+
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut accelerated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let haystacks = [b"".as_slice(), b"a", b"\0\xff", b"dead"];
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let want = plan
+                        .prepare::<Exists>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut pike,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    let got = plan
+                        .prepare::<Exists>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut accelerated,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(got.output(), want.output());
+                    assert_eq!(
+                        got.accounting().boundaries(),
+                        want.accounting().boundaries()
+                    );
+
+                    let want = plan
+                        .prepare::<EarliestEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut pike,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    let got = plan
+                        .prepare::<EarliestEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut accelerated,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(got.output(), want.output());
+                    assert_eq!(
+                        got.accounting().boundaries(),
+                        want.accounting().boundaries()
+                    );
+
+                    let want = plan
+                        .prepare::<SelectedEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut pike,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    let got = plan
+                        .prepare::<SelectedEnd>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut accelerated,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(got.output(), want.output());
+                    assert_eq!(
+                        got.accounting().boundaries(),
+                        want.accounting().boundaries()
+                    );
+
+                    let want = plan
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut pike,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    let got = plan
+                        .prepare::<Span>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut accelerated,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(got.output(), want.output());
+                    assert_eq!(
+                        got.accounting().boundaries(),
+                        want.accounting().boundaries()
+                    );
+                }
+            }
+        }
+        assert!(accelerated.lazy.initialized);
+        assert!(!accelerated.lazy.declined);
+        assert!(!accelerated.lazy.saturated);
+        assert!(accelerated.lazy.state_len <= endpoint.lazy_state_capacity);
+        assert!(accelerated.lazy.item_len <= endpoint.lazy_item_capacity);
     }
 
     #[test]
@@ -9661,6 +10320,12 @@ mod tests {
 
             assert!(endpoint.lazy.initialized, "{name}: endpoint initialized");
             assert!(!endpoint.lazy.declined, "{name}: endpoint accepted");
+            assert!(
+                !endpoint.lazy.saturated,
+                "{name}: exhaustive nullable identities fit their proven capacity"
+            );
+            assert!(endpoint.lazy.state_len <= endpoint.layout.lazy_state_capacity);
+            assert!(endpoint.lazy.item_len <= endpoint.layout.lazy_item_capacity);
             assert!(bidirectional.lazy.initialized, "{name}: span initialized");
             assert!(
                 !bidirectional.reverse.initialized,
@@ -9670,6 +10335,12 @@ mod tests {
                 !bidirectional.lazy.declined,
                 "{name}: span forward accepted"
             );
+            assert!(
+                !bidirectional.lazy.saturated,
+                "{name}: full-session forward identities fit their proven capacity"
+            );
+            assert!(bidirectional.lazy.state_len <= bidirectional.layout.lazy_state_capacity);
+            assert!(bidirectional.lazy.item_len <= bidirectional.layout.lazy_item_capacity);
         }
         assert!(checked > 10_000);
         assert!(positive_spans > 100);
@@ -10245,6 +10916,30 @@ mod tests {
         );
         assert_eq!(exact.consumed, 1);
         assert_eq!(forward.lazy.state_len, 1);
+        forward.lazy.scratch[0] = 0;
+        forward.lazy.scratch_len = 1;
+        let mut fill = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            forward
+                .lazy
+                .intern_speculative(false, &mut fill, 0, 0)
+                .unwrap(),
+            super::LazyInterned::State(1)
+        );
+        forward.lazy.scratch[0] = 0;
+        forward.lazy.scratch_len = 1;
+        assert_eq!(
+            forward
+                .lazy
+                .intern_speculative(true, &mut fill, 0, 0)
+                .unwrap(),
+            super::LazyInterned::State(2)
+        );
+        assert_eq!(forward.lazy.state_len, 3);
+        assert_eq!(forward.lazy.item_len, 2);
+        assert_eq!(forward.lazy.offsets.len(), 3);
+        assert_eq!(forward.lazy.items.len(), 2);
+        assert!(!forward.lazy.saturated);
 
         let mut reverse =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
@@ -10267,6 +10962,18 @@ mod tests {
         );
         assert_eq!(exact.consumed, 1);
         assert_eq!(reverse.reverse.state_len, 1);
+        reverse.reverse.scratch[0] = 0;
+        reverse.reverse.scratch_len = 1;
+        let mut fill = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            reverse.reverse.intern_speculative(&mut fill, 0, 0).unwrap(),
+            super::LazyInterned::State(1)
+        );
+        assert_eq!(reverse.reverse.state_len, 2);
+        assert_eq!(reverse.reverse.item_len, 1);
+        assert_eq!(reverse.reverse.offsets.len(), 2);
+        assert_eq!(reverse.reverse.items.len(), 1);
+        assert!(!reverse.reverse.saturated);
     }
 
     #[test]

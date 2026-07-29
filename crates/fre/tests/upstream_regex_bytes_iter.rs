@@ -3,7 +3,7 @@
 use fre::{
     BuildLimits, Match, PlanKind, PlanSelection, PortableBuilder, PortableFindIterAccounting,
     PortableFindIterError, PortableFindIterLimits, PortableRegex, RustProfile, SearchError,
-    SearchLimits,
+    SearchLimits, SearchSessionLimits,
 };
 
 const UPSTREAM_REVISION: &str = "7b96fdc9d5fe6a0cb4efe30e6689b050493fc1e1";
@@ -349,6 +349,105 @@ fn nullable_k0_iteration_preserves_priority_and_empty_progress_across_reused_sea
                 assert!(accounting.search_calls >= accounting.matches);
             }
         }
+    }
+}
+
+#[test]
+fn nullable_iterator_sessions_use_tight_source_free_setup_and_preserve_public_fallbacks() {
+    let haystack = b"abcdabcdabcdabcdabcdabcdabcdabc";
+    assert_eq!(haystack.len(), 31);
+    let mut setup_sizes = Vec::new();
+
+    for pattern in ["", "a*", "(?:ab)*", "(?:abc)*", "(?:abcd)*"] {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap_or_else(|error| panic!("nullable K0 build failed for {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned build failed for {pattern:?}: {error}"));
+        let expected: Vec<_> = upstream
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+
+        let mut probe = regex
+            .find_iter(haystack, PortableFindIterLimits::unlimited())
+            .unwrap_or_else(|error| {
+                panic!("nullable iterator setup failed for {pattern:?}: {error}")
+            });
+        let setup = probe
+            .workspace_setup_accounting()
+            .expect("forced K0 iterator retains one workspace");
+        let actual = probe
+            .by_ref()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, expected, "{pattern:?}: unlimited offsets");
+        assert!(probe.next().is_none(), "{pattern:?}: fused offsets");
+
+        let exact_limits = PortableFindIterLimits {
+            session: SearchSessionLimits {
+                max_setup_work: setup.work(),
+                max_scratch_bytes: setup.retained_bytes(),
+            },
+            ..PortableFindIterLimits::unlimited()
+        };
+        let mut exact = regex
+            .find_iter_borrowed(haystack, exact_limits)
+            .unwrap_or_else(|error| panic!("exact nullable setup failed for {pattern:?}: {error}"));
+        assert_eq!(exact.workspace_setup_accounting(), Some(setup));
+        let exact_matches = exact
+            .by_ref()
+            .map(|matched| {
+                matched.map(|matched| {
+                    let range = matched.range();
+                    (range.start, range.end)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(exact_matches, expected, "{pattern:?}: exact borrowed");
+        assert!(exact.next().is_none(), "{pattern:?}: fused borrowed");
+
+        let fallback_limits = PortableFindIterLimits {
+            session: SearchSessionLimits {
+                max_setup_work: setup.work() - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+            ..PortableFindIterLimits::unlimited()
+        };
+        let mut fallback = regex
+            .find_iter(haystack, fallback_limits)
+            .unwrap_or_else(|error| panic!("ordinary fallback failed for {pattern:?}: {error}"));
+        let fallback_setup = fallback
+            .workspace_setup_accounting()
+            .expect("forced K0 fallback retains ordinary workspace");
+        assert!(
+            fallback_setup.work() < setup.work(),
+            "{pattern:?}: one-below must select the smaller ordinary tier"
+        );
+        let fallback_matches = fallback
+            .by_ref()
+            .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(fallback_matches, expected, "{pattern:?}: ordinary fallback");
+        setup_sizes.push((setup.work(), setup.retained_bytes()));
+    }
+
+    for adjacent in setup_sizes.windows(2) {
+        assert!(
+            adjacent[0].0 < adjacent[1].0,
+            "construction work must track the proven state space"
+        );
+        assert!(
+            adjacent[0].1 < adjacent[1].1,
+            "retained bytes must track the proven state space"
+        );
     }
 }
 

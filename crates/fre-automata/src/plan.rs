@@ -227,6 +227,7 @@ pub struct PlanStats {
     zero_width_edges: usize,
     assertion_edges: usize,
     assertion_kinds: u32,
+    consuming_states: u32,
     consuming_edges: usize,
     storage_bytes: usize,
     validation_work: usize,
@@ -263,6 +264,13 @@ impl PlanStats {
 
     pub(crate) const fn assertion_kinds(self) -> u32 {
         self.assertion_kinds
+    }
+
+    /// Number of states authenticated with the consuming role.
+    #[must_use]
+    pub fn consuming_states(self) -> usize {
+        usize::try_from(self.consuming_states)
+            .expect("validated u32 consuming-state count fits usize")
     }
 
     #[must_use]
@@ -855,7 +863,7 @@ struct Shape {
 fn validate_raw(raw: &RawPlan, limits: CompileLimits) -> Result<PlanStats, CompileError> {
     let shape = validate_shape(raw, limits)?;
     validate_offsets(&raw.edge_offsets, shape.edges)?;
-    let (zero_width_edges, assertion_edges, assertion_kinds, consuming_edges) =
+    let (zero_width_edges, assertion_edges, assertion_kinds, consuming_states, consuming_edges) =
         validate_graph(raw, shape.states)?;
     Ok(PlanStats {
         states: shape.states,
@@ -863,6 +871,7 @@ fn validate_raw(raw: &RawPlan, limits: CompileLimits) -> Result<PlanStats, Compi
         zero_width_edges,
         assertion_edges,
         assertion_kinds,
+        consuming_states,
         consuming_edges,
         storage_bytes: shape.storage_bytes,
         validation_work: shape.validation_work,
@@ -959,10 +968,11 @@ fn validate_edge_array_lengths(raw: &RawPlan, edges: usize) -> Result<(), Compil
 fn validate_graph(
     raw: &RawPlan,
     states: usize,
-) -> Result<(usize, usize, u32, usize), CompileError> {
+) -> Result<(usize, usize, u32, u32, usize), CompileError> {
     let mut zero_width_edges = 0usize;
     let mut assertion_edges = 0usize;
     let mut assertion_kinds = 0_u32;
+    let mut consuming_states = 0_u32;
     let mut consuming_edges = 0usize;
     let mut has_accept = false;
     for state in 0..states {
@@ -970,6 +980,14 @@ fn validate_graph(
         let begin = plan_index(raw.edge_offsets[state]);
         let end = plan_index(raw.edge_offsets[next_state]);
         let role = raw.roles[state];
+        if role == StateRole::Consume {
+            consuming_states =
+                consuming_states
+                    .checked_add(1)
+                    .ok_or(CompileError::ArithmeticOverflow {
+                        computation: "consuming state count",
+                    })?;
+        }
         if role == StateRole::Accept {
             has_accept = true;
             if begin != end {
@@ -1004,6 +1022,7 @@ fn validate_graph(
         zero_width_edges,
         assertion_edges,
         assertion_kinds,
+        consuming_states,
         consuming_edges,
     ))
 }
