@@ -617,6 +617,8 @@ impl FoldedLiteralTriePlan {
     ///
     /// Returns checked resource/allocation/invariant errors. All resource
     /// limits are enforced before exact persistent allocation.
+    #[cold]
+    #[inline(never)]
     pub fn build(
         patterns: &[FoldedLiteral<'_>],
         limits: BuildLimits,
@@ -635,6 +637,8 @@ impl FoldedLiteralTriePlan {
         clippy::too_many_lines,
         reason = "bounded allocation, exact topology census, and receipt publication stay in one auditable transaction"
     )]
+    #[cold]
+    #[inline(never)]
     pub fn build_with_dispatch(
         dispatch: SimdDispatchContext,
         patterns: &[FoldedLiteral<'_>],
@@ -1067,6 +1071,8 @@ struct PrefilterColumn {
     clippy::too_many_lines,
     reason = "one allocation-free traversal keeps fixed-column derivation, ranking and exact work accounting visibly coupled"
 )]
+#[cold]
+#[inline(never)]
 fn select_root_prefilter(
     dispatch: SimdDispatchContext,
     patterns: &[FoldedLiteral<'_>],
@@ -1494,6 +1500,8 @@ where
     Ok(())
 }
 
+#[cold]
+#[inline(never)]
 fn fallback_reason(
     patterns: &[FoldedLiteral<'_>],
 ) -> Result<(Option<DenseFallbackReason>, usize), BuildError> {
@@ -1563,6 +1571,8 @@ fn fallback_reason(
     Ok((None, comparisons))
 }
 
+#[cold]
+#[inline(never)]
 fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccounting, BuildError> {
     let mut scalar_positions = 0_usize;
     let mut equivalent_scalars = 0_usize;
@@ -1703,6 +1713,8 @@ fn preflight_root_prefilter_work_upper_bound(
         })
 }
 
+#[cold]
+#[inline(never)]
 fn enforce_build_limits(
     accounting: &BuildAccounting,
     limits: BuildLimits,
@@ -1823,6 +1835,8 @@ fn class_relation(
     })
 }
 
+#[cold]
+#[inline(never)]
 fn insert_class(
     nodes: &mut ExactVec<Node>,
     edges: &mut ExactVec<Edge>,

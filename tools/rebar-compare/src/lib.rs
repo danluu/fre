@@ -1863,6 +1863,63 @@ enum CurrentFreAggregateOperationInner {
     SpanSumMany(AggregateManySpanSumRegex, AggregateManyRunLimits),
 }
 
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_input_length_error(actual: usize, expected: usize) -> CompareError {
+    CompareError::new(format!(
+        "aggregate operation haystack length {actual} differs from prepared {expected}"
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_canonical_count_error(error: ExecutionError) -> CompareError {
+    CompareError::new(format!(
+        "FRE canonical case-fold count lifecycle: {}",
+        error.message
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_folded_count_error(error: UnicodeFoldedLiteralRunError) -> CompareError {
+    CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_count_error(error: fre::AggregateExecutionError) -> CompareError {
+    let message = format!("FRE count lifecycle: {error}");
+    CompareError::new(aggregate_attempt_error(&error, message).message)
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_count_many_error(error: fre::AggregateManyExecutionError) -> CompareError {
+    CompareError::new(format!("FRE count-many lifecycle: {error}"))
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_folded_span_sum_error(error: UnicodeFoldedLiteralRunError) -> CompareError {
+    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_span_sum_error(error: fre::AggregateExecutionError) -> CompareError {
+    let message = format!("FRE span-sum lifecycle: {error}");
+    CompareError::new(aggregate_attempt_error(&error, message).message)
+}
+
+#[cold]
+#[inline(never)]
+fn aggregate_lifecycle_span_sum_many_error(
+    error: fre::AggregateManyExecutionError,
+) -> CompareError {
+    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
+}
+
 /// Value produced by the reusable aggregate operation shell together with an
 /// optional immutable continuation counter receipt.
 ///
@@ -1942,71 +1999,47 @@ impl CurrentFreAggregateOperationLifecycle {
     /// Returns an error for input-length mismatch or retained-plan refusal.
     pub fn execute(&self, haystack: &[u8]) -> Result<u64, CompareError> {
         if haystack.len() != self.haystack_len {
-            return Err(CompareError::new(format!(
-                "aggregate operation haystack length {} differs from prepared {}",
+            return Err(aggregate_lifecycle_input_length_error(
                 haystack.len(),
-                self.haystack_len
-            )));
+                self.haystack_len,
+            ));
         }
         match &self.inner {
-            CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => {
-                lifecycle.execute(haystack).map_err(|error| {
-                    CompareError::new(format!(
-                        "FRE canonical case-fold count lifecycle: {}",
-                        error.message
-                    ))
-                })
-            }
+            CurrentFreAggregateOperationInner::CountCanonical(lifecycle) => lifecycle
+                .execute(haystack)
+                .map_err(aggregate_lifecycle_canonical_count_error),
             CurrentFreAggregateOperationInner::CountFolded(regex, limits) => regex
                 .execute(haystack, *limits)
                 .map(|result| result.value)
-                .map_err(|error| {
-                    CompareError::new(format!("FRE folded-literal count lifecycle: {error}"))
-                }),
-            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => {
-                regex.count_value(haystack, limits).map_err(|error| {
-                    let message = format!("FRE count lifecycle: {error}");
-                    CompareError::new(aggregate_attempt_error(&error, message).message)
-                })
-            }
+                .map_err(aggregate_lifecycle_folded_count_error),
+            CurrentFreAggregateOperationInner::CountSingle(regex, limits) => regex
+                .count_value(haystack, limits)
+                .map_err(aggregate_lifecycle_count_error),
             CurrentFreAggregateOperationInner::CountSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
                 regex
                     .count_value_with_workspace(haystack, limits, &mut workspace)
-                    .map_err(|error| {
-                        let message = format!("FRE count lifecycle: {error}");
-                        CompareError::new(aggregate_attempt_error(&error, message).message)
-                    })
+                    .map_err(aggregate_lifecycle_count_error)
             }
             CurrentFreAggregateOperationInner::CountMany(regex, limits) => regex
                 .count_value(haystack, *limits)
-                .map_err(|error| CompareError::new(format!("FRE count-many lifecycle: {error}"))),
+                .map_err(aggregate_lifecycle_count_many_error),
             CurrentFreAggregateOperationInner::SpanSumFolded(regex, limits) => regex
                 .execute(haystack, *limits)
                 .map(|result| result.value)
-                .map_err(|error| {
-                    CompareError::new(format!("FRE folded-literal span-sum lifecycle: {error}"))
-                }),
-            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
-                regex.span_sum_value(haystack, limits).map_err(|error| {
-                    let message = format!("FRE span-sum lifecycle: {error}");
-                    CompareError::new(aggregate_attempt_error(&error, message).message)
-                })
-            }
+                .map_err(aggregate_lifecycle_folded_span_sum_error),
+            CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => regex
+                .span_sum_value(haystack, limits)
+                .map_err(aggregate_lifecycle_span_sum_error),
             CurrentFreAggregateOperationInner::SpanSumSingleDense(regex, limits, workspace) => {
                 let mut workspace = workspace.borrow_mut();
                 regex
                     .span_sum_value_with_workspace(haystack, limits, &mut workspace)
-                    .map_err(|error| {
-                        let message = format!("FRE span-sum lifecycle: {error}");
-                        CompareError::new(aggregate_attempt_error(&error, message).message)
-                    })
+                    .map_err(aggregate_lifecycle_span_sum_error)
             }
-            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => {
-                regex.span_sum_value(haystack, *limits).map_err(|error| {
-                    CompareError::new(format!("FRE span-sum-many lifecycle: {error}"))
-                })
-            }
+            CurrentFreAggregateOperationInner::SpanSumMany(regex, limits) => regex
+                .span_sum_value(haystack, *limits)
+                .map_err(aggregate_lifecycle_span_sum_many_error),
         }
     }
 
@@ -2215,6 +2248,8 @@ pub fn current_fre_rebar_aggregate_operation_lifecycle(
 
 const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v4";
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_build_limits(
     limits: &RunLimits,
 ) -> Result<UnicodeFoldedLiteralBuildLimits, ExecutionError> {
@@ -2247,6 +2282,8 @@ fn unicode_folded_literal_build_limits(
     })
 }
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_builder_with_limits(
     pattern: String,
     unicode: bool,
@@ -2260,6 +2297,8 @@ fn unicode_folded_literal_builder_with_limits(
         .limits(limits)
 }
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_build_error(error: &UnicodeFoldedLiteralBuildError) -> ExecutionError {
     let message = format!("FRE Unicode folded-literal build: {error}");
     match error {
@@ -2271,6 +2310,8 @@ fn unicode_folded_literal_build_error(error: &UnicodeFoldedLiteralBuildError) ->
     }
 }
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_resource_refusal(error: &UnicodeFoldedLiteralBuildError) -> bool {
     matches!(
         error,
@@ -2281,6 +2322,8 @@ fn unicode_folded_literal_resource_refusal(error: &UnicodeFoldedLiteralBuildErro
     )
 }
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_run_error(
     error: &UnicodeFoldedLiteralRunError,
     context: &str,
@@ -2296,6 +2339,8 @@ fn unicode_folded_literal_run_error(
     }
 }
 
+#[cold]
+#[inline(never)]
 fn validate_unicode_folded_literal_report(
     report: &fre::UnicodeFoldedLiteralBuildReport,
     operation: UnicodeFoldedLiteralOperation,
@@ -2319,6 +2364,8 @@ fn validate_unicode_folded_literal_report(
     Ok(())
 }
 
+#[cold]
+#[inline(never)]
 fn unicode_folded_literal_displaces_packed_finite_language(
     report: &fre::UnicodeFoldedLiteralBuildReport,
     limits: &RunLimits,
@@ -2329,6 +2376,8 @@ fn unicode_folded_literal_displaces_packed_finite_language(
             .min(PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS)
 }
 
+#[cold]
+#[inline(never)]
 fn try_current_fre_folded_count_lifecycle_with_limits(
     pattern: &str,
     unicode: bool,
@@ -2383,6 +2432,8 @@ fn try_current_fre_folded_count_lifecycle_with_limits(
     Ok(Some((regex, run_limits)))
 }
 
+#[cold]
+#[inline(never)]
 fn try_current_fre_folded_span_sum_lifecycle_with_limits(
     pattern: &str,
     unicode: bool,
@@ -15930,6 +15981,8 @@ enum UnicodeFoldedLiteralPolicyRefusal {
     ReducerSteps { needed: usize, limit: usize },
 }
 
+#[cold]
+#[inline(never)]
 fn validate_unicode_folded_literal_policy(
     upper: fre::UnicodeFoldedLiteralRunUpperBounds,
     limits: &RunLimits,
@@ -15950,6 +16003,8 @@ fn validate_unicode_folded_literal_policy(
     Ok(UnicodeFoldedLiteralRunLimits::exact(upper))
 }
 
+#[cold]
+#[inline(never)]
 fn try_unicode_folded_literal_count_with_limits(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
@@ -16003,6 +16058,8 @@ fn try_unicode_folded_literal_count_with_limits(
     }))
 }
 
+#[cold]
+#[inline(never)]
 fn try_unicode_folded_literal_span_sum_with_limits(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
