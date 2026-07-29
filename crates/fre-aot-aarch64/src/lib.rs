@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod audit;
+mod audit_cfg_v3;
 mod audit_v2;
 mod audit_v3;
 mod emit;
