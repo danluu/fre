@@ -1,16 +1,13 @@
 //! Static final-image adoption for optimizing Count-v3.
 
-#[cfg(feature = "count-v3-qualification-private")]
 use core::marker::PhantomData;
 use core::{mem, ptr, slice};
-#[cfg(feature = "count-v3-qualification-private")]
 use std::rc::Rc;
 
 use fre_aot_aarch64::{
     AotCountCpuFeatures, AotCountMappedMetadataV3, CountAuditReportV3, CountEmitLimitsV3,
     audit_count_mapped_code_v3,
 };
-#[cfg(feature = "count-v3-qualification-private")]
 use fre_aot_count_contract::v3::CountObjectFormatV3;
 use fre_aot_count_contract::v3::{
     ClaimedCountMetadataV3, CountGeneralEligibilityTupleV3, METADATA_BYTES_V3,
@@ -27,7 +24,6 @@ use crate::{
     StaticCountCallErrorV3, StaticCountContractFieldV3, StaticCountVerifyErrorV3,
     expected_v3::ExpectedStaticCountV3, support_v3,
 };
-#[cfg(feature = "count-v3-qualification-private")]
 use crate::{StaticCountSveCallErrorV3, StaticCountSveThreadContractErrorV3};
 
 #[cfg(all(
@@ -102,6 +98,11 @@ use unavailable as platform;
 const POISONED_COUNT_RESULT_V3: u64 = u64::MAX;
 const HARD_MAX_MAPPED_PAYLOAD_BYTES_V3: usize = 4 << 20;
 static EMPTY_HAYSTACK_SENTINEL_V3: u8 = 0;
+/// Native Count-v3 production evidence covers only long-running inputs.
+///
+/// Safe automatic facades route shorter inputs through their retained portable
+/// owner. Low-level production handles reject them before the native entry.
+pub const STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3: usize = 4_096;
 
 /// Raw result slot fixed by Count call ABI schema 2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +149,65 @@ impl StaticCountLinkedAddressesV3 {
                 metadata,
                 entry,
             },
+        }
+    }
+}
+
+/// Untrusted process-lifetime addresses for the production SVE/SVE2 adopter.
+///
+/// The expected full eligibility tuple is supplied independently of the image
+/// addresses. The adopter checks that tuple against source authority before it
+/// reads any address, then proves that the inspected image carries that exact
+/// tuple before a callable can exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCountSveLinkedAddressesV3 {
+    addresses: LinkedAddressesV3,
+    expected_eligibility_tuple: CountGeneralEligibilityTupleV3,
+}
+
+/// Borrowed fixed-policy facade proof for production SVE/SVE2 adoption.
+///
+/// This type is disjoint from both movable ASIMD production and private SVE
+/// qualification bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCountSveFacadeBindingV3<'a> {
+    literal: &'a [u8],
+    semantic_binding_identity: [u8; 32],
+    planning_receipt_identity: [u8; 32],
+}
+
+impl<'a> StaticCountSveFacadeBindingV3<'a> {
+    #[must_use]
+    pub const fn new(
+        literal: &'a [u8],
+        semantic_binding_identity: [u8; 32],
+        planning_receipt_identity: [u8; 32],
+    ) -> Self {
+        Self {
+            literal,
+            semantic_binding_identity,
+            planning_receipt_identity,
+        }
+    }
+}
+
+impl StaticCountSveLinkedAddressesV3 {
+    #[must_use]
+    pub const fn from_exposed_addresses(
+        expectation: usize,
+        payload: usize,
+        metadata: usize,
+        entry: usize,
+        expected_eligibility_tuple: CountGeneralEligibilityTupleV3,
+    ) -> Self {
+        Self {
+            addresses: LinkedAddressesV3 {
+                expectation,
+                payload,
+                metadata,
+                entry,
+            },
+            expected_eligibility_tuple,
         }
     }
 }
@@ -311,6 +371,49 @@ pub struct VerifiedStaticCountV3 {
     core: VerifiedCoreV3,
 }
 
+/// Production-only fixed-VL SVE/SVE2 callable handle.
+///
+/// The handle exposes no direct count method and is deliberately neither
+/// `Send` nor `Sync`: Linux SVE vector length is mutable per thread. Calls
+/// require a borrowed [`StaticCountSveSessionV3`].
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::VerifiedStaticCountSveV3;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<VerifiedStaticCountSveV3>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre_aot_static_runtime::VerifiedStaticCountSveV3;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<VerifiedStaticCountSveV3>();
+/// ```
+///
+/// ```compile_fail,E0599
+/// use fre_aot_static_runtime::VerifiedStaticCountSveV3;
+///
+/// fn direct_count(handle: &VerifiedStaticCountSveV3) {
+///     let _ = handle.count();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct VerifiedStaticCountSveV3 {
+    core: VerifiedCoreV3,
+    thread_bound: PhantomData<Rc<()>>,
+}
+
+/// Current-thread production SVE/SVE2 invocation session.
+///
+/// Session creation checks exact VL16 and every native call checks it again
+/// immediately before branching to the authenticated entry.
+#[derive(Debug)]
+pub struct StaticCountSveSessionV3<'handle> {
+    handle: &'handle VerifiedStaticCountSveV3,
+    thread_bound: PhantomData<Rc<()>>,
+}
+
 /// Qualification-only callable handle.
 ///
 /// This distinct type cannot be passed where production evidence is required.
@@ -371,7 +474,7 @@ pub struct StaticCountSveQualificationSessionV3<'handle> {
 }
 
 macro_rules! verified_accessors_v3 {
-    ($type:ty) => {
+    ($type:ty, production_floor = $production_floor:expr) => {
         impl $type {
             /// Invoke the already-verified whole-haystack non-overlapping
             /// counter. This path performs one value preflight and one direct
@@ -383,6 +486,14 @@ macro_rules! verified_accessors_v3 {
                 haystack: &[u8],
                 limits: AggregateExecutionLimits,
             ) -> Result<u64, StaticCountCallErrorV3> {
+                if $production_floor
+                    && haystack.len() < STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3
+                {
+                    return Err(StaticCountCallErrorV3::ProductionRouteBelowEvidenceFloor {
+                        required_bytes: STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3,
+                        actual_bytes: haystack.len(),
+                    });
+                }
                 self.core.count(haystack, limits)
             }
 
@@ -429,9 +540,91 @@ macro_rules! verified_accessors_v3 {
     };
 }
 
-verified_accessors_v3!(VerifiedStaticCountV3);
+verified_accessors_v3!(VerifiedStaticCountV3, production_floor = true);
 #[cfg(feature = "count-v3-qualification-private")]
-verified_accessors_v3!(VerifiedStaticCountQualificationV3);
+verified_accessors_v3!(VerifiedStaticCountQualificationV3, production_floor = false);
+
+impl VerifiedStaticCountSveV3 {
+    #[must_use]
+    pub fn literal(&self) -> &[u8] {
+        &self.core.literal_manifest[..usize::from(self.core.literal_bytes)]
+    }
+
+    #[must_use]
+    pub const fn semantic_binding_identity(&self) -> &[u8; 32] {
+        &self.core.semantic_binding_identity
+    }
+
+    #[must_use]
+    pub const fn planning_receipt_identity(&self) -> &[u8; 32] {
+        &self.core.planning_receipt_identity
+    }
+
+    #[must_use]
+    pub const fn expectation_identity(&self) -> &[u8; 32] {
+        &self.core.expectation_identity
+    }
+
+    #[must_use]
+    pub const fn compile_identity(&self) -> &[u8; 32] {
+        &self.core.compile_identity
+    }
+
+    #[must_use]
+    pub const fn object_identity(&self) -> &[u8; 32] {
+        &self.core.object_identity
+    }
+
+    #[must_use]
+    pub const fn eligibility_tuple(&self) -> CountGeneralEligibilityTupleV3 {
+        self.core.eligibility_tuple
+    }
+
+    #[must_use]
+    pub const fn inspection_accounting(&self) -> StaticCountInspectionAccountingV3 {
+        self.core.accounting
+    }
+
+    /// Begin a current-thread session after checking exact SVE VL16.
+    pub fn begin_current_thread_session(
+        &self,
+    ) -> Result<StaticCountSveSessionV3<'_>, StaticCountSveThreadContractErrorV3> {
+        platform::require_current_thread_sve_target_v3(
+            self.core.eligibility_tuple.required_isa_id,
+            self.core.eligibility_tuple.actual_features,
+            self.core.eligibility_tuple.sve_vector_length_bytes,
+        )?;
+        Ok(StaticCountSveSessionV3 {
+            handle: self,
+            thread_bound: PhantomData,
+        })
+    }
+}
+
+impl StaticCountSveSessionV3<'_> {
+    /// Invoke after repeating the exact VL16 check immediately before the
+    /// native call.
+    #[inline]
+    pub fn count(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+    ) -> Result<u64, StaticCountSveCallErrorV3> {
+        if haystack.len() < STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3 {
+            return Err(StaticCountCallErrorV3::ProductionRouteBelowEvidenceFloor {
+                required_bytes: STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3,
+                actual_bytes: haystack.len(),
+            }
+            .into());
+        }
+        self.handle.core.count_sve(haystack, limits)
+    }
+
+    #[must_use]
+    pub const fn handle(&self) -> &VerifiedStaticCountSveV3 {
+        self.handle
+    }
+}
 
 #[cfg(feature = "count-v3-qualification-private")]
 impl VerifiedStaticCountSveQualificationV3 {
@@ -479,7 +672,11 @@ impl VerifiedStaticCountSveQualificationV3 {
     pub fn begin_current_thread_session(
         &self,
     ) -> Result<StaticCountSveQualificationSessionV3<'_>, StaticCountSveThreadContractErrorV3> {
-        platform::require_current_thread_sve_vl16_v3()?;
+        platform::require_current_thread_sve_target_v3(
+            self.core.eligibility_tuple.required_isa_id,
+            self.core.eligibility_tuple.actual_features,
+            self.core.eligibility_tuple.sve_vector_length_bytes,
+        )?;
         Ok(StaticCountSveQualificationSessionV3 {
             handle: self,
             thread_bound: PhantomData,
@@ -541,7 +738,6 @@ impl VerifiedCoreV3 {
         )
     }
 
-    #[cfg(feature = "count-v3-qualification-private")]
     #[allow(
         unsafe_code,
         reason = "the SVE entry was exactly audited and current-thread VL16 is rechecked immediately before invocation"
@@ -564,7 +760,11 @@ impl VerifiedCoreV3 {
         let mut result = RawAggregateResultV3 {
             value: POISONED_COUNT_RESULT_V3,
         };
-        platform::require_current_thread_sve_vl16_v3()?;
+        platform::require_current_thread_sve_target_v3(
+            self.eligibility_tuple.required_isa_id,
+            self.eligibility_tuple.actual_features,
+            self.eligibility_tuple.sve_vector_length_bytes,
+        )?;
         // SAFETY: no operation intervenes between the exact current-thread VL
         // check and this branch; the entry and result ABI were authenticated.
         let status =
@@ -604,6 +804,51 @@ pub unsafe fn adopt_linked_static_count_v3(
     // before the address-to-function conversion.
     let core = unsafe { adopt_core_v3(linked.addresses, AuthorityV3::Production)? };
     Ok(VerifiedStaticCountV3 { core })
+}
+
+/// Adopt one source-authorized production Linux SVE/SVE2 image.
+///
+/// The caller-supplied full eligibility tuple is matched against production
+/// source authority before any image address is read. Complete inspection then
+/// proves that the image carries that exact tuple and fixed-policy facade
+/// binding. The returned handle has no direct call method and is neither
+/// `Send` nor `Sync`.
+///
+/// # Safety
+///
+/// Every exposed address must name the exact process-lifetime final-image
+/// symbol described by the linked expectation, without interposition, unload,
+/// remap, or mutation. `facade` must have been projected from the live
+/// fixed-policy owner that will be retained by every safe call facade.
+#[allow(
+    unsafe_code,
+    reason = "sole raw-address boundary for the disjoint production SVE handle"
+)]
+pub unsafe fn adopt_linked_static_count_sve_v3(
+    linked: StaticCountSveLinkedAddressesV3,
+    facade: StaticCountSveFacadeBindingV3<'_>,
+) -> Result<VerifiedStaticCountSveV3, StaticCountVerifyErrorV3> {
+    // This exact source-authority lookup deliberately precedes every read from
+    // the untrusted final-image addresses.
+    support_v3::require_production_tuple(linked.expected_eligibility_tuple)?;
+    if !cfg!(feature = "linked-count-v3") {
+        return Err(StaticCountVerifyErrorV3::LinkedCountV3FeatureDisabled);
+    }
+    // SAFETY: forwarded caller contract; `adopt_core_v3` rechecks the exact
+    // tuple, facade binding, target, host, mapped bytes, and entry address.
+    let core = unsafe {
+        adopt_core_v3(
+            linked.addresses,
+            AuthorityV3::SveProduction {
+                facade,
+                expected_eligibility_tuple: linked.expected_eligibility_tuple,
+            },
+        )?
+    };
+    Ok(VerifiedStaticCountSveV3 {
+        core,
+        thread_bound: PhantomData,
+    })
 }
 
 /// Adopt one image solely for qualification evidence gathering.
@@ -679,6 +924,10 @@ pub fn configure_current_thread_sve_vl16_for_count_v3_qualification()
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthorityV3<'a> {
     Production,
+    SveProduction {
+        facade: StaticCountSveFacadeBindingV3<'a>,
+        expected_eligibility_tuple: CountGeneralEligibilityTupleV3,
+    },
     #[cfg(feature = "count-v3-qualification-private")]
     Qualification {
         facade: StaticCountQualificationFacadeBindingV3<'a>,
@@ -725,8 +974,16 @@ unsafe fn adopt_core_v3(
     let entry_offset = usize::try_from(metadata.entry_offset())
         .map_err(|_| StaticCountVerifyErrorV3::AddressRangeOverflow)?;
     require_entry_address_v3(linked.payload, entry_offset, linked.entry)?;
-    #[cfg(feature = "count-v3-qualification-private")]
     match authority {
+        AuthorityV3::SveProduction { .. } => {
+            require_sve_handle_contract_v3(metadata)?;
+            platform::require_sve_host_contract(
+                metadata.actual_features(),
+                metadata.required_isa_id(),
+                metadata.sve_vector_length_bytes(),
+            )?;
+        }
+        #[cfg(feature = "count-v3-qualification-private")]
         AuthorityV3::SveQualification { .. } => {
             require_sve_handle_contract_v3(metadata)?;
             platform::require_sve_host_contract(
@@ -735,7 +992,7 @@ unsafe fn adopt_core_v3(
                 metadata.sve_vector_length_bytes(),
             )?;
         }
-        AuthorityV3::Production | AuthorityV3::Qualification { .. } => {
+        AuthorityV3::Production => {
             require_thread_safe_asimd_handle_v3(
                 metadata.actual_features(),
                 metadata.sve_vector_length_bytes(),
@@ -745,17 +1002,17 @@ unsafe fn adopt_core_v3(
                 metadata.sve_vector_length_bytes(),
             )?;
         }
-    }
-    #[cfg(not(feature = "count-v3-qualification-private"))]
-    {
-        require_thread_safe_asimd_handle_v3(
-            metadata.actual_features(),
-            metadata.sve_vector_length_bytes(),
-        )?;
-        platform::require_asimd_host_contract(
-            metadata.actual_features(),
-            metadata.sve_vector_length_bytes(),
-        )?;
+        #[cfg(feature = "count-v3-qualification-private")]
+        AuthorityV3::Qualification { .. } => {
+            require_thread_safe_asimd_handle_v3(
+                metadata.actual_features(),
+                metadata.sve_vector_length_bytes(),
+            )?;
+            platform::require_asimd_host_contract(
+                metadata.actual_features(),
+                metadata.sve_vector_length_bytes(),
+            )?;
+        }
     }
 
     // SAFETY: the complete nonempty range is verified RX and the unsafe caller
@@ -771,6 +1028,26 @@ unsafe fn adopt_core_v3(
     let eligibility_tuple = inert.eligibility_tuple;
     match authority {
         AuthorityV3::Production => support_v3::require_production_tuple(eligibility_tuple)?,
+        AuthorityV3::SveProduction {
+            facade,
+            expected_eligibility_tuple,
+        } => {
+            if eligibility_tuple != expected_eligibility_tuple {
+                return Err(StaticCountVerifyErrorV3::EligibilityTupleNotAuthorized);
+            }
+            require(
+                facade.literal == inert.literal(),
+                StaticCountContractFieldV3::Literal,
+            )?;
+            require(
+                facade.semantic_binding_identity == *expected.semantic_binding_identity(),
+                StaticCountContractFieldV3::SemanticBindingIdentity,
+            )?;
+            require(
+                facade.planning_receipt_identity == *expected.planning_receipt_identity(),
+                StaticCountContractFieldV3::PlanningReceiptIdentity,
+            )?;
+        }
         #[cfg(feature = "count-v3-qualification-private")]
         AuthorityV3::Qualification { facade } => {
             require(
@@ -965,9 +1242,9 @@ fn mapped_metadata_v3(
 }
 
 /// This handle is freely movable between threads. Linux SVE VL is a mutable
-/// per-thread property, so an SVE/SVE2 production promotion must introduce a
-/// separately source-authorized same-thread handle/session instead of
-/// broadening this check.
+/// per-thread property, so SVE/SVE2 production uses the separately
+/// source-authorized [`VerifiedStaticCountSveV3`] and
+/// [`StaticCountSveSessionV3`] instead of broadening this check.
 fn require_thread_safe_asimd_handle_v3(
     actual_features: u64,
     sve_vector_length_bytes: u16,
@@ -984,7 +1261,6 @@ fn require_thread_safe_asimd_handle_v3(
     }
 }
 
-#[cfg(feature = "count-v3-qualification-private")]
 fn require_sve_handle_contract_v3(
     metadata: ClaimedCountMetadataV3,
 ) -> Result<(), StaticCountVerifyErrorV3> {
@@ -1003,7 +1279,6 @@ fn require_sve_handle_contract_v3(
     }
 }
 
-#[cfg(feature = "count-v3-qualification-private")]
 fn exact_sve_target_contract_fields_v3(
     required_isa_id: u8,
     register_plan_id: u8,
@@ -1176,6 +1451,32 @@ mod tests {
         0
     }
 
+    fn counted_dummy_core_v3() -> VerifiedCoreV3 {
+        let compiled = compiled_fixture_v3();
+        let expected = ExpectedStaticCountV3::inspect(compiled.expectation()).unwrap();
+        let mut literal_manifest = [0_u8; 32];
+        literal_manifest[..6].copy_from_slice(b"needle");
+        VerifiedCoreV3 {
+            entry: counted_dummy_entry_v3,
+            literal_manifest,
+            literal_bytes: 6,
+            semantic_binding_identity: [1; 32],
+            planning_receipt_identity: [2; 32],
+            expectation_identity: [3; 32],
+            compile_identity: [4; 32],
+            object_identity: [5; 32],
+            eligibility_tuple: expected.eligibility_tuple(),
+            accounting: StaticCountInspectionAccountingV3 {
+                expectation_bytes_copied: 0,
+                metadata_bytes_copied: 0,
+                payload_bytes_hashed: 0,
+                vm_query_input_bytes_upper_bound: 0,
+                vm_regions_checked: 0,
+                audit: CountAuditReportV3::default(),
+            },
+        }
+    }
+
     #[test]
     #[allow(
         unsafe_code,
@@ -1187,6 +1488,30 @@ mod tests {
         // supplied address is inspected.
         assert_eq!(
             unsafe { adopt_linked_static_count_v3(linked) }.unwrap_err(),
+            StaticCountVerifyErrorV3::NoProductionAuthority
+        );
+    }
+
+    #[test]
+    #[allow(
+        unsafe_code,
+        reason = "source-empty SVE authority proves exact-tuple refusal precedes address use"
+    )]
+    fn production_sve_refuses_authority_before_reading_any_address() {
+        let compiled = compiled_fixture_v3();
+        let expected = ExpectedStaticCountV3::inspect(compiled.expectation()).unwrap();
+        let linked = StaticCountSveLinkedAddressesV3::from_exposed_addresses(
+            1,
+            2,
+            3,
+            4,
+            expected.eligibility_tuple(),
+        );
+        let facade = StaticCountSveFacadeBindingV3::new(b"needle", [3; 32], [4; 32]);
+        // SAFETY: the empty production table must refuse the independently
+        // supplied tuple before dereferencing any sentinel address.
+        assert_eq!(
+            unsafe { adopt_linked_static_count_sve_v3(linked, facade) }.unwrap_err(),
             StaticCountVerifyErrorV3::NoProductionAuthority
         );
     }
@@ -1223,9 +1548,8 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "count-v3-qualification-private")]
     #[test]
-    fn sve_qualification_target_fields_are_exact_and_closed() {
+    fn sve_production_and_qualification_target_fields_are_exact_and_closed() {
         let sve = AotCountCpuFeatures::SVE.bits();
         let sve2 = AotCountCpuFeatures::SVE
             .union(AotCountCpuFeatures::SVE2)
@@ -1373,36 +1697,48 @@ mod tests {
     }
 
     #[test]
-    fn verified_value_path_makes_exactly_one_direct_entry_call() {
-        let compiled = compiled_fixture_v3();
-        let expected = ExpectedStaticCountV3::inspect(compiled.expectation()).unwrap();
-        let mut literal_manifest = [0_u8; 32];
-        literal_manifest[..6].copy_from_slice(b"needle");
-        let core = VerifiedCoreV3 {
-            entry: counted_dummy_entry_v3,
-            literal_manifest,
-            literal_bytes: 6,
-            semantic_binding_identity: [1; 32],
-            planning_receipt_identity: [2; 32],
-            expectation_identity: [3; 32],
-            compile_identity: [4; 32],
-            object_identity: [5; 32],
-            eligibility_tuple: expected.eligibility_tuple(),
-            accounting: StaticCountInspectionAccountingV3 {
-                expectation_bytes_copied: 0,
-                metadata_bytes_copied: 0,
-                payload_bytes_hashed: 0,
-                vm_query_input_bytes_upper_bound: 0,
-                vm_regions_checked: 0,
-                audit: CountAuditReportV3::default(),
-            },
+    fn production_value_path_enforces_floor_before_one_direct_entry_call() {
+        let verified = VerifiedStaticCountV3 {
+            core: counted_dummy_core_v3(),
         };
         DIRECT_ENTRY_CALLS_V3.store(0, Ordering::SeqCst);
         assert_eq!(
-            core.count(b"............", AggregateExecutionLimits::unlimited()),
+            verified.count(b"............", AggregateExecutionLimits::unlimited()),
+            Err(StaticCountCallErrorV3::ProductionRouteBelowEvidenceFloor {
+                required_bytes: STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3,
+                actual_bytes: 12,
+            })
+        );
+        assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
+        let long_haystack = [b'.'; STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3];
+        assert_eq!(
+            verified.count(&long_haystack, AggregateExecutionLimits::unlimited()),
             Ok(2)
         );
         assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 1);
-        assert_eq!(core.accounting.payload_bytes_hashed, 0);
+        assert_eq!(verified.core.accounting.payload_bytes_hashed, 0);
+    }
+
+    #[test]
+    fn production_sve_session_enforces_floor_before_target_or_native_call() {
+        let verified = VerifiedStaticCountSveV3 {
+            core: counted_dummy_core_v3(),
+            thread_bound: PhantomData,
+        };
+        let session = StaticCountSveSessionV3 {
+            handle: &verified,
+            thread_bound: PhantomData,
+        };
+        DIRECT_ENTRY_CALLS_V3.store(0, Ordering::SeqCst);
+        assert_eq!(
+            session.count(b"short", AggregateExecutionLimits::unlimited()),
+            Err(StaticCountSveCallErrorV3::Count(
+                StaticCountCallErrorV3::ProductionRouteBelowEvidenceFloor {
+                    required_bytes: STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3,
+                    actual_bytes: 5,
+                }
+            ))
+        );
+        assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
     }
 }

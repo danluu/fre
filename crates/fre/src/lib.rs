@@ -195,7 +195,10 @@ pub use aggregate_construction::{
 };
 #[cfg(feature = "explicit-count-v3-aot")]
 pub use aggregate_count_aot_v3::{
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3,
     AggregateCountExactLiteralAotBindErrorV3, AggregateCountExactLiteralAotExecutionErrorV3,
+    AggregateCountExactLiteralAotOutcomeV3, AggregateCountExactLiteralAotRouteV3,
+    AggregateCountExactLiteralAotSveSessionV3, AggregateCountExactLiteralAotSveV3,
     AggregateCountExactLiteralAotV3,
 };
 #[cfg(feature = "count-v3-aot-qualification-private")]

@@ -2,7 +2,6 @@ use core::mem;
 
 use fre_aot_aarch64::AotCountCpuFeatures;
 
-#[cfg(feature = "count-v3-qualification-private")]
 use crate::StaticCountSveThreadContractErrorV3;
 use crate::StaticCountVerifyErrorV3;
 
@@ -200,7 +199,6 @@ pub(super) fn require_asimd_host_contract(
     Ok(())
 }
 
-#[cfg(feature = "count-v3-qualification-private")]
 pub(super) fn require_sve_host_contract(
     _actual_features: u64,
     _required_isa_id: u8,
@@ -209,9 +207,11 @@ pub(super) fn require_sve_host_contract(
     Err(StaticCountVerifyErrorV3::UnsupportedHost)
 }
 
-#[cfg(feature = "count-v3-qualification-private")]
-pub(super) fn require_current_thread_sve_vl16_v3() -> Result<(), StaticCountSveThreadContractErrorV3>
-{
+pub(super) fn require_current_thread_sve_target_v3(
+    _required_isa_id: u8,
+    _actual_features: u64,
+    _sve_vector_length_bytes: u16,
+) -> Result<(), StaticCountSveThreadContractErrorV3> {
     Err(StaticCountSveThreadContractErrorV3::UnsupportedHost)
 }
 

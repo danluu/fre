@@ -123,6 +123,12 @@ impl From<CountAotError> for StaticCountVerifyErrorV3 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StaticCountCallErrorV3 {
+    /// Production evidence authorizes native execution only at or above this
+    /// haystack-size floor. Qualification call surfaces do not apply it.
+    ProductionRouteBelowEvidenceFloor {
+        required_bytes: usize,
+        actual_bytes: usize,
+    },
     Preflight(AggregateExecuteError),
     BackendArithmeticOverflow,
     BackendFault {
@@ -164,7 +170,8 @@ impl From<AggregateExecuteError> for StaticCountCallErrorV3 {
     }
 }
 
-/// Current-thread Linux SVE contract failure for Count-v3 qualification.
+/// Current-thread Linux SVE contract failure for Count-v3 production or
+/// qualification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StaticCountSveThreadContractErrorV3 {
@@ -194,7 +201,8 @@ impl fmt::Display for StaticCountSveThreadContractErrorV3 {
 
 impl std::error::Error for StaticCountSveThreadContractErrorV3 {}
 
-/// Failure at the qualification-only same-thread SVE/SVE2 call boundary.
+/// Failure at a same-thread SVE/SVE2 production or qualification call
+/// boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StaticCountSveCallErrorV3 {
@@ -204,10 +212,7 @@ pub enum StaticCountSveCallErrorV3 {
 
 impl fmt::Display for StaticCountSveCallErrorV3 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "FRE Count-v3 SVE qualification call failed: {self:?}"
-        )
+        write!(formatter, "FRE Count-v3 SVE call failed: {self:?}")
     }
 }
 

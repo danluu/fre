@@ -1,21 +1,24 @@
 //! Explicit binding of an authenticated optimizing Count-v3 handle.
 //!
-//! Route selection happens once in `bind`. A successful wrapper has only the
-//! native route; a refusal leaves the original portable owner available to the
-//! caller as its construction-time fallback. No call performs artifact lookup,
-//! target dispatch, compilation, recipe selection, or code audit.
-//! The movable production facade remains ASIMD-only. Any later SVE/SVE2
-//! evidence promotion requires a separate source-authorized production
-//! same-thread facade/session rather than broadening that handle.
+//! Binding authenticates one precompiled image once. Production calls apply
+//! one evidence-backed size split: inputs below 4096 bytes stay on the retained
+//! portable owner and longer inputs use authenticated native code. The typed
+//! outcome exposes the route that actually ran. No call performs artifact
+//! lookup, target dispatch, compilation, recipe selection, or code audit.
+//! Movable ASIMD production and same-thread SVE/SVE2 production remain
+//! type-disjoint. Qualification facades remain native-only for measurement.
 
 use core::fmt;
 
-use fre_aot_static_runtime::{StaticCountCallErrorV3, VerifiedStaticCountV3};
+use fre_aot_static_runtime::{
+    STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3, StaticCountCallErrorV3,
+    StaticCountSveCallErrorV3, StaticCountSveFacadeBindingV3, StaticCountSveSessionV3,
+    StaticCountSveThreadContractErrorV3, VerifiedStaticCountSveV3, VerifiedStaticCountV3,
+};
 #[cfg(feature = "count-v3-aot-qualification-private")]
 use fre_aot_static_runtime::{
-    StaticCountQualificationFacadeBindingV3, StaticCountSveCallErrorV3,
-    StaticCountSveQualificationFacadeBindingV3, StaticCountSveQualificationSessionV3,
-    StaticCountSveThreadContractErrorV3, VerifiedStaticCountQualificationV3,
+    StaticCountQualificationFacadeBindingV3, StaticCountSveQualificationFacadeBindingV3,
+    StaticCountSveQualificationSessionV3, VerifiedStaticCountQualificationV3,
     VerifiedStaticCountSveQualificationV3,
 };
 use fre_kernel_ir::AggregateExecutionLimits;
@@ -23,8 +26,13 @@ use fre_kernel_ir::AggregateExecutionLimits;
 use crate::{
     AggregateCountExactLiteralAotPlannedCandidate,
     AggregateCountExactLiteralAotPlanningReceiptIdentity,
-    AggregateCountExactLiteralAotSemanticBindingIdentity, AggregateCountRegex, AggregateRunLimits,
+    AggregateCountExactLiteralAotSemanticBindingIdentity, AggregateCountRegex,
+    AggregateExecutionError, AggregateRunLimits,
 };
+
+/// Minimum haystack size authorized for Count-v3 production native routes.
+pub const AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3: usize =
+    STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3;
 
 /// Refusal to bind a static image to its exact fixed-policy facade owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +67,10 @@ impl std::error::Error for AggregateCountExactLiteralAotBindErrorV3 {}
 /// Value-only execution refusal from the explicit optimizing AOT facade.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the portable fallback retains its complete typed execution receipt without an error-path allocation"
+)]
 pub enum AggregateCountExactLiteralAotExecutionErrorV3 {
     ArithmeticOverflow {
         at: &'static str,
@@ -68,10 +80,9 @@ pub enum AggregateCountExactLiteralAotExecutionErrorV3 {
         limit: u128,
         required: u128,
     },
+    Portable(AggregateExecutionError),
     Native(StaticCountCallErrorV3),
-    #[cfg(feature = "count-v3-aot-qualification-private")]
-    #[doc(hidden)]
-    SveQualificationNative(StaticCountSveCallErrorV3),
+    SveNative(StaticCountSveCallErrorV3),
 }
 
 impl fmt::Display for AggregateCountExactLiteralAotExecutionErrorV3 {
@@ -86,9 +97,9 @@ impl fmt::Display for AggregateCountExactLiteralAotExecutionErrorV3 {
 impl std::error::Error for AggregateCountExactLiteralAotExecutionErrorV3 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Portable(error) => Some(error),
             Self::Native(error) => Some(error),
-            #[cfg(feature = "count-v3-aot-qualification-private")]
-            Self::SveQualificationNative(error) => Some(error),
+            Self::SveNative(error) => Some(error),
             _ => None,
         }
     }
@@ -100,10 +111,15 @@ impl From<StaticCountCallErrorV3> for AggregateCountExactLiteralAotExecutionErro
     }
 }
 
-#[cfg(feature = "count-v3-aot-qualification-private")]
 impl From<StaticCountSveCallErrorV3> for AggregateCountExactLiteralAotExecutionErrorV3 {
     fn from(value: StaticCountSveCallErrorV3) -> Self {
-        Self::SveQualificationNative(value)
+        Self::SveNative(value)
+    }
+}
+
+impl From<AggregateExecutionError> for AggregateCountExactLiteralAotExecutionErrorV3 {
+    fn from(value: AggregateExecutionError) -> Self {
+        Self::Portable(value)
     }
 }
 
@@ -113,6 +129,33 @@ struct CheckedBindingV3 {
     planning_receipt_identity: AggregateCountExactLiteralAotPlanningReceiptIdentity,
     literal_bytes: usize,
     portable_persistent_bytes: usize,
+}
+
+/// Evidence-backed automatic route selected by a production Count-v3 facade.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateCountExactLiteralAotRouteV3 {
+    Portable,
+    AsimdAot,
+    SveAot,
+}
+
+/// Value plus the production route that actually executed it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AggregateCountExactLiteralAotOutcomeV3 {
+    value: u64,
+    route: AggregateCountExactLiteralAotRouteV3,
+}
+
+impl AggregateCountExactLiteralAotOutcomeV3 {
+    #[must_use]
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn route(self) -> AggregateCountExactLiteralAotRouteV3 {
+        self.route
+    }
 }
 
 /// Explicit production Count-v3 view of one fixed-policy portable owner.
@@ -157,15 +200,57 @@ impl<'binding> AggregateCountExactLiteralAotV3<'binding> {
         })
     }
 
-    /// Direct value-only count with the incumbent exact-literal resource
-    /// limits and no per-call route selection.
+    /// Value-only automatic production count.
+    ///
+    /// Inputs below the evidence floor execute through the retained portable
+    /// owner. Longer inputs execute through the authenticated ASIMD image.
     #[inline]
     pub fn count_value(
         &self,
         haystack: &[u8],
         limits: impl core::borrow::Borrow<AggregateRunLimits>,
     ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
-        count_value_v3(self.verified, self.checked, haystack, limits.borrow())
+        self.count_value_with_route(haystack, limits)
+            .map(AggregateCountExactLiteralAotOutcomeV3::value)
+    }
+
+    /// Automatic production count retaining the route that actually ran.
+    #[inline]
+    pub fn count_value_with_route(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<AggregateCountExactLiteralAotOutcomeV3, AggregateCountExactLiteralAotExecutionErrorV3>
+    {
+        let limits = limits.borrow();
+        let route = production_route_v3(
+            haystack.len(),
+            AggregateCountExactLiteralAotRouteV3::AsimdAot,
+        );
+        let value = match route {
+            AggregateCountExactLiteralAotRouteV3::Portable => {
+                self.portable_owner.count_value(haystack, limits)?
+            }
+            AggregateCountExactLiteralAotRouteV3::AsimdAot => {
+                count_value_v3(self.verified, self.checked, haystack, limits)?
+            }
+            AggregateCountExactLiteralAotRouteV3::SveAot => {
+                unreachable!("ASIMD facade cannot select the SVE route")
+            }
+        };
+        Ok(AggregateCountExactLiteralAotOutcomeV3 { value, route })
+    }
+
+    /// Predict the evidence-backed route without executing either backend.
+    #[must_use]
+    pub const fn route_for_haystack_bytes(
+        &self,
+        haystack_bytes: usize,
+    ) -> AggregateCountExactLiteralAotRouteV3 {
+        production_route_v3(
+            haystack_bytes,
+            AggregateCountExactLiteralAotRouteV3::AsimdAot,
+        )
     }
 
     #[must_use]
@@ -176,6 +261,196 @@ impl<'binding> AggregateCountExactLiteralAotV3<'binding> {
     #[must_use]
     pub const fn verified_handle(&self) -> &VerifiedStaticCountV3 {
         self.verified
+    }
+}
+
+/// Production fixed-VL SVE/SVE2 automatic facade.
+///
+/// This surface is type-disjoint from movable ASIMD production and all
+/// qualification handles. It retains the fixed-policy portable owner and has
+/// no direct native call method. Open a same-thread session; calls below the
+/// evidence floor stay portable and calls at or above it use authenticated
+/// SVE/SVE2 code.
+pub struct AggregateCountExactLiteralAotSveV3<'binding> {
+    portable_owner: &'binding AggregateCountRegex,
+    verified: &'binding VerifiedStaticCountSveV3,
+    checked: CheckedBindingV3,
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotSveV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotSveV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field("eligibility_tuple", &self.verified.eligibility_tuple())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'binding> AggregateCountExactLiteralAotSveV3<'binding> {
+    /// Project the live fixed-policy owner into the borrowed proof required by
+    /// the production SVE/SVE2 adopter.
+    pub fn adoption_binding(
+        portable_owner: &'binding AggregateCountRegex,
+    ) -> Result<StaticCountSveFacadeBindingV3<'binding>, AggregateCountExactLiteralAotBindErrorV3>
+    {
+        let candidate = portable_owner
+            .exact_literal_aot_planned_candidate()
+            .ok_or(
+                AggregateCountExactLiteralAotBindErrorV3::PortableOwnerIsNotFixedPolicyExactLiteralCandidate,
+            )?;
+        Ok(StaticCountSveFacadeBindingV3::new(
+            candidate.literal(),
+            *candidate.semantic_binding_identity().as_bytes(),
+            *candidate.planning_receipt_identity().as_bytes(),
+        ))
+    }
+
+    pub fn bind(
+        portable_owner: &'binding AggregateCountRegex,
+        verified: &'binding VerifiedStaticCountSveV3,
+    ) -> Result<Self, AggregateCountExactLiteralAotBindErrorV3> {
+        let checked = check_binding_v3(
+            portable_owner.exact_literal_aot_planned_candidate(),
+            verified.literal(),
+            verified.semantic_binding_identity(),
+            verified.planning_receipt_identity(),
+        )?;
+        Ok(Self {
+            portable_owner,
+            verified,
+            checked,
+        })
+    }
+
+    /// Open a non-movable current-thread session after checking exact VL16.
+    pub fn begin_current_thread_session(
+        &self,
+    ) -> Result<AggregateCountExactLiteralAotSveSessionV3<'_>, StaticCountSveThreadContractErrorV3>
+    {
+        Ok(AggregateCountExactLiteralAotSveSessionV3 {
+            portable_owner: self.portable_owner,
+            native: self.verified.begin_current_thread_session()?,
+            checked: self.checked,
+        })
+    }
+
+    /// Predict the evidence-backed route without opening a session or
+    /// executing either backend.
+    #[must_use]
+    pub const fn route_for_haystack_bytes(
+        &self,
+        haystack_bytes: usize,
+    ) -> AggregateCountExactLiteralAotRouteV3 {
+        production_route_v3(haystack_bytes, AggregateCountExactLiteralAotRouteV3::SveAot)
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountSveV3 {
+        self.verified
+    }
+}
+
+/// Same-thread automatic production token for Count-v3 SVE/SVE2.
+///
+/// The embedded runtime token makes this value neither `Send` nor `Sync`.
+/// Exact VL16 is checked again immediately before each native call.
+///
+/// ```compile_fail,E0277
+/// use fre::AggregateCountExactLiteralAotSveSessionV3;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<AggregateCountExactLiteralAotSveSessionV3<'static>>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use fre::AggregateCountExactLiteralAotSveSessionV3;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<AggregateCountExactLiteralAotSveSessionV3<'static>>();
+/// ```
+pub struct AggregateCountExactLiteralAotSveSessionV3<'session> {
+    portable_owner: &'session AggregateCountRegex,
+    native: StaticCountSveSessionV3<'session>,
+    checked: CheckedBindingV3,
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotSveSessionV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotSveSessionV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field(
+                "eligibility_tuple",
+                &self.native.handle().eligibility_tuple(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl AggregateCountExactLiteralAotSveSessionV3<'_> {
+    /// Value-only projection of [`Self::count_value_with_route`].
+    #[inline]
+    pub fn count_value(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+        self.count_value_with_route(haystack, limits)
+            .map(AggregateCountExactLiteralAotOutcomeV3::value)
+    }
+
+    /// Count through the portable owner below 4096 bytes or through the
+    /// authenticated SVE/SVE2 image at and above that evidence floor.
+    #[inline]
+    pub fn count_value_with_route(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<AggregateCountExactLiteralAotOutcomeV3, AggregateCountExactLiteralAotExecutionErrorV3>
+    {
+        let limits = limits.borrow();
+        let route =
+            production_route_v3(haystack.len(), AggregateCountExactLiteralAotRouteV3::SveAot);
+        let value = match route {
+            AggregateCountExactLiteralAotRouteV3::Portable => {
+                self.portable_owner.count_value(haystack, limits)?
+            }
+            AggregateCountExactLiteralAotRouteV3::SveAot => {
+                let upper = preflight_v3(self.checked, haystack.len(), limits)?;
+                self.native
+                    .count(haystack, exact_runtime_limits_v3(upper))?
+            }
+            AggregateCountExactLiteralAotRouteV3::AsimdAot => {
+                unreachable!("SVE facade cannot select the ASIMD route")
+            }
+        };
+        Ok(AggregateCountExactLiteralAotOutcomeV3 { value, route })
+    }
+
+    #[must_use]
+    pub const fn route_for_haystack_bytes(
+        &self,
+        haystack_bytes: usize,
+    ) -> AggregateCountExactLiteralAotRouteV3 {
+        production_route_v3(haystack_bytes, AggregateCountExactLiteralAotRouteV3::SveAot)
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountSveV3 {
+        self.native.handle()
     }
 }
 
@@ -454,6 +729,17 @@ impl CountV3Handle for VerifiedStaticCountV3 {
     }
 }
 
+const fn production_route_v3(
+    haystack_bytes: usize,
+    admitted_native_route: AggregateCountExactLiteralAotRouteV3,
+) -> AggregateCountExactLiteralAotRouteV3 {
+    if haystack_bytes < STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3 {
+        AggregateCountExactLiteralAotRouteV3::Portable
+    } else {
+        admitted_native_route
+    }
+}
+
 fn count_value_v3(
     handle: &impl CountV3Handle,
     checked: CheckedBindingV3,
@@ -689,5 +975,22 @@ mod tests {
         assert_eq!(upper.match_events, 3);
         assert_eq!(upper.count, 3);
         assert_eq!(upper.reducer_steps, 4);
+    }
+
+    #[test]
+    fn production_route_floor_is_exact_for_both_native_targets() {
+        for native in [
+            AggregateCountExactLiteralAotRouteV3::AsimdAot,
+            AggregateCountExactLiteralAotRouteV3::SveAot,
+        ] {
+            assert_eq!(
+                production_route_v3(STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3 - 1, native),
+                AggregateCountExactLiteralAotRouteV3::Portable
+            );
+            assert_eq!(
+                production_route_v3(STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3, native),
+                native
+            );
+        }
     }
 }

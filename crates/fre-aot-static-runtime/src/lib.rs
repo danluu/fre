@@ -7,13 +7,14 @@
 //! value-only handle. Its artifact-independent production authority is exact
 //! full-tuple source data and begins empty. The default-off qualification path
 //! has disjoint address/handle APIs and cannot populate production authority.
-//! The movable production and qualification handles are ASIMD-only. The
-//! qualification-private Linux AArch64 surface has a separate SVE/SVE2 handle
-//! and same-thread exact-VL16 session; neither type implements `Send` or
-//! `Sync`. It rechecks VL16 immediately before every native call and grants no
-//! production authority. Any later evidence promotion must add a separately
-//! reviewed, source-authorized production same-thread SVE surface; it must not
-//! broaden the movable ASIMD handle.
+//! The movable production and qualification handles are ASIMD-only. Linux
+//! AArch64 SVE/SVE2 uses separate production and qualification handles plus
+//! same-thread exact-VL16 sessions; none of those types implements `Send` or
+//! `Sync`. Production SVE adoption requires a source-authorized full tuple
+//! before any image address is read. Both production call boundaries enforce
+//! the evidence-backed long-input floor, while safe facades retain the
+//! portable owner for shorter calls. Qualification rechecks VL16 immediately
+//! before every raw measurement call and grants no production authority.
 //! The independent Search-v1 Span architecture uses a JIT- and compiler-neutral
 //! 584-byte expectation contract. Its literal source qualification table is
 //! checked before any final-image pointer is used, every identity is matched,
@@ -83,8 +84,10 @@ pub use linked::{
     adopt_linked_static_count_qualification_v2, fre_aot_static_count_adopt_qualification_raw_v2,
 };
 pub use linked_v3::{
-    RawAggregateResultV3, StaticAggregateEntryV3, StaticCountInspectionAccountingV3,
-    StaticCountLinkedAddressesV3, VerifiedStaticCountV3, adopt_linked_static_count_v3,
+    RawAggregateResultV3, STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3, StaticAggregateEntryV3,
+    StaticCountInspectionAccountingV3, StaticCountLinkedAddressesV3, StaticCountSveFacadeBindingV3,
+    StaticCountSveLinkedAddressesV3, StaticCountSveSessionV3, VerifiedStaticCountSveV3,
+    VerifiedStaticCountV3, adopt_linked_static_count_sve_v3, adopt_linked_static_count_v3,
 };
 #[cfg(feature = "count-v3-qualification-private")]
 #[doc(hidden)]
