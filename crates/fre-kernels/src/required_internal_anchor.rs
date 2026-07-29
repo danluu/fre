@@ -8,6 +8,10 @@
 //! successful greedy continuation scans disjoint after normal regex
 //! non-overlap. Execution therefore streams one candidate and one continuation
 //! state without a queue, active set, scratch allocation, or input rewind.
+//! Anchor discovery uses one native `memchr` stream over the first required
+//! anchor byte. Every skipped start and every remaining anchor-byte
+//! confirmation receives the same logical source-access and control-work
+//! charge as the scalar reference scan.
 //! A caller-captured dispatch context may retain one fixed-16 automatic SIMD
 //! scanner for an all-ASCII tail class on an SVE-capable host. Its reported physical classifications,
 //! including terminating-load recovery, are charged exactly; the prospective
@@ -20,11 +24,12 @@ use fre_simd_kernels::{
     ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
     Feature, SimdDispatchContext,
 };
+use memchr::memchr;
 
 use crate::required_literal::ByteClass;
 
-pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v4";
-pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v4";
+pub const PLAN_ID: &str = "required-internal-anchor.bounded-continuation.v5";
+pub const COUNT_OPERATION_ID: &str = "required-internal-anchor.count.v5";
 pub const MAX_OPTIONAL_STAGES: usize = 4;
 const MAX_ANCHOR_BYTES: usize = 64;
 // One complete ASCII-domain table pass, one paired-direction profile binding,
@@ -717,11 +722,41 @@ impl RequiredInternalAnchorPlan {
         };
         let mut candidate = search;
         while candidate <= last_start {
-            actual.anchor_window_attempts =
-                add(actual.anchor_window_attempts, 1, "anchor window attempts")?;
-            actual.control_work = add(actual.control_work, 1, "anchor window dispatch")?;
+            // The first anchor byte is excluded from the prefix class by the
+            // construction proof. A native byte stream can therefore skip
+            // every impossible anchor start without changing candidate order.
+            // Charge the skipped starts plus the selected start exactly as the
+            // prior scalar loop did: one window attempt, source access, and
+            // control transition per leading-byte probe.
+            let searched = haystack
+                .get(candidate..=last_start)
+                .ok_or(CountError::Overflow("anchor scan window"))?;
+            let relative = memchr(anchor[0], searched);
+            let leading_probes = match relative {
+                Some(offset) => add(offset, 1, "anchor leading probes")?,
+                None => searched.len(),
+            };
+            actual.anchor_window_attempts = add(
+                actual.anchor_window_attempts,
+                leading_probes,
+                "anchor window attempts",
+            )?;
+            actual.control_work = add(
+                actual.control_work,
+                leading_probes,
+                "anchor window dispatch",
+            )?;
+            actual.finder_source_accesses = add(
+                actual.finder_source_accesses,
+                leading_probes,
+                "anchor scan source accesses",
+            )?;
+            let Some(relative) = relative else {
+                return Ok(None);
+            };
+            candidate = add(candidate, relative, "anchor leading candidate")?;
             let mut matched = true;
-            for (offset, &expected) in anchor.iter().enumerate() {
+            for (offset, &expected) in anchor.iter().enumerate().skip(1) {
                 let position = add(candidate, offset, "anchor scan position")?;
                 actual.finder_source_accesses = add(
                     actual.finder_source_accesses,
@@ -1944,6 +1979,92 @@ mod tests {
             ),
             Err(BuildError::AnchorLimit { .. })
         ));
+    }
+
+    fn scalar_find_anchor_reference(
+        anchor: &[u8],
+        haystack: &[u8],
+        search: usize,
+        actual: &mut CountActual,
+    ) -> Result<Option<usize>, CountError> {
+        let Some(last_start) = haystack.len().checked_sub(anchor.len()) else {
+            return Ok(None);
+        };
+        let mut candidate = search;
+        while candidate <= last_start {
+            actual.anchor_window_attempts = add(
+                actual.anchor_window_attempts,
+                1,
+                "reference anchor window attempts",
+            )?;
+            actual.control_work = add(actual.control_work, 1, "reference anchor window dispatch")?;
+            let mut matched = true;
+            for (offset, &expected) in anchor.iter().enumerate() {
+                let position = add(candidate, offset, "reference anchor scan position")?;
+                actual.finder_source_accesses = add(
+                    actual.finder_source_accesses,
+                    1,
+                    "reference anchor scan source accesses",
+                )?;
+                if haystack[position] != expected {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                return Ok(Some(candidate));
+            }
+            candidate = add(candidate, 1, "reference anchor scan candidate")?;
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn native_anchor_stream_exhaustively_matches_scalar_results_and_resource_ledger() {
+        let continuation =
+            ContinuationSource::new(ByteClass::from_bytes(b"q"), ByteClass::from_bytes(b"q"));
+        for &(anchor, alphabet) in &[
+            (b"X".as_slice(), b"Xxyz".as_slice()),
+            (b"ab".as_slice(), b"abxy".as_slice()),
+            (b"://".as_slice(), b":/xy".as_slice()),
+            (b"aaab".as_slice(), b"abxy".as_slice()),
+        ] {
+            let plan = RequiredInternalAnchorPlan::build(
+                ByteClass::from_bytes(b"z"),
+                anchor,
+                continuation,
+                BuildLimits::default(),
+            )
+            .unwrap();
+            for length in 0..=7 {
+                let cases = alphabet.len().pow(u32::try_from(length).unwrap());
+                for encoded in 0..cases {
+                    let mut ordinal = encoded;
+                    let mut haystack = vec![0_u8; length];
+                    for byte in &mut haystack {
+                        *byte = alphabet[ordinal % alphabet.len()];
+                        ordinal /= alphabet.len();
+                    }
+                    for search in 0..=length.saturating_add(1) {
+                        let mut native = CountActual::default();
+                        let mut scalar = CountActual::default();
+                        let native_result =
+                            plan.find_anchor(&haystack, search, &mut native).unwrap();
+                        let scalar_result =
+                            scalar_find_anchor_reference(anchor, &haystack, search, &mut scalar)
+                                .unwrap();
+                        assert_eq!(
+                            native_result, scalar_result,
+                            "anchor={anchor:?} haystack={haystack:?} search={search}"
+                        );
+                        assert_eq!(
+                            native, scalar,
+                            "anchor={anchor:?} haystack={haystack:?} search={search}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
