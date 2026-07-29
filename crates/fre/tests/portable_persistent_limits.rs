@@ -123,6 +123,31 @@ fn total_persistent_limit_is_exact_across_every_portable_plan() {
 }
 
 #[test]
+fn folded_plan_persistent_refusal_falls_through_without_exceeding_the_total_limit() {
+    let builder = PortableBuilder::new("Шерлок Холмс").case_insensitive(true);
+    let probe = builder.clone().build().unwrap();
+    assert_eq!(probe.build_report().plan, PlanKind::UnicodeFoldedLiteral);
+    let needed = probe.build_report().charged_persistent_bytes;
+
+    let exact = builder
+        .clone()
+        .max_persistent_bytes(needed)
+        .build()
+        .unwrap();
+    assert_eq!(exact.build_report().plan, PlanKind::UnicodeFoldedLiteral);
+    assert_eq!(exact.build_report().charged_persistent_bytes, needed);
+
+    let below = builder
+        .max_persistent_bytes(needed.checked_sub(1).unwrap())
+        .build()
+        .unwrap();
+    assert_ne!(below.build_report().plan, PlanKind::UnicodeFoldedLiteral);
+    assert!(
+        below.build_report().charged_persistent_bytes <= below.build_report().persistent_byte_limit
+    );
+}
+
+#[test]
 fn source_and_capture_names_are_not_hidden_from_the_total_limit() {
     let plain = PortableBuilder::new("Sherlock")
         .unicode(false)

@@ -400,6 +400,7 @@ const fn plan_tag(plan: PlanKind) -> u8 {
         PlanKind::ForwardAnchored => 5,
         PlanKind::K0 => 6,
         PlanKind::UnicodeWordRun => 7,
+        PlanKind::UnicodeFoldedLiteral => 8,
     }
 }
 

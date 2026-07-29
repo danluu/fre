@@ -1586,6 +1586,7 @@ fn require_grep_runtime_plan(runtime: &str, plan: PlanKind) -> Result<(), Compar
     match (runtime, plan) {
         ("exact-literal", PlanKind::ExactLiteral)
         | ("k0", PlanKind::K0)
+        | (fre::UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID, PlanKind::UnicodeFoldedLiteral)
         | ("ascii-word-run-linear-v1" | "unicode-word-run-linear-v1", PlanKind::UnicodeWordRun) => {
             Ok(())
         }
@@ -2787,6 +2788,13 @@ mod tests {
         assert!(require_grep_runtime_plan("exact-literal", PlanKind::ExactLiteral).is_ok());
         assert!(require_grep_runtime_plan("k0", PlanKind::K0).is_ok());
         assert!(
+            require_grep_runtime_plan(
+                fre::UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID,
+                PlanKind::UnicodeFoldedLiteral,
+            )
+            .is_ok()
+        );
+        assert!(
             require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::UnicodeWordRun,)
                 .is_ok()
         );
@@ -2795,6 +2803,13 @@ mod tests {
                 .is_ok()
         );
         assert!(require_grep_runtime_plan("exact-literal", PlanKind::K0).is_err());
+        assert!(
+            require_grep_runtime_plan(
+                fre::UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID,
+                PlanKind::K0,
+            )
+            .is_err()
+        );
         assert!(require_grep_runtime_plan("k0", PlanKind::UnicodeWordRun).is_err());
         assert!(require_grep_runtime_plan("ascii-word-run-linear-v1", PlanKind::K0).is_err());
         assert!(require_grep_runtime_plan("unicode-word-run-linear-v1", PlanKind::K0).is_err());

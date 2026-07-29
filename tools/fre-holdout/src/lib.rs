@@ -1586,6 +1586,7 @@ fn plan_name(plan: PlanKind) -> &'static str {
         PlanKind::RequiredLiteral => "required-literal",
         PlanKind::ForwardAnchored => "forward-anchored",
         PlanKind::K0 => "k0",
+        PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal",
         PlanKind::UnicodeWordRun => "unicode-word-run",
     }
 }
@@ -2058,6 +2059,10 @@ mod tests {
     #[test]
     fn every_public_plan_has_a_stable_receipt_name() {
         assert_eq!(plan_name(PlanKind::UnicodeWordRun), "unicode-word-run");
+        assert_eq!(
+            plan_name(PlanKind::UnicodeFoldedLiteral),
+            "unicode-folded-literal"
+        );
     }
 
     #[test]

@@ -480,9 +480,9 @@ impl RootPrefilter {
         source: &[u8],
         invalid_actual: ScanActual,
         mut hit: F,
-    ) -> Result<(), ScanAttemptError>
+    ) -> Result<usize, ScanAttemptError>
     where
-        F: FnMut(usize) -> Result<(), ScanAttemptError>,
+        F: FnMut(usize, usize) -> Result<bool, ScanAttemptError>,
     {
         if usize::from(self.guard_needle_count) > ROOT_PREFILTER_BYTE_VALUES {
             return Err(ScanAttemptError {
@@ -495,19 +495,43 @@ impl RootPrefilter {
         match self.needle_count {
             1 => {
                 for position in memchr_iter(self.needles[0], source) {
-                    hit(position)?;
+                    let scanned_through = position.checked_add(1).ok_or(ScanAttemptError {
+                        source: ScanError::ArithmeticOverflow {
+                            computation: "folded root prefilter scanned prefix",
+                        },
+                        actual: invalid_actual,
+                    })?;
+                    if !hit(position, scanned_through)? {
+                        return Ok(scanned_through);
+                    }
                 }
             }
             2 => {
                 for position in memchr2_iter(self.needles[0], self.needles[1], source) {
-                    hit(position)?;
+                    let scanned_through = position.checked_add(1).ok_or(ScanAttemptError {
+                        source: ScanError::ArithmeticOverflow {
+                            computation: "folded root prefilter scanned prefix",
+                        },
+                        actual: invalid_actual,
+                    })?;
+                    if !hit(position, scanned_through)? {
+                        return Ok(scanned_through);
+                    }
                 }
             }
             3 => {
                 for position in
                     memchr3_iter(self.needles[0], self.needles[1], self.needles[2], source)
                 {
-                    hit(position)?;
+                    let scanned_through = position.checked_add(1).ok_or(ScanAttemptError {
+                        source: ScanError::ArithmeticOverflow {
+                            computation: "folded root prefilter scanned prefix",
+                        },
+                        actual: invalid_actual,
+                    })?;
+                    if !hit(position, scanned_through)? {
+                        return Ok(scanned_through);
+                    }
                 }
             }
             4..=256 => {
@@ -521,6 +545,12 @@ impl RootPrefilter {
                 };
                 let mut block_start = 0_usize;
                 while let Some(masks) = classifier.classify_16(&source[block_start..]) {
+                    let scanned_through = block_start.checked_add(16).ok_or(ScanAttemptError {
+                        source: ScanError::ArithmeticOverflow {
+                            computation: "wide folded root prefilter scanned prefix",
+                        },
+                        actual: invalid_actual,
+                    })?;
                     for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
                         while chunk != 0 {
                             let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
@@ -535,7 +565,9 @@ impl RootPrefilter {
                                     },
                                     actual: invalid_actual,
                                 })?;
-                            hit(position)?;
+                            if !hit(position, scanned_through)? {
+                                return Ok(scanned_through);
+                            }
                             let shift = lane.checked_mul(8).ok_or(ScanAttemptError {
                                 source: ScanError::ArithmeticOverflow {
                                     computation: "wide folded root prefilter lane shift",
@@ -578,7 +610,15 @@ impl RootPrefilter {
                                     },
                                     actual: invalid_actual,
                                 })?;
-                        hit(position)?;
+                        let scanned_through = position.checked_add(1).ok_or(ScanAttemptError {
+                            source: ScanError::ArithmeticOverflow {
+                                computation: "wide folded root prefilter scanned prefix",
+                            },
+                            actual: invalid_actual,
+                        })?;
+                        if !hit(position, scanned_through)? {
+                            return Ok(scanned_through);
+                        }
                     }
                 }
             }
@@ -591,7 +631,7 @@ impl RootPrefilter {
                 });
             }
         }
-        Ok(())
+        Ok(source.len())
     }
 }
 
@@ -864,6 +904,87 @@ impl FoldedLiteralTriePlan {
         haystack: &[u8],
         window: Window,
         limits: ScanLimits,
+        emit: F,
+    ) -> Result<ScanReceipt, ScanAttemptError>
+    where
+        F: FnMut(LiteralCandidate),
+    {
+        self.scan_window_mode(haystack, window, limits, ScanStop::Never, emit)
+    }
+
+    /// Return the leftmost candidate, breaking equal-start ties by source
+    /// pattern order.
+    ///
+    /// The complete source-independent envelope and every caller limit are
+    /// checked before source access. Execution stops after fully traversing
+    /// the first candidate-bearing scalar start, so ordered alternatives at
+    /// that start remain leftmost-first without scanning later starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range, resource and accounting failures as
+    /// [`Self::scan_window`].
+    pub fn find_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+    ) -> Result<(Option<LiteralCandidate>, ScanReceipt), ScanAttemptError> {
+        let mut selected = None::<LiteralCandidate>;
+        let mut order_violation = false;
+        let receipt = self.scan_window_mode(
+            haystack,
+            window,
+            limits,
+            ScanStop::AfterMatchingStart,
+            |candidate| match selected {
+                None => selected = Some(candidate),
+                Some(best) if candidate.start() == best.start() => {
+                    if candidate.pattern_index() < best.pattern_index() {
+                        selected = Some(candidate);
+                    }
+                }
+                Some(_) => order_violation = true,
+            },
+        )?;
+        if order_violation {
+            return Err(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "first folded candidate group contained multiple starts",
+                },
+                actual: receipt.actual,
+            });
+        }
+        Ok((selected, receipt))
+    }
+
+    /// Return whether any folded candidate exists, stopping on the first
+    /// emitted candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same checked range, resource and accounting failures as
+    /// [`Self::scan_window`].
+    pub fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+    ) -> Result<(bool, ScanReceipt), ScanAttemptError> {
+        let mut matched = false;
+        let receipt =
+            self.scan_window_mode(haystack, window, limits, ScanStop::AfterFirstEvent, |_| {
+                matched = true;
+            })?;
+        Ok((matched, receipt))
+    }
+
+    fn scan_window_mode<F>(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: ScanLimits,
+        stop: ScanStop,
         mut emit: F,
     ) -> Result<ScanReceipt, ScanAttemptError>
     where
@@ -902,7 +1023,7 @@ impl FoldedLiteralTriePlan {
 
         scan_source_probe::record();
         let source = &haystack[window.start()..window.end()];
-        let mut actual = execute_folded_scan(self, source, window.start(), upper, &mut emit)?;
+        let mut actual = execute_folded_scan(self, source, window.start(), upper, stop, &mut emit)?;
         let event_work = actual
             .candidate_events
             .checked_mul(CANDIDATE_WORK)
@@ -947,6 +1068,7 @@ fn execute_folded_scan<F>(
     source: &[u8],
     absolute_base: usize,
     upper: ScanUpperBounds,
+    stop: ScanStop,
     emit: &mut F,
 ) -> Result<ScanActual, ScanAttemptError>
 where
@@ -958,16 +1080,39 @@ where
         absolute_base,
         upper,
         plan.root_prefilter.as_ref(),
+        stop,
         emit,
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanStop {
+    Never,
+    AfterMatchingStart,
+    AfterFirstEvent,
+}
+
+impl ScanStop {
+    const fn after_matching_start(self) -> bool {
+        !matches!(self, Self::Never)
+    }
+
+    const fn after_first_event(self) -> bool {
+        matches!(self, Self::AfterFirstEvent)
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the scalar and prefetched paths share one exact early-stop accounting transaction"
+)]
 fn execute_folded_scan_impl<F>(
     plan: &FoldedLiteralTriePlan,
     source: &[u8],
     absolute_base: usize,
     upper: ScanUpperBounds,
     root_prefilter: Option<&RootPrefilter>,
+    stop: ScanStop,
     emit: &mut F,
 ) -> Result<ScanActual, ScanAttemptError>
 where
@@ -978,57 +1123,85 @@ where
         ..ScanActual::default()
     };
     if let Some(prefilter) = root_prefilter {
-        actual.source_byte_reads = checked_actual_add(
-            actual.source_byte_reads,
-            source.len(),
-            upper,
-            actual,
-            "folded root-prefilter source reads",
-        )?;
         let offset = usize::from(prefilter.offset);
         let invalid_actual = actual;
-        prefilter.scan(source, invalid_actual, |hit| {
-            let Some(relative_start) = hit.checked_sub(offset) else {
-                return Ok(());
-            };
-            if prefilter.has_guard() {
-                let Some(guard_position) =
-                    relative_start.checked_add(usize::from(prefilter.guard_offset))
-                else {
-                    return Ok(());
-                };
-                let Some(&guard_byte) = source.get(guard_position) else {
-                    return Ok(());
-                };
+        let mut prefilter_source_reads = 0_usize;
+        let completed_source_reads =
+            prefilter.scan(source, invalid_actual, |hit, scanned_through| {
+                let additional_reads = scanned_through.checked_sub(prefilter_source_reads).ok_or(
+                    ScanAttemptError {
+                        source: ScanError::Invariant {
+                            detail: "folded root prefilter scanned prefix moved backwards",
+                        },
+                        actual,
+                    },
+                )?;
                 actual.source_byte_reads = checked_actual_add(
                     actual.source_byte_reads,
+                    additional_reads,
+                    upper,
+                    actual,
+                    "folded root-prefilter source reads",
+                )?;
+                prefilter_source_reads = scanned_through;
+                let Some(relative_start) = hit.checked_sub(offset) else {
+                    return Ok(true);
+                };
+                if prefilter.has_guard() {
+                    let Some(guard_position) =
+                        relative_start.checked_add(usize::from(prefilter.guard_offset))
+                    else {
+                        return Ok(true);
+                    };
+                    let Some(&guard_byte) = source.get(guard_position) else {
+                        return Ok(true);
+                    };
+                    actual.source_byte_reads = checked_actual_add(
+                        actual.source_byte_reads,
+                        1,
+                        upper,
+                        actual,
+                        "folded root-prefilter guard reads",
+                    )?;
+                    if !prefilter.guard_matches(guard_byte) {
+                        return Ok(true);
+                    }
+                }
+                actual.candidate_starts = checked_actual_add(
+                    actual.candidate_starts,
                     1,
                     upper,
                     actual,
-                    "folded root-prefilter guard reads",
+                    "folded root-prefilter candidate starts",
                 )?;
-                if !prefilter.guard_matches(guard_byte) {
-                    return Ok(());
-                }
-            }
-            actual.candidate_starts = checked_actual_add(
-                actual.candidate_starts,
-                1,
-                upper,
+                let events_before = actual.candidate_events;
+                let _ = scan_folded_start(
+                    plan,
+                    source,
+                    absolute_base,
+                    relative_start,
+                    upper,
+                    &mut actual,
+                    stop.after_first_event(),
+                    emit,
+                )?;
+                Ok(!stop.after_matching_start() || actual.candidate_events == events_before)
+            })?;
+        let remaining_prefilter_reads = completed_source_reads
+            .checked_sub(prefilter_source_reads)
+            .ok_or(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root prefilter completion moved backwards",
+                },
                 actual,
-                "folded root-prefilter candidate starts",
-            )?;
-            let _ = scan_folded_start(
-                plan,
-                source,
-                absolute_base,
-                relative_start,
-                upper,
-                &mut actual,
-                emit,
-            )?;
-            Ok(())
-        })?;
+            })?;
+        actual.source_byte_reads = checked_actual_add(
+            actual.source_byte_reads,
+            remaining_prefilter_reads,
+            upper,
+            actual,
+            "folded root-prefilter completion source reads",
+        )?;
         return Ok(actual);
     }
     let mut relative_start = 0_usize;
@@ -1040,6 +1213,7 @@ where
             actual,
             "folded candidate starts",
         )?;
+        let events_before = actual.candidate_events;
         let advance = scan_folded_start(
             plan,
             source,
@@ -1047,8 +1221,12 @@ where
             relative_start,
             upper,
             &mut actual,
+            stop.after_first_event(),
             emit,
         )?;
+        if stop.after_matching_start() && actual.candidate_events != events_before {
+            break;
+        }
         relative_start = relative_start
             .checked_add(advance)
             .ok_or_else(|| attempt_overflow(upper, actual, "next folded candidate start"))?;
@@ -1394,6 +1572,10 @@ fn root_prefilter_classifier(
     Ok((classifier, work))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the early-stop bit joins the established explicit scan-accounting boundary"
+)]
 fn scan_folded_start<F>(
     plan: &FoldedLiteralTriePlan,
     source: &[u8],
@@ -1401,6 +1583,7 @@ fn scan_folded_start<F>(
     relative_start: usize,
     upper: ScanUpperBounds,
     actual: &mut ScanActual,
+    stop_after_first_event: bool,
     emit: &mut F,
 ) -> Result<usize, ScanAttemptError>
 where
@@ -1453,19 +1636,26 @@ where
         depth = depth
             .checked_add(1)
             .ok_or_else(|| attempt_overflow(upper, *actual, "folded depth"))?;
-        emit_folded_outputs(
+        if emit_folded_outputs(
             plan,
             state,
             absolute_base,
             (relative_start, cursor),
             upper,
             actual,
+            stop_after_first_event,
             emit,
-        )?;
+        )? {
+            break;
+        }
     }
     Ok(next_start_advance)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "output emission retains explicit span, envelope, actual and early-stop state"
+)]
 fn emit_folded_outputs<F>(
     plan: &FoldedLiteralTriePlan,
     state: usize,
@@ -1473,8 +1663,9 @@ fn emit_folded_outputs<F>(
     relative_span: (usize, usize),
     upper: ScanUpperBounds,
     actual: &mut ScanActual,
+    stop_after_first_event: bool,
     emit: &mut F,
-) -> Result<(), ScanAttemptError>
+) -> Result<bool, ScanAttemptError>
 where
     F: FnMut(LiteralCandidate),
 {
@@ -1495,9 +1686,12 @@ where
             "folded candidate events",
         )?;
         emit(LiteralCandidate::new(terminal.pattern_index, start, end));
+        if stop_after_first_event {
+            return Ok(true);
+        }
         output = terminal.next;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cold]
@@ -2350,8 +2544,8 @@ mod tests {
     use super::{
         BuildAccounting, BuildAttempt, BuildError, BuildLimits, BuildResource, DenseFallbackReason,
         FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass, ScanActual, ScanError, ScanLimits,
-        ScanResource, ScanUpperBounds, build_probe, byte_set_members, execute_folded_scan_impl,
-        scan_source_probe,
+        ScanResource, ScanStop, ScanUpperBounds, build_probe, byte_set_members,
+        execute_folded_scan_impl, scan_source_probe,
     };
     use crate::{LiteralCandidate, Window};
     use fre_simd_kernels::{ByteBucketClassifier, DispatchPolicy, SimdDispatchContext};
@@ -2505,6 +2699,46 @@ mod tests {
                 LiteralCandidate::new(1, 1, 2),
                 LiteralCandidate::new(3, 1, 2),
             ]
+        );
+    }
+
+    #[test]
+    fn first_candidate_projection_stops_after_one_start_and_keeps_pattern_priority() {
+        let kelvin = FoldedScalarClass::new(&KELVIN);
+        let one = [kelvin];
+        let two = [kelvin, kelvin];
+        let patterns = [
+            FoldedLiteral::new(&two),
+            FoldedLiteral::new(&one),
+            FoldedLiteral::new(&two),
+            FoldedLiteral::new(&one),
+        ];
+        let plan = admitted(&patterns);
+        let (candidate, receipt) = plan
+            .find_window(b"xKKKK", Window::new(1, 5), ScanLimits::unlimited())
+            .unwrap();
+        assert_eq!(candidate, Some(LiteralCandidate::new(0, 1, 3)));
+        assert_eq!(receipt.actual.candidate_starts, 1);
+        assert_eq!(receipt.actual.candidate_events, 4);
+        assert!(receipt.actual.work < receipt.upper.work);
+        assert!(receipt.actual.source_byte_reads < receipt.upper.source_byte_reads);
+
+        let (matched, exists_receipt) = plan
+            .is_match_window(b"xKKKK", Window::new(1, 5), ScanLimits::unlimited())
+            .unwrap();
+        assert!(matched);
+        assert_eq!(exists_receipt.actual.candidate_starts, 1);
+        assert_eq!(exists_receipt.actual.candidate_events, 1);
+        assert!(exists_receipt.actual.work < receipt.actual.work);
+
+        let reversed = [FoldedLiteral::new(&one), FoldedLiteral::new(&two)];
+        let reversed = admitted(&reversed);
+        assert_eq!(
+            reversed
+                .find_window(b"KK", Window::full(b"KK"), ScanLimits::unlimited())
+                .unwrap()
+                .0,
+            Some(LiteralCandidate::new(0, 0, 1))
         );
     }
 
@@ -2675,11 +2909,18 @@ mod tests {
         source.extend_from_slice(b"tail-ABCD-\xff");
         let upper = plan.scan_upper_bounds(source.len()).unwrap();
         let mut scalar = Vec::new();
-        let scalar_actual =
-            execute_folded_scan_impl(&plan, &source, 0, upper, None, &mut |candidate| {
+        let scalar_actual = execute_folded_scan_impl(
+            &plan,
+            &source,
+            0,
+            upper,
+            None,
+            ScanStop::Never,
+            &mut |candidate| {
                 scalar.push(candidate);
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         let mut prefetched = Vec::new();
         let prefetched_actual = execute_folded_scan_impl(
             &plan,
@@ -2687,6 +2928,7 @@ mod tests {
             0,
             upper,
             plan.root_prefilter.as_ref(),
+            ScanStop::Never,
             &mut |candidate| prefetched.push(candidate),
         )
         .unwrap();
@@ -2722,6 +2964,7 @@ mod tests {
                     window_start,
                     upper,
                     None,
+                    ScanStop::Never,
                     &mut |candidate| scalar.push(candidate),
                 )
                 .unwrap();
@@ -2732,6 +2975,7 @@ mod tests {
                     window_start,
                     upper,
                     plan.root_prefilter.as_ref(),
+                    ScanStop::Never,
                     &mut |candidate| prefetched.push(candidate),
                 )
                 .unwrap();
@@ -2771,6 +3015,7 @@ mod tests {
                             start,
                             upper,
                             None,
+                            ScanStop::Never,
                             &mut |candidate| scalar.push(candidate),
                         )
                         .unwrap();
@@ -2781,6 +3026,7 @@ mod tests {
                             start,
                             upper,
                             plan.root_prefilter.as_ref(),
+                            ScanStop::Never,
                             &mut |candidate| prefetched.push(candidate),
                         )
                         .unwrap();
@@ -2795,9 +3041,17 @@ mod tests {
         let multi_hit = "ШЕшеШЕ".as_bytes();
         let upper = plan.scan_upper_bounds(multi_hit.len()).unwrap();
         let mut scalar = Vec::new();
-        execute_folded_scan_impl(&plan, multi_hit, 0, upper, None, &mut |candidate| {
-            scalar.push(candidate);
-        })
+        execute_folded_scan_impl(
+            &plan,
+            multi_hit,
+            0,
+            upper,
+            None,
+            ScanStop::Never,
+            &mut |candidate| {
+                scalar.push(candidate);
+            },
+        )
         .unwrap();
         let mut prefetched = Vec::new();
         execute_folded_scan_impl(
@@ -2806,6 +3060,7 @@ mod tests {
             0,
             upper,
             plan.root_prefilter.as_ref(),
+            ScanStop::Never,
             &mut |candidate| {
                 prefetched.push(candidate);
             },
@@ -3161,7 +3416,9 @@ mod tests {
         assert_eq!(emissions, 0);
         assert_eq!(scan_source_probe::accesses(), 0);
 
-        let actual = execute_folded_scan_impl(&plan, &source, 0, upper, None, &mut |_| {}).unwrap();
+        let actual =
+            execute_folded_scan_impl(&plan, &source, 0, upper, None, ScanStop::Never, &mut |_| {})
+                .unwrap();
         assert_eq!(actual.transition_probes, 32 * 14);
         assert!(super::actual_within(actual, upper));
     }

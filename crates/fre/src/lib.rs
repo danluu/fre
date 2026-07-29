@@ -79,13 +79,14 @@ mod unicode_word_run;
 
 pub use unicode_folded_literal::{
     UNICODE_FOLDED_LITERAL_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID,
-    UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID, UnicodeFoldedLiteralBuildAttempt,
-    UnicodeFoldedLiteralBuildError, UnicodeFoldedLiteralBuildLimits,
-    UnicodeFoldedLiteralBuildReport, UnicodeFoldedLiteralBuilder, UnicodeFoldedLiteralCountRegex,
-    UnicodeFoldedLiteralIneligibility, UnicodeFoldedLiteralOperation,
-    UnicodeFoldedLiteralPlannerAccounting, UnicodeFoldedLiteralRunError,
-    UnicodeFoldedLiteralRunLimits, UnicodeFoldedLiteralRunReceipt, UnicodeFoldedLiteralRunResult,
-    UnicodeFoldedLiteralRunUpperBounds, UnicodeFoldedLiteralSpanSumRegex,
+    UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID, UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID,
+    UnicodeFoldedLiteralBuildAttempt, UnicodeFoldedLiteralBuildError,
+    UnicodeFoldedLiteralBuildLimits, UnicodeFoldedLiteralBuildReport, UnicodeFoldedLiteralBuilder,
+    UnicodeFoldedLiteralCountRegex, UnicodeFoldedLiteralIneligibility,
+    UnicodeFoldedLiteralOperation, UnicodeFoldedLiteralPlannerAccounting,
+    UnicodeFoldedLiteralRunError, UnicodeFoldedLiteralRunLimits, UnicodeFoldedLiteralRunReceipt,
+    UnicodeFoldedLiteralRunResult, UnicodeFoldedLiteralRunUpperBounds,
+    UnicodeFoldedLiteralSearchBuildAccounting, UnicodeFoldedLiteralSpanSumRegex,
 };
 
 pub use aggregate::PortableGrepLineTotalError;
@@ -596,7 +597,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 5;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 6;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -867,6 +868,8 @@ pub enum PlanKind {
     ForwardAnchored,
     /// Generic bounded portable prioritized automaton.
     K0,
+    /// Ordered Unicode simple-fold scalar sequences backed by a sparse trie.
+    UnicodeFoldedLiteral,
     /// Linear canonical ASCII or Unicode `\b\w{m,}\b` word-run scan.
     UnicodeWordRun,
 }
@@ -1014,6 +1017,51 @@ fn forward_anchored_failure_class(error: &ForwardAnchoredBuildError) -> BuildFai
         | ForwardAnchoredBuildError::PersistentLimit { .. }
         | ForwardAnchoredBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
         _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn unicode_folded_literal_resource_refusal(error: &UnicodeFoldedLiteralBuildError) -> bool {
+    matches!(
+        error,
+        UnicodeFoldedLiteralBuildError::Resource { .. }
+            | UnicodeFoldedLiteralBuildError::Trie(
+                fre_kernels::FoldedLiteralTrieBuildError::Resource { .. }
+            )
+    )
+}
+
+fn map_unicode_folded_literal_build_error(error: UnicodeFoldedLiteralBuildError) -> BuildError {
+    match error {
+        UnicodeFoldedLiteralBuildError::Syntax(error) => BuildError::Syntax(error.into_source()),
+        UnicodeFoldedLiteralBuildError::AllocationFailed { structure, items } => {
+            BuildError::AllocationFailed {
+                structure,
+                additional: items,
+            }
+        }
+        UnicodeFoldedLiteralBuildError::Trie(
+            fre_kernels::FoldedLiteralTrieBuildError::AllocationFailed { structure, items },
+        ) => BuildError::AllocationFailed {
+            structure,
+            additional: items,
+        },
+        UnicodeFoldedLiteralBuildError::Invariant { detail }
+        | UnicodeFoldedLiteralBuildError::Trie(
+            fre_kernels::FoldedLiteralTrieBuildError::Invariant { detail },
+        ) => BuildError::InternalInvariant(detail),
+        UnicodeFoldedLiteralBuildError::ArithmeticOverflow { computation }
+        | UnicodeFoldedLiteralBuildError::Trie(
+            fre_kernels::FoldedLiteralTrieBuildError::ArithmeticOverflow { computation },
+        ) => BuildError::InternalInvariant(computation),
+        UnicodeFoldedLiteralBuildError::Resource { .. }
+        | UnicodeFoldedLiteralBuildError::Trie(
+            fre_kernels::FoldedLiteralTrieBuildError::Resource { .. },
+        ) => BuildError::InternalInvariant(
+            "folded-literal resource refusal escaped optional Auto routing",
+        ),
+        UnicodeFoldedLiteralBuildError::Trie(_) => {
+            BuildError::InternalInvariant("folded-literal trie returned an unknown failure")
+        }
     }
 }
 
@@ -1322,6 +1370,12 @@ pub enum SearchAccounting {
     RequiredLiteral(RequiredLiteralSearchAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
+    /// Exact folded-scalar trie early-stop counters.
+    ///
+    /// The source-independent envelope is available separately from
+    /// [`PortableRegex::unicode_folded_literal_search_upper_bounds`] so this
+    /// admitted-only route does not enlarge unrelated accounting owners.
+    UnicodeFoldedLiteral(fre_kernels::FoldedLiteralTrieScanActual),
     /// Exact linear Unicode word-run counters.
     UnicodeWordRun(UnicodeWordRunAccounting),
 }
@@ -1337,6 +1391,7 @@ impl SearchAccounting {
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
+            Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
         }
     }
@@ -1357,8 +1412,32 @@ impl SearchAccounting {
             }
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
             Self::ForwardAnchored(accounting) => accounting.work_upper_bound,
+            Self::UnicodeFoldedLiteral(accounting) => {
+                u64::try_from(accounting.work).unwrap_or(u64::MAX)
+            }
             Self::UnicodeWordRun(accounting) => accounting.work(),
         }
+    }
+}
+
+/// Compact folded-plan failure projection that preserves charged work and
+/// source reads without enlarging unrelated search-error owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnicodeFoldedLiteralSearchError {
+    pub source: fre_kernels::FoldedLiteralTrieScanError,
+    pub actual_work: usize,
+    pub actual_source_byte_reads: usize,
+}
+
+impl fmt::Display for UnicodeFoldedLiteralSearchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.source, formatter)
+    }
+}
+
+impl std::error::Error for UnicodeFoldedLiteralSearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -1372,6 +1451,7 @@ pub enum SearchError {
     LiteralSetDfa(LiteralSetError),
     RequiredLiteral(RequiredLiteralSearchError),
     ForwardAnchored(ForwardAnchoredSearchError),
+    UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
 }
 
@@ -1388,6 +1468,9 @@ impl fmt::Display for SearchError {
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
             }
+            Self::UnicodeFoldedLiteral(error) => {
+                write!(f, "Unicode folded-literal search failed: {error}")
+            }
             Self::UnicodeWordRun(error) => write!(f, "Unicode word-run search failed: {error}"),
         }
     }
@@ -1402,6 +1485,7 @@ impl std::error::Error for SearchError {
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
+            Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
         }
     }
@@ -1440,6 +1524,16 @@ impl From<RequiredLiteralSearchError> for SearchError {
 impl From<ForwardAnchoredSearchError> for SearchError {
     fn from(value: ForwardAnchoredSearchError) -> Self {
         Self::ForwardAnchored(value)
+    }
+}
+
+impl From<fre_kernels::FoldedLiteralTrieScanAttemptError> for SearchError {
+    fn from(value: fre_kernels::FoldedLiteralTrieScanAttemptError) -> Self {
+        Self::UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError {
+            source: value.source,
+            actual_work: value.actual.work,
+            actual_source_byte_reads: value.actual.source_byte_reads,
+        })
     }
 }
 
@@ -2294,6 +2388,118 @@ impl PortableBuilder {
                 });
             }
         }
+        let mut fallback_planner_work = finite_work;
+        if self.selection == PlanSelection::Auto {
+            let retained_facade_bytes = source_storage_bytes
+                .checked_add(capture_name_storage_bytes)
+                .ok_or(BuildError::PersistentBytesOverflow)?;
+            let available_plan_bytes = self
+                .limits
+                .max_persistent_bytes
+                .saturating_sub(retained_facade_bytes);
+            let folded_owner_bytes = unicode_folded_literal::search_plan_owner_bytes();
+            if let Some(available_trie_bytes) = available_plan_bytes.checked_sub(folded_owner_bytes)
+            {
+                let remaining_planner_work = self
+                    .limits
+                    .max_planner_work
+                    .checked_sub(finite_work)
+                    .ok_or(BuildError::InternalInvariant(
+                        "incumbent planner work exceeded its enforced limit",
+                    ))?;
+                let planner_limit = usize::try_from(remaining_planner_work).unwrap_or(usize::MAX);
+                let mut folded_limits = UnicodeFoldedLiteralBuildLimits::default();
+                folded_limits.max_planner_work = folded_limits.max_planner_work.min(planner_limit);
+                folded_limits.trie.max_work = folded_limits.trie.max_work.min(planner_limit);
+                folded_limits.trie.max_persistent_bytes = folded_limits
+                    .trie
+                    .max_persistent_bytes
+                    .min(available_trie_bytes);
+                folded_limits.trie.max_peak_bytes =
+                    folded_limits.trie.max_peak_bytes.min(available_trie_bytes);
+
+                match unicode_folded_literal::build_search_plan(
+                    SimdDispatchContext::capture(),
+                    &rust.hir,
+                    &self.profile,
+                    folded_limits,
+                ) {
+                    Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(plan)) => {
+                        let build = plan.build_accounting();
+                        let folded_planner_work =
+                            u64::try_from(build.planner.work).map_err(|_| {
+                                BuildError::InternalInvariant(
+                                    "folded-literal planner work does not fit u64",
+                                )
+                            })?;
+                        let planner_work = finite_work.checked_add(folded_planner_work).ok_or(
+                            BuildError::InternalInvariant(
+                                "cumulative folded-literal planner work overflowed u64",
+                            ),
+                        )?;
+                        if planner_work > self.limits.max_planner_work {
+                            return Err(BuildError::PlannerWorkLimit {
+                                needed: planner_work,
+                                limit: self.limits.max_planner_work,
+                            });
+                        }
+                        fallback_planner_work = planner_work;
+                        if let Ok(plan) = fre_exact_alloc::try_box_preserve(plan) {
+                            return Ok(PortableRegex {
+                                source,
+                                capture_names,
+                                line_total_grep_plan,
+                                plan: PortablePlan::UnicodeFoldedLiteral(plan),
+                                profile: profile.clone(),
+                                limits: self.limits,
+                                selection: self.selection,
+                                report: BuildReport {
+                                    profile: profile.clone(),
+                                    admission,
+                                    syntax,
+                                    plan: PlanKind::UnicodeFoldedLiteral,
+                                    planner_work,
+                                    lowering: None,
+                                    states: build.trie.states,
+                                    edges: build.trie.transitions,
+                                    plan_storage_bytes: build.persistent_bytes,
+                                    source_storage_bytes,
+                                    capture_name_storage_bytes,
+                                    charged_persistent_bytes: 0,
+                                    persistent_byte_limit: 0,
+                                    captures_len,
+                                    static_captures_len,
+                                    minimum_match_bytes,
+                                    required_literal: None,
+                                    forward_anchored: None,
+                                }
+                                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                            });
+                        }
+                    }
+                    Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { planner, .. }) => {
+                        let folded_planner_work = u64::try_from(planner.work).map_err(|_| {
+                            BuildError::InternalInvariant(
+                                "declined folded-literal planner work does not fit u64",
+                            )
+                        })?;
+                        fallback_planner_work = finite_work
+                            .checked_add(folded_planner_work)
+                            .ok_or(BuildError::InternalInvariant(
+                                "declined folded-literal planner work overflowed u64",
+                            ))?;
+                        if fallback_planner_work > self.limits.max_planner_work {
+                            return Err(BuildError::PlannerWorkLimit {
+                                needed: fallback_planner_work,
+                                limit: self.limits.max_planner_work,
+                            });
+                        }
+                    }
+                    Err(error) if unicode_folded_literal_resource_refusal(&error) => {}
+                    Err(error) => return Err(map_unicode_folded_literal_build_error(error)),
+                }
+            }
+        }
         let lowered =
             fre_lower::lower(&rust, OperationSemantics::CaptureFree, self.limits.lowering)?;
         let lowering = lowered.stats();
@@ -2314,7 +2520,7 @@ impl PortableBuilder {
                 admission,
                 syntax,
                 plan: PlanKind::K0,
-                planner_work: finite_work,
+                planner_work: fallback_planner_work,
                 lowering: Some(lowering),
                 states: plan.states(),
                 edges: plan.edges(),
@@ -2553,6 +2759,7 @@ enum PortablePlan {
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
     K0(Automaton),
+    UnicodeFoldedLiteral(Box<unicode_folded_literal::UnicodeFoldedLiteralSearchPlan>),
     UnicodeWordRun(unicode_word_run::Plan),
     AsciiWordRun(unicode_word_run::AsciiPlan),
 }
@@ -2569,6 +2776,7 @@ impl PortablePlan {
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
             Self::K0(_) => "k0",
+            Self::UnicodeFoldedLiteral(plan) => plan.plan_id(),
             Self::UnicodeWordRun(plan) => plan.plan_id(),
             Self::AsciiWordRun(_) => unicode_word_run::ASCII_PLAN_ID,
         }
@@ -2691,6 +2899,46 @@ impl PortableRegex {
     #[must_use]
     pub const fn build_report(&self) -> &BuildReport {
         &self.report
+    }
+
+    /// Complete admitted-only construction census for the Unicode
+    /// folded-literal plan.
+    ///
+    /// The census is retained with that optional plan instead of enlarging
+    /// every portable matcher and aggregate owner. Other plan families return
+    /// `None`.
+    #[must_use]
+    pub fn unicode_folded_literal_build_accounting(
+        &self,
+    ) -> Option<UnicodeFoldedLiteralSearchBuildAccounting> {
+        match &self.plan {
+            PortablePlan::UnicodeFoldedLiteral(plan) => Some(plan.build_accounting()),
+            _ => None,
+        }
+    }
+
+    /// Derive the folded plan's complete source-independent search envelope
+    /// without touching a haystack.
+    ///
+    /// Other plan families return `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked arithmetic failure if `input_bytes` cannot be
+    /// represented by the retained folded plan's envelope.
+    pub fn unicode_folded_literal_search_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<
+        Option<fre_kernels::FoldedLiteralTrieScanUpperBounds>,
+        fre_kernels::FoldedLiteralTrieScanError,
+    > {
+        match &self.plan {
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                plan.scan_upper_bounds(input_bytes).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Stable identity of the selected runtime implementation.
@@ -2976,6 +3224,17 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                let (matched, accounting) = plan.is_match_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )?;
+                Ok((
+                    matched,
+                    SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
+                ))
+            }
             PortablePlan::K0(automaton) => {
                 let report = automaton
                     .prepare::<Exists>()
@@ -3079,6 +3338,14 @@ impl PortableRegex {
                     forward_anchored_limits(limits),
                 )
                 .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::UnicodeFoldedLiteral(plan) => plan
+                .is_match_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::K0(automaton) => automaton
                 .prepare::<Exists>()
@@ -3233,6 +3500,17 @@ impl PortableRegex {
                     SearchAccounting::ForwardAnchored(accounting),
                 ))
             }
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )?;
+                Ok((
+                    end,
+                    SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
+                ))
+            }
             PortablePlan::K0(automaton) => {
                 let report = automaton
                     .prepare::<EarliestEnd>()
@@ -3329,6 +3607,17 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::full(haystack),
+                    unicode_folded_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|candidate| candidate.end()),
+                    SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
             PortablePlan::K0(automaton) => {
@@ -3603,6 +3892,20 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     SearchAccounting::ForwardAnchored(accounting),
+                ))
+            }
+            PortablePlan::UnicodeFoldedLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    unicode_folded_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|candidate| Match {
+                        start: candidate.start(),
+                        end: candidate.end(),
+                    }),
+                    SearchAccounting::UnicodeFoldedLiteral(accounting.actual),
                 ))
             }
             PortablePlan::K0(automaton) => {
@@ -4378,6 +4681,14 @@ fn forward_anchored_limits(limits: SearchLimits) -> ForwardAnchoredSearchLimits 
         max_work_upper_bound: limits.max_work,
         max_examined_bytes_upper_bound: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
         max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
+fn unicode_folded_literal_limits(limits: SearchLimits) -> FoldedLiteralTrieScanLimits {
+    FoldedLiteralTrieScanLimits {
+        max_work: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
+        max_scratch_bytes: limits.max_scratch_bytes,
+        ..FoldedLiteralTrieScanLimits::unlimited()
     }
 }
 

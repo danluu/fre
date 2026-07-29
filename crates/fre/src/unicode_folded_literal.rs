@@ -36,6 +36,9 @@ pub const UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID: &str = "fre.unicode-folded-
 /// Stable matched-byte-sum operation identity.
 pub const UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID: &str =
     "fre.unicode-folded-literal.span-sum.v4";
+/// Stable implementation identity for portable first-match operations.
+pub const UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID: &str =
+    "fre.portable.unicode-folded-literal.first-start-trie.v1";
 
 const MAX_CLASS_MEMBERS: usize = 4;
 const REDUCER_WORK_PER_CANDIDATE: usize = 8;
@@ -124,6 +127,21 @@ pub struct UnicodeFoldedLiteralBuildReport {
     pub syntax: ParseSummary,
     pub planner: UnicodeFoldedLiteralPlannerAccounting,
     pub trie: FoldedLiteralTrieBuildAccounting,
+}
+
+/// Complete construction census for the portable first-match owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnicodeFoldedLiteralSearchBuildAccounting {
+    pub planner: UnicodeFoldedLiteralPlannerAccounting,
+    pub trie: FoldedLiteralTrieBuildAccounting,
+    /// Exact retained allocation count added by the portable facade owner.
+    pub facade_owner_allocations: usize,
+    /// Exact retained bytes added by the portable facade owner.
+    pub facade_owner_persistent_bytes: usize,
+    /// Exact retained allocations across the trie and facade owner.
+    pub persistent_allocations: usize,
+    /// Exact retained bytes across the trie and facade owner.
+    pub persistent_bytes: usize,
 }
 
 /// A structural miss is distinct from a selected-plan construction failure.
@@ -283,6 +301,88 @@ impl UnicodeFoldedLiteralBuilder {
 struct UnicodeFoldedLiteralPlan {
     trie: FoldedLiteralTriePlan,
     report: UnicodeFoldedLiteralBuildReport,
+}
+
+/// Facade-private retained owner for allocation-free first-match operations.
+#[derive(Debug)]
+pub(crate) struct UnicodeFoldedLiteralSearchPlan {
+    trie: FoldedLiteralTriePlan,
+    planner: UnicodeFoldedLiteralPlannerAccounting,
+}
+
+impl UnicodeFoldedLiteralSearchPlan {
+    pub(crate) const fn plan_id(&self) -> &'static str {
+        UNICODE_FOLDED_LITERAL_SEARCH_ALGORITHM_ID
+    }
+
+    pub(crate) fn build_accounting(&self) -> UnicodeFoldedLiteralSearchBuildAccounting {
+        let trie = self.trie.build_accounting();
+        let facade_owner_persistent_bytes = search_plan_owner_bytes();
+        UnicodeFoldedLiteralSearchBuildAccounting {
+            planner: self.planner,
+            trie,
+            facade_owner_allocations: 1,
+            facade_owner_persistent_bytes,
+            persistent_allocations: trie
+                .allocations
+                .checked_add(1)
+                .expect("portable folded allocation total was checked at construction"),
+            persistent_bytes: trie
+                .persistent_bytes
+                .checked_add(facade_owner_persistent_bytes)
+                .expect("portable folded byte total was checked at construction"),
+        }
+    }
+
+    pub(crate) fn scan_upper_bounds(
+        &self,
+        input_bytes: usize,
+    ) -> Result<FoldedLiteralTrieScanUpperBounds, fre_kernels::FoldedLiteralTrieScanError> {
+        self.trie.scan_upper_bounds(input_bytes)
+    }
+
+    pub(crate) fn find_window(
+        &self,
+        haystack: &[u8],
+        window: fre_kernels::Window,
+        limits: FoldedLiteralTrieScanLimits,
+    ) -> Result<
+        (Option<LiteralCandidate>, FoldedLiteralTrieScanReceipt),
+        FoldedLiteralTrieScanAttemptError,
+    > {
+        self.trie.find_window(haystack, window, limits)
+    }
+
+    pub(crate) fn is_match_window(
+        &self,
+        haystack: &[u8],
+        window: fre_kernels::Window,
+        limits: FoldedLiteralTrieScanLimits,
+    ) -> Result<(bool, FoldedLiteralTrieScanReceipt), FoldedLiteralTrieScanAttemptError> {
+        self.trie.is_match_window(haystack, window, limits)
+    }
+
+    pub(crate) fn shortest_window(
+        &self,
+        haystack: &[u8],
+        window: fre_kernels::Window,
+        limits: FoldedLiteralTrieScanLimits,
+    ) -> Result<(Option<usize>, FoldedLiteralTrieScanReceipt), FoldedLiteralTrieScanAttemptError>
+    {
+        let mut earliest_end = None::<usize>;
+        let receipt = self
+            .trie
+            .scan_window(haystack, window, limits, |candidate| {
+                earliest_end = Some(
+                    earliest_end.map_or(candidate.end(), |current| current.min(candidate.end())),
+                );
+            })?;
+        Ok((earliest_end, receipt))
+    }
+}
+
+pub(crate) const fn search_plan_owner_bytes() -> usize {
+    size_of::<UnicodeFoldedLiteralSearchPlan>()
 }
 
 /// Reusable allocation-free Count artifact.
@@ -510,7 +610,90 @@ fn build(
             detail: "Rust-bytes folded-literal parse produced a non-Rust pattern",
         });
     };
-    let shape = match inspect_hir(&rust.hir)? {
+    let constructed = match construct_from_hir(dispatch, &rust.hir, builder.limits)? {
+        UnicodeFoldedLiteralBuildAttempt::Admitted(constructed) => constructed,
+        UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner } => {
+            return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner });
+        }
+    };
+    let report = UnicodeFoldedLiteralBuildReport {
+        algorithm: UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
+        operation,
+        syntax_key: record.key,
+        admission: record.admission_status,
+        syntax: record.summary,
+        planner: constructed.planner,
+        trie: constructed.trie.build_accounting(),
+    };
+    Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(
+        UnicodeFoldedLiteralPlan {
+            trie: constructed.trie,
+            report,
+        },
+    ))
+}
+
+pub(crate) fn build_search_plan(
+    dispatch: SimdDispatchContext,
+    hir: &Hir,
+    profile: &RustProfile,
+    limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<
+    UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralSearchPlan>,
+    UnicodeFoldedLiteralBuildError,
+> {
+    if !eligible_profile(profile) {
+        return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
+            reason: UnicodeFoldedLiteralIneligibility::Profile,
+            planner: UnicodeFoldedLiteralPlannerAccounting::default(),
+        });
+    }
+    match construct_from_hir(dispatch, hir, limits)? {
+        UnicodeFoldedLiteralBuildAttempt::Admitted(constructed) => {
+            let trie = constructed.trie.build_accounting();
+            let facade_owner_persistent_bytes = search_plan_owner_bytes();
+            trie.allocations.checked_add(1).ok_or(
+                UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
+                    computation: "portable folded-literal persistent allocations",
+                },
+            )?;
+            trie.persistent_bytes
+                .checked_add(facade_owner_persistent_bytes)
+                .ok_or(UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
+                    computation: "portable folded-literal persistent bytes",
+                })?;
+            Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(
+                UnicodeFoldedLiteralSearchPlan {
+                    trie: constructed.trie,
+                    planner: constructed.planner,
+                },
+            ))
+        }
+        UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner } => {
+            Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible { reason, planner })
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ConstructedFoldedLiteral {
+    trie: FoldedLiteralTriePlan,
+    planner: UnicodeFoldedLiteralPlannerAccounting,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "two-pass HIR materialization and exact-allocation trie publication stay in one shared transaction"
+)]
+fn construct_from_hir(
+    dispatch: SimdDispatchContext,
+    hir: &Hir,
+    limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<
+    UnicodeFoldedLiteralBuildAttempt<ConstructedFoldedLiteral>,
+    UnicodeFoldedLiteralBuildError,
+> {
+    let shape = match inspect_hir(hir)? {
         Ok(shape) => shape,
         Err(reason) => {
             return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
@@ -531,13 +714,13 @@ fn build(
             planner: planner_accounting(shape, 0, 0),
         });
     }
-    enforce_build_limits(shape, builder.limits)?;
+    enforce_build_limits(shape, limits)?;
     let scratch_bytes = planner_scratch_bytes(shape)?;
-    if scratch_bytes > builder.limits.max_planner_scratch_bytes {
+    if scratch_bytes > limits.max_planner_scratch_bytes {
         return Err(UnicodeFoldedLiteralBuildError::Resource {
             resource: "planner scratch bytes",
             needed: scratch_bytes,
-            limit: builder.limits.max_planner_scratch_bytes,
+            limit: limits.max_planner_scratch_bytes,
         });
     }
     let mut classes = Vec::<Vec<char>>::new();
@@ -554,7 +737,7 @@ fn build(
             structure: "folded literal boundaries",
             items: shape.patterns,
         })?;
-    match rust.hir.kind() {
+    match hir.kind() {
         HirKind::Alternation(alternatives) => {
             for alternative in alternatives {
                 materialize_hir(alternative, &mut classes)?;
@@ -562,7 +745,7 @@ fn build(
             }
         }
         _ => {
-            materialize_hir(&rust.hir, &mut classes)?;
+            materialize_hir(hir, &mut classes)?;
             literal_ends.push(classes.len());
         }
     }
@@ -616,35 +799,28 @@ fn build(
             computation: "folded planner allocation count",
         },
     )?;
-    let trie =
-        match FoldedLiteralTriePlan::build_with_dispatch(dispatch, &literals, builder.limits.trie)
-            .map_err(UnicodeFoldedLiteralBuildError::Trie)?
-        {
-            FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
-            FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
-                return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
-                    reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
-                    planner: planner_accounting(shape, scratch_bytes, planner_allocations),
-                });
-            }
-        };
+    let trie = match FoldedLiteralTriePlan::build_with_dispatch(dispatch, &literals, limits.trie)
+        .map_err(UnicodeFoldedLiteralBuildError::Trie)?
+    {
+        FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
+        FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
+            return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
+                reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
+                planner: planner_accounting(shape, scratch_bytes, planner_allocations),
+            });
+        }
+    };
     if trie.build_accounting().root_prefilter_needles == 0 {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::NoUsefulRootPrefilter,
             planner: planner_accounting(shape, scratch_bytes, planner_allocations),
         });
     }
-    let report = UnicodeFoldedLiteralBuildReport {
-        algorithm: UNICODE_FOLDED_LITERAL_ALGORITHM_ID,
-        operation,
-        syntax_key: record.key,
-        admission: record.admission_status,
-        syntax: record.summary,
-        planner: planner_accounting(shape, scratch_bytes, planner_allocations),
-        trie: trie.build_accounting(),
-    };
     Ok(UnicodeFoldedLiteralBuildAttempt::Admitted(
-        UnicodeFoldedLiteralPlan { trie, report },
+        ConstructedFoldedLiteral {
+            trie,
+            planner: planner_accounting(shape, scratch_bytes, planner_allocations),
+        },
     ))
 }
 
