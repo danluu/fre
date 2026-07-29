@@ -1,8 +1,9 @@
 //! SIMD packed ordered finite-literal search with explicit refusal.
 
-use core::fmt;
+use core::{fmt, mem::size_of};
 
 use aho_corasick::packed::Searcher;
+use memchr::{memchr, memchr2, memchr3};
 
 use crate::Window;
 
@@ -10,6 +11,18 @@ const BUILD_FACTOR: usize = 256;
 const PATTERN_BYTE_ENVELOPE: usize = 64;
 const PATTERN_ENTRY_ENVELOPE: usize = 1_024;
 const FIXED_BUILD_ENVELOPE: usize = 1024 * 1024;
+// The pinned aho-corasick Teddy builder uses at most four bytes of every
+// pattern in its SIMD filter and refuses more than 64 patterns in one
+// searcher. Above that ceiling, only a complete fixed-width column product
+// with the full four-byte filter enters the factored path. This makes the
+// alternate route a language proof and bounded cost decision, rather than an
+// arbitrary increase to Teddy's cardinality heuristic.
+const FULL_TEDDY_FILTER_BYTES: usize = 4;
+const TEDDY_PATTERNS_PER_SEARCHER: usize = 64;
+const MAX_FACTORED_PATTERNS: usize = TEDDY_PATTERNS_PER_SEARCHER * 2;
+const MAX_FACTORED_COLUMNS: usize = 16;
+const MAX_FACTORED_ANCHOR_BYTES: usize = 3;
+const FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES: usize = 32;
 
 /// Hard limits for a packed finite-literal plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +108,8 @@ pub struct PackedLiteralSetAccounting {
     pub work_upper_bound: usize,
     /// External heap scratch required by the immutable search call.
     pub scratch_bytes: usize,
+    /// Whether the selected execution is a fixed-width byte-column product.
+    pub factored_columns: bool,
     /// Whether this window is long enough for the packed SIMD implementation.
     pub simd_eligible_length: bool,
 }
@@ -196,15 +211,75 @@ impl fmt::Display for PackedLiteralSetError {
 
 impl std::error::Error for PackedLiteralSetError {}
 
+#[derive(Clone, Copy, Debug)]
+struct FactoredColumns {
+    columns: [[u64; 4]; MAX_FACTORED_COLUMNS],
+    width: u8,
+    anchor_offset: u8,
+    anchor_bytes: [u8; MAX_FACTORED_ANCHOR_BYTES],
+    anchor_len: u8,
+}
+
+impl FactoredColumns {
+    fn find(&self, haystack: &[u8]) -> Option<(usize, usize)> {
+        let width = usize::from(self.width);
+        if haystack.len() < width {
+            return None;
+        }
+        let anchor_offset = usize::from(self.anchor_offset);
+        let trailing = width.checked_sub(anchor_offset)?.checked_sub(1)?;
+        let mut cursor = anchor_offset;
+        let anchor_end = haystack.len().checked_sub(trailing)?;
+        while cursor < anchor_end {
+            let relative = match self.anchor_len {
+                1 => memchr(self.anchor_bytes[0], &haystack[cursor..anchor_end]),
+                2 => memchr2(
+                    self.anchor_bytes[0],
+                    self.anchor_bytes[1],
+                    &haystack[cursor..anchor_end],
+                ),
+                3 => memchr3(
+                    self.anchor_bytes[0],
+                    self.anchor_bytes[1],
+                    self.anchor_bytes[2],
+                    &haystack[cursor..anchor_end],
+                ),
+                _ => None,
+            }?;
+            let anchor = cursor.checked_add(relative)?;
+            let start = anchor.checked_sub(anchor_offset)?;
+            let end = start.checked_add(width)?;
+            let candidate = &haystack[start..end];
+            if self.columns[..width]
+                .iter()
+                .zip(candidate)
+                .all(|(class, &byte)| class_contains(class, byte))
+            {
+                return Some((start, end));
+            }
+            cursor = anchor.checked_add(1)?;
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PackedLiteralEngine {
+    Native(Searcher),
+    Factored(Box<FactoredColumns>),
+}
+
 /// Immutable SIMD packed ordered-literal plan.
 ///
 /// This is a shared native primitive, not pattern-specialized JIT code. The
 /// pinned implementation uses Teddy on supported x86-64/AArch64 haystacks and
-/// a bounded Rabin-Karp path for short inputs. Construction refuses unsupported
-/// targets/shapes; search never changes plan after selection.
+/// a bounded Rabin-Karp path for short inputs. Larger complete byte-column
+/// products use one native byte-set scan plus exact column verification.
+/// Construction refuses unsupported targets/shapes and search never changes
+/// plan after selection.
 #[derive(Clone, Debug)]
 pub struct PackedLiteralSetPlan {
-    searcher: Searcher,
+    engine: PackedLiteralEngine,
     build: PackedLiteralSetBuildAccounting,
 }
 
@@ -220,17 +295,21 @@ impl PackedLiteralSetPlan {
         limits: PackedLiteralSetBuildLimits,
     ) -> Result<Self, PackedLiteralSetError> {
         let mut build = preflight(patterns, limits)?;
-        let searcher = Searcher::new(patterns.iter().map(AsRef::as_ref))
-            .ok_or(PackedLiteralSetError::UnsupportedTargetOrShape)?;
-        build.persistent_bytes = searcher.memory_usage();
-        build.simd_minimum_haystack_bytes = searcher.minimum_len();
-        if build.persistent_bytes > limits.max_persistent_bytes {
-            return Err(PackedLiteralSetError::PersistentBytesLimit {
-                needed: build.persistent_bytes,
-                limit: limits.max_persistent_bytes,
-            });
-        }
-        Ok(Self { searcher, build })
+        let engine =
+            if let Some(native_searcher) = Searcher::new(patterns.iter().map(AsRef::as_ref)) {
+                build.persistent_bytes = native_searcher.memory_usage();
+                build.simd_minimum_haystack_bytes = native_searcher.minimum_len();
+                enforce_persistent_limit(&build, limits)?;
+                PackedLiteralEngine::Native(native_searcher)
+            } else if let Some(factored) = factor_complete_columns(patterns, &build) {
+                build.persistent_bytes = size_of::<FactoredColumns>();
+                build.simd_minimum_haystack_bytes = FACTORED_SIMD_MINIMUM_HAYSTACK_BYTES;
+                enforce_persistent_limit(&build, limits)?;
+                PackedLiteralEngine::Factored(Box::new(factored))
+            } else {
+                return Err(PackedLiteralSetError::UnsupportedTargetOrShape);
+            };
+        Ok(Self { engine, build })
     }
 
     /// Checked construction facts and actual persistent footprint.
@@ -306,18 +385,24 @@ impl PackedLiteralSetPlan {
             verification_bytes_per_position,
             work_upper_bound,
             scratch_bytes: 0,
+            factored_columns: matches!(&self.engine, PackedLiteralEngine::Factored(_)),
             simd_eligible_length: searched_bytes >= self.build.simd_minimum_haystack_bytes,
         };
-        let matched = self
-            .searcher
-            .find(&haystack[window.start()..window.end()])
-            .map(|matched| {
-                let start = window.start().checked_add(matched.start()).ok_or(
+        let window_bytes = &haystack[window.start()..window.end()];
+        let matched = match &self.engine {
+            PackedLiteralEngine::Native(searcher) => searcher
+                .find(window_bytes)
+                .map(|matched| (matched.start(), matched.end())),
+            PackedLiteralEngine::Factored(factored) => factored.find(window_bytes),
+        };
+        let matched = matched
+            .map(|(relative_start, relative_end)| {
+                let start = window.start().checked_add(relative_start).ok_or(
                     PackedLiteralSetError::ArithmeticOverflow {
                         computation: "packed literal match start",
                     },
                 )?;
-                let end = window.start().checked_add(matched.end()).ok_or(
+                let end = window.start().checked_add(relative_end).ok_or(
                     PackedLiteralSetError::ArithmeticOverflow {
                         computation: "packed literal match end",
                     },
@@ -327,6 +412,141 @@ impl PackedLiteralSetPlan {
             .transpose()?;
         Ok((matched, accounting))
     }
+}
+
+fn enforce_persistent_limit(
+    build: &PackedLiteralSetBuildAccounting,
+    limits: PackedLiteralSetBuildLimits,
+) -> Result<(), PackedLiteralSetError> {
+    if build.persistent_bytes > limits.max_persistent_bytes {
+        Err(PackedLiteralSetError::PersistentBytesLimit {
+            needed: build.persistent_bytes,
+            limit: limits.max_persistent_bytes,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+const fn factored_search_is_cost_admitted(build: &PackedLiteralSetBuildAccounting) -> bool {
+    build.patterns > TEDDY_PATTERNS_PER_SEARCHER && build.patterns <= MAX_FACTORED_PATTERNS
+}
+
+fn factor_complete_columns<P: AsRef<[u8]>>(
+    patterns: &[P],
+    build: &PackedLiteralSetBuildAccounting,
+) -> Option<FactoredColumns> {
+    if !factored_search_is_cost_admitted(build) {
+        return None;
+    }
+    let width = patterns.first()?.as_ref().len();
+    if !(FULL_TEDDY_FILTER_BYTES..=MAX_FACTORED_COLUMNS).contains(&width)
+        || patterns
+            .iter()
+            .any(|pattern| pattern.as_ref().len() != width)
+    {
+        return None;
+    }
+
+    let mut columns = [[0_u64; 4]; MAX_FACTORED_COLUMNS];
+    for pattern in patterns {
+        for (column, &byte) in pattern.as_ref().iter().enumerate() {
+            let word = usize::from(byte) >> 6;
+            columns[column][word] |= 1_u64 << (byte & 63);
+        }
+    }
+    let mut cardinalities = [0_usize; MAX_FACTORED_COLUMNS];
+    let mut product = 1_usize;
+    for column in 0..width {
+        cardinalities[column] = columns[column].iter().map(|word| population(*word)).sum();
+        product = product.checked_mul(cardinalities[column])?;
+        if product > patterns.len() {
+            return None;
+        }
+    }
+    if product != patterns.len() {
+        return None;
+    }
+
+    // Prove that every mixed-radix tuple occurs exactly once. Equal marginal
+    // cardinality alone is insufficient in the presence of a duplicate and a
+    // missing combination. Every admitted word has the same width, so source
+    // priority cannot change the observable span after this proof succeeds.
+    let mut seen = [0_u64; 2];
+    for pattern in patterns {
+        let mut tuple = 0_usize;
+        for (column, &byte) in pattern.as_ref().iter().enumerate() {
+            tuple = tuple
+                .checked_mul(cardinalities[column])?
+                .checked_add(class_rank(&columns[column], byte))?;
+        }
+        let word = tuple >> 6;
+        let bit = 1_u64 << (tuple & 63);
+        if seen[word] & bit != 0 {
+            return None;
+        }
+        seen[word] |= bit;
+    }
+
+    let mut anchor_offset = None;
+    let mut anchor_score = (u64::MAX, usize::MAX);
+    for column in 0..width {
+        let cardinality = cardinalities[column];
+        if cardinality > MAX_FACTORED_ANCHOR_BYTES {
+            continue;
+        }
+        let frequency_score = class_bytes(&columns[column])
+            .map(|byte| {
+                u64::from(crate::packed_ordered_literal_aggregate::byte_frequency_rank(byte)) + 1
+            })
+            .sum();
+        let score = (frequency_score, cardinality);
+        if score < anchor_score {
+            anchor_score = score;
+            anchor_offset = Some(column);
+        }
+    }
+    let anchor_offset = anchor_offset?;
+    let mut anchor_bytes = [0_u8; MAX_FACTORED_ANCHOR_BYTES];
+    let mut anchor_len = 0_usize;
+    for byte in class_bytes(&columns[anchor_offset]) {
+        *anchor_bytes.get_mut(anchor_len)? = byte;
+        anchor_len = anchor_len.checked_add(1)?;
+    }
+    Some(FactoredColumns {
+        columns,
+        width: u8::try_from(width).ok()?,
+        anchor_offset: u8::try_from(anchor_offset).ok()?,
+        anchor_bytes,
+        anchor_len: u8::try_from(anchor_len).ok()?,
+    })
+}
+
+fn class_contains(class: &[u64; 4], byte: u8) -> bool {
+    let word = usize::from(byte) >> 6;
+    class[word] & (1_u64 << (byte & 63)) != 0
+}
+
+fn class_rank(class: &[u64; 4], byte: u8) -> usize {
+    let word = usize::from(byte) >> 6;
+    let preceding_words = class[..word]
+        .iter()
+        .map(|bits| population(*bits))
+        .sum::<usize>();
+    let preceding_bits = class[word] & ((1_u64 << (byte & 63)).wrapping_sub(1));
+    preceding_words
+        .checked_add(population(preceding_bits))
+        .expect("a byte-class rank is at most 255")
+}
+
+fn population(bits: u64) -> usize {
+    usize::try_from(bits.count_ones()).expect("a u64 population count fits usize")
+}
+
+fn class_bytes(class: &[u64; 4]) -> impl Iterator<Item = u8> + '_ {
+    (0_u16..=u16::from(u8::MAX))
+        .map(|byte| u8::try_from(byte).expect("the bounded byte domain fits u8"))
+        .filter(|&byte| class_contains(class, byte))
 }
 
 fn preflight<P: AsRef<[u8]>>(
@@ -410,8 +630,8 @@ fn preflight<P: AsRef<[u8]>>(
 #[cfg(test)]
 mod tests {
     use super::{
-        PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
-        PackedLiteralSetSearchLimits,
+        PackedLiteralEngine, PackedLiteralSetBuildLimits, PackedLiteralSetError,
+        PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
     };
     use crate::Window;
 
@@ -421,6 +641,63 @@ mod tests {
             Err(PackedLiteralSetError::UnsupportedTargetOrShape) => None,
             Err(error) => panic!("unexpected packed-plan error: {error}"),
         }
+    }
+
+    fn fixed_patterns(count: usize, width: usize) -> Vec<Vec<u8>> {
+        assert!(width >= 3);
+        let third_from_end = width.checked_sub(3).unwrap();
+        let second_from_end = width.checked_sub(2).unwrap();
+        let last = width.checked_sub(1).unwrap();
+        (0..count)
+            .map(|index| {
+                let mut pattern = vec![b'p'; width];
+                pattern[third_from_end] = u8::try_from(index).unwrap();
+                let mixed = index.checked_mul(193).unwrap() % 251;
+                pattern[second_from_end] = u8::try_from(mixed).unwrap();
+                pattern[last] = b'x';
+                pattern
+            })
+            .collect()
+    }
+
+    fn pattern_refs(patterns: &[Vec<u8>]) -> Vec<&[u8]> {
+        patterns.iter().map(Vec::as_slice).collect()
+    }
+
+    fn cartesian_patterns() -> Vec<Vec<u8>> {
+        let mut patterns = Vec::new();
+        for first in b'm'..=b'r' {
+            for second in b'3'..=b'8' {
+                for fourth in [b'u', b'v'] {
+                    patterns.push(vec![first, second, b'T', fourth]);
+                }
+            }
+        }
+        patterns
+    }
+
+    fn cartesian_grid(rows: u8, columns: u8) -> Vec<Vec<u8>> {
+        let mut patterns = Vec::new();
+        for row in 0..rows {
+            for column in 0..columns {
+                patterns.push(vec![row, column, b'Q', b'x']);
+            }
+        }
+        patterns
+    }
+
+    fn cartesian_four(classes: [&[u8]; 4]) -> Vec<Vec<u8>> {
+        let mut patterns = Vec::new();
+        for &first in classes[0] {
+            for &second in classes[1] {
+                for &third in classes[2] {
+                    for &fourth in classes[3] {
+                        patterns.push(vec![first, second, third, fourth]);
+                    }
+                }
+            }
+        }
+        patterns
     }
 
     #[test]
@@ -526,6 +803,160 @@ mod tests {
                     .0;
                 assert_eq!(actual, expected, "source={source:?}, haystack={haystack:?}");
             }
+        }
+    }
+
+    #[test]
+    fn cardinality_above_teddy_requires_a_complete_factored_language() {
+        let patterns_64 = fixed_patterns(64, 4);
+        let refs_64 = pattern_refs(&patterns_64);
+        let Some(single) = plan(&refs_64) else {
+            return;
+        };
+        assert_eq!(single.build_accounting().patterns, 64);
+        assert!(matches!(&single.engine, PackedLiteralEngine::Native(_)));
+
+        for count in [65, 72, 128] {
+            let patterns = fixed_patterns(count, 4);
+            let refs = pattern_refs(&patterns);
+            assert!(matches!(
+                PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default()),
+                Err(PackedLiteralSetError::UnsupportedTargetOrShape)
+            ));
+        }
+        for (rows, columns) in [(5, 13), (6, 12), (8, 16)] {
+            let patterns = cartesian_grid(rows, columns);
+            let refs = pattern_refs(&patterns);
+            let factored =
+                PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default()).unwrap();
+            assert!(matches!(&factored.engine, PackedLiteralEngine::Factored(_)));
+        }
+
+        let short_patterns = fixed_patterns(65, 3);
+        let short_refs = pattern_refs(&short_patterns);
+        assert!(matches!(
+            PackedLiteralSetPlan::new(&short_refs, PackedLiteralSetBuildLimits::default()),
+            Err(PackedLiteralSetError::UnsupportedTargetOrShape)
+        ));
+
+        let patterns_129 = fixed_patterns(129, 4);
+        let refs_129 = pattern_refs(&patterns_129);
+        assert!(matches!(
+            PackedLiteralSetPlan::new(&refs_129, PackedLiteralSetBuildLimits::default()),
+            Err(PackedLiteralSetError::PatternLimit {
+                needed: 129,
+                limit: 128
+            })
+        ));
+    }
+
+    #[test]
+    fn complete_cartesian_columns_use_one_anchored_scan_and_reject_missing_tuples() {
+        let patterns = cartesian_patterns();
+        let refs = pattern_refs(&patterns);
+        let factored = PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default())
+            .expect("complete 72-string product");
+        assert!(matches!(&factored.engine, PackedLiteralEngine::Factored(_)));
+        let persistent = factored.build_accounting().persistent_bytes;
+        assert_eq!(
+            PackedLiteralSetPlan::new(
+                &refs,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            )
+            .unwrap()
+            .build_accounting()
+            .persistent_bytes,
+            persistent
+        );
+        assert!(matches!(
+            PackedLiteralSetPlan::new(
+                &refs,
+                PackedLiteralSetBuildLimits {
+                    max_persistent_bytes: persistent - 1,
+                    ..PackedLiteralSetBuildLimits::default()
+                },
+            ),
+            Err(PackedLiteralSetError::PersistentBytesLimit { needed, limit })
+                if needed == persistent && limit == persistent - 1
+        ));
+
+        for pattern in &patterns {
+            let mut haystack = b"xx".to_vec();
+            haystack.extend_from_slice(pattern);
+            haystack.extend_from_slice(b"yy");
+            assert_eq!(
+                factored
+                    .find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                Some((2, 6))
+            );
+        }
+        for miss in [b"l3Tu", b"m2Tu", b"m3Su", b"m3Tw"] {
+            assert_eq!(
+                factored
+                    .find(miss, PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                None
+            );
+        }
+        assert_eq!(
+            factored
+                .find_window(
+                    b"badm3Tuxxr8Tv",
+                    Window::new(5, 13),
+                    PackedLiteralSetSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((9, 13))
+        );
+
+        let mut incomplete = patterns;
+        incomplete[71] = incomplete[0].clone();
+        let refs = pattern_refs(&incomplete);
+        assert!(matches!(
+            PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default()),
+            Err(PackedLiteralSetError::UnsupportedTargetOrShape)
+        ));
+    }
+
+    #[test]
+    fn factored_search_covers_two_and_three_byte_anchor_classes() {
+        let two_anchor: [&[u8]; 4] = [b"\x00\x01", b"abc", b"def", b"ghij"];
+        let three_anchor: [&[u8]; 4] = [b"\x00\x01\x02", b"abc", b"def", b"ghi"];
+        for (classes, expected_anchor_len) in [(two_anchor, 2), (three_anchor, 3)] {
+            let patterns = cartesian_four(classes);
+            let refs = pattern_refs(&patterns);
+            let factored =
+                PackedLiteralSetPlan::new(&refs, PackedLiteralSetBuildLimits::default()).unwrap();
+            let PackedLiteralEngine::Factored(columns) = &factored.engine else {
+                panic!("complete column product did not select the factored engine")
+            };
+            assert_eq!(columns.anchor_len, expected_anchor_len);
+
+            for pattern in patterns {
+                let mut haystack = b"!!".to_vec();
+                haystack.extend_from_slice(&pattern);
+                assert_eq!(
+                    factored
+                        .find(&haystack, PackedLiteralSetSearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    Some((2, 6))
+                );
+            }
+            assert_eq!(
+                factored
+                    .find(b"!!!!", PackedLiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0,
+                None
+            );
         }
     }
 }
