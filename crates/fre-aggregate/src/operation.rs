@@ -6093,7 +6093,7 @@ fn candidate_prospective(
     kind: OperationKind,
     limits: OperationLimits,
 ) -> Result<OperationProspective, Error> {
-    let schedule = if plan.has_shared_fixed() {
+    let schedule = if plan.has_shared_fixed() || plan.classified_anchors().is_some() {
         1
     } else {
         add(plan.max_offset(), 1, Resource::ScratchBytes)?
@@ -14483,6 +14483,62 @@ mod tests {
         assert!(terminal.receipt.actual.work > 0);
         assert!(terminal.receipt.actual.sequential_bytes_read > 0);
         assert!(terminal_p.contains(terminal.receipt.actual));
+    }
+
+    #[test]
+    fn classified_candidate_publishes_its_exact_one_slot_scratch_envelope() {
+        let hir = ParserBuilder::new()
+            .utf8(false)
+            .unicode(false)
+            .build()
+            .parse(r"(?i:abx|cdy)")
+            .unwrap();
+        let compiled = CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4,
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let plan = compiled.candidate.as_ref().unwrap();
+        let classified = plan.classified_anchors().unwrap();
+        assert_eq!(classified.offset(), 2);
+        assert!(!plan.has_shared_fixed());
+
+        let haystack = b"ABX xx cdy";
+        let range = 0..haystack.len();
+        let strategy = Strategy::ReverseSequentialRows;
+        let baseline = compiled
+            .count_value_attempt(
+                haystack,
+                range.clone(),
+                strategy,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            baseline.receipt.identity.physical_route,
+            Some(OperationPhysicalRoute::Candidate)
+        );
+        let prospective = baseline.receipt.prospective.unwrap();
+        assert_eq!(
+            prospective.scratch_bytes,
+            baseline.receipt.actual.scratch_peak_bytes
+        );
+        assert_eq!(
+            prospective.random_access_bytes,
+            baseline.receipt.actual.random_access_peak_bytes
+        );
+
+        let exact_workspace = OperationLimits {
+            max_random_access_bytes: baseline.receipt.actual.random_access_peak_bytes,
+            max_scratch_bytes: baseline.receipt.actual.scratch_peak_bytes,
+            ..OperationLimits::default()
+        };
+        let replay = compiled
+            .count_value_attempt(haystack, range, strategy, exact_workspace)
+            .unwrap();
+        assert_eq!(replay.value, baseline.value);
+        assert_eq!(replay.receipt.actual, baseline.receipt.actual);
     }
 
     #[test]

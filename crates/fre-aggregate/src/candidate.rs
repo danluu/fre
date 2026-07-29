@@ -11,7 +11,9 @@
 use core::{mem::size_of, ops::Range};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
-use fre_kernels::{ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier};
+use fre_kernels::{
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, SimdDispatchContext,
+};
 
 use crate::accounting::ExecutionAccounting;
 use crate::error::{add, enforce, mul};
@@ -301,9 +303,14 @@ impl ClassifiedAnchors {
     }
 }
 
-pub(crate) fn build_classified_anchors(proof: ClassifiedAnchorProof) -> ClassifiedAnchors {
+pub(crate) fn build_classified_anchors(
+    proof: ClassifiedAnchorProof,
+    dispatch: SimdDispatchContext,
+) -> ClassifiedAnchors {
     ClassifiedAnchors {
-        classifier: AsciiByteSetClassifier::new(proof.set),
+        classifier: dispatch
+            .ascii_byte_set_classifier(proof.set, DispatchPolicy::Auto)
+            .expect("automatic ASCII classifier dispatch retains a scalar fallback"),
         offset: proof.offset,
         owners: proof.owners,
     }
@@ -3025,6 +3032,7 @@ mod tests {
         let classified = plan
             .classified_anchors()
             .expect("four folded anchor bytes select the native classifier");
+        assert_eq!(classified.offset(), 2);
         assert_eq!(classified.owners(), 0b11);
         assert_eq!(
             classified

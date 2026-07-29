@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use fre_exact_alloc::{CopyError, ExactVec};
+use fre_kernels::SimdDispatchContext;
 use regex_syntax::hir::{Class, Hir, HirKind, Look, Repetition};
 use regex_syntax::utf8::Utf8Sequences;
 
@@ -1064,6 +1065,7 @@ impl CompiledRegex {
         limits: CompileLimits,
         allocation_scope: Option<AllocationScope>,
     ) -> Result<CompileConstructionAttempt, CompileConstructionAttemptError> {
+        let simd_dispatch = SimdDispatchContext::capture();
         let identity = CompileAttemptIdentity {
             profile,
             kind: CompileAttemptKind::EraseCapturesForWholeMatch,
@@ -1080,6 +1082,7 @@ impl CompiledRegex {
                 limits,
                 CapturePolicy::EraseForWholeMatch,
                 false,
+                simd_dispatch,
                 &mut budget,
             )
         });
@@ -1123,6 +1126,7 @@ impl CompiledRegex {
         limits: CompileLimits,
         allocation: Option<(usize, usize)>,
     ) -> Result<(Self, usize), CompileAttemptError> {
+        let simd_dispatch = SimdDispatchContext::capture();
         let identity = CompileAttemptIdentity {
             profile,
             kind: CompileAttemptKind::EraseCapturesForWholeMatch,
@@ -1140,6 +1144,7 @@ impl CompiledRegex {
                 limits,
                 CapturePolicy::EraseForWholeMatch,
                 false,
+                simd_dispatch,
                 &mut budget,
             )
         });
@@ -1180,6 +1185,7 @@ impl CompiledRegex {
         capture_policy: CapturePolicy,
         ordered_root: bool,
     ) -> Result<Self, Error> {
+        let simd_dispatch = SimdDispatchContext::capture();
         let mut budget = CompileBudget::new(limits);
         Self::compile_with_budget(
             hir,
@@ -1187,6 +1193,7 @@ impl CompiledRegex {
             limits,
             capture_policy,
             ordered_root,
+            simd_dispatch,
             &mut budget,
         )
     }
@@ -1201,6 +1208,7 @@ impl CompiledRegex {
         limits: CompileLimits,
         capture_policy: CapturePolicy,
         ordered_root: bool,
+        simd_dispatch: SimdDispatchContext,
         budget: &mut CompileBudget,
     ) -> Result<Self, Error> {
         validate_hir(hir, profile, capture_policy, budget)?;
@@ -1271,7 +1279,7 @@ impl CompiledRegex {
         let mut candidate = if ordered_root {
             None
         } else {
-            build_candidate_plan(hir, profile, capture_policy, budget)?
+            build_candidate_plan(hir, profile, capture_policy, simd_dispatch, budget)?
         };
         let candidate_bytes = candidate
             .as_ref()
@@ -2326,6 +2334,7 @@ fn build_candidate_plan(
     hir: &Hir,
     profile: RustByteProfile,
     capture_policy: CapturePolicy,
+    simd_dispatch: SimdDispatchContext,
     budget: &mut CompileBudget,
 ) -> Result<Option<candidate::Plan>, Error> {
     // The executor is deliberately byte-only. Unicode-on plans retain their
@@ -2589,9 +2598,11 @@ fn build_candidate_plan(
     };
     let classified = if let Some(proof) = classified_proof {
         // `AsciiByteSetClassifier` constructs its 16 nibble columns by
-        // examining the complete 128-byte domain exactly once.
-        budget.charge(128)?;
-        let classified = candidate::build_classified_anchors(proof);
+        // examining the complete 128-byte domain exactly once, then binds
+        // its narrow and wide leaves. The immutable host snapshot was
+        // captured before the bounded compile transaction began.
+        budget.charge(128 + 2 + 2)?;
+        let classified = candidate::build_classified_anchors(proof, simd_dispatch);
         retain_classified_anchors(&classified, budget)?
     } else {
         candidate::inline_no_classified_anchors()?
@@ -9168,6 +9179,7 @@ mod tests {
     #[test]
     fn candidate_allocation_failures_commit_only_successful_storage() {
         let hir = parse_bytes(r"(?:ab|ac)d|cd|x[0-9]z");
+        let simd_dispatch = SimdDispatchContext::capture();
         let HirKind::Alternation(branches) = hir.kind() else {
             panic!("candidate fixture must remain a root alternation")
         };
@@ -9193,6 +9205,7 @@ mod tests {
                 &hir,
                 RustByteProfile::PINNED_1_12_4,
                 CapturePolicy::Reject,
+                simd_dispatch,
                 &mut budget,
             )
             .unwrap_err();
@@ -9214,6 +9227,7 @@ mod tests {
             &hir,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
+            simd_dispatch,
             &mut budget,
         )
         .unwrap()
@@ -9228,6 +9242,7 @@ mod tests {
     #[test]
     fn classified_candidate_allocation_is_exact_and_commits_after_bucket_storage() {
         let hir = parse_bytes(r"(?i:abx|cdy)");
+        let simd_dispatch = SimdDispatchContext::capture();
         let HirKind::Alternation(branches) = hir.kind() else {
             panic!("classified candidate fixture must remain a root alternation")
         };
@@ -9255,6 +9270,7 @@ mod tests {
                 &hir,
                 RustByteProfile::PINNED_1_12_4,
                 CapturePolicy::Reject,
+                simd_dispatch,
                 &mut budget,
             )
             .unwrap_err();
@@ -9276,6 +9292,7 @@ mod tests {
             &hir,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::Reject,
+            simd_dispatch,
             &mut budget,
         )
         .unwrap()
@@ -9296,11 +9313,13 @@ mod tests {
     fn fixed_continuation_allocation_receipts_cover_tokens_and_tagged_proof() {
         let pattern = r#"(?:(?:alpha|beta|nil|true|\d|["'\\+])+\)*;?((?:\s|-|~|!|\{\}|\|\||\+)*.*(?:.*=.*)))"#;
         let hir = parse_bytes(pattern);
+        let simd_dispatch = SimdDispatchContext::capture();
         let mut census_budget = CompileBudget::new(CompileLimits::default());
         let census = build_candidate_plan(
             &hir,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::EraseForWholeMatch,
+            simd_dispatch,
             &mut census_budget,
         )
         .unwrap()
@@ -9339,6 +9358,7 @@ mod tests {
                 &hir,
                 RustByteProfile::PINNED_1_12_4,
                 CapturePolicy::EraseForWholeMatch,
+                simd_dispatch,
                 &mut budget,
             )
             .unwrap_err();
@@ -9362,6 +9382,7 @@ mod tests {
             &hir,
             RustByteProfile::PINNED_1_12_4,
             CapturePolicy::EraseForWholeMatch,
+            simd_dispatch,
             &mut budget,
         )
         .unwrap()
