@@ -46,6 +46,8 @@ const SPARSE_PAIR_01_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3;
 const SPARSE_PAIR_23_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 2;
 const SPARSE_PAIR_45_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 4;
 const SPARSE_PAIR_67_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 6;
+const SEMANTIC_SECONDARY_VECTOR_V3: u8 = 18;
+const SEMANTIC_PREFIX_VECTOR_V3: u8 = 19;
 const OVERLAPPING_SUFFIX_VECTOR_V3: u8 = 23;
 
 const X0: u8 = 0;
@@ -2349,6 +2351,17 @@ fn emit_multi_specialized_v3(
     let sparse_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
     let sparse_hit = assembler.new_label(LabelKindV3::Internal)?;
     let sparse_first_half = assembler.new_label(LabelKindV3::Internal)?;
+    let last_offset = u8::try_from(literal.len() - 1).expect("bounded nonempty literal");
+    let semantic_secondary_offset = if filter.offsets[0] == last_offset {
+        0
+    } else {
+        last_offset
+    };
+    let sparse_prefix_escalation = if filter.offsets[0] != 0 && filter.offsets[0] != last_offset {
+        Some(assembler.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
     let match_run = if strategy == LoweringStrategyV3::PeriodicRun {
         Some(assembler.new_label(LabelKindV3::CandidateLoop)?)
     } else {
@@ -2378,6 +2391,15 @@ fn emit_multi_specialized_v3(
         assembler.dup_byte16(vector_registers[index], value_registers[index])?;
     }
     assembler.mov_imm64_minimal(X17, SPARSE_NIBBLE_BITS_V3)?;
+    assembler.mov_imm64_minimal(
+        X8,
+        u64::from(literal[usize::from(semantic_secondary_offset)]),
+    )?;
+    assembler.dup_byte16(SEMANTIC_SECONDARY_VECTOR_V3, X8)?;
+    if sparse_prefix_escalation.is_some() {
+        assembler.mov_imm64_minimal(X8, u64::from(literal[0]))?;
+        assembler.dup_byte16(SEMANTIC_PREFIX_VECTOR_V3, X8)?;
+    }
 
     // Hoist the exact confirmation constants once. Register identities are
     // fixed by the sealed Neon-v1 register plan.
@@ -2521,11 +2543,11 @@ fn emit_multi_specialized_v3(
     assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(primary_sparse_scan)?;
 
-    // A composite-empty block whose primary is present takes the complete
-    // filter route. Advance once, then evaluate every selected column across
-    // eight blocks before reducing. This keeps the normal 16-start path free
-    // of staged reductions while ensuring the wide fallback cannot stay blind
-    // to whichever later column rejected a dense near-match stream.
+    // A composite-empty block whose primary is present takes a semantic pair
+    // route. The second column is the literal suffix unless the primary is
+    // already the suffix, in which case it is the prefix. This retains the
+    // original two-column wide-loop cost while preventing an internal
+    // optimizer pair from repeatedly rediscovering suffix near-matches.
     assembler.bind(sparse_scan)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2535,6 +2557,7 @@ fn emit_multi_specialized_v3(
     assembler.branch_cond(ConditionV3::CarryClear, vector)?;
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+    assembler.add_imm(X9, X15, u16::from(semantic_secondary_offset))?;
     for block in 0..SPARSE_SCAN_BLOCKS_V3 {
         let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
             CountAotError::ArithmeticOverflow {
@@ -2543,11 +2566,75 @@ fn emit_multi_specialized_v3(
         )?;
         let mask =
             u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks");
-        assembler.load_vector128_offset(mask, X8, offset)?;
-        assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+        assembler.load_vector128_offset(0, X8, offset)?;
+        assembler.load_vector128_offset(1, X9, offset)?;
+        assembler.compare_equal_bytes16(0, 0, vector_registers[0])?;
+        assembler.compare_equal_bytes16(1, 1, SEMANTIC_SECONDARY_VECTOR_V3)?;
+        assembler.and_bytes16(mask, 0, 1)?;
     }
-    for index in 1..usize::from(filter.len) {
-        assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+    if sparse_prefix_escalation.is_some() {
+        // Preserve all eight pair masks until the survivor branch so a dense
+        // internal+suffix stream can be refined by the prefix without
+        // rescanning either earlier column.
+        assembler.or_bytes16(0, SPARSE_BLOCK_MASK_BASE_V3, SPARSE_BLOCK_MASK_BASE_V3 + 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(0, 0, 1)?;
+        assembler.or_bytes16(
+            1,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, 0, 1)?;
+    } else {
+        assembler.or_bytes16(
+            SPARSE_PAIR_01_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 1,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_23_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_45_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_67_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;
+        assembler.or_bytes16(0, SPARSE_PAIR_45_MASK_V3, SPARSE_PAIR_67_MASK_V3)?;
+        assembler.or_bytes16(1, 1, 0)?;
+    }
+    assembler.unsigned_max_across_bytes16(1, 1)?;
+    assembler.move_vector_byte_to32(X8, 1)?;
+    assembler.cmp_imm64(X8, 0)?;
+    assembler.branch_cond(
+        ConditionV3::NotEqual,
+        sparse_prefix_escalation.unwrap_or(sparse_hit),
+    )?;
+    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(sparse_scan)?;
+
+    if let Some(sparse_prefix_escalation) = sparse_prefix_escalation {
+        // Only a surviving internal-primary+suffix batch pays for the prefix.
+        // If all three semantic columns reject the batch, resume the same
+        // 128-start loop; otherwise classify its earliest hit-bearing block.
+        assembler.bind(sparse_prefix_escalation)?;
         for block in 0..SPARSE_SCAN_BLOCKS_V3 {
             let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
                 CountAotError::ArithmeticOverflow {
@@ -2556,40 +2643,40 @@ fn emit_multi_specialized_v3(
             )?;
             let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
                 .expect("eight sparse masks");
-            assembler.load_vector128_offset(0, X8, offset)?;
-            assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
+            assembler.load_vector128_offset(0, X15, offset)?;
+            assembler.compare_equal_bytes16(0, 0, SEMANTIC_PREFIX_VECTOR_V3)?;
             assembler.and_bytes16(mask, mask, 0)?;
         }
+        assembler.or_bytes16(
+            SPARSE_PAIR_01_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 1,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_23_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_45_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        )?;
+        assembler.or_bytes16(
+            SPARSE_PAIR_67_MASK_V3,
+            SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        )?;
+        assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;
+        assembler.or_bytes16(0, SPARSE_PAIR_45_MASK_V3, SPARSE_PAIR_67_MASK_V3)?;
+        assembler.or_bytes16(1, 1, 0)?;
+        assembler.unsigned_max_across_bytes16(1, 1)?;
+        assembler.move_vector_byte_to32(X8, 1)?;
+        assembler.cmp_imm64(X8, 0)?;
+        assembler.branch_cond(ConditionV3::NotEqual, sparse_hit)?;
+        assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
+        assembler.branch(sparse_scan)?;
     }
-    assembler.or_bytes16(
-        SPARSE_PAIR_01_MASK_V3,
-        SPARSE_BLOCK_MASK_BASE_V3,
-        SPARSE_BLOCK_MASK_BASE_V3 + 1,
-    )?;
-    assembler.or_bytes16(
-        SPARSE_PAIR_23_MASK_V3,
-        SPARSE_BLOCK_MASK_BASE_V3 + 2,
-        SPARSE_BLOCK_MASK_BASE_V3 + 3,
-    )?;
-    assembler.or_bytes16(
-        SPARSE_PAIR_45_MASK_V3,
-        SPARSE_BLOCK_MASK_BASE_V3 + 4,
-        SPARSE_BLOCK_MASK_BASE_V3 + 5,
-    )?;
-    assembler.or_bytes16(
-        SPARSE_PAIR_67_MASK_V3,
-        SPARSE_BLOCK_MASK_BASE_V3 + 6,
-        SPARSE_BLOCK_MASK_BASE_V3 + 7,
-    )?;
-    assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;
-    assembler.or_bytes16(0, SPARSE_PAIR_45_MASK_V3, SPARSE_PAIR_67_MASK_V3)?;
-    assembler.or_bytes16(1, 1, 0)?;
-    assembler.unsigned_max_across_bytes16(1, 1)?;
-    assembler.move_vector_byte_to32(X8, 1)?;
-    assembler.cmp_imm64(X8, 0)?;
-    assembler.branch_cond(ConditionV3::NotEqual, sparse_hit)?;
-    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
-    assembler.branch(sparse_scan)?;
 
     assembler.bind(sparse_hit)?;
     assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;

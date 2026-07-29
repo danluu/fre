@@ -97,7 +97,7 @@ fn sve_compare_instruction_v3(sve2: bool, destination: u8, right: u8) -> Decoded
 fn v3_versions_and_identity_domain_are_disjoint() {
     assert_eq!(AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, 3);
     assert_eq!(AOT_COUNT_BACKEND_VERSION_V3.0, 0xa003);
-    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 10);
+    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 11);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V2);
     assert_eq!(IDENTITY_DOMAIN_V3.last(), Some(&3));
@@ -524,7 +524,7 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
 }
 
 #[test]
-fn primary_empty_scan_and_complete_filter_fallback_are_disjoint() {
+fn primary_empty_scan_and_semantic_endpoint_fallback_are_disjoint() {
     let (program, optimized) = optimized(b"abababab");
     assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
     let image = emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
@@ -623,11 +623,17 @@ fn primary_empty_scan_and_complete_filter_fallback_are_disjoint() {
     );
 
     // A primary-present block whose complete filter is empty branches only
-    // after the packed full mask is zero. The separate wide scan evaluates
-    // every selected column for every block, so it cannot repeat a pair that
-    // misses the actual eliminating column.
+    // after the packed full mask is zero. The wide scan pairs the optimizer's
+    // primary with a semantic endpoint even when that endpoint was not the
+    // optimizer's second column.
     let filter_offsets = optimized.recipe().filter_offsets();
-    let vector_constants = [2_u8, 3, 16, 17];
+    let last_offset = u8::try_from(program.literal().len() - 1).unwrap();
+    let semantic_secondary = if filter_offsets[0] == last_offset {
+        0
+    } else {
+        last_offset
+    };
+    let has_prefix_escalation = filter_offsets[0] != 0 && filter_offsets[0] != last_offset;
     let composite_probe = decoded
         .windows(2)
         .enumerate()
@@ -647,56 +653,85 @@ fn primary_empty_scan_and_complete_filter_fallback_are_disjoint() {
                 )
         })
         .map(|(index, _)| index)
-        .expect("complete composite-empty proof");
-    let complete_scan_offset = branch_target_v3(&decoded, composite_probe + 1);
-    assert_ne!(complete_scan_offset, primary_scan_offset);
-    let complete_scan = usize::try_from(complete_scan_offset / 4).unwrap();
+        .expect("composite-empty proof");
+    let endpoint_scan_offset = branch_target_v3(&decoded, composite_probe + 1);
+    assert_ne!(endpoint_scan_offset, primary_scan_offset);
+    let endpoint_scan = usize::try_from(endpoint_scan_offset / 4).unwrap();
     assert_eq!(
-        decoded[complete_scan + 4],
+        decoded[endpoint_scan + 4],
         DecodedInstructionV3::CompareImmediate64 {
             register: 5,
             immediate: 127,
         }
     );
+    assert_eq!(
+        decoded[endpoint_scan + 8],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 9,
+            source: 15,
+            immediate: u16::from(semantic_secondary),
+        }
+    );
 
-    let mut cursor = complete_scan + 8;
+    let mut cursor = endpoint_scan + 9;
     for block in 0_u16..8 {
         let mask = u8::try_from(24 + block).unwrap();
         assert_eq!(
             decoded[cursor],
             DecodedInstructionV3::LoadVector128 {
-                destination: mask,
+                destination: 0,
                 base: 8,
                 offset: block * 16,
             }
         );
         assert_eq!(
             decoded[cursor + 1],
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: mask,
-                left: mask,
-                right: vector_constants[0],
+            DecodedInstructionV3::LoadVector128 {
+                destination: 1,
+                base: 9,
+                offset: block * 16,
             }
         );
-        cursor += 2;
-    }
-    for (filter_index, filter_offset) in filter_offsets.iter().copied().enumerate().skip(1) {
         assert_eq!(
-            decoded[cursor],
-            DecodedInstructionV3::AddImmediate64 {
-                destination: 8,
-                source: 15,
-                immediate: u16::from(filter_offset),
+            decoded[cursor + 2],
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: 0,
+                left: 0,
+                right: 2,
             }
         );
-        cursor += 1;
+        assert_eq!(
+            decoded[cursor + 3],
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: 1,
+                left: 1,
+                right: 18,
+            }
+        );
+        assert_eq!(
+            decoded[cursor + 4],
+            DecodedInstructionV3::AndBytes16 {
+                destination: mask,
+                left: 0,
+                right: 1,
+            }
+        );
+        cursor += 5;
+    }
+    if has_prefix_escalation {
+        // Seven scratch ORs preserve v24..v31. A surviving batch branches to
+        // the prefix stage, which refines each exact block mask in place.
+        let escalation_offset = branch_target_v3(&decoded, cursor + 10);
+        let escalation = usize::try_from(escalation_offset / 4).unwrap();
+        assert!(escalation > cursor);
+        cursor = escalation;
         for block in 0_u16..8 {
             let mask = u8::try_from(24 + block).unwrap();
             assert_eq!(
                 decoded[cursor],
                 DecodedInstructionV3::LoadVector128 {
                     destination: 0,
-                    base: 8,
+                    base: 15,
                     offset: block * 16,
                 }
             );
@@ -705,7 +740,7 @@ fn primary_empty_scan_and_complete_filter_fallback_are_disjoint() {
                 DecodedInstructionV3::CompareEqualBytes16 {
                     destination: 0,
                     left: 0,
-                    right: vector_constants[filter_index],
+                    right: 19,
                 }
             );
             assert_eq!(
@@ -718,6 +753,17 @@ fn primary_empty_scan_and_complete_filter_fallback_are_disjoint() {
             );
             cursor += 3;
         }
+    } else {
+        // The in-place pair reduction begins immediately when the primary is
+        // itself an endpoint, because both semantic endpoints are covered.
+        assert_eq!(
+            decoded[cursor],
+            DecodedInstructionV3::OrBytes16 {
+                destination: 24,
+                left: 24,
+                right: 25,
+            }
+        );
     }
     assert!(matches!(
         decoded[cursor],

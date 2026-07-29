@@ -63,6 +63,8 @@ const SPARSE_PAIR_01_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3;
 const SPARSE_PAIR_23_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 2;
 const SPARSE_PAIR_45_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 4;
 const SPARSE_PAIR_67_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 6;
+const SEMANTIC_SECONDARY_VECTOR_V3: u8 = 18;
+const SEMANTIC_PREFIX_VECTOR_V3: u8 = 19;
 const OVERLAPPING_SUFFIX_VECTOR_V3: u8 = 23;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3583,6 +3585,17 @@ fn policy_multi_specialized_v3(
     let sparse_scan = policy.new_label(LabelKindV3::VectorLoop)?;
     let sparse_hit = policy.new_label(LabelKindV3::Internal)?;
     let sparse_first_half = policy.new_label(LabelKindV3::Internal)?;
+    let last_offset = u8::try_from(literal.len() - 1).expect("bounded nonempty literal");
+    let semantic_secondary_offset = if filter.offsets[0] == last_offset {
+        0
+    } else {
+        last_offset
+    };
+    let sparse_prefix_escalation = if filter.offsets[0] != 0 && filter.offsets[0] != last_offset {
+        Some(policy.new_label(LabelKindV3::Internal)?)
+    } else {
+        None
+    };
     let match_run = if strategy == AuditLoweringStrategyV3::PeriodicRun {
         Some(policy.new_label(LabelKindV3::CandidateLoop)?)
     } else {
@@ -3619,6 +3632,28 @@ fn policy_multi_specialized_v3(
         )?;
     }
     policy_mov_minimal_v3(policy, X17, SPARSE_NIBBLE_BITS_V3)?;
+    policy_mov_minimal_v3(
+        policy,
+        X8,
+        u64::from(literal[usize::from(semantic_secondary_offset)]),
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::DuplicateByte16 {
+            destination: SEMANTIC_SECONDARY_VECTOR_V3,
+            source: X8,
+        },
+    )?;
+    if sparse_prefix_escalation.is_some() {
+        policy_mov_minimal_v3(policy, X8, u64::from(literal[0]))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::DuplicateByte16 {
+                destination: SEMANTIC_PREFIX_VECTOR_V3,
+                source: X8,
+            },
+        )?;
+    }
     for (chunk_index, chunk) in literal.chunks_exact(16).enumerate() {
         let mut low = [0_u8; 8];
         let mut high = [0_u8; 8];
@@ -3935,6 +3970,7 @@ fn policy_multi_specialized_v3(
     condition_v3(policy, ConditionV3::CarryClear, vector)?;
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
+    add_immediate64_v3(policy, X9, X15, u16::from(semantic_secondary_offset))?;
     for block in 0..SPARSE_SCAN_BLOCKS_V3 {
         let offset = block * SIMD_CANDIDATE_STARTS_V3;
         let mask =
@@ -3942,108 +3978,159 @@ fn policy_multi_specialized_v3(
         exact_v3(
             policy,
             DecodedInstructionV3::LoadVector128 {
-                destination: mask,
+                destination: 0,
                 base: X8,
                 offset,
             },
         )?;
         exact_v3(
             policy,
+            DecodedInstructionV3::LoadVector128 {
+                destination: 1,
+                base: X9,
+                offset,
+            },
+        )?;
+        exact_v3(
+            policy,
             DecodedInstructionV3::CompareEqualBytes16 {
-                destination: mask,
-                left: mask,
+                destination: 0,
+                left: 0,
                 right: vector_registers[0],
             },
         )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: 1,
+                left: 1,
+                right: SEMANTIC_SECONDARY_VECTOR_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::AndBytes16 {
+                destination: mask,
+                left: 0,
+                right: 1,
+            },
+        )?;
     }
-    for index in 1..usize::from(filter.len) {
-        add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[index]))?;
-        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
-            let offset = block * SIMD_CANDIDATE_STARTS_V3;
-            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
-                .expect("eight sparse masks");
-            exact_v3(
-                policy,
-                DecodedInstructionV3::LoadVector128 {
-                    destination: 0,
-                    base: X8,
-                    offset,
-                },
-            )?;
-            exact_v3(
-                policy,
-                DecodedInstructionV3::CompareEqualBytes16 {
-                    destination: 0,
-                    left: 0,
-                    right: vector_registers[index],
-                },
-            )?;
-            exact_v3(
-                policy,
-                DecodedInstructionV3::AndBytes16 {
-                    destination: mask,
-                    left: mask,
-                    right: 0,
-                },
-            )?;
-        }
+    if sparse_prefix_escalation.is_some() {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: SPARSE_BLOCK_MASK_BASE_V3,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: 0,
+                right: 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: 0,
+                right: 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: 0,
+                right: 1,
+            },
+        )?;
+    } else {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_01_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_23_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_45_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_67_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: SPARSE_PAIR_01_MASK_V3,
+                right: SPARSE_PAIR_23_MASK_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: SPARSE_PAIR_45_MASK_V3,
+                right: SPARSE_PAIR_67_MASK_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: 1,
+                right: 0,
+            },
+        )?;
     }
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: SPARSE_PAIR_01_MASK_V3,
-            left: SPARSE_BLOCK_MASK_BASE_V3,
-            right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: SPARSE_PAIR_23_MASK_V3,
-            left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
-            right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: SPARSE_PAIR_45_MASK_V3,
-            left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
-            right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: SPARSE_PAIR_67_MASK_V3,
-            left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
-            right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: 1,
-            left: SPARSE_PAIR_01_MASK_V3,
-            right: SPARSE_PAIR_23_MASK_V3,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: 0,
-            left: SPARSE_PAIR_45_MASK_V3,
-            right: SPARSE_PAIR_67_MASK_V3,
-        },
-    )?;
-    exact_v3(
-        policy,
-        DecodedInstructionV3::OrBytes16 {
-            destination: 1,
-            left: 1,
-            right: 0,
-        },
-    )?;
     exact_v3(
         policy,
         DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
@@ -4059,7 +4146,11 @@ fn policy_multi_specialized_v3(
         },
     )?;
     compare_immediate64_v3(policy, X8, 0)?;
-    condition_v3(policy, ConditionV3::NotEqual, sparse_hit)?;
+    condition_v3(
+        policy,
+        ConditionV3::NotEqual,
+        sparse_prefix_escalation.unwrap_or(sparse_hit),
+    )?;
     add_immediate64_v3(
         policy,
         X3,
@@ -4067,6 +4158,118 @@ fn policy_multi_specialized_v3(
         SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3,
     )?;
     branch_v3(policy, sparse_scan)?;
+
+    if let Some(sparse_prefix_escalation) = sparse_prefix_escalation {
+        policy.bind(sparse_prefix_escalation)?;
+        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+            let offset = block * SIMD_CANDIDATE_STARTS_V3;
+            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                .expect("eight sparse masks");
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: 0,
+                    base: X15,
+                    offset,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: SEMANTIC_PREFIX_VECTOR_V3,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: mask,
+                    left: mask,
+                    right: 0,
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_01_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_23_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_45_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: SPARSE_PAIR_67_MASK_V3,
+                left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
+                right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: SPARSE_PAIR_01_MASK_V3,
+                right: SPARSE_PAIR_23_MASK_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 0,
+                left: SPARSE_PAIR_45_MASK_V3,
+                right: SPARSE_PAIR_67_MASK_V3,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::OrBytes16 {
+                destination: 1,
+                left: 1,
+                right: 0,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                destination: 1,
+                source: 1,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::MoveVectorByteTo32 {
+                destination: X8,
+                source: 1,
+            },
+        )?;
+        compare_immediate64_v3(policy, X8, 0)?;
+        condition_v3(policy, ConditionV3::NotEqual, sparse_hit)?;
+        add_immediate64_v3(
+            policy,
+            X3,
+            X3,
+            SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3,
+        )?;
+        branch_v3(policy, sparse_scan)?;
+    }
 
     policy.bind(sparse_hit)?;
     exact_v3(
