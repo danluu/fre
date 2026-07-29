@@ -62,7 +62,8 @@ enum AbstractValueV3 {
     Length,
     Cursor,
     MaxStart,
-    CursorOffset { minimum: u16, maximum: u16 },
+    CandidateOffset { minimum: u16, maximum: u16 },
+    CursorRelative { minimum: u16, maximum: u16 },
     HaystackAddress { minimum: u16, maximum: u16 },
     RemainingToMax,
     RemainingToLength,
@@ -70,7 +71,7 @@ enum AbstractValueV3 {
     CandidateMask { nonempty: bool, reduced: bool },
     ReversedCandidateMask,
     CandidateBitIndex,
-    CandidateMaskMinusOne,
+    CandidateMaskMinusOne { source_register: u8 },
 }
 
 impl AbstractValueV3 {
@@ -203,6 +204,20 @@ impl AbstractStateV3 {
     }
 
     fn clobber_gpr(&mut self, register: u8) {
+        // A `mask - 1` value is useful as a progress witness only while the
+        // exact source register still contains the mask from which it was
+        // derived. Invalidate every dependent value before overwriting that
+        // source; recording a register without this kill would let a stale
+        // value from an earlier loop iteration clear an unrelated mask.
+        for value in &mut self.values {
+            if matches!(
+                *value,
+                AbstractValueV3::CandidateMaskMinusOne { source_register }
+                    if source_register == register
+            ) {
+                *value = AbstractValueV3::Unknown;
+            }
+        }
         match register {
             X0 => self.x0_is_haystack = false,
             X1 => {
@@ -253,7 +268,7 @@ impl AbstractStateV3 {
         for value in &mut self.values {
             if matches!(
                 value,
-                AbstractValueV3::CursorOffset { .. } | AbstractValueV3::HaystackAddress { .. }
+                AbstractValueV3::CursorRelative { .. } | AbstractValueV3::HaystackAddress { .. }
             ) {
                 *value = AbstractValueV3::Unknown;
             }
@@ -267,7 +282,7 @@ impl AbstractStateV3 {
     ) -> Result<(), CountAotError> {
         let (minimum, maximum) = match source {
             AbstractValueV3::Cursor => (immediate, immediate),
-            AbstractValueV3::CursorOffset { minimum, maximum } => (
+            AbstractValueV3::CursorRelative { minimum, maximum } => (
                 minimum
                     .checked_add(immediate)
                     .ok_or_else(audit_arithmetic_v3)?,
@@ -632,7 +647,9 @@ fn execute_v3(
                     && immediate == 1
                     && matches!(source_value, AbstractValueV3::CandidateMask { .. })
                 {
-                    AbstractValueV3::CandidateMaskMinusOne
+                    AbstractValueV3::CandidateMaskMinusOne {
+                        source_register: source,
+                    }
                 } else {
                     AbstractValueV3::Unknown
                 };
@@ -652,7 +669,9 @@ fn execute_v3(
                     X6,
                     X16,
                     AbstractValueV3::CandidateMask { nonempty: true, .. },
-                    AbstractValueV3::CandidateMaskMinusOne,
+                    AbstractValueV3::CandidateMaskMinusOne {
+                        source_register: X6,
+                    },
                 ) => AbstractValueV3::CandidateMask {
                     nonempty: false,
                     reduced: true,
@@ -680,7 +699,7 @@ fn execute_v3(
                 && shift == 2
                 && state.value(source) == AbstractValueV3::CandidateBitIndex
             {
-                AbstractValueV3::CursorOffset {
+                AbstractValueV3::CandidateOffset {
                     minimum: 0,
                     maximum: 15,
                 }
@@ -907,7 +926,7 @@ fn execute_v3(
                 && state.predicate(predicate) == PredicateValueV3::AllVl16
                 && state.predicate(source) == PredicateValueV3::PrefixBeforeFirst
             {
-                AbstractValueV3::CursorOffset {
+                AbstractValueV3::CandidateOffset {
                     minimum: 0,
                     maximum: 15,
                 }
@@ -1013,13 +1032,13 @@ fn add_values_v3(left: AbstractValueV3, right: AbstractValueV3) -> AbstractValue
                 maximum: 0,
             }
         }
-        (AbstractValueV3::HaystackBase, AbstractValueV3::CursorOffset { minimum, maximum })
-        | (AbstractValueV3::CursorOffset { minimum, maximum }, AbstractValueV3::HaystackBase) => {
+        (AbstractValueV3::HaystackBase, AbstractValueV3::CursorRelative { minimum, maximum })
+        | (AbstractValueV3::CursorRelative { minimum, maximum }, AbstractValueV3::HaystackBase) => {
             AbstractValueV3::HaystackAddress { minimum, maximum }
         }
-        (AbstractValueV3::Cursor, AbstractValueV3::CursorOffset { minimum, maximum })
-        | (AbstractValueV3::CursorOffset { minimum, maximum }, AbstractValueV3::Cursor) => {
-            AbstractValueV3::CursorOffset { minimum, maximum }
+        (AbstractValueV3::Cursor, AbstractValueV3::CandidateOffset { minimum, maximum })
+        | (AbstractValueV3::CandidateOffset { minimum, maximum }, AbstractValueV3::Cursor) => {
+            AbstractValueV3::CursorRelative { minimum, maximum }
         }
         _ => AbstractValueV3::Unknown,
     }
@@ -1040,14 +1059,26 @@ fn add_immediate_value_v3(
                     .ok_or_else(audit_arithmetic_v3)?,
             })
         }
-        AbstractValueV3::CursorOffset { minimum, maximum } => Ok(AbstractValueV3::CursorOffset {
-            minimum: minimum
-                .checked_add(immediate)
-                .ok_or_else(audit_arithmetic_v3)?,
-            maximum: maximum
-                .checked_add(immediate)
-                .ok_or_else(audit_arithmetic_v3)?,
-        }),
+        AbstractValueV3::CandidateOffset { minimum, maximum } => {
+            Ok(AbstractValueV3::CandidateOffset {
+                minimum: minimum
+                    .checked_add(immediate)
+                    .ok_or_else(audit_arithmetic_v3)?,
+                maximum: maximum
+                    .checked_add(immediate)
+                    .ok_or_else(audit_arithmetic_v3)?,
+            })
+        }
+        AbstractValueV3::CursorRelative { minimum, maximum } => {
+            Ok(AbstractValueV3::CursorRelative {
+                minimum: minimum
+                    .checked_add(immediate)
+                    .ok_or_else(audit_arithmetic_v3)?,
+                maximum: maximum
+                    .checked_add(immediate)
+                    .ok_or_else(audit_arithmetic_v3)?,
+            })
+        }
         _ => Ok(AbstractValueV3::Unknown),
     }
 }
@@ -1427,6 +1458,133 @@ mod tests {
             audit_decoded_cfg_safety_v3(&decoded, &labels, 2),
             Err(invalid_v3("v3 decoded CFG non-progressing backedge"))
         );
+    }
+
+    #[test]
+    fn candidate_clear_requires_the_exact_live_source_mask() {
+        let mut state = AbstractStateV3::entry();
+        state.write_value(
+            X6,
+            AbstractValueV3::CandidateMask {
+                nonempty: true,
+                reduced: false,
+            },
+        );
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::SubtractImmediate64 {
+                destination: X16,
+                source: X6,
+                immediate: 1,
+            },
+            2,
+        )
+        .unwrap();
+
+        // Replacing X6 must kill the X16 dependency even when the replacement
+        // has the same abstract candidate flags.
+        state.write_value(
+            X6,
+            AbstractValueV3::CandidateMask {
+                nonempty: true,
+                reduced: false,
+            },
+        );
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::AndRegister64 {
+                destination: X6,
+                left: X6,
+                right: X16,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(state.value(X6), AbstractValueV3::Unknown);
+
+        // A still-live subtraction derived from another register also cannot
+        // witness a strict reduction of X6.
+        state.write_value(
+            X6,
+            AbstractValueV3::CandidateMask {
+                nonempty: true,
+                reduced: false,
+            },
+        );
+        state.write_value(
+            X17,
+            AbstractValueV3::CandidateMask {
+                nonempty: true,
+                reduced: false,
+            },
+        );
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::SubtractImmediate64 {
+                destination: X16,
+                source: X17,
+                immediate: 1,
+            },
+            2,
+        )
+        .unwrap();
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::AndRegister64 {
+                destination: X6,
+                left: X6,
+                right: X16,
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(state.value(X6), AbstractValueV3::Unknown);
+    }
+
+    #[test]
+    fn raw_candidate_offset_cannot_advance_the_cursor() {
+        let mut state = AbstractStateV3::entry();
+        state.x3_is_cursor = true;
+        state.write_value(
+            X7,
+            AbstractValueV3::CandidateOffset {
+                minimum: 0,
+                maximum: 15,
+            },
+        );
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::AddImmediate64 {
+                destination: X3,
+                source: X7,
+                immediate: 1,
+            },
+            2,
+        )
+        .unwrap();
+        assert!(!state.x3_is_cursor);
+        assert!(!state.cursor_advanced);
+
+        state.x3_is_cursor = true;
+        state.write_value(
+            X5,
+            AbstractValueV3::CursorRelative {
+                minimum: 0,
+                maximum: 15,
+            },
+        );
+        execute_v3(
+            &mut state,
+            DecodedInstructionV3::AddImmediate64 {
+                destination: X3,
+                source: X5,
+                immediate: 1,
+            },
+            2,
+        )
+        .unwrap();
+        assert!(state.x3_is_cursor);
+        assert!(state.cursor_advanced);
     }
 
     #[test]
