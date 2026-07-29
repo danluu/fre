@@ -11,17 +11,27 @@
 
 mod audit;
 mod audit_v2;
+mod audit_v3;
 mod emit;
 mod emit_v2;
+mod emit_v3;
 mod error;
 mod image;
 mod image_v2;
+mod image_v3;
 
 pub use audit::{ConditionV1, CountAuditReportV1, DecodedInstructionV1, audit_count_image_v1};
 pub use audit_v2::{ConditionV2, CountAuditReportV2, DecodedInstructionV2, audit_count_image_v2};
+pub use audit_v3::{
+    ConditionV3, CountAuditReportV3, DecodedInstructionV3, audit_count_image_v3,
+    audit_count_image_view_v3, audit_count_mapped_code_v3,
+};
 pub use emit::{CountEmitLimitsV1, CountProspectiveReportV1, emit_count_v1, prospective_count_v1};
 pub use emit_v2::{
     CountEmitLimitsV2, CountProspectiveReportV2, emit_count_v2, prospective_count_v2,
+};
+pub use emit_v3::{
+    CountEmitLimitsV3, CountProspectiveReportV3, emit_count_v3, prospective_count_v3,
 };
 pub use error::{CountAotArithmeticSite, CountAotError, CountAotResource, CountAotUnsupported};
 pub use image::{
@@ -41,8 +51,19 @@ pub use image_v2::{
     AotCountLiteralManifestV2, CodeLabelV2, LabelKindV2, RelocationKindV2, RelocationTargetV2,
     RelocationV2, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V2, is_supported_aot_count_backend_tuple_v2,
 };
+pub use image_v3::{
+    AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V3,
+    AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, AOT_COUNT_KIR_ABI_VERSION_V3,
+    AOT_COUNT_KIR_SEMANTICS_VERSION_V3, AotCountArtifactIdentityV3, AotCountBackendSupportV3,
+    AotCountImageBuildReceiptV3, AotCountImageLayoutV3, AotCountImageStatsV3, AotCountImageV3,
+    AotCountImageViewV3, AotCountLiteralManifestV3, AotCountMappedMetadataV3,
+    AotCountRecipeManifestV3, CodeLabelV3, LabelKindV3, RelocationKindV3, RelocationTargetV3,
+    RelocationV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3, is_supported_aot_count_backend_tuple_v3,
+};
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_v2;
+#[cfg(test)]
+mod tests_v3;

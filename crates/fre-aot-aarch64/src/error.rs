@@ -34,6 +34,9 @@ pub enum CountAotUnsupported {
     LiteralWidth,
     KernelShape,
     BackendTuple,
+    OptimizerRecipe,
+    RecipeSchedule,
+    TargetFeature,
 }
 
 /// Typed refusal from Count AOT preflight, emission, identity, or audit.

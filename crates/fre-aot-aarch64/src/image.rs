@@ -29,6 +29,28 @@ pub struct AotCountCpuFeatures(u64);
 impl AotCountCpuFeatures {
     pub const NONE: Self = Self(0);
     pub const ASIMD: Self = Self(1);
+    /// Scalable Vector Extension. Count-v1/v2 never set this bit.
+    pub const SVE: Self = Self(1 << 1);
+    /// Scalable Vector Extension 2. Count-v1/v2 never set this bit.
+    pub const SVE2: Self = Self(1 << 2);
+
+    /// Construct a feature set only when every bit is known to this schema.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        const KNOWN: u64 =
+            AotCountCpuFeatures::ASIMD.0 | AotCountCpuFeatures::SVE.0 | AotCountCpuFeatures::SVE2.0;
+        if bits & !KNOWN == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Canonical union used by target tuples such as fixed-VL16 SVE2.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 
     #[must_use]
     pub const fn bits(self) -> u64 {

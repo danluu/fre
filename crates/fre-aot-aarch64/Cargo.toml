@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+fre-aot-optimizer = { path = "../fre-aot-optimizer" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 sha2 = "=0.10.9"
