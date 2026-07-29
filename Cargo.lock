@@ -136,6 +136,7 @@ dependencies = [
  "fre-simd-kernels",
  "memchr",
  "regex-syntax",
+ "stats_alloc",
 ]
 
 [[package]]

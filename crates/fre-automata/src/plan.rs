@@ -312,8 +312,10 @@ impl SearchWindow {
 /// reset (and, extremely rarely, generation-table clearing) before transitions.
 /// The first successful search on an immutable [`Automaton`] also charges its
 /// bounded full-byte start-filter proof and scanner/guard selection. The
-/// automaton retains that result, so later calls do not repeat or charge that
-/// work; conservative work bounds cover the first-use case.
+/// automaton fallibly retains that result in one cold heap owner, so later
+/// calls do not repeat or charge that work. Owner publication requires one
+/// additional work unit and enough scratch allowance for its exact payload;
+/// refusal preserves ordinary K0 and leaves publication retryable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchLimits {
     pub max_work: u64,
@@ -440,6 +442,92 @@ pub(crate) struct StartFilterProof {
     pub(crate) relaxed_nullable: bool,
 }
 
+/// Cold, fallibly allocated owner for one published start-filter proof.
+///
+/// `None` inside the lock is a permanent allocation-failure sentinel. Resource
+/// refusal does not initialize the lock, so a later invocation with more
+/// scratch allowance may retry. `get_or_init` serializes the fallible
+/// allocation itself: concurrent successful first users may each derive the
+/// same immutable proof, but exactly one of them attempts to allocate its
+/// retained owner.
+#[derive(Debug, Default)]
+pub(crate) struct StartFilterProofCell {
+    inner: OnceLock<Option<Box<[StartFilterProof; 1]>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartFilterPublication {
+    AlreadyInitialized,
+    AllocationFailed,
+    Published,
+}
+
+impl StartFilterProofCell {
+    pub(crate) const PAYLOAD_BYTES: usize = size_of::<StartFilterProof>();
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&StartFilterProof> {
+        self.inner
+            .get()
+            .and_then(Option::as_ref)
+            .map(|owner| &owner[0])
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.inner.get().is_some()
+    }
+
+    pub(crate) fn allocation_failed(&self) -> bool {
+        matches!(self.inner.get(), Some(None))
+    }
+
+    pub(crate) fn publish(&self, proof: &StartFilterProof) -> StartFilterPublication {
+        let mut attempted = false;
+        let retained = self.inner.get_or_init(|| {
+            attempted = true;
+            try_start_filter_proof_owner(proof)
+        });
+        if !attempted {
+            StartFilterPublication::AlreadyInitialized
+        } else if retained.is_some() {
+            StartFilterPublication::Published
+        } else {
+            StartFilterPublication::AllocationFailed
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set(&self, proof: &StartFilterProof) -> Result<(), ()> {
+        let owner = try_start_filter_proof_owner(proof).ok_or(())?;
+        self.inner.set(Some(owner)).map_err(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_allocation_failed(&self) -> Result<(), ()> {
+        self.inner.set(None).map_err(|_| ())
+    }
+}
+
+fn try_start_filter_proof_owner(proof: &StartFilterProof) -> Option<Box<[StartFilterProof; 1]>> {
+    let mut slot = Vec::new();
+    slot.try_reserve_exact(1).ok()?;
+    // `into_boxed_slice` is allocation-free only when length equals
+    // capacity. An allocator may legally grant more than was requested; in
+    // that unusual case, decline publication instead of invoking an
+    // infallible shrinking allocation.
+    if slot.capacity() != 1 {
+        return None;
+    }
+    slot.push(*proof);
+    let owner: Box<[StartFilterProof]> = slot.into_boxed_slice();
+    owner.try_into().ok()
+}
+
 /// Immutable structure-of-arrays prioritized Thompson graph.
 #[derive(Debug)]
 pub struct Automaton {
@@ -451,7 +539,7 @@ pub struct Automaton {
     pub(crate) edge_kinds: Box<[EdgeKind]>,
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
-    pub(crate) start_filter_proof: OnceLock<StartFilterProof>,
+    pub(crate) start_filter_proof: StartFilterProofCell,
     line_terminator: u8,
     stats: PlanStats,
 }
@@ -470,7 +558,7 @@ impl Clone for Automaton {
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
             // to derive.
-            start_filter_proof: OnceLock::new(),
+            start_filter_proof: StartFilterProofCell::new(),
             line_terminator: self.line_terminator,
             stats: self.stats,
         }
@@ -498,7 +586,7 @@ impl Automaton {
             edge_kinds: raw.edge_kinds.into_boxed_slice(),
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
-            start_filter_proof: OnceLock::new(),
+            start_filter_proof: StartFilterProofCell::new(),
             line_terminator: b'\n',
             stats,
         })

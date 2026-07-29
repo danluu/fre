@@ -78,7 +78,10 @@ impl SearchAccounting {
         self.work
     }
 
-    /// Work charged before the first automaton transition.
+    /// Workspace setup plus transactional retained-owner publication work.
+    ///
+    /// Retained owners are committed only after the search loop succeeds, but
+    /// remain setup rather than transition work in this accounting split.
     #[must_use]
     pub const fn setup_work(self) -> u64 {
         self.setup.work()
@@ -112,11 +115,14 @@ impl SearchAccounting {
     }
 }
 
-/// Auditable workspace setup performed before an execution loop starts.
+/// Auditable workspace setup and retained-owner preparation for one invocation.
 ///
-/// `allocated_bytes` counts retained heap payload obtained during this call;
-/// it is zero for a reusable-workspace call. `initialized_bytes` counts payload
-/// bytes logically written during construction or a generation-table reset.
+/// `allocated_bytes` counts retained heap payload obtained during this call. It
+/// is zero for a warm reusable-workspace call, while a cold reusable call may
+/// retain one immutable plan-side proof. `initialized_bytes` counts payload
+/// bytes logically written during construction, a generation-table reset, or
+/// transactional proof publication. Such a proof is published only after the
+/// execution loop succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupAccounting {
     pub(crate) work: u64,
@@ -156,6 +162,9 @@ impl SetupAccounting {
     }
 
     /// Total heap payload bytes retained by the workspace used for this call.
+    ///
+    /// This excludes an immutable plan-side proof even when this invocation
+    /// allocated it; that delta is visible through [`Self::allocated_bytes`].
     #[must_use]
     pub const fn retained_bytes(self) -> usize {
         self.retained_bytes

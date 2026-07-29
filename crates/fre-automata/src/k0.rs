@@ -7,18 +7,28 @@ use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
     plan::{
-        ByteSet, StartAsciiClassifier, StartFilterProof, StartPositionClass, StartPositionScanner,
-        StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
-        BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-        BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-        START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-        START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
+        ByteSet, StartAsciiClassifier, StartFilterProof, StartFilterProofCell,
+        StartFilterPublication, StartPositionClass, StartPositionScanner, StartScanner,
+        BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
+        BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_SET_SCANNER_SELECTION_WORK,
+        BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+        START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+        START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
     SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
+const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
+const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
+    scanner: None,
+    guard: None,
+    force_haystack_start: false,
+    // Conservatively decline contextual acceleration when an allocation
+    // failure permanently disables the optional retained proof.
+    relaxed_nullable: true,
+};
 const BYTE_ALPHABET: usize = 256;
 const LAZY_MAX_STATES: usize = 64;
 const LAZY_MAX_ITEMS: usize = 16_384;
@@ -1775,6 +1785,14 @@ impl WorkMeter {
     const fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.consumed)
     }
+
+    fn charge_admitted(&mut self, requested: u64) {
+        debug_assert!(requested <= self.remaining());
+        // The caller proved `consumed + requested <= limit`, and `limit`
+        // itself is representable. Saturation is therefore unreachable and
+        // keeps this post-success accounting update infallible.
+        self.consumed = self.consumed.saturating_add(requested);
+    }
 }
 
 pub(crate) fn search(
@@ -1864,7 +1882,7 @@ fn execute(
         && workspace.reverse.is_bound_to(automaton);
     let may_use_lazy =
         allow_lazy && workspace.lazy.is_allocated() && (!wants_span || may_use_reverse);
-    let (mut meter, setup_work) = prepare_invocation(
+    let (mut meter, mut setup_work) = prepare_invocation(
         automaton,
         workspace,
         window,
@@ -2055,6 +2073,18 @@ fn execute(
         }
     }
 
+    let published_proof_bytes = start_proof.publish(
+        automaton,
+        workspace.retained_bytes,
+        limits.max_scratch_bytes,
+        &mut meter,
+        &mut setup,
+        &mut setup_work,
+    );
+    let scratch_bytes = workspace
+        .retained_bytes
+        .checked_add(published_proof_bytes)
+        .expect("published start-filter payload was preflighted");
     let transition_work =
         meter
             .consumed
@@ -2062,14 +2092,13 @@ fn execute(
             .ok_or(SearchError::InternalInvariant {
                 detail: "setup work exceeded total search work",
             })?;
-    start_proof.publish(automaton);
     Ok(UntypedReport {
         found: pending,
         accounting: SearchAccounting::new(
             meter.consumed,
             setup,
             transition_work,
-            workspace.retained_bytes,
+            scratch_bytes,
             boundaries,
         ),
     })
@@ -4246,8 +4275,9 @@ fn retain_next_start_frontier(
     Ok(())
 }
 
-// Boxing the cold pending proof would add an allocation outside the authenticated
-// workspace accounting. The warm published variant remains a borrowed pointer.
+// Keep the pending proof inline until the complete search succeeds. Publication
+// then uses the fallible, exactly accounted cold owner; the warm variant remains
+// one borrowed pointer resolved before the execution loop.
 #[allow(clippy::large_enum_variant)]
 enum InvocationStartProof<'a> {
     Published(&'a StartFilterProof),
@@ -4262,11 +4292,64 @@ impl InvocationStartProof<'_> {
         }
     }
 
-    fn publish(self, automaton: &Automaton) {
-        if let Self::Pending(proof) = self {
-            // A concurrent successful invocation may already have published
-            // the same proof for this immutable automaton.
-            let _ = automaton.start_filter_proof.set(proof);
+    fn publish(
+        self,
+        automaton: &Automaton,
+        workspace_bytes: usize,
+        scratch_limit: usize,
+        meter: &mut WorkMeter,
+        setup: &mut SetupAccounting,
+        setup_work: &mut u64,
+    ) -> usize {
+        let Self::Pending(proof) = self else {
+            return 0;
+        };
+        if automaton.start_filter_proof.is_initialized() {
+            return 0;
+        }
+
+        let proof_bytes = StartFilterProofCell::PAYLOAD_BYTES;
+        let Some(scratch_bytes) = workspace_bytes.checked_add(proof_bytes) else {
+            return 0;
+        };
+        if scratch_bytes > scratch_limit || meter.remaining() < START_FILTER_OWNER_ALLOCATION_WORK {
+            // Optional specialization ownership never turns an otherwise
+            // admitted ordinary K0 result into a resource error. Unlike an
+            // allocator failure, a resource refusal remains retryable.
+            return 0;
+        }
+        let Some(next_setup_work) = setup.work.checked_add(START_FILTER_OWNER_ALLOCATION_WORK)
+        else {
+            return 0;
+        };
+        let Some(next_reported_setup_work) =
+            setup_work.checked_add(START_FILTER_OWNER_ALLOCATION_WORK)
+        else {
+            return 0;
+        };
+        let Some(next_allocated_bytes) = setup.allocated_bytes.checked_add(proof_bytes) else {
+            return 0;
+        };
+        let Some(next_initialized_bytes) = setup.initialized_bytes.checked_add(proof_bytes) else {
+            return 0;
+        };
+
+        match automaton.start_filter_proof.publish(&proof) {
+            StartFilterPublication::AlreadyInitialized => 0,
+            StartFilterPublication::AllocationFailed => {
+                meter.charge_admitted(START_FILTER_OWNER_ALLOCATION_WORK);
+                setup.work = next_setup_work;
+                *setup_work = next_reported_setup_work;
+                0
+            }
+            StartFilterPublication::Published => {
+                meter.charge_admitted(START_FILTER_OWNER_ALLOCATION_WORK);
+                setup.work = next_setup_work;
+                setup.allocated_bytes = next_allocated_bytes;
+                setup.initialized_bytes = next_initialized_bytes;
+                *setup_work = next_reported_setup_work;
+                proof_bytes
+            }
         }
     }
 }
@@ -4279,6 +4362,11 @@ fn prepare_start_filter<'a>(
 ) -> Result<InvocationStartProof<'a>, SearchError> {
     if let Some(proof) = automaton.start_filter_proof.get() {
         return Ok(InvocationStartProof::Published(proof));
+    }
+    if automaton.start_filter_proof.allocation_failed() {
+        return Ok(InvocationStartProof::Published(
+            &ORDINARY_START_FILTER_PROOF,
+        ));
     }
 
     let position_proof = derive_start_position_classes(automaton, workspace, meter, position)?;
@@ -5492,12 +5580,12 @@ mod tests {
     };
     use crate::{
         plan::{
-            ByteSet, StartFilterProof, StartPositionClass, StartPositionScanner, StartScanner,
-            BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
-            BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_SET_SCANNER_SELECTION_WORK,
-            BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
-            START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
-            START_FILTER_SCANNER_SELECTION_WORK,
+            ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
+            StartPositionScanner, StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
+            BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
+            BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+            START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
+            START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, MatchSpan, RawPlan,
         ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
@@ -5506,6 +5594,12 @@ mod tests {
 
     fn ascii_literal(byte: u8) -> Automaton {
         ascii_root_bytes(&[byte])
+    }
+
+    fn one_below_owner_free(work: u64) -> u64 {
+        work.checked_sub(super::START_FILTER_OWNER_ALLOCATION_WORK)
+            .and_then(|owner_free| owner_free.checked_sub(1))
+            .unwrap()
     }
 
     fn ascii_root_bytes(bytes: &[u8]) -> Automaton {
@@ -6055,7 +6149,7 @@ mod tests {
     fn pin_without_start_filter(automaton: &Automaton) {
         automaton
             .start_filter_proof
-            .set(StartFilterProof {
+            .set(&StartFilterProof {
                 scanner: None,
                 guard: None,
                 force_haystack_start: false,
@@ -7580,11 +7674,31 @@ mod tests {
         let specialization_work = 4_u64
             .checked_add(expected_filter_selection_work(1, b"a"))
             .unwrap();
+        let proof_bytes = StartFilterProofCell::PAYLOAD_BYTES;
         assert_eq!(
             cold.accounting()
                 .transition_work()
                 .checked_sub(warm.accounting().transition_work()),
             Some(specialization_work)
+        );
+        assert_eq!(cold.accounting().setup().allocated_bytes(), proof_bytes);
+        assert_eq!(cold.accounting().setup().initialized_bytes(), proof_bytes);
+        assert_eq!(
+            cold.accounting().scratch_bytes(),
+            workspace.retained_bytes().checked_add(proof_bytes).unwrap()
+        );
+        assert_eq!(warm.accounting().setup().allocated_bytes(), 0);
+        assert_eq!(warm.accounting().setup().initialized_bytes(), 0);
+        assert_eq!(
+            warm.accounting().scratch_bytes(),
+            workspace.retained_bytes()
+        );
+        assert_eq!(
+            cold.accounting().setup_work(),
+            warm.accounting()
+                .setup_work()
+                .checked_add(super::START_FILTER_OWNER_ALLOCATION_WORK)
+                .unwrap()
         );
         let published = automaton
             .start_filter_proof
@@ -7627,6 +7741,161 @@ mod tests {
                 .checked_sub(clone_warm.accounting().transition_work()),
             Some(specialization_work)
         );
+        assert_eq!(
+            clone_cold.accounting().setup().allocated_bytes(),
+            proof_bytes
+        );
+        assert_eq!(clone_warm.accounting().setup().allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn start_filter_owner_layout_is_pointer_isolated() {
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(size_of::<StartFilterProofCell>() <= 16);
+            assert!(size_of::<Automaton>() <= 192);
+        }
+        #[cfg(all(
+            target_pointer_width = "64",
+            target_arch = "aarch64",
+            target_os = "macos"
+        ))]
+        {
+            assert_eq!(size_of::<StartFilterProofCell>(), 16);
+            assert_eq!(size_of::<Automaton>(), 192);
+            #[cfg(feature = "static-dispatch")]
+            assert_eq!(size_of::<StartFilterProof>(), 136);
+            #[cfg(not(feature = "static-dispatch"))]
+            assert_eq!(size_of::<StartFilterProof>(), 480);
+        }
+    }
+
+    #[test]
+    fn owner_limit_refusal_preserves_k0_and_remains_retryable() {
+        let proof_bytes = StartFilterProofCell::PAYLOAD_BYTES;
+        let scratch_refused = ascii_literal(b'a');
+        let mut scratch_workspace =
+            K0Workspace::new(&scratch_refused, WorkspaceLimits::unlimited()).unwrap();
+        let retained = scratch_workspace.retained_bytes();
+        let refused = scratch_refused
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut scratch_workspace,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            refused.output(),
+            &Some(crate::MatchSpan::new(3, 4)),
+            "owner refusal must not refuse ordinary K0"
+        );
+        assert_eq!(refused.accounting().setup().allocated_bytes(), 0);
+        assert_eq!(refused.accounting().setup().initialized_bytes(), 0);
+        assert_eq!(refused.accounting().scratch_bytes(), retained);
+        assert!(
+            scratch_refused.start_filter_proof.get().is_none(),
+            "scratch refusal must leave publication retryable"
+        );
+
+        let published = scratch_refused
+            .prepare::<Span>()
+            .search_with_workspace(b"zzza", &mut scratch_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            published.accounting().setup().allocated_bytes(),
+            proof_bytes
+        );
+        assert_eq!(
+            published.accounting().scratch_bytes(),
+            retained.checked_add(proof_bytes).unwrap()
+        );
+        assert!(scratch_refused.start_filter_proof.get().is_some());
+
+        let warm = scratch_refused
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut scratch_workspace,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(warm.output(), refused.output());
+        assert_eq!(warm.accounting().setup().allocated_bytes(), 0);
+        assert_eq!(warm.accounting().scratch_bytes(), retained);
+
+        let work_refused = ascii_literal(b'a');
+        let mut work_workspace =
+            K0Workspace::new(&work_refused, WorkspaceLimits::unlimited()).unwrap();
+        let exact_without_owner = refused.accounting().work();
+        let exact = work_refused
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut work_workspace,
+                SearchLimits {
+                    max_work: exact_without_owner,
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(exact.output(), refused.output());
+        assert_eq!(exact.accounting().work(), exact_without_owner);
+        assert_eq!(exact.accounting().setup().allocated_bytes(), 0);
+        assert!(
+            work_refused.start_filter_proof.get().is_none(),
+            "work refusal must leave publication retryable"
+        );
+        let retry = work_refused
+            .prepare::<Span>()
+            .search_with_workspace(b"zzza", &mut work_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(retry.accounting().setup().allocated_bytes(), proof_bytes);
+        assert!(work_refused.start_filter_proof.get().is_some());
+    }
+
+    #[test]
+    fn owner_allocation_failure_permanently_uses_ordinary_k0() {
+        let automaton = ascii_literal(b'a');
+        automaton
+            .start_filter_proof
+            .mark_allocation_failed()
+            .unwrap();
+        let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let proof = super::prepare_start_filter(&automaton, &mut workspace, &mut meter, 0).unwrap();
+        match proof {
+            super::InvocationStartProof::Published(proof) => {
+                assert_eq!(proof, &super::ORDINARY_START_FILTER_PROOF);
+            }
+            super::InvocationStartProof::Pending(_) => {
+                panic!("allocation failure retried optional proof construction");
+            }
+        }
+        assert_eq!(meter.consumed, 0);
+
+        let retained = workspace.retained_bytes();
+        let report = automaton
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"zzza",
+                &mut workspace,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(report.output(), &Some(crate::MatchSpan::new(3, 4)));
+        assert_eq!(report.accounting().setup().allocated_bytes(), 0);
+        assert_eq!(report.accounting().scratch_bytes(), retained);
+        assert!(automaton.start_filter_proof.get().is_none());
     }
 
     #[test]
@@ -7810,13 +8079,17 @@ mod tests {
             .unwrap()
             .accounting()
             .work();
+        // Owner publication is optional: one below the complete cold report
+        // now admits the search itself and merely declines retention. Refuse
+        // one unit below the owner-free execution instead.
+        let late_limit = one_below_owner_free(full_cold_work);
         let late_error = automaton
             .prepare::<Span>()
             .search_with_workspace(
                 b"za",
                 &mut workspace,
                 SearchLimits {
-                    max_work: full_cold_work.checked_sub(1).unwrap(),
+                    max_work: late_limit,
                     max_scratch_bytes: usize::MAX,
                 },
             )
@@ -7920,8 +8193,14 @@ mod tests {
                     .prepare::<Span>()
                     .search_with_workspace(b"zzzzzzza", &mut workspace, SearchLimits::unlimited())
                     .unwrap();
-                let work = report.accounting().transition_work();
-                (report.into_output(), work)
+                let accounting = report.accounting();
+                (
+                    report.into_output(),
+                    accounting.transition_work(),
+                    accounting.setup(),
+                    accounting.scratch_bytes(),
+                    workspace.retained_bytes(),
+                )
             }));
         }
 
@@ -7929,18 +8208,37 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect();
-        assert!(reports
-            .iter()
-            .all(
-                |(found, _)| found.as_ref().map(|span| (span.start(), span.end())) == Some((7, 8))
-            ));
+        assert!(reports.iter().all(|(found, _, _, _, _)| found
+            .as_ref()
+            .map(|span| (span.start(), span.end()))
+            == Some((7, 8))));
         assert!(
             reports
                 .iter()
-                .all(|(_, work)| *work == cold_work || *work == warm_work),
+                .all(|(_, work, _, _, _)| *work == cold_work || *work == warm_work),
             "a racing caller must either derive and fully charge or use the published proof"
         );
-        assert!(reports.iter().any(|(_, work)| *work == cold_work));
+        assert!(reports.iter().any(|(_, work, _, _, _)| *work == cold_work));
+        let proof_bytes = StartFilterProofCell::PAYLOAD_BYTES;
+        let publishers: Vec<_> = reports
+            .iter()
+            .filter(|(_, _, setup, _, _)| setup.allocated_bytes() != 0)
+            .collect();
+        assert_eq!(
+            publishers.len(),
+            1,
+            "the lock must serialize the only fallible owner allocation"
+        );
+        let (_, _, setup, scratch_bytes, retained_bytes) = publishers[0];
+        assert_eq!(setup.allocated_bytes(), proof_bytes);
+        assert_eq!(setup.initialized_bytes(), proof_bytes);
+        assert_eq!(
+            *scratch_bytes,
+            retained_bytes.checked_add(proof_bytes).unwrap()
+        );
+        assert!(reports.iter().all(|(_, _, setup, scratch, retained)| {
+            setup.allocated_bytes() == proof_bytes || *scratch == *retained
+        }));
         assert!(automaton.start_filter_proof.get().is_some());
     }
 
@@ -8206,13 +8504,14 @@ mod tests {
         let mut unpublished_workspace =
             K0Workspace::new(&unpublished, WorkspaceLimits::unlimited()).unwrap();
         let cold_work = cold.accounting().work();
+        let failed_search_limit = one_below_owner_free(cold_work);
         let refused = unpublished
             .prepare::<Span>()
             .search_with_workspace(
                 &haystack,
                 &mut unpublished_workspace,
                 SearchLimits {
-                    max_work: cold_work - 1,
+                    max_work: failed_search_limit,
                     max_scratch_bytes: usize::MAX,
                 },
             )
@@ -8234,6 +8533,7 @@ mod tests {
         )
         .unwrap();
         let no_reset = ascii_literal(b'a');
+        pin_without_start_filter(&no_reset);
         let mut no_reset_workspace =
             K0Workspace::new(&no_reset, WorkspaceLimits::unlimited()).unwrap();
         no_reset_workspace.generation = u64::MAX.checked_sub(required_generations).unwrap();
@@ -8245,6 +8545,7 @@ mod tests {
         assert_eq!(no_reset_report.accounting().setup().initialized_bytes(), 0);
 
         let automaton = ascii_literal(b'a');
+        pin_without_start_filter(&automaton);
         let mut workspace =
             super::K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).expect("workspace");
         workspace.generation = u64::MAX

@@ -23,5 +23,8 @@ fre-simd-kernels = { path = "../fre-simd-kernels" }
 memchr = "=2.8.3"
 regex-syntax = { version = "=0.8.11", default-features = false, features = ["unicode-perl"] }
 
+[dev-dependencies]
+stats_alloc = "=0.1.10"
+
 [lints]
 workspace = true
