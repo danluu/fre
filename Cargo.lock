@@ -383,6 +383,7 @@ dependencies = [
  "bstr",
  "fre",
  "fre-automata",
+ "fre-exact-alloc",
  "fre-lower",
  "libc",
  "rebar-expand",

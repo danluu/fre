@@ -108,6 +108,7 @@ use fre::{
     UnicodeScalarAggregateReduceLimits, WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
     WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK, guarded_ascii_word,
 };
+use fre_exact_alloc::zeroed_exact;
 use rebar_expand::{ExpandedRegex, HaystackTransforms, Job, Manifest, PatternBlob};
 use regex_automata::{Input, meta::Regex};
 use serde::{Deserialize, Serialize};
@@ -644,6 +645,18 @@ impl CandidateAdapter for CurrentFreAdapter {
         );
         identity.availability.push_str(
             "; eligible one-pattern grep-captures may bind one caller-owned authenticated whole-input LF/CRLF stream with reusable state/tag storage at the retained lifecycle boundary; direct one-shot reductions retain the unchanged generic per-line selector/replay, and source-free stream construction refusal selects that same fallback before source access",
+        );
+        identity.identity.push_str(
+            "; line-batch-cached-v1 independently certifies positive whole-match width, absence of look assertions, one ASCII separator excluded by every consuming HIR atom, and delimiter-safe required literals before retaining one exact-capacity N+1 candidate-line buffer; the retained buffer is charged against the outer peak and only the residual peak is delegated to unchanged selector/replay",
+        );
+        identity.availability.push_str(
+            "; eligible required-literal grep-captures pack LF/CRLF-stripped candidate lines behind the certified separator and reuse that caller-owned buffer across first and steady operations; arithmetic, peak, exact-layout, allocation, separator-proof, or delimiter-safety refusal retains the independently checked per-line route before source access",
+        );
+        identity.identity.push_str(
+            "; classified-candidate-anchor-v1 construction-selects one native ASCII set classifier for a shared fixed candidate offset wider than memchr3, binds its exact set, offset, and owner mask into the continuation plan identity, and retains the original byte buckets as the semantic owner authority",
+        );
+        identity.availability.push_str(
+            "; eligible Unicode-off continuation candidate plans enumerate native classified lanes with one exact schedule slot and a bounded dense scalar cutover at a block boundary without replay; narrow, dense, incompatible, or construction-refused anchor sets retain the incumbent bucket scheduler",
         );
         identity.identity.push_str(
             "; anchored-line-capture-v2 lowers generic Unicode-off absolute-start deterministic byte HIRs to fixed inline masks, retains an optional terminal absolute-End assertion, and counts mandatory capture participation in one raw LF/CRLF pass",
@@ -3502,13 +3515,25 @@ enum CurrentFreCapturePreparation {
     AbsoluteFullCount(Box<AbsoluteFullCaptureRunLimits>),
     Count(Box<CaptureRunLimits>),
     Grep,
-    LineBatch { packed: Vec<u8>, separator: u8 },
+    LineBatch(LineBatchPreparation),
     Stream(CaptureStreamSession),
     RuffGrep(Box<LineCaptureRunLimits>),
     AnchoredLineGrep(Box<AnchoredLineCaptureRunLimits>),
     RunAlternation(Box<CaptureRunAlternationRunLimits>),
     WordRunGrep(Box<CaptureWordRunRunLimits>),
     AnchoredWordGrep(Box<AnchoredWordCaptureRunLimits>),
+}
+
+#[derive(Debug)]
+struct LineBatchPreparation {
+    /// Exact-capacity caller-owned candidate-domain storage.
+    packed: Vec<u8>,
+    /// Construction-certified byte that no consuming HIR atom accepts.
+    separator: u8,
+    /// Exact bytes retained by `packed` across public operations.
+    retained_bytes: usize,
+    /// Residual dynamic peak after the retained batch storage is charged.
+    operation_peak_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -3569,10 +3594,7 @@ impl CurrentFreCaptureLifecycle {
     /// Stable authenticated plan label expected by the timing runner.
     #[must_use]
     pub fn plan(&self) -> &'static str {
-        if matches!(
-            self.preparation,
-            CurrentFreCapturePreparation::LineBatch { .. }
-        ) {
+        if matches!(self.preparation, CurrentFreCapturePreparation::LineBatch(_)) {
             return CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN;
         }
         if let CurrentFreCapturePreparation::Stream(session) = &self.preparation {
@@ -3653,10 +3675,8 @@ impl CurrentFreCaptureLifecycle {
             }
             (
                 CurrentFreCaptureRegex::General(regex),
-                CurrentFreCapturePreparation::LineBatch { packed, separator },
-            ) => {
-                execute_line_batch_grep_captures(regex, haystack, &self.limits, packed, *separator)
-            }
+                CurrentFreCapturePreparation::LineBatch(prepared),
+            ) => execute_line_batch_grep_captures(regex, haystack, &self.limits, prepared),
             (CurrentFreCaptureRegex::General(_), CurrentFreCapturePreparation::Stream(session)) => {
                 session
                     .count_value(haystack)
@@ -3759,7 +3779,7 @@ impl CurrentFreCaptureLifecycle {
                     "absolute-full count preparation reached an incompatible capture artifact",
                 ));
             }
-            (_, CurrentFreCapturePreparation::LineBatch { .. }) => {
+            (_, CurrentFreCapturePreparation::LineBatch(_)) => {
                 return Err(CompareError::new(
                     "line-batch preparation reached an incompatible capture artifact",
                 ));
@@ -3932,18 +3952,28 @@ fn current_fre_rebar_capture_lifecycle_with_limits(
                         .is_some_and(|accounting| accounting.line_partition_safe)
                     && let Some(proof) = general.line_batch_proof()
                 {
-                    let capacity = haystack_len.checked_add(1).ok_or_else(|| {
-                        CompareError::new("FRE line-batch capacity overflowed usize")
-                    })?;
-                    let mut packed = Vec::new();
-                    packed.try_reserve_exact(capacity).map_err(|_| {
-                        CompareError::new(format!(
-                            "FRE line-batch failed to reserve {capacity} bytes"
-                        ))
-                    })?;
-                    CurrentFreCapturePreparation::LineBatch {
-                        packed,
-                        separator: proof.separator,
+                    if let Some(capacity) = haystack_len.checked_add(1)
+                        && let Some(operation_peak_limit) =
+                            limits.fre_aggregate_peak_bytes.checked_sub(capacity)
+                        && let Ok(packed) = zeroed_exact(capacity)
+                    {
+                        if packed.len() != capacity || packed.capacity() != capacity {
+                            return Err(CompareError::new(
+                                "FRE exact line-batch allocation changed its retained capacity",
+                            ));
+                        }
+                        CurrentFreCapturePreparation::LineBatch(LineBatchPreparation {
+                            packed,
+                            separator: proof.separator,
+                            retained_bytes: capacity,
+                            operation_peak_limit,
+                        })
+                    } else {
+                        // The batch is an optional source-free optimization.
+                        // A caller peak below its exact retained bytes, layout
+                        // refusal, or allocation refusal keeps the already
+                        // built per-line route before any source is observed.
+                        CurrentFreCapturePreparation::Grep
                     }
                 } else if active_capture_required_literal_plan(&general).is_some() {
                     CurrentFreCapturePreparation::Grep
@@ -9173,15 +9203,31 @@ fn execute_line_batch_grep_captures(
     regex: &CaptureRegex,
     haystack: &[u8],
     limits: &RunLimits,
-    packed: &mut Vec<u8>,
-    separator: u8,
+    prepared: &mut LineBatchPreparation,
 ) -> Result<u64, ExecutionError> {
     let proof = regex.line_batch_proof().ok_or_else(|| {
         ExecutionError::fault("FRE line-batch route lost its canonical-HIR separator proof")
     })?;
-    if proof.separator != separator || proof.minimum_match_bytes == 0 {
+    let expected_retained = haystack
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ExecutionError::fault("FRE line-batch retained byte bound overflow"))?;
+    let expected_peak_limit = limits
+        .fre_aggregate_peak_bytes
+        .checked_sub(expected_retained)
+        .ok_or_else(|| {
+            ExecutionError::fault(
+                "FRE line-batch retained bytes escaped source-free peak admission",
+            )
+        })?;
+    if proof.separator != prepared.separator
+        || proof.minimum_match_bytes == 0
+        || prepared.retained_bytes != expected_retained
+        || prepared.packed.capacity() != prepared.retained_bytes
+        || prepared.operation_peak_limit != expected_peak_limit
+    {
         return Err(ExecutionError::fault(
-            "FRE line-batch preparation diverged from its separator proof",
+            "FRE line-batch preparation diverged from its separator/peak proof",
         ));
     }
     let prefilter = active_capture_required_literal_plan(regex).ok_or_else(|| {
@@ -9241,7 +9287,7 @@ fn execute_line_batch_grep_captures(
         ));
     }
 
-    packed.clear();
+    prepared.packed.clear();
     let (reducer_limit, _) = capture_reducer_budget(limits)?;
     let mut reducer_events = 0_usize;
     let mut raw_cursor = 0_usize;
@@ -9281,26 +9327,27 @@ fn execute_line_batch_grep_captures(
         if !candidate {
             continue;
         }
-        let required = packed
+        let required = prepared
+            .packed
             .len()
             .checked_add(line.len())
             .and_then(|length| length.checked_add(1))
             .ok_or_else(|| ExecutionError::fault("FRE line-batch packed length overflow"))?;
-        if required > packed.capacity() {
+        if required > prepared.retained_bytes {
             return Err(ExecutionError::fault(format!(
                 "FRE line-batch needs {required} bytes, prepared capacity is {}",
-                packed.capacity()
+                prepared.retained_bytes
             )));
         }
-        packed.extend_from_slice(line);
-        packed.push(separator);
+        prepared.packed.extend_from_slice(line);
+        prepared.packed.push(prepared.separator);
     }
     if raw_cursor != haystack.len() || matches.next().is_some() {
         return Err(ExecutionError::fault(
             "FRE line-batch partition did not consume the complete source",
         ));
     }
-    if packed.is_empty() {
+    if prepared.packed.is_empty() {
         return Ok(0);
     }
 
@@ -9311,7 +9358,7 @@ fn execute_line_batch_grep_captures(
     let (_, work_limit) = capture_reducer_budget(limits)?;
     let run_limits = capture_run_limits(
         regex,
-        packed.len(),
+        prepared.packed.len(),
         regex.build_report().selector.into(),
         selector_work_remaining,
         selector_sequential_remaining,
@@ -9322,24 +9369,73 @@ fn execute_line_batch_grep_captures(
         work_limit,
         limits,
     )?;
+    let run_limits = capture_run_limits_with_peak(run_limits, prepared.operation_peak_limit);
     let result = regex
-        .count_captures_observed_selector(packed, run_limits)
+        .count_captures_observed_selector(&prepared.packed, run_limits)
         .map_err(|error| {
             capture_execution_error(
                 regex,
-                packed.len(),
+                prepared.packed.len(),
                 &run_limits,
                 &error,
                 format!("FRE line-batch capture reducer refused execution: {error}"),
             )
         })?;
-    if !authenticates_direct_capture_success(regex, packed.len(), &run_limits, &result) {
+    let combined_peak = prepared
+        .retained_bytes
+        .checked_add(result.combined_peak_bytes)
+        .ok_or_else(|| ExecutionError::fault("FRE line-batch combined peak overflow"))?;
+    if !authenticates_direct_capture_success(regex, prepared.packed.len(), &run_limits, &result)
+        || result.combined_peak_bytes > prepared.operation_peak_limit
+        || combined_peak > limits.fre_aggregate_peak_bytes
+    {
         return Err(ExecutionError::fault(
-            "FRE line-batch capture result failed identity/P/A authentication",
+            "FRE line-batch capture result failed identity/P/A/peak authentication",
         ));
     }
     u64::try_from(result.accounting.count)
         .map_err(|_| ExecutionError::fault("FRE line-batch count does not fit u64"))
+}
+
+fn capture_run_limits_with_peak(
+    mut limits: CaptureRunLimits,
+    operation_peak_limit: usize,
+) -> CaptureRunLimits {
+    limits.selector.max_random_access_bytes = limits
+        .selector
+        .max_random_access_bytes
+        .min(operation_peak_limit);
+    limits.selector.max_scratch_bytes = limits.selector.max_scratch_bytes.min(operation_peak_limit);
+    limits.selector.max_log_bytes = limits.selector.max_log_bytes.min(operation_peak_limit);
+    limits.selector.max_output_bytes = limits.selector.max_output_bytes.min(operation_peak_limit);
+    limits.selector.max_peak_bytes = limits.selector.max_peak_bytes.min(operation_peak_limit);
+    limits.aggregate.per_search.max_scratch_bytes = limits
+        .aggregate
+        .per_search
+        .max_scratch_bytes
+        .min(operation_peak_limit);
+    limits.aggregate.max_retained_output_bytes = limits
+        .aggregate
+        .max_retained_output_bytes
+        .min(operation_peak_limit);
+    limits.aggregate.max_combined_peak_bytes = limits
+        .aggregate
+        .max_combined_peak_bytes
+        .min(operation_peak_limit);
+    limits.prefix_class_participation.max_operation_bytes = limits
+        .prefix_class_participation
+        .max_operation_bytes
+        .min(operation_peak_limit);
+    limits.prefix_class_participation.max_scratch_bytes = limits
+        .prefix_class_participation
+        .max_scratch_bytes
+        .min(operation_peak_limit);
+    limits.prefix_class_participation.max_peak_bytes = limits
+        .prefix_class_participation
+        .max_peak_bytes
+        .min(operation_peak_limit);
+    limits.max_combined_peak_bytes = limits.max_combined_peak_bytes.min(operation_peak_limit);
+    limits
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21589,6 +21685,139 @@ mod tests {
     }
 
     #[test]
+    fn line_batch_retained_peak_admits_exactly_and_one_below_falls_back_source_free() {
+        const PATTERN: &str = r"(?:(ABC)|(XY))";
+        let haystack = b"miss\n";
+        let retained_bytes = haystack.len() + 1;
+        let exact = RunLimits {
+            fre_aggregate_peak_bytes: retained_bytes,
+            ..RunLimits::default()
+        };
+        let mut admitted = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            PATTERN,
+            false,
+            false,
+            haystack.len(),
+            exact.clone(),
+        )
+        .expect("exact retained line-batch peak");
+        assert_eq!(admitted.plan(), CURRENT_FRE_CAPTURE_LINE_BATCH_PLAN);
+        let CurrentFreCapturePreparation::LineBatch(prepared) = &admitted.preparation else {
+            panic!("exact peak must retain the line-batch preparation");
+        };
+        assert_eq!(prepared.packed.len(), retained_bytes);
+        assert_eq!(prepared.packed.capacity(), retained_bytes);
+        assert_eq!(prepared.retained_bytes, retained_bytes);
+        assert_eq!(prepared.operation_peak_limit, 0);
+        assert_eq!(admitted.execute(haystack).expect("exact first miss"), 0);
+        assert_eq!(admitted.execute(haystack).expect("exact steady miss"), 0);
+
+        let one_below = RunLimits {
+            fre_aggregate_peak_bytes: retained_bytes - 1,
+            ..exact
+        };
+        let mut fallback = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            PATTERN,
+            false,
+            false,
+            haystack.len(),
+            one_below,
+        )
+        .expect("one-below optional batch refusal");
+        assert_eq!(fallback.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert!(matches!(
+            fallback.preparation,
+            CurrentFreCapturePreparation::Grep
+        ));
+        assert_eq!(fallback.execute(haystack).expect("per-line miss"), 0);
+
+        let overflow = current_fre_rebar_capture_lifecycle_with_limits(
+            "grep-captures",
+            PATTERN,
+            false,
+            false,
+            usize::MAX,
+            RunLimits::default(),
+        )
+        .expect("overflowed optional batch capacity");
+        assert_eq!(overflow.plan(), CURRENT_FRE_CAPTURE_REQUIRED_LITERAL_PLAN);
+        assert!(matches!(
+            overflow.preparation,
+            CurrentFreCapturePreparation::Grep
+        ));
+    }
+
+    #[test]
+    fn line_batch_residual_peak_clamps_every_capture_storage_dimension() {
+        let original = CaptureRunLimits::default();
+        let residual = 17;
+        let clipped = capture_run_limits_with_peak(original, residual);
+        assert_eq!(
+            clipped.selector.max_random_access_bytes,
+            original.selector.max_random_access_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.selector.max_scratch_bytes,
+            original.selector.max_scratch_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.selector.max_log_bytes,
+            original.selector.max_log_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.selector.max_output_bytes,
+            original.selector.max_output_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.selector.max_peak_bytes,
+            original.selector.max_peak_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.aggregate.per_search.max_scratch_bytes,
+            original
+                .aggregate
+                .per_search
+                .max_scratch_bytes
+                .min(residual)
+        );
+        assert_eq!(
+            clipped.aggregate.max_retained_output_bytes,
+            original.aggregate.max_retained_output_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.aggregate.max_combined_peak_bytes,
+            original.aggregate.max_combined_peak_bytes.min(residual)
+        );
+        assert_eq!(
+            clipped.prefix_class_participation.max_operation_bytes,
+            original
+                .prefix_class_participation
+                .max_operation_bytes
+                .min(residual)
+        );
+        assert_eq!(
+            clipped.prefix_class_participation.max_scratch_bytes,
+            original
+                .prefix_class_participation
+                .max_scratch_bytes
+                .min(residual)
+        );
+        assert_eq!(
+            clipped.prefix_class_participation.max_peak_bytes,
+            original
+                .prefix_class_participation
+                .max_peak_bytes
+                .min(residual)
+        );
+        assert_eq!(
+            clipped.max_combined_peak_bytes,
+            original.max_combined_peak_bytes.min(residual)
+        );
+    }
+
+    #[test]
     fn required_literal_line_stream_keeps_delimiter_sensitive_fallback() {
         const PATTERN: &str = r"(?:(AB\r)|(BC))";
         let limits = RunLimits::default();
@@ -23729,6 +23958,37 @@ mod tests {
             identity
                 .availability
                 .contains("independent checked per-line fallback")
+        );
+        assert!(identity.adapter.contains("-line-batch-cached-v1-"));
+        assert!(
+            identity
+                .identity
+                .contains("retaining one exact-capacity N+1 candidate-line buffer")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("only the residual peak is delegated")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("allocation, separator-proof, or delimiter-safety refusal")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("classified-candidate-anchor-v1 construction-selects")
+        );
+        assert!(
+            identity
+                .identity
+                .contains("original byte buckets as the semantic owner authority")
+        );
+        assert!(
+            identity
+                .availability
+                .contains("native classified lanes with one exact schedule slot")
         );
         assert!(
             identity
