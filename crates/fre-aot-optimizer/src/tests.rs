@@ -18,6 +18,7 @@ fn optimize(literal: &[u8]) -> OptimizedCountV3 {
 
 #[test]
 fn selection_and_every_identity_are_deterministic() {
+    assert_eq!(COUNT_V3_OPTIMIZER_VERSION, 5);
     let left_program = program(b"header: x-fre-request-id");
     let right_program = program(b"header: x-fre-request-id");
     let left = optimize_count_v3(

@@ -46,6 +46,7 @@ const SPARSE_PAIR_01_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3;
 const SPARSE_PAIR_23_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 2;
 const SPARSE_PAIR_45_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 4;
 const SPARSE_PAIR_67_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 6;
+const OVERLAPPING_SUFFIX_VECTOR_V3: u8 = 23;
 
 const X0: u8 = 0;
 const X1: u8 = 1;
@@ -2043,6 +2044,12 @@ fn emit_multi_incumbent_v3(
             X8,
         )?;
     }
+    if let Some(suffix_offset) = overlapping_suffix_offset_v3(literal.len()) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&literal[suffix_offset..]);
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(bytes))?;
+        assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
+    }
 
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2397,6 +2404,12 @@ fn emit_multi_specialized_v3(
             X8,
         )?;
     }
+    if let Some(suffix_offset) = overlapping_suffix_offset_v3(literal.len()) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&literal[suffix_offset..]);
+        assembler.mov_imm64_minimal(X8, u64::from_le_bytes(bytes))?;
+        assembler.move_x_to_vector_double(OVERLAPPING_SUFFIX_VECTOR_V3, X8)?;
+    }
 
     assembler.bind(vector)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2648,8 +2661,10 @@ fn emit_confirmation_ordered_v3(
     let vector_tail_offset = vector_chunks * 16;
     let double_chunks = (literal.len() - vector_tail_offset) / 8;
     let double_tail_offset = vector_tail_offset + double_chunks * 8;
+    let overlapping_suffix_offset = overlapping_suffix_offset_v3(literal.len());
     let mut emitted_vector_chunks = 0_u8;
     let mut emitted_double_chunks = 0_u8;
+    let mut emitted_overlapping_suffix = false;
     for offset in confirmation_order.iter().copied() {
         if proven_filter_offsets.contains(&offset) {
             continue;
@@ -2691,6 +2706,19 @@ fn emit_confirmation_ordered_v3(
                 0,
                 u8::try_from(4_usize + global_chunk).expect("at most v7"),
             )?;
+            assembler.unsigned_min_across_bytes8(0, 0)?;
+        } else if let Some(suffix_offset) = overlapping_suffix_offset {
+            if emitted_overlapping_suffix {
+                continue;
+            }
+            emitted_overlapping_suffix = true;
+            assembler.add_imm(
+                X9,
+                candidate_pointer,
+                u16::try_from(suffix_offset).expect("bounded overlapping suffix offset"),
+            )?;
+            assembler.load_vector_double(0, X9, 0)?;
+            assembler.compare_equal_bytes8(0, 0, OVERLAPPING_SUFFIX_VECTOR_V3)?;
             assembler.unsigned_min_across_bytes8(0, 0)?;
         } else {
             assembler.load_byte(
@@ -2761,6 +2789,24 @@ fn emit_confirmation_v3(
         assembler.branch_cond(ConditionV3::NotEqual, mismatch)?;
     }
     let tail_offset = vector_tail_offset + double_chunks * 8;
+    if let Some(suffix_offset) = overlapping_suffix_offset_v3(literal.len()) {
+        if !(suffix_offset..literal.len()).all(|offset| {
+            proven_filter_offsets.contains(&u8::try_from(offset).expect("bounded literal offset"))
+        }) {
+            assembler.add_imm(
+                X9,
+                candidate_pointer,
+                u16::try_from(suffix_offset).expect("bounded overlapping suffix offset"),
+            )?;
+            assembler.load_vector_double(0, X9, 0)?;
+            assembler.compare_equal_bytes8(0, 0, OVERLAPPING_SUFFIX_VECTOR_V3)?;
+            assembler.unsigned_min_across_bytes8(0, 0)?;
+            assembler.move_vector_byte_to32(X8, 0)?;
+            assembler.cmp_imm32(X8, 255)?;
+            assembler.branch_cond(ConditionV3::NotEqual, mismatch)?;
+        }
+        return Ok(());
+    }
     for (index, byte) in literal[tail_offset..].iter().copied().enumerate() {
         let literal_offset = tail_offset + index;
         let narrow_offset = u8::try_from(literal_offset).expect("bounded literal offset");
@@ -2774,6 +2820,22 @@ fn emit_confirmation_v3(
         assembler.branch_cond(ConditionV3::NotEqual, mismatch)?;
     }
     Ok(())
+}
+
+/// Return a safe 8-byte suffix load for a residual tail when it wins over
+/// scalar byte confirmation.
+///
+/// The suffix ends exactly at the literal boundary, so it cannot overread the
+/// last legal candidate. A one-byte residual remains scalar: its four
+/// instructions are cheaper than the seven-instruction unaligned suffix
+/// confirmation.
+fn overlapping_suffix_offset_v3(literal_len: usize) -> Option<usize> {
+    let residual = literal_len % 8;
+    if literal_len >= 8 && residual >= 2 {
+        Some(literal_len - 8)
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

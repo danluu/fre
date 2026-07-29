@@ -63,6 +63,7 @@ const SPARSE_PAIR_01_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3;
 const SPARSE_PAIR_23_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 2;
 const SPARSE_PAIR_45_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 4;
 const SPARSE_PAIR_67_MASK_V3: u8 = SPARSE_BLOCK_MASK_BASE_V3 + 6;
+const OVERLAPPING_SUFFIX_VECTOR_V3: u8 = 23;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AuditCandidateFilterV3 {
@@ -2911,6 +2912,18 @@ fn policy_multi_incumbent_v3(
             },
         )?;
     }
+    if let Some(suffix_offset) = policy_overlapping_suffix_offset_v3(literal.len()) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&literal[suffix_offset..]);
+        policy_mov_minimal_v3(policy, X8, u64::from_le_bytes(bytes))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::Move64ToVectorDouble {
+                destination: OVERLAPPING_SUFFIX_VECTOR_V3,
+                source: X8,
+            },
+        )?;
+    }
     policy.bind(vector)?;
     compare_register64_v3(policy, X3, X4)?;
     condition_v3(policy, ConditionV3::Higher, done)?;
@@ -3644,6 +3657,18 @@ fn policy_multi_specialized_v3(
             },
         )?;
     }
+    if let Some(suffix_offset) = policy_overlapping_suffix_offset_v3(literal.len()) {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&literal[suffix_offset..]);
+        policy_mov_minimal_v3(policy, X8, u64::from_le_bytes(bytes))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::Move64ToVectorDouble {
+                destination: OVERLAPPING_SUFFIX_VECTOR_V3,
+                source: X8,
+            },
+        )?;
+    }
 
     policy.bind(vector)?;
     compare_register64_v3(policy, X3, X4)?;
@@ -4158,8 +4183,10 @@ fn policy_confirmation_ordered_v3(
     let vector_tail_offset = vector_chunks * 16;
     let double_chunks = (literal.len() - vector_tail_offset) / 8;
     let double_tail_offset = vector_tail_offset + double_chunks * 8;
+    let overlapping_suffix_offset = policy_overlapping_suffix_offset_v3(literal.len());
     let mut emitted_vector_chunks = 0_u8;
     let mut emitted_double_chunks = 0_u8;
+    let mut emitted_overlapping_suffix = false;
     for offset in confirmation_order.iter().copied() {
         if proven_filter_offsets.contains(&offset) {
             continue;
@@ -4218,6 +4245,40 @@ fn policy_confirmation_ordered_v3(
                     destination: 0,
                     left: 0,
                     right: u8::try_from(4_usize + global_chunk).expect("at most v7"),
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::UnsignedMinAcrossBytes8 {
+                    destination: 0,
+                    source: 0,
+                },
+            )?;
+        } else if let Some(suffix_offset) = overlapping_suffix_offset {
+            if emitted_overlapping_suffix {
+                continue;
+            }
+            emitted_overlapping_suffix = true;
+            add_immediate64_v3(
+                policy,
+                X9,
+                candidate_pointer,
+                u16::try_from(suffix_offset).expect("bounded overlapping suffix offset"),
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVectorDouble {
+                    destination: 0,
+                    base: X9,
+                    offset: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes8 {
+                    destination: 0,
+                    left: 0,
+                    right: OVERLAPPING_SUFFIX_VECTOR_V3,
                 },
             )?;
             exact_v3(
@@ -4363,6 +4424,57 @@ fn policy_confirmation_v3(
         condition_v3(policy, ConditionV3::NotEqual, mismatch)?;
     }
     let tail_offset = vector_tail_offset + double_chunks * 8;
+    if let Some(suffix_offset) = policy_overlapping_suffix_offset_v3(literal.len()) {
+        if !(suffix_offset..literal.len()).all(|offset| {
+            proven_filter_offsets.contains(&u8::try_from(offset).expect("bounded literal offset"))
+        }) {
+            add_immediate64_v3(
+                policy,
+                X9,
+                candidate_pointer,
+                u16::try_from(suffix_offset).expect("bounded overlapping suffix offset"),
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVectorDouble {
+                    destination: 0,
+                    base: X9,
+                    offset: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes8 {
+                    destination: 0,
+                    left: 0,
+                    right: OVERLAPPING_SUFFIX_VECTOR_V3,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::UnsignedMinAcrossBytes8 {
+                    destination: 0,
+                    source: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::MoveVectorByteTo32 {
+                    destination: X8,
+                    source: 0,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareImmediate32 {
+                    register: X8,
+                    immediate: 255,
+                },
+            )?;
+            condition_v3(policy, ConditionV3::NotEqual, mismatch)?;
+        }
+        return Ok(());
+    }
     for (index, byte) in literal[tail_offset..].iter().copied().enumerate() {
         let literal_offset = tail_offset + index;
         let narrow_offset = u8::try_from(literal_offset).expect("bounded literal offset");
@@ -4375,6 +4487,15 @@ fn policy_confirmation_v3(
         condition_v3(policy, ConditionV3::NotEqual, mismatch)?;
     }
     Ok(())
+}
+
+fn policy_overlapping_suffix_offset_v3(literal_len: usize) -> Option<usize> {
+    let residual = literal_len % 8;
+    if literal_len >= 8 && residual >= 2 {
+        Some(literal_len - 8)
+    } else {
+        None
+    }
 }
 
 fn policy_mov_minimal_v3(

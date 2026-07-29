@@ -97,7 +97,7 @@ fn sve_compare_instruction_v3(sve2: bool, destination: u8, right: u8) -> Decoded
 fn v3_versions_and_identity_domain_are_disjoint() {
     assert_eq!(AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, 3);
     assert_eq!(AOT_COUNT_BACKEND_VERSION_V3.0, 0xa003);
-    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 8);
+    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 9);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V2);
     assert_eq!(IDENTITY_DOMAIN_V3.last(), Some(&3));
@@ -1026,6 +1026,71 @@ fn sve_primary_empty_batch_advances_128_starts_with_closed_quarter_reentry() {
             assert!(reentry <= position && position < reentry + 32);
         }
 
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+            image.build_receipt().audit
+        );
+    }
+}
+
+#[test]
+fn neon_residual_confirmation_uses_a_boundary_safe_overlapping_suffix() {
+    for width in 9_usize..=15 {
+        let literal = (0..width)
+            .map(|offset| u8::try_from(offset).unwrap())
+            .collect::<Vec<_>>();
+        let (program, optimized) = optimized_for(&literal, CountV3RequiredIsa::Aarch64Neon128);
+        let image = emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default())
+            .unwrap_or_else(|error| panic!("width {width}: {error:?}"));
+        let decoded = decoded_v3(&image);
+        let suffix_offset = width - 8;
+        let expect_overlapping_suffix = width % 8 >= 2;
+
+        assert_eq!(
+            decoded.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    DecodedInstructionV3::Move64ToVectorDouble {
+                        destination: 23,
+                        ..
+                    }
+                )
+            }),
+            expect_overlapping_suffix,
+            "width {width} suffix constant"
+        );
+        assert_eq!(
+            decoded.windows(2).any(|window| {
+                matches!(
+                    window[0],
+                    DecodedInstructionV3::AddImmediate64 {
+                        destination: 9,
+                        source: 15,
+                        immediate,
+                    } if usize::from(immediate) == suffix_offset
+                ) && matches!(
+                    window[1],
+                    DecodedInstructionV3::LoadVectorDouble {
+                        base: 9,
+                        offset: 0,
+                        ..
+                    }
+                )
+            }),
+            expect_overlapping_suffix,
+            "width {width} suffix load"
+        );
+        assert_eq!(
+            decoded.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    DecodedInstructionV3::CompareEqualBytes8 { right: 23, .. }
+                )
+            }),
+            expect_overlapping_suffix,
+            "width {width} suffix comparison"
+        );
+        assert_eq!(suffix_offset + 8, width);
         assert_eq!(
             audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
             image.build_receipt().audit
