@@ -320,6 +320,24 @@ fn structural_misses_wide_prefilters_and_resource_failures_are_distinct() {
         }
     };
     assert!(wide.build_report().trie.root_prefilter_needles > 3);
+    assert!(
+        wide.build_report()
+            .trie
+            .root_prefilter_classifier_selection
+            .is_some()
+    );
+    let wide_haystack = [
+        &[0xFF, 0x80][..],
+        "\u{0345}Ιιι".as_bytes(),
+        &[0xF4, 0x90, 0x80, 0x80][..],
+    ]
+    .concat();
+    assert_eq!(
+        wide.execute(&wide_haystack, UnicodeFoldedLiteralRunLimits::unlimited())
+            .unwrap()
+            .value,
+        u64::try_from(oracle("\u{0345}").find_iter(&wide_haystack).count()).unwrap()
+    );
     assert!(matches!(
         UnicodeFoldedLiteralBuilder::new("Ше")
             .case_insensitive(true)

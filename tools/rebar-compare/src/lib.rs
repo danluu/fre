@@ -248,7 +248,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v2-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -620,7 +620,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible wide Unicode-on case-insensitive literal alternatives use the same retained canonical Count route and plan identity in semantic and raw operation execution; span-sum retains its incumbent byte-span-preserving route",
         );
         identity.identity.push_str(
-            "; unicode-folded-literal-v3 construction-selects one bounded finite canonical case-fold trie from an eligible nonempty literal/class sequence or root ordered alternation, then count and span-sum reuse an allocation-free ranked fixed-column memchr or retained full-byte classifier, a second source-independent fixed-column guard when available, exact scalar-trie validation, and source-pattern priority reduction under explicit build and run receipts",
+            "; unicode-folded-literal-v3 construction-selects one bounded finite canonical case-fold trie from an eligible nonempty literal/class sequence or root ordered alternation, then count and span-sum reuse an allocation-free ranked fixed-column memchr or retained full-byte classifier whose one-time Auto dispatch is charged and published, a second source-independent fixed-column guard when available, exact scalar-trie validation, and source-pattern priority reduction under explicit build and run receipts",
         );
         identity.availability.push_str(
             "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences or root ordered alternatives whose non-ASCII folded roots each have at most four canonical members and whose combined Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
@@ -2247,17 +2247,17 @@ fn unicode_folded_literal_build_limits(
     })
 }
 
-fn unicode_folded_literal_builder(
+fn unicode_folded_literal_builder_with_limits(
     pattern: String,
     unicode: bool,
     case_insensitive: bool,
-    limits: &RunLimits,
-) -> Result<UnicodeFoldedLiteralBuilder, ExecutionError> {
-    Ok(UnicodeFoldedLiteralBuilder::new(pattern)
+    limits: UnicodeFoldedLiteralBuildLimits,
+) -> UnicodeFoldedLiteralBuilder {
+    UnicodeFoldedLiteralBuilder::new(pattern)
         .profile(rebar_profile())
         .unicode(unicode)
         .case_insensitive(case_insensitive)
-        .limits(unicode_folded_literal_build_limits(limits)?))
+        .limits(limits)
 }
 
 fn unicode_folded_literal_build_error(error: &UnicodeFoldedLiteralBuildError) -> ExecutionError {
@@ -2269,6 +2269,16 @@ fn unicode_folded_literal_build_error(error: &UnicodeFoldedLiteralBuildError) ->
         }) => ExecutionError::unsupported(message),
         _ => ExecutionError::fault(message),
     }
+}
+
+fn unicode_folded_literal_resource_refusal(error: &UnicodeFoldedLiteralBuildError) -> bool {
+    matches!(
+        error,
+        UnicodeFoldedLiteralBuildError::Resource { .. }
+            | UnicodeFoldedLiteralBuildError::Trie(
+                fre::FoldedLiteralTrieBuildError::Resource { .. }
+            )
+    )
 }
 
 fn unicode_folded_literal_run_error(
@@ -2319,11 +2329,13 @@ fn unicode_folded_literal_displaces_packed_finite_language(
             .min(PACKED_ORDERED_LITERAL_CERTIFIED_MAX_PATTERNS)
 }
 
-fn try_current_fre_folded_count_lifecycle(
+fn try_current_fre_folded_count_lifecycle_with_limits(
     pattern: &str,
     unicode: bool,
     case_insensitive: bool,
     haystack_len: usize,
+    limits: &RunLimits,
+    build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<
     Option<(
         UnicodeFoldedLiteralCountRegex,
@@ -2331,14 +2343,22 @@ fn try_current_fre_folded_count_lifecycle(
     )>,
     CompareError,
 > {
-    let limits = RunLimits::default();
-    let attempt =
-        unicode_folded_literal_builder(pattern.to_owned(), unicode, case_insensitive, &limits)
-            .map_err(|error| CompareError::new(error.message))?
-            .build_count()
-            .map_err(|error| {
-                CompareError::new(unicode_folded_literal_build_error(&error).message)
-            })?;
+    let attempt = match unicode_folded_literal_builder_with_limits(
+        pattern.to_owned(),
+        unicode,
+        case_insensitive,
+        build_limits,
+    )
+    .build_count()
+    {
+        Ok(attempt) => attempt,
+        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
+        Err(error) => {
+            return Err(CompareError::new(
+                unicode_folded_literal_build_error(&error).message,
+            ));
+        }
+    };
     let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
         return Ok(None);
     };
@@ -2372,13 +2392,48 @@ fn try_current_fre_folded_span_sum_lifecycle(
     CompareError,
 > {
     let limits = RunLimits::default();
-    let attempt =
-        unicode_folded_literal_builder(pattern.to_owned(), unicode, case_insensitive, &limits)
-            .map_err(|error| CompareError::new(error.message))?
-            .build_span_sum()
-            .map_err(|error| {
-                CompareError::new(unicode_folded_literal_build_error(&error).message)
-            })?;
+    let build_limits = unicode_folded_literal_build_limits(&limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    try_current_fre_folded_span_sum_lifecycle_with_limits(
+        pattern,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        &limits,
+        build_limits,
+    )
+}
+
+fn try_current_fre_folded_span_sum_lifecycle_with_limits(
+    pattern: &str,
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    limits: &RunLimits,
+    build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<
+    Option<(
+        UnicodeFoldedLiteralSpanSumRegex,
+        UnicodeFoldedLiteralRunLimits,
+    )>,
+    CompareError,
+> {
+    let attempt = match unicode_folded_literal_builder_with_limits(
+        pattern.to_owned(),
+        unicode,
+        case_insensitive,
+        build_limits,
+    )
+    .build_span_sum()
+    {
+        Ok(attempt) => attempt,
+        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
+        Err(error) => {
+            return Err(CompareError::new(
+                unicode_folded_literal_build_error(&error).message,
+            ));
+        }
+    };
     let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
         return Ok(None);
     };
@@ -2406,12 +2461,34 @@ fn build_current_fre_count_lifecycle(
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     let run_limits = RunLimits::default();
+    let build_limits = unicode_folded_literal_build_limits(&run_limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    build_current_fre_count_lifecycle_with_folded_limits(
+        patterns,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        &run_limits,
+        build_limits,
+    )
+}
+
+fn build_current_fre_count_lifecycle_with_folded_limits(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    run_limits: &RunLimits,
+    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     if let [pattern] = patterns
-        && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle(
+        && let Some((regex, limits)) = try_current_fre_folded_count_lifecycle_with_limits(
             pattern,
             unicode,
             case_insensitive,
             haystack_len,
+            run_limits,
+            folded_build_limits,
         )?
     {
         return Ok(CurrentFreAggregateOperationLifecycle {
@@ -2426,7 +2503,7 @@ fn build_current_fre_count_lifecycle(
         unicode,
         case_insensitive,
         haystack_len,
-        &run_limits,
+        run_limits,
     )
     .map_err(|error| {
         CompareError::new(format!(
@@ -15741,7 +15818,18 @@ fn fre_aggregate_count(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_count(request, limits);
     }
-    if let Some(reduction) = try_unicode_folded_literal_count(request, limits)? {
+    let folded_build_limits = unicode_folded_literal_build_limits(limits)?;
+    fre_aggregate_count_with_folded_limits(request, limits, folded_build_limits)
+}
+
+fn fre_aggregate_count_with_folded_limits(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<FreReduction, ExecutionError> {
+    if let Some(reduction) =
+        try_unicode_folded_literal_count_with_limits(request, limits, folded_build_limits)?
+    {
         return Ok(reduction);
     }
     if let Some(reduction) = canonical_case_fold::try_count(request, limits)? {
@@ -15830,21 +15918,26 @@ fn validate_unicode_folded_literal_policy(
     Ok(UnicodeFoldedLiteralRunLimits::exact(upper))
 }
 
-fn try_unicode_folded_literal_count(
+fn try_unicode_folded_literal_count_with_limits(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
+    build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<Option<FreReduction>, ExecutionError> {
     let [pattern] = request.patterns else {
         return Ok(None);
     };
-    let attempt = unicode_folded_literal_builder(
+    let attempt = match unicode_folded_literal_builder_with_limits(
         pattern.clone(),
         request.unicode,
         request.case_insensitive,
-        limits,
-    )?
+        build_limits,
+    )
     .build_count()
-    .map_err(|error| unicode_folded_literal_build_error(&error))?;
+    {
+        Ok(attempt) => attempt,
+        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
+        Err(error) => return Err(unicode_folded_literal_build_error(&error)),
+    };
     let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
         return Ok(None);
     };
@@ -15879,17 +15972,30 @@ fn try_unicode_folded_literal_span_sum(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
 ) -> Result<Option<FreReduction>, ExecutionError> {
+    let build_limits = unicode_folded_literal_build_limits(limits)?;
+    try_unicode_folded_literal_span_sum_with_limits(request, limits, build_limits)
+}
+
+fn try_unicode_folded_literal_span_sum_with_limits(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+    build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<Option<FreReduction>, ExecutionError> {
     let [pattern] = request.patterns else {
         return Ok(None);
     };
-    let attempt = unicode_folded_literal_builder(
+    let attempt = match unicode_folded_literal_builder_with_limits(
         pattern.clone(),
         request.unicode,
         request.case_insensitive,
-        limits,
-    )?
+        build_limits,
+    )
     .build_span_sum()
-    .map_err(|error| unicode_folded_literal_build_error(&error))?;
+    {
+        Ok(attempt) => attempt,
+        Err(error) if unicode_folded_literal_resource_refusal(&error) => return Ok(None),
+        Err(error) => return Err(unicode_folded_literal_build_error(&error)),
+    };
     let UnicodeFoldedLiteralBuildAttempt::Admitted(regex) = attempt else {
         return Ok(None);
     };
@@ -23867,7 +23973,7 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v1-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v2-required-literal-best-concat-v1"
         );
         assert!(
             identity
@@ -23877,6 +23983,10 @@ mod tests {
         assert!(
             current_fre_adapter_id().contains("-persistent-continuation-sweep-v4-"),
             "runner/schedule adapter key must version the persistent physical route"
+        );
+        assert!(
+            current_fre_adapter_id().contains("-unicode-folded-literal-v2-"),
+            "runner/schedule adapter key must version the ordered folded-literal route"
         );
         assert!(
             identity
@@ -25847,6 +25957,59 @@ mod tests {
                 CurrentFreAggregateCounterReceiptStatus::DirectSelectedPlan
             ));
         }
+    }
+
+    #[test]
+    fn folded_resource_refusals_fall_through_raw_and_retained_count_ladders() {
+        let pattern = "Шерлок Холмс";
+        let patterns = [pattern.to_string()];
+        let haystack = "ШЕРЛОК ХОЛМС/шерлок холмс".as_bytes();
+        let run_limits = RunLimits::default();
+        let admitted = unicode_folded_literal_build_limits(&run_limits).unwrap();
+        let mut planner_refusal = admitted;
+        planner_refusal.max_scalar_positions = 1;
+        let mut trie_refusal = admitted;
+        trie_refusal.trie.max_patterns = 0;
+        let request = CandidateRequest {
+            job_id: "focused/folded-resource-fallback@rust/regex",
+            model: "count",
+            patterns: &patterns,
+            haystack,
+            unicode: true,
+            case_insensitive: true,
+        };
+
+        for folded_limits in [planner_refusal, trie_refusal] {
+            assert!(
+                try_unicode_folded_literal_count_with_limits(request, &run_limits, folded_limits,)
+                    .unwrap()
+                    .is_none(),
+                "a speculative folded resource refusal must be a raw-route miss"
+            );
+            let raw = fre_aggregate_count_with_folded_limits(request, &run_limits, folded_limits)
+                .expect("the incumbent raw Count route remains available");
+            assert_eq!(raw.actual, 2);
+            assert_ne!(raw.plan, UNICODE_FOLDED_LITERAL_PLAN);
+
+            let lifecycle = build_current_fre_count_lifecycle_with_folded_limits(
+                &patterns,
+                true,
+                true,
+                haystack.len(),
+                &run_limits,
+                folded_limits,
+            )
+            .expect("the incumbent retained Count route remains available");
+            assert_ne!(lifecycle.plan(), UNICODE_FOLDED_LITERAL_PLAN);
+            assert_eq!(lifecycle.execute(haystack).unwrap(), 2);
+            assert_eq!(lifecycle.execute(haystack).unwrap(), 2);
+        }
+
+        assert!(!unicode_folded_literal_resource_refusal(
+            &UnicodeFoldedLiteralBuildError::ArithmeticOverflow {
+                computation: "synthetic non-resource fault",
+            }
+        ));
     }
 
     #[test]

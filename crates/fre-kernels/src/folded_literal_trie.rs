@@ -10,7 +10,10 @@
 use core::{fmt, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
-use fre_simd_kernels::{BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables};
+use fre_simd_kernels::{
+    BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables, DispatchPolicy,
+    SelectionReceipt, SimdDispatchContext,
+};
 use memchr::{memchr_iter, memchr2_iter, memchr3_iter};
 
 use crate::{
@@ -31,6 +34,9 @@ const ROOT_PREFILTER_BYTE_WORDS: usize = 4;
 const ROOT_PREFILTER_WORD_BITS: usize = 64;
 const ROOT_PREFILTER_BUCKETS: usize = 8;
 const ROOT_PREFILTER_CLASSIFIER_HIGH_WORK: usize = 16;
+// Matches the authenticated byte-bucket construction charge used by the
+// packed multi-literal owner. Host capture and Auto selection happen once.
+const ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK: usize = 256;
 const ROOT_PREFILTER_OFFSET_WORK: usize = 2;
 const ROOT_PREFILTER_EDGE_WORK: usize = 7;
 const ROOT_PREFILTER_NEEDLE_WORK: usize = 2;
@@ -215,6 +221,7 @@ pub struct BuildAccounting {
     pub root_prefilter_offset: Option<usize>,
     pub root_prefilter_guard_needles: usize,
     pub root_prefilter_guard_offset: Option<usize>,
+    pub root_prefilter_classifier_selection: Option<SelectionReceipt>,
     pub work: usize,
     pub persistent_bytes: usize,
     pub peak_bytes: usize,
@@ -695,6 +702,10 @@ impl FoldedLiteralTriePlan {
             .as_ref()
             .filter(|prefilter| prefilter.has_guard())
             .map(|prefilter| usize::from(prefilter.guard_offset));
+        build.root_prefilter_classifier_selection = root_prefilter
+            .as_ref()
+            .and_then(|prefilter| prefilter.classifier.as_ref())
+            .map(ByteBucketClassifier::selection);
         build.work = work;
         if !build_actual_within(build) {
             return Err(BuildError::Invariant {
@@ -1332,10 +1343,14 @@ fn root_prefilter_classifier(
     })?;
     let work = ROOT_PREFILTER_CLASSIFIER_HIGH_WORK
         .checked_add(members)
+        .and_then(|work| work.checked_add(ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded root prefilter classifier work",
         })?;
-    Ok((ByteBucketClassifier::new(tables), work))
+    let classifier = SimdDispatchContext::capture()
+        .byte_bucket_classifier(tables, DispatchPolicy::Auto)
+        .expect("automatic byte-bucket dispatch retains a scalar fallback");
+    Ok((classifier, work))
 }
 
 fn scan_folded_start<F>(
@@ -1595,6 +1610,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         root_prefilter_offset: None,
         root_prefilter_guard_needles: 0,
         root_prefilter_guard_offset: None,
+        root_prefilter_classifier_selection: None,
         work: 0,
         persistent_bytes: 0,
         peak_bytes: 0,
@@ -1643,6 +1659,7 @@ fn preflight_root_prefilter_work_upper_bound(
         .and_then(|work| work.checked_add(needle_work))
         .and_then(|work| work.checked_add(ROOT_PREFILTER_CLASSIFIER_HIGH_WORK))
         .and_then(|work| work.checked_add(ROOT_PREFILTER_BYTE_VALUES))
+        .and_then(|work| work.checked_add(ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded root prefilter upper work",
         })
@@ -2482,6 +2499,7 @@ mod tests {
         assert_eq!(needles, [0x88, 0xA8]);
         assert_eq!(plan.build.root_prefilter_offset, Some(1));
         assert_eq!(plan.build.root_prefilter_needles, 2);
+        assert_eq!(plan.build.root_prefilter_classifier_selection, None);
         assert_eq!(prefilter.guard_offset, 3);
         assert_eq!(prefilter.guard_needle_count, 2);
         let mut guard_needles = byte_set_members(prefilter.guard_byte_set).collect::<Vec<_>>();
@@ -2499,6 +2517,11 @@ mod tests {
         let plan = admitted(&patterns);
         assert_eq!(plan.build.root_prefilter_offset, Some(1));
         assert_eq!(plan.build.root_prefilter_needles, 4);
+        let selection = plan
+            .build
+            .root_prefilter_classifier_selection
+            .expect("the wide prefilter publishes its retained classifier selection");
+        assert!(!selection.variant_id.is_empty());
         assert_eq!(
             collect(&plan, "xАРрё".as_bytes()),
             [
@@ -2540,6 +2563,7 @@ mod tests {
         let plan = admitted(&patterns);
         assert_eq!(plan.build.root_prefilter_offset, Some(0));
         assert_eq!(plan.build.root_prefilter_needles, 4);
+        assert!(plan.build.root_prefilter_classifier_selection.is_some());
         assert_eq!(
             collect(&plan, b"xABCD"),
             [
@@ -2579,6 +2603,54 @@ mod tests {
         assert_eq!(prefetched, scalar);
         assert!(super::actual_within(scalar_actual, upper));
         assert!(super::actual_within(prefetched_actual, upper));
+
+        for residue in 0..32 {
+            let len = 48_usize.checked_add(residue).unwrap();
+            let mut framed = vec![b'x'; len.checked_add(8).unwrap()];
+            for (position, byte) in [
+                (0, b'A'),
+                (1, b'B'),
+                (2, b'C'),
+                (3, b'D'),
+                (7, b'A'),
+                (8, b'B'),
+                (15, b'C'),
+                (16, b'D'),
+                (len.saturating_sub(1), b'A'),
+            ] {
+                framed[position.checked_add(4).unwrap()] = byte;
+            }
+            framed[6] = 0xFF;
+            for window_start in 1_usize..=4 {
+                let window_end = window_start.checked_add(len).unwrap();
+                let window = &framed[window_start..window_end];
+                let upper = plan.scan_upper_bounds(window.len()).unwrap();
+                let mut scalar = Vec::new();
+                execute_folded_scan_impl(
+                    &plan,
+                    window,
+                    window_start,
+                    upper,
+                    None,
+                    &mut |candidate| scalar.push(candidate),
+                )
+                .unwrap();
+                let mut prefetched = Vec::new();
+                execute_folded_scan_impl(
+                    &plan,
+                    window,
+                    window_start,
+                    upper,
+                    plan.root_prefilter.as_ref(),
+                    &mut |candidate| prefetched.push(candidate),
+                )
+                .unwrap();
+                assert_eq!(
+                    prefetched, scalar,
+                    "residue {residue}, nonzero window {window_start}"
+                );
+            }
+        }
     }
 
     #[test]
