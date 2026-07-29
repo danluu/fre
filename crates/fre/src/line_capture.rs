@@ -8,6 +8,7 @@
 use core::fmt;
 
 use fre_syntax::RustProfile;
+use memchr::memchr_iter;
 
 /// Exact source spelling for the first admitted line-capture plan.
 pub const SPACE_AROUND_OPERATOR_CAPTURE_PATTERN: &str = r"[^,\s](\s*)(?:[-+*/|!<=>%&^]+|:=)(\s*)";
@@ -70,7 +71,7 @@ pub const SPACE_AROUND_OPERATOR_OPERATION_ID: &str = "capture-line-space-around-
 /// Stable operation identity for the configured shebang stream.
 pub const SHEBANG_OPERATION_ID: &str = "capture-line-ruff-shebang-stream-v1";
 /// Stable operation identity for the configured quote-prefix stream.
-pub const STRING_QUOTE_PREFIX_OPERATION_ID: &str = "capture-line-ruff-string-quote-stream-v1";
+pub const STRING_QUOTE_PREFIX_OPERATION_ID: &str = "capture-line-ruff-string-quote-stream-v2";
 /// Stable operation identity for the configured Python-keyword stream.
 pub const WHITESPACE_AROUND_KEYWORDS_OPERATION_ID: &str =
     "capture-line-ruff-python-keywords-stream-v1";
@@ -349,7 +350,7 @@ pub struct LineCaptureRunReport {
     pub work: usize,
     /// Actual charged scanner/decoder work.
     pub actual_work: usize,
-    /// Exact prospective single-pass input-load certificate.
+    /// Exact prospective input-load certificate.
     pub sequential_bytes: usize,
     /// Prospective non-overlapping match ceiling admitted before scanning.
     pub prospective_matches: usize,
@@ -612,6 +613,19 @@ impl LineCapturePlan {
         &self.report
     }
 
+    /// Source-independent sequential-read envelope for one invocation.
+    ///
+    /// Most configurations retain the original single-load stream. The
+    /// anchored boundary-filtered configuration admits three logical passes:
+    /// LF discovery, boundary probes, and UTF-8 validation of surviving
+    /// domains.
+    pub fn sequential_bytes_upper_bound(
+        &self,
+        source_bytes: usize,
+    ) -> Result<usize, LineCaptureRunError> {
+        line_capture_sequential_bound(self.report.identity.operation, source_bytes)
+    }
+
     /// Count participating groups over `bstr::lines`-equivalent records.
     pub fn grep_capture_count(
         &self,
@@ -627,7 +641,7 @@ impl LineCapturePlan {
                 LineCaptureResource::ExecutionWork,
             ))?;
         enforce(LineCaptureResource::ExecutionWork, work, limits.max_work)?;
-        let sequential_bytes = haystack.len();
+        let sequential_bytes = self.sequential_bytes_upper_bound(haystack.len())?;
         enforce(
             LineCaptureResource::SequentialBytes,
             sequential_bytes,
@@ -1476,6 +1490,9 @@ fn scan_line_capture(
     operation: LineCaptureOperationIdentity,
     haystack: &[u8],
 ) -> Result<LineScanReport, LineCaptureRunError> {
+    if operation.configuration == LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail {
+        return scan_anchored_ascii_prefix_quoted_lines(operation, haystack);
+    }
     let mut decoder = Utf8StreamDecoder::default();
     let mut scanner = LineScanner::new(operation);
     let mut input_loads = 0_usize;
@@ -1496,6 +1513,139 @@ fn scan_line_capture(
         input_loads,
         work: scanner.work,
     })
+}
+
+fn line_capture_sequential_bound(
+    operation: LineCaptureOperationIdentity,
+    source_bytes: usize,
+) -> Result<usize, LineCaptureRunError> {
+    if operation.configuration == LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail {
+        source_bytes
+            .checked_mul(3)
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::SequentialBytes,
+            ))
+    } else {
+        Ok(source_bytes)
+    }
+}
+
+/// Scan LF domains once, reject lines from their compiler-proved leading and
+/// trailing ASCII predicates, and validate UTF-8 only for surviving domains.
+///
+/// The anchored configuration cannot recover after either boundary predicate
+/// fails. This makes decoding rejected line interiors semantically dead work.
+/// Candidate validation uses the standard library's optimized UTF-8 checker;
+/// the exact three-pass sequential envelope covers the LF pass, all boundary
+/// probes, and complete candidate validation without source-dependent
+/// admission.
+fn scan_anchored_ascii_prefix_quoted_lines(
+    operation: LineCaptureOperationIdentity,
+    haystack: &[u8],
+) -> Result<LineScanReport, LineCaptureRunError> {
+    let mut report = LineScanReport {
+        input_loads: haystack.len(),
+        work: haystack.len(),
+        ..LineScanReport::default()
+    };
+    let mut line_start = 0_usize;
+    for line_feed in memchr_iter(b'\n', haystack) {
+        let mut line_end = line_feed;
+        if line_end > line_start {
+            charge_line_scan_load(&mut report, 1)?;
+            let previous =
+                line_end
+                    .checked_sub(1)
+                    .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                        LineCaptureResource::SequentialBytes,
+                    ))?;
+            if haystack[previous] == b'\r' {
+                line_end = previous;
+            }
+        }
+        scan_anchored_ascii_prefix_quoted_line(
+            &haystack[line_start..line_end],
+            operation,
+            &mut report,
+        )?;
+        line_start = line_feed
+            .checked_add(1)
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::SequentialBytes,
+            ))?;
+    }
+    if line_start < haystack.len() {
+        scan_anchored_ascii_prefix_quoted_line(&haystack[line_start..], operation, &mut report)?;
+    }
+    Ok(report)
+}
+
+fn scan_anchored_ascii_prefix_quoted_line(
+    line: &[u8],
+    operation: LineCaptureOperationIdentity,
+    report: &mut LineScanReport,
+) -> Result<(), LineCaptureRunError> {
+    report.lines = report
+        .lines
+        .checked_add(1)
+        .ok_or(LineCaptureRunError::ArithmeticOverflow(
+            LineCaptureResource::ReducerEvents,
+        ))?;
+    charge_line_scan_work(&mut report.work, 1)?;
+    if line.len() < operation.minimum_match_bytes {
+        return Ok(());
+    }
+
+    charge_line_scan_load(report, 1)?;
+    if !line.last().copied().is_some_and(is_quote_byte) {
+        return Ok(());
+    }
+    let mut opening = None;
+    for (offset, &byte) in line.iter().enumerate() {
+        charge_line_scan_load(report, 1)?;
+        if is_quote_prefix_byte(byte) {
+            continue;
+        }
+        if is_quote_byte(byte) {
+            opening = Some(offset);
+        }
+        break;
+    }
+    let Some(opening) = opening else {
+        return Ok(());
+    };
+    if opening >= line.len().saturating_sub(1) {
+        return Ok(());
+    }
+
+    charge_line_scan_load(report, line.len())?;
+    if core::str::from_utf8(line).is_err() {
+        return Ok(());
+    }
+    add_match(&mut report.matches)
+}
+
+fn charge_line_scan_load(
+    report: &mut LineScanReport,
+    amount: usize,
+) -> Result<(), LineCaptureRunError> {
+    report.input_loads =
+        report
+            .input_loads
+            .checked_add(amount)
+            .ok_or(LineCaptureRunError::ArithmeticOverflow(
+                LineCaptureResource::SequentialBytes,
+            ))?;
+    charge_line_scan_work(&mut report.work, amount)
+}
+
+fn charge_line_scan_work(work: &mut usize, amount: usize) -> Result<(), LineCaptureRunError> {
+    *work = work
+        .checked_add(amount)
+        .ok_or(LineCaptureRunError::ArithmeticOverflow(
+            LineCaptureResource::ExecutionWork,
+        ))?;
+    Ok(())
 }
 
 fn add_match(matches: &mut usize) -> Result<(), LineCaptureRunError> {
@@ -1536,6 +1686,14 @@ fn is_quote_prefix(scalar: char) -> bool {
 
 fn is_quote(scalar: char) -> bool {
     matches!(scalar, '\'' | '"')
+}
+
+fn is_quote_prefix_byte(byte: u8) -> bool {
+    matches!(byte, b'B' | b'R' | b'U' | b'b' | b'r' | b'u')
+}
+
+fn is_quote_byte(byte: u8) -> bool {
+    matches!(byte, b'\'' | b'"')
 }
 
 fn is_unicode_word(scalar: char) -> bool {

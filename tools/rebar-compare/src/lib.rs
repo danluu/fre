@@ -597,7 +597,7 @@ impl CandidateAdapter for CurrentFreAdapter {
                 "{}; fre Rust-bytes facade: PortableRegex grep with absolute/LF-line/ASCII-word/positive-Unicode-word assertions and a linear canonical Unicode word-run plan plus construction-selected one-pattern compile/count/span-sum and ordered build-many compile/count/span-sum/uniform-capture-count; exact literal, direct Unicode scalar-class/counted-run, bounded fixed class-sandwich, ordered grapheme scalar DFA, linear bounded compound byte-class sequence count, constant-frontier bounded separated-field count, shared finite-language dense/sparse automaton, guarded finite ASCII-word dictionary scan, full-Unicode guarded maximal ASCII-word-run finite set with exact length/two-byte-prefix masks, allocation-free ASCII fixed-predicate Word64 Shift-And with exact repetition expansion and up to four disjoint ranges per position, full-Unicode variable-width canonical case-fold alternatives, fixed-class/bounded-gap literal context count, ordered literal, or reverse-sequential-rows continuation with HIR-certified required internal-anchor and exact URL count/span-sum routes; compact canonical scalar ranges; regex-redux uses a prospectively bounded 15-stage sequential composite with one fresh Auto count or literal-replacement artifact live at a time; grep-capture participation additionally recognizes three exact literal-anchored noqa HIRs with separate ASCII-leading, ASCII-no-leading, and Unicode-leading identities and allocation-free prospective whole-haystack bounds plus four exact-HIR allocation-free Ruff line-stream configurations and one additional exact-HIR allocation-free Unicode-off anchored ASCII separated-fields HIR, with distinct immutable identities and a same-parse bounded required-any-literal DFA whose construction proves delimiter safety before one checked whole-input literal stream prunes impossible LF-framed lines for unchanged selector/replay, with an independent per-line fallback otherwise; other capture participation uses a direct Unicode-off two-arm prefix/class uniform-participation count, a uniform whole-match proof, a proved uniform captured Unicode-scalar alternation, whole-operation capture-erased span selection with a structural fixed-participation proof, or exact-span persistent tagged-history replay",
                 profile.identity_string()
             ),
-            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, single-load decoding, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
+            availability: "one-pattern compile/count/count-spans auto-select exact canonical literals, canonical nonempty root Unicode scalar classes and greedy/lazy non-nullable root scalar repetitions, span-sum also admits greedy nullable unbounded root scalar repetition by erasing its zero-length matches, exact PREFIX MIDDLE{N} SUFFIX byte/scalar class sandwiches, Unicode-off count for greedy bounded repetitions of pairwise-disjoint HEAD BODY+ TRAIL* byte-class units, Unicode-off fixed-count identical bounded byte-class fields separated by one disjoint byte, Unicode-off fixed-class/bounded-gap literal contexts, a bounded finite-language shared dense or sparse reversed automaton (including nonempty valid-UTF8 Unicode words), a bounded Unicode-off dictionary scan for finite nonempty ASCII-word bodies with proved directional word guards, a bounded Unicode-on maximal ASCII-word-run scan with exact length/two-byte-prefix masks for finite nonempty ASCII-word bodies with two full word boundaries, an allocation-free Unicode-off fixed-predicate Word64 reducer for concatenated literals/classes and exact repetitions, with at most four disjoint ASCII ranges per position, after a typed finite refusal, a full-Unicode variable-width canonical case-fold alternative count plan, or a bounded continuation program including structurally certified internal-anchor and exact ordered-TLD URL reducers; regex-redux composes one cleanup replacement, nine independent finite-language counts, and five ordered literal replacements serially under cumulative checked work/output/allocation/peak limits without job-name or expected-value dispatch; the direct scalar and fixed-class plans decode valid UTF-8 once and advance one byte over invalid encoding; the direct scalar plan keeps counted and lower-bounded repetition symbolic and supports count/span-sum without materializing matches; fixed-class reduction uses bounded N+2 circular state without a continuation log; bounded compound class count uses three inline byte masks and constant execution state; bounded separated-field count uses inline byte masks and a constant frontier; bounded-context count uses monotone suffix intervals and one non-overlapping unbordered-literal stream in O(N+Q); the finite-language DFA preserves leftmost-first HIR order and empty-match progress while using either dense shared transitions or sorted sparse edges with bounded failure links; the guarded dictionary preserves source order, duplicates, full bytes and directional guards while scanning exact maximal ASCII-word runs without allocation; the Unicode guarded maximal-run route preserves source order and checks adjacent Unicode scalars only after exact ASCII-body verification; Unicode-on finite execution rejects empty words and invalid UTF-8 words before selection; Unicode-on continuation admits compact canonical-scalar transitions with bounded UTF-8 decoding plus positive Unicode word boundaries on valid UTF-8, while local Unicode-off raw bytes remain byte-oriented and malformed word-boundary input plus remaining Unicode-word/CRLF assertions stay typed refusals; ordered build-many compile/count/count-spans preserve leftmost-first input priority, use the ordered literal plan for eligible sets, and otherwise use the Unicode-off bounded continuation while retaining every pattern's syntax/profile identity; ordered build-many count-captures additionally requires every nonempty pattern to have exactly one root capture, then reduces ordered matches to the implicit whole-match group plus that uniformly participating capture; one-pattern grep-captures first admits only three exact literal-anchored noqa HIRs under route-specific prospective O(N) work and sequential-byte bounds with zero dynamic scratch or four exact Unicode-on Ruff line HIRs plus one Unicode-off anchored ASCII separated-fields HIR through one allocation-free configured stream envelope with fixed participation, bounded input-load certificates, and distinct plan identities, then may certify an ordered required-any-literal set from the same capture HIR and, when construction proves every effective literal delimiter-free, prune impossible lines through one checked whole-input non-overlapping stream before unchanged exact selector/replay; delimiter-sensitive required sets retain an independent checked per-line fallback; other one-pattern count-captures/grep-captures normalize a proved descending uniform captured Unicode-scalar alternation to one bounded scalar run, use a complete reverse-row selector without tagged replay when the same HIR traversal proves fixed capture participation, and otherwise retain exact-span tagged-history replay; compile constructs a fresh complete artifact before untimed verification; portable grep construction-selects a linear canonical \\b\\w{m,}\\b Unicode scalar-run plan and otherwise executes bounded compact canonical-scalar transitions plus absolute/LF-line/ASCII-word and positive Unicode-word assertions; invalid UTF-8 is non-word context for positive Unicode boundaries, while CRLF and remaining Unicode-word looks stay typed refusals; general capture-record/span outputs and all other inputs are unsupported"
                 .to_string(),
             runtime_sha256,
         };
@@ -7863,6 +7863,13 @@ fn ruff_line_capture_run_limits(
 ) -> Result<LineCaptureRunLimits, ExecutionError> {
     authenticate_ruff_line_capture_plan(plan)?;
     let operation = plan.build_report().identity.operation;
+    let sequential_bytes = plan
+        .sequential_bytes_upper_bound(haystack_len)
+        .map_err(|error| {
+            ExecutionError::fault(format!(
+                "FRE line-capture sequential preflight failed: {error}"
+            ))
+        })?;
     let reducer_limit = usize::try_from(limits.reducer_steps)
         .map_err(|_| ExecutionError::fault("FRE line-capture reducer limit does not fit usize"))?;
     let work = haystack_len
@@ -7880,7 +7887,7 @@ fn ruff_line_capture_run_limits(
         ("ExecutionWork", work, limits.fre_aggregate_operation_work),
         (
             "SequentialBytes",
-            haystack_len,
+            sequential_bytes,
             limits.fre_aggregate_sequential_bytes,
         ),
         ("CaptureCount", prospective_captures, reducer_limit),
@@ -7916,9 +7923,16 @@ fn execute_ruff_line_capture_with_limits(
                 ExecutionError::fault(format!("FRE direct line-capture reducer faulted: {error}"))
             }
         })?;
+    let expected_sequential =
+        plan.sequential_bytes_upper_bound(haystack.len())
+            .map_err(|error| {
+                ExecutionError::fault(format!(
+                    "FRE line-capture sequential authentication failed: {error}"
+                ))
+            })?;
     if report.identity != plan.build_report().identity
-        || report.sequential_bytes != haystack.len()
-        || report.actual_input_loads != haystack.len()
+        || report.sequential_bytes != expected_sequential
+        || report.actual_input_loads > expected_sequential
         || report.actual_work > report.work
         || report.scratch_bytes != 0
         || report.output_bytes != 0
@@ -20886,6 +20900,7 @@ mod tests {
         work_rate: usize,
         groups: usize,
         inspection: usize,
+        sequential_passes: usize,
     ) -> (RunLimits, usize, usize) {
         let work = haystack_len
             .checked_mul(work_rate)
@@ -20898,11 +20913,14 @@ mod tests {
         let reducer_events = haystack_len
             .checked_add(captures)
             .expect("small configured Ruff reducer bound");
+        let sequential_bytes = haystack_len
+            .checked_mul(sequential_passes)
+            .expect("small configured Ruff sequential bound");
         (
             RunLimits {
                 fre_capture_scalar_planner_work: inspection,
                 fre_aggregate_operation_work: work,
-                fre_aggregate_sequential_bytes: haystack_len,
+                fre_aggregate_sequential_bytes: sequential_bytes,
                 reducer_steps: u64::try_from(reducer_events).expect("reducer u64"),
                 ..RunLimits::default()
             },
@@ -20920,6 +20938,7 @@ mod tests {
                 SHEBANG_INSPECTION_WORK,
                 12,
                 3,
+                1,
                 b" #!python\n#!x\nno\n".as_slice(),
             ),
             (
@@ -20928,6 +20947,7 @@ mod tests {
                 STRING_QUOTE_PREFIX_INSPECTION_WORK,
                 8,
                 2,
+                3,
                 b"r'raw'\nUR\"x\"\nno\n".as_slice(),
             ),
             (
@@ -20936,16 +20956,22 @@ mod tests {
                 WHITESPACE_AROUND_KEYWORDS_INSPECTION_WORK,
                 16,
                 3,
+                1,
                 b" if else\nxif _if\ntry\r\n".as_slice(),
             ),
         ];
-        for (pattern, plan, inspection, rate, groups, haystack) in cases {
+        for (pattern, plan, inspection, rate, groups, sequential_passes, haystack) in cases {
             let upstream = rust_compile_options(&[pattern.to_string()], true, false)
                 .expect("pinned Rust configured Ruff pattern");
             let expected =
                 grep_captures(&upstream, haystack, u64::MAX).expect("Rust configured Ruff result");
-            let (limits, work, reducer_events) =
-                exact_configured_ruff_limits(haystack.len(), rate, groups, inspection);
+            let (limits, work, reducer_events) = exact_configured_ruff_limits(
+                haystack.len(),
+                rate,
+                groups,
+                inspection,
+                sequential_passes,
+            );
             let mut lifecycle = current_fre_rebar_capture_lifecycle_with_limits(
                 "grep-captures",
                 pattern,
@@ -20970,10 +20996,10 @@ mod tests {
                 (
                     "SequentialBytes",
                     RunLimits {
-                        fre_aggregate_sequential_bytes: haystack
-                            .len()
+                        fre_aggregate_sequential_bytes: limits
+                            .fre_aggregate_sequential_bytes
                             .checked_sub(1)
-                            .expect("nonempty haystack"),
+                            .expect("positive sequential bound"),
                         ..limits.clone()
                     },
                 ),

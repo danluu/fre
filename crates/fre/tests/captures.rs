@@ -778,7 +778,7 @@ fn assert_remaining_ruff_build_limits(pattern: &str, inspection: usize) {
 }
 
 #[test]
-fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
+fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_load_envelopes() {
     let cases = [
         (SHEBANG_CAPTURE_PATTERN, b"#!".as_slice(), 12, 3, 23),
         (
@@ -786,7 +786,7 @@ fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
             b"''".as_slice(),
             8,
             2,
-            15,
+            7,
         ),
         (
             WHITESPACE_AROUND_KEYWORDS_CAPTURE_PATTERN,
@@ -802,9 +802,12 @@ fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
         let prospective_matches = haystack.len() / 2;
         let prospective_captures = prospective_matches * count;
         let prospective_events = haystack.len() + prospective_captures;
+        let sequential_bytes = plan
+            .sequential_bytes_upper_bound(haystack.len())
+            .expect("small sequential envelope");
         let exact = LineCaptureRunLimits {
             max_work: prospective_work,
-            max_sequential_bytes: haystack.len(),
+            max_sequential_bytes: sequential_bytes,
             max_capture_count: prospective_captures,
             max_reducer_events: prospective_events,
         };
@@ -814,8 +817,13 @@ fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
         assert_eq!(report.work, prospective_work);
         assert_eq!(report.actual_work, actual_work);
         assert!(report.actual_work <= report.work);
-        assert_eq!(report.sequential_bytes, haystack.len());
-        assert_eq!(report.actual_input_loads, haystack.len());
+        assert_eq!(report.sequential_bytes, sequential_bytes);
+        assert!(report.actual_input_loads <= sequential_bytes);
+        if plan.build_report().identity.operation.configuration
+            != LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail
+        {
+            assert_eq!(report.actual_input_loads, haystack.len());
+        }
         assert_eq!(report.prospective_matches, prospective_matches);
         assert_eq!(report.prospective_capture_count, prospective_captures);
         assert_eq!(report.prospective_line_events, haystack.len());
@@ -838,7 +846,7 @@ fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
             (
                 LineCaptureResource::SequentialBytes,
                 LineCaptureRunLimits {
-                    max_sequential_bytes: haystack.len() - 1,
+                    max_sequential_bytes: sequential_bytes - 1,
                     ..exact
                 },
             ),
@@ -869,8 +877,16 @@ fn remaining_ruff_line_plans_bind_exact_prospective_limits_and_single_load() {
                 .grep_capture_count(&input, LineCaptureRunLimits::default())
                 .expect("scaled direct reduction");
             assert_eq!(report.work, rate * bytes + 1);
-            assert_eq!(report.sequential_bytes, bytes);
-            assert_eq!(report.actual_input_loads, bytes);
+            let sequential_bytes = plan
+                .sequential_bytes_upper_bound(bytes)
+                .expect("scaled sequential envelope");
+            assert_eq!(report.sequential_bytes, sequential_bytes);
+            assert!(report.actual_input_loads <= sequential_bytes);
+            if plan.build_report().identity.operation.configuration
+                != LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail
+            {
+                assert_eq!(report.actual_input_loads, bytes);
+            }
             assert!(report.actual_work <= report.work);
         }
     }
@@ -883,7 +899,16 @@ fn assert_line_capture_oracle(pattern: &str, haystack: &[u8]) {
         .grep_capture_count(haystack, LineCaptureRunLimits::default())
         .unwrap_or_else(|error| panic!("pattern={pattern:?} haystack={haystack:?}: {error}"));
     assert_eq!(report.capture_count, expected, "haystack={haystack:?}");
-    assert_eq!(report.actual_input_loads, haystack.len());
+    let sequential_bytes = plan
+        .sequential_bytes_upper_bound(haystack.len())
+        .expect("oracle sequential envelope");
+    assert_eq!(report.sequential_bytes, sequential_bytes);
+    assert!(report.actual_input_loads <= sequential_bytes);
+    if plan.build_report().identity.operation.configuration
+        != LineCaptureConfiguration::AnchoredAsciiPrefixQuotedTail
+    {
+        assert_eq!(report.actual_input_loads, haystack.len());
+    }
     assert!(report.actual_work <= report.work);
     assert_eq!(report.scratch_bytes, 0);
     assert_eq!(report.output_bytes, 0);
@@ -945,6 +970,30 @@ fn string_quote_direct_plan_matches_casefold_raw_invalid_and_crlf_oracles() {
 }
 
 #[test]
+fn anchored_quote_boundaries_skip_semantically_dead_line_interiors() {
+    let plan = line_capture_plan(STRING_QUOTE_PREFIX_CAPTURE_PATTERN);
+    let haystack = vec![b'x'; 32_768];
+    let report = plan
+        .grep_capture_count(&haystack, LineCaptureRunLimits::default())
+        .expect("boundary-rejected line");
+    assert_eq!(report.matches, 0);
+    assert_eq!(report.capture_count, 0);
+    assert_eq!(
+        report.sequential_bytes,
+        haystack.len().checked_mul(3).expect("small test bound")
+    );
+    assert_eq!(
+        report.actual_input_loads,
+        haystack.len().checked_add(1).expect("small test loads"),
+        "the mandatory trailing quote rejects before prefix or UTF-8 interior work"
+    );
+    assert_eq!(
+        report.actual_work,
+        haystack.len().checked_add(2).expect("small test work")
+    );
+}
+
+#[test]
 fn keyword_direct_plan_matches_unicode_boundaries_invalid_and_multiple_oracles() {
     let all_keywords = b"False,None,True,and,as,assert,async,await,break,class,continue,def,del,elif,else,except,finally,for,from,global,if,import,in,is,lambda,nonlocal,not,or,pass,raise,return,try,while,with,yield\n";
     assert_eq!(
@@ -980,7 +1029,7 @@ fn keyword_direct_plan_matches_unicode_boundaries_invalid_and_multiple_oracles()
 }
 
 #[test]
-fn remaining_ruff_line_plans_load_every_valid_malformed_and_cr_byte_once() {
+fn remaining_ruff_line_plans_honor_exact_valid_malformed_and_cr_load_envelopes() {
     let inputs: &[&[u8]] = &[
         b"\ra",
         b"\r\n",
