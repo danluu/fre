@@ -432,12 +432,26 @@ fn select_executor(
                 && prospective.allocations <= allocation_limit
                 && prospective.enforce_limits(limits).is_ok()
             {
-                return Ok(Selection {
-                    executor: SelectedExecutor::Events,
-                    prospective,
-                    physical_route: OperationPhysicalRoute::OrderedBoundedSpanSumEvents,
-                    prepublication_fallback: OperationPrepublicationFallback::None,
-                });
+                match frontier_work_envelope(plan, input_bytes) {
+                    Ok(frontier_work) if prospective.work_bound < frontier_work.work_bound => {
+                        return Ok(Selection {
+                            executor: SelectedExecutor::Events,
+                            prospective,
+                            physical_route: OperationPhysicalRoute::OrderedBoundedSpanSumEvents,
+                            prepublication_fallback: OperationPrepublicationFallback::None,
+                        });
+                    }
+                    Err(Error::ArithmeticOverflow { .. }) => {
+                        return Ok(Selection {
+                            executor: SelectedExecutor::Events,
+                            prospective,
+                            physical_route: OperationPhysicalRoute::OrderedBoundedSpanSumEvents,
+                            prepublication_fallback: OperationPrepublicationFallback::None,
+                        });
+                    }
+                    Err(other) => return Err(other),
+                    Ok(_) => {}
+                }
             }
             return Err(error);
         }
@@ -594,34 +608,12 @@ fn frontier_prospective(
     plan: &OrderedBoundedSpanSumPlan,
     input_bytes: usize,
 ) -> Result<OperationProspective, Error> {
-    let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
-    let anchor_bytes = add(
-        plan.first_anchor().len(),
-        plan.second_anchor().len(),
-        Resource::ExecutionWork,
-    )?;
-    let root_probes = mul(
-        mul(2, anchor_bytes, Resource::ExecutionWork)?,
-        boundaries,
-        Resource::ExecutionWork,
-    )?;
-    let states = middle_state_count(plan.max_chunks())?;
-    let slots = mul(4, states, Resource::ExecutionWork)?;
-    let lane_bound = mul(slots, boundaries, Resource::ExecutionWork)?;
-    // A work unit is one bounded service, not the sum of its correlated
-    // public subcounters. Each slot can participate in at most six services
-    // per boundary: epsilon closure, two direction-presence passes, terminal
-    // update, symbol transition, and settlement/filtering. Literal source
-    // probes and the two class predicates are charged separately.
-    let work_bound = add(
-        add(
-            mul(6, lane_bound, Resource::ExecutionWork)?,
-            mul(2, root_probes, Resource::ExecutionWork)?,
-            Resource::ExecutionWork,
-        )?,
-        mul(3, input_bytes, Resource::ExecutionWork)?,
-        Resource::ExecutionWork,
-    )?;
+    let envelope = frontier_work_envelope(plan, input_bytes)?;
+    let boundaries = envelope.boundaries;
+    let root_probes = envelope.root_probes;
+    let slots = envelope.slots;
+    let lane_bound = envelope.lane_bound;
+    let work_bound = envelope.work_bound;
     let scratch = core::mem::size_of::<ExecutorScratch>();
     let accounting = ExecutionAccounting {
         state_evaluations: mul(4, lane_bound, Resource::ExecutionWork)?,
@@ -663,6 +655,56 @@ fn frontier_prospective(
         allocations: 0,
         peak_bytes: scratch,
         accounting,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FrontierWorkEnvelope {
+    boundaries: usize,
+    root_probes: usize,
+    slots: usize,
+    lane_bound: usize,
+    work_bound: usize,
+}
+
+fn frontier_work_envelope(
+    plan: &OrderedBoundedSpanSumPlan,
+    input_bytes: usize,
+) -> Result<FrontierWorkEnvelope, Error> {
+    let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
+    let anchor_bytes = add(
+        plan.first_anchor().len(),
+        plan.second_anchor().len(),
+        Resource::ExecutionWork,
+    )?;
+    let root_probes = mul(
+        mul(2, anchor_bytes, Resource::ExecutionWork)?,
+        boundaries,
+        Resource::ExecutionWork,
+    )?;
+    let states = middle_state_count(plan.max_chunks())?;
+    let slots = mul(4, states, Resource::ExecutionWork)?;
+    let lane_bound = mul(slots, boundaries, Resource::ExecutionWork)?;
+    // A work unit is one bounded service, not the sum of its correlated
+    // public subcounters. Each slot can participate in at most six services
+    // per boundary: epsilon closure, two direction-presence passes, terminal
+    // update, symbol transition, and settlement/filtering. Literal source
+    // probes and the two class predicates are charged separately.
+    let work_bound = add(
+        add(
+            mul(6, lane_bound, Resource::ExecutionWork)?,
+            mul(2, root_probes, Resource::ExecutionWork)?,
+            Resource::ExecutionWork,
+        )?,
+        mul(3, input_bytes, Resource::ExecutionWork)?,
+        Resource::ExecutionWork,
+    )?;
+    Ok(FrontierWorkEnvelope {
+        boundaries,
+        root_probes,
+        slots,
+        lane_bound,
+        work_bound,
     })
 }
 
@@ -2252,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_bounded_span_sum_events_survive_frontier_prospective_overflow() {
+    fn ordered_bounded_span_sum_events_survive_frontier_work_overflow() {
         let compiled = compiled(PATTERN);
         let plan = compiled
             .ordered_bounded_span_sum
@@ -2262,6 +2304,10 @@ mod tests {
         let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
         assert!(matches!(
             frontier_prospective(&compiled.program, plan, input_bytes),
+            Err(Error::ArithmeticOverflow { .. })
+        ));
+        assert!(matches!(
+            frontier_work_envelope(plan, input_bytes),
             Err(Error::ArithmeticOverflow { .. })
         ));
         let selection = select_executor(
@@ -2282,6 +2328,38 @@ mod tests {
             selection.prepublication_fallback,
             OperationPrepublicationFallback::None
         );
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_bookkeeping_overflow_cannot_promote_dominated_events() {
+        let pattern = r"(?:a(?:_*[ab]+_*){0,1}b)|(?:b(?:_*[ab]+_*){0,1}a)";
+        let compiled = compiled(pattern);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        let input_bytes = 72_057_594_037_927_935;
+        let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
+        let frontier_work = frontier_work_envelope(plan, input_bytes).unwrap();
+        assert!(events.work_bound > frontier_work.work_bound);
+        let frontier_error =
+            frontier_prospective(&compiled.program, plan, input_bytes).unwrap_err();
+        assert!(matches!(
+            frontier_error,
+            Error::ArithmeticOverflow {
+                resource: Resource::ExecutionWork
+            }
+        ));
+        let selection_error = select_executor(
+            &compiled.program,
+            plan,
+            input_bytes,
+            super::super::intrinsic_attempt_limits(),
+            usize::MAX,
+        )
+        .err()
+        .expect("dominated event route must retain the frontier overflow");
+        assert_eq!(selection_error, frontier_error);
     }
 
     #[test]
