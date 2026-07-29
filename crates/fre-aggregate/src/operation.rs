@@ -2882,7 +2882,7 @@ impl CompiledRegex {
         let mut accounting = StateByteValueMeter;
         let (matches, span_sum) = match plan.topology() {
             StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => {
-                reduce_greedy_prefix_literal_suffix(
+                reduce_greedy_prefix_literal_suffix_value(
                     plan,
                     local,
                     envelope.work_bound,
@@ -5394,6 +5394,185 @@ fn reduce_greedy_prefix_literal_suffix(
         );
     }
     reduce_greedy_prefix_literal_suffix_scalar(plan, haystack, work_limit, accounting)
+}
+
+/// Value-only long-input reduction for the compile-proved `C* L D*`
+/// topology.
+///
+/// `L ⊆ C ⊆ D` proves that the first literal at or after the non-overlap
+/// cursor selects the same whole-match span as greedy backtracking: the start
+/// follows the last non-`C` byte before that literal and the end is the first
+/// non-`D` byte after it. The retained byte sets can therefore drive native
+/// searches for small complements. Other admitted classes keep an exact
+/// scalar boundary search, so this is not a shape-selection restriction.
+///
+/// The complete incumbent resource envelope is admitted before this function
+/// runs. Short inputs retain the established scalar loop; long inputs build
+/// one reusable native literal finder for the whole operation.
+fn reduce_greedy_prefix_literal_suffix_value(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut StateByteValueMeter,
+) -> Result<(usize, usize), Error> {
+    if haystack.len() < 256 {
+        return reduce_greedy_prefix_literal_suffix_scalar(plan, haystack, work_limit, accounting);
+    }
+
+    let literal = plan.literal();
+    if literal.is_empty() {
+        return Err(Error::InternalInvariant(
+            "state-byte greedy value plan lost its nonempty literal",
+        ));
+    }
+    let finder = memchr::memmem::Finder::new(literal);
+    let prefix_boundary = StateByteClassBoundary::new(plan.first());
+    let suffix_boundary = StateByteClassBoundary::new(plan.second());
+    let mut cursor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    while cursor < haystack.len() {
+        let remaining = haystack.get(cursor..).ok_or(Error::InternalInvariant(
+            "state-byte greedy literal cursor exceeds admitted source",
+        ))?;
+        let Some(relative_literal_start) = finder.find(remaining) else {
+            break;
+        };
+        let literal_start = add(cursor, relative_literal_start, Resource::Boundaries)?;
+        let literal_end = add(literal_start, literal.len(), Resource::Boundaries)?;
+
+        let prefix_source = haystack
+            .get(cursor..literal_start)
+            .ok_or(Error::InternalInvariant(
+                "state-byte greedy prefix window exceeds admitted source",
+            ))?;
+        let start = add(
+            cursor,
+            prefix_boundary.start_after_last_nonmember(prefix_source),
+            Resource::Boundaries,
+        )?;
+
+        let suffix_source = haystack.get(literal_end..).ok_or(Error::InternalInvariant(
+            "state-byte greedy suffix window exceeds admitted source",
+        ))?;
+        let end = add(
+            literal_end,
+            suffix_boundary.first_nonmember_or_len(suffix_source),
+            Resource::Boundaries,
+        )?;
+
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            end.checked_sub(start).ok_or(Error::InternalInvariant(
+                "state-byte greedy value reducer selected a reversed span",
+            ))?,
+            Resource::SpanSum,
+        )?;
+        cursor = end;
+    }
+    Ok((matches, span_sum))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StateByteClassBoundary {
+    Native { excluded: [u8; 3], excluded_len: u8 },
+    Scalar(crate::program::ByteSet),
+}
+
+impl StateByteClassBoundary {
+    /// Derive a bounded complement classifier from the compile-retained
+    /// membership bitset. Four or more excluded bytes use the general scalar
+    /// fallback; discovery therefore examines at most four set bits.
+    fn new(class: crate::program::ByteSet) -> Self {
+        let mut excluded = [0_u8; 3];
+        let mut excluded_len = 0_usize;
+        for (word_index, members) in class.0.into_iter().enumerate() {
+            let mut outside = !members;
+            while outside != 0 {
+                if excluded_len == excluded.len() {
+                    return Self::Scalar(class);
+                }
+                let bit = usize::try_from(outside.trailing_zeros())
+                    .expect("u64 trailing-zero count fits usize");
+                let byte = word_index
+                    .checked_mul(
+                        usize::try_from(u64::BITS).expect("u64 bit width fits target usize"),
+                    )
+                    .and_then(|base| base.checked_add(bit))
+                    .expect("four u64 words contain exactly the byte domain");
+                excluded[excluded_len] = u8::try_from(byte).expect("byte-set bit index fits u8");
+                excluded_len = excluded_len
+                    .checked_add(1)
+                    .expect("three retained complement bytes fit usize");
+                outside &= outside.wrapping_sub(1);
+            }
+        }
+        Self::Native {
+            excluded,
+            excluded_len: u8::try_from(excluded_len)
+                .expect("three retained complement bytes fit u8"),
+        }
+    }
+
+    #[inline]
+    fn first_nonmember_or_len(self, haystack: &[u8]) -> usize {
+        match self {
+            Self::Native {
+                excluded_len: 0, ..
+            } => haystack.len(),
+            Self::Native {
+                excluded,
+                excluded_len: 1,
+            } => memchr::memchr(excluded[0], haystack).unwrap_or(haystack.len()),
+            Self::Native {
+                excluded,
+                excluded_len: 2,
+            } => memchr::memchr2(excluded[0], excluded[1], haystack).unwrap_or(haystack.len()),
+            Self::Native {
+                excluded,
+                excluded_len: 3,
+            } => memchr::memchr3(excluded[0], excluded[1], excluded[2], haystack)
+                .unwrap_or(haystack.len()),
+            Self::Native { .. } => {
+                unreachable!("native state-byte complement retains at most three bytes")
+            }
+            Self::Scalar(class) => haystack
+                .iter()
+                .position(|&byte| !class.contains(byte))
+                .unwrap_or(haystack.len()),
+        }
+    }
+
+    #[inline]
+    fn start_after_last_nonmember(self, haystack: &[u8]) -> usize {
+        let last = match self {
+            Self::Native {
+                excluded_len: 0, ..
+            } => None,
+            Self::Native {
+                excluded,
+                excluded_len: 1,
+            } => memchr::memrchr(excluded[0], haystack),
+            Self::Native {
+                excluded,
+                excluded_len: 2,
+            } => memchr::memrchr2(excluded[0], excluded[1], haystack),
+            Self::Native {
+                excluded,
+                excluded_len: 3,
+            } => memchr::memrchr3(excluded[0], excluded[1], excluded[2], haystack),
+            Self::Native { .. } => {
+                unreachable!("native state-byte complement retains at most three bytes")
+            }
+            Self::Scalar(class) => haystack.iter().rposition(|&byte| !class.contains(byte)),
+        };
+        last.map_or(0, |index| {
+            index
+                .checked_add(1)
+                .expect("a retained source index has a following boundary")
+        })
+    }
 }
 
 fn reduce_greedy_prefix_literal_suffix_anchored(
@@ -11719,10 +11898,10 @@ mod tests {
         CachedFrontierRequirements, CachedFrontierStore, CachedTransitionSlot,
         MAX_CACHED_FRONTIERS, OperationAttemptKind, OperationKind, OperationLimitsId,
         OperationPhysicalRoute, OperationPrepublicationFallback, OperationProspective,
-        RequiredLiteralScan, Requirements, RowReader, RowStorage, RowStore, StateByteSpanSumPlan,
-        StateByteSpanSumTopology, UNCACHED_FRONTIER, allocation_fault, cached_boundary_symbol,
-        cached_compute_row, cached_frontier_amortizes_dense, cached_frontier_words,
-        cached_program_assertion_mask, cached_retained_candidate_bit,
+        RequiredLiteralScan, Requirements, RowReader, RowStorage, RowStore, StateByteClassBoundary,
+        StateByteSpanSumPlan, StateByteSpanSumTopology, UNCACHED_FRONTIER, allocation_fault,
+        cached_boundary_symbol, cached_compute_row, cached_frontier_amortizes_dense,
+        cached_frontier_words, cached_program_assertion_mask, cached_retained_candidate_bit,
         compact_operation_allocation_count, decode, dense_reduction_work_floor, encoded_width,
         exact_filled, fixed_continuation_beats_dense, operation_identity, read_encoded,
         scan_required_literals, write_encoded,
@@ -17027,6 +17206,18 @@ mod tests {
                     Some(OperationPhysicalRoute::StateByteSpanSum)
                 );
                 assert!(sum.receipt.authenticates_success());
+                assert_eq!(
+                    compiled
+                        .span_sum_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap(),
+                    sum.value,
+                    "compact value mismatch for {pattern:?}, {length}"
+                );
                 let count = compiled
                     .count_value_attempt(
                         &haystack,
@@ -17044,6 +17235,21 @@ mod tests {
                     "{pattern:?}, {length}"
                 );
                 assert!(count.receipt.authenticates_success());
+                assert_eq!(
+                    compiled
+                        .count_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits {
+                                max_span_sum: 0,
+                                ..OperationLimits::default()
+                            },
+                        )
+                        .unwrap(),
+                    count.value,
+                    "compact count mismatch for {pattern:?}, {length}"
+                );
             }
         }
 
@@ -17053,9 +17259,13 @@ mod tests {
 
     #[test]
     fn state_byte_span_sum_exhaustive_small_differential() {
-        let cases: [(&str, &[u8]); 7] = [
+        let cases: [(&str, &[u8]); 11] = [
             (r"[ab]*ab[abc]*", b"abc\n"),
             (r"[ab]*abab[abc]*", b"abc\n"),
+            (r"[^\n]*[^\n]*=[^\n]*", b"=\nxy"),
+            (r"[^ab]*[^ab]*c[^a]*", b"abcx"),
+            (r"[^abc]*[^abc]*d[^ab]*", b"abcd"),
+            (r"[^abcd]*[^abcd]*e[^abc]*", b"abde"),
             (r"[ab]+[ ]+a", b"ab \n"),
             (r"[a]+[b]+aba", b"abx\n"),
             (r"[ab]+@[ab]+", b"ab@\n"),
@@ -17164,6 +17374,275 @@ mod tests {
         assert_eq!(result.receipt.actual.random_access_bytes_read, 0);
         assert_eq!(result.receipt.actual.root_probes, haystack.len());
         assert!(result.receipt.authenticates_success());
+    }
+
+    #[test]
+    fn state_byte_greedy_boundary_classifier_matches_scalar_for_every_byte() {
+        let excluded_cases: &[&[u8]] = &[&[], &[0], &[0, 127], &[0, 127, 255], &[0, 64, 128, 255]];
+        let source = (u8::MIN..=u8::MAX)
+            .rev()
+            .chain(u8::MIN..=u8::MAX)
+            .collect::<Vec<_>>();
+        for &excluded in excluded_cases {
+            let mut class = crate::program::ByteSet([u64::MAX; 4]);
+            for &byte in excluded {
+                let word = usize::from(byte) / 64;
+                let bit = usize::from(byte) % 64;
+                class.0[word] &= !(1_u64 << bit);
+            }
+            let classifier = StateByteClassBoundary::new(class);
+            assert_eq!(
+                matches!(classifier, StateByteClassBoundary::Native { .. }),
+                excluded.len() <= 3,
+                "excluded={excluded:?}"
+            );
+            for start in 0..=source.len() {
+                let suffix = &source[start..];
+                let expected_first = suffix
+                    .iter()
+                    .position(|&byte| !class.contains(byte))
+                    .unwrap_or(suffix.len());
+                let expected_last = suffix
+                    .iter()
+                    .rposition(|&byte| !class.contains(byte))
+                    .map_or(0, |index| index + 1);
+                assert_eq!(
+                    classifier.first_nonmember_or_len(suffix),
+                    expected_first,
+                    "forward excluded={excluded:?}, start={start}"
+                );
+                assert_eq!(
+                    classifier.start_after_last_nonmember(suffix),
+                    expected_last,
+                    "reverse excluded={excluded:?}, start={start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_greedy_value_native_boundaries_match_adversarial_runs() {
+        let mut haystack = vec![b'x'; 32 * 1024];
+        for index in (31..haystack.len()).step_by(251) {
+            haystack[index] = b'\n';
+        }
+        for index in (47..haystack.len()).step_by(379) {
+            haystack[index] = if index % 2 == 0 { 0 } else { 0xff };
+        }
+        for index in (73..haystack.len() - 6).step_by(521) {
+            haystack[index..index + 6].copy_from_slice(b"ababab");
+        }
+        for index in (101..haystack.len()).step_by(613) {
+            haystack[index] = b'c';
+        }
+        for index in (149..haystack.len() - 4).step_by(887) {
+            haystack[index..index + 4].copy_from_slice(b"efgh");
+        }
+        for index in (181..haystack.len()).step_by(997) {
+            haystack[index] = b'd';
+        }
+
+        for pattern in [
+            r".*.*abab.*",
+            r"[^ab]*[^ab]*c[^a]*",
+            r"[^abcd]*[^abcd]*efgh[^abc]*",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::GreedyPrefixLiteralSuffix),
+                "{pattern:?}"
+            );
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            for range in [
+                0..haystack.len(),
+                13..haystack.len() - 17,
+                250..8_193,
+                8_191..16_385,
+            ] {
+                let local = &haystack[range.clone()];
+                let expected_sum = oracle
+                    .find_iter(local)
+                    .map(|matched| matched.end() - matched.start())
+                    .sum::<usize>();
+                let expected_count = oracle.find_iter(local).count();
+                let compact_sum = compiled
+                    .span_sum_value(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap();
+                let diagnostic_sum = compiled
+                    .span_sum_value_with_counters(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_sum, diagnostic_sum),
+                    (expected_sum, expected_sum),
+                    "{pattern:?}, range={range:?}"
+                );
+                let count_limits = OperationLimits {
+                    max_span_sum: 0,
+                    ..OperationLimits::default()
+                };
+                let compact_count = compiled
+                    .count_value(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap();
+                let diagnostic_count = compiled
+                    .count_value_with_counters(
+                        &haystack,
+                        range.clone(),
+                        Strategy::ReverseSequentialRows,
+                        count_limits,
+                    )
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    (compact_count, diagnostic_count),
+                    (expected_count, expected_count),
+                    "{pattern:?}, count range={range:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_repeated_delimiter_retained_classifier_matches_native_search() {
+        for pattern in [r"(?:.*?,){2}z", r"(?:.*?;){3}q"] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            let plan = compiled.state_byte_span_sum.as_ref().unwrap();
+            assert_eq!(
+                plan.topology(),
+                StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix
+            );
+            let classifier = plan.delimiter_classifier().unwrap();
+            assert!(classifier.authenticates());
+            let mut seed = 0x9e37_79b9_u32;
+            let mut source = Vec::new();
+            for length in 0..=257_usize {
+                source.clear();
+                for index in 0..length {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let byte = match (seed ^ u32::try_from(index).unwrap()) % 11 {
+                        0..=2 => classifier.first(),
+                        3 => classifier.second(),
+                        4 => b'z',
+                        5 => b'q',
+                        _ => b'a' + u8::try_from(seed % 23).unwrap(),
+                    };
+                    source.push(byte);
+                }
+                for start in 0..=length {
+                    assert_eq!(
+                        state_byte_find_either_retained(classifier, &source[start..]),
+                        memchr::memchr2(classifier.first(), classifier.second(), &source[start..]),
+                        "{pattern:?}, length={length}, start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn state_byte_repeated_delimiter_dense_and_sparse_differential() {
+        for pattern in [
+            r"(?:.*?,){2}z",
+            r"(?:.*?,){13}z",
+            r"(?:.*?;){3}q",
+            r"(?:.*?,){2},x",
+            r"(?:.*?,){2}\nz",
+        ] {
+            let compiled = state_byte_span_sum_fixture(pattern);
+            assert_eq!(
+                compiled
+                    .state_byte_span_sum
+                    .as_ref()
+                    .map(StateByteSpanSumPlan::topology),
+                Some(StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix),
+                "{pattern:?}"
+            );
+            let oracle = RegexBuilder::new(pattern).unicode(false).build().unwrap();
+            let mut seed = 0x243f_6a88_u32;
+            let mut haystack = Vec::new();
+            for case in 0..384_usize {
+                haystack.clear();
+                let length = (case * 67 + 31) % 320;
+                for index in 0..length {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let byte = match (seed ^ u32::try_from(index).unwrap()) % 16 {
+                        0..=5 => b',',
+                        6..=7 => b';',
+                        8 => b'\n',
+                        9 => b'z',
+                        10 => b'x',
+                        11 => b'q',
+                        _ => b'a' + u8::try_from(seed % 26).unwrap(),
+                    };
+                    haystack.push(byte);
+                }
+                let start = if haystack.is_empty() {
+                    0
+                } else {
+                    case % (haystack.len() + 1)
+                };
+                let available = haystack.len() - start;
+                let end = start + (case.wrapping_mul(29) % (available + 1));
+                for range in [0..haystack.len(), start..end] {
+                    let local = &haystack[range.clone()];
+                    let expected_sum: usize = oracle
+                        .find_iter(local)
+                        .map(|matched| matched.end() - matched.start())
+                        .sum();
+                    let expected_count = oracle.find_iter(local).count();
+                    assert_eq!(
+                        compiled
+                            .span_sum_value(
+                                &haystack,
+                                range.clone(),
+                                Strategy::ReverseSequentialRows,
+                                OperationLimits::default(),
+                            )
+                            .unwrap(),
+                        expected_sum,
+                        "{pattern:?}, case={case}, range={range:?}, haystack={haystack:?}"
+                    );
+                    assert_eq!(
+                        compiled
+                            .count_value(
+                                &haystack,
+                                range.clone(),
+                                Strategy::ReverseSequentialRows,
+                                OperationLimits {
+                                    max_span_sum: 0,
+                                    ..OperationLimits::default()
+                                },
+                            )
+                            .unwrap(),
+                        expected_count,
+                        "{pattern:?}, case={case}, range={range:?}, haystack={haystack:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
