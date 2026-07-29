@@ -271,6 +271,16 @@ impl<'binding> AggregateCountExactLiteralAotQualificationV3<'binding> {
 /// session, and the static runtime rechecks exact VL16 immediately before
 /// every native branch. This facade and its adopter are type-disjoint from
 /// both production and movable ASIMD qualification.
+///
+/// The facade itself deliberately has no value-call surface:
+///
+/// ```compile_fail,E0599
+/// use fre::AggregateCountExactLiteralAotSveQualificationV3;
+///
+/// fn direct_count(facade: &AggregateCountExactLiteralAotSveQualificationV3<'_>) {
+///     let _ = facade.count_value();
+/// }
+/// ```
 #[cfg(feature = "count-v3-aot-qualification-private")]
 #[doc(hidden)]
 pub struct AggregateCountExactLiteralAotSveQualificationV3<'binding> {

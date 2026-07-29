@@ -340,6 +340,16 @@ pub struct VerifiedStaticCountQualificationV3 {
 /// fn require_sync<T: Sync>() {}
 /// require_sync::<VerifiedStaticCountSveQualificationV3>();
 /// ```
+///
+/// A verified SVE handle deliberately has no direct call surface:
+///
+/// ```compile_fail,E0599
+/// use fre_aot_static_runtime::VerifiedStaticCountSveQualificationV3;
+///
+/// fn direct_count(handle: &VerifiedStaticCountSveQualificationV3) {
+///     let _ = handle.count();
+/// }
+/// ```
 #[cfg(feature = "count-v3-qualification-private")]
 #[derive(Debug)]
 #[doc(hidden)]
@@ -1215,7 +1225,7 @@ mod tests {
 
     #[cfg(feature = "count-v3-qualification-private")]
     #[test]
-    fn sve_qualification_target_fields_are_exact_and_type_disjoint() {
+    fn sve_qualification_target_fields_are_exact_and_closed() {
         let sve = AotCountCpuFeatures::SVE.bits();
         let sve2 = AotCountCpuFeatures::SVE
             .union(AotCountCpuFeatures::SVE2)
@@ -1273,6 +1283,42 @@ mod tests {
             sve2,
             CountObjectFormatV3::Elf64Aarch64,
             32,
+            16,
+        ));
+        assert!(!exact_sve_target_contract_fields_v3(
+            3,
+            3,
+            AotCountCpuFeatures::SVE2.bits(),
+            AotCountCpuFeatures::SVE2.bits(),
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
+            16,
+        ));
+        assert!(!exact_sve_target_contract_fields_v3(
+            3,
+            3,
+            sve2,
+            sve,
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
+            16,
+        ));
+        assert!(!exact_sve_target_contract_fields_v3(
+            2,
+            2,
+            sve,
+            sve,
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
+            0,
+        ));
+        assert!(!exact_sve_target_contract_fields_v3(
+            2,
+            3,
+            sve,
+            sve,
+            CountObjectFormatV3::Elf64Aarch64,
+            16,
             16,
         ));
     }
