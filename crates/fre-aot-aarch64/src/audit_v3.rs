@@ -286,6 +286,12 @@ pub enum DecodedInstructionV3 {
         predicate: u8,
         base: u8,
     },
+    SveLoadBytesMulVl {
+        destination: u8,
+        predicate: u8,
+        base: u8,
+        vector_offset: i8,
+    },
     SveCompareEqualBytes {
         destination: u8,
         predicate: u8,
@@ -299,6 +305,12 @@ pub enum DecodedInstructionV3 {
         right: u8,
     },
     SveAndPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveOrPredicateBytes {
         destination: u8,
         predicate: u8,
         left: u8,
@@ -369,8 +381,10 @@ impl DecodedInstructionV3 {
             Self::SvePtrueBytesVl16 { .. }
                 | Self::SveDuplicateByte { .. }
                 | Self::SveLoadBytes { .. }
+                | Self::SveLoadBytesMulVl { .. }
                 | Self::SveCompareEqualBytes { .. }
                 | Self::SveAndPredicateBytes { .. }
+                | Self::SveOrPredicateBytes { .. }
                 | Self::SveBitClearPredicateBytesSetFlags { .. }
                 | Self::SveTestPredicateBytes { .. }
                 | Self::SveBreakBeforeBytes { .. }
@@ -447,7 +461,8 @@ impl DecodedInstructionV3 {
             | Self::Move64ToVectorDouble { destination, .. }
             | Self::Insert64ToVectorDoubleLane1 { destination, .. }
             | Self::SveDuplicateByte { destination, .. }
-            | Self::SveLoadBytes { destination, .. } => Some(destination),
+            | Self::SveLoadBytes { destination, .. }
+            | Self::SveLoadBytesMulVl { destination, .. } => Some(destination),
             _ => None,
         }
     }
@@ -2232,6 +2247,34 @@ fn policy_sve_compare_bytes_v3(
     )
 }
 
+fn policy_sve_load_bytes_mul_vl_v3(
+    policy: &mut PolicySinkV3,
+    destination: u8,
+    predicate: u8,
+    base: u8,
+    vector_offset: i8,
+) -> Result<(), CountAotError> {
+    // The architectural zero-offset form has the same bits as ordinary LD1B
+    // and therefore retains the decoder's canonical legacy representation.
+    exact_v3(
+        policy,
+        if vector_offset == 0 {
+            DecodedInstructionV3::SveLoadBytes {
+                destination,
+                predicate,
+                base,
+            }
+        } else {
+            DecodedInstructionV3::SveLoadBytesMulVl {
+                destination,
+                predicate,
+                base,
+                vector_offset,
+            }
+        },
+    )
+}
+
 fn policy_scalar_confirmation_sve_v3(
     policy: &mut PolicySinkV3,
     literal: &[u8],
@@ -2295,43 +2338,44 @@ fn policy_sve_direct_exact_v3(
     compare_immediate64_v3(policy, X6, 63)?;
     condition_v3(policy, ConditionV3::CarryClear, vector16)?;
     add_register64_v3(policy, X15, X0, X3)?;
-    for block in 0_u16..4 {
-        let block_offset = block
-            .checked_mul(SIMD_CANDIDATE_STARTS_V3)
-            .ok_or(audit_arithmetic_v3())?;
-        for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
-            let offset = block_offset
-                .checked_add(u16::try_from(index).expect("direct literal width"))
-                .ok_or(audit_arithmetic_v3())?;
-            add_immediate64_v3(policy, X8, X15, offset)?;
-            exact_v3(
+    for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+        add_immediate64_v3(
+            policy,
+            X8,
+            X15,
+            u16::try_from(index).expect("direct literal width"),
+        )?;
+        for block in 0_u8..4 {
+            policy_sve_load_bytes_mul_vl_v3(
                 policy,
-                DecodedInstructionV3::SveLoadBytes {
-                    destination: 0,
-                    predicate: 0,
-                    base: X8,
-                },
+                0,
+                0,
+                X8,
+                i8::try_from(block).expect("nonnegative imm4"),
             )?;
-            let result = if index == 0 { 1 } else { 2 };
+            let block_predicate = 4_u8.checked_add(block).expect("p4 through p7");
+            let result = if index == 0 { block_predicate } else { 1 };
             policy_sve_compare_bytes_v3(policy, result, 0, 0, constant, sve2)?;
             if index != 0 {
                 exact_v3(
                     policy,
                     DecodedInstructionV3::SveAndPredicateBytes {
-                        destination: 1,
+                        destination: block_predicate,
                         predicate: 0,
-                        left: 1,
+                        left: block_predicate,
                         right: result,
                     },
                 )?;
             }
         }
+    }
+    for block_predicate in 4_u8..8 {
         exact_v3(
             policy,
             DecodedInstructionV3::SveCountPredicateBytes {
                 destination: X6,
                 predicate: 0,
-                source: 1,
+                source: block_predicate,
             },
         )?;
         add_register64_v3(policy, X13, X13, X6)?;
@@ -2423,6 +2467,9 @@ fn policy_sve_filtered_v3(
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
     let advance = policy.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_scan = policy.new_label(LabelKindV3::VectorLoop)?;
+    let primary_sparse_hit = policy.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_first_half = policy.new_label(LabelKindV3::Internal)?;
     let tail = policy.new_label(LabelKindV3::ScalarTail)?;
     let tail_miss = policy.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).expect("bounded width");
@@ -2455,7 +2502,31 @@ fn policy_sve_filtered_v3(
     compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
     condition_v3(policy, ConditionV3::CarryClear, tail)?;
     add_register64_v3(policy, X15, X0, X3)?;
-    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+    let primary_offset = filter.offsets[0];
+    let primary_base = if primary_offset == 0 {
+        X15
+    } else {
+        add_immediate64_v3(policy, X8, X15, u16::from(primary_offset))?;
+        X8
+    };
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: primary_base,
+        },
+    )?;
+    policy_sve_compare_bytes_v3(policy, 1, 0, 0, constants[0], sve2)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::Equal, primary_sparse_scan)?;
+    for (index, offset) in filter.offsets()[1..].iter().copied().enumerate() {
         let base = if offset == 0 {
             X15
         } else {
@@ -2470,19 +2541,16 @@ fn policy_sve_filtered_v3(
                 base,
             },
         )?;
-        let result = if index == 0 { 1 } else { 2 };
-        policy_sve_compare_bytes_v3(policy, result, 0, 0, constants[index], sve2)?;
-        if index != 0 {
-            exact_v3(
-                policy,
-                DecodedInstructionV3::SveAndPredicateBytes {
-                    destination: 1,
-                    predicate: 0,
-                    left: 1,
-                    right: result,
-                },
-            )?;
-        }
+        policy_sve_compare_bytes_v3(policy, 2, 0, 0, constants[index + 1], sve2)?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveAndPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 1,
+                right: 2,
+            },
+        )?;
         exact_v3(
             policy,
             DecodedInstructionV3::SveTestPredicateBytes {
@@ -2546,6 +2614,127 @@ fn policy_sve_filtered_v3(
 
     policy.bind(advance)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    branch_v3(policy, vector)?;
+
+    policy.bind(primary_sparse_scan)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, SPARSE_SCAN_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, vector)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    let primary_base = if primary_offset == 0 {
+        X15
+    } else {
+        add_immediate64_v3(policy, X8, X15, u16::from(primary_offset))?;
+        X8
+    };
+    for block in 0_u8..8 {
+        let block_predicate = 4_u8.checked_add(block).expect("p4 through p11");
+        policy_sve_load_bytes_mul_vl_v3(
+            policy,
+            0,
+            0,
+            primary_base,
+            i8::try_from(block).expect("nonnegative imm4"),
+        )?;
+        policy_sve_compare_bytes_v3(policy, block_predicate, 0, 0, constants[0], sve2)?;
+    }
+    for (destination, left, right) in [(12, 4, 5), (13, 6, 7), (14, 8, 9), (15, 10, 11)] {
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveOrPredicateBytes {
+                destination,
+                predicate: 0,
+                left,
+                right,
+            },
+        )?;
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 12,
+            right: 13,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 2,
+            predicate: 0,
+            left: 14,
+            right: 15,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 2,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, primary_sparse_hit)?;
+    add_immediate64_v3(
+        policy,
+        X3,
+        X3,
+        SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3,
+    )?;
+    branch_v3(policy, primary_sparse_scan)?;
+
+    policy.bind(primary_sparse_hit)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 12,
+            right: 13,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 1,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, primary_sparse_first_half)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 14,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, vector)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3 * 2)?;
+    branch_v3(policy, vector)?;
+
+    policy.bind(primary_sparse_first_half)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: 0,
+            tested: 12,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, vector)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3 * 2)?;
     branch_v3(policy, vector)?;
 
     policy.bind(tail)?;
@@ -4482,6 +4671,13 @@ pub(crate) fn decode_word_v3(
             predicate: governing_predicate_v3(word),
             base: rn,
         })
+    } else if word & 0xfff0_e000 == 0xa400_a000 {
+        Ok(DecodedInstructionV3::SveLoadBytesMulVl {
+            destination: rd,
+            predicate: governing_predicate_v3(word),
+            base: rn,
+            vector_offset: signed_immediate4_v3(word),
+        })
     } else if word & 0xffe0_e010 == 0x2400_a000 {
         Ok(DecodedInstructionV3::SveCompareEqualBytes {
             destination: predicate_destination_v3(word),
@@ -4498,6 +4694,13 @@ pub(crate) fn decode_word_v3(
         })
     } else if word & 0xfff0_e210 == 0x2500_4000 {
         Ok(DecodedInstructionV3::SveAndPredicateBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            left: predicate_source_v3(word),
+            right: predicate_right_v3(word),
+        })
+    } else if word & 0xfff0_e210 == 0x2580_4000 {
+        Ok(DecodedInstructionV3::SveOrPredicateBytes {
             destination: predicate_destination_v3(word),
             predicate: governing_predicate_v3(word),
             left: predicate_source_v3(word),
@@ -4687,6 +4890,11 @@ fn governing_predicate_v3(word: u32) -> u8 {
 
 fn predicate_right_v3(word: u32) -> u8 {
     u8::try_from((word >> 16) & 0xf).expect("four-bit predicate")
+}
+
+fn signed_immediate4_v3(word: u32) -> i8 {
+    let raw = i8::try_from((word >> 16) & 0xf).expect("four-bit signed immediate");
+    if raw & 8 == 0 { raw } else { raw - 16 }
 }
 
 fn immediate12_v3(word: u32) -> u16 {

@@ -1729,27 +1729,29 @@ fn emit_sve_direct_exact_v3(
     assembler.cmp_imm64(X6, 63)?;
     assembler.branch_cond(ConditionV3::CarryClear, vector16)?;
     assembler.add_reg(X15, X0, X3)?;
-    for block in 0_u16..4 {
-        let block_offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
-            CountAotError::ArithmeticOverflow {
-                site: CountAotArithmeticSite::CodeOffset,
-            },
-        )?;
-        for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
-            let offset = block_offset
-                .checked_add(u16::try_from(index).expect("direct literal width"))
-                .ok_or(CountAotError::ArithmeticOverflow {
-                    site: CountAotArithmeticSite::CodeOffset,
-                })?;
-            assembler.add_imm(X8, X15, offset)?;
-            assembler.sve_load_bytes(0, 0, X8)?;
-            let result = if index == 0 { 1 } else { 2 };
+    // Column-major lowering amortizes each scalar column-base calculation
+    // across four VL16 blocks. The block masks remain live in p4-p7 while
+    // LD1B's MUL VL immediate selects starts 0, 16, 32, and 48.
+    for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+        assembler.add_imm(X8, X15, u16::try_from(index).expect("direct literal width"))?;
+        for block in 0_u8..4 {
+            assembler.sve_load_bytes_mul_vl(
+                0,
+                0,
+                X8,
+                i8::try_from(block).expect("nonnegative imm4"),
+            )?;
+            let block_predicate = 4_u8.checked_add(block).expect("p4 through p7");
+            let result = if index == 0 { block_predicate } else { 1 };
             emit_sve_compare_bytes_v3(assembler, result, 0, 0, constant, sve2)?;
             if index != 0 {
-                assembler.sve_and_predicate_bytes(1, 0, 1, result)?;
+                assembler.sve_and_predicate_bytes(block_predicate, 0, block_predicate, result)?;
             }
         }
-        assembler.sve_count_predicate_bytes(X6, 0, 1)?;
+    }
+    // Count each retained 16-start block mask after all columns have refined it.
+    for block_predicate in 4_u8..8 {
+        assembler.sve_count_predicate_bytes(X6, 0, block_predicate)?;
         assembler.add_reg(X13, X13, X6)?;
     }
     assembler.add_imm(X3, X3, 64)?;
@@ -1812,6 +1814,9 @@ fn emit_sve_filtered_v3(
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
     let advance = assembler.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let primary_sparse_hit = assembler.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_first_half = assembler.new_label(LabelKindV3::Internal)?;
     let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
     let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
     let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
@@ -1837,7 +1842,18 @@ fn emit_sve_filtered_v3(
     assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
     assembler.branch_cond(ConditionV3::CarryClear, tail)?;
     assembler.add_reg(X15, X0, X3)?;
-    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+    let primary_offset = filter.offsets[0];
+    let primary_base = if primary_offset == 0 {
+        X15
+    } else {
+        assembler.add_imm(X8, X15, u16::from(primary_offset))?;
+        X8
+    };
+    assembler.sve_load_bytes(0, 0, primary_base)?;
+    emit_sve_compare_bytes_v3(assembler, 1, 0, 0, constants[0], sve2)?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::Equal, primary_sparse_scan)?;
+    for (index, offset) in filter.offsets()[1..].iter().copied().enumerate() {
         let base = if offset == 0 {
             X15
         } else {
@@ -1845,11 +1861,8 @@ fn emit_sve_filtered_v3(
             X8
         };
         assembler.sve_load_bytes(0, 0, base)?;
-        let result = if index == 0 { 1 } else { 2 };
-        emit_sve_compare_bytes_v3(assembler, result, 0, 0, constants[index], sve2)?;
-        if index != 0 {
-            assembler.sve_and_predicate_bytes(1, 0, 1, result)?;
-        }
+        emit_sve_compare_bytes_v3(assembler, 2, 0, 0, constants[index + 1], sve2)?;
+        assembler.sve_and_predicate_bytes(1, 0, 1, 2)?;
         assembler.sve_test_predicate_bytes(0, 1)?;
         assembler.branch_cond(ConditionV3::Equal, advance)?;
     }
@@ -1878,6 +1891,61 @@ fn emit_sve_filtered_v3(
 
     assembler.bind(advance)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(vector)?;
+
+    // A primary-empty block admits a fixed-VL16 128-start one-column scan.
+    // LD1B's MUL VL immediate addresses the eight blocks without scalar
+    // pointer arithmetic. Predicate OR reductions classify the earliest
+    // hit-bearing 32-start quarter, which always re-enters the complete filter.
+    assembler.bind(primary_sparse_scan)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, SPARSE_SCAN_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, vector)?;
+    assembler.add_reg(X15, X0, X3)?;
+    let primary_base = if primary_offset == 0 {
+        X15
+    } else {
+        assembler.add_imm(X8, X15, u16::from(primary_offset))?;
+        X8
+    };
+    for block in 0_u8..8 {
+        let block_predicate = 4_u8.checked_add(block).expect("p4 through p11");
+        assembler.sve_load_bytes_mul_vl(
+            0,
+            0,
+            primary_base,
+            i8::try_from(block).expect("nonnegative imm4"),
+        )?;
+        emit_sve_compare_bytes_v3(assembler, block_predicate, 0, 0, constants[0], sve2)?;
+    }
+    for (destination, left, right) in [(12, 4, 5), (13, 6, 7), (14, 8, 9), (15, 10, 11)] {
+        assembler.sve_or_predicate_bytes(destination, 0, left, right)?;
+    }
+    assembler.sve_or_predicate_bytes(1, 0, 12, 13)?;
+    assembler.sve_or_predicate_bytes(2, 0, 14, 15)?;
+    assembler.sve_or_predicate_bytes(1, 0, 1, 2)?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::NotEqual, primary_sparse_hit)?;
+    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(primary_sparse_scan)?;
+
+    assembler.bind(primary_sparse_hit)?;
+    assembler.sve_or_predicate_bytes(1, 0, 12, 13)?;
+    assembler.sve_test_predicate_bytes(0, 1)?;
+    assembler.branch_cond(ConditionV3::NotEqual, primary_sparse_first_half)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3 * 4)?;
+    assembler.sve_test_predicate_bytes(0, 14)?;
+    assembler.branch_cond(ConditionV3::NotEqual, vector)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3 * 2)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(primary_sparse_first_half)?;
+    assembler.sve_test_predicate_bytes(0, 12)?;
+    assembler.branch_cond(ConditionV3::NotEqual, vector)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3 * 2)?;
     assembler.branch(vector)?;
 
     assembler.bind(tail)?;
@@ -3179,8 +3247,25 @@ impl AssemblerV3 {
         predicate: u8,
         base: u8,
     ) -> Result<(), CountAotError> {
+        self.sve_load_bytes_mul_vl(destination, predicate, base, 0)
+    }
+
+    fn sve_load_bytes_mul_vl(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        base: u8,
+        vector_offset: i8,
+    ) -> Result<(), CountAotError> {
+        if !(-8..=7).contains(&vector_offset) {
+            return Err(CountAotError::InternalInvariant {
+                at: "v3 SVE LD1B vector offset",
+            });
+        }
+        let immediate = u32::from(vector_offset.to_le_bytes()[0] & 0x0f);
         self.emit_sve_word(
             0xa400_a000
+                | (immediate << 16)
                 | (u32::from(predicate) << 10)
                 | register_field_v3(base, 5)
                 | u32::from(destination),
@@ -3231,6 +3316,23 @@ impl AssemblerV3 {
     ) -> Result<(), CountAotError> {
         self.emit_sve_word(
             0x2500_4000
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_or_predicate_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2580_4000
                 | (u32::from(right) << 16)
                 | (u32::from(predicate) << 10)
                 | (u32::from(left) << 5)

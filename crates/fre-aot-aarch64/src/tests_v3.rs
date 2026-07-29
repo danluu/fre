@@ -75,11 +75,29 @@ fn branch_target_v3(instructions: &[DecodedInstructionV3], index: usize) -> u32 
     u32::try_from(offset.checked_add(i64::from(displacement)).unwrap()).unwrap()
 }
 
+fn sve_compare_instruction_v3(sve2: bool, destination: u8, right: u8) -> DecodedInstructionV3 {
+    if sve2 {
+        DecodedInstructionV3::Sve2MatchBytes {
+            destination,
+            predicate: 0,
+            left: 0,
+            right,
+        }
+    } else {
+        DecodedInstructionV3::SveCompareEqualBytes {
+            destination,
+            predicate: 0,
+            left: 0,
+            right,
+        }
+    }
+}
+
 #[test]
 fn v3_versions_and_identity_domain_are_disjoint() {
     assert_eq!(AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, 3);
     assert_eq!(AOT_COUNT_BACKEND_VERSION_V3.0, 0xa003);
-    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 7);
+    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 8);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V2);
     assert_eq!(IDENTITY_DOMAIN_V3.last(), Some(&3));
@@ -169,6 +187,146 @@ fn target_aware_sve_rows_emit_real_independently_audited_opcodes() {
 }
 
 #[test]
+fn sve_direct_64_start_body_is_column_major_and_mul_vl_addressed() {
+    for (required_isa, sve2) in [
+        (CountV3RequiredIsa::Aarch64SveVl16, false),
+        (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
+    ] {
+        let literal = b"abcd";
+        let (program, optimized) = optimized_for(literal, required_isa);
+        assert_eq!(
+            optimized.recipe().strategy(),
+            CountV3Strategy::DirectExactMask
+        );
+        let image =
+            emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+        let decoded = decoded_v3(&image);
+        let vector64 = image
+            .labels()
+            .iter()
+            .filter(|label| label.kind == LabelKindV3::VectorLoop)
+            .map(|label| usize::try_from(label.offset / 4).unwrap())
+            .min()
+            .expect("64-start SVE vector loop");
+        assert_eq!(
+            decoded[vector64 + 3],
+            DecodedInstructionV3::CompareImmediate64 {
+                register: 6,
+                immediate: 63,
+            }
+        );
+        assert_eq!(
+            decoded[vector64 + 5],
+            DecodedInstructionV3::AddRegister64 {
+                destination: 15,
+                left: 0,
+                right: 3,
+            }
+        );
+
+        let constants = [2_u8, 3, 16, 17];
+        let mut cursor = vector64 + 6;
+        for (column, constant) in constants.into_iter().enumerate() {
+            assert_eq!(
+                decoded[cursor],
+                DecodedInstructionV3::AddImmediate64 {
+                    destination: 8,
+                    source: 15,
+                    immediate: u16::try_from(column).unwrap(),
+                }
+            );
+            cursor += 1;
+            for block in 0_u8..4 {
+                let expected_load = if block == 0 {
+                    DecodedInstructionV3::SveLoadBytes {
+                        destination: 0,
+                        predicate: 0,
+                        base: 8,
+                    }
+                } else {
+                    DecodedInstructionV3::SveLoadBytesMulVl {
+                        destination: 0,
+                        predicate: 0,
+                        base: 8,
+                        vector_offset: i8::try_from(block).unwrap(),
+                    }
+                };
+                assert_eq!(decoded[cursor], expected_load);
+                let block_predicate = 4 + block;
+                let result = if column == 0 { block_predicate } else { 1 };
+                assert_eq!(
+                    decoded[cursor + 1],
+                    sve_compare_instruction_v3(sve2, result, constant)
+                );
+                cursor += 2;
+                if column != 0 {
+                    assert_eq!(
+                        decoded[cursor],
+                        DecodedInstructionV3::SveAndPredicateBytes {
+                            destination: block_predicate,
+                            predicate: 0,
+                            left: block_predicate,
+                            right: 1,
+                        }
+                    );
+                    cursor += 1;
+                }
+            }
+        }
+        for block_predicate in 4_u8..8 {
+            assert_eq!(
+                decoded[cursor],
+                DecodedInstructionV3::SveCountPredicateBytes {
+                    destination: 6,
+                    predicate: 0,
+                    source: block_predicate,
+                }
+            );
+            assert_eq!(
+                decoded[cursor + 1],
+                DecodedInstructionV3::AddRegister64 {
+                    destination: 13,
+                    left: 13,
+                    right: 6,
+                }
+            );
+            cursor += 2;
+        }
+        assert_eq!(
+            decoded[cursor],
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate: 64,
+            }
+        );
+
+        let body = &decoded[vector64 + 6..cursor];
+        let scalar_column_bases = body
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction,
+                    DecodedInstructionV3::AddImmediate64 {
+                        destination: 8,
+                        source: 15,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(scalar_column_bases, literal.len());
+        let block_major_scalar_bases = literal.len() * 4;
+        assert_eq!(scalar_column_bases * 4, block_major_scalar_bases);
+        assert!(scalar_column_bases < block_major_scalar_bases);
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+            image.build_receipt().audit
+        );
+    }
+}
+
+#[test]
 fn sve_decoder_and_metadata_reject_near_miss_feature_relabeling() {
     assert_eq!(
         decode_word_v3(0x2518_e120, 0).unwrap(),
@@ -183,6 +341,42 @@ fn sve_decoder_and_metadata_reject_near_miss_feature_relabeling() {
         DecodedInstructionV3::Sve2MatchBytes { .. }
     ));
     assert!(decode_word_v3(0x4523_8001 ^ (1 << 13), 8).is_err());
+    assert_eq!(
+        decode_word_v3(0xa400_a000, 12).unwrap(),
+        DecodedInstructionV3::SveLoadBytes {
+            destination: 0,
+            predicate: 0,
+            base: 0,
+        }
+    );
+    assert_eq!(
+        decode_word_v3(0xa407_a000, 16).unwrap(),
+        DecodedInstructionV3::SveLoadBytesMulVl {
+            destination: 0,
+            predicate: 0,
+            base: 0,
+            vector_offset: 7,
+        }
+    );
+    assert_eq!(
+        decode_word_v3(0xa40f_a000, 20).unwrap(),
+        DecodedInstructionV3::SveLoadBytesMulVl {
+            destination: 0,
+            predicate: 0,
+            base: 0,
+            vector_offset: -1,
+        }
+    );
+    assert_eq!(
+        decode_word_v3(0x258d_4181, 24).unwrap(),
+        DecodedInstructionV3::SveOrPredicateBytes {
+            destination: 1,
+            predicate: 0,
+            left: 12,
+            right: 13,
+        }
+    );
+    assert!(decode_word_v3(0x258d_4181 ^ (1 << 13), 24).is_err());
 
     let (program, optimized) = optimized_for(
         b"metadata-cannot-relabel-opcodes",
@@ -507,6 +701,333 @@ fn primary_empty_scan_is_single_column_and_pair_fallback_is_disjoint() {
         audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
         image.build_receipt().audit
     );
+}
+
+#[test]
+fn sve_primary_empty_batch_advances_128_starts_with_closed_quarter_reentry() {
+    for (required_isa, sve2) in [
+        (CountV3RequiredIsa::Aarch64SveVl16, false),
+        (CountV3RequiredIsa::Aarch64Sve2Vl16, true),
+    ] {
+        let (program, optimized) = optimized_for(b"abababab", required_isa);
+        assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+        let image =
+            emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+        let decoded = decoded_v3(&image);
+
+        let primary_probe = decoded
+            .windows(3)
+            .position(|window| {
+                window[0] == sve_compare_instruction_v3(sve2, 1, 2)
+                    && window[1]
+                        == DecodedInstructionV3::SveTestPredicateBytes {
+                            predicate: 0,
+                            tested: 1,
+                        }
+                    && matches!(
+                        window[2],
+                        DecodedInstructionV3::BranchCondition {
+                            condition: crate::ConditionV3::Equal,
+                            ..
+                        }
+                    )
+            })
+            .expect("ordinary SVE primary-empty proof");
+        let primary_scan_offset = branch_target_v3(&decoded, primary_probe + 2);
+        let primary_scan = usize::try_from(primary_scan_offset / 4).unwrap();
+        let entry_advance = match decoded[primary_scan] {
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate,
+            } => immediate,
+            _ => panic!("missing SVE sparse-batch entry advance"),
+        };
+        assert_eq!(entry_advance, 16);
+        assert_eq!(
+            decoded[primary_scan + 3],
+            DecodedInstructionV3::SubtractRegister64 {
+                destination: 6,
+                left: 4,
+                right: 3,
+            }
+        );
+        let threshold = match decoded[primary_scan + 4] {
+            DecodedInstructionV3::CompareImmediate64 {
+                register: 6,
+                immediate,
+            } => immediate,
+            _ => panic!("missing SVE sparse-batch threshold"),
+        };
+        assert_eq!(threshold, 127);
+        assert!(matches!(
+            decoded[primary_scan + 5],
+            DecodedInstructionV3::BranchCondition {
+                condition: crate::ConditionV3::CarryClear,
+                ..
+            }
+        ));
+        for (remaining_starts, admitted) in [(127_u16, false), (128, true), (129, true)] {
+            let inclusive_difference = remaining_starts - 1;
+            assert_eq!(inclusive_difference >= threshold, admitted);
+        }
+        let ordinary_vector_offset = branch_target_v3(&decoded, primary_scan + 5);
+        let ordinary_vector = usize::try_from(ordinary_vector_offset / 4).unwrap();
+
+        let first_load = (primary_scan + 6..=primary_scan + 8)
+            .find(|index| {
+                matches!(
+                    decoded[*index],
+                    DecodedInstructionV3::SveLoadBytes {
+                        destination: 0,
+                        predicate: 0,
+                        ..
+                    }
+                )
+            })
+            .expect("first SVE sparse-batch load");
+        let load_base = match decoded[first_load] {
+            DecodedInstructionV3::SveLoadBytes { base, .. } => base,
+            _ => unreachable!(),
+        };
+        for block in 0_u8..8 {
+            let index = first_load + usize::from(block) * 2;
+            let expected_load = if block == 0 {
+                DecodedInstructionV3::SveLoadBytes {
+                    destination: 0,
+                    predicate: 0,
+                    base: load_base,
+                }
+            } else {
+                DecodedInstructionV3::SveLoadBytesMulVl {
+                    destination: 0,
+                    predicate: 0,
+                    base: load_base,
+                    vector_offset: i8::try_from(block).unwrap(),
+                }
+            };
+            assert_eq!(decoded[index], expected_load);
+            assert_eq!(
+                decoded[index + 1],
+                sve_compare_instruction_v3(sve2, 4 + block, 2)
+            );
+        }
+        assert!(
+            decoded[first_load..first_load + 16]
+                .iter()
+                .all(|instruction| !matches!(
+                    instruction,
+                    DecodedInstructionV3::AddRegister64 { .. }
+                        | DecodedInstructionV3::AddImmediate64 { .. }
+                ))
+        );
+
+        let reduction = first_load + 16;
+        for (index, (destination, left, right)) in
+            [(12, 4, 5), (13, 6, 7), (14, 8, 9), (15, 10, 11)]
+                .into_iter()
+                .enumerate()
+        {
+            assert_eq!(
+                decoded[reduction + index],
+                DecodedInstructionV3::SveOrPredicateBytes {
+                    destination,
+                    predicate: 0,
+                    left,
+                    right,
+                }
+            );
+        }
+        for (index, (destination, left, right)) in [(1, 12, 13), (2, 14, 15), (1, 1, 2)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                decoded[reduction + 4 + index],
+                DecodedInstructionV3::SveOrPredicateBytes {
+                    destination,
+                    predicate: 0,
+                    left,
+                    right,
+                }
+            );
+        }
+        assert_eq!(
+            decoded[reduction + 7],
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 1,
+            }
+        );
+        assert!(matches!(
+            decoded[reduction + 8],
+            DecodedInstructionV3::BranchCondition {
+                condition: crate::ConditionV3::NotEqual,
+                ..
+            }
+        ));
+        let no_hit_advance = match decoded[reduction + 9] {
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate,
+            } => immediate,
+            _ => panic!("missing SVE sparse-batch no-hit advance"),
+        };
+        assert_eq!(no_hit_advance, 112);
+        assert!(matches!(
+            decoded[reduction + 10],
+            DecodedInstructionV3::Branch { .. }
+        ));
+        assert_eq!(
+            branch_target_v3(&decoded, reduction + 10),
+            primary_scan_offset
+        );
+        assert_eq!(entry_advance + no_hit_advance, 128);
+
+        let aggregate_probe = &decoded[reduction..reduction + 9];
+        assert_eq!(
+            aggregate_probe
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction,
+                    DecodedInstructionV3::SveTestPredicateBytes { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            aggregate_probe
+                .iter()
+                .filter(|instruction| matches!(
+                    instruction,
+                    DecodedInstructionV3::BranchCondition { .. }
+                ))
+                .count(),
+            1
+        );
+
+        let batch_static_instructions = reduction + 11 - primary_scan;
+        let ordinary_primary_probe_instructions = primary_probe + 3 - ordinary_vector;
+        let eight_block_baseline = (ordinary_primary_probe_instructions + 2) * 8;
+        assert!(batch_static_instructions * 5 < eight_block_baseline * 4);
+
+        let hit = usize::try_from(branch_target_v3(&decoded, reduction + 8) / 4).unwrap();
+        assert_eq!(
+            decoded[hit],
+            DecodedInstructionV3::SveOrPredicateBytes {
+                destination: 1,
+                predicate: 0,
+                left: 12,
+                right: 13,
+            }
+        );
+        assert_eq!(
+            decoded[hit + 1],
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 1,
+            }
+        );
+        assert!(matches!(
+            decoded[hit + 2],
+            DecodedInstructionV3::BranchCondition {
+                condition: crate::ConditionV3::NotEqual,
+                ..
+            }
+        ));
+        let first_half = usize::try_from(branch_target_v3(&decoded, hit + 2) / 4).unwrap();
+        assert_eq!(
+            decoded[hit + 3],
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate: 64,
+            }
+        );
+        assert_eq!(
+            decoded[hit + 4],
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 14,
+            }
+        );
+        assert!(matches!(
+            decoded[hit + 5],
+            DecodedInstructionV3::BranchCondition {
+                condition: crate::ConditionV3::NotEqual,
+                ..
+            }
+        ));
+        assert_eq!(branch_target_v3(&decoded, hit + 5), ordinary_vector_offset);
+        assert_eq!(
+            decoded[hit + 6],
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate: 32,
+            }
+        );
+        assert_eq!(branch_target_v3(&decoded, hit + 7), ordinary_vector_offset);
+        assert_eq!(
+            decoded[first_half],
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 12,
+            }
+        );
+        assert!(matches!(
+            decoded[first_half + 1],
+            DecodedInstructionV3::BranchCondition {
+                condition: crate::ConditionV3::NotEqual,
+                ..
+            }
+        ));
+        assert_eq!(
+            branch_target_v3(&decoded, first_half + 1),
+            ordinary_vector_offset
+        );
+        assert_eq!(
+            decoded[first_half + 2],
+            DecodedInstructionV3::AddImmediate64 {
+                destination: 3,
+                source: 3,
+                immediate: 32,
+            }
+        );
+        assert_eq!(
+            branch_target_v3(&decoded, first_half + 3),
+            ordinary_vector_offset
+        );
+
+        let classify_hit = |position: usize| {
+            let mut block_hits = [false; 8];
+            block_hits[position / 16] = true;
+            let pair_hits = [
+                block_hits[0] || block_hits[1],
+                block_hits[2] || block_hits[3],
+                block_hits[4] || block_hits[5],
+                block_hits[6] || block_hits[7],
+            ];
+            if pair_hits[0] || pair_hits[1] {
+                if pair_hits[0] { 0 } else { 32 }
+            } else if pair_hits[2] {
+                64
+            } else {
+                96
+            }
+        };
+        for position in [0_usize, 15, 16, 31, 32, 63, 64, 95, 96, 127] {
+            let reentry = classify_hit(position);
+            assert_eq!(reentry, (position / 32) * 32);
+            assert!(reentry <= position && position < reentry + 32);
+        }
+
+        assert_eq!(
+            audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+            image.build_receipt().audit
+        );
+    }
 }
 
 #[test]

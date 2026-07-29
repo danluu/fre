@@ -15,7 +15,7 @@ pub const AOT_COUNT_BACKEND_VERSION_V3: AotCountBackendVersion = AotCountBackend
 /// This is deliberately not an alias for Count-v2 algorithm 4. The recipe,
 /// schedule, register plan, and complete optimizer identity are authenticated
 /// inputs to both lowering and the final artifact identity.
-pub const AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3: u16 = 7;
+pub const AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3: u16 = 8;
 pub const AOT_COUNT_KIR_SEMANTICS_VERSION_V3: u16 = 1;
 pub const AOT_COUNT_KIR_ABI_VERSION_V3: u16 = 1;
 const AOT_COUNT_LITERAL_MANIFEST_BYTES_V3: usize = 32;
