@@ -1384,6 +1384,9 @@ impl FixedPredicateWord64Plan {
     #[must_use]
     #[inline]
     pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        if self.width == 1 {
+            return self.width_one_value_success(haystack, Operation::Count, limits);
+        }
         let upper_bounds = self
             .preflight(haystack.len(), Operation::Count, limits)
             .ok()?;
@@ -1423,11 +1426,78 @@ impl FixedPredicateWord64Plan {
     #[must_use]
     #[inline]
     pub fn span_sum_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        if self.width == 1 {
+            return self.width_one_value_success(haystack, Operation::SpanSum, limits);
+        }
         let upper_bounds = self
             .preflight(haystack.len(), Operation::SpanSum, limits)
             .ok()?;
         self.execute_value(haystack, upper_bounds)
             .map(|value| value.matched_bytes)
+    }
+
+    /// Admit the exact width-one envelope without materializing the much
+    /// larger generic upper-bound record, then count direct byte-predicate
+    /// membership. Diagnostic calls retain the receipt-bearing reducer; this
+    /// projection is used only after every one of the same prospective limits
+    /// has succeeded.
+    #[inline]
+    fn width_one_value_success(
+        &self,
+        haystack: &[u8],
+        operation: Operation,
+        limits: ReduceLimits,
+    ) -> Option<u64> {
+        let input_bytes = haystack.len();
+        if input_bytes > limits.max_input_bytes
+            || input_bytes > limits.max_transitions
+            || input_bytes > limits.max_match_events
+        {
+            return None;
+        }
+        let semantic_upper = u64::try_from(input_bytes).ok()?;
+        if semantic_upper > limits.max_count
+            || (operation == Operation::SpanSum && semantic_upper > limits.max_span_sum)
+        {
+            return None;
+        }
+        let reducer_steps = input_bytes.checked_add(REDUCE_FINAL_WORK)?;
+        if reducer_steps > limits.max_reducer_steps {
+            return None;
+        }
+        let work = match self.anchor {
+            Anchor::One { .. } | Anchor::Two { .. } if input_bytes == 0 => REDUCE_FINAL_WORK,
+            Anchor::One { .. } | Anchor::Two { .. } => input_bytes
+                .checked_mul(6)?
+                .checked_add(FINDER_CALL_WORK + REDUCE_FINAL_WORK)?,
+            Anchor::ShiftAnd => input_bytes
+                .checked_mul(TRANSITION_WORK + MATCH_WORK)?
+                .checked_add(REDUCE_FINAL_WORK)?,
+        };
+        if u64::try_from(work).ok()? > limits.max_work
+            || self.build.persistent_bytes > limits.max_persistent_bytes
+            || self.build.persistent_bytes > limits.max_peak_bytes
+        {
+            return None;
+        }
+
+        match self.anchor {
+            Anchor::One { byte, .. } => {
+                self.scan_anchor_value(haystack, 0, |bytes| memchr(byte, bytes))
+            }
+            Anchor::Two { first, second, .. } => {
+                self.scan_anchor_value(haystack, 0, |bytes| memchr2(first, second, bytes))
+            }
+            Anchor::ShiftAnd => {
+                let mut count = 0_u64;
+                for &byte in haystack {
+                    if self.masks[usize::from(byte)] & 1 != 0 {
+                        count = count.checked_add(1)?;
+                    }
+                }
+                Some(count)
+            }
+        }
     }
 
     fn preflight(
@@ -2453,6 +2523,78 @@ mod tests {
                 maximum: MAX_WIDTH
             }) if needed == MAX_WIDTH + 1
         ));
+    }
+
+    #[test]
+    fn width_one_value_projection_closes_every_prospective_limit() {
+        const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
+        let anchor = FixedPredicateWord64Plan::build(&[A], BuildLimits::unlimited()).unwrap();
+        let shift_and = FixedPredicateWord64Plan::build(&[FULL], BuildLimits::unlimited()).unwrap();
+        let haystack = [b'a', b'A', b'x', 0, u8::MAX];
+
+        for (plan, expected, expected_work) in [(&anchor, 2_u64, 32_u64), (&shift_and, 5, 46)] {
+            let diagnostic = plan.span_sum(&haystack, ReduceLimits::unlimited()).unwrap();
+            let upper = diagnostic.accounting.upper_bounds;
+            assert_eq!(upper.work, expected_work);
+            let exact = ReduceLimits {
+                max_input_bytes: upper.input_bytes,
+                max_transitions: upper.transitions,
+                max_match_events: upper.match_events,
+                max_count: upper.count,
+                max_span_sum: upper.span_sum,
+                max_reducer_steps: upper.reducer_steps,
+                max_work: upper.work,
+                max_scratch_bytes: upper.scratch_bytes,
+                max_persistent_bytes: upper.persistent_bytes,
+                max_peak_bytes: upper.peak_bytes,
+            };
+            assert_eq!(plan.count_value_success(&haystack, exact), Some(expected));
+            assert_eq!(
+                plan.span_sum_value_success(&haystack, exact),
+                Some(expected)
+            );
+            assert_eq!(
+                plan.count_value_success(
+                    &haystack,
+                    ReduceLimits {
+                        max_span_sum: 0,
+                        ..exact
+                    }
+                ),
+                Some(expected),
+                "Count does not admit a SpanSum-only ceiling"
+            );
+
+            macro_rules! one_below {
+                ($field:ident) => {{
+                    assert!(exact.$field > 0, "{} must be positive", stringify!($field));
+                    let one_below = ReduceLimits {
+                        $field: exact.$field - 1,
+                        ..exact
+                    };
+                    assert_eq!(
+                        plan.span_sum_value_success(&haystack, one_below),
+                        None,
+                        "width-one projection admitted one-below {}",
+                        stringify!($field)
+                    );
+                    assert!(
+                        plan.span_sum(&haystack, one_below).is_err(),
+                        "diagnostic path admitted one-below {}",
+                        stringify!($field)
+                    );
+                }};
+            }
+            one_below!(max_input_bytes);
+            one_below!(max_transitions);
+            one_below!(max_match_events);
+            one_below!(max_count);
+            one_below!(max_span_sum);
+            one_below!(max_reducer_steps);
+            one_below!(max_work);
+            one_below!(max_persistent_bytes);
+            one_below!(max_peak_bytes);
+        }
     }
 
     #[test]
