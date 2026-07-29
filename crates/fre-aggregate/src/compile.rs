@@ -672,6 +672,11 @@ pub(crate) enum StateByteSpanSumTopology {
     /// Exact `(C*? D){N} L`, where `C` excludes exactly one barrier byte,
     /// `D ∈ C`, `N > 0`, and `L` is nonempty.
     RepeatedLazyDelimiterSuffix,
+    /// Unicode-on `A C{M,N} B | B C{M,N} A` evaluated directly only when
+    /// the complete source is ASCII. In that domain every UTF-8 scalar is
+    /// exactly one byte, so the retained ASCII projection of `C` is exact.
+    /// Non-ASCII sources keep the incumbent continuation route.
+    AsciiGuardedBoundedLiteralPair,
 }
 
 impl StateByteSpanSumPlan {
@@ -707,6 +712,19 @@ impl StateByteSpanSumPlan {
         self.barrier
     }
 
+    pub(crate) fn bounded_pair_anchors(&self) -> Option<(&[u8], &[u8])> {
+        if self.topology != StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair {
+            return None;
+        }
+        let split = self.literal_anchor_offset();
+        (split > 0 && split < self.literal().len()).then(|| self.literal().split_at(split))
+    }
+
+    pub(crate) fn bounded_pair_gap_bounds(&self) -> Option<(usize, usize)> {
+        (self.topology == StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair)
+            .then(|| (self.repeat_count(), usize::from(self.barrier())))
+    }
+
     const fn materialized_bytes() -> usize {
         core::mem::size_of::<Self>()
     }
@@ -725,6 +743,7 @@ impl StateByteSpanSumPlan {
             StateByteSpanSumTopology::DisjointInternalRuns => 3,
             StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
             StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 5,
+            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 6,
         }
     }
 }
@@ -1578,16 +1597,44 @@ fn build_state_byte_span_sum_plan(
 ) -> Result<Option<StateByteSpanSumPlan>, Error> {
     let start_work = budget.accounting.work;
     budget.charge(1)?;
-    if profile.unicode || capture_policy != CapturePolicy::EraseForWholeMatch {
+    if capture_policy != CapturePolicy::EraseForWholeMatch {
         return Ok(None);
     }
-    let Some(parts) = state_byte_concat_parts(hir, budget)? else {
-        return Ok(None);
+    let parts = if profile.unicode {
+        &[][..]
+    } else {
+        let Some(parts) = state_byte_concat_parts(hir, budget)? else {
+            return Ok(None);
+        };
+        parts
     };
     budget.charge(1)?;
     let mut proof = None;
+    let mut bounded_pair_split = 0_u8;
     let mut retained_literal = [0_u8; MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES];
-    if let Some((first, literal, second)) = state_byte_greedy_prefix_literal_suffix(parts, budget)?
+    if profile.unicode
+        && let Some(pair) = state_byte_unicode_bounded_literal_pair(hir, budget)?
+    {
+        let literal_len = add(pair.left.len(), pair.right.len(), Resource::CompileWork)?;
+        if literal_len <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES {
+            retained_literal[..pair.left.len()].copy_from_slice(pair.left);
+            retained_literal[pair.left.len()..literal_len].copy_from_slice(pair.right);
+            bounded_pair_split = u8::try_from(pair.left.len()).map_err(|_| {
+                Error::InternalInvariant("state-byte bounded-pair split exceeds u8")
+            })?;
+            proof = Some((
+                StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair,
+                pair.class,
+                ByteSet::empty(),
+                literal_len,
+                pair.gap_min,
+                pair.gap_max,
+            ));
+        }
+    }
+    if proof.is_none()
+        && let Some((first, literal, second)) =
+            state_byte_greedy_prefix_literal_suffix(parts, budget)?
         && !literal.is_empty()
         && literal.len() <= MAX_STATE_BYTE_SPAN_SUM_LITERAL_BYTES
     {
@@ -1721,12 +1768,13 @@ fn build_state_byte_span_sum_plan(
     let retained_bytes = StateByteSpanSumPlan::materialized_bytes();
     budget.charge(add(retained_bytes, literal.len(), Resource::CompileWork)?)?;
     let literal_failure = state_byte_literal_failure(literal, budget)?;
-    let literal_anchor_offset =
-        if topology == StateByteSpanSumTopology::DisjointRunsLiteral && literal.len() > 1 {
+    let literal_anchor_offset = match topology {
+        StateByteSpanSumTopology::DisjointRunsLiteral if literal.len() > 1 => {
             state_byte_literal_anchor_offset(literal, budget)?
-        } else {
-            0
-        };
+        }
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => bounded_pair_split,
+        _ => 0,
+    };
     let plan = StateByteSpanSumPlan {
         topology,
         first,
@@ -1960,6 +2008,149 @@ fn state_byte_literal_failure(
         budget.charge(1)?;
     }
     Ok(failure)
+}
+
+struct StateByteUnicodeBoundedPair<'a> {
+    left: &'a [u8],
+    right: &'a [u8],
+    class: ByteSet,
+    gap_min: u8,
+    gap_max: u8,
+}
+
+struct StateByteUnicodeBoundedPairArm<'a> {
+    prefix: &'a [u8],
+    suffix: &'a [u8],
+    class: &'a regex_syntax::hir::ClassUnicode,
+    gap_min: u32,
+    gap_max: u32,
+}
+
+/// Recognize the exact Unicode-scalar shape
+/// `A C{M,N} B | B C{M,N} A`.
+///
+/// The retained descriptor is used only after a whole-source ASCII guard.
+/// In that domain every scalar is one byte and the ASCII projection of `C`
+/// is therefore the complete byte language for the repeated term.
+fn state_byte_unicode_bounded_literal_pair<'a>(
+    hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteUnicodeBoundedPair<'a>>, Error> {
+    let hir = state_byte_transparent(hir, budget)?;
+    let HirKind::Alternation(arms) = hir.kind() else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    let [first, second] = arms.as_slice() else {
+        return Ok(None);
+    };
+    let Some(first) = state_byte_unicode_bounded_literal_pair_arm(first, budget)? else {
+        return Ok(None);
+    };
+    let Some(second) = state_byte_unicode_bounded_literal_pair_arm(second, budget)? else {
+        return Ok(None);
+    };
+    budget.charge(8)?;
+    if first.prefix != second.suffix
+        || first.suffix != second.prefix
+        || first.class != second.class
+        || first.gap_min != second.gap_min
+        || first.gap_max != second.gap_max
+        || first.prefix.is_empty()
+        || first.suffix.is_empty()
+        || first.prefix[0] == first.suffix[0]
+        || !first.prefix.iter().chain(first.suffix).all(u8::is_ascii)
+    {
+        return Ok(None);
+    }
+    let Ok(gap_min) = u8::try_from(first.gap_min) else {
+        return Ok(None);
+    };
+    let Ok(gap_max) = u8::try_from(first.gap_max) else {
+        return Ok(None);
+    };
+    let mut class = ByteSet::empty();
+    for range in first.class.ranges() {
+        budget.charge(1)?;
+        if range.start() > '\u{7f}' {
+            break;
+        }
+        let start = u8::try_from(u32::from(range.start())).map_err(|_| {
+            Error::InternalInvariant("ASCII Unicode-class start does not fit one byte")
+        })?;
+        let end = u8::try_from(u32::from(range.end().min('\u{7f}'))).map_err(|_| {
+            Error::InternalInvariant("ASCII Unicode-class end does not fit one byte")
+        })?;
+        budget.charge(add(
+            inclusive_byte_width(start, end)?,
+            1,
+            Resource::CompileWork,
+        )?)?;
+        class.insert_range(start, end);
+    }
+    Ok(Some(StateByteUnicodeBoundedPair {
+        left: first.prefix,
+        right: first.suffix,
+        class,
+        gap_min,
+        gap_max,
+    }))
+}
+
+fn state_byte_unicode_bounded_literal_pair_arm<'a>(
+    hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<Option<StateByteUnicodeBoundedPairArm<'a>>, Error> {
+    let hir = state_byte_transparent(hir, budget)?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return Ok(None);
+    };
+    budget.charge(1)?;
+    let [prefix, gap, suffix] = parts.as_slice() else {
+        return Ok(None);
+    };
+    let Some(prefix) = state_byte_literal(prefix, budget)? else {
+        return Ok(None);
+    };
+    let gap = state_byte_transparent(gap, budget)?;
+    let HirKind::Repetition(repetition) = gap.kind() else {
+        return Ok(None);
+    };
+    budget.charge(4)?;
+    let Some(gap_max) = repetition.max else {
+        return Ok(None);
+    };
+    if !repetition.greedy || gap_max == 0 || repetition.min > gap_max {
+        return Ok(None);
+    }
+    let repeated = state_byte_transparent(&repetition.sub, budget)?;
+    let HirKind::Class(Class::Unicode(class)) = repeated.kind() else {
+        return Ok(None);
+    };
+    budget.charge(class.ranges().len())?;
+    let Some(suffix) = state_byte_literal(suffix, budget)? else {
+        return Ok(None);
+    };
+    Ok(Some(StateByteUnicodeBoundedPairArm {
+        prefix,
+        suffix,
+        class,
+        gap_min: repetition.min,
+        gap_max,
+    }))
+}
+
+fn state_byte_transparent<'a>(
+    mut hir: &'a Hir,
+    budget: &mut CompileBudget,
+) -> Result<&'a Hir, Error> {
+    loop {
+        budget.charge(1)?;
+        match hir.kind() {
+            HirKind::Capture(capture) => hir = &capture.sub,
+            _ => return Ok(hir),
+        }
+    }
 }
 
 fn state_byte_concat_parts<'a>(

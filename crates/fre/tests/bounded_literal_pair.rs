@@ -1,8 +1,9 @@
 use fre::{
     AGGREGATE_EXPLAIN_SCHEMA_VERSION, AggregateBuildAccounting, AggregateBuildError,
-    AggregateBuilder, AggregateExecutionDetails, AggregateOperation, AggregatePlanIdentity,
-    AggregatePlanKind, AggregateRunLimits, BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID,
-    BOUNDED_LITERAL_PAIR_PLAN_ID, BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
+    AggregateBuilder, AggregateCountWorkspace, AggregateExecutionDetails, AggregateOperation,
+    AggregatePlanIdentity, AggregatePlanKind, AggregateRunLimits, AggregateSpanSumWorkspace,
+    BOUNDED_LITERAL_PAIR_COUNT_OPERATION_ID, BOUNDED_LITERAL_PAIR_PLAN_ID,
+    BOUNDED_LITERAL_PAIR_SPAN_SUM_OPERATION_ID,
 };
 use fre_kernels::{
     BoundedLiteralPairBuildLimits as KernelBuildLimits, BoundedLiteralPairPlan,
@@ -234,6 +235,71 @@ fn small_complete_byte_languages_match_the_rust_oracle() {
             );
         }
     }
+}
+
+#[test]
+fn unicode_bounded_pair_uses_ascii_value_specialization_with_unicode_fallback() {
+    const PATTERN: &str = r"Tom.{10,25}river|river.{10,25}Tom";
+    let count = AggregateBuilder::new(PATTERN)
+        .unicode(true)
+        .build_count()
+        .unwrap();
+    let span_sum = AggregateBuilder::new(PATTERN)
+        .unicode(true)
+        .build_span_sum()
+        .unwrap();
+    for report in [count.build_report(), span_sum.build_report()] {
+        assert_eq!(report.plan, AggregatePlanKind::ContinuationProgram);
+        let AggregateBuildAccounting::Continuation(build) = report.build else {
+            panic!("Unicode bounded pair did not retain its continuation fallback")
+        };
+        assert_eq!(build.state_byte_span_sum_plans, 1);
+        assert!(build.state_byte_span_sum_build_work > 0);
+    }
+
+    let oracle = RegexBuilder::new(PATTERN).unicode(true).build().unwrap();
+    for haystack in [
+        b"Tom0123456789river--river0123456789012345678901234Tom".as_slice(),
+        "Toméééééééééériver--riverééééééééééTom".as_bytes(),
+        &b"Tom0123456789river--\xFF--river0123456789Tom"[..],
+    ] {
+        let expected = reference(&oracle, haystack);
+        assert_eq!(
+            count
+                .count_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.0
+        );
+        assert_eq!(
+            span_sum
+                .span_sum_value(haystack, AggregateRunLimits::default())
+                .unwrap(),
+            expected.1
+        );
+    }
+
+    let ascii = b"Tom0123456789river--river0123456789Tom";
+    let expected = reference(&oracle, ascii);
+    let mut count_workspace = AggregateCountWorkspace::new();
+    let mut span_workspace = AggregateSpanSumWorkspace::new();
+    assert_eq!(
+        count
+            .count_value_with_workspace(ascii, AggregateRunLimits::default(), &mut count_workspace,)
+            .unwrap(),
+        expected.0
+    );
+    assert_eq!(
+        span_sum
+            .span_sum_value_with_workspace(
+                ascii,
+                AggregateRunLimits::default(),
+                &mut span_workspace,
+            )
+            .unwrap(),
+        expected.1
+    );
+    assert_eq!(count_workspace.retained_continuation_bytes(), None);
+    assert_eq!(span_workspace.retained_continuation_bytes(), None);
 }
 
 #[test]

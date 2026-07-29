@@ -2830,6 +2830,11 @@ impl CompiledRegex {
             });
         }
         let local = &haystack[range.clone()];
+        if plan.topology() == StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
+            && !local.is_ascii()
+        {
+            return Ok(None);
+        }
         let envelope = state_byte_reducer_envelope::<true>(plan, local.len(), limits)?;
         enforce(
             envelope.boundaries,
@@ -2898,6 +2903,14 @@ impl CompiledRegex {
             }
             StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
                 reduce_repeated_lazy_delimiter_suffix(
+                    plan,
+                    local,
+                    envelope.work_bound,
+                    &mut accounting,
+                )?
+            }
+            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+                reduce_ascii_bounded_literal_pair(
                     plan,
                     local,
                     envelope.work_bound,
@@ -2980,6 +2993,14 @@ impl CompiledRegex {
             }
             StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
                 reduce_repeated_lazy_delimiter_suffix(
+                    plan,
+                    local,
+                    prospective.work_bound,
+                    attempt_accounting,
+                )?
+            }
+            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+                reduce_ascii_bounded_literal_pair(
                     plan,
                     local,
                     prospective.work_bound,
@@ -3334,6 +3355,11 @@ impl CompiledRegex {
             && matches!(kind, OperationKind::Count | OperationKind::Sum)
             && strategy == Strategy::ReverseSequentialRows
             && let Some(plan) = &self.state_byte_span_sum
+            // The Unicode bounded-pair theorem is intentionally value-only:
+            // its ASCII/non-ASCII choice is source dependent. Receipt-bearing
+            // operations keep the incumbent continuation so publication
+            // never falls back after inspecting source bytes.
+            && plan.topology() != StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
         {
             return self.execute_state_byte_reducer::<OBSERVED_WORK>(
                 plan,
@@ -4876,6 +4902,21 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
             add(plan.literal().len(), 4, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
+                "state-byte bounded-pair plan lost its anchors",
+            ))?;
+            let literal_max = left.len().max(right.len());
+            add(
+                mul(
+                    add(literal_max, 1, Resource::ExecutionWork)?,
+                    4,
+                    Resource::ExecutionWork,
+                )?,
+                6,
+                Resource::ExecutionWork,
+            )?
+        }
     };
     let structural_work_bound = mul(input_bytes, work_factor, Resource::ExecutionWork)?;
     let work_bound = if OBSERVED_WORK {
@@ -4888,6 +4929,7 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::DisjointInternalRuns
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 0,
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 2,
         _ => 2,
     };
     let state_transition_bound = mul(
@@ -4913,6 +4955,17 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             let factor = add(plan.literal().len(), 3, Resource::ExecutionWork)?;
             mul(input_bytes, factor, Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
+                "state-byte bounded-pair plan lost its anchors",
+            ))?;
+            let factor = mul(
+                add(left.len().max(right.len()), 1, Resource::ExecutionWork)?,
+                4,
+                Resource::ExecutionWork,
+            )?;
+            mul(input_bytes, factor, Resource::ExecutionWork)?
+        }
     };
     let random_access_bytes_read = match plan.topology() {
         StateByteSpanSumTopology::GreedyPrefixLiteralSuffix => input_bytes,
@@ -4931,11 +4984,29 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
             mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
         }
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            mul(input_bytes, 2, Resource::ExecutionWork)?
+        }
     };
     let sequential_bytes_bound = match plan.topology() {
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
             let factor = add(plan.literal().len(), 1, Resource::SequentialBytes)?;
             mul(input_bytes, factor, Resource::SequentialBytes)?
+        }
+        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
+                "state-byte bounded-pair plan lost its anchors",
+            ))?;
+            let literal_scans = mul(
+                add(left.len().max(right.len()), 1, Resource::SequentialBytes)?,
+                4,
+                Resource::SequentialBytes,
+            )?;
+            mul(
+                input_bytes,
+                add(literal_scans, 1, Resource::SequentialBytes)?,
+                Resource::SequentialBytes,
+            )?
         }
         _ => input_bytes,
     };
@@ -5223,6 +5294,247 @@ impl StateByteMeter for StateByteValueMeter {
     #[inline]
     fn event(&mut self, _work_limit: usize) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete guarded candidate, gap, greedy suffix, and non-overlap transaction stays adjacent"
+)]
+fn reduce_ascii_bounded_literal_pair(
+    plan: &StateByteSpanSumPlan,
+    haystack: &[u8],
+    work_limit: usize,
+    accounting: &mut impl StateByteMeter,
+) -> Result<(usize, usize), Error> {
+    debug_assert!(haystack.is_ascii());
+    let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
+        "state-byte bounded-pair plan lost its anchors",
+    ))?;
+    let (gap_min, gap_max) = plan
+        .bounded_pair_gap_bounds()
+        .ok_or(Error::InternalInvariant(
+            "state-byte bounded-pair plan lost its gap bounds",
+        ))?;
+    if left.is_empty() || right.is_empty() || left[0] == right[0] || gap_min > gap_max {
+        return Err(Error::InternalInvariant(
+            "state-byte bounded-pair descriptor is not canonical",
+        ));
+    }
+
+    // Prefix and suffix roles need independent monotone occurrence streams:
+    // each direction's suffix lower bound is monotone even when the two
+    // literals have different widths and their merged prefix ends are not.
+    // Four native literal streams plus two monotone class cursors retain a
+    // source-linear bound without rescanning the finite gap for every start.
+    let mut left_prefixes = StateByteLiteralStream::new(left);
+    let mut right_prefixes = StateByteLiteralStream::new(right);
+    let mut left_suffixes = StateByteLiteralStream::new(left);
+    let mut right_suffixes = StateByteLiteralStream::new(right);
+    let mut left_class = StateByteClassRunCursor::new();
+    let mut right_class = StateByteClassRunCursor::new();
+    let mut match_floor = 0_usize;
+    let mut matches = 0_usize;
+    let mut span_sum = 0_usize;
+    loop {
+        let left_start =
+            left_prefixes.peek_at_least(haystack, match_floor, work_limit, accounting)?;
+        let right_start =
+            right_prefixes.peek_at_least(haystack, match_floor, work_limit, accounting)?;
+        let (start, prefix, suffix, suffixes, class_cursor) = match (left_start, right_start) {
+            (None, None) => break,
+            (Some(start), None) => {
+                left_prefixes.consume_pending(start)?;
+                (start, left, right, &mut right_suffixes, &mut left_class)
+            }
+            (Some(start), Some(other)) if start <= other => {
+                left_prefixes.consume_pending(start)?;
+                (start, left, right, &mut right_suffixes, &mut left_class)
+            }
+            (_, Some(start)) => {
+                right_prefixes.consume_pending(start)?;
+                (start, right, left, &mut left_suffixes, &mut right_class)
+            }
+        };
+        let Some(prefix_end) = start.checked_add(prefix.len()) else {
+            return Err(Error::ArithmeticOverflow {
+                resource: Resource::Boundaries,
+            });
+        };
+        if prefix_end > haystack.len() {
+            continue;
+        }
+        let lower = add(prefix_end, gap_min, Resource::Boundaries)?;
+        if lower > haystack.len() {
+            continue;
+        }
+        let upper = add(prefix_end, gap_max, Resource::Boundaries)?.min(haystack.len());
+        let class_end = class_cursor.end_at_most(
+            plan.first(),
+            haystack,
+            prefix_end,
+            upper,
+            work_limit,
+            accounting,
+        )?;
+        if lower > class_end {
+            continue;
+        }
+        let Some(suffix_start) =
+            suffixes.farthest_between(haystack, lower, class_end, work_limit, accounting)?
+        else {
+            continue;
+        };
+        let end = add(suffix_start, suffix.len(), Resource::Boundaries)?;
+
+        state_byte_event(work_limit, accounting)?;
+        matches = add(matches, 1, Resource::OutputMatches)?;
+        span_sum = add(
+            span_sum,
+            end.checked_sub(start).ok_or(Error::InternalInvariant(
+                "state-byte bounded pair selected a reversed span",
+            ))?,
+            Resource::SpanSum,
+        )?;
+        match_floor = end;
+    }
+    Ok((matches, span_sum))
+}
+
+struct StateByteLiteralStream<'a> {
+    literal: &'a [u8],
+    search: usize,
+    pending: Option<usize>,
+    exhausted: bool,
+}
+
+impl<'a> StateByteLiteralStream<'a> {
+    const fn new(literal: &'a [u8]) -> Self {
+        Self {
+            literal,
+            search: 0,
+            pending: None,
+            exhausted: false,
+        }
+    }
+
+    fn peek_at_least(
+        &mut self,
+        haystack: &[u8],
+        lower: usize,
+        work_limit: usize,
+        accounting: &mut impl StateByteMeter,
+    ) -> Result<Option<usize>, Error> {
+        loop {
+            if let Some(pending) = self.pending {
+                if pending >= lower {
+                    return Ok(Some(pending));
+                }
+                self.pending = None;
+                continue;
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            let Some(found) = state_byte_find_literal(
+                self.literal,
+                haystack,
+                self.search,
+                work_limit,
+                accounting,
+            )?
+            else {
+                self.exhausted = true;
+                return Ok(None);
+            };
+            self.search = add(found, 1, Resource::Boundaries)?;
+            self.pending = Some(found);
+        }
+    }
+
+    fn consume_pending(&mut self, expected: usize) -> Result<(), Error> {
+        if self.pending != Some(expected) {
+            return Err(Error::InternalInvariant(
+                "state-byte literal stream consumed another occurrence",
+            ));
+        }
+        self.pending = None;
+        Ok(())
+    }
+
+    fn farthest_between(
+        &mut self,
+        haystack: &[u8],
+        lower: usize,
+        upper: usize,
+        work_limit: usize,
+        accounting: &mut impl StateByteMeter,
+    ) -> Result<Option<usize>, Error> {
+        let mut selected = None;
+        while let Some(next) = self.peek_at_least(haystack, lower, work_limit, accounting)? {
+            if next > upper {
+                break;
+            }
+            self.consume_pending(next)?;
+            selected = Some(next);
+        }
+        Ok(selected)
+    }
+}
+
+struct StateByteClassRunCursor {
+    scanned: usize,
+    barrier: Option<usize>,
+}
+
+impl StateByteClassRunCursor {
+    const fn new() -> Self {
+        Self {
+            scanned: 0,
+            barrier: None,
+        }
+    }
+
+    fn end_at_most(
+        &mut self,
+        class: crate::program::ByteSet,
+        haystack: &[u8],
+        start: usize,
+        upper: usize,
+        work_limit: usize,
+        accounting: &mut impl StateByteMeter,
+    ) -> Result<usize, Error> {
+        if start > upper || upper > haystack.len() {
+            return Err(Error::InternalInvariant(
+                "state-byte class cursor received invalid bounds",
+            ));
+        }
+        if self.scanned < start {
+            self.scanned = start;
+        }
+        if self.barrier.is_some_and(|barrier| barrier < start) {
+            self.barrier = None;
+        }
+        if let Some(barrier) = self.barrier {
+            return Ok(barrier.min(upper));
+        }
+        while self.scanned < upper {
+            if !state_byte_classify(
+                class,
+                haystack,
+                self.scanned,
+                StateByteSourceAccess::Random,
+                work_limit,
+                accounting,
+            )?
+            .matches
+            {
+                self.barrier = Some(self.scanned);
+                return Ok(self.scanned);
+            }
+            self.scanned = add(self.scanned, 1, Resource::Boundaries)?;
+        }
+        Ok(upper)
     }
 }
 
@@ -16943,6 +17255,21 @@ mod tests {
         .unwrap()
     }
 
+    fn unicode_state_byte_fixture(pattern: &str) -> CompiledRegex {
+        let hir = ParserBuilder::new()
+            .unicode(true)
+            .utf8(true)
+            .build()
+            .parse(pattern)
+            .unwrap();
+        CompiledRegex::from_hir_erasing_captures_for_whole_match(
+            &hir,
+            RustByteProfile::PINNED_1_12_4_UNICODE_ON_BYTE_STABLE,
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn upstream_span_sum(pattern: &str, haystack: &[u8]) -> usize {
         RegexBuilder::new(pattern)
             .unicode(false)
@@ -16977,6 +17304,154 @@ mod tests {
             max_peak_bytes: prospective.peak_bytes,
             max_work: prospective.work_bound,
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one differential test keeps ASCII direct, UTF-8 fallback, malformed fallback, receipt, and target-shape assertions together"
+    )]
+    fn unicode_bounded_pair_uses_ascii_value_route_and_nonascii_continuation() {
+        const PATTERN: &str = r"a.{1,2}b|b.{1,2}a";
+        let compiled = unicode_state_byte_fixture(PATTERN);
+        let plan = compiled
+            .state_byte_span_sum
+            .as_ref()
+            .expect("Unicode bounded pair should retain its ASCII theorem");
+        assert_eq!(
+            plan.topology(),
+            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
+        );
+        assert_eq!(plan.bounded_pair_anchors(), Some((&b"a"[..], &b"b"[..])));
+        assert_eq!(plan.bounded_pair_gap_bounds(), Some((1, 2)));
+        assert_eq!(compiled.compile_accounting().state_byte_span_sum_plans, 1);
+
+        let oracle = RegexBuilder::new(PATTERN).unicode(true).build().unwrap();
+        let alphabet = [b'a', b'b', b'x', b'y', b'\n'];
+        let mut haystack = Vec::new();
+        for length in 0_u32..=7 {
+            for mut ordinal in 0..alphabet.len().pow(length) {
+                haystack.clear();
+                for _ in 0..length {
+                    haystack.push(alphabet[ordinal % alphabet.len()]);
+                    ordinal /= alphabet.len();
+                }
+                let expected = oracle
+                    .find_iter(&haystack)
+                    .map(|found| found.end() - found.start())
+                    .collect::<Vec<_>>();
+                let direct = CompiledRegex::state_byte_reducer_value(
+                    plan,
+                    &haystack,
+                    &(0..haystack.len()),
+                    OperationKind::Sum,
+                    OperationLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    direct,
+                    Some((expected.len(), expected.iter().sum())),
+                    "{haystack:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .count_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap(),
+                    expected.len(),
+                    "{haystack:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .span_sum_value(
+                            &haystack,
+                            0..haystack.len(),
+                            Strategy::ReverseSequentialRows,
+                            OperationLimits::default(),
+                        )
+                        .unwrap(),
+                    expected.iter().sum(),
+                    "{haystack:?}"
+                );
+            }
+        }
+
+        for haystack in ["aéb axyb béa".as_bytes(), &b"a\xFFxb-bx\xFFa"[..]] {
+            assert_eq!(
+                CompiledRegex::state_byte_reducer_value(
+                    plan,
+                    haystack,
+                    &(0..haystack.len()),
+                    OperationKind::Count,
+                    OperationLimits::default(),
+                )
+                .unwrap(),
+                None
+            );
+            let expected = oracle.find_iter(haystack).collect::<Vec<_>>();
+            assert_eq!(
+                compiled
+                    .count_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                expected.len()
+            );
+            assert_eq!(
+                compiled
+                    .span_sum_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                expected
+                    .iter()
+                    .map(|found| found.end() - found.start())
+                    .sum()
+            );
+        }
+
+        let admitted = compiled
+            .admit_count(
+                b"axyb",
+                0..4,
+                Strategy::ReverseSequentialRows,
+                OperationLimits::default(),
+            )
+            .unwrap();
+        assert_ne!(
+            admitted.certificate().physical_route,
+            OperationPhysicalRoute::StateByteSpanSum
+        );
+
+        let benchmark_shape = unicode_state_byte_fixture(r"Tom.{10,25}river|river.{10,25}Tom");
+        let benchmark_plan = benchmark_shape
+            .state_byte_span_sum
+            .as_ref()
+            .expect("target shape should retain the bounded-pair theorem");
+        let input_bytes = 16 * 1_048_576;
+        let envelope = super::state_byte_reducer_envelope::<true>(
+            benchmark_plan,
+            input_bytes,
+            OperationLimits {
+                max_work: 1 << 29,
+                ..OperationLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(envelope.structural_work_bound, input_bytes * 30);
+        assert_eq!(envelope.sequential_bytes_bound, input_bytes * 25);
+        assert!(envelope.structural_work_bound <= 1 << 29);
+        assert!(envelope.sequential_bytes_bound <= 512 * 1_048_576);
     }
 
     #[test]
