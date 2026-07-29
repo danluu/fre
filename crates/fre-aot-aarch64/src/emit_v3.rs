@@ -99,6 +99,7 @@ impl CandidateFilterV3 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoweringRecipeV3 {
     pub(crate) strategy: LoweringStrategyV3,
+    pub(crate) required_isa: CountV3RequiredIsa,
     pub(crate) filter: Option<CandidateFilterV3>,
     pub(crate) confirmation_order: [u8; 32],
     pub(crate) confirmation_len: u8,
@@ -348,6 +349,7 @@ pub fn emit_count_v3(
         relocations,
         emission_work,
         vector_instructions,
+        actual_features,
         code_capacity_bytes,
         label_capacity_bytes,
         relocation_capacity_bytes,
@@ -384,13 +386,23 @@ pub fn emit_count_v3(
         rodata_from_code_start: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
         total_mapped_bytes: to_u32(rodata_offset, CountAotArithmeticSite::ImageLayout)?,
     };
-    let support = SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[0];
+    let support = match lowering_recipe.required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[0],
+        CountV3RequiredIsa::Aarch64SveVl16 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[1],
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[2],
+    };
+    let expected_features = if literal.is_empty() {
+        AotCountCpuFeatures::NONE
+    } else {
+        support.allowed_features
+    };
+    if actual_features != expected_features || !support.allowed_features.contains(actual_features) {
+        return Err(CountAotError::InternalInvariant {
+            at: "v3 emitted target feature closure",
+        });
+    }
     let target = AotCountTargetSpec {
-        features: if vector_instructions == 0 {
-            AotCountCpuFeatures::NONE
-        } else {
-            AotCountCpuFeatures::ASIMD
-        },
+        features: actual_features,
         ..AotCountTargetSpec::AARCH64_AAPCS64_BASELINE
     };
     let retained_heap_bytes = AotCountImageV3::retained_heap_bytes(
@@ -542,9 +554,12 @@ fn project_recipe_v3(
             });
         }
     }
-    if recipe.register_plan_id() != CountV3RegisterPlanId::Aarch64NeonV1
-        || recipe.required_isa() != CountV3RequiredIsa::Aarch64Neon128
-    {
+    let expected_register_plan = match recipe.required_isa() {
+        CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+    };
+    if recipe.register_plan_id() != expected_register_plan {
         return Err(CountAotError::Unsupported {
             reason: CountAotUnsupported::TargetFeature,
         });
@@ -711,6 +726,7 @@ fn project_recipe_v3(
     Ok((
         LoweringRecipeV3 {
             strategy,
+            required_isa: recipe.required_isa(),
             filter,
             confirmation_order,
             confirmation_len: u8::try_from(order.len()).expect("bounded literal width"),
@@ -1391,30 +1407,53 @@ pub(crate) fn canonical_template_v3(
     let entry = assembler.new_label(LabelKindV3::Entry)?;
     let done = assembler.new_label(LabelKindV3::Success)?;
     assembler.bind(entry)?;
-    match literal.len() {
-        0 => emit_empty_v3(&mut assembler, done)?,
-        1 => emit_single_v3(&mut assembler, literal[0], done)?,
-        _ => {
-            let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
-                at: "missing v3 candidate filter",
-            })?;
-            match recipe.strategy {
-                LoweringStrategyV3::Incumbent => {
-                    emit_multi_incumbent_v3(&mut assembler, literal, filter, done)?;
+    if literal.is_empty() {
+        emit_empty_v3(&mut assembler, done)?;
+    } else {
+        match recipe.required_isa {
+            CountV3RequiredIsa::Aarch64Neon128 => match literal.len() {
+                1 => emit_single_v3(&mut assembler, literal[0], done)?,
+                _ => {
+                    let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
+                        at: "missing v3 candidate filter",
+                    })?;
+                    match recipe.strategy {
+                        LoweringStrategyV3::Incumbent => {
+                            emit_multi_incumbent_v3(&mut assembler, literal, filter, done)?;
+                        }
+                        LoweringStrategyV3::DirectExactMask => {
+                            emit_direct_exact_mask_v3(&mut assembler, literal, filter, done)?;
+                        }
+                        LoweringStrategyV3::SparseRareColumns
+                        | LoweringStrategyV3::EndpointDense
+                        | LoweringStrategyV3::PeriodicRun => emit_multi_specialized_v3(
+                            &mut assembler,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.strategy,
+                            done,
+                        )?,
+                    }
                 }
-                LoweringStrategyV3::DirectExactMask => {
-                    emit_direct_exact_mask_v3(&mut assembler, literal, filter, done)?;
+            },
+            CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16 => {
+                let sve2 = recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16;
+                if literal.len() == 1 || recipe.strategy == LoweringStrategyV3::DirectExactMask {
+                    emit_sve_direct_exact_v3(&mut assembler, literal, sve2, done)?;
+                } else {
+                    let filter = recipe.filter.ok_or(CountAotError::InternalInvariant {
+                        at: "missing v3 SVE candidate filter",
+                    })?;
+                    emit_sve_filtered_v3(
+                        &mut assembler,
+                        literal,
+                        filter,
+                        recipe.confirmation_order(),
+                        sve2,
+                        done,
+                    )?;
                 }
-                LoweringStrategyV3::SparseRareColumns
-                | LoweringStrategyV3::EndpointDense
-                | LoweringStrategyV3::PeriodicRun => emit_multi_specialized_v3(
-                    &mut assembler,
-                    literal,
-                    filter,
-                    recipe.confirmation_order(),
-                    recipe.strategy,
-                    done,
-                )?,
             }
         }
     }
@@ -1538,6 +1577,8 @@ fn emit_direct_exact_mask_v3(
     assembler.mov_imm64_minimal(X5, 256)?;
 
     assembler.bind(vector64)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X6, X4, X3)?;
     assembler.cmp_imm64(X6, 63)?;
     assembler.branch_cond(ConditionV3::CarryClear, vector16)?;
@@ -1573,6 +1614,8 @@ fn emit_direct_exact_mask_v3(
     assembler.branch(vector64)?;
 
     assembler.bind(vector16)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
     assembler.sub_reg(X6, X4, X3)?;
     assembler.cmp_imm64(X6, 15)?;
     assembler.branch_cond(ConditionV3::CarryClear, tail)?;
@@ -1608,6 +1651,243 @@ fn emit_direct_exact_mask_v3(
         assembler.branch_cond(ConditionV3::NotEqual, tail_miss)?;
     }
     assembler.add_imm(X13, X13, 1)?;
+    assembler.bind(tail_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(tail)
+}
+
+fn emit_sve_compare_bytes_v3(
+    assembler: &mut AssemblerV3,
+    destination: u8,
+    predicate: u8,
+    left: u8,
+    right: u8,
+    sve2: bool,
+) -> Result<(), CountAotError> {
+    if sve2 {
+        assembler.sve2_match_bytes(destination, predicate, left, right)
+    } else {
+        assembler.sve_compare_equal_bytes(destination, predicate, left, right)
+    }
+}
+
+fn emit_scalar_confirmation_sve_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    confirmation_order: &[u8],
+    proven_filter_offsets: &[u8],
+    candidate_pointer: u8,
+    mismatch: LabelV3,
+) -> Result<(), CountAotError> {
+    for offset in confirmation_order.iter().copied() {
+        if proven_filter_offsets.contains(&offset) {
+            continue;
+        }
+        assembler.load_byte(X8, candidate_pointer, u16::from(offset))?;
+        assembler.cmp_imm32(X8, u16::from(literal[usize::from(offset)]))?;
+        assembler.branch_cond(ConditionV3::NotEqual, mismatch)?;
+    }
+    Ok(())
+}
+
+/// Count width-one or self-non-overlapping width-two-through-four literals
+/// directly with fixed-VL16 SVE predicates.
+///
+/// The SVE2 row replaces every equality compare with the genuinely SVE2-only
+/// MATCH instruction. Duplicating one byte across the right-hand vector makes
+/// MATCH's set-membership result exactly byte equality.
+fn emit_sve_direct_exact_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    sve2: bool,
+    done: LabelV3,
+) -> Result<(), CountAotError> {
+    let vector64 = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let vector16 = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
+        site: CountAotArithmeticSite::CodeOffset,
+    })?;
+    let constants = [2_u8, 3, 16, 17];
+
+    assembler.mov_imm64_minimal(X13, 0)?;
+    assembler.cmp_imm64(X1, width)?;
+    assembler.branch_cond(ConditionV3::CarryClear, done)?;
+    assembler.sub_imm(X4, X1, width)?;
+    assembler.mov_imm64_minimal(X3, 0)?;
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        assembler.mov_imm64_minimal(X8, u64::from(byte))?;
+        assembler.sve_duplicate_byte(constants[offset], X8)?;
+    }
+
+    assembler.bind(vector64)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, 63)?;
+    assembler.branch_cond(ConditionV3::CarryClear, vector16)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for block in 0_u16..4 {
+        let block_offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
+            CountAotError::ArithmeticOverflow {
+                site: CountAotArithmeticSite::CodeOffset,
+            },
+        )?;
+        for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+            let offset = block_offset
+                .checked_add(u16::try_from(index).expect("direct literal width"))
+                .ok_or(CountAotError::ArithmeticOverflow {
+                    site: CountAotArithmeticSite::CodeOffset,
+                })?;
+            assembler.add_imm(X8, X15, offset)?;
+            assembler.sve_load_bytes(0, 0, X8)?;
+            let result = if index == 0 { 1 } else { 2 };
+            emit_sve_compare_bytes_v3(assembler, result, 0, 0, constant, sve2)?;
+            if index != 0 {
+                assembler.sve_and_predicate_bytes(1, 0, 1, result)?;
+            }
+        }
+        assembler.sve_count_predicate_bytes(X6, 0, 1)?;
+        assembler.add_reg(X13, X13, X6)?;
+    }
+    assembler.add_imm(X3, X3, 64)?;
+    assembler.branch(vector64)?;
+
+    assembler.bind(vector16)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, 15)?;
+    assembler.branch_cond(ConditionV3::CarryClear, tail)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+        assembler.add_imm(X8, X15, u16::try_from(index).expect("direct literal width"))?;
+        assembler.sve_load_bytes(0, 0, X8)?;
+        let result = if index == 0 { 1 } else { 2 };
+        emit_sve_compare_bytes_v3(assembler, result, 0, 0, constant, sve2)?;
+        if index != 0 {
+            assembler.sve_and_predicate_bytes(1, 0, 1, result)?;
+        }
+    }
+    assembler.sve_count_predicate_bytes(X6, 0, 1)?;
+    assembler.add_reg(X13, X13, X6)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(vector16)?;
+
+    assembler.bind(tail)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        assembler.load_byte(
+            X6,
+            X15,
+            u16::try_from(offset).expect("direct literal width"),
+        )?;
+        assembler.cmp_imm32(X6, u16::from(byte))?;
+        assembler.branch_cond(ConditionV3::NotEqual, tail_miss)?;
+    }
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.bind(tail_miss)?;
+    assembler.add_imm(X3, X3, 1)?;
+    assembler.branch(tail)
+}
+
+/// Fixed-VL16 SVE filter and scalar exact-confirmation template.
+///
+/// Predicate recovery retains every candidate lane in the current block:
+/// BRKB/CNTP materialize the first lane, while BRKA/BICS remove only a rejected
+/// lane. A confirmed match resumes at its semantic non-overlapping successor.
+fn emit_sve_filtered_v3(
+    assembler: &mut AssemblerV3,
+    literal: &[u8],
+    filter: CandidateFilterV3,
+    confirmation_order: &[u8],
+    sve2: bool,
+    done: LabelV3,
+) -> Result<(), CountAotError> {
+    let vector = assembler.new_label(LabelKindV3::VectorLoop)?;
+    let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
+    let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let advance = assembler.new_label(LabelKindV3::Internal)?;
+    let tail = assembler.new_label(LabelKindV3::ScalarTail)?;
+    let tail_miss = assembler.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).map_err(|_| CountAotError::ArithmeticOverflow {
+        site: CountAotArithmeticSite::CodeOffset,
+    })?;
+    let constants = [2_u8, 3, 16, 17];
+
+    assembler.mov_imm64_minimal(X13, 0)?;
+    assembler.cmp_imm64(X1, width)?;
+    assembler.branch_cond(ConditionV3::CarryClear, done)?;
+    assembler.sub_imm(X4, X1, width)?;
+    assembler.mov_imm64_minimal(X3, 0)?;
+    assembler.sve_ptrue_bytes_vl16(0)?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        assembler.mov_imm64_minimal(X8, u64::from(literal[usize::from(offset)]))?;
+        assembler.sve_duplicate_byte(constants[index], X8)?;
+    }
+
+    assembler.bind(vector)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X6, X4, X3)?;
+    assembler.cmp_imm64(X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, tail)?;
+    assembler.add_reg(X15, X0, X3)?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        let base = if offset == 0 {
+            X15
+        } else {
+            assembler.add_imm(X8, X15, u16::from(offset))?;
+            X8
+        };
+        assembler.sve_load_bytes(0, 0, base)?;
+        let result = if index == 0 { 1 } else { 2 };
+        emit_sve_compare_bytes_v3(assembler, result, 0, 0, constants[index], sve2)?;
+        if index != 0 {
+            assembler.sve_and_predicate_bytes(1, 0, 1, result)?;
+        }
+        assembler.sve_test_predicate_bytes(0, 1)?;
+        assembler.branch_cond(ConditionV3::Equal, advance)?;
+    }
+
+    assembler.bind(candidate)?;
+    assembler.sve_break_before_bytes(3, 0, 1)?;
+    assembler.sve_count_predicate_bytes(X7, 0, 3)?;
+    assembler.add_reg(X5, X3, X7)?;
+    assembler.add_reg(X15, X0, X5)?;
+    emit_scalar_confirmation_sve_v3(
+        assembler,
+        literal,
+        confirmation_order,
+        filter.offsets(),
+        X15,
+        candidate_miss,
+    )?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X5, width)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(candidate_miss)?;
+    assembler.sve_break_after_bytes(3, 0, 1)?;
+    assembler.sve_bit_clear_predicate_bytes_set_flags(1, 0, 1, 3)?;
+    assembler.branch_cond(ConditionV3::NotEqual, candidate)?;
+
+    assembler.bind(advance)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(vector)?;
+
+    assembler.bind(tail)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.add_reg(X15, X0, X3)?;
+    emit_scalar_confirmation_sve_v3(assembler, literal, confirmation_order, &[], X15, tail_miss)?;
+    assembler.add_imm(X13, X13, 1)?;
+    assembler.add_imm(X3, X3, width)?;
+    assembler.branch(tail)?;
     assembler.bind(tail_miss)?;
     assembler.add_imm(X3, X3, 1)?;
     assembler.branch(tail)
@@ -2389,6 +2669,9 @@ struct AssemblerV3 {
     prospective: ProspectiveV3,
     emission_work: u64,
     vector_instructions: u32,
+    asimd_instructions: u32,
+    sve_instructions: u32,
+    sve2_instructions: u32,
     peak_scratch_bytes: u64,
 }
 
@@ -2419,6 +2702,9 @@ impl AssemblerV3 {
             prospective,
             emission_work: 0,
             vector_instructions: 0,
+            asimd_instructions: 0,
+            sve_instructions: 0,
+            sve2_instructions: 0,
             peak_scratch_bytes: 0,
         };
         assembler.observe_scratch(0, 0, EmissionPhaseV3::Canonical)?;
@@ -2522,6 +2808,37 @@ impl AssemblerV3 {
                     site: CountAotArithmeticSite::CodeOffset,
                 },
             )?;
+            self.asimd_instructions = self.asimd_instructions.checked_add(1).ok_or(
+                CountAotError::ArithmeticOverflow {
+                    site: CountAotArithmeticSite::CodeOffset,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_sve_word(&mut self, word: u32, sve2: bool) -> Result<(), CountAotError> {
+        self.emit_word(word, false)?;
+        self.vector_instructions =
+            self.vector_instructions
+                .checked_add(1)
+                .ok_or(CountAotError::ArithmeticOverflow {
+                    site: CountAotArithmeticSite::CodeOffset,
+                })?;
+        if sve2 {
+            self.sve2_instructions =
+                self.sve2_instructions
+                    .checked_add(1)
+                    .ok_or(CountAotError::ArithmeticOverflow {
+                        site: CountAotArithmeticSite::CodeOffset,
+                    })?;
+        } else {
+            self.sve_instructions =
+                self.sve_instructions
+                    .checked_add(1)
+                    .ok_or(CountAotError::ArithmeticOverflow {
+                        site: CountAotArithmeticSite::CodeOffset,
+                    })?;
         }
         Ok(())
     }
@@ -2780,6 +3097,152 @@ impl AssemblerV3 {
         self.emit_word(
             0x4e01_0c00 | register_field_v3(source, 5) | u32::from(destination),
             true,
+        )
+    }
+
+    fn sve_ptrue_bytes_vl16(&mut self, destination: u8) -> Result<(), CountAotError> {
+        self.emit_sve_word(0x2518_e120 | u32::from(destination), false)
+    }
+
+    fn sve_duplicate_byte(&mut self, destination: u8, source: u8) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x0520_3800 | register_field_v3(source, 5) | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_load_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        base: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0xa400_a000
+                | (u32::from(predicate) << 10)
+                | register_field_v3(base, 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_compare_equal_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2400_a000
+                | register_field_v3(right, 16)
+                | (u32::from(predicate) << 10)
+                | register_field_v3(left, 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve2_match_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x4520_8000
+                | register_field_v3(right, 16)
+                | (u32::from(predicate) << 10)
+                | register_field_v3(left, 5)
+                | u32::from(destination),
+            true,
+        )
+    }
+
+    fn sve_and_predicate_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2500_4000
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_bit_clear_predicate_bytes_set_flags(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2540_4010
+                | (u32::from(right) << 16)
+                | (u32::from(predicate) << 10)
+                | (u32::from(left) << 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_test_predicate_bytes(&mut self, predicate: u8, tested: u8) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2550_c000 | (u32::from(predicate) << 10) | (u32::from(tested) << 5),
+            false,
+        )
+    }
+
+    fn sve_break_before_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2590_4000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_break_after_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2510_4000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+            false,
+        )
+    }
+
+    fn sve_count_predicate_bytes(
+        &mut self,
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    ) -> Result<(), CountAotError> {
+        self.emit_sve_word(
+            0x2520_8000
+                | (u32::from(predicate) << 10)
+                | (u32::from(source) << 5)
+                | u32::from(destination),
+            false,
         )
     }
 
@@ -3093,12 +3556,25 @@ impl AssemblerV3 {
             relocations.capacity(),
             EmissionPhaseV3::FinalizeReturn,
         )?;
+        let mut actual_features = AotCountCpuFeatures::NONE;
+        if self.asimd_instructions != 0 {
+            actual_features = actual_features.union(AotCountCpuFeatures::ASIMD);
+        }
+        if self.sve_instructions != 0 {
+            actual_features = actual_features.union(AotCountCpuFeatures::SVE);
+        }
+        if self.sve2_instructions != 0 {
+            actual_features = actual_features
+                .union(AotCountCpuFeatures::SVE)
+                .union(AotCountCpuFeatures::SVE2);
+        }
         Ok(FinalizedV3 {
             code: self.code,
             labels,
             relocations,
             emission_work: self.emission_work,
             vector_instructions: self.vector_instructions,
+            actual_features,
             code_capacity_bytes,
             label_capacity_bytes,
             relocation_capacity_bytes,
@@ -3144,6 +3620,7 @@ pub(crate) struct FinalizedV3 {
     pub(crate) relocations: ExactVec<RelocationV3>,
     pub(crate) emission_work: u64,
     pub(crate) vector_instructions: u32,
+    pub(crate) actual_features: AotCountCpuFeatures,
     pub(crate) code_capacity_bytes: usize,
     pub(crate) label_capacity_bytes: usize,
     pub(crate) relocation_capacity_bytes: usize,

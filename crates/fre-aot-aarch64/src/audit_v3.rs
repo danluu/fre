@@ -20,7 +20,7 @@ use crate::{
     AotCountImageViewV3, AotCountLiteralManifestV3, AotCountMappedMetadataV3,
     AotCountRecipeManifestV3, CodeLabelV3, CountAotArithmeticSite, CountAotError, CountAotResource,
     CountEmitLimitsV3, LabelKindV3, RelocationKindV3, RelocationTargetV3, RelocationV3,
-    emit_count_v3,
+    SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3, emit_count_v3,
     emit_v3::{
         ProspectiveV3, artifact_identity_encoded_len_v3,
         assembler_scratch_derivation_work_upper_bound_v3, assembler_scratch_for_capacities_v3,
@@ -88,6 +88,7 @@ enum AuditLoweringStrategyV3 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AuditLoweringRecipeV3 {
     strategy: AuditLoweringStrategyV3,
+    required_isa: CountV3RequiredIsa,
     filter: Option<AuditCandidateFilterV3>,
     confirmation_order: [u8; 32],
     confirmation_len: u8,
@@ -273,6 +274,61 @@ pub enum DecodedInstructionV3 {
         destination: u8,
         source: u8,
     },
+    SvePtrueBytesVl16 {
+        destination: u8,
+    },
+    SveDuplicateByte {
+        destination: u8,
+        source: u8,
+    },
+    SveLoadBytes {
+        destination: u8,
+        predicate: u8,
+        base: u8,
+    },
+    SveCompareEqualBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    Sve2MatchBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveAndPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveBitClearPredicateBytesSetFlags {
+        destination: u8,
+        predicate: u8,
+        left: u8,
+        right: u8,
+    },
+    SveTestPredicateBytes {
+        predicate: u8,
+        tested: u8,
+    },
+    SveBreakBeforeBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
+    SveBreakAfterBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
+    SveCountPredicateBytes {
+        destination: u8,
+        predicate: u8,
+        source: u8,
+    },
     Branch {
         displacement: i32,
     },
@@ -284,7 +340,7 @@ pub enum DecodedInstructionV3 {
 }
 
 impl DecodedInstructionV3 {
-    const fn is_vector(self) -> bool {
+    const fn is_asimd(self) -> bool {
         matches!(
             self,
             Self::LoadVector128 { .. }
@@ -305,6 +361,30 @@ impl DecodedInstructionV3 {
                 | Self::Move64ToVectorDouble { .. }
                 | Self::Insert64ToVectorDoubleLane1 { .. }
         )
+    }
+
+    const fn is_sve(self) -> bool {
+        matches!(
+            self,
+            Self::SvePtrueBytesVl16 { .. }
+                | Self::SveDuplicateByte { .. }
+                | Self::SveLoadBytes { .. }
+                | Self::SveCompareEqualBytes { .. }
+                | Self::SveAndPredicateBytes { .. }
+                | Self::SveBitClearPredicateBytesSetFlags { .. }
+                | Self::SveTestPredicateBytes { .. }
+                | Self::SveBreakBeforeBytes { .. }
+                | Self::SveBreakAfterBytes { .. }
+                | Self::SveCountPredicateBytes { .. }
+        )
+    }
+
+    const fn is_sve2(self) -> bool {
+        matches!(self, Self::Sve2MatchBytes { .. })
+    }
+
+    const fn is_vector(self) -> bool {
+        self.is_asimd() || self.is_sve() || self.is_sve2()
     }
 
     const fn direct_displacement(self) -> Option<i32> {
@@ -340,7 +420,8 @@ impl DecodedInstructionV3 {
             | Self::LoadByte { destination, .. }
             | Self::LoadByteRegister { destination, .. }
             | Self::MoveVectorByteTo32 { destination, .. }
-            | Self::MoveVectorDoubleTo64 { destination, .. } => Some(destination),
+            | Self::MoveVectorDoubleTo64 { destination, .. }
+            | Self::SveCountPredicateBytes { destination, .. } => Some(destination),
             _ => None,
         }
     }
@@ -364,7 +445,9 @@ impl DecodedInstructionV3 {
             | Self::UnsignedMinAcrossBytes8 { destination, .. }
             | Self::UnsignedMinAcrossBytes16 { destination, .. }
             | Self::Move64ToVectorDouble { destination, .. }
-            | Self::Insert64ToVectorDoubleLane1 { destination, .. } => Some(destination),
+            | Self::Insert64ToVectorDoubleLane1 { destination, .. }
+            | Self::SveDuplicateByte { destination, .. }
+            | Self::SveLoadBytes { destination, .. } => Some(destination),
             _ => None,
         }
     }
@@ -876,13 +959,19 @@ fn audit_impl_v3(
         return Err(invalid_v3("v3 emission scratch receipt"));
     }
     let literal = program.literal();
+    let (audit_recipe, expected_recipe_manifest) = audit_project_recipe_v3(program, recipe)?;
+    let expected_support = match audit_recipe.required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[0],
+        CountV3RequiredIsa::Aarch64SveVl16 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[1],
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[2],
+    };
     if literal_len != literal.len()
         || image.support.backend_version != AOT_COUNT_BACKEND_VERSION_V3
         || !is_supported_aot_count_backend_tuple_v3(image.support)
+        || image.support != expected_support
         || image.support.candidate_block_starts
             != u8::try_from(SIMD_CANDIDATE_STARTS_V3).expect("candidate block width fits u8")
         || image.support.vector_bytes != 16
-        || image.support.sve_vector_length_bytes != 0
     {
         return Err(invalid_v3("v3 support tuple"));
     }
@@ -897,7 +986,6 @@ fn audit_impl_v3(
     {
         return Err(invalid_v3("v3 target tuple"));
     }
-    let (audit_recipe, expected_recipe_manifest) = audit_project_recipe_v3(program, recipe)?;
     let independent_filter = audit_recipe.filter;
     let independent_filter_offsets = independent_filter
         .as_ref()
@@ -996,6 +1084,9 @@ fn audit_impl_v3(
     let mut relocation_index = 0_usize;
     let mut direct_branches = 0_u32;
     let mut vector_instructions = 0_u32;
+    let mut asimd_instructions = 0_u32;
+    let mut sve_instructions = 0_u32;
+    let mut sve2_instructions = 0_u32;
     let mut simd_candidate_blocks = 0_u32;
     let mut staged_filter_checks = 0_u32;
     let mut sparse_lane_recoveries = 0_u32;
@@ -1004,6 +1095,21 @@ fn audit_impl_v3(
     for (index, instruction) in decoded.iter().copied().enumerate() {
         if instruction.is_vector() {
             vector_instructions = vector_instructions
+                .checked_add(1)
+                .ok_or(audit_arithmetic_v3())?;
+        }
+        if instruction.is_asimd() {
+            asimd_instructions = asimd_instructions
+                .checked_add(1)
+                .ok_or(audit_arithmetic_v3())?;
+        }
+        if instruction.is_sve() {
+            sve_instructions = sve_instructions
+                .checked_add(1)
+                .ok_or(audit_arithmetic_v3())?;
+        }
+        if instruction.is_sve2() {
+            sve2_instructions = sve2_instructions
                 .checked_add(1)
                 .ok_or(audit_arithmetic_v3())?;
         }
@@ -1089,7 +1195,7 @@ fn audit_impl_v3(
         }
     }
     let (expected_candidate_blocks, expected_lane_recoveries, expected_staged_checks) =
-        if literal_len < 2 {
+        if literal_len < 2 || audit_recipe.required_isa != CountV3RequiredIsa::Aarch64Neon128 {
             (0, 0, 0)
         } else if audit_recipe.strategy == AuditLoweringStrategyV3::DirectExactMask {
             (0, 0, 0)
@@ -1117,12 +1223,52 @@ fn audit_impl_v3(
     {
         return Err(invalid_v3("v3 decoded summary"));
     }
-    let required_features = if vector_instructions == 0 {
+    let mut decoded_features = AotCountCpuFeatures::NONE;
+    if asimd_instructions != 0 {
+        decoded_features = decoded_features.union(AotCountCpuFeatures::ASIMD);
+    }
+    if sve_instructions != 0 {
+        decoded_features = decoded_features.union(AotCountCpuFeatures::SVE);
+    }
+    if sve2_instructions != 0 {
+        decoded_features = decoded_features
+            .union(AotCountCpuFeatures::SVE)
+            .union(AotCountCpuFeatures::SVE2);
+    }
+    let expected_features = if literal.is_empty() {
         AotCountCpuFeatures::NONE
     } else {
-        AotCountCpuFeatures::ASIMD
+        match audit_recipe.required_isa {
+            CountV3RequiredIsa::Aarch64Neon128 => AotCountCpuFeatures::ASIMD,
+            CountV3RequiredIsa::Aarch64SveVl16 => AotCountCpuFeatures::SVE,
+            CountV3RequiredIsa::Aarch64Sve2Vl16 => {
+                AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2)
+            }
+        }
     };
-    if image.target.features != required_features {
+    let instruction_classes_match = match audit_recipe.required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => {
+            literal.is_empty()
+                || (asimd_instructions != 0 && sve_instructions == 0 && sve2_instructions == 0)
+        }
+        CountV3RequiredIsa::Aarch64SveVl16 => {
+            literal.is_empty()
+                || (asimd_instructions == 0 && sve_instructions != 0 && sve2_instructions == 0)
+        }
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => {
+            literal.is_empty()
+                || (asimd_instructions == 0 && sve_instructions != 0 && sve2_instructions != 0)
+        }
+    };
+    if !instruction_classes_match
+        || vector_instructions
+            != asimd_instructions
+                .checked_add(sve_instructions)
+                .and_then(|value| value.checked_add(sve2_instructions))
+                .ok_or(audit_arithmetic_v3())?
+        || decoded_features != expected_features
+        || image.target.features != decoded_features
+    {
         return Err(invalid_v3("v3 decoded target features"));
     }
 
@@ -1180,8 +1326,12 @@ fn audit_project_recipe_v3(
         Ok(decoded) if decoded == *recipe => {}
         _ => return Err(invalid_v3("v3 canonical recipe round trip")),
     }
-    if recipe.register_plan_id() != CountV3RegisterPlanId::Aarch64NeonV1
-        || recipe.required_isa() != CountV3RequiredIsa::Aarch64Neon128
+    let expected_register_plan = match recipe.required_isa() {
+        CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+    };
+    if recipe.register_plan_id() != expected_register_plan
         || recipe.successor_mode() != CountV3SuccessorMode::NonOverlapping
     {
         return Err(invalid_v3("v3 recipe ISA or ABI"));
@@ -1346,6 +1496,7 @@ fn audit_project_recipe_v3(
     Ok((
         AuditLoweringRecipeV3 {
             strategy,
+            required_isa: recipe.required_isa(),
             filter,
             confirmation_order,
             confirmation_len: u8::try_from(order.len())
@@ -1542,28 +1693,50 @@ fn independent_policy_template_v3(
     let entry = policy.new_label(LabelKindV3::Entry)?;
     let done = policy.new_label(LabelKindV3::Success)?;
     policy.bind(entry)?;
-    match literal.len() {
-        0 => policy_empty_v3(&mut policy, done)?,
-        1 => policy_single_v3(&mut policy, literal[0], done)?,
-        _ => {
-            let filter = recipe.filter.ok_or(invalid_v3("v3 policy filter"))?;
-            match recipe.strategy {
-                AuditLoweringStrategyV3::Incumbent => {
-                    policy_multi_incumbent_v3(&mut policy, literal, filter, done)?;
+    if literal.is_empty() {
+        policy_empty_v3(&mut policy, done)?;
+    } else {
+        match recipe.required_isa {
+            CountV3RequiredIsa::Aarch64Neon128 => match literal.len() {
+                1 => policy_single_v3(&mut policy, literal[0], done)?,
+                _ => {
+                    let filter = recipe.filter.ok_or(invalid_v3("v3 policy filter"))?;
+                    match recipe.strategy {
+                        AuditLoweringStrategyV3::Incumbent => {
+                            policy_multi_incumbent_v3(&mut policy, literal, filter, done)?;
+                        }
+                        AuditLoweringStrategyV3::DirectExactMask => {
+                            policy_direct_exact_mask_v3(&mut policy, literal, filter, done)?;
+                        }
+                        AuditLoweringStrategyV3::SparseRareColumns
+                        | AuditLoweringStrategyV3::EndpointDense
+                        | AuditLoweringStrategyV3::PeriodicRun => policy_multi_specialized_v3(
+                            &mut policy,
+                            literal,
+                            filter,
+                            recipe.confirmation_order(),
+                            recipe.strategy,
+                            done,
+                        )?,
+                    }
                 }
-                AuditLoweringStrategyV3::DirectExactMask => {
-                    policy_direct_exact_mask_v3(&mut policy, literal, filter, done)?;
+            },
+            CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16 => {
+                let sve2 = recipe.required_isa == CountV3RequiredIsa::Aarch64Sve2Vl16;
+                if literal.len() == 1 || recipe.strategy == AuditLoweringStrategyV3::DirectExactMask
+                {
+                    policy_sve_direct_exact_v3(&mut policy, literal, sve2, done)?;
+                } else {
+                    let filter = recipe.filter.ok_or(invalid_v3("v3 SVE policy filter"))?;
+                    policy_sve_filtered_v3(
+                        &mut policy,
+                        literal,
+                        filter,
+                        recipe.confirmation_order(),
+                        sve2,
+                        done,
+                    )?;
                 }
-                AuditLoweringStrategyV3::SparseRareColumns
-                | AuditLoweringStrategyV3::EndpointDense
-                | AuditLoweringStrategyV3::PeriodicRun => policy_multi_specialized_v3(
-                    &mut policy,
-                    literal,
-                    filter,
-                    recipe.confirmation_order(),
-                    recipe.strategy,
-                    done,
-                )?,
             }
         }
     }
@@ -1863,6 +2036,8 @@ fn policy_direct_exact_mask_v3(
     policy_mov_minimal_v3(policy, X5, 256)?;
 
     policy.bind(vector64)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X6, X4, X3)?;
     compare_immediate64_v3(policy, X6, 63)?;
     condition_v3(policy, ConditionV3::CarryClear, vector16)?;
@@ -1946,6 +2121,8 @@ fn policy_direct_exact_mask_v3(
     branch_v3(policy, vector64)?;
 
     policy.bind(vector16)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
     subtract_register64_v3(policy, X6, X4, X3)?;
     compare_immediate64_v3(policy, X6, 15)?;
     condition_v3(policy, ConditionV3::CarryClear, tail)?;
@@ -2022,6 +2199,363 @@ fn policy_direct_exact_mask_v3(
         condition_v3(policy, ConditionV3::NotEqual, tail_miss)?;
     }
     add_immediate64_v3(policy, X13, X13, 1)?;
+    policy.bind(tail_miss)?;
+    add_immediate64_v3(policy, X3, X3, 1)?;
+    branch_v3(policy, tail)
+}
+
+fn policy_sve_compare_bytes_v3(
+    policy: &mut PolicySinkV3,
+    destination: u8,
+    predicate: u8,
+    left: u8,
+    right: u8,
+    sve2: bool,
+) -> Result<(), CountAotError> {
+    exact_v3(
+        policy,
+        if sve2 {
+            DecodedInstructionV3::Sve2MatchBytes {
+                destination,
+                predicate,
+                left,
+                right,
+            }
+        } else {
+            DecodedInstructionV3::SveCompareEqualBytes {
+                destination,
+                predicate,
+                left,
+                right,
+            }
+        },
+    )
+}
+
+fn policy_scalar_confirmation_sve_v3(
+    policy: &mut PolicySinkV3,
+    literal: &[u8],
+    confirmation_order: &[u8],
+    proven_filter_offsets: &[u8],
+    candidate_pointer: u8,
+    mismatch: PolicyLabelV3,
+) -> Result<(), CountAotError> {
+    for offset in confirmation_order.iter().copied() {
+        if proven_filter_offsets.contains(&offset) {
+            continue;
+        }
+        load_byte_v3(policy, X8, candidate_pointer, u16::from(offset))?;
+        compare_immediate32_v3(policy, X8, u16::from(literal[usize::from(offset)]))?;
+        condition_v3(policy, ConditionV3::NotEqual, mismatch)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independent SVE direct policy mirrors two unrolled vector loops and its exact scalar tail"
+)]
+fn policy_sve_direct_exact_v3(
+    policy: &mut PolicySinkV3,
+    literal: &[u8],
+    sve2: bool,
+    done: PolicyLabelV3,
+) -> Result<(), CountAotError> {
+    let vector64 = policy.new_label(LabelKindV3::VectorLoop)?;
+    let vector16 = policy.new_label(LabelKindV3::VectorLoop)?;
+    let tail = policy.new_label(LabelKindV3::ScalarTail)?;
+    let tail_miss = policy.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).expect("bounded width");
+    let constants = [2_u8, 3, 16, 17];
+
+    policy_mov_minimal_v3(policy, X13, 0)?;
+    compare_immediate64_v3(policy, X1, width)?;
+    condition_v3(policy, ConditionV3::CarryClear, done)?;
+    subtract_immediate64_v3(policy, X4, X1, width)?;
+    policy_mov_minimal_v3(policy, X3, 0)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SvePtrueBytesVl16 { destination: 0 },
+    )?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        policy_mov_minimal_v3(policy, X8, u64::from(byte))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveDuplicateByte {
+                destination: constants[offset],
+                source: X8,
+            },
+        )?;
+    }
+
+    policy.bind(vector64)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, 63)?;
+    condition_v3(policy, ConditionV3::CarryClear, vector16)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    for block in 0_u16..4 {
+        let block_offset = block
+            .checked_mul(SIMD_CANDIDATE_STARTS_V3)
+            .ok_or(audit_arithmetic_v3())?;
+        for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+            let offset = block_offset
+                .checked_add(u16::try_from(index).expect("direct literal width"))
+                .ok_or(audit_arithmetic_v3())?;
+            add_immediate64_v3(policy, X8, X15, offset)?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::SveLoadBytes {
+                    destination: 0,
+                    predicate: 0,
+                    base: X8,
+                },
+            )?;
+            let result = if index == 0 { 1 } else { 2 };
+            policy_sve_compare_bytes_v3(policy, result, 0, 0, constant, sve2)?;
+            if index != 0 {
+                exact_v3(
+                    policy,
+                    DecodedInstructionV3::SveAndPredicateBytes {
+                        destination: 1,
+                        predicate: 0,
+                        left: 1,
+                        right: result,
+                    },
+                )?;
+            }
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveCountPredicateBytes {
+                destination: X6,
+                predicate: 0,
+                source: 1,
+            },
+        )?;
+        add_register64_v3(policy, X13, X13, X6)?;
+    }
+    add_immediate64_v3(policy, X3, X3, 64)?;
+    branch_v3(policy, vector64)?;
+
+    policy.bind(vector16)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, 15)?;
+    condition_v3(policy, ConditionV3::CarryClear, tail)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    for (index, constant) in constants[..literal.len()].iter().copied().enumerate() {
+        add_immediate64_v3(
+            policy,
+            X8,
+            X15,
+            u16::try_from(index).expect("direct literal width"),
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveLoadBytes {
+                destination: 0,
+                predicate: 0,
+                base: X8,
+            },
+        )?;
+        let result = if index == 0 { 1 } else { 2 };
+        policy_sve_compare_bytes_v3(policy, result, 0, 0, constant, sve2)?;
+        if index != 0 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::SveAndPredicateBytes {
+                    destination: 1,
+                    predicate: 0,
+                    left: 1,
+                    right: result,
+                },
+            )?;
+        }
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveCountPredicateBytes {
+            destination: X6,
+            predicate: 0,
+            source: 1,
+        },
+    )?;
+    add_register64_v3(policy, X13, X13, X6)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    branch_v3(policy, vector16)?;
+
+    policy.bind(tail)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    for (offset, byte) in literal.iter().copied().enumerate() {
+        load_byte_v3(
+            policy,
+            X6,
+            X15,
+            u16::try_from(offset).expect("direct literal width"),
+        )?;
+        compare_immediate32_v3(policy, X6, u16::from(byte))?;
+        condition_v3(policy, ConditionV3::NotEqual, tail_miss)?;
+    }
+    add_immediate64_v3(policy, X13, X13, 1)?;
+    policy.bind(tail_miss)?;
+    add_immediate64_v3(policy, X3, X3, 1)?;
+    branch_v3(policy, tail)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the independent SVE filtered policy retains the full predicate-recovery graph"
+)]
+fn policy_sve_filtered_v3(
+    policy: &mut PolicySinkV3,
+    literal: &[u8],
+    filter: AuditCandidateFilterV3,
+    confirmation_order: &[u8],
+    sve2: bool,
+    done: PolicyLabelV3,
+) -> Result<(), CountAotError> {
+    let vector = policy.new_label(LabelKindV3::VectorLoop)?;
+    let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
+    let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
+    let advance = policy.new_label(LabelKindV3::Internal)?;
+    let tail = policy.new_label(LabelKindV3::ScalarTail)?;
+    let tail_miss = policy.new_label(LabelKindV3::Miss)?;
+    let width = u16::try_from(literal.len()).expect("bounded width");
+    let constants = [2_u8, 3, 16, 17];
+
+    policy_mov_minimal_v3(policy, X13, 0)?;
+    compare_immediate64_v3(policy, X1, width)?;
+    condition_v3(policy, ConditionV3::CarryClear, done)?;
+    subtract_immediate64_v3(policy, X4, X1, width)?;
+    policy_mov_minimal_v3(policy, X3, 0)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SvePtrueBytesVl16 { destination: 0 },
+    )?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        policy_mov_minimal_v3(policy, X8, u64::from(literal[usize::from(offset)]))?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveDuplicateByte {
+                destination: constants[index],
+                source: X8,
+            },
+        )?;
+    }
+
+    policy.bind(vector)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X6, X4, X3)?;
+    compare_immediate64_v3(policy, X6, SIMD_CANDIDATE_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, tail)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    for (index, offset) in filter.offsets().iter().copied().enumerate() {
+        let base = if offset == 0 {
+            X15
+        } else {
+            add_immediate64_v3(policy, X8, X15, u16::from(offset))?;
+            X8
+        };
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveLoadBytes {
+                destination: 0,
+                predicate: 0,
+                base,
+            },
+        )?;
+        let result = if index == 0 { 1 } else { 2 };
+        policy_sve_compare_bytes_v3(policy, result, 0, 0, constants[index], sve2)?;
+        if index != 0 {
+            exact_v3(
+                policy,
+                DecodedInstructionV3::SveAndPredicateBytes {
+                    destination: 1,
+                    predicate: 0,
+                    left: 1,
+                    right: result,
+                },
+            )?;
+        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::SveTestPredicateBytes {
+                predicate: 0,
+                tested: 1,
+            },
+        )?;
+        condition_v3(policy, ConditionV3::Equal, advance)?;
+    }
+
+    policy.bind(candidate)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveBreakBeforeBytes {
+            destination: 3,
+            predicate: 0,
+            source: 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveCountPredicateBytes {
+            destination: X7,
+            predicate: 0,
+            source: 3,
+        },
+    )?;
+    add_register64_v3(policy, X5, X3, X7)?;
+    add_register64_v3(policy, X15, X0, X5)?;
+    policy_scalar_confirmation_sve_v3(
+        policy,
+        literal,
+        confirmation_order,
+        filter.offsets(),
+        X15,
+        candidate_miss,
+    )?;
+    add_immediate64_v3(policy, X13, X13, 1)?;
+    add_immediate64_v3(policy, X3, X5, width)?;
+    branch_v3(policy, vector)?;
+
+    policy.bind(candidate_miss)?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveBreakAfterBytes {
+            destination: 3,
+            predicate: 0,
+            source: 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::SveBitClearPredicateBytesSetFlags {
+            destination: 1,
+            predicate: 0,
+            left: 1,
+            right: 3,
+        },
+    )?;
+    condition_v3(policy, ConditionV3::NotEqual, candidate)?;
+
+    policy.bind(advance)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    branch_v3(policy, vector)?;
+
+    policy.bind(tail)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    policy_scalar_confirmation_sve_v3(policy, literal, confirmation_order, &[], X15, tail_miss)?;
+    add_immediate64_v3(policy, X13, X13, 1)?;
+    add_immediate64_v3(policy, X3, X3, width)?;
+    branch_v3(policy, tail)?;
     policy.bind(tail_miss)?;
     add_immediate64_v3(policy, X3, X3, 1)?;
     branch_v3(policy, tail)
@@ -3591,6 +4125,20 @@ fn compare_immediate64_v3(
     )
 }
 
+fn compare_immediate32_v3(
+    policy: &mut PolicySinkV3,
+    register: u8,
+    immediate: u16,
+) -> Result<(), CountAotError> {
+    exact_v3(
+        policy,
+        DecodedInstructionV3::CompareImmediate32 {
+            register,
+            immediate,
+        },
+    )
+}
+
 fn add_register64_v3(
     policy: &mut PolicySinkV3,
     destination: u8,
@@ -3675,7 +4223,10 @@ fn load_byte_v3(
     clippy::too_many_lines,
     reason = "one ordered mask table makes the independent decoder auditable"
 )]
-fn decode_word_v3(word: u32, offset: u32) -> Result<DecodedInstructionV3, CountAotError> {
+pub(crate) fn decode_word_v3(
+    word: u32,
+    offset: u32,
+) -> Result<DecodedInstructionV3, CountAotError> {
     let rd = register_v3(word);
     let rn = register_v3(word >> 5);
     let rm = register_v3(word >> 16);
@@ -3774,6 +4325,72 @@ fn decode_word_v3(word: u32, offset: u32) -> Result<DecodedInstructionV3, CountA
             destination: rd,
             base: rn,
             index: rm,
+        })
+    } else if word & 0xffff_fff0 == 0x2518_e120 {
+        Ok(DecodedInstructionV3::SvePtrueBytesVl16 {
+            destination: predicate_destination_v3(word),
+        })
+    } else if word & 0xffff_fc00 == 0x0520_3800 {
+        Ok(DecodedInstructionV3::SveDuplicateByte {
+            destination: rd,
+            source: rn,
+        })
+    } else if word & 0xffff_e000 == 0xa400_a000 {
+        Ok(DecodedInstructionV3::SveLoadBytes {
+            destination: rd,
+            predicate: governing_predicate_v3(word),
+            base: rn,
+        })
+    } else if word & 0xffe0_e010 == 0x2400_a000 {
+        Ok(DecodedInstructionV3::SveCompareEqualBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            left: rn,
+            right: rm,
+        })
+    } else if word & 0xffe0_e010 == 0x4520_8000 {
+        Ok(DecodedInstructionV3::Sve2MatchBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            left: rn,
+            right: rm,
+        })
+    } else if word & 0xfff0_e210 == 0x2500_4000 {
+        Ok(DecodedInstructionV3::SveAndPredicateBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            left: predicate_source_v3(word),
+            right: predicate_right_v3(word),
+        })
+    } else if word & 0xfff0_e210 == 0x2540_4010 {
+        Ok(DecodedInstructionV3::SveBitClearPredicateBytesSetFlags {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            left: predicate_source_v3(word),
+            right: predicate_right_v3(word),
+        })
+    } else if word & 0xffff_e21f == 0x2550_c000 {
+        Ok(DecodedInstructionV3::SveTestPredicateBytes {
+            predicate: governing_predicate_v3(word),
+            tested: predicate_source_v3(word),
+        })
+    } else if word & 0xffff_e210 == 0x2590_4000 {
+        Ok(DecodedInstructionV3::SveBreakBeforeBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            source: predicate_source_v3(word),
+        })
+    } else if word & 0xffff_e210 == 0x2510_4000 {
+        Ok(DecodedInstructionV3::SveBreakAfterBytes {
+            destination: predicate_destination_v3(word),
+            predicate: governing_predicate_v3(word),
+            source: predicate_source_v3(word),
+        })
+    } else if word & 0xffff_e200 == 0x2520_8000 {
+        Ok(DecodedInstructionV3::SveCountPredicateBytes {
+            destination: rd,
+            predicate: governing_predicate_v3(word),
+            source: predicate_source_v3(word),
         })
     } else if word & 0xffc0_0000 == 0xf900_0000 {
         Ok(DecodedInstructionV3::Store64 {
@@ -3913,6 +4530,22 @@ fn read_word_audit_v3(code: &[u8], offset: usize) -> Result<u32, CountAotError> 
 
 fn register_v3(word: u32) -> u8 {
     u8::try_from(word & 0x1f).expect("five-bit register")
+}
+
+fn predicate_destination_v3(word: u32) -> u8 {
+    u8::try_from(word & 0xf).expect("four-bit predicate")
+}
+
+fn predicate_source_v3(word: u32) -> u8 {
+    u8::try_from((word >> 5) & 0xf).expect("four-bit predicate")
+}
+
+fn governing_predicate_v3(word: u32) -> u8 {
+    u8::try_from((word >> 10) & 7).expect("three-bit governing predicate")
+}
+
+fn predicate_right_v3(word: u32) -> u8 {
+    u8::try_from((word >> 16) & 0xf).expect("four-bit predicate")
 }
 
 fn immediate12_v3(word: u32) -> u16 {

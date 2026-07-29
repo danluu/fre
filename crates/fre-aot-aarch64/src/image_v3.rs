@@ -10,7 +10,7 @@ use crate::{AotCountBackendVersion, AotCountCpuFeatures, AotCountTargetSpec, Cou
 pub const AOT_COUNT_IMAGE_SCHEMA_VERSION_V3: u16 = 3;
 /// Numerically disjoint from Count-v1, Count-v2, and every search-JIT backend.
 pub const AOT_COUNT_BACKEND_VERSION_V3: AotCountBackendVersion = AotCountBackendVersion(0xa003);
-/// Closed recipe-specialized ASIMD lowering.
+/// Closed recipe-specialized ASIMD/SVE/SVE2 lowering.
 ///
 /// This is deliberately not an alias for Count-v2 algorithm 4. The recipe,
 /// schedule, register plan, and complete optimizer identity are authenticated
@@ -46,8 +46,8 @@ pub struct AotCountBackendSupportV3 {
 }
 
 /// Complete explicit v3 support table; no implicit current-version alias.
-pub const SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3: &[AotCountBackendSupportV3] =
-    &[AotCountBackendSupportV3 {
+pub const SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3: &[AotCountBackendSupportV3] = &[
+    AotCountBackendSupportV3 {
         backend_version: AOT_COUNT_BACKEND_VERSION_V3,
         algorithm_version: AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3,
         kir_semantics_version: AOT_COUNT_KIR_SEMANTICS_VERSION_V3,
@@ -62,7 +62,40 @@ pub const SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3: &[AotCountBackendSupportV3] =
         candidate_block_starts: 16,
         vector_bytes: 16,
         sve_vector_length_bytes: 0,
-    }];
+    },
+    AotCountBackendSupportV3 {
+        backend_version: AOT_COUNT_BACKEND_VERSION_V3,
+        algorithm_version: AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3,
+        kir_semantics_version: AOT_COUNT_KIR_SEMANTICS_VERSION_V3,
+        kir_abi_version: AOT_COUNT_KIR_ABI_VERSION_V3,
+        output_kind: 1,
+        architecture: 1,
+        little_endian: true,
+        pointer_width: 64,
+        target_abi: 1,
+        allowed_features: AotCountCpuFeatures::SVE,
+        max_literal_bytes: 32,
+        candidate_block_starts: 16,
+        vector_bytes: 16,
+        sve_vector_length_bytes: 16,
+    },
+    AotCountBackendSupportV3 {
+        backend_version: AOT_COUNT_BACKEND_VERSION_V3,
+        algorithm_version: AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3,
+        kir_semantics_version: AOT_COUNT_KIR_SEMANTICS_VERSION_V3,
+        kir_abi_version: AOT_COUNT_KIR_ABI_VERSION_V3,
+        output_kind: 1,
+        architecture: 1,
+        little_endian: true,
+        pointer_width: 64,
+        target_abi: 1,
+        allowed_features: AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2),
+        max_literal_bytes: 32,
+        candidate_block_starts: 16,
+        vector_bytes: 16,
+        sve_vector_length_bytes: 16,
+    },
+];
 
 #[must_use]
 pub fn is_supported_aot_count_backend_tuple_v3(candidate: AotCountBackendSupportV3) -> bool {

@@ -1,6 +1,6 @@
 use fre_aot_optimizer::{
-    CountV3OptimizerLimits, CountV3Strategy, CountV3TuningClass, encode_count_recipe_v3,
-    optimize_count_v3,
+    CountV3OptimizerLimits, CountV3RegisterPlanId, CountV3RequiredIsa, CountV3Strategy,
+    CountV3TuningClass, encode_count_recipe_v3, optimize_count_v3, optimize_count_v3_for_isa,
 };
 use fre_kernel_ir::{Count, ValidateLimits, build_exact_aggregate};
 
@@ -9,8 +9,11 @@ use crate::{
     AOT_COUNT_BACKEND_VERSION_V2, AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_IMAGE_SCHEMA_VERSION_V3,
     AotCountCpuFeatures, AotCountImageViewV3, AotCountMappedMetadataV3, CountAotError,
     CountAotResource, CountEmitLimitsV3, LabelKindV3, SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3,
-    audit_count_image_v3, audit_count_image_view_v3, audit_count_mapped_code_v3, emit_count_v3,
-    emit_v3::IDENTITY_DOMAIN_V3, prospective_count_v3,
+    audit_count_image_v3, audit_count_image_view_v3, audit_count_mapped_code_v3,
+    audit_v3::{DecodedInstructionV3, decode_word_v3},
+    emit_count_v3,
+    emit_v3::IDENTITY_DOMAIN_V3,
+    prospective_count_v3,
 };
 
 fn optimized(
@@ -27,6 +30,39 @@ fn optimized(
     )
     .unwrap();
     (program, optimized)
+}
+
+fn optimized_for(
+    literal: &[u8],
+    required_isa: CountV3RequiredIsa,
+) -> (
+    fre_kernel_ir::ExactAggregateProgram<Count>,
+    fre_aot_optimizer::OptimizedCountV3,
+) {
+    let program = build_exact_aggregate::<Count>(literal, ValidateLimits::default()).unwrap();
+    let optimized = optimize_count_v3_for_isa(
+        &program,
+        CountV3TuningClass::GenericAarch64,
+        required_isa,
+        CountV3OptimizerLimits::default(),
+    )
+    .unwrap();
+    (program, optimized)
+}
+
+fn decoded_v3(image: &crate::AotCountImageV3) -> Vec<DecodedInstructionV3> {
+    image
+        .code()
+        .chunks_exact(4)
+        .enumerate()
+        .map(|(index, bytes)| {
+            decode_word_v3(
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                u32::try_from(index * 4).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect()
 }
 
 #[test]
@@ -51,6 +87,101 @@ fn feature_parser_preserves_sve_and_sve2_as_two_bits() {
     assert_eq!(scalable.bits(), 6);
     assert_eq!(AotCountCpuFeatures::from_bits(6), Some(scalable));
     assert_eq!(AotCountCpuFeatures::from_bits(8), None);
+}
+
+#[test]
+fn target_aware_sve_rows_emit_real_independently_audited_opcodes() {
+    for (required_isa, register_plan, features, support_index, expect_match) in [
+        (
+            CountV3RequiredIsa::Aarch64SveVl16,
+            CountV3RegisterPlanId::Aarch64SveVl16V1,
+            AotCountCpuFeatures::SVE,
+            1,
+            false,
+        ),
+        (
+            CountV3RequiredIsa::Aarch64Sve2Vl16,
+            CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+            AotCountCpuFeatures::SVE.union(AotCountCpuFeatures::SVE2),
+            2,
+            true,
+        ),
+    ] {
+        for literal in [&b"x"[..], &b"abc"[..], &b"target-aware-sve"[..]] {
+            let (program, optimized) = optimized_for(literal, required_isa);
+            assert_eq!(optimized.recipe().register_plan_id(), register_plan);
+            let image =
+                emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+            assert_eq!(
+                image.support(),
+                SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[support_index]
+            );
+            assert_eq!(image.target().features, features);
+            assert_eq!(image.support().vector_bytes, 16);
+            assert_eq!(image.support().sve_vector_length_bytes, 16);
+            let decoded = decoded_v3(&image);
+            assert!(decoded.iter().any(|instruction| matches!(
+                instruction,
+                DecodedInstructionV3::SvePtrueBytesVl16 { .. }
+            )));
+            assert_eq!(
+                decoded.iter().any(|instruction| matches!(
+                    instruction,
+                    DecodedInstructionV3::Sve2MatchBytes { .. }
+                )),
+                expect_match
+            );
+            assert_eq!(
+                audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+                image.build_receipt().audit
+            );
+        }
+    }
+
+    let (empty_program, empty_optimized) = optimized_for(b"", CountV3RequiredIsa::Aarch64Sve2Vl16);
+    let empty = emit_count_v3(
+        &empty_program,
+        empty_optimized.recipe(),
+        CountEmitLimitsV3::default(),
+    )
+    .unwrap();
+    assert_eq!(empty.support(), SUPPORTED_AOT_COUNT_BACKEND_TUPLES_V3[2]);
+    assert_eq!(empty.target().features, AotCountCpuFeatures::NONE);
+    assert!(
+        decoded_v3(&empty)
+            .iter()
+            .all(|instruction| !matches!(instruction, DecodedInstructionV3::Sve2MatchBytes { .. }))
+    );
+    assert_eq!(
+        audit_count_image_v3(&empty_program, empty_optimized.recipe(), &empty).unwrap(),
+        empty.build_receipt().audit
+    );
+}
+
+#[test]
+fn sve_decoder_and_metadata_reject_near_miss_feature_relabeling() {
+    assert_eq!(
+        decode_word_v3(0x2518_e120, 0).unwrap(),
+        DecodedInstructionV3::SvePtrueBytesVl16 { destination: 0 }
+    );
+    assert!(matches!(
+        decode_word_v3(0x2403_a001, 4).unwrap(),
+        DecodedInstructionV3::SveCompareEqualBytes { .. }
+    ));
+    assert!(matches!(
+        decode_word_v3(0x4523_8001, 8).unwrap(),
+        DecodedInstructionV3::Sve2MatchBytes { .. }
+    ));
+    assert!(decode_word_v3(0x4523_8001 ^ (1 << 13), 8).is_err());
+
+    let (program, optimized) = optimized_for(
+        b"metadata-cannot-relabel-opcodes",
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+    );
+    let mut image =
+        emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+    image.target.features = AotCountCpuFeatures::SVE;
+    assert!(audit_count_image_v3(&program, optimized.recipe(), &image).is_err());
 }
 
 #[test]
@@ -183,6 +314,48 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
         audit_count_image_v3(&periodic_program, periodic_optimized.recipe(), &periodic).unwrap(),
         periodic.build_receipt().audit
     );
+}
+
+#[test]
+fn every_direct_vector_head_guards_exact_exhaustion_before_subtraction() {
+    for required_isa in [
+        CountV3RequiredIsa::Aarch64Neon128,
+        CountV3RequiredIsa::Aarch64SveVl16,
+        CountV3RequiredIsa::Aarch64Sve2Vl16,
+    ] {
+        let (program, optimized) = optimized_for(b"abc", required_isa);
+        let image =
+            emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+        let decoded = decoded_v3(&image);
+        let vector_heads = image
+            .labels()
+            .iter()
+            .filter(|label| label.kind == LabelKindV3::VectorLoop)
+            .collect::<Vec<_>>();
+        assert_eq!(vector_heads.len(), 2);
+        for head in vector_heads {
+            let index = usize::try_from(head.offset / 4).unwrap();
+            assert_eq!(
+                decoded[index],
+                DecodedInstructionV3::CompareRegister64 { left: 3, right: 4 }
+            );
+            assert!(matches!(
+                decoded[index + 1],
+                DecodedInstructionV3::BranchCondition {
+                    condition: crate::ConditionV3::Higher,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                decoded[index + 2],
+                DecodedInstructionV3::SubtractRegister64 {
+                    destination: 6,
+                    left: 4,
+                    right: 3
+                }
+            ));
+        }
+    }
 }
 
 #[test]

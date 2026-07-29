@@ -752,7 +752,21 @@ pub fn optimize_count_v3(
     tuning: CountV3TuningClass,
     limits: CountV3OptimizerLimits,
 ) -> Result<OptimizedCountV3, CountV3OptimizeError> {
-    optimize_impl(program, tuning, limits)
+    optimize_count_v3_for_isa(program, tuning, CountV3RequiredIsa::Aarch64Neon128, limits)
+}
+
+/// Optimize one sealed exact-literal Count program for an explicit ISA plan.
+///
+/// The target is selected before recipe materialization and therefore
+/// participates in the authenticated recipe identity. Backends never patch a
+/// sealed Neon recipe into an SVE recipe after optimization.
+pub fn optimize_count_v3_for_isa(
+    program: &ExactAggregateProgram<Count>,
+    tuning: CountV3TuningClass,
+    required_isa: CountV3RequiredIsa,
+    limits: CountV3OptimizerLimits,
+) -> Result<OptimizedCountV3, CountV3OptimizeError> {
+    optimize_impl(program, tuning, required_isa, limits)
 }
 
 /// Domain-separated identity used by every Count-v3 optimizer recipe.
@@ -853,6 +867,7 @@ struct Candidate {
 fn optimize_impl(
     program: &ExactAggregateProgram<Count>,
     tuning: CountV3TuningClass,
+    required_isa: CountV3RequiredIsa,
     limits: CountV3OptimizerLimits,
 ) -> Result<OptimizedCountV3, CountV3OptimizeError> {
     let literal = program.literal();
@@ -949,6 +964,7 @@ fn optimize_impl(
         program.cache_identity(),
         literal_identity,
         tuning,
+        required_isa,
         selected,
         literal,
         &analysis.multiplicity,
@@ -1693,6 +1709,7 @@ fn materialize_recipe(
     program_identity: AggregateProgramIdentity,
     literal_identity: [u8; 32],
     tuning_class: CountV3TuningClass,
+    required_isa: CountV3RequiredIsa,
     candidate: Candidate,
     literal: &[u8],
     multiplicity: &[u8; 256],
@@ -1709,8 +1726,8 @@ fn materialize_recipe(
         tuning_class,
         strategy: candidate.strategy,
         schedule_id: candidate.schedule,
-        register_plan_id: CountV3RegisterPlanId::Aarch64NeonV1,
-        required_isa: CountV3RequiredIsa::Aarch64Neon128,
+        register_plan_id: register_plan_for_isa(required_isa),
+        required_isa,
         filter_offsets: candidate.filters,
         filter_count: candidate.filter_count,
         confirmation_order,
@@ -1722,6 +1739,14 @@ fn materialize_recipe(
         costs: candidate.costs,
         identity: CountV3RecipeIdentity([0; 32]),
     })
+}
+
+const fn register_plan_for_isa(required_isa: CountV3RequiredIsa) -> CountV3RegisterPlanId {
+    match required_isa {
+        CountV3RequiredIsa::Aarch64Neon128 => CountV3RegisterPlanId::Aarch64NeonV1,
+        CountV3RequiredIsa::Aarch64SveVl16 => CountV3RegisterPlanId::Aarch64SveVl16V1,
+        CountV3RequiredIsa::Aarch64Sve2Vl16 => CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+    }
 }
 
 fn confirmation_order(
@@ -2316,11 +2341,8 @@ fn validate_recipe(
     if recipe.schedule_id != expected_schedule {
         return Err(CountV3RecipeValidationError::StrategySchedule);
     }
-    if recipe.register_plan_id != CountV3RegisterPlanId::Aarch64NeonV1 {
+    if recipe.register_plan_id != register_plan_for_isa(recipe.required_isa) {
         return Err(CountV3RecipeValidationError::RegisterPlan);
-    }
-    if recipe.required_isa != CountV3RequiredIsa::Aarch64Neon128 {
-        return Err(CountV3RecipeValidationError::RequiredIsa);
     }
     let width = literal.len();
     if usize::from(recipe.filter_count) > COUNT_V3_MAX_FILTER_OFFSETS

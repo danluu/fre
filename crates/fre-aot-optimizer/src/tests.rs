@@ -47,6 +47,55 @@ fn selection_and_every_identity_are_deterministic() {
 }
 
 #[test]
+fn explicit_isa_plans_are_sealed_before_recipe_identity() {
+    let program = program(b"target-aware-recipe");
+    let optimize_for = |required_isa| {
+        optimize_count_v3_for_isa(
+            &program,
+            CountV3TuningClass::NeoverseV2V3,
+            required_isa,
+            CountV3OptimizerLimits::default(),
+        )
+        .expect("target-aware optimization")
+    };
+    let neon = optimize_for(CountV3RequiredIsa::Aarch64Neon128);
+    let sve = optimize_for(CountV3RequiredIsa::Aarch64SveVl16);
+    let sve2 = optimize_for(CountV3RequiredIsa::Aarch64Sve2Vl16);
+
+    for (optimized, required_isa, register_plan) in [
+        (
+            &neon,
+            CountV3RequiredIsa::Aarch64Neon128,
+            CountV3RegisterPlanId::Aarch64NeonV1,
+        ),
+        (
+            &sve,
+            CountV3RequiredIsa::Aarch64SveVl16,
+            CountV3RegisterPlanId::Aarch64SveVl16V1,
+        ),
+        (
+            &sve2,
+            CountV3RequiredIsa::Aarch64Sve2Vl16,
+            CountV3RegisterPlanId::Aarch64Sve2Vl16V1,
+        ),
+    ] {
+        assert_eq!(optimized.recipe().required_isa(), required_isa);
+        assert_eq!(optimized.recipe().register_plan_id(), register_plan);
+        validate_count_recipe_v3(&program, optimized.recipe()).expect("sealed target recipe");
+        assert_eq!(
+            decode_count_recipe_v3(&program, &encode_count_recipe_v3(optimized.recipe()))
+                .expect("target-aware canonical decode"),
+            *optimized.recipe()
+        );
+    }
+
+    assert_ne!(neon.recipe().identity(), sve.recipe().identity());
+    assert_ne!(sve.recipe().identity(), sve2.recipe().identity());
+    assert_ne!(neon.receipt().identity(), sve.receipt().identity());
+    assert_ne!(sve.receipt().identity(), sve2.receipt().identity());
+}
+
+#[test]
 fn canonical_inspection_and_decode_are_strict() {
     let program = program(b"0123456789abcdef");
     let optimized = optimize_count_v3(
