@@ -1716,6 +1716,30 @@ impl BoundedContextPlan {
         })
     }
 
+    /// Return only a bounded-affix count after the ordinary prospective
+    /// envelope has admitted the complete operation.
+    ///
+    /// The diagnostic reducer retains its maximal-middle-run accounting. This
+    /// projection instead lets the retained literal finder visit possible
+    /// suffixes and inspects the disjoint middle run immediately before each
+    /// right endpoint. Shapes outside the bounded-affix theorem, or any
+    /// prospective refusal, return `None` for the caller's authenticated
+    /// fallback.
+    #[must_use]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        if !self.bounded_affix
+            || haystack.len() > limits.max_input_bytes
+            || self.build.persistent_bytes > limits.max_peak_bytes
+            || !literal_occurrences_are_disjoint(self.finder.needle())
+        {
+            return None;
+        }
+        let literal = self.finder.needle();
+        self.bounded_affix_preflight(haystack.len(), literal.len(), limits)
+            .ok()?;
+        self.bounded_affix_values(haystack).map(|(count, _)| count)
+    }
+
     pub fn span_sum(
         &self,
         haystack: &[u8],
@@ -1762,6 +1786,80 @@ impl BoundedContextPlan {
                 },
             },
         })
+    }
+
+    /// Return only a bounded-affix span sum after the ordinary prospective
+    /// envelope has admitted the complete operation.
+    #[must_use]
+    pub fn span_sum_value_success(&self, haystack: &[u8], limits: SpanSumLimits) -> Option<u64> {
+        if !self.bounded_affix
+            || haystack.len() > limits.max_input_bytes
+            || self.build.persistent_bytes > limits.max_peak_bytes
+            || !literal_occurrences_are_disjoint(self.finder.needle())
+        {
+            return None;
+        }
+        let literal = self.finder.needle();
+        self.bounded_affix_span_sum_preflight(haystack.len(), literal.len(), limits)
+            .ok()?;
+        self.bounded_affix_values(haystack)
+            .map(|(_, span_sum)| span_sum)
+    }
+
+    /// Reduce `LEFT MIDDLE{0,A} LITERAL RIGHT` from literal suffixes.
+    ///
+    /// `RIGHT` is disjoint from `MIDDLE`, so two literal occurrences followed
+    /// by `RIGHT` terminate disjoint middle runs. Backward classifications
+    /// therefore total at most one source traversal. The caller has also
+    /// authenticated a sufficient literal self-non-overlap condition, while
+    /// construction proved that every literal byte belongs to `MIDDLE`, that
+    /// the literal is nonempty, and that `LEFT` is outside `MIDDLE`.
+    fn bounded_affix_values(&self, haystack: &[u8]) -> Option<(u64, u64)> {
+        let literal = self.finder.needle();
+        let middle_max = usize::try_from(self.left_gap_max).ok()?;
+        let mut next_match_start = 0_usize;
+        let mut count = 0_u64;
+        let mut span_sum = 0_u64;
+
+        for literal_start in self.finder.find_iter(haystack) {
+            let literal_end = literal_start.checked_add(literal.len())?;
+            let Some(&right) = haystack.get(literal_end) else {
+                continue;
+            };
+            if !self.tail.contains(right) {
+                continue;
+            }
+
+            let lower = literal_start.saturating_sub(middle_max);
+            let mut middle_start = literal_start;
+            while middle_start > lower
+                && self
+                    .separator
+                    .contains(haystack[middle_start.checked_sub(1)?])
+            {
+                middle_start = middle_start.checked_sub(1)?;
+            }
+            // Reaching the bounded window while another middle byte precedes
+            // it proves that the maximal greedy run exceeds A.
+            if middle_start == lower
+                && middle_start > 0
+                && self.separator.contains(haystack[middle_start - 1])
+            {
+                continue;
+            }
+            let Some(start) = middle_start.checked_sub(1) else {
+                continue;
+            };
+            if start < next_match_start || !self.prefix.contains(haystack[start]) {
+                continue;
+            }
+
+            let end = literal_end.checked_add(1)?;
+            count = count.checked_add(1)?;
+            span_sum = span_sum.checked_add(u64::try_from(end.checked_sub(start)?).ok()?)?;
+            next_match_start = end;
+        }
+        Some((count, span_sum))
     }
 
     #[allow(
@@ -2806,6 +2904,20 @@ fn allocation_reduce_error(
     }
 }
 
+/// A sufficient constant-space proof that native non-overlapping substring
+/// iteration visits every literal occurrence.
+///
+/// Any proper border would place the literal's first byte at a later position.
+/// Rejecting every literal that repeats its first byte is conservative, linear
+/// in the retained literal, and leaves less obvious unbordered cases on the
+/// receipt-bearing endpoint reducer.
+fn literal_occurrences_are_disjoint(literal: &[u8]) -> bool {
+    let Some((&first, rest)) = literal.split_first() else {
+        return false;
+    };
+    !rest.contains(&first)
+}
+
 #[derive(Clone, Copy)]
 enum ReduceResource {
     Work,
@@ -3673,6 +3785,14 @@ mod tests {
         assert_eq!(default.count, expected);
         let span_sum = plan.span_sum(haystack, SpanSumLimits::default()).unwrap();
         assert_eq!(span_sum.span_sum, expected_span_sum);
+        assert_eq!(
+            plan.count_value_success(haystack, ReduceLimits::default()),
+            Some(expected)
+        );
+        assert_eq!(
+            plan.span_sum_value_success(haystack, SpanSumLimits::default()),
+            Some(expected_span_sum)
+        );
         assert_eq!(span_sum.accounting.actual.span_sum, expected_span_sum);
         assert_eq!(
             span_sum.accounting.actual.match_events,
@@ -3759,7 +3879,101 @@ mod tests {
             default.accounting.upper_bounds.branches
         );
         assert_bounded_affix_count_and_build_limits(&plan, haystack, expected);
+        let exact_work = default.accounting.upper_bounds.work;
+        assert_eq!(
+            plan.count_value_success(
+                haystack,
+                ReduceLimits {
+                    max_work: exact_work - 1,
+                    ..ReduceLimits::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            plan.span_sum_value_success(
+                haystack,
+                SpanSumLimits {
+                    max_span_sum: expected_span_sum - 1,
+                    ..SpanSumLimits::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            plan.count_value_success(
+                haystack,
+                ReduceLimits {
+                    max_input_bytes: haystack.len() - 1,
+                    ..ReduceLimits::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            plan.span_sum_value_success(
+                haystack,
+                SpanSumLimits {
+                    max_input_bytes: haystack.len() - 1,
+                    ..SpanSumLimits::default()
+                }
+            ),
+            None
+        );
+        let exact_peak = plan.build_accounting().persistent_bytes;
+        assert_eq!(
+            plan.count_value_success(
+                haystack,
+                ReduceLimits {
+                    max_peak_bytes: exact_peak - 1,
+                    ..ReduceLimits::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            plan.span_sum_value_success(
+                haystack,
+                SpanSumLimits {
+                    max_peak_bytes: exact_peak - 1,
+                    ..SpanSumLimits::default()
+                }
+            ),
+            None
+        );
         assert!(span_sum.span_sum <= u64::try_from(haystack.len()).unwrap());
+    }
+
+    #[test]
+    fn bounded_affix_bordered_literal_uses_endpoint_fallback() {
+        let plan = BoundedContextPlan::build_bounded_affix(
+            [(b'L', b'L')],
+            [(b'a', b'a')],
+            [(b'R', b'R')],
+            b"aa",
+            1,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let haystack = b"LaaaR";
+        assert_eq!(
+            plan.count(haystack, ReduceLimits::default()).unwrap().count,
+            1
+        );
+        assert_eq!(
+            plan.span_sum(haystack, SpanSumLimits::default())
+                .unwrap()
+                .span_sum,
+            5
+        );
+        assert_eq!(
+            plan.count_value_success(haystack, ReduceLimits::default()),
+            None
+        );
+        assert_eq!(
+            plan.span_sum_value_success(haystack, SpanSumLimits::default()),
+            None
+        );
     }
 
     #[test]
@@ -3795,8 +4009,18 @@ mod tests {
                 let span_sum = plan.span_sum(&haystack, SpanSumLimits::default()).unwrap();
                 assert_eq!(count.count, expected_count, "haystack={haystack:?}");
                 assert_eq!(
+                    plan.count_value_success(&haystack, ReduceLimits::default()),
+                    Some(expected_count),
+                    "value haystack={haystack:?}"
+                );
+                assert_eq!(
                     span_sum.span_sum, expected_span_sum,
                     "haystack={haystack:?}"
+                );
+                assert_eq!(
+                    plan.span_sum_value_success(&haystack, SpanSumLimits::default()),
+                    Some(expected_span_sum),
+                    "value haystack={haystack:?}"
                 );
                 assert_eq!(
                     span_sum.accounting.actual.span_sum, expected_span_sum,

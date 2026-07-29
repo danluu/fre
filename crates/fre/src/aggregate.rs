@@ -16953,16 +16953,21 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedLiteralPair(source),
                     )
                 }),
-            AggregateEngine::BoundedContext(engine) => engine
-                .count(haystack, limits.bounded_context)
-                .map(|result| result.count)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::BoundedContext(source),
-                    )
-                }),
+            AggregateEngine::BoundedContext(engine) => {
+                if let Some(value) = engine.count_value_success(haystack, limits.bounded_context) {
+                    return Ok(value);
+                }
+                engine
+                    .count(haystack, limits.bounded_context)
+                    .map(|result| result.count)
+                    .map_err(|source| {
+                        self.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::BoundedContext(source),
+                        )
+                    })
+            }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_count_value(engine, haystack, limits)
             }
@@ -17585,19 +17590,23 @@ impl AggregatePlan {
                         AggregateExecutionSource::BoundedLiteralPair(source),
                     )
                 }),
-            AggregateEngine::BoundedContext(engine) => engine
-                .span_sum(
-                    haystack,
-                    BoundedContextSpanSumLimits::from_shared(limits.bounded_context),
-                )
-                .map(|result| result.span_sum)
-                .map_err(|source| {
-                    self.direct_execution_error(
-                        haystack.len(),
-                        limits,
-                        AggregateExecutionSource::BoundedContext(source),
-                    )
-                }),
+            AggregateEngine::BoundedContext(engine) => {
+                let reduce_limits =
+                    BoundedContextSpanSumLimits::from_shared(limits.bounded_context);
+                if let Some(value) = engine.span_sum_value_success(haystack, reduce_limits) {
+                    return Ok(value);
+                }
+                engine
+                    .span_sum(haystack, reduce_limits)
+                    .map(|result| result.span_sum)
+                    .map_err(|source| {
+                        self.direct_execution_error(
+                            haystack.len(),
+                            limits,
+                            AggregateExecutionSource::BoundedContext(source),
+                        )
+                    })
+            }
             AggregateEngine::FixedAbsoluteDomain(engine) => {
                 self.execute_fixed_absolute_span_sum_value(engine, haystack, limits)
             }
