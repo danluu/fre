@@ -3360,6 +3360,7 @@ fn policy_multi_specialized_v3(
     let candidate = policy.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = policy.new_label(LabelKindV3::Miss)?;
     let block_advance = policy.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_scan = policy.new_label(LabelKindV3::VectorLoop)?;
     let sparse_scan = policy.new_label(LabelKindV3::VectorLoop)?;
     let sparse_hit = policy.new_label(LabelKindV3::Internal)?;
     let sparse_first_half = policy.new_label(LabelKindV3::Internal)?;
@@ -3445,13 +3446,45 @@ fn policy_multi_specialized_v3(
     compare_immediate64_v3(policy, X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
     condition_v3(policy, ConditionV3::CarryClear, scalar)?;
     add_register64_v3(policy, X15, X0, X3)?;
-    for index in 0..usize::from(filter.len) {
+    add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::LoadVector128 {
+            destination: 0,
+            base: X8,
+            offset: 0,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::CompareEqualBytes16 {
+            destination: 0,
+            left: 0,
+            right: vector_registers[0],
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+            destination: 1,
+            source: 0,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::MoveVectorByteTo32 {
+            destination: X8,
+            source: 1,
+        },
+    )?;
+    compare_immediate64_v3(policy, X8, 0)?;
+    condition_v3(policy, ConditionV3::Equal, primary_sparse_scan)?;
+    for index in 1..usize::from(filter.len) {
         add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[index]))?;
-        let destination = if index == 0 { 0 } else { 1 };
         exact_v3(
             policy,
             DecodedInstructionV3::LoadVector128 {
-                destination,
+                destination: 1,
                 base: X8,
                 offset: 0,
             },
@@ -3459,21 +3492,19 @@ fn policy_multi_specialized_v3(
         exact_v3(
             policy,
             DecodedInstructionV3::CompareEqualBytes16 {
-                destination,
-                left: destination,
+                destination: 1,
+                left: 1,
                 right: vector_registers[index],
             },
         )?;
-        if index != 0 {
-            exact_v3(
-                policy,
-                DecodedInstructionV3::AndBytes16 {
-                    destination: 0,
-                    left: 0,
-                    right: destination,
-                },
-            )?;
-        }
+        exact_v3(
+            policy,
+            DecodedInstructionV3::AndBytes16 {
+                destination: 0,
+                left: 0,
+                right: 1,
+            },
+        )?;
     }
     exact_v3(
         policy,
@@ -3553,6 +3584,116 @@ fn policy_multi_specialized_v3(
     policy.bind(block_advance)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     branch_v3(policy, vector)?;
+
+    policy.bind(primary_sparse_scan)?;
+    add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    compare_register64_v3(policy, X3, X4)?;
+    condition_v3(policy, ConditionV3::Higher, done)?;
+    subtract_register64_v3(policy, X5, X4, X3)?;
+    compare_immediate64_v3(policy, X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    condition_v3(policy, ConditionV3::CarryClear, vector)?;
+    add_register64_v3(policy, X15, X0, X3)?;
+    add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
+    for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+        let offset = block * SIMD_CANDIDATE_STARTS_V3;
+        let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+            .expect("eight sparse primary masks");
+        exact_v3(
+            policy,
+            DecodedInstructionV3::LoadVector128 {
+                destination: mask,
+                base: X8,
+                offset,
+            },
+        )?;
+        exact_v3(
+            policy,
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: mask,
+                left: mask,
+                right: vector_registers[0],
+            },
+        )?;
+    }
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_01_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_23_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 2,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_45_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 4,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 5,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: SPARSE_PAIR_67_MASK_V3,
+            left: SPARSE_BLOCK_MASK_BASE_V3 + 6,
+            right: SPARSE_BLOCK_MASK_BASE_V3 + 7,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 1,
+            left: SPARSE_PAIR_01_MASK_V3,
+            right: SPARSE_PAIR_23_MASK_V3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 0,
+            left: SPARSE_PAIR_45_MASK_V3,
+            right: SPARSE_PAIR_67_MASK_V3,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::OrBytes16 {
+            destination: 1,
+            left: 1,
+            right: 0,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+            destination: 1,
+            source: 1,
+        },
+    )?;
+    exact_v3(
+        policy,
+        DecodedInstructionV3::MoveVectorByteTo32 {
+            destination: X8,
+            source: 1,
+        },
+    )?;
+    compare_immediate64_v3(policy, X8, 0)?;
+    condition_v3(policy, ConditionV3::NotEqual, sparse_hit)?;
+    add_immediate64_v3(
+        policy,
+        X3,
+        X3,
+        SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3,
+    )?;
+    branch_v3(policy, primary_sparse_scan)?;
 
     policy.bind(sparse_scan)?;
     add_immediate64_v3(policy, X3, X3, SIMD_CANDIDATE_STARTS_V3)?;

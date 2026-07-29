@@ -65,11 +65,21 @@ fn decoded_v3(image: &crate::AotCountImageV3) -> Vec<DecodedInstructionV3> {
         .collect()
 }
 
+fn branch_target_v3(instructions: &[DecodedInstructionV3], index: usize) -> u32 {
+    let displacement = match instructions[index] {
+        DecodedInstructionV3::Branch { displacement }
+        | DecodedInstructionV3::BranchCondition { displacement, .. } => displacement,
+        _ => panic!("instruction at {index} is not a branch"),
+    };
+    let offset = i64::try_from(index.checked_mul(4).unwrap()).unwrap();
+    u32::try_from(offset.checked_add(i64::from(displacement)).unwrap()).unwrap()
+}
+
 #[test]
 fn v3_versions_and_identity_domain_are_disjoint() {
     assert_eq!(AOT_COUNT_IMAGE_SCHEMA_VERSION_V3, 3);
     assert_eq!(AOT_COUNT_BACKEND_VERSION_V3.0, 0xa003);
-    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 6);
+    assert_eq!(AOT_COUNT_BACKEND_ALGORITHM_VERSION_V3, 7);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V1);
     assert_ne!(AOT_COUNT_BACKEND_VERSION_V3, AOT_COUNT_BACKEND_VERSION_V2);
     assert_eq!(IDENTITY_DOMAIN_V3.last(), Some(&3));
@@ -313,6 +323,189 @@ fn direct_masks_and_periodic_absence_batching_have_distinct_graphs() {
     assert_eq!(
         audit_count_image_v3(&periodic_program, periodic_optimized.recipe(), &periodic).unwrap(),
         periodic.build_receipt().audit
+    );
+}
+
+#[test]
+fn primary_empty_scan_is_single_column_and_pair_fallback_is_disjoint() {
+    let (program, optimized) = optimized(b"abababab");
+    assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+    let image = emit_count_v3(&program, optimized.recipe(), CountEmitLimitsV3::default()).unwrap();
+    let decoded = decoded_v3(&image);
+
+    // The ordinary block proves the primary mask empty before loading the
+    // secondary column. This branch is the only entry to the one-column scan.
+    let primary_probe = decoded
+        .windows(5)
+        .position(|window| {
+            window[0]
+                == DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: 2,
+                }
+                && window[1]
+                    == DecodedInstructionV3::UnsignedMaxAcrossBytes16 {
+                        destination: 1,
+                        source: 0,
+                    }
+                && window[2]
+                    == DecodedInstructionV3::MoveVectorByteTo32 {
+                        destination: 8,
+                        source: 1,
+                    }
+                && window[3]
+                    == DecodedInstructionV3::CompareImmediate64 {
+                        register: 8,
+                        immediate: 0,
+                    }
+                && matches!(
+                    window[4],
+                    DecodedInstructionV3::BranchCondition {
+                        condition: crate::ConditionV3::Equal,
+                        ..
+                    }
+                )
+        })
+        .expect("ordinary primary-empty proof");
+    let primary_scan_offset = branch_target_v3(&decoded, primary_probe + 4);
+    let primary_scan = usize::try_from(primary_scan_offset / 4).unwrap();
+    assert_eq!(
+        decoded[primary_scan],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 3,
+            source: 3,
+            immediate: 16,
+        }
+    );
+    assert_eq!(
+        decoded[primary_scan + 4],
+        DecodedInstructionV3::CompareImmediate64 {
+            register: 5,
+            immediate: 127,
+        }
+    );
+    for block in 0_u16..8 {
+        let index = primary_scan + 8 + usize::from(block) * 2;
+        let mask = u8::try_from(24 + block).unwrap();
+        assert_eq!(
+            decoded[index],
+            DecodedInstructionV3::LoadVector128 {
+                destination: mask,
+                base: 8,
+                offset: block * 16,
+            }
+        );
+        assert_eq!(
+            decoded[index + 1],
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: mask,
+                left: mask,
+                right: 2,
+            }
+        );
+    }
+    let next_primary_iteration = decoded
+        .iter()
+        .enumerate()
+        .skip(primary_scan + 24)
+        .take(24)
+        .find(|(index, instruction)| {
+            matches!(instruction, DecodedInstructionV3::Branch { .. })
+                && branch_target_v3(&decoded, *index) == primary_scan_offset
+        })
+        .map(|(index, _)| index)
+        .expect("primary sparse loop backedge");
+    assert_eq!(
+        decoded[next_primary_iteration - 1],
+        DecodedInstructionV3::AddImmediate64 {
+            destination: 3,
+            source: 3,
+            immediate: 112,
+        }
+    );
+
+    // A primary-present block whose complete filter is empty branches to a
+    // separate pair scan. The two loads and comparisons per block are retained
+    // here, preventing common-primary adversarial input from using the
+    // one-column scan.
+    let composite_probe = decoded
+        .windows(2)
+        .enumerate()
+        .skip(primary_probe + 5)
+        .find(|(_, window)| {
+            window[0]
+                == DecodedInstructionV3::CompareImmediate64 {
+                    register: 6,
+                    immediate: 0,
+                }
+                && matches!(
+                    window[1],
+                    DecodedInstructionV3::BranchCondition {
+                        condition: crate::ConditionV3::Equal,
+                        ..
+                    }
+                )
+        })
+        .map(|(index, _)| index)
+        .expect("composite-empty proof");
+    let pair_scan_offset = branch_target_v3(&decoded, composite_probe + 1);
+    assert_ne!(pair_scan_offset, primary_scan_offset);
+    let pair_scan = usize::try_from(pair_scan_offset / 4).unwrap();
+    assert_eq!(
+        decoded[pair_scan + 4],
+        DecodedInstructionV3::CompareImmediate64 {
+            register: 5,
+            immediate: 127,
+        }
+    );
+    for block in 0_u16..8 {
+        let index = pair_scan + 9 + usize::from(block) * 5;
+        let mask = u8::try_from(24 + block).unwrap();
+        assert_eq!(
+            decoded[index],
+            DecodedInstructionV3::LoadVector128 {
+                destination: 0,
+                base: 8,
+                offset: block * 16,
+            }
+        );
+        assert_eq!(
+            decoded[index + 1],
+            DecodedInstructionV3::LoadVector128 {
+                destination: 1,
+                base: 9,
+                offset: block * 16,
+            }
+        );
+        assert_eq!(
+            decoded[index + 2],
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: 0,
+                left: 0,
+                right: 2,
+            }
+        );
+        assert_eq!(
+            decoded[index + 3],
+            DecodedInstructionV3::CompareEqualBytes16 {
+                destination: 1,
+                left: 1,
+                right: 3,
+            }
+        );
+        assert_eq!(
+            decoded[index + 4],
+            DecodedInstructionV3::AndBytes16 {
+                destination: mask,
+                left: 0,
+                right: 1,
+            }
+        );
+    }
+    assert_eq!(
+        audit_count_image_v3(&program, optimized.recipe(), &image).unwrap(),
+        image.build_receipt().audit
     );
 }
 

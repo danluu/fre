@@ -2270,6 +2270,7 @@ fn emit_multi_specialized_v3(
     let candidate = assembler.new_label(LabelKindV3::CandidateLoop)?;
     let candidate_miss = assembler.new_label(LabelKindV3::Miss)?;
     let block_advance = assembler.new_label(LabelKindV3::Internal)?;
+    let primary_sparse_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
     let sparse_scan = assembler.new_label(LabelKindV3::VectorLoop)?;
     let sparse_hit = assembler.new_label(LabelKindV3::Internal)?;
     let sparse_first_half = assembler.new_label(LabelKindV3::Internal)?;
@@ -2336,14 +2337,20 @@ fn emit_multi_specialized_v3(
     assembler.cmp_imm64(X5, SIMD_CANDIDATE_STARTS_V3 - 1)?;
     assembler.branch_cond(ConditionV3::CarryClear, scalar)?;
     assembler.add_reg(X15, X0, X3)?;
-    for index in 0..usize::from(filter.len) {
+    assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+    assembler.load_vector128(0, X8)?;
+    assembler.compare_equal_bytes16(0, 0, vector_registers[0])?;
+    // Prove the primary mask empty before paying for any other filter
+    // column. Only this proof admits the wide one-column scan below.
+    assembler.unsigned_max_across_bytes16(1, 0)?;
+    assembler.move_vector_byte_to32(X8, 1)?;
+    assembler.cmp_imm64(X8, 0)?;
+    assembler.branch_cond(ConditionV3::Equal, primary_sparse_scan)?;
+    for index in 1..usize::from(filter.len) {
         assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
-        let destination = if index == 0 { 0 } else { 1 };
-        assembler.load_vector128(destination, X8)?;
-        assembler.compare_equal_bytes16(destination, destination, vector_registers[index])?;
-        if index != 0 {
-            assembler.and_bytes16(0, 0, destination)?;
-        }
+        assembler.load_vector128(1, X8)?;
+        assembler.compare_equal_bytes16(1, 1, vector_registers[index])?;
+        assembler.and_bytes16(0, 0, 1)?;
     }
     assembler.shrink_narrow_bytes_from_halfwords(0, 0, 4)?;
     assembler.move_vector_double_to64(X6, 0)?;
@@ -2378,10 +2385,65 @@ fn emit_multi_specialized_v3(
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(vector)?;
 
-    // The sparse route reaches this label with the current block known empty.
-    // Advance once, then reduce eight pair-filter blocks per iteration. A hit
-    // is classified into its earliest 32-start quarter, bounding the full
-    // filter rescan to one 16-start block.
+    // A primary-empty ordinary block enters a single-column 128-start scan.
+    // Every hit-bearing group returns through the shared classifier to the
+    // complete filter, so a primary byte can never become a semantic match by
+    // itself. On genuinely rare primaries this halves sparse-scan loads and
+    // comparisons; primary-present/composite-empty blocks never enter here.
+    assembler.bind(primary_sparse_scan)?;
+    assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.cmp_reg64(X3, X4)?;
+    assembler.branch_cond(ConditionV3::Higher, done)?;
+    assembler.sub_reg(X5, X4, X3)?;
+    assembler.cmp_imm64(X5, SPARSE_SCAN_STARTS_V3 - 1)?;
+    assembler.branch_cond(ConditionV3::CarryClear, vector)?;
+    assembler.add_reg(X15, X0, X3)?;
+    assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
+    for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+        let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
+            CountAotError::ArithmeticOverflow {
+                site: CountAotArithmeticSite::CodeOffset,
+            },
+        )?;
+        let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+            .expect("eight sparse primary masks");
+        assembler.load_vector128_offset(mask, X8, offset)?;
+        assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+    }
+    assembler.or_bytes16(
+        SPARSE_PAIR_01_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 1,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_23_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 2,
+        SPARSE_BLOCK_MASK_BASE_V3 + 3,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_45_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 4,
+        SPARSE_BLOCK_MASK_BASE_V3 + 5,
+    )?;
+    assembler.or_bytes16(
+        SPARSE_PAIR_67_MASK_V3,
+        SPARSE_BLOCK_MASK_BASE_V3 + 6,
+        SPARSE_BLOCK_MASK_BASE_V3 + 7,
+    )?;
+    assembler.or_bytes16(1, SPARSE_PAIR_01_MASK_V3, SPARSE_PAIR_23_MASK_V3)?;
+    assembler.or_bytes16(0, SPARSE_PAIR_45_MASK_V3, SPARSE_PAIR_67_MASK_V3)?;
+    assembler.or_bytes16(1, 1, 0)?;
+    assembler.unsigned_max_across_bytes16(1, 1)?;
+    assembler.move_vector_byte_to32(X8, 1)?;
+    assembler.cmp_imm64(X8, 0)?;
+    assembler.branch_cond(ConditionV3::NotEqual, sparse_hit)?;
+    assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
+    assembler.branch(primary_sparse_scan)?;
+
+    // A composite-empty block whose primary is present takes the robust pair
+    // route. Advance once, then reduce eight pair-filter blocks per iteration.
+    // This avoids repeatedly rediscovering a common primary byte on input such
+    // as a long run of the primary with no secondary/full-filter match.
     assembler.bind(sparse_scan)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.cmp_reg64(X3, X4)?;
