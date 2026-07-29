@@ -15,6 +15,14 @@ qualified-exact-search-jit = [
     "dep:fre-jit-runtime",
 ]
 explicit-search-span-aot = ["dep:fre-aot-static-runtime"]
+explicit-count-v3-aot = [
+    "dep:fre-aot-static-runtime",
+    "fre-aot-static-runtime/linked-count-v3",
+]
+count-v3-aot-qualification-private = [
+    "explicit-count-v3-aot",
+    "fre-aot-static-runtime/count-v3-qualification-private",
+]
 static-dispatch = ["fre-kernels/static-dispatch"]
 static-dispatch-arm-41-d84 = [
     "static-dispatch",

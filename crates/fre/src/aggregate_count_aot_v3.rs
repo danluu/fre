@@ -1,0 +1,505 @@
+//! Explicit binding of an authenticated optimizing Count-v3 handle.
+//!
+//! Route selection happens once in `bind`. A successful wrapper has only the
+//! native route; a refusal leaves the original portable owner available to the
+//! caller as its construction-time fallback. No call performs artifact lookup,
+//! target dispatch, compilation, recipe selection, or code audit.
+
+use core::fmt;
+
+use fre_aot_static_runtime::{StaticCountCallErrorV3, VerifiedStaticCountV3};
+#[cfg(feature = "count-v3-aot-qualification-private")]
+use fre_aot_static_runtime::{
+    StaticCountQualificationFacadeBindingV3, VerifiedStaticCountQualificationV3,
+};
+use fre_kernel_ir::AggregateExecutionLimits;
+
+use crate::{
+    AggregateCountExactLiteralAotPlannedCandidate,
+    AggregateCountExactLiteralAotPlanningReceiptIdentity,
+    AggregateCountExactLiteralAotSemanticBindingIdentity, AggregateCountRegex, AggregateRunLimits,
+};
+
+/// Refusal to bind a static image to its exact fixed-policy facade owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AggregateCountExactLiteralAotBindErrorV3 {
+    PortableOwnerIsNotFixedPolicyExactLiteralCandidate,
+    LiteralMismatch {
+        portable_bytes: usize,
+        adopted_bytes: usize,
+    },
+    SemanticBindingIdentityMismatch {
+        portable: AggregateCountExactLiteralAotSemanticBindingIdentity,
+        adopted: [u8; 32],
+    },
+    PlanningReceiptIdentityMismatch {
+        portable: AggregateCountExactLiteralAotPlanningReceiptIdentity,
+        adopted: [u8; 32],
+    },
+}
+
+impl fmt::Display for AggregateCountExactLiteralAotBindErrorV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE exact-literal optimizing Count-v3 AOT binding failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for AggregateCountExactLiteralAotBindErrorV3 {}
+
+/// Value-only execution refusal from the explicit optimizing AOT facade.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AggregateCountExactLiteralAotExecutionErrorV3 {
+    ArithmeticOverflow {
+        at: &'static str,
+    },
+    ResourceLimit {
+        resource: &'static str,
+        limit: u128,
+        required: u128,
+    },
+    Native(StaticCountCallErrorV3),
+}
+
+impl fmt::Display for AggregateCountExactLiteralAotExecutionErrorV3 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "FRE exact-literal optimizing Count-v3 AOT execution failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for AggregateCountExactLiteralAotExecutionErrorV3 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Native(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<StaticCountCallErrorV3> for AggregateCountExactLiteralAotExecutionErrorV3 {
+    fn from(value: StaticCountCallErrorV3) -> Self {
+        Self::Native(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedBindingV3 {
+    semantic_binding_identity: AggregateCountExactLiteralAotSemanticBindingIdentity,
+    planning_receipt_identity: AggregateCountExactLiteralAotPlanningReceiptIdentity,
+    literal_bytes: usize,
+    portable_persistent_bytes: usize,
+}
+
+/// Explicit production Count-v3 view of one fixed-policy portable owner.
+///
+/// The original owner remains borrowed for the complete callable lifetime.
+/// Since production authority is currently empty, construction can succeed
+/// only after a future reviewed tuple promotion.
+pub struct AggregateCountExactLiteralAotV3<'binding> {
+    portable_owner: &'binding AggregateCountRegex,
+    verified: &'binding VerifiedStaticCountV3,
+    checked: CheckedBindingV3,
+}
+
+impl fmt::Debug for AggregateCountExactLiteralAotV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field("eligibility_tuple", &self.verified.eligibility_tuple())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'binding> AggregateCountExactLiteralAotV3<'binding> {
+    /// Bind an already production-adopted handle to the existing fixed-policy
+    /// exact-literal owner.
+    pub fn bind(
+        portable_owner: &'binding AggregateCountRegex,
+        verified: &'binding VerifiedStaticCountV3,
+    ) -> Result<Self, AggregateCountExactLiteralAotBindErrorV3> {
+        let checked = check_binding_v3(
+            portable_owner.exact_literal_aot_planned_candidate(),
+            verified.literal(),
+            verified.semantic_binding_identity(),
+            verified.planning_receipt_identity(),
+        )?;
+        Ok(Self {
+            portable_owner,
+            verified,
+            checked,
+        })
+    }
+
+    /// Direct value-only count with the incumbent exact-literal resource
+    /// limits and no per-call route selection.
+    #[inline]
+    pub fn count_value(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+        count_value_v3(self.verified, self.checked, haystack, limits.borrow())
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountV3 {
+        self.verified
+    }
+}
+
+/// Qualification-only explicit facade.
+///
+/// Its native handle and facade type are unavailable without the private
+/// feature and cannot be substituted for the production wrapper.
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub struct AggregateCountExactLiteralAotQualificationV3<'binding> {
+    portable_owner: &'binding AggregateCountRegex,
+    verified: &'binding VerifiedStaticCountQualificationV3,
+    checked: CheckedBindingV3,
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl fmt::Debug for AggregateCountExactLiteralAotQualificationV3<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AggregateCountExactLiteralAotQualificationV3")
+            .field("portable_owner", &self.portable_owner)
+            .field("checked", &self.checked)
+            .field("eligibility_tuple", &self.verified.eligibility_tuple())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "count-v3-aot-qualification-private")]
+impl<'binding> AggregateCountExactLiteralAotQualificationV3<'binding> {
+    /// Project the live fixed-policy owner into the borrowed proof required by
+    /// the qualification-only adopter.
+    pub fn adoption_binding(
+        portable_owner: &'binding AggregateCountRegex,
+    ) -> Result<
+        StaticCountQualificationFacadeBindingV3<'binding>,
+        AggregateCountExactLiteralAotBindErrorV3,
+    > {
+        let candidate = portable_owner
+            .exact_literal_aot_planned_candidate()
+            .ok_or(
+                AggregateCountExactLiteralAotBindErrorV3::PortableOwnerIsNotFixedPolicyExactLiteralCandidate,
+            )?;
+        Ok(StaticCountQualificationFacadeBindingV3::new(
+            candidate.literal(),
+            *candidate.semantic_binding_identity().as_bytes(),
+            *candidate.planning_receipt_identity().as_bytes(),
+        ))
+    }
+
+    pub fn bind(
+        portable_owner: &'binding AggregateCountRegex,
+        verified: &'binding VerifiedStaticCountQualificationV3,
+    ) -> Result<Self, AggregateCountExactLiteralAotBindErrorV3> {
+        let checked = check_binding_v3(
+            portable_owner.exact_literal_aot_planned_candidate(),
+            verified.literal(),
+            verified.semantic_binding_identity(),
+            verified.planning_receipt_identity(),
+        )?;
+        Ok(Self {
+            portable_owner,
+            verified,
+            checked,
+        })
+    }
+
+    #[inline]
+    pub fn count_value(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+    ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+        let upper = preflight_v3(self.checked, haystack.len(), limits.borrow())?;
+        self.verified
+            .count(haystack, exact_runtime_limits_v3(upper))
+            .map_err(Into::into)
+    }
+
+    #[must_use]
+    pub const fn portable_owner(&self) -> &AggregateCountRegex {
+        self.portable_owner
+    }
+
+    #[must_use]
+    pub const fn verified_handle(&self) -> &VerifiedStaticCountQualificationV3 {
+        self.verified
+    }
+}
+
+trait CountV3Handle {
+    fn count_v3(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+    ) -> Result<u64, StaticCountCallErrorV3>;
+}
+
+impl CountV3Handle for VerifiedStaticCountV3 {
+    #[inline]
+    fn count_v3(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+    ) -> Result<u64, StaticCountCallErrorV3> {
+        self.count(haystack, limits)
+    }
+}
+
+fn count_value_v3(
+    handle: &impl CountV3Handle,
+    checked: CheckedBindingV3,
+    haystack: &[u8],
+    limits: &AggregateRunLimits,
+) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+    let upper = preflight_v3(checked, haystack.len(), limits)?;
+    handle
+        .count_v3(haystack, exact_runtime_limits_v3(upper))
+        .map_err(Into::into)
+}
+
+fn check_binding_v3(
+    candidate: Option<AggregateCountExactLiteralAotPlannedCandidate<'_>>,
+    adopted_literal: &[u8],
+    adopted_semantic_identity: &[u8; 32],
+    adopted_planning_identity: &[u8; 32],
+) -> Result<CheckedBindingV3, AggregateCountExactLiteralAotBindErrorV3> {
+    let candidate = candidate.ok_or(
+        AggregateCountExactLiteralAotBindErrorV3::PortableOwnerIsNotFixedPolicyExactLiteralCandidate,
+    )?;
+    if candidate.literal() != adopted_literal {
+        return Err(AggregateCountExactLiteralAotBindErrorV3::LiteralMismatch {
+            portable_bytes: candidate.literal().len(),
+            adopted_bytes: adopted_literal.len(),
+        });
+    }
+    let semantic_binding_identity = candidate.semantic_binding_identity();
+    if semantic_binding_identity.as_bytes() != adopted_semantic_identity {
+        return Err(
+            AggregateCountExactLiteralAotBindErrorV3::SemanticBindingIdentityMismatch {
+                portable: semantic_binding_identity,
+                adopted: *adopted_semantic_identity,
+            },
+        );
+    }
+    let planning_receipt_identity = candidate.planning_receipt_identity();
+    if planning_receipt_identity.as_bytes() != adopted_planning_identity {
+        return Err(
+            AggregateCountExactLiteralAotBindErrorV3::PlanningReceiptIdentityMismatch {
+                portable: planning_receipt_identity,
+                adopted: *adopted_planning_identity,
+            },
+        );
+    }
+    Ok(CheckedBindingV3 {
+        semantic_binding_identity,
+        planning_receipt_identity,
+        literal_bytes: candidate.literal().len(),
+        portable_persistent_bytes: candidate.build_accounting().persistent_bytes,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreflightV3 {
+    match_events: usize,
+    count: u64,
+    reducer_steps: usize,
+}
+
+fn preflight_v3(
+    checked: CheckedBindingV3,
+    haystack_bytes: usize,
+    limits: &AggregateRunLimits,
+) -> Result<PreflightV3, AggregateCountExactLiteralAotExecutionErrorV3> {
+    let literal_bytes = checked.literal_bytes;
+    let linear_terms = haystack_bytes.checked_add(literal_bytes).ok_or(
+        AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+            at: "aggregate linear terms",
+        },
+    )?;
+    let match_events = if literal_bytes == 0 {
+        haystack_bytes.checked_add(1).ok_or(
+            AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+                at: "Unicode-off empty byte boundaries",
+            },
+        )?
+    } else {
+        haystack_bytes / literal_bytes
+    };
+    let count = u64::try_from(match_events).map_err(|_| {
+        AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+            at: "count upper bound",
+        }
+    })?;
+    let literal_u64 = u64::try_from(literal_bytes).map_err(|_| {
+        AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+            at: "literal width",
+        }
+    })?;
+    count.checked_mul(literal_u64).ok_or(
+        AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+            at: "span-sum upper bound",
+        },
+    )?;
+    let reducer_steps = if literal_bytes == 0 {
+        1
+    } else {
+        match_events.checked_add(1).ok_or(
+            AggregateCountExactLiteralAotExecutionErrorV3::ArithmeticOverflow {
+                at: "reducer steps",
+            },
+        )?
+    };
+    let exact = limits.exact_literal;
+    require_limit("linear terms", exact.max_linear_terms, linear_terms)?;
+    require_limit("match events", exact.max_match_events, match_events)?;
+    require_limit("count", exact.max_count, count)?;
+    require_limit("reducer steps", exact.max_reducer_steps, reducer_steps)?;
+    require_limit("scratch bytes", exact.max_scratch_bytes, 0_usize)?;
+    require_limit(
+        "peak bytes",
+        exact.max_peak_bytes,
+        checked.portable_persistent_bytes,
+    )?;
+    Ok(PreflightV3 {
+        match_events,
+        count,
+        reducer_steps,
+    })
+}
+
+fn require_limit<T>(
+    resource: &'static str,
+    limit: T,
+    required: T,
+) -> Result<(), AggregateCountExactLiteralAotExecutionErrorV3>
+where
+    T: Copy + Ord + Into<u128>,
+{
+    if required <= limit {
+        Ok(())
+    } else {
+        Err(
+            AggregateCountExactLiteralAotExecutionErrorV3::ResourceLimit {
+                resource,
+                limit: limit.into(),
+                required: required.into(),
+            },
+        )
+    }
+}
+
+const fn exact_runtime_limits_v3(upper: PreflightV3) -> AggregateExecutionLimits {
+    AggregateExecutionLimits {
+        max_haystack_bytes: usize::MAX,
+        max_literal_bytes: 32,
+        max_candidate_positions: usize::MAX,
+        max_work: u64::MAX,
+        max_match_events: upper.match_events,
+        max_output: upper.count,
+        max_reducer_steps: upper.reducer_steps,
+        max_scratch_bytes: 0,
+        max_native_invocations: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AggregateBuildLimits, AggregateBuilder, AggregatePlanSelection};
+
+    fn owner(pattern: &str) -> AggregateCountRegex {
+        AggregateBuilder::new(pattern)
+            .unicode(false)
+            .limits(AggregateBuildLimits::aot_count_exact_literal_v1())
+            .plan_selection(AggregatePlanSelection::ForceExactLiteral)
+            .build_count()
+            .expect("fixed-policy exact owner")
+    }
+
+    #[test]
+    fn binding_checks_literal_semantic_and_planning_identities() {
+        let owner = owner("needle");
+        let candidate = owner.exact_literal_aot_planned_candidate().unwrap();
+        let literal = candidate.literal().to_vec();
+        let semantic = *candidate.semantic_binding_identity().as_bytes();
+        let planning = *candidate.planning_receipt_identity().as_bytes();
+        assert!(
+            check_binding_v3(
+                owner.exact_literal_aot_planned_candidate(),
+                &literal,
+                &semantic,
+                &planning
+            )
+            .is_ok()
+        );
+
+        let mut changed = semantic;
+        changed[0] ^= 1;
+        assert!(matches!(
+            check_binding_v3(
+                owner.exact_literal_aot_planned_candidate(),
+                &literal,
+                &changed,
+                &planning
+            ),
+            Err(AggregateCountExactLiteralAotBindErrorV3::SemanticBindingIdentityMismatch { .. })
+        ));
+        let mut changed = planning;
+        changed[0] ^= 1;
+        assert!(matches!(
+            check_binding_v3(
+                owner.exact_literal_aot_planned_candidate(),
+                &literal,
+                &semantic,
+                &changed
+            ),
+            Err(AggregateCountExactLiteralAotBindErrorV3::PlanningReceiptIdentityMismatch { .. })
+        ));
+        assert!(matches!(
+            check_binding_v3(
+                owner.exact_literal_aot_planned_candidate(),
+                b"different",
+                &semantic,
+                &planning
+            ),
+            Err(AggregateCountExactLiteralAotBindErrorV3::LiteralMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn resource_preflight_matches_nonoverlapping_count_shape() {
+        let owner = owner("abc");
+        let candidate = owner.exact_literal_aot_planned_candidate().unwrap();
+        let checked = CheckedBindingV3 {
+            semantic_binding_identity: candidate.semantic_binding_identity(),
+            planning_receipt_identity: candidate.planning_receipt_identity(),
+            literal_bytes: candidate.literal().len(),
+            portable_persistent_bytes: candidate.build_accounting().persistent_bytes,
+        };
+        let upper = preflight_v3(checked, 10, &AggregateRunLimits::default()).unwrap();
+        assert_eq!(upper.match_events, 3);
+        assert_eq!(upper.count, 3);
+        assert_eq!(upper.reducer_steps, 4);
+    }
+}

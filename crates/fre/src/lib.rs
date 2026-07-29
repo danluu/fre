@@ -10,6 +10,12 @@
 //! from an already-adopted static Search Span handle to the authenticated
 //! portable exact-literal owner. It does not adopt, link, compile, authorize,
 //! or automatically select AOT code.
+//! The separate default-off `explicit-count-v3-aot` feature binds an
+//! already-adopted optimizing Count-v3 handle only to the live fixed-policy
+//! exact-literal Count owner whose literal, semantic identity, and planning
+//! receipt all match. A bind refusal leaves that owner as the construction-time
+//! portable fallback; successful calls contain no artifact lookup or target
+//! dispatch.
 //! [`PortableRegexSetBuilder`] and
 //! [`PortableTextRegexSetBuilder`] compose independently admitted matchers
 //! with exact ascending pattern-ID semantics. [`AggregateBuilder`] constructs
@@ -36,6 +42,8 @@ use regex_syntax::hir::{Hir, HirKind};
 
 mod aggregate;
 mod aggregate_construction;
+#[cfg(feature = "explicit-count-v3-aot")]
+mod aggregate_count_aot_v3;
 mod aggregate_many;
 mod anchored_line_capture;
 mod blocking_delimiter;
@@ -184,6 +192,14 @@ pub use aggregate_construction::{
     AggregateConstructionSelectedPlanOwnerSeal, AggregateConstructionStage,
     AggregateConstructionStageDisposition, AggregateConstructionStateError,
     AggregateConstructionTerminal, AggregateConstructionTransition,
+};
+#[cfg(feature = "count-v3-aot-qualification-private")]
+#[doc(hidden)]
+pub use aggregate_count_aot_v3::AggregateCountExactLiteralAotQualificationV3;
+#[cfg(feature = "explicit-count-v3-aot")]
+pub use aggregate_count_aot_v3::{
+    AggregateCountExactLiteralAotBindErrorV3, AggregateCountExactLiteralAotExecutionErrorV3,
+    AggregateCountExactLiteralAotV3,
 };
 pub use aggregate_many::{
     AGGREGATE_MANY_EXPLAIN_SCHEMA_VERSION, AggregateManyBuildAccounting, AggregateManyBuildError,

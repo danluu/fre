@@ -1,6 +1,15 @@
 //! Static-link verification and adoption boundaries for FRE AOT objects.
 //!
 //! Count-v2 retains its existing production and C5 qualification architecture.
+//! Optimizing Count-v3 adds an independent, self-contained non-LLVM boundary:
+//! fixed expectation/metadata inspection, exact Count KIR reconstruction,
+//! canonical recipe decode, mapped-code regeneration audit, and a direct
+//! value-only handle. Its artifact-independent production authority is exact
+//! full-tuple source data and begins empty. The default-off qualification path
+//! has disjoint address/handle APIs and cannot populate production authority.
+//! The current movable handle is ASIMD-only; future SVE/SVE2 support requires
+//! a separate same-thread exact-VL session because Linux SVE VL is mutable per
+//! thread.
 //! The independent Search-v1 Span architecture uses a JIT- and compiler-neutral
 //! 584-byte expectation contract. Its literal source qualification table is
 //! checked before any final-image pointer is used, every identity is matched,
@@ -27,8 +36,11 @@
 
 mod call;
 mod error;
+mod error_v3;
 mod expected;
+mod expected_v3;
 mod linked;
+mod linked_v3;
 mod search_call;
 mod search_expected;
 mod search_linked;
@@ -38,6 +50,7 @@ mod search_test_fixture;
 #[cfg(feature = "linked-search-selected-end-v2")]
 mod selected_end_direct_v2;
 mod support;
+mod support_v3;
 #[cfg(test)]
 mod test_fixture;
 
@@ -46,6 +59,7 @@ pub use error::{
     StaticSearchSpanCallErrorV1, StaticSearchSpanContractFieldV1,
     StaticSearchSpanThreadContractErrorV1, StaticSearchSpanVerifyErrorV1, StaticVerifyError,
 };
+pub use error_v3::{StaticCountCallErrorV3, StaticCountContractFieldV3, StaticCountVerifyErrorV3};
 #[cfg(feature = "linked-hardware-matrix-v2")]
 #[doc(hidden)]
 pub use linked::invoke_raw_count_hardware_matrix_v2;
@@ -60,6 +74,16 @@ pub use linked::{
 #[doc(hidden)]
 pub use linked::{
     adopt_linked_static_count_qualification_v2, fre_aot_static_count_adopt_qualification_raw_v2,
+};
+pub use linked_v3::{
+    RawAggregateResultV3, StaticAggregateEntryV3, StaticCountInspectionAccountingV3,
+    StaticCountLinkedAddressesV3, VerifiedStaticCountV3, adopt_linked_static_count_v3,
+};
+#[cfg(feature = "count-v3-qualification-private")]
+#[doc(hidden)]
+pub use linked_v3::{
+    StaticCountQualificationFacadeBindingV3, StaticCountQualificationLinkedAddressesV3,
+    VerifiedStaticCountQualificationV3, adopt_linked_static_count_qualification_v3,
 };
 pub use search_call::{
     RawSearchCallV1, RawSearchResultV1, SEARCH_END_POISON_V1, SEARCH_START_POISON_V1,
