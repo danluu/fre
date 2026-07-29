@@ -36,3 +36,9 @@ cost vector, and identity against the supplied typed program. The current
 optimizer emits only baseline AArch64 Advanced SIMD recipes. Distinct stable
 IDs are reserved for fixed-VL16 SVE and SVE2 recipes; they cannot be inferred
 from the host or silently substituted for the emitted recipe.
+
+`inspect_count_v3_optimizer_receipt` separately decodes the fixed 192-byte
+optimizer receipt without allocation. It rejects unknown versions and tuning
+classes, nonzero padding, impossible resource/accounting fields, and an
+incorrect domain-separated receipt identity before a compiler may bind the
+receipt into an object.

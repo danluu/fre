@@ -487,6 +487,78 @@ impl CountV3OptimizerReceipt {
     }
 }
 
+/// Allocation-free strict projection of one canonical optimizer receipt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InspectedCountV3OptimizerReceipt {
+    program_identity: [u8; 32],
+    recipe_identity: CountV3RecipeIdentity,
+    tuning_class: CountV3TuningClass,
+    resources: CountV3OptimizerResources,
+    chosen_ordinal: u16,
+    minimax_regret: u64,
+    identity: CountV3OptimizerReceiptIdentity,
+}
+
+impl InspectedCountV3OptimizerReceipt {
+    #[must_use]
+    pub const fn program_identity(&self) -> &[u8; 32] {
+        &self.program_identity
+    }
+
+    #[must_use]
+    pub const fn recipe_identity(&self) -> CountV3RecipeIdentity {
+        self.recipe_identity
+    }
+
+    #[must_use]
+    pub const fn tuning_class(&self) -> CountV3TuningClass {
+        self.tuning_class
+    }
+
+    #[must_use]
+    pub const fn resources(&self) -> CountV3OptimizerResources {
+        self.resources
+    }
+
+    #[must_use]
+    pub const fn chosen_ordinal(&self) -> u16 {
+        self.chosen_ordinal
+    }
+
+    #[must_use]
+    pub const fn minimax_regret(&self) -> u64 {
+        self.minimax_regret
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> CountV3OptimizerReceiptIdentity {
+        self.identity
+    }
+}
+
+/// A canonical optimizer receipt was malformed, noncanonical, or internally
+/// inconsistent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CountV3OptimizerReceiptDecodeError {
+    Magic,
+    SchemaVersion,
+    OptimizerVersion,
+    UnknownTuningClass(u8),
+    NonCanonicalPadding,
+    InvalidIdentity,
+    InvalidResources,
+    ReceiptIdentity,
+    HostWidth,
+}
+
+impl fmt::Display for CountV3OptimizerReceiptDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for CountV3OptimizerReceiptDecodeError {}
+
 /// Complete source-only optimizer output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OptimizedCountV3 {
@@ -691,6 +763,14 @@ pub fn encode_count_v3_optimizer_receipt(
     receipt: &CountV3OptimizerReceipt,
 ) -> [u8; COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES] {
     encode_receipt(receipt, false)
+}
+
+/// Strictly inspect a fixed canonical optimizer receipt without allocating or
+/// trusting a compiler claim.
+pub fn inspect_count_v3_optimizer_receipt(
+    bytes: &[u8; COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES],
+) -> Result<InspectedCountV3OptimizerReceipt, CountV3OptimizerReceiptDecodeError> {
+    inspect_optimizer_receipt(bytes)
 }
 
 /// Recompute all pattern-derived recipe invariants and the sealed identity.
@@ -1725,6 +1805,105 @@ fn encode_receipt(
     bytes
 }
 
+fn inspect_optimizer_receipt(
+    bytes: &[u8; COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES],
+) -> Result<InspectedCountV3OptimizerReceipt, CountV3OptimizerReceiptDecodeError> {
+    if &bytes[..8] != b"FRECV3P\0" {
+        return Err(CountV3OptimizerReceiptDecodeError::Magic);
+    }
+    if read_u16(bytes, 8) != COUNT_V3_RECIPE_SCHEMA_VERSION {
+        return Err(CountV3OptimizerReceiptDecodeError::SchemaVersion);
+    }
+    if read_u16(bytes, 10) != COUNT_V3_OPTIMIZER_VERSION {
+        return Err(CountV3OptimizerReceiptDecodeError::OptimizerVersion);
+    }
+    let tuning_class = match bytes[12] {
+        1 => CountV3TuningClass::GenericAarch64,
+        2 => CountV3TuningClass::AppleMSeries,
+        3 => CountV3TuningClass::NeoverseV2V3,
+        value => return Err(CountV3OptimizerReceiptDecodeError::UnknownTuningClass(value)),
+    };
+    if bytes[13] != 0 {
+        return Err(CountV3OptimizerReceiptDecodeError::NonCanonicalPadding);
+    }
+    let chosen_ordinal = read_u16(bytes, 14);
+    let minimax_regret = read_u64(bytes, 16);
+    let program_identity: [u8; 32] = bytes[24..56]
+        .try_into()
+        .expect("fixed optimizer program identity");
+    let recipe_identity_bytes: [u8; 32] = bytes[56..88]
+        .try_into()
+        .expect("fixed optimizer recipe identity");
+    if program_identity == [0; 32] || recipe_identity_bytes == [0; 32] {
+        return Err(CountV3OptimizerReceiptDecodeError::InvalidIdentity);
+    }
+
+    let literal_bytes = receipt_usize(read_u64(bytes, 88))?;
+    let candidate_columns = receipt_usize(read_u64(bytes, 96))?;
+    let portfolio_recipes = receipt_usize(read_u64(bytes, 104))?;
+    let pareto_recipes = receipt_usize(read_u64(bytes, 112))?;
+    let analysis_work = read_u64(bytes, 120);
+    let scratch_bytes = receipt_usize(read_u64(bytes, 128))?;
+    let allocation_requests = u8::try_from(read_u64(bytes, 136))
+        .map_err(|_| CountV3OptimizerReceiptDecodeError::InvalidResources)?;
+    let retained_bytes = receipt_usize(read_u64(bytes, 144))?;
+    let claimed_identity_bytes_hashed = read_u64(bytes, 152);
+    let expected_scratch = portfolio_recipes
+        .checked_mul(size_of::<Candidate>())
+        .ok_or(CountV3OptimizerReceiptDecodeError::InvalidResources)?;
+    let expected_identity_bytes_hashed = identity_bytes_hashed(literal_bytes)
+        .map_err(|_| CountV3OptimizerReceiptDecodeError::InvalidResources)?;
+    if literal_bytes > COUNT_V3_MAX_LITERAL_BYTES
+        || candidate_columns != literal_bytes
+        || !(1..=COUNT_V3_HARD_MAX_PORTFOLIO_RECIPES).contains(&portfolio_recipes)
+        || pareto_recipes == 0
+        || pareto_recipes > portfolio_recipes
+        || usize::from(chosen_ordinal) >= portfolio_recipes
+        || analysis_work == 0
+        || scratch_bytes != expected_scratch
+        || allocation_requests != 1
+        || retained_bytes != size_of::<OptimizedCountV3>()
+        || claimed_identity_bytes_hashed != expected_identity_bytes_hashed
+    {
+        return Err(CountV3OptimizerReceiptDecodeError::InvalidResources);
+    }
+    let resources = CountV3OptimizerResources {
+        literal_bytes,
+        candidate_columns,
+        portfolio_recipes,
+        pareto_recipes,
+        analysis_work,
+        scratch_bytes,
+        allocation_requests,
+        retained_bytes,
+        identity_bytes_hashed: claimed_identity_bytes_hashed,
+    };
+
+    let identity_bytes: [u8; 32] = bytes[160..192]
+        .try_into()
+        .expect("fixed optimizer receipt identity");
+    let mut hasher = Sha256::new();
+    hasher.update(RECEIPT_IDENTITY_DOMAIN);
+    hasher.update(&bytes[..160]);
+    let expected_identity: [u8; 32] = hasher.finalize().into();
+    if identity_bytes != expected_identity {
+        return Err(CountV3OptimizerReceiptDecodeError::ReceiptIdentity);
+    }
+    Ok(InspectedCountV3OptimizerReceipt {
+        program_identity,
+        recipe_identity: CountV3RecipeIdentity(recipe_identity_bytes),
+        tuning_class,
+        resources,
+        chosen_ordinal,
+        minimax_regret,
+        identity: CountV3OptimizerReceiptIdentity(identity_bytes),
+    })
+}
+
+fn receipt_usize(value: u64) -> Result<usize, CountV3OptimizerReceiptDecodeError> {
+    usize::try_from(value).map_err(|_| CountV3OptimizerReceiptDecodeError::HostWidth)
+}
+
 const fn usize_to_u64(value: usize) -> u64 {
     value as u64
 }
@@ -2046,6 +2225,14 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset..offset + 4]
             .try_into()
             .expect("fixed u32 canonical range"),
+    )
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed u64 canonical range"),
     )
 }
 

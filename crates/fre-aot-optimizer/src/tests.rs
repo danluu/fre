@@ -87,6 +87,52 @@ fn canonical_inspection_and_decode_are_strict() {
 }
 
 #[test]
+fn canonical_optimizer_receipt_inspection_is_strict_and_allocation_free() {
+    let optimized = optimize(b"receipt-inspection");
+    let canonical = encode_count_v3_optimizer_receipt(optimized.receipt());
+    let inspected =
+        inspect_count_v3_optimizer_receipt(&canonical).expect("canonical optimizer receipt");
+    assert_eq!(
+        inspected.program_identity(),
+        optimized.receipt().program_identity().as_bytes()
+    );
+    assert_eq!(
+        inspected.recipe_identity(),
+        optimized.receipt().recipe_identity()
+    );
+    assert_eq!(inspected.tuning_class(), optimized.receipt().tuning_class());
+    assert_eq!(inspected.resources(), optimized.receipt().resources());
+    assert_eq!(
+        inspected.chosen_ordinal(),
+        optimized.receipt().chosen_ordinal()
+    );
+    assert_eq!(
+        inspected.minimax_regret(),
+        optimized.receipt().minimax_regret()
+    );
+    assert_eq!(inspected.identity(), optimized.receipt().identity());
+
+    let mut padding = canonical;
+    padding[13] = 1;
+    assert_eq!(
+        inspect_count_v3_optimizer_receipt(&padding),
+        Err(CountV3OptimizerReceiptDecodeError::NonCanonicalPadding)
+    );
+    let mut resource = canonical;
+    resource[128] ^= 1;
+    assert_eq!(
+        inspect_count_v3_optimizer_receipt(&resource),
+        Err(CountV3OptimizerReceiptDecodeError::InvalidResources)
+    );
+    let mut identity = canonical;
+    identity[191] ^= 1;
+    assert_eq!(
+        inspect_count_v3_optimizer_receipt(&identity),
+        Err(CountV3OptimizerReceiptDecodeError::ReceiptIdentity)
+    );
+}
+
+#[test]
 fn literal_facts_use_kmp_minimum_period_and_self_overlap() {
     let optimized = optimize(b"abababab");
     let facts = optimized.facts();
