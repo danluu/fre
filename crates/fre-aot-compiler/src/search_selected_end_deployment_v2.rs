@@ -369,13 +369,13 @@ impl LinuxSelectedEndQualificationDeploymentReceiptV2 {
 
     #[must_use]
     pub fn receipt_identity(&self) -> LinuxSelectedEndQualificationDeploymentReceiptIdentityV2 {
-        LinuxSelectedEndQualificationDeploymentReceiptIdentityV2::new(
-            *self
-                .bytes
-                .get(RECEIPT_IDENTITY_OFFSET_V2..RECEIPT_IDENTITY_OFFSET_V2 + 32)
-                .and_then(|bytes| bytes.try_into().ok())
-                .expect("fixed deployment receipt identity range"),
-        )
+        let bytes = self
+            .bytes
+            .get(RECEIPT_IDENTITY_OFFSET_V2..RECEIPT_IDENTITY_OFFSET_V2 + 32)
+            .expect("fixed deployment receipt identity range");
+        let identity =
+            <&[u8; 32]>::try_from(bytes).expect("fixed deployment receipt identity width");
+        LinuxSelectedEndQualificationDeploymentReceiptIdentityV2::new(*identity)
     }
 
     #[must_use]

@@ -229,20 +229,21 @@ pub fn emit_selected_end_search_object_v2(
         return Err(invalid("self-inspected SelectedEnd-v2 metadata"));
     }
     let object_identity = ObjectIdentity(*inspection.claimed_object_identity().as_bytes());
+    let report = SelectedEndObjectBuildReportV2 {
+        object_bytes: inspection.object_bytes,
+        persistent_capacity_bytes,
+        payload_bytes,
+        total_work: inspection.work,
+        sections: u16::try_from(SECTION_COUNT).expect("fixed section count"),
+        symbols: u16::try_from(SYMBOL_COUNT).expect("fixed symbol count"),
+        image_audit,
+        compile_identity: metadata.compile_identity(),
+        object_identity,
+    };
     Ok(BuiltSelectedEndSearchObjectV2 {
         bytes,
         metadata,
-        report: SelectedEndObjectBuildReportV2 {
-            object_bytes: inspection.object_bytes,
-            persistent_capacity_bytes,
-            payload_bytes,
-            total_work: inspection.work,
-            sections: u16::try_from(SECTION_COUNT).expect("fixed section count"),
-            symbols: u16::try_from(SYMBOL_COUNT).expect("fixed symbol count"),
-            image_audit,
-            compile_identity: metadata.compile_identity(),
-            object_identity,
-        },
+        report,
     })
 }
 

@@ -1,4 +1,4 @@
-use std::{cell::Cell, env, hint::black_box, time::Instant};
+use std::{cell::Cell, env as process_env, hint::black_box, time::Instant};
 
 use fre_kernel_ir::{
     AnchorFlags, ExecutionLimits, SearchWindow as KirSearchWindow, Span as KirSpan, ValidateLimits,
@@ -841,16 +841,20 @@ fn hex(bytes: &[u8]) -> String {
 #[test]
 #[ignore = "external source-bound qualification driver"]
 fn driver() {
-    match env::var("FRE_JIT_BRIDGE_DRIVER")
+    match process_env::var("FRE_JIT_BRIDGE_DRIVER")
         .expect("FRE_JIT_BRIDGE_DRIVER")
         .as_str()
     {
         "header" => println!("FRE_JIT_BRIDGE_ROW\t{CSV_HEADER}"),
         "run" => run_cell(
-            Operation::parse(&env::var("FRE_JIT_BRIDGE_OPERATION").expect("operation")),
-            Size::parse(&env::var("FRE_JIT_BRIDGE_SIZE").expect("size")),
-            Scenario::parse(&env::var("FRE_JIT_BRIDGE_SCENARIO").expect("scenario")),
-            env::var("FRE_JIT_BRIDGE_REPETITION")
+            Operation::parse(
+                &process_env::var("FRE_JIT_BRIDGE_OPERATION").expect("operation"),
+            ),
+            Size::parse(&process_env::var("FRE_JIT_BRIDGE_SIZE").expect("size")),
+            Scenario::parse(
+                &process_env::var("FRE_JIT_BRIDGE_SCENARIO").expect("scenario"),
+            ),
+            process_env::var("FRE_JIT_BRIDGE_REPETITION")
                 .expect("repetition")
                 .parse()
                 .expect("numeric repetition"),

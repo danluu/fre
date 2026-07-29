@@ -5508,6 +5508,7 @@ fn encode_aot_planning_fallback(
         AggregateConstructionPrepublicationFallback::DenseFiniteBuildResourceToContinuation => 11,
         AggregateConstructionPrepublicationFallback::TooLargeFixedSequenceToFixedPredicateWord64 => 12,
         AggregateConstructionPrepublicationFallback::FixedPredicateWord64BuildResource => 13,
+        AggregateConstructionPrepublicationFallback::PackedFiniteBuildResourceToDenseFinite => 14,
     })
 }
 
@@ -5532,6 +5533,7 @@ fn encode_aot_planning_transition(
         AggregateConstructionTransition::FixedPredicateWord64ToContinuation => encoder.u8(8),
         AggregateConstructionTransition::HardTerminal => encoder.u8(9),
         AggregateConstructionTransition::Published => encoder.u8(10),
+        AggregateConstructionTransition::PackedFiniteToDenseFinite => encoder.u8(11),
     }
 }
 

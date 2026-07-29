@@ -23,10 +23,10 @@ use fre_aot_elf::{
     SELECTED_END_LITTLE_ENDIAN_V2, SELECTED_END_METADATA_BYTES_V2,
     SELECTED_END_NO_MATCH_SENTINEL_V2, SELECTED_END_OUTPUT_KIND_V2, SELECTED_END_PLATFORM_LINUX_V2,
     SELECTED_END_POINTER_WIDTH_V2, SELECTED_END_REQUIRED_FEATURES_V2,
-    SELECTED_END_RESULT_SLOT_BYTES_V2, SELECTED_END_RETURN_BITS_V2,
-    SELECTED_END_RETURN_ENCODING_END_OR_ZERO_V2, SELECTED_END_RETURN_REGISTER_V2,
-    SELECTED_END_TARGET_ABI_AAPCS64_V2, SELECTED_END_WINDOW_CONTRACT_HALF_OPEN_ABSOLUTE_END_V2,
-    SelectedEndMetadataV2, SelectedEndObjectLimitsV2, emit_selected_end_search_object_v2,
+    SELECTED_END_RESULT_SLOT_BYTES_V2, SELECTED_END_RETURN_ENCODING_END_OR_ZERO_V2,
+    SELECTED_END_RETURN_REGISTER_V2, SELECTED_END_TARGET_ABI_AAPCS64_V2,
+    SELECTED_END_WINDOW_CONTRACT_HALF_OPEN_ABSOLUTE_END_V2, SelectedEndMetadataV2,
+    SelectedEndObjectLimitsV2, emit_selected_end_search_object_v2,
     inspect_selected_end_metadata_v2, inspect_selected_end_search_object_v2,
     validate_selected_end_search_object_v2,
 };
@@ -616,6 +616,31 @@ impl LinuxSelectedEndCompileReceiptV2 {
             return Err(contract("ELF object receipt"));
         }
         Ok(inspection)
+    }
+
+    pub fn validate_expectation(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ClaimedStaticSearchSelectedEndExpectationV2, LinuxSelectedEndCompileErrorV2> {
+        if !self.authenticates_itself() {
+            return Err(contract("compiler receipt"));
+        }
+        let claim = inspect_static_search_selected_end_expectation_v2(bytes)
+            .map_err(|_| contract("compiler receipt/expectation"))?;
+        if claim.manifest_identity() != self.manifest_identity.as_bytes()
+            || claim.semantic_binding_identity() != self.semantic_binding_identity.as_bytes()
+            || claim.literal_identity() != self.literal_identity.as_bytes()
+            || claim.kir_identity() != self.kir_identity.as_bytes()
+            || claim.artifact_identity() != self.artifact_identity.as_bytes()
+            || claim.binding_identity() != self.binding_identity.as_bytes()
+            || claim.compile_identity() != self.compile_identity.as_bytes()
+            || claim.object_identity() != self.object_identity.as_bytes()
+            || claim.receipt_identity() != self.receipt_identity.as_bytes()
+            || !metadata_claim_matches_elf(claim.metadata(), self.metadata)
+        {
+            return Err(contract("compiler receipt/expectation binding"));
+        }
+        Ok(claim)
     }
 
     fn authenticates_itself(&self) -> bool {

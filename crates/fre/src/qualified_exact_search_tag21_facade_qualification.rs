@@ -1,4 +1,4 @@
-use std::{env, fs, hint::black_box, time::Instant};
+use std::{env as process_env, fs, hint::black_box, time::Instant};
 
 use fre_kernel_ir::Span as NativeSpan;
 
@@ -138,7 +138,7 @@ fn required_hex(value: Option<&'static str>, digits: usize, label: &str) -> &'st
 }
 
 fn runtime_token(name: &str) -> String {
-    let value = env::var(name).unwrap_or_else(|_| panic!("{name}"));
+    let value = process_env::var(name).unwrap_or_else(|_| panic!("{name}"));
     assert!(
         !value.is_empty()
             && value.len() <= 128
@@ -151,8 +151,9 @@ fn runtime_token(name: &str) -> String {
 }
 
 fn sole_thread_affinity_cpu() -> u32 {
-    let affinity = fs::read_to_string("/proc/thread-self/status")
-        .expect("read Linux timing-thread status")
+    let status =
+        fs::read_to_string("/proc/thread-self/status").expect("read Linux timing-thread status");
+    let affinity = status
         .lines()
         .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
         .map(str::trim)
@@ -981,17 +982,17 @@ fn drive(
     scenario: &str,
     repetition: &str,
 ) {
-    match env::var(driver)
+    match process_env::var(driver)
         .unwrap_or_else(|_| panic!("{driver}"))
         .as_str()
     {
         "header" => println!("{}\t{}", subject.row_prefix(), subject.csv_header()),
         "run" => run_cell(
             subject,
-            LiteralCase::parse(&env::var(literal).expect("literal class")),
-            Size::parse(&env::var(size).expect("size")),
-            Scenario::parse(&env::var(scenario).expect("scenario")),
-            env::var(repetition)
+            LiteralCase::parse(&process_env::var(literal).expect("literal class")),
+            Size::parse(&process_env::var(size).expect("size")),
+            Scenario::parse(&process_env::var(scenario).expect("scenario")),
+            process_env::var(repetition)
                 .unwrap_or_else(|_| panic!("{repetition}"))
                 .parse()
                 .expect("numeric repetition"),

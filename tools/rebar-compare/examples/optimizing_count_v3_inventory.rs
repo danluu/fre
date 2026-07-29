@@ -1,8 +1,8 @@
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 use rebar_compare::{
-    RunConfig, RunLimits, read_authenticated_report,
-    optimizing_count_v3::inventory_optimizing_count_v3,
+    RunConfig, RunLimits, optimizing_count_v3::inventory_optimizing_count_v3,
+    read_authenticated_report,
 };
 
 fn main() -> ExitCode {
