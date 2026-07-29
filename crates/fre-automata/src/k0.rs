@@ -240,15 +240,29 @@ enum SpanCursorStartProof {
     Ordinary,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LazyCapabilities {
+    lazy: bool,
+    reverse: bool,
+    contextual: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EffectiveLazyMode {
+    lazy: bool,
+    reverse: bool,
+}
+
 // Source-independent facts that are invariant across suffix searches using
-// one workspace. Haystack bytes and the changing start remain call-local.
+// one workspace. Haystack bytes, the changing start, and the effective
+// forward/reverse mode remain call-local. In particular, preparing a direct
+// nullable initial row can prove the next span's start and remove the need for
+// reverse recovery without invalidating this cache.
 #[derive(Clone, Copy, Debug, Default)]
 struct SpanCursorCache {
     binding: Option<SpanCursorBinding>,
     start_proof: SpanCursorStartProof,
-    may_use_lazy: bool,
-    may_use_reverse: bool,
-    contextual: bool,
+    capabilities: LazyCapabilities,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1893,6 +1907,45 @@ pub(crate) fn search_with_workspace(
     )
 }
 
+fn lazy_capabilities(
+    automaton: &Automaton,
+    workspace: &K0Workspace,
+    allow_lazy: bool,
+) -> LazyCapabilities {
+    let lazy = allow_lazy && workspace.lazy.is_allocated();
+    LazyCapabilities {
+        lazy,
+        reverse: lazy
+            && workspace.reverse.is_allocated()
+            && workspace.reverse.is_bound_to(automaton),
+        contextual: automaton.stats().assertion_edges() != 0,
+    }
+}
+
+fn effective_lazy_mode(
+    automaton: &Automaton,
+    workspace: &K0Workspace,
+    wants_span: bool,
+    capabilities: LazyCapabilities,
+) -> Result<EffectiveLazyMode, SearchError> {
+    let cached_start_known = capabilities.lazy
+        && wants_span
+        && !capabilities.contextual
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && lazy_initial_has_pending(workspace)?;
+    let reverse = capabilities.reverse && wants_span && !cached_start_known;
+
+    // A direct nullable initial state proves every retained consuming path
+    // belongs to the invocation's window start. Before that row is prepared,
+    // a direct endpoint workspace may attempt forward execution and
+    // authenticate its pending bit; a direct nonnullable endpoint workspace
+    // will decline the span acceleration and use Pike.
+    let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
+    let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
+    Ok(EffectiveLazyMode { lazy, reverse })
+}
+
 pub(crate) fn search_span_with_workspace_cursor(
     automaton: &Automaton,
     haystack: &[u8],
@@ -1903,6 +1956,7 @@ pub(crate) fn search_span_with_workspace_cursor(
     let window = SearchWindow::new(start, haystack.len());
     validate_window(haystack, window)?;
     let cursor = prepare_span_cursor(automaton, workspace, limits)?;
+    let mode = effective_lazy_mode(automaton, workspace, true, cursor.capabilities)?;
     let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
     let (mut meter, setup_work) = prepare_prevalidated_invocation(
         automaton,
@@ -1910,8 +1964,8 @@ pub(crate) fn search_span_with_workspace_cursor(
         window,
         limits,
         &mut setup,
-        cursor.may_use_lazy,
-        cursor.may_use_reverse,
+        mode.lazy,
+        mode.reverse,
     )?;
     let start_proof = match cursor.start_proof {
         SpanCursorStartProof::AutomatonOwned => {
@@ -1939,9 +1993,9 @@ pub(crate) fn search_span_with_workspace_cursor(
         limits,
         setup,
         OutputContract::Span,
-        cursor.may_use_lazy,
-        cursor.may_use_reverse,
-        cursor.contextual,
+        mode.lazy,
+        mode.reverse,
+        cursor.capabilities.contextual,
         meter,
         setup_work,
         start_proof,
@@ -1967,29 +2021,8 @@ fn execute(
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let wants_span = matches!(contract, OutputContract::Span);
-    let contextual_graph = automaton.stats().assertion_edges() != 0;
-    let cached_start_known = allow_lazy
-        && wants_span
-        && !contextual_graph
-        && workspace.lazy.is_allocated()
-        && workspace.lazy.is_bound_to(automaton)
-        && workspace.lazy.initialized
-        && lazy_initial_has_pending(workspace)?;
-    let may_use_reverse = allow_lazy
-        && wants_span
-        && !cached_start_known
-        && workspace.lazy.is_allocated()
-        && workspace.reverse.is_allocated()
-        && workspace.reverse.is_bound_to(automaton);
-    // A direct nullable initial state proves every retained consuming path
-    // belongs to `window.start`. Its Span therefore needs only the endpoint
-    // workspace. The exact pending bit is authenticated after preparation;
-    // direct nonnullable endpoint sessions still decline Span to Pike.
-    let may_prove_start_without_reverse = wants_span && !contextual_graph;
-    let may_use_lazy = allow_lazy
-        && workspace.lazy.is_allocated()
-        && (!wants_span || may_use_reverse || may_prove_start_without_reverse);
-    let contextual = contextual_graph;
+    let capabilities = lazy_capabilities(automaton, workspace, allow_lazy);
+    let mode = effective_lazy_mode(automaton, workspace, wants_span, capabilities)?;
     let mut setup = setup;
     let (mut meter, setup_work) = prepare_invocation(
         automaton,
@@ -1997,8 +2030,8 @@ fn execute(
         window,
         limits,
         &mut setup,
-        may_use_lazy,
-        may_use_reverse,
+        mode.lazy,
+        mode.reverse,
     )?;
     let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
     execute_prepared(
@@ -2009,9 +2042,9 @@ fn execute(
         limits,
         setup,
         contract,
-        may_use_lazy,
-        may_use_reverse,
-        contextual,
+        mode.lazy,
+        mode.reverse,
+        capabilities.contextual,
         meter,
         setup_work,
         start_proof,
@@ -5153,15 +5186,10 @@ fn prepare_span_cursor(
         });
     }
 
-    let may_use_reverse = workspace.lazy.is_allocated()
-        && workspace.reverse.is_allocated()
-        && workspace.reverse.is_bound_to(automaton);
     let cursor = SpanCursorCache {
         binding: Some(binding),
         start_proof: retained_span_cursor_start_proof(automaton),
-        may_use_lazy: workspace.lazy.is_allocated() && may_use_reverse,
-        may_use_reverse,
-        contextual: automaton.stats().assertion_edges() != 0,
+        capabilities: lazy_capabilities(automaton, workspace, true),
     };
     workspace.span_cursor = cursor;
     Ok(cursor)
@@ -11443,6 +11471,71 @@ mod tests {
         assert!(saturated.lazy.initialized);
         assert!(!saturated.reverse.initialized);
         assert!(!saturated.reverse.saturated);
+    }
+
+    #[test]
+    fn span_cursor_recomputes_nullable_start_known_mode_after_initialization() {
+        let plan = empty_or_ab(false);
+        plan.start_filter_proof
+            .set(&StartFilterProof {
+                scanner: None,
+                guard: None,
+                force_haystack_start: false,
+                relaxed_nullable: true,
+            })
+            .expect("fresh nullable automaton");
+        let limits = SearchLimits::unlimited();
+
+        let mut endpoint =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let endpoint_cursor = super::prepare_span_cursor(&plan, &mut endpoint, limits).unwrap();
+        assert!(endpoint_cursor.capabilities.lazy);
+        assert!(!endpoint_cursor.capabilities.reverse);
+        assert_eq!(
+            super::effective_lazy_mode(&plan, &endpoint, true, endpoint_cursor.capabilities,)
+                .unwrap(),
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: false,
+            }
+        );
+        let endpoint_report =
+            super::search_span_with_workspace_cursor(&plan, b"abxx", 0, &mut endpoint, limits)
+                .unwrap();
+        assert_eq!(endpoint_report.found, Some(MatchSpan::new(0, 2)));
+        assert!(endpoint.lazy.initialized);
+        assert!(super::lazy_initial_has_pending(&endpoint).unwrap());
+
+        let mut full = K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let cold_cursor = super::prepare_span_cursor(&plan, &mut full, limits).unwrap();
+        assert!(cold_cursor.capabilities.lazy);
+        assert!(cold_cursor.capabilities.reverse);
+        assert_eq!(
+            super::effective_lazy_mode(&plan, &full, true, cold_cursor.capabilities).unwrap(),
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: true,
+            }
+        );
+        let full_report =
+            super::search_span_with_workspace_cursor(&plan, b"abxx", 0, &mut full, limits).unwrap();
+        assert_eq!(full_report.found, Some(MatchSpan::new(0, 2)));
+        assert!(full.lazy.initialized);
+        assert!(!full.reverse.initialized);
+
+        let warm_cursor = super::prepare_span_cursor(&plan, &mut full, limits).unwrap();
+        assert_eq!(warm_cursor.capabilities, cold_cursor.capabilities);
+        assert_eq!(
+            super::effective_lazy_mode(&plan, &full, true, warm_cursor.capabilities).unwrap(),
+            super::EffectiveLazyMode {
+                lazy: true,
+                reverse: false,
+            }
+        );
+        let warm_report =
+            super::search_span_with_workspace_cursor(&plan, b"xxab", 2, &mut full, limits).unwrap();
+        assert_eq!(warm_report.found, Some(MatchSpan::new(2, 4)));
+        assert!(!full.reverse.initialized);
     }
 
     #[test]
