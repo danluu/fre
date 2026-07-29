@@ -9,9 +9,21 @@ license = "Apache-2.0 OR MIT"
 publish = false
 build = "build.rs"
 
+[features]
+default = []
+qualification-private = [
+    "fre/count-v3-aot-qualification-private",
+    "fre-aot-static-runtime/count-v3-qualification-private",
+]
+production = [
+    "fre/explicit-count-v3-aot",
+    "fre-aot-static-runtime/linked-count-v3",
+]
+
 [dependencies]
-fre = { path = "../../../fre", default-features = false, features = ["count-v3-aot-qualification-private"] }
-fre-aot-static-runtime = { path = "../../../fre-aot-static-runtime", default-features = false, features = ["count-v3-qualification-private"] }
+fre = { path = "../../../fre", default-features = false }
+fre-aot-count-contract = { path = "../../../fre-aot-count-contract" }
+fre-aot-static-runtime = { path = "../../../fre-aot-static-runtime", default-features = false }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
 sha2 = "=0.10.9"

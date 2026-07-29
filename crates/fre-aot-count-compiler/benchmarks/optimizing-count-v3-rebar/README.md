@@ -1,8 +1,14 @@
 # Optimizing Count-v3 compiled-Rebar runner
 
-This is the qualification-private, fresh-process runner for the source-only
-Count-v3 AOT campaign. It is intentionally a standalone Cargo workspace. Its
-build script authenticates one frozen Rebar inventory, reconstructs every
+This standalone Cargo workspace has two deliberately disjoint build
+authorities. `qualification-private` is the original formal, native-only
+qualification runner; its request, observation, registry schemas, and private
+handle types are unchanged. `production` is a post-promotion confirmation
+runner. It can construct only source-authorized production handles, uses the
+automatic production FRE facades, and refuses to retain a timing unless the
+typed route is `AsimdAot` or `SveAot`.
+
+The build script authenticates one frozen Rebar inventory, reconstructs every
 fixed-policy exact-literal facade owner from source, and emits exactly one
 fresh Count-v2 control object and one optimizing Count-v3 object for each
 distinct pattern/semantic artifact row.
@@ -14,14 +20,17 @@ Haystack length remains absent from the pattern-only compiler input.
 
 The regex payload compiler receives no cell, job, family, partition, haystack,
 oracle, or timing value. Cell attribution is joined only after all objects have
-been compiled. Count-v3 is called only through the qualification-private static
-adopter and the facade-bound value API; compiler self-hashes never become
-production authority.
+been compiled. Compiler self-hashes never become production authority.
+Qualification calls only its private facade. Production adoption checks the
+reviewed source tuple table and binds the real production facade before any
+confirmation call.
 
 ## Build inputs
 
 The build is fail-closed and accepts these environment variables:
 
+- `FRE_COUNT_V3_BUILD_AUTHORITY`: exactly `qualification-private` or
+  `production`. It must agree with exactly one same-named Cargo feature.
 - `FRE_COUNT_V3_INVENTORY`: regular, non-symlink inventory JSON.
 - `FRE_COUNT_V3_INVENTORY_SHA256`: independently frozen SHA-256 of those exact
   bytes.
@@ -36,6 +45,12 @@ The build is fail-closed and accepts these environment variables:
 - `FRE_COUNT_V3_REQUIRED_ISA`: `neon`, `sve-vl16`, or `sve2-vl16`. The selected
   optimizer/backend must independently emit that exact ISA row.
 
+A qualification build must use both
+`FRE_COUNT_V3_BUILD_AUTHORITY=qualification-private` and
+`--features qualification-private`. A production build must use both
+`FRE_COUNT_V3_BUILD_AUTHORITY=production` and `--features production`. Missing,
+mixed, or dual selectors are rejected.
+
 Only `aarch64-apple-darwin` and `aarch64-unknown-linux-gnu` targets are
 accepted. The former links Mach-O objects; the latter links ELF64/AArch64
 objects. Count-v3 expectation, metadata, and payload symbols are
@@ -43,7 +58,7 @@ identity-suffixed. The expectation is placed in
 `__FRE_CONST,__fre_expect` on Mach-O or the read-only allocated
 `.fre.expect` section on ELF.
 
-The build script writes
+The qualification build script writes
 `fre.optimizing-count-v3.compiled-artifact-registry.v2` as
 `compiled-artifacts.json` in `OUT_DIR`. It records
 source, object, payload, metadata, expectation, optimizer-input, and
@@ -58,6 +73,13 @@ equality with both `FocusedCompiledCountV3::general_eligibility_tuple()` and
 the separately inspected static-expectation metadata. Control engine rows
 carry `null`.
 
+Production uses the distinct
+`fre.optimizing-count-v3.production-confirmation-artifact-registry.v1`
+schema. It adds the frozen cell join needed by the post-promotion controller,
+marks qualification authority absent, and marks production authority as
+requiring reviewed source tuples. Both binaries embed their exact build
+authority and a domain-separated hash binding it to the registry digest.
+
 Eventual promotion does not enumerate Rebar cases, patterns, literals, or
 artifact IDs. For each target, it joins evidence-passing eligible artifact IDs
 to this authenticated registry, applies the separately qualified long-scan
@@ -69,10 +91,10 @@ Compile elapsed time and compiler peak RSS are process-level target-receipt
 facts and must be captured by the external frozen build controller; they are
 not nondeterministically embedded in this receipt.
 
-## Runtime protocol
+## Qualification runtime protocol
 
-Every invocation reads this exact compact UTF-8 request from stdin, with no
-trailing newline:
+In `qualification-private`, every invocation reads this exact compact UTF-8
+request from stdin, with no trailing newline:
 
 ```json
 {"process_nonce":"64-lower-hex","schema":"fre.optimizing-count-v3.runner-request.v1","target_id":"TARGET"}
@@ -104,4 +126,81 @@ single-link file named exactly by its lowercase 64-hex inventory
 `input_sha256`. The runner verifies its byte length and digest outside timing.
 
 `inventory` emits the embedded pattern-only build receipt.
-Neither mode grants production authority.
+Qualification never grants production authority.
+
+## Production confirmation protocol
+
+The production binary uses distinct request, observation, and registry
+schemas, all named
+`fre.optimizing-count-v3.production-confirmation-*.v1`. It also provides
+`authorize CELL_ID`. This command authenticates the selected object, obtains a
+production handle through the source authority table, and binds the
+fixed-policy FRE facade without executing native regex code. An unpromoted
+tuple returns an error; it is never treated as portable permission.
+
+For a retained Count-v3 timing, the runner:
+
+1. source-authorizes and fully audits the linked object;
+2. binds `AggregateCountExactLiteralAotV3` or
+   `AggregateCountExactLiteralAotSveV3`;
+3. requires the predicted route to be `AsimdAot` or `SveAot`;
+4. executes one typed outcome call and requires the same native route; and
+5. times only subsequent value-only facade calls.
+
+Every production inventory cell is at least 4096 bytes. A shorter live input
+is refused before timing even though the general production facade can
+portably serve short inputs elsewhere. Production SVE/SVE2 session creation
+requires the current Linux thread already to have exact VL=16 bytes; unlike
+qualification, confirmation does not mutate the thread VL.
+
+## Bounded post-promotion controller
+
+`production_confirm.py` runs a resumable, fresh-process confirmation over an
+explicit set of promoted cells. Its plan is exact compact sorted JSON with no
+trailing newline:
+
+```json
+{"cells":[{"cell_id":"CELL","iterations":1000000}],"haystack_dir":"/absolute/content-addressed-haystacks","minimum_elapsed_ns":1000000000,"repetitions":30,"runner":{"path":"/absolute/sealed/fre-optimizing-count-v3-rebar","registry_sha256":"64-lower-hex","sha256":"64-lower-hex","timeout_seconds":120},"schema":"fre.optimizing-count-v3.production-confirmation-plan.v1","target_contract_sha256":"64-lower-hex","target_id":"TARGET","timing_wrapper":{"argv":["/absolute/sealed/wrapper","run-timing","--"],"executable_sha256":"64-lower-hex"}}
+```
+
+Run or resume it with:
+
+```text
+python3 production_confirm.py PLAN.json /absolute/JOURNAL.jsonl /absolute/SUMMARY.json
+```
+
+The wrapper `argv` is an opaque caller-supplied prefix. The controller
+authenticates its absolute read-only executable and launches every correctness
+and measurement process as:
+
+```text
+WRAPPER_PREFIX RUNNER (correctness|measure) CELL ENGINE ITERATIONS
+```
+
+Thus the admission holder covers the runner's full lifetime; there is no
+probe/release race. If the wrapper returns 75, the denial is fsynced and the
+controller immediately returns 75 without waiting or retrying. A later
+invocation resumes the exact journal prefix. The controller never searches
+`PATH`, waits for an idle host, or signals unrelated work. A timeout kills only
+the new process group containing its own wrapper and runner.
+
+All selected cells are authorized in fresh processes before any correctness or
+timing process starts. Any unpromoted tuple or other authorization failure is
+sealed as terminal. The retained schedule then runs all three engines in all
+six rotating orders, requires at least 30 repetitions in complete six-order
+blocks, and requires every sample to last at least one second.
+
+The create-only sealed summary contains every paired elapsed value and reports:
+
+- per-cell and per-source-tuple Count-v3/portable and
+  Count-v3/faster-current-control geometric-mean ratios;
+- the exact integer-product test
+  `Count-v3/faster-current-control < 4/5`;
+- at least `ceil(4 * repetitions / 5)` strict paired wins per cell; and
+- the aggregate ratio and exact `< 4/5` result across all retained cells.
+
+The summary status is `pass` only when every cell, every source tuple, and the
+aggregate pass those gates. Its payload hash, plan hash, journal hash, registry
+hash, source-set hash, runner hash, and timing-wrapper hash make the result
+independently replayable. This confirmation is downstream of promotion; it
+does not replace held-out qualification evidence or create source authority.

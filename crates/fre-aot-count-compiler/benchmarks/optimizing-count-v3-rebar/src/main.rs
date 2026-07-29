@@ -18,6 +18,12 @@ compile_error!(
     "the optimizing Count-v3 Rebar runner requires little-endian AArch64 Linux or macOS"
 );
 
+#[cfg(all(feature = "qualification-private", feature = "production"))]
+compile_error!("exactly one Count-v3 build-authority feature must be selected");
+
+#[cfg(not(any(feature = "qualification-private", feature = "production")))]
+compile_error!("one Count-v3 build-authority feature must be selected");
+
 #[cfg(any(
     all(fre_count_v3_neon, fre_count_v3_sve),
     all(fre_count_v3_neon, fre_count_v3_sve2),
@@ -40,36 +46,86 @@ use std::{
     time::Instant,
 };
 
-#[cfg(fre_count_v3_neon)]
+#[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 use fre::AggregateCountExactLiteralAotQualificationV3;
-#[cfg(any(fre_count_v3_sve, fre_count_v3_sve2))]
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
 use fre::AggregateCountExactLiteralAotSveQualificationV3;
+#[cfg(all(feature = "production", any(fre_count_v3_sve, fre_count_v3_sve2)))]
+use fre::AggregateCountExactLiteralAotSveV3;
+#[cfg(all(feature = "production", fre_count_v3_neon))]
+use fre::AggregateCountExactLiteralAotV3;
+#[cfg(feature = "production")]
+use fre::{
+    AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3, AggregateCountExactLiteralAotRouteV3,
+};
 use fre::{
     AggregateBuildLimits, AggregateBuilder, AggregateCountRegex, AggregatePlanKind,
     AggregatePlanSelection, AggregateRunLimits, AggregateStrategy, LiteralAggregateReduceLimits,
     RustProfile,
 };
-#[cfg(fre_count_v3_neon)]
+use fre_aot_static_runtime::StaticCountVerifyErrorV3;
+#[cfg(all(feature = "production", fre_count_v3_neon))]
+use fre_aot_static_runtime::VerifiedStaticCountV3;
+#[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 use fre_aot_static_runtime::{
-    StaticCountQualificationFacadeBindingV3, StaticCountVerifyErrorV3,
-    VerifiedStaticCountQualificationV3,
+    StaticCountQualificationFacadeBindingV3, VerifiedStaticCountQualificationV3,
 };
-#[cfg(any(fre_count_v3_sve, fre_count_v3_sve2))]
+#[cfg(all(feature = "production", any(fre_count_v3_sve, fre_count_v3_sve2)))]
+use fre_aot_static_runtime::{StaticCountSveFacadeBindingV3, VerifiedStaticCountSveV3};
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
 use fre_aot_static_runtime::{
-    StaticCountSveQualificationFacadeBindingV3, StaticCountVerifyErrorV3,
-    VerifiedStaticCountSveQualificationV3,
+    StaticCountSveQualificationFacadeBindingV3, VerifiedStaticCountSveQualificationV3,
     configure_current_thread_sve_vl16_for_count_v3_qualification,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "qualification-private")]
 const REQUEST_SCHEMA: &str = "fre.optimizing-count-v3.runner-request.v1";
+#[cfg(feature = "production")]
+const REQUEST_SCHEMA: &str = "fre.optimizing-count-v3.production-confirmation-runner-request.v1";
+#[cfg(feature = "qualification-private")]
 const OBSERVATION_SCHEMA: &str = "fre.optimizing-count-v3.measurement-observation.v1";
+#[cfg(feature = "production")]
+const OBSERVATION_SCHEMA: &str = "fre.optimizing-count-v3.production-confirmation-observation.v1";
+#[cfg(feature = "qualification-private")]
 const RESULT_DOMAIN: &[u8] = b"fre.optimizing-count-v3.result.v1\0";
+#[cfg(feature = "production")]
+const RESULT_DOMAIN: &[u8] = b"fre.optimizing-count-v3.production-confirmation.result.v1\0";
+#[cfg(feature = "qualification-private")]
 const WORK_DOMAIN: &[u8] = b"fre.optimizing-count-v3.work.v1\0";
+#[cfg(feature = "production")]
+const WORK_DOMAIN: &[u8] = b"fre.optimizing-count-v3.production-confirmation.work.v1\0";
+const BUILD_AUTHORITY_BINDING_DOMAIN: &[u8] =
+    b"FRE-OPTIMIZING-COUNT-V3-BUILD-AUTHORITY-BINDING\0\x01";
 const MAX_REQUEST_BYTES: u64 = 4_096;
 const MAX_EXECUTABLE_BYTES: usize = 512 * 1_048_576;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1_048_576;
+
+#[cfg(feature = "qualification-private")]
+const COMPILED_BUILD_AUTHORITY: &str = "qualification-private";
+#[cfg(feature = "production")]
+const COMPILED_BUILD_AUTHORITY: &str = "production";
+#[cfg(feature = "qualification-private")]
+const COMPILED_REGISTRY_SCHEMA: &str = "fre.optimizing-count-v3.compiled-artifact-registry.v2";
+#[cfg(feature = "production")]
+const COMPILED_REGISTRY_SCHEMA: &str =
+    "fre.optimizing-count-v3.production-confirmation-artifact-registry.v1";
+#[cfg(feature = "qualification-private")]
+const COMPILED_PRODUCTION_AUTHORITY: &str = "absent";
+#[cfg(feature = "production")]
+const COMPILED_PRODUCTION_AUTHORITY: &str = "source-reviewed-tuples-required";
+#[cfg(feature = "qualification-private")]
+const COMPILED_QUALIFICATION_AUTHORITY: &str = "private-only";
+#[cfg(feature = "production")]
+const COMPILED_QUALIFICATION_AUTHORITY: &str = "absent";
 
 #[cfg(fre_count_v3_neon)]
 const COMPILED_REQUIRED_ISA: &str = "neon";
@@ -90,18 +146,29 @@ struct RawCountResult {
 )]
 type RawCountEntry = unsafe extern "C" fn(*const u8, usize, *mut RawCountResult) -> u64;
 
-#[cfg(fre_count_v3_neon)]
+#[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 type V3AdoptFn =
     for<'binding> fn(
         StaticCountQualificationFacadeBindingV3<'binding>,
     ) -> Result<VerifiedStaticCountQualificationV3, StaticCountVerifyErrorV3>;
 
-#[cfg(any(fre_count_v3_sve, fre_count_v3_sve2))]
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
 type V3AdoptFn =
     for<'binding> fn(
         StaticCountSveQualificationFacadeBindingV3<'binding>,
     )
         -> Result<VerifiedStaticCountSveQualificationV3, StaticCountVerifyErrorV3>;
+
+#[cfg(all(feature = "production", fre_count_v3_neon))]
+type V3AdoptFn = fn() -> Result<VerifiedStaticCountV3, StaticCountVerifyErrorV3>;
+
+#[cfg(all(feature = "production", any(fre_count_v3_sve, fre_count_v3_sve2)))]
+type V3AdoptFn = for<'binding> fn(
+    StaticCountSveFacadeBindingV3<'binding>,
+) -> Result<VerifiedStaticCountSveV3, StaticCountVerifyErrorV3>;
 
 #[derive(Clone, Copy, Debug)]
 struct ArtifactDescriptor {
@@ -229,6 +296,17 @@ struct Observation<'a> {
     status: &'static str,
 }
 
+#[cfg(feature = "production")]
+#[derive(Debug, Serialize)]
+struct ProductionAuthorization<'a> {
+    artifact_id: &'static str,
+    build_authority: &'static str,
+    cell_id: &'static str,
+    process_nonce: &'a str,
+    schema: &'static str,
+    target_id: &'static str,
+}
+
 #[derive(Debug)]
 struct RunnerError(String);
 
@@ -261,6 +339,7 @@ fn run() -> Result<(), RunnerError> {
             "embedded artifact registry bytes differ from their build digest",
         ));
     }
+    validate_embedded_authority()?;
     let mut arguments = env::args_os();
     let _program = arguments.next();
     let Some(command) = arguments.next() else {
@@ -280,6 +359,10 @@ fn run() -> Result<(), RunnerError> {
             .write_all(&output)
             .map_err(|error| RunnerError::new(format!("write inventory: {error}")))?;
         return Ok(());
+    }
+    #[cfg(feature = "production")]
+    if command == "authorize" {
+        return run_production_authorization(arguments);
     }
     let invocation = parse_invocation(command, arguments)?;
     let request_bytes = read_request()?;
@@ -336,9 +419,54 @@ fn run() -> Result<(), RunnerError> {
         .map_err(|error| RunnerError::new(format!("write observation: {error}")))
 }
 
+#[cfg(feature = "production")]
+fn run_production_authorization(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), RunnerError> {
+    let cell_id = utf8_argument(arguments.next(), "cell ID")?;
+    if arguments.next().is_some() {
+        return Err(usage());
+    }
+    let request_bytes = read_request()?;
+    let request: RunnerRequest = serde_json::from_slice(&request_bytes)
+        .map_err(|error| RunnerError::new(format!("decode canonical runner request: {error}")))?;
+    validate_request(&request, &request_bytes)?;
+    let cell = find_cell(&cell_id)?;
+    let artifact = ARTIFACTS
+        .get(cell.artifact_index)
+        .ok_or_else(|| RunnerError::new("cell artifact index escaped the embedded table"))?;
+    authenticate_selected_artifact(Engine::CountV3Aot, artifact)?;
+    authorize_count_v3(artifact)?;
+    let authorization = ProductionAuthorization {
+        artifact_id: artifact.v3_artifact_id,
+        build_authority: COMPILED_BUILD_AUTHORITY,
+        cell_id: cell.cell_id,
+        process_nonce: &request.process_nonce,
+        schema: "fre.optimizing-count-v3.production-authorization.v1",
+        target_id: EMBEDDED_TARGET_ID,
+    };
+    let mut output = serde_json::to_vec(&authorization).map_err(|error| {
+        RunnerError::new(format!("serialize production authorization: {error}"))
+    })?;
+    output.push(b'\n');
+    io::stdout()
+        .lock()
+        .write_all(&output)
+        .map_err(|error| RunnerError::new(format!("write production authorization: {error}")))
+}
+
+#[cfg(feature = "qualification-private")]
 fn usage() -> RunnerError {
     RunnerError::new(
         "usage: fre-optimizing-count-v3-rebar inventory | \
+         (correctness|measure) CELL_ID ENGINE ITERATIONS",
+    )
+}
+
+#[cfg(feature = "production")]
+fn usage() -> RunnerError {
+    RunnerError::new(
+        "usage: fre-optimizing-count-v3-rebar inventory | authorize CELL_ID | \
          (correctness|measure) CELL_ID ENGINE ITERATIONS",
     )
 }
@@ -434,6 +562,86 @@ fn validate_embedded_isa() -> Result<(), RunnerError> {
     Ok(())
 }
 
+fn validate_embedded_authority() -> Result<(), RunnerError> {
+    if EMBEDDED_BUILD_AUTHORITY != COMPILED_BUILD_AUTHORITY {
+        return Err(RunnerError::new(
+            "generated build authority differs from the exact Cargo feature",
+        ));
+    }
+    require_lower_hex_64(
+        BUILD_AUTHORITY_REGISTRY_BINDING_SHA256,
+        "build-authority registry binding",
+    )?;
+    if build_authority_binding_sha256(EMBEDDED_BUILD_AUTHORITY, BUILD_REGISTRY_SHA256)
+        != BUILD_AUTHORITY_REGISTRY_BINDING_SHA256
+    {
+        return Err(RunnerError::new(
+            "embedded build authority is not bound to the embedded registry digest",
+        ));
+    }
+    let registry: Value = serde_json::from_str(BUILD_REGISTRY_JSON)
+        .map_err(|error| RunnerError::new(format!("decode embedded registry: {error}")))?;
+    let object = registry
+        .as_object()
+        .ok_or_else(|| RunnerError::new("embedded registry is not an object"))?;
+    if object.get("schema").and_then(Value::as_str) != Some(COMPILED_REGISTRY_SCHEMA)
+        || object.get("production_authority").and_then(Value::as_str)
+            != Some(COMPILED_PRODUCTION_AUTHORITY)
+        || object
+            .get("qualification_authority")
+            .and_then(Value::as_str)
+            != Some(COMPILED_QUALIFICATION_AUTHORITY)
+    {
+        return Err(RunnerError::new(
+            "embedded registry authority markers differ from the compiled mode",
+        ));
+    }
+    #[cfg(feature = "qualification-private")]
+    if object.contains_key("build_authority") {
+        return Err(RunnerError::new(
+            "qualification registry unexpectedly gained a production build-authority field",
+        ));
+    }
+    #[cfg(feature = "production")]
+    if object.get("build_authority").and_then(Value::as_str) != Some(COMPILED_BUILD_AUTHORITY) {
+        return Err(RunnerError::new(
+            "production registry lacks its exact build-authority field",
+        ));
+    }
+
+    let patterns = object
+        .get("compiled_patterns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RunnerError::new("embedded registry lacks compiled patterns"))?;
+    let mut v3_rows = 0_usize;
+    for pattern in patterns {
+        let engines = pattern
+            .get("engines")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RunnerError::new("embedded pattern lacks engine rows"))?;
+        for engine in engines {
+            if engine.get("engine").and_then(Value::as_str) == Some("count-v3-aot") {
+                v3_rows = v3_rows
+                    .checked_add(1)
+                    .ok_or_else(|| RunnerError::new("Count-v3 registry row count overflow"))?;
+                if engine.get("runtime_authority").and_then(Value::as_str)
+                    != Some(COMPILED_BUILD_AUTHORITY)
+                {
+                    return Err(RunnerError::new(
+                        "Count-v3 registry row has the wrong runtime authority",
+                    ));
+                }
+            }
+        }
+    }
+    if v3_rows != ARTIFACTS.len() {
+        return Err(RunnerError::new(
+            "Count-v3 registry authority rows differ from the linked artifact table",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_embedded_tables() -> Result<(), RunnerError> {
     if CELLS.is_empty() || ARTIFACTS.is_empty() {
         return Err(RunnerError::new("embedded inventory tables are empty"));
@@ -458,6 +666,12 @@ fn validate_embedded_tables() -> Result<(), RunnerError> {
         if cell.artifact_index >= ARTIFACTS.len() {
             return Err(RunnerError::new(
                 "embedded cell has an out-of-range artifact index",
+            ));
+        }
+        #[cfg(feature = "production")]
+        if cell.input_bytes < AGGREGATE_COUNT_EXACT_LITERAL_AOT_MIN_HAYSTACK_BYTES_V3 {
+            return Err(RunnerError::new(
+                "production confirmation cell is below the evidence-backed AOT route floor",
             ));
         }
     }
@@ -693,6 +907,34 @@ fn execute_engine(
     }
 }
 
+#[cfg(all(feature = "production", fre_count_v3_neon))]
+fn authorize_count_v3(artifact: &ArtifactDescriptor) -> Result<(), RunnerError> {
+    let owner = build_fixed_owner(artifact)?;
+    let verified = (artifact.v3_adopt)().map_err(|error| {
+        RunnerError::new(format!(
+            "source authority refused production NEON Count-v3 object: {error}"
+        ))
+    })?;
+    let _facade = AggregateCountExactLiteralAotV3::bind(&owner, &verified)
+        .map_err(|error| RunnerError::new(format!("bind production NEON facade: {error}")))?;
+    Ok(())
+}
+
+#[cfg(all(feature = "production", any(fre_count_v3_sve, fre_count_v3_sve2)))]
+fn authorize_count_v3(artifact: &ArtifactDescriptor) -> Result<(), RunnerError> {
+    let owner = build_fixed_owner(artifact)?;
+    let binding = AggregateCountExactLiteralAotSveV3::adoption_binding(&owner)
+        .map_err(|error| RunnerError::new(format!("project production SVE binding: {error}")))?;
+    let verified = (artifact.v3_adopt)(binding).map_err(|error| {
+        RunnerError::new(format!(
+            "source authority refused production SVE Count-v3 object: {error}"
+        ))
+    })?;
+    let _facade = AggregateCountExactLiteralAotSveV3::bind(&owner, &verified)
+        .map_err(|error| RunnerError::new(format!("bind production SVE facade: {error}")))?;
+    Ok(())
+}
+
 fn execute_portable(
     kind: RunKind,
     artifact: &ArtifactDescriptor,
@@ -772,7 +1014,7 @@ fn execute_count_v2(
     Ok(elapsed)
 }
 
-#[cfg(fre_count_v3_neon)]
+#[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 fn execute_count_v3(
     kind: RunKind,
     artifact: &ArtifactDescriptor,
@@ -800,7 +1042,10 @@ fn execute_count_v3(
     })
 }
 
-#[cfg(any(fre_count_v3_sve, fre_count_v3_sve2))]
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
 fn execute_count_v3(
     kind: RunKind,
     artifact: &ArtifactDescriptor,
@@ -830,6 +1075,101 @@ fn execute_count_v3(
         .count_value(black_box(haystack), &limits)
         .map_err(|error| RunnerError::new(format!("SVE Count-v3 oracle call failed: {error}")))?;
     require_expected(first, expected, "count-v3-aot")?;
+    if kind == RunKind::Correctness {
+        return Ok(0);
+    }
+    measure_safe_values(iterations, expected, || {
+        session.count_value(black_box(haystack), &limits)
+    })
+}
+
+#[cfg(all(feature = "production", fre_count_v3_neon))]
+fn execute_count_v3(
+    kind: RunKind,
+    artifact: &ArtifactDescriptor,
+    expected: u64,
+    haystack: &[u8],
+    iterations: u64,
+) -> Result<u64, RunnerError> {
+    let owner = build_fixed_owner(artifact)?;
+    let verified = (artifact.v3_adopt)().map_err(|error| {
+        RunnerError::new(format!(
+            "adopt source-authorized production NEON Count-v3 object: {error}"
+        ))
+    })?;
+    let facade = AggregateCountExactLiteralAotV3::bind(&owner, &verified)
+        .map_err(|error| RunnerError::new(format!("bind production NEON facade: {error}")))?;
+    if facade.route_for_haystack_bytes(haystack.len())
+        != AggregateCountExactLiteralAotRouteV3::AsimdAot
+    {
+        return Err(RunnerError::new(
+            "production NEON confirmation refused a non-ASIMD route",
+        ));
+    }
+    let limits = run_limits();
+    let first = facade
+        .count_value_with_route(black_box(haystack), &limits)
+        .map_err(|error| {
+            RunnerError::new(format!(
+                "production NEON Count-v3 oracle call failed: {error}"
+            ))
+        })?;
+    if first.route() != AggregateCountExactLiteralAotRouteV3::AsimdAot {
+        return Err(RunnerError::new(
+            "production NEON confirmation executed a non-ASIMD route",
+        ));
+    }
+    require_expected(first.value(), expected, "count-v3-aot")?;
+    if kind == RunKind::Correctness {
+        return Ok(0);
+    }
+    measure_safe_values(iterations, expected, || {
+        facade.count_value(black_box(haystack), &limits)
+    })
+}
+
+#[cfg(all(feature = "production", any(fre_count_v3_sve, fre_count_v3_sve2)))]
+fn execute_count_v3(
+    kind: RunKind,
+    artifact: &ArtifactDescriptor,
+    expected: u64,
+    haystack: &[u8],
+    iterations: u64,
+) -> Result<u64, RunnerError> {
+    let owner = build_fixed_owner(artifact)?;
+    let binding = AggregateCountExactLiteralAotSveV3::adoption_binding(&owner)
+        .map_err(|error| RunnerError::new(format!("project production SVE binding: {error}")))?;
+    let verified = (artifact.v3_adopt)(binding).map_err(|error| {
+        RunnerError::new(format!(
+            "adopt source-authorized production SVE Count-v3 object: {error}"
+        ))
+    })?;
+    let facade = AggregateCountExactLiteralAotSveV3::bind(&owner, &verified)
+        .map_err(|error| RunnerError::new(format!("bind production SVE facade: {error}")))?;
+    if facade.route_for_haystack_bytes(haystack.len())
+        != AggregateCountExactLiteralAotRouteV3::SveAot
+    {
+        return Err(RunnerError::new(
+            "production SVE confirmation refused a non-SVE route",
+        ));
+    }
+    let session = facade
+        .begin_current_thread_session()
+        .map_err(|error| RunnerError::new(format!("open production SVE session: {error}")))?;
+    let limits = run_limits();
+    let first = session
+        .count_value_with_route(black_box(haystack), &limits)
+        .map_err(|error| {
+            RunnerError::new(format!(
+                "production SVE Count-v3 oracle call failed: {error}"
+            ))
+        })?;
+    if first.route() != AggregateCountExactLiteralAotRouteV3::SveAot {
+        return Err(RunnerError::new(
+            "production SVE confirmation executed a non-SVE route",
+        ));
+    }
+    require_expected(first.value(), expected, "count-v3-aot")?;
     if kind == RunKind::Correctness {
         return Ok(0);
     }
@@ -990,6 +1330,22 @@ fn require_lower_hex_64(value: &str, label: &str) -> Result<(), RunnerError> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
+}
+
+fn build_authority_binding_sha256(authority: &str, registry_sha256: &str) -> String {
+    let authority_bytes = u64::try_from(authority.len())
+        .expect("build authority length is statically bounded")
+        .to_le_bytes();
+    let registry_bytes = u64::try_from(registry_sha256.len())
+        .expect("registry digest text length is statically bounded")
+        .to_le_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(BUILD_AUTHORITY_BINDING_DOMAIN);
+    hasher.update(authority_bytes);
+    hasher.update(authority.as_bytes());
+    hasher.update(registry_bytes);
+    hasher.update(registry_sha256.as_bytes());
+    hex(&hasher.finalize())
 }
 
 fn hex(bytes: &[u8]) -> String {

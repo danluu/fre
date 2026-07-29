@@ -37,6 +37,8 @@ use sha2::{Digest, Sha256};
 
 const BINARY: &str = "fre-optimizing-count-v3-rebar";
 const REGISTRY_SCHEMA: &str = "fre.optimizing-count-v3.compiled-artifact-registry.v2";
+const PRODUCTION_REGISTRY_SCHEMA: &str =
+    "fre.optimizing-count-v3.production-confirmation-artifact-registry.v1";
 const PORTABLE_RECEIPT_SCHEMA: &str = "fre.optimizing-count-v3.portable-compiled-recipe-receipt.v1";
 const PORTABLE_PAYLOAD_SCHEMA: &str = "fre.optimizing-count-v3.portable-compiled-recipe-payload.v1";
 const PORTABLE_METADATA_SCHEMA: &str =
@@ -54,6 +56,8 @@ const RESOURCE_CLAIM_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-RESOURCE-CLAIM\0\
 const V2_OBJECT_BINDING_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-V2-CONTROL-BINDING\0\x01";
 const PORTABLE_RECEIPT_IDENTITY_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-PORTABLE-RECEIPT\0\x01";
 const SOURCE_SET_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-RUNNER-SOURCE-SET\0\x01";
+const BUILD_AUTHORITY_BINDING_DOMAIN: &[u8] =
+    b"FRE-OPTIMIZING-COUNT-V3-BUILD-AUTHORITY-BINDING\0\x01";
 const GENERAL_ELIGIBILITY_TUPLE_KEYS_V3: [&str; 35] = [
     "compiler_version",
     "metadata_version",
@@ -92,6 +96,88 @@ const GENERAL_ELIGIBILITY_TUPLE_KEYS_V3: [&str; 35] = [
     "max_literal_bytes",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuildAuthority {
+    QualificationPrivate,
+    Production,
+}
+
+impl BuildAuthority {
+    fn from_environment() -> Result<Self, String> {
+        Self::parse(
+            &required_environment("FRE_COUNT_V3_BUILD_AUTHORITY")?,
+            env::var_os("CARGO_FEATURE_QUALIFICATION_PRIVATE").is_some(),
+            env::var_os("CARGO_FEATURE_PRODUCTION").is_some(),
+        )
+    }
+
+    fn parse(
+        value: &str,
+        qualification_feature: bool,
+        production_feature: bool,
+    ) -> Result<Self, String> {
+        let selected = match value {
+            "qualification-private" => Self::QualificationPrivate,
+            "production" => Self::Production,
+            _ => {
+                return Err(format!(
+                    "FRE_COUNT_V3_BUILD_AUTHORITY must be exactly qualification-private or production, got {value}"
+                ));
+            }
+        };
+        let feature_matches = matches!(
+            (selected, qualification_feature, production_feature),
+            (Self::QualificationPrivate, true, false) | (Self::Production, false, true)
+        );
+        if !feature_matches {
+            return Err(format!(
+                "build authority {} requires exactly its matching Cargo feature",
+                selected.name()
+            ));
+        }
+        Ok(selected)
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::QualificationPrivate => "qualification-private",
+            Self::Production => "production",
+        }
+    }
+
+    const fn registry_schema(self) -> &'static str {
+        match self {
+            Self::QualificationPrivate => REGISTRY_SCHEMA,
+            Self::Production => PRODUCTION_REGISTRY_SCHEMA,
+        }
+    }
+
+    const fn runtime_authority(self) -> &'static str {
+        match self {
+            Self::QualificationPrivate => "qualification-private",
+            Self::Production => "production",
+        }
+    }
+
+    const fn production_authority(self) -> &'static str {
+        match self {
+            Self::QualificationPrivate => "absent",
+            Self::Production => "source-reviewed-tuples-required",
+        }
+    }
+
+    const fn qualification_authority(self) -> &'static str {
+        match self {
+            Self::QualificationPrivate => "private-only",
+            Self::Production => "absent",
+        }
+    }
+
+    const fn is_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         panic!("optimizing Count-v3 Rebar builder refused: {error}");
@@ -107,6 +193,7 @@ fn run() -> Result<(), String> {
         "FRE_COUNT_V3_TARGET_CONTRACT_SHA256",
         "FRE_COUNT_V3_TUNING_CLASS",
         "FRE_COUNT_V3_REQUIRED_ISA",
+        "FRE_COUNT_V3_BUILD_AUTHORITY",
     ] {
         println!("cargo:rerun-if-env-changed={variable}");
     }
@@ -116,6 +203,7 @@ fn run() -> Result<(), String> {
         "build.rs",
         "build_support/inventory.rs",
         "build_support/expectation_object.rs",
+        "production_confirm.py",
         "src/main.rs",
     ] {
         println!("cargo:rerun-if-changed={source}");
@@ -123,6 +211,7 @@ fn run() -> Result<(), String> {
 
     let manifest_dir = required_path("CARGO_MANIFEST_DIR")?;
     let out_dir = required_path("OUT_DIR")?;
+    let authority = BuildAuthority::from_environment()?;
     let target = TargetConfig::from_environment()?;
     println!("cargo:rustc-check-cfg=cfg(fre_count_v3_neon)");
     println!("cargo:rustc-check-cfg=cfg(fre_count_v3_sve)");
@@ -151,6 +240,7 @@ fn run() -> Result<(), String> {
     let inventory = inventory::parse_and_validate(&inventory_bytes)?;
     let artifact_root = validate_artifact_root(&required_path("FRE_COUNT_V3_ARTIFACT_ROOT")?)?;
     validate_runner_source_boundary(&manifest_dir)?;
+    validate_production_controller_source_boundary(&manifest_dir)?;
     let source_receipt = source_receipt(&manifest_dir)?;
 
     let mut compiled = Vec::new();
@@ -169,6 +259,7 @@ fn run() -> Result<(), String> {
         &artifact_root,
         &source_receipt,
         &compiled,
+        authority,
     );
     let registry_bytes = serde_json::to_vec(&registry)
         .map_err(|error| format!("serialize compiled artifact registry: {error}"))?;
@@ -180,8 +271,9 @@ fn run() -> Result<(), String> {
         &registry_bytes,
         &registry_sha256,
         &target,
+        authority,
     )?;
-    validate_generated_v3_boundary(&generated, compiled.len())?;
+    validate_generated_v3_boundary(&generated, compiled.len(), authority, &target)?;
     fs::write(out_dir.join("generated.rs"), generated)
         .map_err(|error| format!("write generated bindings: {error}"))?;
     fs::write(out_dir.join("compiled-artifacts.json"), &registry_bytes)
@@ -262,7 +354,7 @@ impl TargetConfig {
         if target_triple == "aarch64-apple-darwin"
             && required_isa != CountV3RequiredIsa::Aarch64Neon128
         {
-            return Err("macOS Count-v3 qualification target must select NEON".to_string());
+            return Err("macOS Count-v3 runner target must select NEON".to_string());
         }
         let canonical_bytes = serde_json::to_vec(&json!({
             "object_format": object_format_name,
@@ -324,6 +416,7 @@ struct EngineArtifact {
 #[derive(Clone, Debug)]
 struct V3Artifact {
     engine: EngineArtifact,
+    eligibility_tuple: CountGeneralEligibilityTupleV3,
     general_eligibility_tuple: Value,
     expectation_file_path: PathBuf,
     expectation_file_sha256: String,
@@ -710,6 +803,7 @@ fn compile_artifact(
             code_bytes: Some(inspection.code().len()),
             receipt_identity: None,
         },
+        eligibility_tuple: inspected_eligibility,
         general_eligibility_tuple,
         expectation_file_path,
         expectation_file_sha256,
@@ -1014,6 +1108,7 @@ fn build_registry(
     artifact_root: &Path,
     source_receipt: &Value,
     compiled: &[CompiledArtifact],
+    authority: BuildAuthority,
 ) -> Value {
     let compiled_patterns: Vec<Value> = compiled
         .iter()
@@ -1021,9 +1116,14 @@ fn build_registry(
             json!({
                 "claim_derivations": artifact.claim_derivations,
                 "engines": [
-                    engine_registry("portable-current", &artifact.portable, None),
-                    engine_registry("count-v2-current", &artifact.v2, None),
-                    engine_registry("count-v3-aot", &artifact.v3.engine, Some(&artifact.v3)),
+                    engine_registry("portable-current", &artifact.portable, None, authority),
+                    engine_registry("count-v2-current", &artifact.v2, None, authority),
+                    engine_registry(
+                        "count-v3-aot",
+                        &artifact.v3.engine,
+                        Some(&artifact.v3),
+                        authority,
+                    ),
                 ],
                 "input_policy": inventory::INPUT_POLICY,
                 "optimizer_input_sha256": artifact.optimizer_input_sha256,
@@ -1058,7 +1158,7 @@ fn build_registry(
         .into_iter()
         .map(|(_, _, row)| row)
         .collect();
-    json!({
+    let mut registry = json!({
         "artifact_root": path_text(artifact_root),
         "artifacts": campaign_artifacts,
         "compiled_patterns": compiled_patterns,
@@ -1067,16 +1167,43 @@ fn build_registry(
         "inventory_identity": inventory.inventory_identity,
         "inventory_sha256": inventory_sha256,
         "object_format": target.object_format_name,
-        "production_authority": "absent",
-        "qualification_authority": "private-only",
+        "production_authority": authority.production_authority(),
+        "qualification_authority": authority.qualification_authority(),
         "required_isa": target.required_isa_name,
-        "schema": REGISTRY_SCHEMA,
+        "schema": authority.registry_schema(),
         "source": source_receipt,
         "target_contract_sha256": target.target_contract_hex,
         "target_id": target.target_id,
         "target_triple": target.target_triple,
         "tuning_class": target.tuning_class_name,
-    })
+    });
+    if authority.is_production() {
+        let object = registry
+            .as_object_mut()
+            .expect("registry literal is an object");
+        object.insert("build_authority".to_string(), json!(authority.name()));
+        object.insert(
+            "cells".to_string(),
+            Value::Array(
+                inventory
+                    .cells
+                    .iter()
+                    .map(|cell| {
+                        json!({
+                            "cell_id": cell.cell_id,
+                            "expected_count": cell.expected_count,
+                            "input_bytes": cell.input_bytes,
+                            "input_sha256": cell.input_sha256,
+                            "oracle_receipt_sha256": cell.oracle_receipt_sha256,
+                            "pattern_input_id": cell.pattern_input_id,
+                            "pattern_sha256": cell.pattern_sha256,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    registry
 }
 
 fn campaign_artifact_registry(
@@ -1095,7 +1222,12 @@ fn campaign_artifact_registry(
     })
 }
 
-fn engine_registry(engine: &str, artifact: &EngineArtifact, v3: Option<&V3Artifact>) -> Value {
+fn engine_registry(
+    engine: &str,
+    artifact: &EngineArtifact,
+    v3: Option<&V3Artifact>,
+    authority: BuildAuthority,
+) -> Value {
     json!({
         "artifact_file_path": path_text(&artifact.artifact_file_path),
         "artifact_file_sha256": artifact.artifact_file_sha256,
@@ -1117,7 +1249,7 @@ fn engine_registry(engine: &str, artifact: &EngineArtifact, v3: Option<&V3Artifa
         "payload_sha256": artifact.payload_sha256,
         "receipt_identity": artifact.receipt_identity,
         "recipe_identity": v3.map(|value| value.recipe_identity.as_str()),
-        "runtime_authority": if v3.is_some() { "qualification-private" } else { "control" },
+        "runtime_authority": if v3.is_some() { authority.runtime_authority() } else { "control" },
         "optimizer_receipt_identity": v3.map(|value| value.optimizer_receipt_identity.as_str()),
     })
 }
@@ -1157,6 +1289,7 @@ fn generate_bindings(
     registry_bytes: &[u8],
     registry_sha256: &str,
     target: &TargetConfig,
+    authority: BuildAuthority,
 ) -> Result<String, String> {
     let registry_text = std::str::from_utf8(registry_bytes)
         .map_err(|error| format!("registry is not UTF-8: {error}"))?;
@@ -1186,6 +1319,19 @@ fn generate_bindings(
         target.required_isa_name
     )
     .map_err(|_| "format generated required ISA".to_string())?;
+    writeln!(
+        output,
+        "pub(crate) const EMBEDDED_BUILD_AUTHORITY: &str = {:?};",
+        authority.name()
+    )
+    .map_err(|_| "format generated build authority".to_string())?;
+    let authority_binding = build_authority_binding_sha256(authority.name(), registry_sha256);
+    writeln!(
+        output,
+        "pub(crate) const BUILD_AUTHORITY_REGISTRY_BINDING_SHA256: &str = {:?};",
+        authority_binding
+    )
+    .map_err(|_| "format generated build-authority registry binding".to_string())?;
 
     for (index, artifact) in compiled.iter().enumerate() {
         let v2_compile = artifact
@@ -1229,8 +1375,8 @@ fn generate_bindings(
             artifact.v3.expectation_symbol
         )
         .map_err(|_| "format private Count-v3 extern bindings".to_string())?;
-        match target.required_isa {
-            CountV3RequiredIsa::Aarch64Neon128 => {
+        match (authority, target.required_isa) {
+            (BuildAuthority::QualificationPrivate, CountV3RequiredIsa::Aarch64Neon128) => {
                 writeln!(
                     output,
                     "#[allow(unsafe_code, reason = \"the build-linked immutable symbols satisfy the sole qualification adopter boundary\")]\n\
@@ -1248,7 +1394,10 @@ fn generate_bindings(
                 )
                 .map_err(|_| "format private NEON Count-v3 adopter".to_string())?;
             }
-            CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16 => {
+            (
+                BuildAuthority::QualificationPrivate,
+                CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16,
+            ) => {
                 writeln!(
                     output,
                     "#[allow(unsafe_code, reason = \"the build-linked immutable symbols satisfy the sole SVE qualification adopter boundary\")]\n\
@@ -1265,6 +1414,45 @@ fn generate_bindings(
                      }}"
                 )
                 .map_err(|_| "format private SVE Count-v3 adopter".to_string())?;
+            }
+            (BuildAuthority::Production, CountV3RequiredIsa::Aarch64Neon128) => {
+                writeln!(
+                    output,
+                    "#[allow(unsafe_code, reason = \"the build-linked immutable symbols enter only the source-authorized production adopter\")]\n\
+                     pub(super) fn adopt_v3_{index}() -> Result<fre_aot_static_runtime::VerifiedStaticCountV3, fre_aot_static_runtime::StaticCountVerifyErrorV3> {{\n\
+                         let linked = fre_aot_static_runtime::StaticCountLinkedAddressesV3::from_exposed_addresses(\n\
+                             core::ptr::addr_of!(v3_expectation_{index}).expose_provenance(),\n\
+                             core::ptr::addr_of!(v3_payload_{index}).expose_provenance(),\n\
+                             core::ptr::addr_of!(v3_metadata_{index}).expose_provenance(),\n\
+                             (v3_entry_{index} as *const ()).expose_provenance(),\n\
+                         );\n\
+                         unsafe {{ fre_aot_static_runtime::adopt_linked_static_count_v3(linked) }}\n\
+                     }}"
+                )
+                .map_err(|_| "format private production NEON Count-v3 adopter".to_string())?;
+            }
+            (
+                BuildAuthority::Production,
+                CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16,
+            ) => {
+                let tuple_source = eligibility_tuple_source_v3(artifact.v3.eligibility_tuple);
+                writeln!(
+                    output,
+                    "#[allow(unsafe_code, reason = \"the build-linked immutable symbols and exact source tuple enter only the production SVE adopter\")]\n\
+                     pub(super) fn adopt_v3_{index}(\n\
+                         binding: fre_aot_static_runtime::StaticCountSveFacadeBindingV3<'_>,\n\
+                     ) -> Result<fre_aot_static_runtime::VerifiedStaticCountSveV3, fre_aot_static_runtime::StaticCountVerifyErrorV3> {{\n\
+                         let linked = fre_aot_static_runtime::StaticCountSveLinkedAddressesV3::from_exposed_addresses(\n\
+                             core::ptr::addr_of!(v3_expectation_{index}).expose_provenance(),\n\
+                             core::ptr::addr_of!(v3_payload_{index}).expose_provenance(),\n\
+                             core::ptr::addr_of!(v3_metadata_{index}).expose_provenance(),\n\
+                             (v3_entry_{index} as *const ()).expose_provenance(),\n\
+                             {tuple_source},\n\
+                         );\n\
+                         unsafe {{ fre_aot_static_runtime::adopt_linked_static_count_sve_v3(linked, binding) }}\n\
+                     }}"
+                )
+                .map_err(|_| "format private production SVE Count-v3 adopter".to_string())?;
             }
         }
     }
@@ -1336,7 +1524,87 @@ fn generate_bindings(
     Ok(output)
 }
 
-fn validate_generated_v3_boundary(source: &str, artifacts: usize) -> Result<(), String> {
+fn build_authority_binding_sha256(authority: &str, registry_sha256: &str) -> String {
+    let authority_bytes = u64::try_from(authority.len())
+        .expect("build authority length is statically bounded")
+        .to_le_bytes();
+    let registry_bytes = u64::try_from(registry_sha256.len())
+        .expect("registry digest text length is statically bounded")
+        .to_le_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(BUILD_AUTHORITY_BINDING_DOMAIN);
+    hasher.update(authority_bytes);
+    hasher.update(authority.as_bytes());
+    hasher.update(registry_bytes);
+    hasher.update(registry_sha256.as_bytes());
+    hex(&hasher.finalize())
+}
+
+fn eligibility_tuple_source_v3(tuple: CountGeneralEligibilityTupleV3) -> String {
+    let object_format = match tuple.object_format {
+        CountObjectFormatV3::MachOArm64 => {
+            "fre_aot_count_contract::v3::CountObjectFormatV3::MachOArm64"
+        }
+        CountObjectFormatV3::Elf64Aarch64 => {
+            "fre_aot_count_contract::v3::CountObjectFormatV3::Elf64Aarch64"
+        }
+    };
+    format!(
+        "fre_aot_count_contract::v3::CountGeneralEligibilityTupleV3 {{ \
+         compiler_version: {}, metadata_version: {}, image_schema_version: {}, \
+         backend_version: {}, algorithm_version: {}, auditor_version: {}, \
+         kir_semantics_version: {}, kir_abi_version: {}, recipe_schema_version: {}, \
+         optimizer_version: {}, tuning_class_id: {}, strategy_id: {}, schedule_id: {}, \
+         register_plan_id: {}, literal_bytes: {}, filter_len: {}, sparse_group_count: {}, \
+         match_stride: {}, periodic_stride: {}, call_abi_schema: {}, abi_kind: {}, \
+         status_bits: {}, output_kind: {}, architecture: {}, little_endian: {}, \
+         pointer_width: {}, target_abi: {}, object_format: {object_format}, \
+         required_isa_id: {}, actual_features: {}, allowed_features: {}, \
+         candidate_block_starts: {}, vector_bytes: {}, sve_vector_length_bytes: {}, \
+         max_literal_bytes: {} }}",
+        tuple.compiler_version,
+        tuple.metadata_version,
+        tuple.image_schema_version,
+        tuple.backend_version,
+        tuple.algorithm_version,
+        tuple.auditor_version,
+        tuple.kir_semantics_version,
+        tuple.kir_abi_version,
+        tuple.recipe_schema_version,
+        tuple.optimizer_version,
+        tuple.tuning_class_id,
+        tuple.strategy_id,
+        tuple.schedule_id,
+        tuple.register_plan_id,
+        tuple.literal_bytes,
+        tuple.filter_len,
+        tuple.sparse_group_count,
+        tuple.match_stride,
+        tuple.periodic_stride,
+        tuple.call_abi_schema,
+        tuple.abi_kind,
+        tuple.status_bits,
+        tuple.output_kind,
+        tuple.architecture,
+        tuple.little_endian,
+        tuple.pointer_width,
+        tuple.target_abi,
+        tuple.required_isa_id,
+        tuple.actual_features,
+        tuple.allowed_features,
+        tuple.candidate_block_starts,
+        tuple.vector_bytes,
+        tuple.sve_vector_length_bytes,
+        tuple.max_literal_bytes,
+    )
+}
+
+fn validate_generated_v3_boundary(
+    source: &str,
+    artifacts: usize,
+    authority: BuildAuthority,
+    target: &TargetConfig,
+) -> Result<(), String> {
     let private_modules = source.matches("mod v3_linked_symbols {").count();
     let raw_entries = source.matches("fn v3_entry_").count();
     let safe_adopters = source.matches("pub(super) fn adopt_v3_").count();
@@ -1351,6 +1619,63 @@ fn validate_generated_v3_boundary(source: &str, artifacts: usize) -> Result<(), 
             "generated Count-v3 binding boundary leaks or omits a private linked symbol"
                 .to_string(),
         );
+    }
+    if source
+        .matches("pub(crate) const EMBEDDED_BUILD_AUTHORITY:")
+        .count()
+        != 1
+        || source
+            .matches("pub(crate) const BUILD_AUTHORITY_REGISTRY_BINDING_SHA256:")
+            .count()
+            != 1
+    {
+        return Err(
+            "generated Count-v3 binary lacks an exact build-authority registry binding".to_string(),
+        );
+    }
+
+    let qualification_neon = source
+        .matches("adopt_linked_static_count_qualification_v3(linked, binding)")
+        .count();
+    let qualification_sve = source
+        .matches("adopt_linked_static_count_sve_qualification_v3(linked, binding)")
+        .count();
+    let production_neon = source
+        .matches("adopt_linked_static_count_v3(linked)")
+        .count();
+    let production_sve = source
+        .matches("adopt_linked_static_count_sve_v3(linked, binding)")
+        .count();
+    let source_tuples = source
+        .matches("fre_aot_count_contract::v3::CountGeneralEligibilityTupleV3 {")
+        .count();
+    let expected = match (authority, target.required_isa) {
+        (BuildAuthority::QualificationPrivate, CountV3RequiredIsa::Aarch64Neon128) => {
+            (artifacts, 0, 0, 0, 0)
+        }
+        (
+            BuildAuthority::QualificationPrivate,
+            CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16,
+        ) => (0, artifacts, 0, 0, 0),
+        (BuildAuthority::Production, CountV3RequiredIsa::Aarch64Neon128) => (0, 0, artifacts, 0, 0),
+        (
+            BuildAuthority::Production,
+            CountV3RequiredIsa::Aarch64SveVl16 | CountV3RequiredIsa::Aarch64Sve2Vl16,
+        ) => (0, 0, 0, artifacts, artifacts),
+    };
+    if (
+        qualification_neon,
+        qualification_sve,
+        production_neon,
+        production_sve,
+        source_tuples,
+    ) != expected
+    {
+        return Err(format!(
+            "generated Count-v3 adopter authority/ISA shape differs: got \
+             ({qualification_neon}, {qualification_sve}, {production_neon}, \
+             {production_sve}, {source_tuples}), expected {expected:?}"
+        ));
     }
     Ok(())
 }
@@ -1373,12 +1698,58 @@ fn validate_runner_source_boundary(manifest_dir: &Path) -> Result<(), String> {
         }
     }
     if source.matches(".count_value(").count() < 4
+        || source.matches(".count_value_with_route(").count() < 2
         || !source.contains("begin_current_thread_session")
+        || !source.contains("AggregateCountExactLiteralAotRouteV3::AsimdAot")
+        || !source.contains("AggregateCountExactLiteralAotRouteV3::SveAot")
+        || !source.contains("fn authorize_count_v3")
+        || !source.contains("fn validate_embedded_authority")
         || source.contains("mod v3_linked_symbols")
     {
         return Err(
             "runner source lacks the reviewed safe Count-v3 facade/session shape".to_string(),
         );
+    }
+    Ok(())
+}
+
+fn validate_production_controller_source_boundary(manifest_dir: &Path) -> Result<(), String> {
+    let path = manifest_dir.join("production_confirm.py");
+    let bytes = read_regular_file(&path, MAX_SOURCE_FILE_BYTES, false)?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("production controller source is not UTF-8: {error}"))?;
+    for forbidden in [
+        "shell=True",
+        "shutil.which",
+        "time.sleep",
+        "while True",
+        "pkill",
+        "killall",
+        "resource-coordinator",
+        "headroom-coordinator",
+    ] {
+        if source.contains(forbidden) {
+            return Err(format!(
+                "production controller crosses its closed execution boundary with {forbidden}"
+            ));
+        }
+    }
+    for required in [
+        "TEMPORARY_UNAVAILABLE = 75",
+        "start_new_session=True",
+        "os.killpg(process.pid, signal.SIGKILL)",
+        "list(plan[\"timing_wrapper\"][\"argv\"]) + [",
+        "return TEMPORARY_UNAVAILABLE",
+        "fresh-process-full-lifetime-wrapper-rotating-six-order-paired-v1",
+        "strict_faster_control_ratio_below_four_fifths",
+        "numerator_product * (5**count) < denominator_product * (4**count)",
+        "\"authorize\"",
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "production controller lacks required bounded invariant {required}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1392,6 +1763,7 @@ fn source_receipt(manifest_dir: &Path) -> Result<Value, String> {
         "build.rs",
         "build_support/inventory.rs",
         "build_support/expectation_object.rs",
+        "production_confirm.py",
         "src/main.rs",
     ] {
         let bytes = read_regular_file(&manifest_dir.join(relative), MAX_SOURCE_FILE_BYTES, false)?;
@@ -1586,4 +1958,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn path_text(path: &Path) -> &str {
     path.to_str()
         .expect("validated campaign paths must be UTF-8 for JSON receipts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_authority_requires_one_exact_matching_feature() {
+        assert_eq!(
+            BuildAuthority::parse("qualification-private", true, false),
+            Ok(BuildAuthority::QualificationPrivate)
+        );
+        assert_eq!(
+            BuildAuthority::parse("production", false, true),
+            Ok(BuildAuthority::Production)
+        );
+        for (value, qualification, production) in [
+            ("qualification-private", false, false),
+            ("qualification-private", false, true),
+            ("qualification-private", true, true),
+            ("production", false, false),
+            ("production", true, false),
+            ("production", true, true),
+            ("qualification", true, false),
+        ] {
+            assert!(BuildAuthority::parse(value, qualification, production).is_err());
+        }
+    }
+
+    #[test]
+    fn authority_binding_separates_mode_and_registry() {
+        let registry_a = "00".repeat(32);
+        let registry_b = "11".repeat(32);
+        let qualification = build_authority_binding_sha256("qualification-private", &registry_a);
+        let production = build_authority_binding_sha256("production", &registry_a);
+        let other_registry = build_authority_binding_sha256("production", &registry_b);
+        assert_ne!(qualification, production);
+        assert_ne!(production, other_registry);
+        assert_eq!(qualification.len(), 64);
+        assert_eq!(production.len(), 64);
+        assert_eq!(other_registry.len(), 64);
+    }
 }
