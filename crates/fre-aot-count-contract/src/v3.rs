@@ -191,8 +191,8 @@ pub struct ClaimedCountMetadataV3 {
 /// hashes remain mandatory integrity bindings, but are intentionally absent
 /// here so qualification does not overfit a list of benchmark identities.
 /// Pattern-derived class fields scope promotion to the closed recipe classes
-/// actually covered by held-out evidence, without enumerating literal bytes or
-/// Rebar case names.
+/// actually covered by held-out evidence, without enumerating literal contents
+/// or Rebar case names.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CountGeneralEligibilityTupleV3 {
     pub compiler_version: u16,
