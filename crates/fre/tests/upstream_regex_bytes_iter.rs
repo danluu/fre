@@ -120,6 +120,10 @@ fn borrowed_find_iter_matches_pinned_bytes_across_every_portable_plan() {
                 .find_iter(haystack)
                 .map(|matched| (matched.range(), matched.as_bytes().to_vec()))
                 .collect();
+            let _ = collect(&fre, haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("iterator-path warm-up failed for {case:?}: {error}")
+                });
             let mut iterator = fre
                 .find_iter_borrowed(haystack, PortableFindIterLimits::unlimited())
                 .unwrap_or_else(|error| {
@@ -155,6 +159,8 @@ fn borrowed_find_iter_preserves_limit_errors_workspace_and_fusion() {
         .plan_selection(PlanSelection::ForceK0)
         .build()
         .expect("empty portable regex");
+    let _ = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
+        .expect("warm empty-pattern iterator path");
     let (_, probe) = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
         .expect("unlimited accounting probe");
     let limits = PortableFindIterLimits {
@@ -300,6 +306,8 @@ fn whole_iterator_search_call_limit_is_exact_and_terminal() {
         .plan_selection(PlanSelection::ForceK0)
         .build()
         .expect("empty portable regex");
+    let _ = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
+        .expect("warm empty-pattern iterator path");
     let (_, probe) = collect(&regex, b"ab", PortableFindIterLimits::unlimited())
         .expect("unlimited accounting probe");
     assert_eq!(probe.search_calls, 6);
