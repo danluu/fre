@@ -114,6 +114,109 @@ fn reusable_continuation_sweep_matches_incumbent_and_regex_oracle_body() {
 }
 
 #[test]
+fn state_byte_incumbent_dominates_sweep_without_touching_workspace() {
+    std::thread::Builder::new()
+        .name("continuation-sweep-route-dominance".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(state_byte_incumbent_dominates_sweep_without_touching_workspace_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn state_byte_incumbent_dominates_sweep_without_touching_workspace_body() {
+    // Both programs are wide enough for the continuation sweep's program-size
+    // gate. The first also has a compiler-proved single-pass state/byte value
+    // reducer; the ordered-alternation control does not.
+    let dominated_pattern = r"[ab]+[ ]+abcdefghijklmnopq";
+    let sweep_pattern = r"(?:abcdefghijklmnopq|qrstuvwxyzabcdefg)+z";
+    let dominated_haystack = b"aa abcdefghijklmnopq--bb abcdefghijklmnopq--not-a-match";
+    let sweep_haystack = b"xxabcdefghijklmnopqqrstuvwxyzabcdefgz--qrstuvwxyzabcdefgz";
+    let limits = AggregateRunLimits::default();
+
+    let dominated_count = builder(dominated_pattern).build_count().unwrap();
+    let dominated_sum = builder(dominated_pattern).build_span_sum().unwrap();
+    assert_eq!(
+        dominated_count.continuation_sweep_upper_bounds().unwrap(),
+        None
+    );
+    assert_eq!(
+        dominated_sum.continuation_sweep_upper_bounds().unwrap(),
+        None
+    );
+    let expected = oracle(dominated_pattern, dominated_haystack);
+    assert_eq!(
+        (
+            dominated_count
+                .count_value(dominated_haystack, limits)
+                .unwrap(),
+            dominated_sum
+                .span_sum_value(dominated_haystack, limits)
+                .unwrap(),
+        ),
+        expected
+    );
+    let mut count_workspace = AggregateCountWorkspace::new();
+    let mut sum_workspace = AggregateSpanSumWorkspace::new();
+    assert_eq!(
+        dominated_count
+            .count_value_with_workspace(dominated_haystack, limits, &mut count_workspace)
+            .unwrap(),
+        expected.0
+    );
+    assert_eq!(
+        dominated_sum
+            .span_sum_value_with_workspace(dominated_haystack, limits, &mut sum_workspace)
+            .unwrap(),
+        expected.1
+    );
+    assert_eq!(count_workspace.retained_continuation_bytes(), None);
+    assert_eq!(sum_workspace.retained_continuation_bytes(), None);
+
+    let sweep_count = builder(sweep_pattern).build_count().unwrap();
+    let sweep_sum = builder(sweep_pattern).build_span_sum().unwrap();
+    assert!(
+        sweep_count
+            .continuation_sweep_upper_bounds()
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sweep_sum
+            .continuation_sweep_upper_bounds()
+            .unwrap()
+            .is_some()
+    );
+    let expected = oracle(sweep_pattern, sweep_haystack);
+    let mut count_workspace = AggregateCountWorkspace::new();
+    let mut sum_workspace = AggregateSpanSumWorkspace::new();
+    assert_eq!(
+        sweep_count
+            .count_value_with_workspace(sweep_haystack, limits, &mut count_workspace)
+            .unwrap(),
+        expected.0
+    );
+    assert_eq!(
+        sweep_sum
+            .span_sum_value_with_workspace(sweep_haystack, limits, &mut sum_workspace)
+            .unwrap(),
+        expected.1
+    );
+    assert!(
+        count_workspace
+            .retained_continuation_bytes()
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(
+        sum_workspace
+            .retained_continuation_bytes()
+            .unwrap_or_default()
+            > 0
+    );
+}
+
+#[test]
 fn late_priority_adversary_preserves_value_without_restart() {
     std::thread::Builder::new()
         .name("continuation-sweep-late-priority".to_owned())

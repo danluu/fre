@@ -2395,6 +2395,14 @@ impl CompiledRegex {
             || self.program.contains_unicode_word_boundary()
             || self.program.start_domain.is_sparse()
             || self.required_internal_anchor.is_some()
+            // A retained state/byte reducer is the incumbent value route for
+            // both Count and SpanSum. It already executes one source pass
+            // with fixed scalar state, so interposing a forward transition
+            // cache (and a reverse cache for SpanSum) cannot reduce its
+            // authenticated asymptotic work. Preserve that strictly cheaper
+            // compiled route instead of allocating or consulting a sweep
+            // workspace.
+            || self.state_byte_span_sum.is_some()
             // The incumbent two-row byte kernel is already dense and cheap
             // for very small programs. Avoid a persistent DFA workspace and
             // its first-call determinization until the program is large
