@@ -979,8 +979,14 @@ fn split_condition_v3(
         (CompareFactV3::RemainingMax { minimum }, ConditionV3::CarryClear) => {
             strengthen_bound_v3(&mut fallthrough.max_slack, minimum);
         }
+        (CompareFactV3::RemainingMax { minimum }, ConditionV3::CarrySet) => {
+            strengthen_bound_v3(&mut taken.max_slack, minimum);
+        }
         (CompareFactV3::RemainingLength { minimum }, ConditionV3::CarryClear) => {
             strengthen_bound_v3(&mut fallthrough.length_remaining, minimum);
+        }
+        (CompareFactV3::RemainingLength { minimum }, ConditionV3::CarrySet) => {
+            strengthen_bound_v3(&mut taken.length_remaining, minimum);
         }
         (CompareFactV3::CandidateMaskAgainstZero { register }, ConditionV3::Equal) => {
             mark_candidate_nonempty_v3(&mut fallthrough, register);
@@ -1221,7 +1227,10 @@ fn strengthen_bound_v3(bound: &mut Option<u16>, candidate: u16) {
 }
 
 fn join_lower_bound_v3(left: Option<u16>, right: Option<u16>) -> Option<u16> {
-    (left == right).then_some(left).flatten()
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        _ => None,
+    }
 }
 
 const fn invalid_v3(at: &'static str) -> CountAotError {
