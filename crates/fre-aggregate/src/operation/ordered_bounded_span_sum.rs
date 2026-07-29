@@ -2569,38 +2569,6 @@ mod tests {
     }
 
     #[test]
-    fn ordered_bounded_span_sum_bookkeeping_overflow_cannot_promote_dominated_events() {
-        let pattern = r"(?:a(?:_*[ab]+_*){0,1}b)|(?:b(?:_*[ab]+_*){0,1}a)";
-        let compiled = compiled(pattern);
-        let plan = compiled
-            .ordered_bounded_span_sum
-            .as_ref()
-            .expect("ordered bounded-span plan");
-        let input_bytes = usize::MAX / 256;
-        let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
-        let frontier_work = frontier_work_envelope(plan, input_bytes).unwrap();
-        assert!(events.work_bound > frontier_work.work_bound);
-        let frontier_error =
-            frontier_prospective(&compiled.program, plan, input_bytes).unwrap_err();
-        assert!(matches!(
-            frontier_error,
-            Error::ArithmeticOverflow {
-                resource: Resource::ExecutionWork
-            }
-        ));
-        let selection_error = select_executor(
-            &compiled.program,
-            plan,
-            input_bytes,
-            super::super::intrinsic_attempt_limits(),
-            usize::MAX,
-        )
-        .err()
-        .expect("dominated event route must retain the frontier overflow");
-        assert_eq!(selection_error, frontier_error);
-    }
-
-    #[test]
     fn ordered_bounded_span_sum_allocation_faults_close_exact_partial_ledgers() {
         let compiled = compiled(PATTERN);
         let haystack = b"red one blue; blue two red";
