@@ -101,6 +101,23 @@ Compile elapsed time and compiler peak RSS are process-level target-receipt
 facts and must be captured by the external frozen build controller; they are
 not nondeterministically embedded in this receipt.
 
+## Linux post-link audit
+
+Before running correctness or timing on Linux, verify the sealed runner against
+its exact compiled registry:
+
+```text
+python3 -I -B verify_linux_expectations.py \
+  --runner /absolute/fre-optimizing-count-v3-rebar \
+  --registry /absolute/compiled-artifacts.json
+```
+
+The audit parses ELF64/AArch64 directly. For every registry expectation it
+requires one hidden object definition of the exact width, authenticates the
+linked bytes, requires an allocated non-W/non-X section in an exactly R-only
+`PT_LOAD`, and rejects overlap with an executable load at the linker's maximum
+page alignment.
+
 ## Qualification runtime protocol
 
 In `qualification-private`, every invocation reads this exact compact UTF-8
