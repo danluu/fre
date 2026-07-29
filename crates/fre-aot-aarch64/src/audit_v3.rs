@@ -15,6 +15,10 @@ use fre_kernel_ir::{
     AggregateOutput, Count, ExactAggregateProgram, MAX_EXACT_AGGREGATE_LITERAL_BYTES,
 };
 
+use crate::audit_cfg_v3::{
+    audit_decoded_cfg_safety_v3, decoded_cfg_safety_scratch_bytes_v3,
+    decoded_cfg_safety_work_upper_bound_v3,
+};
 use crate::{
     AOT_COUNT_BACKEND_VERSION_V3, AotCountArtifactIdentityV3, AotCountCpuFeatures, AotCountImageV3,
     AotCountImageViewV3, AotCountLiteralManifestV3, AotCountMappedMetadataV3,
@@ -558,7 +562,9 @@ pub(crate) fn audit_work_components_v3(
     relocations: usize,
     literal_len: usize,
 ) -> Result<AuditWorkComponentsV3, CountAotError> {
-    let instructions = audit_to_u64(code_bytes / 4)?;
+    let instruction_count = code_bytes / 4;
+    let label_count = labels;
+    let instructions = audit_to_u64(instruction_count)?;
     let code_bytes = audit_to_u64(code_bytes)?;
     let labels = audit_to_u64(labels)?;
     let relocations = audit_to_u64(relocations)?;
@@ -603,9 +609,12 @@ pub(crate) fn audit_work_components_v3(
         .ok_or(audit_arithmetic_v3())?;
     // Each instruction performs fixed classification/ABI checks. A branch may
     // scan every label, then consumes one four-field relocation record.
+    let decoded_cfg_safety =
+        decoded_cfg_safety_work_upper_bound_v3(instruction_count, label_count)?;
     let cfg_and_relocations = instructions
         .checked_mul(labels.checked_add(18).ok_or(audit_arithmetic_v3())?)
         .and_then(|work| work.checked_add(relocations.checked_mul(8)?))
+        .and_then(|work| work.checked_add(decoded_cfg_safety))
         .ok_or(audit_arithmetic_v3())?;
     let recipe_validation = independent_recipe_work_envelope_v3(literal_len)?.total;
     let manifest_and_recipe_validation = literal
@@ -622,11 +631,11 @@ pub(crate) fn audit_work_components_v3(
     let identity_hash_bytes = identity_bytes;
     let identity_hash_finalization = 8;
     // One complete scratch derivation, one assembler-envelope recomputation,
-    // five ExactVec admission sites, actual-capacity arithmetic, persistent
+    // six ExactVec admission sites, actual-capacity arithmetic, persistent
     // envelope arithmetic, and caller/hard/receipt seals.
     let scratch_and_allocation_accounting = 24_u64
         .checked_add(assembler_scratch_derivation_work_upper_bound_v3())
-        .and_then(|work| work.checked_add(5 * 3))
+        .and_then(|work| work.checked_add(6 * 3))
         .and_then(|work| work.checked_add(18))
         .and_then(|work| work.checked_add(16))
         .ok_or(audit_arithmetic_v3())?;
@@ -764,7 +773,9 @@ pub(crate) fn audit_scratch_upper_bound_v3(
             )
         })
         .ok_or(audit_arithmetic_v3())?;
-    audit_to_u64(requested)
+    audit_to_u64(requested)?
+        .checked_add(decoded_cfg_safety_scratch_bytes_v3(instructions)?)
+        .ok_or(audit_arithmetic_v3())
 }
 
 /// Audit a sealed optimizing-v3 image without trusting emitter templates.
@@ -1095,6 +1106,7 @@ fn audit_impl_v3(
     {
         return Err(invalid_v3("v3 independent full template"));
     }
+    audit_decoded_cfg_safety_v3(decoded.as_slice(), image.labels.as_slice(), literal_len)?;
 
     let mut relocation_index = 0_usize;
     let mut direct_branches = 0_u32;
