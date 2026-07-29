@@ -427,6 +427,13 @@ fn capture_free_locations_read_matches_pinned_bytes_across_every_portable_plan()
         let upstream = upstream_builder.build().expect("pinned capture-free regex");
         let mut actual_locations = fre.capture_locations();
         let mut expected_locations = upstream.capture_locations();
+        // K0 publishes its source-independent start filter after the first
+        // successful invocation. Compare the two whole-match facades at the
+        // same warm specialization state so their exact accounting remains
+        // directly comparable.
+        let _ = fre
+            .find(b"", fre::SearchLimits::unlimited())
+            .expect("warm capture-free whole-match search");
 
         for &haystack in haystacks {
             let (actual, accounting) = fre
@@ -612,6 +619,12 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
             upstream.unwrap_or_else(|error| panic!("pinned regex rejected {name}: {error}"));
         assert_eq!(fre.build_report().plan, expected_plan, "{name}");
 
+        // K0's first successful call authenticates and publishes its bounded
+        // start filter. Warm once before comparing offset and borrowed-match
+        // projections so both calls carry the same exact accounting state.
+        let _ = fre
+            .find(haystack, fre::SearchLimits::unlimited())
+            .unwrap_or_else(|error| panic!("FRE warm-up search failed for {name}: {error}"));
         let (actual, offset_accounting) = fre
             .find(haystack, fre::SearchLimits::unlimited())
             .unwrap_or_else(|error| panic!("FRE search failed for {name}: {error}"));
