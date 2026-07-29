@@ -7,9 +7,15 @@ pub const INVENTORY_SCHEMA: &str = "fre.optimizing-count-v3.inventory.v1";
 pub const ARTIFACT_SCHEMA: &str = "fre.optimizing-count-v3.artifact-input.v1";
 pub const DECISION_SCHEMA: &str = "fre.optimizing-count-v3.selector-decision.v1";
 pub const INPUT_POLICY: &str = "pattern-semantic-options-target-only-v1";
+pub const SEMANTIC_PROFILE: &str = concat!(
+    "rust-regex-1.12.4-rebar-bytes-case-sensitive-",
+    "candidate-proven-exact-byte-equivalence-",
+    "whole-haystack-nonoverlapping-count-v1"
+);
 pub const MAX_INVENTORY_ROWS: usize = 16_384;
 pub const MAX_CELLS: usize = 4_096;
 
+const SEMANTIC_OPTIONS_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-SEMANTIC-OPTIONS\0\x01";
 const ARTIFACT_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-ARTIFACT\0\x01";
 const PATTERN_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-PATTERN\0\x01";
 const INVENTORY_ID_DOMAIN: &[u8] = b"FRE-OPTIMIZING-COUNT-V3-INVENTORY\0\x01";
@@ -168,10 +174,21 @@ fn validate(inventory: &Inventory) -> Result<(), String> {
         require_hex(value, 64, label)?;
     }
     require_hex(&inventory.rebar_revision, 40, "Rebar revision")?;
-    if inventory.semantic_profile.is_empty()
-        || inventory.semantic_profile.contains(['\0', '\r', '\n'])
-    {
-        return Err("invalid semantic profile".to_string());
+    if inventory.semantic_profile != SEMANTIC_PROFILE {
+        return Err(format!(
+            "unexpected semantic profile {}",
+            inventory.semantic_profile
+        ));
+    }
+    let expected_semantic_options = hex(&digest_fields(
+        SEMANTIC_OPTIONS_DOMAIN,
+        &[SEMANTIC_PROFILE.as_bytes()],
+    ));
+    if inventory.semantic_options_sha256 != expected_semantic_options {
+        return Err(format!(
+            "semantic-options SHA-256 differs: derived {expected_semantic_options}, embedded {}",
+            inventory.semantic_options_sha256
+        ));
     }
     if inventory.input_policy != INPUT_POLICY {
         return Err(format!(
