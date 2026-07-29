@@ -30,12 +30,12 @@ use regex_syntax::hir::{Class, Hir, HirKind};
 
 /// Stable implementation identity for the product-facing folded-literal facade.
 pub const UNICODE_FOLDED_LITERAL_ALGORITHM_ID: &str =
-    "fre.unicode-folded-literal.ordered-alt-fixed-column-trie.v3";
+    "fre.unicode-folded-literal.ordered-alt-fixed-column-trie.v4";
 /// Stable Count operation identity.
-pub const UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID: &str = "fre.unicode-folded-literal.count.v3";
+pub const UNICODE_FOLDED_LITERAL_COUNT_OPERATION_ID: &str = "fre.unicode-folded-literal.count.v4";
 /// Stable matched-byte-sum operation identity.
 pub const UNICODE_FOLDED_LITERAL_SPAN_SUM_OPERATION_ID: &str =
-    "fre.unicode-folded-literal.span-sum.v3";
+    "fre.unicode-folded-literal.span-sum.v4";
 
 const MAX_CLASS_MEMBERS: usize = 4;
 const REDUCER_WORK_PER_CANDIDATE: usize = 8;

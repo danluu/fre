@@ -43,6 +43,16 @@ fn scale_fixture(len: usize) -> Vec<u8> {
 
 #[test]
 fn casefold_literal_facade_retains_scalar_verification_and_operation_lifecycle() {
+    std::thread::Builder::new()
+        .name("unicode-casefold-literal-row".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(assert_casefold_literal_facade)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn assert_casefold_literal_facade() {
     assert_eq!(
         format!("{:x}", sha2::Sha256::digest(PATTERN.as_bytes())),
         PATTERN_SHA256
@@ -64,7 +74,7 @@ fn casefold_literal_facade_retains_scalar_verification_and_operation_lifecycle()
         haystack.len(),
     )
     .unwrap();
-    assert_eq!(lifecycle.plan(), "aggregate-unicode-folded-literal-v3");
+    assert_eq!(lifecycle.plan(), "aggregate-unicode-folded-literal-v4");
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 4);
     assert_eq!(lifecycle.execute(&haystack).unwrap(), 4);
 

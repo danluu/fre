@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Stable identity of the canonical folded-scalar trie primitive.
-pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v4";
+pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v5";
 
 const NONE: usize = usize::MAX;
 const CANDIDATE_WORK: usize = 2;
@@ -207,6 +207,7 @@ pub struct BuildAccounting {
     pub states_upper_bound: usize,
     pub transitions_upper_bound: usize,
     pub max_pattern_scalars: usize,
+    pub max_state_fanout_upper_bound: usize,
     pub canonical_comparisons_upper_bound: usize,
     pub insertion_probes_upper_bound: usize,
     pub root_prefilter_work_upper_bound: usize,
@@ -216,6 +217,10 @@ pub struct BuildAccounting {
     pub allocations_upper_bound: usize,
     pub canonical_comparisons: usize,
     pub insertion_probes: usize,
+    /// Exact maximum number of outgoing trie edges inspected by one scalar
+    /// transition. This is a retained topology certificate, not the total
+    /// transition count across unrelated states.
+    pub max_state_fanout: usize,
     pub root_prefilter_work: usize,
     pub root_prefilter_needles: usize,
     pub root_prefilter_offset: Option<usize>,
@@ -626,13 +631,17 @@ impl FoldedLiteralTriePlan {
     ///
     /// Returns checked resource/allocation/invariant errors. All resource
     /// limits are enforced before exact persistent allocation.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bounded allocation, exact topology census, and receipt publication stay in one auditable transaction"
+    )]
     pub fn build_with_dispatch(
         dispatch: SimdDispatchContext,
         patterns: &[FoldedLiteral<'_>],
         limits: BuildLimits,
     ) -> Result<BuildAttempt, BuildError> {
         let prospective = preflight_from_lengths(patterns)?;
-        enforce_build_limits(prospective, limits)?;
+        enforce_build_limits(&prospective, limits)?;
         let (fallback, canonical_comparisons) = fallback_reason(patterns)?;
         if let Some(reason) = fallback {
             let mut accounting = prospective;
@@ -662,6 +671,7 @@ impl FoldedLiteralTriePlan {
             .map_err(|error| map_copy_error(error, "folded trie outputs", prospective.patterns))?;
         let mut work = canonical_comparisons;
         let mut insertion_probes = 0_usize;
+        let mut max_state_fanout = 0_usize;
         push_exact(&mut nodes, Node::EMPTY, "folded root state")?;
         work = checked_build_add(work, 1, "folded root work")?;
         for (pattern_index, pattern) in patterns.iter().enumerate() {
@@ -675,6 +685,7 @@ impl FoldedLiteralTriePlan {
                     state,
                     class.equivalents,
                     &mut insertion_probes,
+                    &mut max_state_fanout,
                     &mut work,
                 )?;
             }
@@ -684,6 +695,7 @@ impl FoldedLiteralTriePlan {
         let mut build = prospective;
         build.canonical_comparisons = canonical_comparisons;
         build.insertion_probes = insertion_probes;
+        build.max_state_fanout = max_state_fanout;
         build.work = work;
         build.states = nodes.len();
         build.transitions = edges.len();
@@ -722,7 +734,7 @@ impl FoldedLiteralTriePlan {
             .and_then(|prefilter| prefilter.classifier.as_ref())
             .map(ByteBucketClassifier::selection);
         build.work = work;
-        if !build_actual_within(build) {
+        if !build_actual_within(&build) {
             return Err(BuildError::Invariant {
                 detail: "folded construction actual exceeded prospective",
             });
@@ -749,6 +761,12 @@ impl FoldedLiteralTriePlan {
     }
 
     /// Derive a complete fixed-program linear envelope from input length only.
+    ///
+    /// Every successfully decoded scalar performs at most one transition
+    /// lookup. A lookup follows only the current state's singly linked edge
+    /// list, whose authenticated maximum length is `max_state_fanout`.
+    /// Invalid decodes perform no lookup, so `scalar_decodes *
+    /// max_state_fanout` also bounds their mixed valid/invalid execution.
     ///
     /// # Errors
     ///
@@ -793,7 +811,7 @@ impl FoldedLiteralTriePlan {
         };
         let transition_probes = checked_scan_mul(
             scalar_decodes,
-            self.build.transitions,
+            self.build.max_state_fanout,
             "folded transition probes",
         )?;
         let candidate_events = checked_scan_mul(
@@ -1602,6 +1620,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
             })?;
     let work_upper_bound = canonical_comparisons_upper_bound
         .checked_add(insertion_work)
+        .and_then(|work| work.checked_add(scalar_positions))
         .and_then(|work| work.checked_add(root_prefilter_work_upper_bound))
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded construction work",
@@ -1613,6 +1632,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         states_upper_bound,
         transitions_upper_bound,
         max_pattern_scalars,
+        max_state_fanout_upper_bound: transitions_upper_bound,
         canonical_comparisons_upper_bound,
         insertion_probes_upper_bound,
         root_prefilter_work_upper_bound,
@@ -1622,6 +1642,7 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
         allocations_upper_bound: 3,
         canonical_comparisons: 0,
         insertion_probes: 0,
+        max_state_fanout: 0,
         root_prefilter_work: 0,
         root_prefilter_needles: 0,
         root_prefilter_offset: None,
@@ -1683,7 +1704,7 @@ fn preflight_root_prefilter_work_upper_bound(
 }
 
 fn enforce_build_limits(
-    accounting: BuildAccounting,
+    accounting: &BuildAccounting,
     limits: BuildLimits,
 ) -> Result<(), BuildError> {
     for (needed, limit, resource) in [
@@ -1808,10 +1829,12 @@ fn insert_class(
     state: usize,
     equivalents: &[char],
     insertion_probes: &mut usize,
+    max_state_fanout: &mut usize,
     work: &mut usize,
 ) -> Result<usize, BuildError> {
     let mut target = None;
     let mut missing = false;
+    let mut missing_state_edges = None;
     for &scalar in equivalents {
         build_probe::record_scalar_reads(1);
         *work = checked_build_add(*work, 1, "folded equivalent-scalar work")?;
@@ -1819,16 +1842,21 @@ fn insert_class(
         *insertion_probes =
             checked_build_add(*insertion_probes, probes, "folded insertion probes")?;
         *work = checked_build_add(*work, probes, "folded insertion probe work")?;
-        match observed {
-            Some(observed) => {
-                if target.is_some_and(|expected| expected != observed) {
-                    return Err(BuildError::Invariant {
-                        detail: "canonical class reached multiple trie states",
-                    });
-                }
-                target = Some(observed);
+        if let Some(observed) = observed {
+            if target.is_some_and(|expected| expected != observed) {
+                return Err(BuildError::Invariant {
+                    detail: "canonical class reached multiple trie states",
+                });
             }
-            None => missing = true,
+            target = Some(observed);
+        } else {
+            missing = true;
+            if missing_state_edges.is_some_and(|expected| expected != probes) {
+                return Err(BuildError::Invariant {
+                    detail: "folded trie miss observed an unstable state degree",
+                });
+            }
+            missing_state_edges = Some(probes);
         }
     }
     if let Some(existing) = target {
@@ -1839,6 +1867,16 @@ fn insert_class(
         }
         return Ok(existing);
     }
+    let state_edges = missing_state_edges
+        .ok_or(BuildError::Invariant {
+            detail: "nonempty folded class had neither an existing nor a missing transition",
+        })?
+        .checked_add(equivalents.len())
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded trie state degree",
+        })?;
+    *work = checked_build_add(*work, 1, "folded trie state-degree certificate work")?;
+    *max_state_fanout = (*max_state_fanout).max(state_edges);
     let next_state = nodes.len();
     push_exact(nodes, Node::EMPTY, "folded trie state")?;
     *work = checked_build_add(*work, 1, "folded trie state work")?;
@@ -2012,9 +2050,11 @@ const fn actual_within(actual: ScanActual, upper: ScanUpperBounds) -> bool {
         && actual.scratch_bytes <= upper.scratch_bytes
 }
 
-const fn build_actual_within(actual: BuildAccounting) -> bool {
+const fn build_actual_within(actual: &BuildAccounting) -> bool {
     actual.canonical_comparisons <= actual.canonical_comparisons_upper_bound
         && actual.insertion_probes <= actual.insertion_probes_upper_bound
+        && actual.max_state_fanout <= actual.max_state_fanout_upper_bound
+        && actual.max_state_fanout <= actual.transitions
         && actual.root_prefilter_work <= actual.root_prefilter_work_upper_bound
         && actual.work <= actual.work_upper_bound
         && actual.persistent_bytes <= actual.persistent_bytes_upper_bound
@@ -2330,7 +2370,7 @@ mod tests {
         candidates
     }
 
-    fn exact_build_limits(accounting: BuildAccounting) -> BuildLimits {
+    fn exact_build_limits(accounting: &BuildAccounting) -> BuildLimits {
         BuildLimits {
             max_patterns: accounting.patterns,
             max_scalar_positions: accounting.scalar_positions,
@@ -2863,11 +2903,12 @@ mod tests {
         let accounting = admitted(&patterns).build_accounting();
         assert!(accounting.canonical_comparisons <= accounting.canonical_comparisons_upper_bound);
         assert!(accounting.insertion_probes <= accounting.insertion_probes_upper_bound);
+        assert!(accounting.max_state_fanout <= accounting.max_state_fanout_upper_bound);
         assert!(accounting.work <= accounting.work_upper_bound);
         assert!(accounting.persistent_bytes <= accounting.persistent_bytes_upper_bound);
         assert!(accounting.peak_bytes <= accounting.peak_bytes_upper_bound);
         assert!(matches!(
-            FoldedLiteralTriePlan::build(&patterns, exact_build_limits(accounting)).unwrap(),
+            FoldedLiteralTriePlan::build(&patterns, exact_build_limits(&accounting)).unwrap(),
             BuildAttempt::Admitted(_)
         ));
         for (resource, limits) in [
@@ -3043,15 +3084,91 @@ mod tests {
     }
 
     #[test]
+    fn maximum_state_fanout_bounds_linked_transition_probes() {
+        const A: [char; 2] = ['A', 'a'];
+        const B: [char; 2] = ['B', 'b'];
+        const C: [char; 2] = ['C', 'c'];
+        const D: [char; 2] = ['D', 'd'];
+        const X: [char; 2] = ['X', 'x'];
+        const Y: [char; 2] = ['Y', 'y'];
+        let ab = [FoldedScalarClass::new(&A), FoldedScalarClass::new(&B)];
+        let ac = [FoldedScalarClass::new(&A), FoldedScalarClass::new(&C)];
+        let ad = [FoldedScalarClass::new(&A), FoldedScalarClass::new(&D)];
+        let xy = [FoldedScalarClass::new(&X), FoldedScalarClass::new(&Y)];
+        let patterns = [
+            FoldedLiteral::new(&ab),
+            FoldedLiteral::new(&ac),
+            FoldedLiteral::new(&ad),
+            FoldedLiteral::new(&xy),
+        ];
+        let plan = admitted(&patterns);
+        let build = plan.build_accounting();
+        assert_eq!(build.transitions, 12);
+        assert_eq!(build.max_state_fanout, 6);
+        assert!(build.max_state_fanout <= build.max_state_fanout_upper_bound);
+
+        let source = b"Ae".repeat(32);
+        let upper = plan.scan_upper_bounds(source.len()).unwrap();
+        assert_eq!(
+            upper.transition_probes,
+            upper.scalar_decodes * build.max_state_fanout
+        );
+        assert!(
+            upper.transition_probes < upper.scalar_decodes * build.transitions,
+            "the envelope must use maximum state fanout, not total transitions"
+        );
+
+        scan_source_probe::reset();
+        plan.scan(&source, exact_scan_limits(upper), |_| {})
+            .unwrap();
+        assert_eq!(scan_source_probe::accesses(), 1);
+
+        scan_source_probe::reset();
+        let mut emissions = 0;
+        let error = plan
+            .scan(
+                &source,
+                ScanLimits {
+                    max_transition_probes: upper.transition_probes - 1,
+                    ..exact_scan_limits(upper)
+                },
+                |_| emissions += 1,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.source,
+            ScanError::Resource {
+                resource: ScanResource::TransitionProbes,
+                needed,
+                limit,
+            } if needed == upper.transition_probes && limit == upper.transition_probes - 1
+        ));
+        assert_eq!(error.actual, ScanActual::default());
+        assert_eq!(emissions, 0);
+        assert_eq!(scan_source_probe::accesses(), 0);
+
+        let actual = execute_folded_scan_impl(&plan, &source, 0, upper, None, &mut |_| {}).unwrap();
+        assert_eq!(actual.transition_probes, 32 * 14);
+        assert!(super::actual_within(actual, upper));
+    }
+
+    #[test]
     fn fixed_trie_doubling_counters_are_linear() {
         let classes = one_class(&KELVIN);
         let patterns = [FoldedLiteral::new(&classes)];
         let plan = admitted(&patterns);
+        assert_eq!(plan.build.max_state_fanout, KELVIN.len());
         let first = plan.scan_upper_bounds(1_024).unwrap();
         let second = plan.scan_upper_bounds(2_048).unwrap();
         let fourth = plan.scan_upper_bounds(4_096).unwrap();
+        assert_eq!(
+            first.transition_probes,
+            first.scalar_decodes * plan.build.max_state_fanout
+        );
         assert_eq!(second.scalar_decodes, first.scalar_decodes * 2);
         assert_eq!(fourth.scalar_decodes, second.scalar_decodes * 2);
+        assert_eq!(second.transition_probes, first.transition_probes * 2);
+        assert_eq!(fourth.transition_probes, second.transition_probes * 2);
         assert_eq!(second.work, first.work * 2);
         assert_eq!(fourth.work, second.work * 2);
     }

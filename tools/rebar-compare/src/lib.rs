@@ -248,7 +248,7 @@ fn is_current_fre_capture_route(model: &str, plan: &str) -> bool {
 
 const RUST_ADAPTER: &str = "rebar-rust-regex-1.12.4";
 const RE2_ADAPTER: &str = "rebar-re2-2025-11-05";
-const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v2-required-literal-best-concat-v1";
+const FRE_ADAPTER: &str = "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1";
 
 /// Stable current-FRE adapter identity used by the formal KLV runner.
 #[must_use]
@@ -620,7 +620,7 @@ impl CandidateAdapter for CurrentFreAdapter {
             "; eligible wide Unicode-on case-insensitive literal alternatives use the same retained canonical Count route and plan identity in semantic and raw operation execution; span-sum retains its incumbent byte-span-preserving route",
         );
         identity.identity.push_str(
-            "; unicode-folded-literal-v3 construction-selects one bounded finite canonical case-fold trie from an eligible nonempty literal/class sequence or root ordered alternation, then count and span-sum reuse an allocation-free ranked fixed-column memchr or retained full-byte classifier whose one-time Auto dispatch is charged and published, a second source-independent fixed-column guard when available, exact scalar-trie validation, and source-pattern priority reduction under explicit build and run receipts",
+            "; unicode-folded-literal-v4 construction-selects one bounded finite canonical case-fold trie from an eligible nonempty literal/class sequence or root ordered alternation, then count and span-sum reuse an allocation-free ranked fixed-column memchr or retained full-byte classifier whose one-time Auto dispatch is charged and published, a second source-independent fixed-column guard when available, an exact charged maximum-state-fanout certificate for transition-probe bounds, exact scalar-trie validation, and source-pattern priority reduction under explicit build and run receipts",
         );
         identity.availability.push_str(
             "; one-pattern Unicode-on case-insensitive count and span-sum admit bounded literal/class sequences or root ordered alternatives whose non-ASCII folded roots each have at most four canonical members and whose combined Cartesian language exceeds the packed finite theorem cap, preserving the incumbent packed route and falling through every other HIR unchanged",
@@ -2213,7 +2213,7 @@ pub fn current_fre_rebar_aggregate_operation_lifecycle(
     }
 }
 
-const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v3";
+const UNICODE_FOLDED_LITERAL_PLAN: &str = "aggregate-unicode-folded-literal-v4";
 
 fn unicode_folded_literal_build_limits(
     limits: &RunLimits,
@@ -24003,7 +24003,7 @@ mod tests {
         assert_eq!(current_fre_adapter_id(), identity.adapter);
         assert_eq!(
             identity.adapter,
-            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v2-required-literal-best-concat-v1"
+            "fre-current-aggregate-capture-v54-line-batch-cached-v1-capture-run-alternation-v1-bare-greedy-word-run-v1-covered-ordered-root-v2-anchored-line-end-v1-absolute-full-capture-v1-capture-word-run-v1-anchored-word-capture-v1-fused-capture-stream-v1-persistent-capture-participation-quotient-v1-anchored-line-capture-v2-bounded-affix-span-sum-v1-ordered-bounded-span-events-v1-terminal-class-frontier-v1-unicode-casefold-suffix-domain-v2-required-literal-line-partition-v1-noqa-v1-portable-word-run-v2-aggregate-word-run-v1-literal-assertions-v1-blocking-delimiter-v1-token-phrase-v2-unicode-scalar-run-v4-capture-scalar-alternation-v1-line-space-operator-v2-line-configured-ruff-three-v1-line-ascii-separated-fields-v1-finite-dfa-v2-packed-v2-sparse-v1-guarded-ascii-word-v1-guarded-unicode-word-maximal-run-prefix2-v2-fixed-predicate-word64-v2-fixed-class-sandwich-v1-literal-class-run-literal-v2-reverse-inner-v1-bounded-literal-pair-v1-grapheme-scalar-dfa-v2-bounded-class-sequence-v1-bounded-separated-fields-v1-casefold-canonical-bytes-v2-prefix-class-alt-v1-bounded-context-v1-bounded-affix-v1-uniform-participation-v1-capture-count-v3-ordered-root-count-v1-persistent-continuation-sweep-v4-continuation-accounting-v9-state-byte-literal-anchor-v1-repeated-lazy-delimiter-v1-required-literal-simd-v1-uniform-prefix-class-participation-v2-required-internal-anchor-v3-structural-quota-v8-regex-redux-composite-v2-url-aggregate-v1-impossible-match-domain-v1-fixed-absolute-domain-v1-terminal-greedy-class-v1-grep-stream-v1-k0-search-session-v1-aggregate-many-total-byte-cover-v1-unicode-folded-literal-v3-required-literal-best-concat-v1"
         );
         assert!(
             identity
@@ -24015,7 +24015,7 @@ mod tests {
             "runner/schedule adapter key must version the persistent physical route"
         );
         assert!(
-            current_fre_adapter_id().contains("-unicode-folded-literal-v2-"),
+            current_fre_adapter_id().contains("-unicode-folded-literal-v3-"),
             "runner/schedule adapter key must version the ordered folded-literal route"
         );
         assert!(
@@ -26047,6 +26047,155 @@ mod tests {
         ));
     }
 
+    fn assert_folded_policy_exact_boundary(
+        pattern: &str,
+        expected_work: usize,
+        expected_reducer_steps: usize,
+        expected_max_state_degree: usize,
+    ) {
+        const SHERLOCK_HAYSTACK_BYTES: usize = 1_570_556;
+        let default_policy = RunLimits::default();
+        let build_limits = unicode_folded_literal_build_limits(&default_policy).unwrap();
+        let (regex, retained_limits) = try_current_fre_folded_count_lifecycle_with_limits(
+            pattern,
+            true,
+            true,
+            SHERLOCK_HAYSTACK_BYTES,
+            &default_policy,
+            build_limits,
+        )
+        .unwrap()
+        .expect("the practical folded shape must pass the default outer policy");
+        let upper = regex
+            .full_window_upper_bounds(SHERLOCK_HAYSTACK_BYTES)
+            .unwrap();
+        assert_eq!(upper.work, expected_work);
+        assert_eq!(upper.reducer_steps, expected_reducer_steps);
+        assert_eq!(
+            regex.build_report().trie.max_state_fanout,
+            expected_max_state_degree
+        );
+        assert!(
+            regex.build_report().trie.max_state_fanout
+                <= regex.build_report().trie.max_state_fanout_upper_bound
+        );
+        assert_eq!(retained_limits, UnicodeFoldedLiteralRunLimits::exact(upper));
+        assert!(upper.work <= default_policy.fre_aggregate_operation_work);
+        assert!(u64::try_from(upper.reducer_steps).unwrap() <= default_policy.reducer_steps);
+        drop(regex);
+
+        let mut exact = default_policy.clone();
+        exact.fre_aggregate_operation_work = upper.work;
+        exact.reducer_steps = u64::try_from(upper.reducer_steps).unwrap();
+        assert_eq!(
+            validate_unicode_folded_literal_policy(upper, &exact),
+            Ok(UnicodeFoldedLiteralRunLimits::exact(upper))
+        );
+
+        let mut work_one_below = exact.clone();
+        work_one_below.fre_aggregate_operation_work = upper.work - 1;
+        assert_eq!(
+            validate_unicode_folded_literal_policy(upper, &work_one_below),
+            Err(UnicodeFoldedLiteralPolicyRefusal::Work {
+                needed: upper.work,
+                limit: upper.work - 1,
+            })
+        );
+
+        let mut reducer_one_below = exact.clone();
+        reducer_one_below.reducer_steps = u64::try_from(upper.reducer_steps - 1).unwrap();
+        assert_eq!(
+            validate_unicode_folded_literal_policy(upper, &reducer_one_below),
+            Err(UnicodeFoldedLiteralPolicyRefusal::ReducerSteps {
+                needed: upper.reducer_steps,
+                limit: upper.reducer_steps - 1,
+            })
+        );
+
+        let (_, exact_retained_limits) = try_current_fre_folded_count_lifecycle_with_limits(
+            pattern,
+            true,
+            true,
+            SHERLOCK_HAYSTACK_BYTES,
+            &exact,
+            build_limits,
+        )
+        .unwrap()
+        .expect("the retained selector must admit the exact policy boundary");
+        assert_eq!(
+            exact_retained_limits,
+            UnicodeFoldedLiteralRunLimits::exact(upper)
+        );
+        assert!(
+            try_current_fre_folded_count_lifecycle_with_limits(
+                pattern,
+                true,
+                true,
+                SHERLOCK_HAYSTACK_BYTES,
+                &work_one_below,
+                build_limits,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            try_current_fre_folded_count_lifecycle_with_limits(
+                pattern,
+                true,
+                true,
+                SHERLOCK_HAYSTACK_BYTES,
+                &reducer_one_below,
+                build_limits,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let patterns = [pattern.to_owned()];
+        let haystack = vec![b'x'; SHERLOCK_HAYSTACK_BYTES];
+        let request = CandidateRequest {
+            job_id: "focused/folded-exact-policy@rust/regex",
+            model: "count",
+            patterns: &patterns,
+            haystack: &haystack,
+            unicode: true,
+            case_insensitive: true,
+        };
+        for policy in [&default_policy, &exact] {
+            let reduction =
+                try_unicode_folded_literal_count_with_limits(request, policy, build_limits)
+                    .unwrap()
+                    .expect("the raw selector must admit the policy boundary");
+            assert_eq!(reduction.actual, 0);
+            assert_eq!(reduction.plan, UNICODE_FOLDED_LITERAL_PLAN);
+        }
+        assert!(
+            try_unicode_folded_literal_count_with_limits(request, &work_one_below, build_limits,)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            try_unicode_folded_literal_count_with_limits(
+                request,
+                &reducer_one_below,
+                build_limits,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn folded_sherlock_shapes_pass_exact_outer_policy_boundaries() {
+        assert_folded_policy_exact_boundary("Шерлок Холмс", 152_343_932, 1_570_556, 3);
+        assert_folded_policy_exact_boundary(
+            "Шерлок Холмс|Джон Уотсон|Ирен Адлер|инспектор Лестрейд|профессор Мориарти",
+            449_179_016,
+            7_852_780,
+            9,
+        );
+    }
+
     fn assert_folded_count_policy_fallback(
         pattern: &str,
         patterns: &[String],
@@ -26175,34 +26324,43 @@ mod tests {
 
     #[test]
     fn folded_operation_policy_refusals_fall_through_raw_and_retained_ladders() {
-        let pattern = "Шерлок Холмс";
-        let patterns = [pattern.to_string()];
-        let haystack = "ШЕРЛОК ХОЛМС/шерлок холмс".as_bytes();
-        let incumbent_limits = RunLimits::default();
-        let folded_build_limits = unicode_folded_literal_build_limits(&incumbent_limits).unwrap();
-        let mut work_refusal = incumbent_limits.clone();
-        work_refusal.fre_aggregate_operation_work = 0;
-        let mut reducer_refusal = incumbent_limits.clone();
-        reducer_refusal.reducer_steps = 0;
+        std::thread::Builder::new()
+            .name("folded-policy-fallback".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let pattern = "Шерлок Холмс";
+                let patterns = [pattern.to_string()];
+                let haystack = "ШЕРЛОК ХОЛМС/шерлок холмс".as_bytes();
+                let incumbent_limits = RunLimits::default();
+                let folded_build_limits =
+                    unicode_folded_literal_build_limits(&incumbent_limits).unwrap();
+                let mut work_refusal = incumbent_limits.clone();
+                work_refusal.fre_aggregate_operation_work = 0;
+                let mut reducer_refusal = incumbent_limits.clone();
+                reducer_refusal.reducer_steps = 0;
 
-        for folded_policy_limits in [&work_refusal, &reducer_refusal] {
-            assert_folded_count_policy_fallback(
-                pattern,
-                &patterns,
-                haystack,
-                &incumbent_limits,
-                folded_policy_limits,
-                folded_build_limits,
-            );
-            assert_folded_span_sum_policy_fallback(
-                pattern,
-                &patterns,
-                haystack,
-                &incumbent_limits,
-                folded_policy_limits,
-                folded_build_limits,
-            );
-        }
+                for folded_policy_limits in [&work_refusal, &reducer_refusal] {
+                    assert_folded_count_policy_fallback(
+                        pattern,
+                        &patterns,
+                        haystack,
+                        &incumbent_limits,
+                        folded_policy_limits,
+                        folded_build_limits,
+                    );
+                    assert_folded_span_sum_policy_fallback(
+                        pattern,
+                        &patterns,
+                        haystack,
+                        &incumbent_limits,
+                        folded_policy_limits,
+                        folded_build_limits,
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
