@@ -380,6 +380,114 @@ fn per_search_refusal_is_visible_and_k0_workspace_is_reused() {
     );
 }
 
+#[test]
+fn k0_cursor_matches_uncursored_sessions_and_exact_accounting() {
+    let cases: &[(&str, &[u8])] = &[
+        ("", &[0xFF, b'a', 0x80]),
+        ("a", b"aaaaaaaaaaaaaaaa"),
+        ("z+", b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"),
+        ("(?:ab)+", b"xxababyyabzzababab"),
+        (r"(?m:^a$)", b"x\na\nb\na\n"),
+        (r"\b[a-z]+\b", &[0xFF, b'a', b'b', b' ', b'z', 0x80]),
+    ];
+
+    for &(pattern, haystack) in cases {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap_or_else(|error| panic!("forced K0 build failed for {pattern:?}: {error}"));
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+
+        // Give both fresh workspaces the same immutable start-filter state.
+        regex
+            .find(haystack, SearchLimits::unlimited())
+            .unwrap_or_else(|error| panic!("proof warm-up failed for {pattern:?}: {error}"));
+
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let expected = upstream
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+
+        let (cursor_matches, cursor_accounting) =
+            collect(&regex, haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| panic!("cursor failed for {pattern:?}: {error}"));
+        let (ordinary_matches, ordinary_accounting) =
+            collect_uncursored(&regex, haystack, PortableFindIterLimits::unlimited())
+                .unwrap_or_else(|error| panic!("ordinary session failed for {pattern:?}: {error}"));
+        let cursor_spans = cursor_matches
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        let ordinary_spans = ordinary_matches
+            .iter()
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(cursor_spans, expected, "cursor pattern={pattern:?}");
+        assert_eq!(ordinary_spans, expected, "ordinary pattern={pattern:?}");
+        assert_eq!(
+            cursor_accounting, ordinary_accounting,
+            "accounting pattern={pattern:?}"
+        );
+
+        let retained = regex
+            .search_session(fre::SearchSessionLimits::unlimited())
+            .unwrap()
+            .workspace_setup_accounting()
+            .unwrap()
+            .retained_bytes();
+        let finite = PortableFindIterLimits {
+            search: SearchLimits {
+                max_work: 1_000_000,
+                max_scratch_bytes: retained,
+            },
+            max_search_calls: ordinary_accounting.search_calls,
+            ..PortableFindIterLimits::unlimited()
+        };
+        let (finite_cursor_matches, finite_cursor_accounting) = collect(&regex, haystack, finite)
+            .unwrap_or_else(|error| panic!("finite cursor failed for {pattern:?}: {error}"));
+        let (finite_ordinary_matches, finite_ordinary_accounting) =
+            collect_uncursored(&regex, haystack, finite).unwrap_or_else(|error| {
+                panic!("finite ordinary session failed for {pattern:?}: {error}")
+            });
+        assert_eq!(finite_cursor_matches, finite_ordinary_matches);
+        assert_eq!(finite_cursor_accounting, finite_ordinary_accounting);
+    }
+
+    // An exact workspace-only scratch allowance cannot retain the optional
+    // automaton-owned start proof. The cursor must preserve the ordinary
+    // repeated derivation and its per-search charges rather than silently
+    // retaining unaccounted state.
+    let cold = PortableBuilder::new("(?:ab)+")
+        .unicode(false)
+        .plan_selection(PlanSelection::ForceK0)
+        .build()
+        .expect("cold finite K0 build");
+    let retained = cold
+        .search_session(fre::SearchSessionLimits::unlimited())
+        .unwrap()
+        .workspace_setup_accounting()
+        .unwrap()
+        .retained_bytes();
+    let finite = PortableFindIterLimits {
+        search: SearchLimits {
+            max_work: 1_000_000,
+            max_scratch_bytes: retained,
+        },
+        ..PortableFindIterLimits::unlimited()
+    };
+    let (cursor_matches, cursor_accounting) =
+        collect(&cold, b"ababxxabab", finite).expect("cold finite cursor");
+    let (ordinary_matches, ordinary_accounting) =
+        collect_uncursored(&cold, b"ababxxabab", finite).expect("cold finite ordinary session");
+    assert_eq!(cursor_matches, ordinary_matches);
+    assert_eq!(cursor_accounting, ordinary_accounting);
+}
+
 fn build_case(case: DifferentialCase) -> PortableRegex {
     let limits = if case.force_literal_set_dfa {
         BuildLimits {
@@ -414,4 +522,63 @@ fn collect(
         matches.push(matched?);
     }
     Ok((matches, iterator.accounting()))
+}
+
+fn collect_uncursored(
+    regex: &PortableRegex,
+    haystack: &[u8],
+    limits: PortableFindIterLimits,
+) -> Result<(Vec<Match>, PortableFindIterAccounting), PortableFindIterError> {
+    let mut session = regex
+        .search_session(limits.session)
+        .map_err(PortableFindIterError::Search)?;
+    let mut start = 0_usize;
+    let mut last_match_end = None;
+    let mut results = Vec::new();
+    let mut accounting = PortableFindIterAccounting::default();
+
+    loop {
+        let needed = accounting.search_calls.checked_add(1).ok_or(
+            PortableFindIterError::AccountingOverflow {
+                counter: "search-call",
+            },
+        )?;
+        if needed > limits.max_search_calls {
+            return Err(PortableFindIterError::SearchCallLimit {
+                needed,
+                limit: limits.max_search_calls,
+            });
+        }
+        accounting.search_calls = needed;
+        let (found, search_accounting) = session
+            .find_at(haystack, start, limits.search)
+            .map_err(PortableFindIterError::Search)?;
+        accounting.work_or_linear_terms = accounting
+            .work_or_linear_terms
+            .checked_add(search_accounting.work_or_linear_terms())
+            .ok_or(PortableFindIterError::AccountingOverflow { counter: "work" })?;
+        let Some(found) = found else {
+            break;
+        };
+        if found.is_empty() && last_match_end == Some(found.end()) {
+            accounting.suppressed_empty = accounting.suppressed_empty.checked_add(1).ok_or(
+                PortableFindIterError::AccountingOverflow {
+                    counter: "suppressed-empty",
+                },
+            )?;
+            if start == haystack.len() {
+                break;
+            }
+            start = start.saturating_add(1);
+            continue;
+        }
+        start = found.end();
+        last_match_end = Some(found.end());
+        accounting.matches = accounting
+            .matches
+            .checked_add(1)
+            .ok_or(PortableFindIterError::AccountingOverflow { counter: "match" })?;
+        results.push(found);
+    }
+    Ok((results, accounting))
 }
