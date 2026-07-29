@@ -1963,18 +1963,29 @@ fn execute(
 ) -> Result<UntypedReport, SearchError> {
     validate_window(haystack, window)?;
     let wants_span = matches!(contract, OutputContract::Span);
+    let contextual_graph = automaton.stats().assertion_edges() != 0;
+    let cached_start_known = allow_lazy
+        && wants_span
+        && !contextual_graph
+        && workspace.lazy.is_allocated()
+        && workspace.lazy.is_bound_to(automaton)
+        && workspace.lazy.initialized
+        && lazy_initial_has_pending(workspace)?;
     let may_use_reverse = allow_lazy
         && wants_span
+        && !cached_start_known
         && workspace.lazy.is_allocated()
         && workspace.reverse.is_allocated()
         && workspace.reverse.is_bound_to(automaton);
-    let contextual = automaton.stats().assertion_edges() != 0;
-    let terminal_without_reverse = wants_span
-        && !contextual
-        && automaton.stats().consuming_edges() == 0;
+    // A direct nullable initial state proves every retained consuming path
+    // belongs to `window.start`. Its Span therefore needs only the endpoint
+    // workspace. The exact pending bit is authenticated after preparation;
+    // direct nonnullable endpoint sessions still decline Span to Pike.
+    let may_prove_start_without_reverse = wants_span && !contextual_graph;
     let may_use_lazy = allow_lazy
         && workspace.lazy.is_allocated()
-        && (!wants_span || may_use_reverse || terminal_without_reverse);
+        && (!wants_span || may_use_reverse || may_prove_start_without_reverse);
+    let contextual = contextual_graph;
     let mut setup = setup;
     let (mut meter, setup_work) = prepare_invocation(
         automaton,
@@ -2077,47 +2088,52 @@ fn execute_prepared(
             && !start_proof.proof().relaxed_nullable
             && (!wants_span || (may_use_reverse && workspace.reverse.context.is_allocated()))
     } else if wants_span && may_use_lazy {
-        let terminal_initial = if workspace.lazy.initialized {
-            lazy_initial_is_terminal(workspace)?
+        let start_known = if workspace.lazy.initialized {
+            lazy_initial_has_pending(workspace)?
         } else {
             false
         };
-        let forward_preparation = if workspace.lazy.initialized {
-            0
-        } else {
-            lazy_initial_work_upper(automaton).unwrap_or(u64::MAX)
-        };
-        let reverse_preparation = if terminal_initial || workspace.reverse.initialized {
-            0
-        } else {
-            reverse_initial_work_upper(automaton).unwrap_or(u64::MAX)
-        };
-        let combined_preparation = forward_preparation.saturating_add(reverse_preparation);
-        let admitted = combined_preparation == 0
-            || meter
-                .remaining()
-                .checked_sub(lazy_core_reserve)
-                .is_some_and(|optional| combined_preparation <= optional);
-        if !admitted
-            || !prepare_lazy(
-                automaton,
-                workspace,
-                &mut meter,
-                lazy_core_reserve,
-                window.start(),
-            )?
-        {
+        if !may_use_reverse && !start_known && !start_proof.proof().relaxed_nullable {
             false
         } else {
-            lazy_initial_is_terminal(workspace)?
-                || (may_use_reverse
-                    && prepare_reverse_lazy(
-                        automaton,
-                        workspace,
-                        &mut meter,
-                        lazy_core_reserve,
-                        window.start(),
-                    )?)
+            let forward_preparation = if workspace.lazy.initialized {
+                0
+            } else {
+                lazy_initial_work_upper(automaton).unwrap_or(u64::MAX)
+            };
+            let reverse_preparation =
+                if !may_use_reverse || start_known || workspace.reverse.initialized {
+                    0
+                } else {
+                    reverse_initial_work_upper(automaton).unwrap_or(u64::MAX)
+                };
+            let combined_preparation = forward_preparation.saturating_add(reverse_preparation);
+            let admitted = combined_preparation == 0
+                || meter
+                    .remaining()
+                    .checked_sub(lazy_core_reserve)
+                    .is_some_and(|optional| combined_preparation <= optional);
+            if !admitted
+                || !prepare_lazy(
+                    automaton,
+                    workspace,
+                    &mut meter,
+                    lazy_core_reserve,
+                    window.start(),
+                )?
+            {
+                false
+            } else {
+                lazy_initial_has_pending(workspace)?
+                    || (may_use_reverse
+                        && prepare_reverse_lazy(
+                            automaton,
+                            workspace,
+                            &mut meter,
+                            lazy_core_reserve,
+                            window.start(),
+                        )?)
+            }
         }
     } else {
         true
@@ -2180,15 +2196,10 @@ fn execute_prepared(
         execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?
     };
     if wants_span && used_lazy {
+        let start_known = !contextual && lazy_initial_has_pending(workspace)?;
         if let Some(selected) = pending {
-            let end = selected.end();
-            if end == window.start() {
-                // A nullable assertion-free initial closure can irrevocably
-                // select the empty match at the first searched boundary. Its
-                // start is already known, so reverse execution has no source
-                // byte to inspect and no ambiguity to resolve.
-                pending = Some(MatchSpan::new(end, end));
-            } else {
+            if !start_known {
+                let end = selected.end();
                 let (start, reverse_boundaries) = if contextual {
                     execute_context_reverse_lazy_loop(
                         automaton,
@@ -2989,6 +3000,7 @@ fn prepare_lazy(
     Ok(true)
 }
 
+#[cfg(test)]
 fn lazy_initial_is_terminal(workspace: &K0Workspace) -> Result<bool, SearchError> {
     let initial = workspace.lazy.initial;
     if initial == LAZY_NO_STATE {
@@ -2998,6 +3010,17 @@ fn lazy_initial_is_terminal(workspace: &K0Workspace) -> Result<bool, SearchError
     }
     let (_, length, pending) = workspace.lazy.state_bounds(initial)?;
     Ok(pending && length == 0)
+}
+
+fn lazy_initial_has_pending(workspace: &K0Workspace) -> Result<bool, SearchError> {
+    let initial = workspace.lazy.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized lazy DFA has no initial state",
+        });
+    }
+    let (_, _, pending) = workspace.lazy.state_bounds(initial)?;
+    Ok(pending)
 }
 
 fn begin_lazy_closure(
@@ -7132,12 +7155,9 @@ mod tests {
         extended_scanner_tie[5] = byte_set(b"Y");
         extended_scanner_tie[15] = byte_set(b"Z");
         let mut extended_scanner_meter = WorkMeter::new(u64::MAX, 0);
-        let selected = super::select_start_classes(
-            &extended_scanner_tie,
-            &mut extended_scanner_meter,
-            0,
-        )
-        .unwrap();
+        let selected =
+            super::select_start_classes(&extended_scanner_tie, &mut extended_scanner_meter, 0)
+                .unwrap();
         assert_eq!(
             selected.scanner,
             StartPositionClass {
@@ -7153,8 +7173,7 @@ mod tests {
         extended_guard_tie[15] = byte_set(b"Z");
         let mut extended_guard_meter = WorkMeter::new(u64::MAX, 0);
         let selected =
-            super::select_start_classes(&extended_guard_tie, &mut extended_guard_meter, 0)
-                .unwrap();
+            super::select_start_classes(&extended_guard_tie, &mut extended_guard_meter, 0).unwrap();
         assert_eq!(selected.scanner.offset, 0);
         assert_eq!(
             selected.guard,
@@ -9477,8 +9496,9 @@ mod tests {
         ];
         let haystacks = bounded_words(&[0x00, b'a', b'b', 0x80, 0xff], 3);
         let mut checked = 0usize;
+        let mut positive_spans = 0usize;
 
-        for (name, plan, terminal_initial) in &plans {
+        for (name, plan, _terminal_initial) in &plans {
             pin_without_start_filter(plan);
             let mut pike = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
             let mut endpoint =
@@ -9591,6 +9611,15 @@ mod tests {
                             .search_window_with_workspace(
                                 haystack,
                                 window,
+                                &mut endpoint,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got_full_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
                                 &mut bidirectional,
                                 SearchLimits::unlimited(),
                             )
@@ -9598,14 +9627,32 @@ mod tests {
                         assert_eq!(
                             got_span.output(),
                             want_span.output(),
-                            "{name}: Span source={haystack:?} window={window:?}"
+                            "{name}: endpoint Span source={haystack:?} window={window:?}"
                         );
-                        if *terminal_initial {
+                        assert_eq!(
+                            got_full_span.output(),
+                            want_span.output(),
+                            "{name}: full Span source={haystack:?} window={window:?}"
+                        );
+                        assert_eq!(
+                            got_span.accounting().boundaries(),
+                            want_span.accounting().boundaries(),
+                            "{name}: start-known endpoint Span boundary accounting"
+                        );
+                        assert_eq!(
+                            got_full_span.accounting().boundaries(),
+                            want_span.accounting().boundaries(),
+                            "{name}: start-known full Span boundary accounting"
+                        );
+                        if let Some(selected) = want_span.output() {
                             assert_eq!(
-                                got_span.accounting().boundaries(),
-                                want_span.accounting().boundaries(),
-                                "{name}: terminal Span boundary accounting"
+                                selected.start(),
+                                window.start(),
+                                "{name}: nullable selected start proof"
                             );
+                            if selected.end() > selected.start() {
+                                positive_spans = positive_spans.checked_add(1).unwrap();
+                            }
                         }
                         checked = checked.checked_add(1).unwrap();
                     }
@@ -9615,9 +9662,9 @@ mod tests {
             assert!(endpoint.lazy.initialized, "{name}: endpoint initialized");
             assert!(!endpoint.lazy.declined, "{name}: endpoint accepted");
             assert!(bidirectional.lazy.initialized, "{name}: span initialized");
-            assert_eq!(
-                bidirectional.reverse.initialized, !*terminal_initial,
-                "{name}: reverse preparation"
+            assert!(
+                !bidirectional.reverse.initialized,
+                "{name}: start-known span must not prepare reverse"
             );
             assert!(
                 !bidirectional.lazy.declined,
@@ -9625,6 +9672,7 @@ mod tests {
             );
         }
         assert!(checked > 10_000);
+        assert!(positive_spans > 100);
     }
 
     #[test]
@@ -10649,7 +10697,7 @@ mod tests {
     }
 
     #[test]
-    fn nullable_reverse_capacity_handoff_recovers_positive_span_without_empty_confusion() {
+    fn nullable_positive_spans_do_not_touch_reverse_capacity() {
         let plan = empty_or_ab(false);
         pin_without_start_filter(&plan);
         let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
@@ -10685,8 +10733,9 @@ mod tests {
                 assert_eq!(got, want, "nullable reverse source={haystack:?}/{window:?}");
             }
         }
-        assert!(saturated.reverse.initialized);
-        assert!(saturated.reverse.saturated);
+        assert!(saturated.lazy.initialized);
+        assert!(!saturated.reverse.initialized);
+        assert!(!saturated.reverse.saturated);
     }
 
     #[test]
@@ -10996,7 +11045,7 @@ mod tests {
         let haystack = b"aaaa";
         let mut endpoint =
             K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
-        let mut span = K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut span = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
         let endpoint_retained = endpoint.retained_bytes();
         let span_retained = span.retained_bytes();
 

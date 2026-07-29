@@ -423,18 +423,78 @@ fn optional_lazy_cache_preserves_the_ordinary_session_admission_boundary() {
             && limit == full_setup.retained_bytes() - 1
     ));
 
-    let nullable = portable("(?:a)*", PlanSelection::ForceK0);
+    let nullable = portable("(?:a+|)", PlanSelection::ForceK0);
     assert_eq!(nullable.build_report().minimum_match_bytes, Some(0));
-    let nullable_session = nullable
+    let mut nullable_session = nullable
         .search_session(SearchSessionLimits::unlimited())
         .expect("nullable K0 session");
+    let nullable_setup = nullable_session.workspace_setup_accounting().unwrap();
+    let nullable_endpoint_setup = nullable
+        .endpoint_search_session(SearchSessionLimits::unlimited())
+        .expect("nullable endpoint K0 session")
+        .workspace_setup_accounting()
+        .unwrap();
+    assert_eq!(
+        nullable_setup, nullable_endpoint_setup,
+        "start-known nullable spans must not retain reverse storage"
+    );
+    let mut nullable_ordinary = nullable
+        .search_session(SearchSessionLimits {
+            max_setup_work: nullable_setup.work() - 1,
+            max_scratch_bytes: usize::MAX,
+        })
+        .expect("nullable cache refusal must retain Pike admission");
+    let nullable_ordinary_setup = nullable_ordinary.workspace_setup_accounting().unwrap();
+    assert!(nullable_setup.work() > nullable_ordinary_setup.work());
+    assert!(nullable_setup.retained_bytes() > nullable_ordinary_setup.retained_bytes());
+
+    let nullable_haystack = vec![b'a'; 4_096];
+    let expected = Some((0, nullable_haystack.len()));
+    let _ = nullable_session
+        .find(&nullable_haystack, SearchLimits::unlimited())
+        .expect("cold accelerated nullable span");
+    let _ = nullable_ordinary
+        .find(&nullable_haystack, SearchLimits::unlimited())
+        .expect("cold ordinary nullable span");
+    let (accelerated_match, accelerated_accounting) = nullable_session
+        .find(&nullable_haystack, SearchLimits::unlimited())
+        .expect("warm accelerated nullable span");
+    let (ordinary_match, ordinary_accounting) = nullable_ordinary
+        .find(&nullable_haystack, SearchLimits::unlimited())
+        .expect("warm ordinary nullable span");
+    assert_eq!(
+        accelerated_match.map(|matched| (matched.start(), matched.end())),
+        expected
+    );
+    assert_eq!(
+        ordinary_match.map(|matched| (matched.start(), matched.end())),
+        expected
+    );
+    let SearchAccounting::K0(accelerated_k0) = accelerated_accounting else {
+        panic!("forced nullable plan must report K0 accounting");
+    };
+    let SearchAccounting::K0(ordinary_k0) = ordinary_accounting else {
+        panic!("forced nullable plan must report K0 accounting");
+    };
     assert!(
-        nullable_session
-            .workspace_setup_accounting()
-            .unwrap()
-            .retained_bytes()
-            < endpoint_setup.retained_bytes(),
-        "minimum-length metadata must exclude nullable facade plans from the cache"
+        accelerated_k0.transition_work() < ordinary_k0.transition_work(),
+        "the publicly selected nullable cache must reduce warm transition work"
+    );
+
+    let nullable_iterator = nullable
+        .find_iter(&nullable_haystack, fre::PortableFindIterLimits::unlimited())
+        .expect("public nullable iterator");
+    assert_eq!(
+        nullable_iterator.workspace_setup_accounting(),
+        Some(nullable_setup),
+        "the iterator must route through the same accelerated nullable tier"
+    );
+    let nullable_matches = nullable_iterator.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(
+        nullable_matches
+            .first()
+            .map(|matched| (matched.start(), matched.end())),
+        expected
     );
 
     let work_endpoint = k0

@@ -2957,13 +2957,16 @@ impl PortableRegex {
     /// K0 allocates and fully initializes one fixed-capacity workspace here.
     /// Eligible byte graphs with a statically known positive minimum length
     /// retain a bounded forward endpoint cache plus a separate reverse cache
-    /// for exact full-span recovery. Assertion-free graphs use direct byte
-    /// rows; assertion-bearing graphs key transitions by the exact
-    /// enabled-assertion mask at each boundary. Nullable, statically empty, or
-    /// resource-refused graphs keep the ordinary Pike workspace. Cache
-    /// selection is source-free and occurs before allocation; every subsequent
-    /// call reuses the selected storage without growing. Native plans retain
-    /// their existing operation-specific dispatch and need no session storage.
+    /// for exact full-span recovery. Assertion-free nullable graphs retain a
+    /// forward cache whose initial pending match proves every selected span
+    /// starts at the requested window; they need no reverse cache.
+    /// Assertion-free graphs use direct byte rows; assertion-bearing graphs key
+    /// transitions by the exact enabled-assertion mask at each boundary.
+    /// Contextual nullable, statically empty, or resource-refused graphs keep
+    /// the ordinary Pike workspace. Cache selection is source-free and occurs
+    /// before allocation; every subsequent call reuses the selected storage
+    /// without growing. Native plans retain their existing operation-specific
+    /// dispatch and need no session storage.
     ///
     /// # Errors
     ///
@@ -2981,10 +2984,11 @@ impl PortableRegex {
     /// Prepare a smaller reusable session for existence and endpoint
     /// projections.
     ///
-    /// Eligible K0 graphs retain only the ordered forward cache. Calling a
-    /// full-span method on the returned session remains correct but uses Pike;
-    /// callers that need `find`/iteration acceleration should use
-    /// [`Self::search_session`].
+    /// Eligible K0 graphs retain only the ordered forward cache.
+    /// Assertion-free nullable full-span methods can reuse that cache because
+    /// their selected start is known; other full-span calls remain correct but
+    /// use Pike. Callers that need nonnullable `find`/iteration acceleration
+    /// should use [`Self::search_session`].
     ///
     /// # Errors
     ///
@@ -3010,6 +3014,9 @@ impl PortableRegex {
                 };
                 let positive =
                     matches!(self.report.minimum_match_bytes, Some(minimum) if minimum > 0);
+                let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
+                    && !automaton.stats().has_assertions();
+                let endpoint_eligible = positive || assertion_free_nullable;
                 let full_fits = bidirectional
                     && positive
                     && automaton
@@ -3018,7 +3025,7 @@ impl PortableRegex {
                             layout.construction_work() <= workspace_limits.max_setup_work
                                 && layout.logical_bytes() <= workspace_limits.max_scratch_bytes
                         });
-                let endpoints_fit = positive
+                let endpoints_fit = endpoint_eligible
                     && automaton
                         .accelerated_workspace_layout()
                         .is_ok_and(|layout| {

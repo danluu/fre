@@ -248,6 +248,15 @@ impl PlanStats {
         self.zero_width_edges
     }
 
+    /// Whether this graph contains any context-sensitive assertion edge.
+    ///
+    /// Assertion-free nullable graphs can retain a start-known ordered lazy
+    /// state, while nullable graphs whose emptiness depends on context cannot.
+    #[must_use]
+    pub const fn has_assertions(self) -> bool {
+        self.assertion_edges != 0
+    }
+
     pub(crate) const fn assertion_edges(self) -> usize {
         self.assertion_edges
     }

@@ -120,10 +120,9 @@ fn borrowed_find_iter_matches_pinned_bytes_across_every_portable_plan() {
                 .find_iter(haystack)
                 .map(|matched| (matched.range(), matched.as_bytes().to_vec()))
                 .collect();
-            let _ = collect(&fre, haystack, PortableFindIterLimits::unlimited())
-                .unwrap_or_else(|error| {
-                    panic!("iterator-path warm-up failed for {case:?}: {error}")
-                });
+            let _ = collect(&fre, haystack, PortableFindIterLimits::unlimited()).unwrap_or_else(
+                |error| panic!("iterator-path warm-up failed for {case:?}: {error}"),
+            );
             let mut iterator = fre
                 .find_iter_borrowed(haystack, PortableFindIterLimits::unlimited())
                 .unwrap_or_else(|error| {
