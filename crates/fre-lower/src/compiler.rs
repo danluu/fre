@@ -3,7 +3,7 @@ use core::mem::size_of;
 use fre_automata::{EdgeKind, RawPlan, StateRole};
 use regex_syntax::{
     hir::{Class, ClassUnicode, Hir, HirKind, Look},
-    utf8::Utf8Sequences,
+    utf8::{Utf8Range, Utf8Sequences},
 };
 
 use crate::{
@@ -34,6 +34,38 @@ struct MutableEdge {
 struct MutableState {
     role: StateRole,
     edges: Vec<MutableEdge>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Utf8Transition {
+    start: u8,
+    end: u8,
+    target: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingUtf8Transition {
+    start: u8,
+    end: u8,
+}
+
+#[derive(Debug)]
+struct Utf8Node {
+    transitions: Vec<Utf8Transition>,
+    pending: Option<PendingUtf8Transition>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedUtf8State {
+    hash: u64,
+    state: u32,
+}
+
+#[derive(Debug)]
+struct Utf8ClassState {
+    compiled: Vec<CachedUtf8State>,
+    uncompiled: Vec<Utf8Node>,
+    outs: Vec<Patch>,
 }
 
 const fn assertion_edge_kind(look: Look) -> EdgeKind {
@@ -1016,7 +1048,31 @@ impl<'h> Compiler<'h> {
     }
 
     fn unicode_class_fragment(&mut self, class: &ClassUnicode) -> Result<Fragment, LowerError> {
-        let mut branches = Vec::new();
+        if class.ranges().is_empty() {
+            return self.class_fragment(core::iter::empty());
+        }
+
+        // UTF-8 encodings are prefix-free, and `Utf8Sequences` yields the
+        // disjoint byte-range words in lexicographic order. Compile that
+        // stream directly into a deterministic sparse byte DAG. Common
+        // prefixes are retained until they diverge; already-emitted identical
+        // suffix states are reused by exact transition identity.
+        //
+        // Terminal byte edges remain ordinary fragment patches. Consequently
+        // every shared state is local to this class occurrence and all paths
+        // through it have the same continuation.
+        let mut utf8 = Utf8ClassState {
+            compiled: Vec::new(),
+            uncompiled: Vec::new(),
+            outs: Vec::new(),
+        };
+        self.push_utf8_node(
+            &mut utf8,
+            Utf8Node {
+                transitions: Vec::new(),
+                pending: None,
+            },
+        )?;
         for scalar_range in class.ranges() {
             self.charge(
                 Self::UTF8_SCALAR_RANGE_PARTITION_WORK,
@@ -1024,32 +1080,352 @@ impl<'h> Compiler<'h> {
             )?;
             for sequence in Utf8Sequences::new(scalar_range.start(), scalar_range.end()) {
                 self.charge(1, "UTF-8 sequence traversal")?;
-                let mut parts = Vec::new();
-                self.charge_vector_growth(
-                    parts.len(),
-                    parts.capacity(),
-                    sequence.len(),
-                    "UTF-8 sequence fragment list",
-                )?;
-                reserve(&mut parts, sequence.len(), "UTF-8 sequence fragment list")?;
-                for range in sequence.as_slice() {
-                    parts.push(self.class_fragment(core::iter::once((range.start, range.end)))?);
-                }
-                let branch = self.concat_fragments(parts)?;
-                self.charge_vector_growth(
-                    branches.len(),
-                    branches.capacity(),
-                    1,
-                    "Unicode class branch list",
-                )?;
-                reserve(&mut branches, 1, "Unicode class branch list")?;
-                branches.push(branch);
+                self.add_utf8_sequence(&mut utf8, sequence.as_slice())?;
             }
         }
-        if branches.is_empty() {
-            return self.class_fragment(core::iter::empty());
+        let (start, outs) = self.finish_utf8_class(&mut utf8)?;
+        Ok(Fragment { start, outs })
+    }
+
+    fn add_utf8_sequence(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+        ranges: &[Utf8Range],
+    ) -> Result<(), LowerError> {
+        if ranges.is_empty() {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 class decomposition yielded an empty sequence",
+            });
         }
-        self.alternation_fragment(branches)
+
+        let mut prefix = 0usize;
+        while prefix < ranges.len() && prefix < utf8.uncompiled.len() {
+            self.charge(1, "UTF-8 common-prefix comparison")?;
+            let pending = utf8
+                .uncompiled
+                .get(prefix)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "UTF-8 common-prefix node was absent",
+                })?
+                .pending;
+            let range = ranges[prefix];
+            if pending
+                != Some(PendingUtf8Transition {
+                    start: range.start,
+                    end: range.end,
+                })
+            {
+                break;
+            }
+            prefix = prefix
+                .checked_add(1)
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "UTF-8 common-prefix length",
+                })?;
+        }
+        if prefix == ranges.len() {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 class decomposition yielded a duplicate sequence",
+            });
+        }
+
+        self.compile_utf8_from(utf8, prefix)?;
+        self.add_utf8_suffix(utf8, &ranges[prefix..])
+    }
+
+    fn compile_utf8_from(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+        from: usize,
+    ) -> Result<(), LowerError> {
+        if from >= utf8.uncompiled.len() {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 compile prefix exceeded the unfinished path",
+            });
+        }
+        let retained = from.checked_add(1).ok_or(LowerError::ArithmeticOverflow {
+            computation: "UTF-8 retained prefix length",
+        })?;
+        let mut next = None;
+        while retained < utf8.uncompiled.len() {
+            self.charge(1, "UTF-8 suffix freeze")?;
+            let mut node = utf8.uncompiled.pop().ok_or(LowerError::InternalInvariant {
+                detail: "UTF-8 unfinished path underflowed",
+            })?;
+            if !self.freeze_utf8_node(&mut node, next)? {
+                return Err(LowerError::InternalInvariant {
+                    detail: "UTF-8 non-root node had no final transition",
+                });
+            }
+            next = Some(self.compile_utf8_node(utf8, node)?);
+        }
+        let top = utf8
+            .uncompiled
+            .last_mut()
+            .ok_or(LowerError::InternalInvariant {
+                detail: "UTF-8 unfinished root was absent",
+            })?;
+        self.freeze_utf8_node(top, next).map(|_| ())
+    }
+
+    fn add_utf8_suffix(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+        ranges: &[Utf8Range],
+    ) -> Result<(), LowerError> {
+        let (first, rest) = ranges.split_first().ok_or(LowerError::InternalInvariant {
+            detail: "UTF-8 sequence suffix was empty",
+        })?;
+        self.charge(1, "UTF-8 suffix head")?;
+        let top = utf8
+            .uncompiled
+            .last_mut()
+            .ok_or(LowerError::InternalInvariant {
+                detail: "UTF-8 unfinished suffix head was absent",
+            })?;
+        if top
+            .pending
+            .replace(PendingUtf8Transition {
+                start: first.start,
+                end: first.end,
+            })
+            .is_some()
+        {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 unfinished suffix head was already occupied",
+            });
+        }
+        for range in rest {
+            self.push_utf8_node(
+                utf8,
+                Utf8Node {
+                    transitions: Vec::new(),
+                    pending: Some(PendingUtf8Transition {
+                        start: range.start,
+                        end: range.end,
+                    }),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn finish_utf8_class(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+    ) -> Result<(u32, Vec<Patch>), LowerError> {
+        self.compile_utf8_from(utf8, 0)?;
+        if utf8.uncompiled.len() != 1 {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 class retained more than its root node",
+            });
+        }
+        let root = utf8.uncompiled.pop().ok_or(LowerError::InternalInvariant {
+            detail: "UTF-8 class root was absent",
+        })?;
+        if root.pending.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 class root retained an unfinished transition",
+            });
+        }
+        let start = self.compile_utf8_node(utf8, root)?;
+        Ok((start, core::mem::take(&mut utf8.outs)))
+    }
+
+    fn freeze_utf8_node(
+        &mut self,
+        node: &mut Utf8Node,
+        target: Option<u32>,
+    ) -> Result<bool, LowerError> {
+        let Some(pending) = node.pending.take() else {
+            return Ok(false);
+        };
+        self.push_utf8_transition(
+            &mut node.transitions,
+            Utf8Transition {
+                start: pending.start,
+                end: pending.end,
+                target,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn push_utf8_node(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+        node: Utf8Node,
+    ) -> Result<(), LowerError> {
+        self.charge_vector_growth(
+            utf8.uncompiled.len(),
+            utf8.uncompiled.capacity(),
+            1,
+            "UTF-8 unfinished node stack",
+        )?;
+        reserve(&mut utf8.uncompiled, 1, "UTF-8 unfinished node stack")?;
+        utf8.uncompiled.push(node);
+        Ok(())
+    }
+
+    fn push_utf8_transition(
+        &mut self,
+        transitions: &mut Vec<Utf8Transition>,
+        transition: Utf8Transition,
+    ) -> Result<(), LowerError> {
+        self.charge(1, "UTF-8 sparse transition ordering")?;
+        if let Some(last) = transitions.last_mut() {
+            if transition.start <= last.end {
+                return Err(LowerError::InternalInvariant {
+                    detail: "UTF-8 sparse transitions overlapped or were out of order",
+                });
+            }
+            if last.target == transition.target && last.end.checked_add(1) == Some(transition.start)
+            {
+                last.end = transition.end;
+                return Ok(());
+            }
+        }
+        self.charge_vector_growth(
+            transitions.len(),
+            transitions.capacity(),
+            1,
+            "UTF-8 sparse transition list",
+        )?;
+        reserve(transitions, 1, "UTF-8 sparse transition list")?;
+        transitions.push(transition);
+        Ok(())
+    }
+
+    fn compile_utf8_node(
+        &mut self,
+        utf8: &mut Utf8ClassState,
+        node: Utf8Node,
+    ) -> Result<u32, LowerError> {
+        if node.pending.is_some() {
+            return Err(LowerError::InternalInvariant {
+                detail: "UTF-8 node was compiled with an unfinished transition",
+            });
+        }
+        let transitions = node.transitions;
+        self.charge_usize(transitions.len(), "UTF-8 state hash")?;
+        let hash = utf8_transition_hash(&transitions);
+        let first = self.utf8_cache_lower_bound(&utf8.compiled, hash)?;
+        let mut candidate = first;
+        while candidate < utf8.compiled.len() && utf8.compiled[candidate].hash == hash {
+            let comparison =
+                transitions
+                    .len()
+                    .checked_add(1)
+                    .ok_or(LowerError::ArithmeticOverflow {
+                        computation: "UTF-8 cached-state comparison work",
+                    })?;
+            self.charge_usize(comparison, "UTF-8 cached-state comparison")?;
+            if self.utf8_cached_state_matches(utf8.compiled[candidate].state, &transitions)? {
+                return Ok(utf8.compiled[candidate].state);
+            }
+            candidate = candidate
+                .checked_add(1)
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "UTF-8 cache collision traversal",
+                })?;
+        }
+
+        let state = self.add_state(StateRole::Consume)?;
+        for transition in transitions {
+            let patch = self.add_edge(
+                state,
+                EdgeKind::ByteRange,
+                transition.start,
+                transition.end,
+                transition.target,
+            )?;
+            if transition.target.is_none() {
+                self.charge_vector_growth(
+                    utf8.outs.len(),
+                    utf8.outs.capacity(),
+                    1,
+                    "UTF-8 class patch list",
+                )?;
+                reserve(&mut utf8.outs, 1, "UTF-8 class patch list")?;
+                utf8.outs.push(patch);
+            }
+        }
+
+        let shifted =
+            utf8.compiled
+                .len()
+                .checked_sub(first)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "UTF-8 cache insertion exceeded its length",
+                })?;
+        self.charge_usize(shifted, "UTF-8 cache insertion shift")?;
+        self.charge_vector_growth(
+            utf8.compiled.len(),
+            utf8.compiled.capacity(),
+            1,
+            "UTF-8 compiled-state cache",
+        )?;
+        reserve(&mut utf8.compiled, 1, "UTF-8 compiled-state cache")?;
+        utf8.compiled.insert(first, CachedUtf8State { hash, state });
+        Ok(state)
+    }
+
+    fn utf8_cache_lower_bound(
+        &mut self,
+        cache: &[CachedUtf8State],
+        hash: u64,
+    ) -> Result<usize, LowerError> {
+        let mut left = 0usize;
+        let mut right = cache.len();
+        while left < right {
+            self.charge(1, "UTF-8 cache binary search")?;
+            let width = right
+                .checked_sub(left)
+                .ok_or(LowerError::InternalInvariant {
+                    detail: "UTF-8 cache search bounds were reversed",
+                })?;
+            let middle = left
+                .checked_add(width / 2)
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "UTF-8 cache search midpoint",
+                })?;
+            if cache[middle].hash < hash {
+                left = middle
+                    .checked_add(1)
+                    .ok_or(LowerError::ArithmeticOverflow {
+                        computation: "UTF-8 cache search advance",
+                    })?;
+            } else {
+                right = middle;
+            }
+        }
+        Ok(left)
+    }
+
+    fn utf8_cached_state_matches(
+        &self,
+        state: u32,
+        transitions: &[Utf8Transition],
+    ) -> Result<bool, LowerError> {
+        let state = self
+            .states
+            .get(lower_index(state)?)
+            .ok_or(LowerError::InternalInvariant {
+                detail: "UTF-8 cached state was absent",
+            })?;
+        if state.role != StateRole::Consume || state.edges.len() != transitions.len() {
+            return Ok(false);
+        }
+        Ok(state
+            .edges
+            .iter()
+            .zip(transitions)
+            .all(|(edge, transition)| {
+                edge.kind == EdgeKind::ByteRange
+                    && edge.byte_start == transition.start
+                    && edge.byte_end == transition.end
+                    && edge.target == transition.target
+            }))
     }
 
     fn optional_fragment(&mut self, child: Fragment, greedy: bool) -> Result<Fragment, LowerError> {
@@ -1436,6 +1812,20 @@ impl<'h> Compiler<'h> {
             byte_ends,
         })
     }
+}
+
+fn utf8_transition_hash(transitions: &[Utf8Transition]) -> u64 {
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+
+    let mut hash = OFFSET;
+    for transition in transitions {
+        hash = (hash ^ u64::from(transition.start)).wrapping_mul(PRIME);
+        hash = (hash ^ u64::from(transition.end)).wrapping_mul(PRIME);
+        let encoded_target = transition.target.map_or(u64::MAX, u64::from);
+        hash = (hash ^ encoded_target).wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn preflight_final_tables(

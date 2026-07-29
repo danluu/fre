@@ -1,4 +1,6 @@
-use fre_automata::{EdgeKind, MatchSpan, SearchLimits, SearchWindow, Span};
+use fre_automata::{
+    EdgeKind, Exists, K0Workspace, MatchSpan, SearchLimits, SearchWindow, Span, WorkspaceLimits,
+};
 use fre_lower::{
     LowerError, LowerLimits, LowerResource, OperationSemantics, UnsupportedFeature, lower,
     lower_hir_raw, lower_raw, lower_utf8_start_guarded,
@@ -99,6 +101,174 @@ fn unicode_scalar_classes_lower_to_exact_utf8_byte_paths() {
         Some((0, b"# -*- coding: utf-8".len()))
     );
     assert_eq!(tuple(find_unicode(ruff, b"x # coding: utf-8")), None);
+}
+
+#[test]
+fn compressed_unicode_classes_match_upstream_across_ranges_and_malformed_bytes() {
+    const PATTERNS: &[&str] = &[
+        r"\w",
+        r"\w{2,4}\s+\p{Greek}+",
+        r"[\u{7F}-\u{800}]{1,3}",
+        r"[\u{D7FF}\u{E000}-\u{10FFFF}]+",
+        r"[^\p{ASCII}]{1,2}",
+        r"(?:\pL|[0-9_])+\s+\p{Greek}{2}",
+    ];
+    let malformed = [
+        0xFF, b'a', 0x80, 0xC0, 0x80, b' ', 0xED, 0xA0, 0x80, b'_', 0xF4, 0x90, 0x80, 0x80,
+    ];
+    let truncated = [0x7F, 0xC2, b' ', 0xE0, 0xA0, b' ', 0xF0, 0x90, 0x80];
+    let mut scalar_boundaries = Vec::new();
+    for scalar in [
+        '\0',
+        '\u{7F}',
+        '\u{80}',
+        '\u{7FF}',
+        '\u{800}',
+        '\u{D7FF}',
+        '\u{E000}',
+        '\u{FFFF}',
+        '\u{10000}',
+        '\u{10FFFF}',
+    ] {
+        let mut encoded = [0_u8; 4];
+        scalar_boundaries.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+        scalar_boundaries.push(b' ');
+    }
+    let haystacks = [
+        b"".as_slice(),
+        b"ASCII words_123 and spaces".as_slice(),
+        "αβ γδε ЖЮ 東京 😀".as_bytes(),
+        malformed.as_slice(),
+        truncated.as_slice(),
+        scalar_boundaries.as_slice(),
+    ];
+
+    for pattern in PATTERNS {
+        let parsed = parsed(pattern, true);
+        let fre = lower(
+            &parsed,
+            OperationSemantics::CaptureFree,
+            LowerLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("failed to lower {pattern:?}: {error}"));
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(true)
+            .build()
+            .unwrap_or_else(|error| panic!("upstream rejected {pattern:?}: {error}"));
+        for haystack in haystacks {
+            let actual = fre
+                .automaton()
+                .prepare::<Span>()
+                .search(haystack, SearchLimits::unlimited())
+                .unwrap_or_else(|error| {
+                    panic!("FRE search failed for {pattern:?}/{haystack:?}: {error}")
+                })
+                .into_output();
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| (matched.start(), matched.end()));
+            assert_eq!(
+                tuple(actual),
+                expected,
+                "pattern={pattern:?}, haystack={haystack:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn repeated_unicode_word_classes_fit_the_k0_lazy_dfa_envelope() {
+    const PATTERN: &str = r"\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}\s+\w{5}";
+    const K0_LAZY_GRAPH_STATE_LIMIT: usize = 16_384;
+
+    let parsed = parsed(PATTERN, true);
+    let lowered = lower(
+        &parsed,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("repeated Unicode classes lower");
+    let stats = lowered.stats();
+    assert_eq!((stats.states(), stats.edges()), (11_115, 45_789));
+    assert!(stats.states() < K0_LAZY_GRAPH_STATE_LIMIT);
+    assert!(
+        lowered
+            .automaton()
+            .accelerated_workspace_layout()
+            .unwrap()
+            .logical_bytes()
+            > lowered
+                .automaton()
+                .workspace_layout()
+                .unwrap()
+                .logical_bytes()
+    );
+    let automaton = lowered.automaton();
+    let mut accelerated = K0Workspace::new_accelerated(automaton, WorkspaceLimits::unlimited())
+        .expect("compressed graph admits accelerated K0 workspace");
+    let found = automaton
+        .prepare::<Exists>()
+        .search_with_workspace(
+            b"alpha bravo charl delta eagle foxtt gamma",
+            &mut accelerated,
+            SearchLimits::unlimited(),
+        )
+        .expect("accelerated K0 search succeeds")
+        .into_output();
+    assert!(found);
+
+    let exact = LowerLimits {
+        max_work: stats.work(),
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states(),
+            max_edges: stats.edges(),
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    let replay = lower_raw(&parsed, OperationSemantics::CaptureFree, exact)
+        .expect("exact Unicode DAG limits replay");
+    assert_eq!(replay.stats(), stats);
+
+    let one_work_short = LowerLimits {
+        max_work: stats.work() - 1,
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, one_work_short),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            ..
+        })
+    ));
+    let one_state_short = LowerLimits {
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states() - 1,
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, one_state_short),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            ..
+        })
+    ));
+    let one_edge_short = LowerLimits {
+        automata: fre_automata::CompileLimits {
+            max_edges: stats.edges() - 1,
+            ..fre_automata::CompileLimits::default()
+        },
+        ..LowerLimits::default()
+    };
+    assert!(matches!(
+        lower_raw(&parsed, OperationSemantics::CaptureFree, one_edge_short),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Edges,
+            ..
+        })
+    ));
 }
 
 #[test]
