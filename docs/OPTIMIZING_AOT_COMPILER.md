@@ -217,27 +217,32 @@ The matrix crosses:
 - every relevant base-pointer alignment;
 - at least 64-KiB and 1-MiB haystacks.
 
-All timing comparisons are same-process paired and rotate engine order.
-Correctness, guard-page, resource, object, and final-image gates run before
-performance.
+All timing comparisons are paired, rotate all six three-engine orders, and run
+each retained engine sample in a fresh process. Correctness, guard-page,
+resource, object, and final-image gates run before performance. Every retained
+engine row runs for at least one second and searches at least one GiB; compile,
+link, load, adoption, and portable-plan construction stay outside that steady
+state boundary for all three arms.
 
 ## Production performance gates
 
-An exact target/workload row may be promoted only if all of the following hold
-on the frozen source and artifacts:
+An exact semantic/target/workload row may be promoted only if all of the
+following hold on the frozen source and artifacts:
 
 - zero semantic, checksum, native-fault, guard-page, audit, object, or resource
   failures;
-- long-running compiled Rebar geometric-mean AOT/portable latency is strictly
+- at least 30 retained repetitions per cell and engine, with all raw elapsed
+  rows retained;
+- on every target and separately in training, validation, and final holdout,
+  the equal-cell geometric-mean Count-v3/portable latency ratio is strictly
   below `0.80`, establishing greater than 20% lower latency;
-- every promoted Rebar cell is below `0.98`, unless a narrower source-defined
-  routing envelope excludes it before timing;
-- at least 95% of same-process Rebar pairs are strict AOT wins;
-- Count-v3 geometric-mean latency is at most `0.95` of the faster of Count-v2
-  and portable across the v3 qualification matrix;
-- no admitted v3 qualification cell is above `1.02` of that faster incumbent;
-- the independently frozen final holdout passes the same correctness gates and
-  has geometric-mean v3/faster-incumbent latency below `0.95`;
+- in each of those target/partition slices, the equal-cell geometric-mean
+  Count-v3/faster-of-(Count-v2, portable) ratio is at most `0.75`;
+- every cell's geometric-mean Count-v3/faster-control ratio is at most `1.03`;
+- Count-v3 strictly beats the faster control in at least 24 of 30 paired
+  repetitions in every cell;
+- the independently committed and frozen final holdout passes without any
+  post-reveal optimizer feedback or source change;
 - code size and instruction-cache costs remain inside the frozen routing
   envelope;
 - Apple ASIMD and EC2 target evidence are separate; neither authorizes the
@@ -249,18 +254,28 @@ input.
 
 ## Runtime routing
 
-Until qualification, all Count-v3 authority atoms and production row tables are
-empty.
+Until qualification, all Count-v3 authority atoms and production row tables
+are empty. A v3 object retains the complete fixed-width literal manifest,
+optimizer recipe manifest, target contract, and their identities. Those are
+not trusted merely because the compiler emitted them: static adoption
+independently reconstructs the exact program and recipe, re-lowers the reviewed
+template, and compares the complete mapped instruction stream before creating a
+callable handle.
 
 After qualification, routing remains construction-time and fail-closed:
 
 1. normal semantic planning proves exact-literal whole-operation Count;
 2. literal width, operation, target, feature, tuning, and workload gates match a
    reviewed production row;
-3. static adoption authenticates the linked object and row identities;
-4. the matcher retains the verified handle;
-5. the value-only hot operation invokes the static entry;
-6. every other case retains the current portable route.
+3. the production row authenticates the qualified compiler/backend/auditor,
+   semantic envelope, target contract, and held-out evidence bundle rather than
+   enumerating Rebar job or artifact identities;
+4. static adoption authenticates the linked object and expectation, validates
+   the full literal and recipe manifests, and independently re-lowers and
+   compares the mapped code;
+5. the matcher retains the verified handle;
+6. the value-only hot operation invokes the static entry;
+7. every other case retains the current portable route.
 
 There is no per-call ISA dispatch, artifact lookup, code generation, or
 authority mutation.
