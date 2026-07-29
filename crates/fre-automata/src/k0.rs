@@ -1,10 +1,14 @@
 use core::{fmt, mem::size_of};
 
+use fre_simd_kernels::{
+    AsciiByteSet, AsciiByteSetClassifier, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
+};
 use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
     plan::{
-        ByteSet, StartFilterProof, StartPositionClass, StartPositionScanner, StartScanner,
+        ByteSet, StartAsciiClassifier, StartFilterProof, StartPositionClass, StartPositionScanner,
+        StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
         BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
         BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
         START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
@@ -4475,12 +4479,29 @@ fn build_byte_start_scanner(
         });
     }
 
+    if let Some(ascii) = ascii_start_set(set) {
+        meter.charge(
+            u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK)
+                .expect("ASCII classifier construction work fits u64"),
+            position,
+        )?;
+        return Ok(StartScanner::AsciiSet {
+            set,
+            classifier: StartAsciiClassifier::new(ascii),
+        });
+    }
+
     meter.charge(
         u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK)
             .expect("byte bitmap scanner selection work fits u64"),
         position,
     )?;
     Ok(StartScanner::Set(set))
+}
+
+fn ascii_start_set(set: ByteSet) -> Option<AsciiByteSet> {
+    let [low, high, upper_low, upper_high] = set.words();
+    (upper_low == 0 && upper_high == 0).then_some(AsciiByteSet::from_words([low, high]))
 }
 
 fn insert_byte_range(words: &mut [u64; 4], start: u8, end: u8) {
@@ -4580,6 +4601,9 @@ fn next_scanner_candidate(
                 memchr3(*first, *second, *third, source)
             })
         }
+        StartScanner::AsciiSet { classifier, .. } => {
+            next_ascii_start_candidate(classifier.classifier(), haystack, position, end, meter)
+        }
         StartScanner::Set(set) => next_set_start_candidate(*set, haystack, position, end, meter),
     }
 }
@@ -4657,6 +4681,84 @@ fn next_set_start_candidate(
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "scalar start-set position",
+            })?;
+    }
+    Ok(end)
+}
+
+fn next_ascii_start_candidate(
+    classifier: &AsciiByteSetClassifier,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    while end.saturating_sub(position) >= ASCII_WIDE_BYTES
+        && meter.remaining() >= u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64")
+    {
+        meter.charge(
+            u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"),
+            position,
+        )?;
+        let block_end =
+            position
+                .checked_add(ASCII_WIDE_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "wide start-classifier block end",
+                })?;
+        let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked wide classifier extent");
+        let members = classifier.classify_32(block).member_mask();
+        if members != 0 {
+            let offset =
+                usize::try_from(members.trailing_zeros()).expect("wide classifier lane fits usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "wide start-classifier candidate",
+                });
+        }
+        position = block_end;
+    }
+    if end.saturating_sub(position) >= ASCII_NARROW_BYTES
+        && meter.remaining()
+            >= u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64")
+    {
+        meter.charge(
+            u64::try_from(ASCII_NARROW_BYTES).expect("classifier width fits u64"),
+            position,
+        )?;
+        let block_end =
+            position
+                .checked_add(ASCII_NARROW_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "narrow start-classifier block end",
+                })?;
+        let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("checked narrow classifier extent");
+        let members = classifier.classify_16(block).member_mask();
+        if members != 0 {
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("narrow classifier lane fits usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "narrow start-classifier candidate",
+                });
+        }
+        position = block_end;
+    }
+    while position < end {
+        meter.charge(1, position)?;
+        if classifier.set().contains(haystack[position]) {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-classifier position",
             })?;
     }
     Ok(end)
@@ -5385,16 +5487,17 @@ mod tests {
     };
 
     use super::{
-        scratch_bytes, ContextTransitionSlot, WorkMeter, CONTEXT_INITIAL_SOURCE,
-        CONTEXT_TRANSITION_SLOTS, INVOCATION_RESET_WORK,
+        scratch_bytes, ContextTransitionSlot, WorkMeter, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
+        CONTEXT_INITIAL_SOURCE, CONTEXT_TRANSITION_SLOTS, INVOCATION_RESET_WORK,
     };
     use crate::{
         plan::{
             ByteSet, StartFilterProof, StartPositionClass, StartPositionScanner, StartScanner,
-            BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-            BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-            START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-            START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
+            BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
+            BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_SET_SCANNER_SELECTION_WORK,
+            BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+            START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+            START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, MatchSpan, RawPlan,
         ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
@@ -6212,7 +6315,7 @@ mod tests {
     fn scanner_for(bytes: &[u8]) -> StartScanner {
         let mut meter = WorkMeter::new(u64::MAX, 0);
         let scanner = super::byte_start_scanner(byte_set(bytes), &mut meter, 0).unwrap();
-        let expected_build_work = expected_scanner_selection_work(bytes.len());
+        let expected_build_work = expected_scanner_selection_work(bytes);
         assert_eq!(meter.consumed, expected_build_work);
         scanner
     }
@@ -6225,21 +6328,24 @@ mod tests {
         positioned_scanner(0, scanner)
     }
 
-    fn expected_scanner_construction_work(members: usize) -> u64 {
-        let construction = if members <= BYTE_START_SMALL_MAX_MEMBERS {
-            members
+    fn expected_scanner_construction_work(bytes: &[u8]) -> u64 {
+        let construction = if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
+            bytes
+                .len()
                 .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                 .unwrap()
+        } else if bytes.iter().all(u8::is_ascii) {
+            BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK
         } else {
             BYTE_START_SET_SCANNER_SELECTION_WORK
         };
         u64::try_from(construction).unwrap()
     }
 
-    fn expected_scanner_selection_work(members: usize) -> u64 {
+    fn expected_scanner_selection_work(bytes: &[u8]) -> u64 {
         u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
             .unwrap()
-            .checked_add(expected_scanner_construction_work(members))
+            .checked_add(expected_scanner_construction_work(bytes))
             .unwrap()
     }
 
@@ -6262,10 +6368,40 @@ mod tests {
         .unwrap()
     }
 
-    fn expected_filter_selection_work(positions: usize, scanner_members: usize) -> u64 {
+    fn expected_filter_selection_work(positions: usize, scanner_bytes: &[u8]) -> u64 {
         expected_start_class_selection_work(positions)
-            .checked_add(expected_scanner_construction_work(scanner_members))
+            .checked_add(expected_scanner_construction_work(scanner_bytes))
             .unwrap()
+    }
+
+    fn expected_ascii_scanner_work(start: usize, end: usize, expected: usize) -> u64 {
+        let mut position = start;
+        let mut work = 0_usize;
+        while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
+            work = work.checked_add(ASCII_WIDE_BYTES).unwrap();
+            let block_end = position.checked_add(ASCII_WIDE_BYTES).unwrap();
+            if expected < block_end {
+                return u64::try_from(work).unwrap();
+            }
+            position = block_end;
+        }
+        if end.saturating_sub(position) >= ASCII_NARROW_BYTES {
+            work = work.checked_add(ASCII_NARROW_BYTES).unwrap();
+            let block_end = position.checked_add(ASCII_NARROW_BYTES).unwrap();
+            if expected < block_end {
+                return u64::try_from(work).unwrap();
+            }
+            position = block_end;
+        }
+        let tail = if expected == end {
+            end.saturating_sub(position)
+        } else {
+            expected
+                .checked_sub(position)
+                .and_then(|distance| distance.checked_add(1))
+                .unwrap()
+        };
+        u64::try_from(work.checked_add(tail).unwrap()).unwrap()
     }
 
     #[test]
@@ -6318,9 +6454,10 @@ mod tests {
 
     #[test]
     fn start_scanner_selection_work_is_exact_and_precedes_construction() {
-        let scanner_sets: &[&[u8]] = &[&[], b"a", b"ab", b"abc", b"abcd"];
+        let scanner_sets: &[&[u8]] =
+            &[&[], b"a", b"ab", b"abc", b"abcd", &[0x80, 0x81, 0x82, 0x83]];
         for &bytes in scanner_sets {
-            let expected = expected_scanner_selection_work(bytes.len());
+            let expected = expected_scanner_selection_work(bytes);
 
             let mut population_refusal = WorkMeter::new(
                 u64::try_from(BYTE_START_BITMAP_POPULATION_WORK.checked_sub(1).unwrap()).unwrap(),
@@ -6355,6 +6492,8 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap()
+            } else if bytes.iter().all(u8::is_ascii) {
+                u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK).unwrap()
             } else {
                 u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK).unwrap()
             };
@@ -6667,16 +6806,19 @@ mod tests {
                             "scanner {bytes:?} disagreed in {start}..{end} of {haystack:?}"
                         );
 
-                        let expected_work = if bytes.is_empty() {
-                            0
-                        } else if expected == end {
-                            u64::try_from(end - start).unwrap()
-                        } else {
-                            u64::try_from(expected - start + 1).unwrap()
-                        };
+                        let expected_work =
+                            if matches!(scanner.scanner, StartScanner::AsciiSet { .. }) {
+                                expected_ascii_scanner_work(start, end, expected)
+                            } else if bytes.is_empty() {
+                                0
+                            } else if expected == end {
+                                u64::try_from(end - start).unwrap()
+                            } else {
+                                u64::try_from(expected - start + 1).unwrap()
+                            };
                         assert_eq!(
                             meter.consumed, expected_work,
-                            "scanner {bytes:?} charged unexpected scalar work in {start}..{end}"
+                            "scanner {bytes:?} charged unexpected physical work in {start}..{end}"
                         );
                     }
                 }
@@ -6995,21 +7137,20 @@ mod tests {
             .unwrap();
         assert_eq!(report.output(), &Some(crate::MatchSpan::new(0, 2)));
         assert!(report.accounting().boundaries() > 0);
-        assert_eq!(
-            automaton
-                .start_filter_proof
-                .get()
-                .expect("successful search publishes later-position filter"),
-            &StartFilterProof {
-                scanner: Some(positioned_scanner(
-                    1,
-                    StartScanner::Set(byte_range_set(0, 64)),
-                )),
-                guard: None,
-                force_haystack_start: false,
-                relaxed_nullable: false,
-            }
-        );
+        let proof = automaton
+            .start_filter_proof
+            .get()
+            .expect("successful search publishes later-position filter");
+        assert!(matches!(
+            proof.scanner,
+            Some(StartPositionScanner {
+                offset: 1,
+                scanner: StartScanner::AsciiSet { set, .. },
+            }) if set == byte_range_set(0, 64)
+        ));
+        assert_eq!(proof.guard, None);
+        assert!(!proof.force_haystack_start);
+        assert!(!proof.relaxed_nullable);
     }
 
     #[test]
@@ -7381,7 +7522,7 @@ mod tests {
                     .unwrap()
             };
             let proof_work = graph_work
-                .checked_add(expected_filter_selection_work(1, bytes.len()))
+                .checked_add(expected_filter_selection_work(1, bytes))
                 .unwrap();
             assert_eq!(
                 cold.accounting()
@@ -7405,7 +7546,7 @@ mod tests {
                     | (b"a", StartScanner::One(b'a'))
                     | (b"ab", StartScanner::Two(b'a', b'b'))
                     | (b"abc", StartScanner::Three(b'a', b'b', b'c'))
-                    | (b"abcd", StartScanner::Set(_))
+                    | (b"abcd", StartScanner::AsciiSet { .. })
             ));
 
             let mut meter = WorkMeter::new(u64::MAX, 0);
@@ -7437,7 +7578,7 @@ mod tests {
             .unwrap();
         assert_eq!(cold.output(), warm.output());
         let specialization_work = 4_u64
-            .checked_add(expected_filter_selection_work(1, 1))
+            .checked_add(expected_filter_selection_work(1, b"a"))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -7659,7 +7800,7 @@ mod tests {
             .unwrap();
         let specialization_admitted = INVOCATION_RESET_WORK
             .checked_add(proof_work)
-            .and_then(|work| work.checked_add(expected_filter_selection_work(1, root.len())))
+            .and_then(|work| work.checked_add(expected_filter_selection_work(1, &root)))
             .unwrap();
         let probe = ascii_root_bytes(&root);
         let mut probe_workspace = K0Workspace::new(&probe, WorkspaceLimits::unlimited()).unwrap();
@@ -7700,7 +7841,7 @@ mod tests {
             .search_with_workspace(b"za", &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let specialization_work = proof_work
-            .checked_add(expected_filter_selection_work(1, root.len()))
+            .checked_add(expected_filter_selection_work(1, &root))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -8013,7 +8154,7 @@ mod tests {
             .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let specialization_work = 16_u64
-            .checked_add(expected_filter_selection_work(4, 1))
+            .checked_add(expected_filter_selection_work(4, b":"))
             .unwrap();
         assert_eq!(
             cold.accounting()

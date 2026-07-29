@@ -4,6 +4,10 @@ use std::sync::{
     OnceLock,
 };
 
+use fre_simd_kernels::{
+    AsciiByteSet, AsciiByteSetClassifier, AsciiSelection, ASCII_CLASSIFIER_BUILD_WORK,
+};
+
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 
 static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -32,6 +36,8 @@ pub(crate) const BYTE_START_MEMBER_EXTRACTION_WORK: usize = 1;
 pub(crate) const BYTE_START_SMALL_MAX_MEMBERS: usize = 3;
 /// Exact abstract work to retain a broad bitmap scanner.
 pub(crate) const BYTE_START_SET_SCANNER_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compile a broad all-ASCII bitmap scanner.
+pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize = ASCII_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compare one position with the incumbent scanner.
 pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
@@ -41,12 +47,12 @@ pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
 /// Sixty-four members are one quarter of the complete 256-byte domain.
 pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 /// Conservative selection bound: count and compare every exact-position set,
-/// compare every non-scanner set for the optional guard, then construct the
-/// largest direct scanner.
+/// compare every non-scanner set for the optional guard, then compile the
+/// costliest retained scanner.
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
-    + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK;
+    + BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,6 +369,40 @@ impl ByteSet {
     }
 }
 
+/// Immutable SIMD classifier retained for one broad all-ASCII byte set.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StartAsciiClassifier {
+    inner: AsciiByteSetClassifier,
+}
+
+impl StartAsciiClassifier {
+    pub(crate) fn new(set: AsciiByteSet) -> Self {
+        Self {
+            inner: AsciiByteSetClassifier::new(set),
+        }
+    }
+
+    pub(crate) const fn classifier(&self) -> &AsciiByteSetClassifier {
+        &self.inner
+    }
+
+    const fn set(&self) -> AsciiByteSet {
+        self.inner.set()
+    }
+
+    const fn selection(&self) -> AsciiSelection {
+        self.inner.selection()
+    }
+}
+
+impl PartialEq for StartAsciiClassifier {
+    fn eq(&self, other: &Self) -> bool {
+        self.set() == other.set() && self.selection() == other.selection()
+    }
+}
+
+impl Eq for StartAsciiClassifier {}
+
 /// Immutable scanner selected from one proved exact-position byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartScanner {
@@ -370,6 +410,10 @@ pub(crate) enum StartScanner {
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
+    AsciiSet {
+        set: ByteSet,
+        classifier: StartAsciiClassifier,
+    },
     Set(ByteSet),
 }
 
