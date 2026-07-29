@@ -201,6 +201,57 @@ fn literal_facts_use_kmp_minimum_period_and_self_overlap() {
 }
 
 #[test]
+fn primary_filter_rank_is_pattern_only_and_encoding_structural() {
+    for literal in ["абабаб".as_bytes(), "中文中文".as_bytes()] {
+        let optimized = optimize(literal);
+        assert_eq!(optimized.recipe().strategy(), CountV3Strategy::PeriodicRun);
+        let primary = literal[usize::from(optimized.recipe().filter_offsets()[0])];
+        assert!(
+            (0x80..=0xbf).contains(&primary),
+            "UTF-8 continuation should precede a repeated lead byte"
+        );
+
+        let mut work = Work::default();
+        let analysis = analyze_literal(literal, &mut work).unwrap();
+        assert!(
+            optimized
+                .recipe()
+                .filter_offsets()
+                .windows(2)
+                .all(|pair| column_rank(literal, &analysis.multiplicity, pair[0])
+                    <= column_rank(literal, &analysis.multiplicity, pair[1]))
+        );
+        validate_count_recipe_v3(&program(literal), optimized.recipe()).unwrap();
+    }
+
+    let english = b"eta";
+    let mut work = Work::default();
+    let analysis = analyze_literal(english, &mut work).unwrap();
+    let e = column_rank(english, &analysis.multiplicity, 0);
+    let t = column_rank(english, &analysis.multiplicity, 1);
+    let a = column_rank(english, &analysis.multiplicity, 2);
+    assert_eq!((e.0, e.1), (t.0, t.1));
+    assert_eq!((t.0, t.1), (a.0, a.1));
+    let mut reversed = [2, 1, 0];
+    canonicalize_filter_order(
+        english,
+        &analysis.multiplicity,
+        CountV3Strategy::SparseRareColumns,
+        &mut reversed,
+    );
+    assert_eq!(reversed, [0, 1, 2]);
+
+    let endpoint_literal = "a中".as_bytes();
+    let mut work = Work::default();
+    let endpoint_analysis = analyze_literal(endpoint_literal, &mut work).unwrap();
+    let endpoints = ranked_endpoint_pair(endpoint_literal, &endpoint_analysis.multiplicity);
+    assert_eq!(
+        endpoints,
+        [u8::try_from(endpoint_literal.len() - 1).unwrap(), 0,]
+    );
+}
+
+#[test]
 fn short_non_overlapping_literals_select_direct_exact_masks() {
     for literal in [&b"ab"[..], &b"abc"[..], &b"abcd"[..]] {
         let optimized = optimize(literal);

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Canonical recipe schema emitted by this optimizer.
 pub const COUNT_V3_RECIPE_SCHEMA_VERSION: u16 = 3;
 /// Version of the deterministic portfolio and cost model.
-pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 2;
+pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 3;
 /// Maximum number of filter columns in one recipe.
 pub const COUNT_V3_MAX_FILTER_OFFSETS: usize = 4;
 /// Maximum exact-literal width consumed by Count-v3.
@@ -32,7 +32,7 @@ pub const COUNT_V3_RECIPE_CANONICAL_BYTES: usize = 256;
 pub const COUNT_V3_OPTIMIZER_RECEIPT_CANONICAL_BYTES: usize = 192;
 /// Hard maximum number of recipes in the exhaustive bounded portfolio.
 pub const COUNT_V3_HARD_MAX_PORTFOLIO_RECIPES: usize = 192;
-const _: () = assert!(1 + 28 + 56 + 70 + 2 + 2 + 1 <= COUNT_V3_HARD_MAX_PORTFOLIO_RECIPES);
+const _: () = assert!(1 + 28 + 56 + 70 + 1 + 1 + 1 + 1 <= COUNT_V3_HARD_MAX_PORTFOLIO_RECIPES);
 
 const RECIPE_IDENTITY_DOMAIN: &[u8] = b"FRE-AOT-COUNT-V3-RECIPE\0\x03";
 const RECEIPT_IDENTITY_DOMAIN: &[u8] = b"FRE-AOT-COUNT-V3-OPTIMIZER-RECEIPT\0\x01";
@@ -1241,13 +1241,13 @@ fn count_portfolio(
     }
     if literal.len() >= 2 {
         count = count
-            .checked_add(2)
+            .checked_add(1)
             .ok_or(CountV3OptimizeError::ArithmeticOverflow {
                 at: "endpoint portfolio count",
             })?;
         if endpoint_rare_offset(literal, frontier).is_some() {
             count = count
-                .checked_add(2)
+                .checked_add(1)
                 .ok_or(CountV3OptimizeError::ArithmeticOverflow {
                     at: "endpoint rare portfolio count",
                 })?;
@@ -1368,8 +1368,20 @@ fn build_portfolio(
         })?;
     }
     if literal.len() >= 2 {
-        let last = to_u8(literal.len() - 1, "endpoint offset")?;
-        for filters in [[0, last], [last, 0]] {
+        let endpoints = ranked_endpoint_pair(literal, multiplicity);
+        push_candidate(
+            &mut candidates,
+            literal,
+            facts,
+            multiplicity,
+            CountV3Strategy::EndpointDense,
+            CountV3ScheduleId::EndpointDenseV1,
+            &endpoints,
+            0,
+            work,
+        )?;
+        if let Some(rare) = endpoint_rare_offset(literal, frontier) {
+            let filters = [endpoints[0], endpoints[1], rare];
             push_candidate(
                 &mut candidates,
                 literal,
@@ -1381,21 +1393,6 @@ fn build_portfolio(
                 0,
                 work,
             )?;
-        }
-        if let Some(rare) = endpoint_rare_offset(literal, frontier) {
-            for filters in [[0, last, rare], [last, 0, rare]] {
-                push_candidate(
-                    &mut candidates,
-                    literal,
-                    facts,
-                    multiplicity,
-                    CountV3Strategy::EndpointDense,
-                    CountV3ScheduleId::EndpointDenseV1,
-                    &filters,
-                    0,
-                    work,
-                )?;
-            }
         }
     }
     if usize::from(facts.minimum_period) < literal.len() {
@@ -1446,7 +1443,19 @@ fn push_candidate(
     work.add(1)?;
     let mut filter_offsets = [0_u8; COUNT_V3_MAX_FILTER_OFFSETS];
     filter_offsets[..filters.len()].copy_from_slice(filters);
-    let costs = estimate_costs(literal, facts, multiplicity, strategy, filters)?;
+    canonicalize_filter_order(
+        literal,
+        multiplicity,
+        strategy,
+        &mut filter_offsets[..filters.len()],
+    );
+    let costs = estimate_costs(
+        literal,
+        facts,
+        multiplicity,
+        strategy,
+        &filter_offsets[..filters.len()],
+    )?;
     work.add(6)?;
     candidates
         .try_push(Candidate {
@@ -1498,6 +1507,45 @@ fn direct_exact_mask_filters(
     Some((filters, width))
 }
 
+/// Order filter columns by deterministic pattern-only selectivity.
+///
+/// Sparse and periodic schedules have no semantic column order, so their
+/// primary is the byte with the lowest static prevalence multiplied by its
+/// literal multiplicity. EndpointDense deliberately retains endpoints in the
+/// first two positions; `ranked_endpoint_pair` orders only those endpoints.
+fn canonicalize_filter_order(
+    literal: &[u8],
+    multiplicity: &[u8; 256],
+    strategy: CountV3Strategy,
+    filters: &mut [u8],
+) {
+    if !matches!(
+        strategy,
+        CountV3Strategy::SparseRareColumns | CountV3Strategy::PeriodicRun
+    ) {
+        return;
+    }
+    for insertion in 1..filters.len() {
+        let key = filters[insertion];
+        let key_rank = column_rank(literal, multiplicity, key);
+        let mut cursor = insertion;
+        while cursor != 0 && key_rank < column_rank(literal, multiplicity, filters[cursor - 1]) {
+            filters[cursor] = filters[cursor - 1];
+            cursor -= 1;
+        }
+        filters[cursor] = key;
+    }
+}
+
+fn ranked_endpoint_pair(literal: &[u8], multiplicity: &[u8; 256]) -> [u8; 2] {
+    let last = u8::try_from(literal.len() - 1).expect("Count-v3 endpoint width is bounded");
+    let mut endpoints = [0, last];
+    if column_rank(literal, multiplicity, last) < column_rank(literal, multiplicity, 0) {
+        endpoints.swap(0, 1);
+    }
+    endpoints
+}
+
 fn periodic_filters(
     literal: &[u8],
     facts: CountV3LiteralFacts,
@@ -1528,18 +1576,23 @@ fn estimate_costs(
     let width = to_u32(literal.len(), "cost literal width")?;
     let filter_count = to_u32(filters.len(), "cost filter count")?;
     let mut discrimination = 0_u32;
-    for offset in filters {
-        let byte = literal[usize::from(*offset)];
+    let mut primary_discrimination = 0_u32;
+    for (index, offset) in filters.iter().copied().enumerate() {
+        let byte = literal[usize::from(offset)];
         let denominator = u32::from(BYTE_PREVALENCE_WEIGHT[usize::from(byte)])
             .checked_add(u32::from(multiplicity[usize::from(byte)]).saturating_mul(12))
             .ok_or(CountV3OptimizeError::ArithmeticOverflow {
                 at: "filter discrimination denominator",
             })?;
-        discrimination = discrimination
-            .checked_add(4096 / denominator.max(1))
-            .ok_or(CountV3OptimizeError::ArithmeticOverflow {
+        let column_discrimination = 4096 / denominator.max(1);
+        discrimination = discrimination.checked_add(column_discrimination).ok_or(
+            CountV3OptimizeError::ArithmeticOverflow {
                 at: "filter discrimination",
-            })?;
+            },
+        )?;
+        if index == 0 {
+            primary_discrimination = column_discrimination;
+        }
     }
     let maximum = u32::from(facts.maximum_multiplicity);
     let period = u32::from(facts.minimum_period);
@@ -1554,22 +1607,36 @@ fn estimate_costs(
             code_size: 320 + width * 4,
         },
         CountV3Strategy::SparseRareColumns => CountV3CostVector {
-            sparse: (1180_u32.saturating_sub(discrimination.saturating_mul(2))).max(180)
+            sparse: (1180_u32
+                .saturating_sub(discrimination.saturating_mul(2))
+                .saturating_sub(primary_discrimination.saturating_mul(2)))
+            .max(180)
                 + width * 2
                 + filter_count * 18,
             dense: (1320_u32.saturating_sub(discrimination)).max(260)
                 + width * 6
                 + filter_count * 25,
-            false_positive: (1500_u32.saturating_sub(discrimination.saturating_mul(2))).max(160)
+            false_positive: (1500_u32
+                .saturating_sub(discrimination.saturating_mul(2))
+                .saturating_sub(primary_discrimination))
+            .max(160)
                 + width * 4,
             matches: 930 + width * 10 + filter_count * 24,
             tail: 390 + width * 3 + filter_count * 15,
             code_size: 430 + width * 7 + filter_count * 44,
         },
         CountV3Strategy::EndpointDense => CountV3CostVector {
-            sparse: (720_u32.saturating_sub(discrimination / 2)).max(220) + width * 3,
+            sparse: (720_u32
+                .saturating_sub(discrimination / 2)
+                .saturating_sub(primary_discrimination / 2))
+            .max(220)
+                + width * 3,
             dense: (900_u32.saturating_sub(discrimination / 2)).max(260) + width * 4 + maximum * 4,
-            false_positive: (1120_u32.saturating_sub(discrimination)).max(220) + width * 5,
+            false_positive: (1120_u32
+                .saturating_sub(discrimination)
+                .saturating_sub(primary_discrimination))
+            .max(220)
+                + width * 5,
             matches: 790 + width * 8 + filter_count * 18,
             tail: 290 + width * 2 + filter_count * 10,
             code_size: 410 + width * 6 + filter_count * 32,
@@ -1577,9 +1644,17 @@ fn estimate_costs(
         CountV3Strategy::PeriodicRun => {
             let period_gain = overlap.saturating_mul(18);
             CountV3CostVector {
-                sparse: (520_u32.saturating_sub(period_gain / 2)).max(180) + width * 3,
+                sparse: (520_u32
+                    .saturating_sub(period_gain / 2)
+                    .saturating_sub(primary_discrimination))
+                .max(180)
+                    + width * 3,
                 dense: (760_u32.saturating_sub(period_gain)).max(180) + period * 8,
-                false_positive: (940_u32.saturating_sub(period_gain)).max(200) + width * 3,
+                false_positive: (940_u32
+                    .saturating_sub(period_gain)
+                    .saturating_sub(primary_discrimination))
+                .max(200)
+                    + width * 3,
                 matches: (650_u32.saturating_sub(period_gain / 2)).max(220) + period * 10,
                 tail: 360 + period * 4,
                 code_size: 510 + width * 8 + period * 6,
@@ -2000,8 +2075,20 @@ fn to_u32(value: usize, at: &'static str) -> Result<u32, CountV3OptimizeError> {
 const BYTE_PREVALENCE_WEIGHT: [u16; 256] = build_byte_prevalence_weight();
 
 const fn build_byte_prevalence_weight() -> [u16; 256] {
+    // Coarse encoding classes only: no language- or benchmark-specific byte
+    // frequencies. Literal multiplicity is the sole pattern-specific signal.
     let mut weights = [12_u16; 256];
-    let mut byte = 0x20_usize;
+    let mut byte = 0x80_usize;
+    while byte <= 0xbf {
+        weights[byte] = 14;
+        byte += 1;
+    }
+    byte = 0xc2;
+    while byte <= 0xf4 {
+        weights[byte] = 28;
+        byte += 1;
+    }
+    byte = 0x20;
     while byte <= 0x7e {
         weights[byte] = 22;
         byte += 1;
@@ -2021,22 +2108,11 @@ const fn build_byte_prevalence_weight() -> [u16; 256] {
         weights[byte] = 40;
         byte += 1;
     }
-    weights[b' ' as usize] = 180;
-    weights[b'\n' as usize] = 96;
-    weights[b'\r' as usize] = 52;
-    weights[b'\t' as usize] = 48;
-    weights[b'e' as usize] = 72;
-    weights[b't' as usize] = 68;
-    weights[b'a' as usize] = 64;
-    weights[b'o' as usize] = 62;
-    weights[b'i' as usize] = 60;
-    weights[b'n' as usize] = 60;
-    weights[b'_' as usize] = 44;
-    weights[b'/' as usize] = 42;
-    weights[b':' as usize] = 40;
-    weights[b',' as usize] = 38;
-    weights[b'.' as usize] = 38;
-    weights[0] = 20;
+    let mut whitespace = 0_usize;
+    while whitespace < 4 {
+        weights[[b' ', b'\n', b'\r', b'\t'][whitespace] as usize] = 96;
+        whitespace += 1;
+    }
     weights
 }
 
@@ -2397,33 +2473,31 @@ fn validate_recipe(
             let filters = recipe.filter_offsets();
             let count_ok = (2..=COUNT_V3_MAX_FILTER_OFFSETS).contains(&filters.len());
             let distinct = count_ok && distinct_filter_bytes(literal, filters);
-            let mut previous = None;
-            let mut ordered_frontier = true;
-            for filter in filters {
-                let Some(position) = frontier
-                    .as_slice()
-                    .iter()
-                    .position(|candidate| candidate == filter)
-                else {
-                    ordered_frontier = false;
-                    break;
-                };
-                if previous.is_some_and(|prior| position <= prior) {
-                    ordered_frontier = false;
-                }
-                previous = Some(position);
-            }
-            distinct && ordered_frontier && recipe.periodic_stride == 0
+            let from_frontier = filters
+                .iter()
+                .all(|filter| frontier.as_slice().contains(filter));
+            let mut canonical = [0_u8; COUNT_V3_MAX_FILTER_OFFSETS];
+            canonical[..filters.len()].copy_from_slice(filters);
+            canonicalize_filter_order(
+                literal,
+                &analysis.multiplicity,
+                CountV3Strategy::SparseRareColumns,
+                &mut canonical[..filters.len()],
+            );
+            distinct
+                && from_frontier
+                && filters == &canonical[..filters.len()]
+                && recipe.periodic_stride == 0
         }
         CountV3Strategy::EndpointDense => {
             if width < 2 || recipe.periodic_stride != 0 {
                 false
             } else {
-                let last = u8::try_from(width - 1).expect("Count-v3 width is at most 32");
+                let endpoints = ranked_endpoint_pair(literal, &analysis.multiplicity);
                 let filters = recipe.filter_offsets();
-                let endpoint_pair = filters == [0, last] || filters == [last, 0];
+                let endpoint_pair = filters == endpoints;
                 let endpoint_rare = endpoint_rare_offset(literal, &frontier)
-                    .is_some_and(|rare| filters == [0, last, rare] || filters == [last, 0, rare]);
+                    .is_some_and(|rare| filters == [endpoints[0], endpoints[1], rare]);
                 endpoint_pair || endpoint_rare
             }
         }
@@ -2432,8 +2506,14 @@ fn validate_recipe(
             if period >= width {
                 false
             } else {
-                let expected = periodic_filters(literal, analysis.facts)
+                let mut expected = periodic_filters(literal, analysis.facts)
                     .map_err(|_| CountV3RecipeValidationError::FilterOffsets)?;
+                canonicalize_filter_order(
+                    literal,
+                    &analysis.multiplicity,
+                    CountV3Strategy::PeriodicRun,
+                    &mut expected.0[..expected.1],
+                );
                 recipe.filter_offsets() == &expected.0[..expected.1]
                     && recipe.periodic_stride == analysis.facts.minimum_period
             }
