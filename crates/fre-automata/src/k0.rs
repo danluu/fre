@@ -4,11 +4,11 @@ use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
     plan::{
-        ByteSet, StartFilterProof, StartPositionClass, StartScanner,
+        ByteSet, StartFilterProof, StartPositionClass, StartPositionScanner, StartScanner,
         BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
         BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
         START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-        START_FILTER_POSITION_COUNT,
+        START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, MatchSpan, ResourceKind, SearchAccounting, SearchError, SearchLimits,
     SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -477,76 +477,25 @@ fn execute(
     let (mut meter, setup_work) =
         prepare_invocation(automaton, workspace, window, limits, &mut setup)?;
     let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
-    let start_scanner = start_proof.proof().scanner.as_ref();
-    let start_guard = start_proof.proof().guard.as_ref();
-    let force_haystack_start = start_proof.proof().force_haystack_start;
-
-    let mut position = window.start();
-    let mut boundaries = 0usize;
-    let mut pending = None;
-
-    loop {
-        if pending.is_none() && workspace.roots_len == 0 {
-            if let Some(scanner) = start_scanner {
-                // An absolute-start branch may contribute a match only at
-                // original haystack boundary zero. Evaluate the full root
-                // there once; the scanner is a proof for later boundaries.
-                if !(force_haystack_start && position == 0) {
-                    position = next_start_candidate(
-                        scanner,
-                        haystack,
-                        position,
-                        window.end(),
-                        start_guard,
-                        &mut meter,
-                    )?;
-                    if position == window.end() {
-                        break;
-                    }
-                }
-            }
-        }
-        boundaries = boundaries
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "examined boundary count",
-            })?;
-        workspace.begin_boundary(&mut meter, position)?;
-        expand_boundary_roots(
+    let (pending, boundaries) = if let Some(scanner) = start_proof.proof().scanner.as_ref() {
+        execute_filtered_loop(
             automaton,
             haystack,
-            position,
+            window,
             workspace,
             &mut meter,
-            &mut pending,
-        )?;
-
-        if earliest && pending.is_some() {
-            break;
-        }
-
-        // All live states are higher priority than `pending`. If none remain,
-        // the pending match is irrevocably selected.
-        if workspace.current_len == 0 && (pending.is_some() || position == window.end()) {
-            break;
-        }
-        if position == window.end() {
-            break;
-        }
-
-        consume_current(
-            automaton,
-            haystack[position],
-            position,
-            workspace,
-            &mut meter,
-        )?;
-        position = position
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "input position",
-            })?;
-    }
+            earliest,
+            scanner,
+            start_proof.proof().guard.as_ref(),
+            start_proof.proof().force_haystack_start,
+        )?
+    } else {
+        // Keep the common nullable/all-byte decline path free of scanner and
+        // guard option tests at every examined boundary.
+        debug_assert!(start_proof.proof().guard.is_none());
+        debug_assert!(!start_proof.proof().force_haystack_start);
+        execute_unfiltered_loop(automaton, haystack, window, workspace, &mut meter, earliest)?
+    };
 
     let transition_work =
         meter
@@ -566,6 +515,127 @@ fn execute(
             boundaries,
         ),
     })
+}
+
+fn execute_unfiltered_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    earliest: bool,
+) -> Result<(Option<MatchSpan>, usize), SearchError> {
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut pending = None;
+
+    loop {
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "examined boundary count",
+            })?;
+        workspace.begin_boundary(meter, position)?;
+        expand_boundary_roots(
+            automaton,
+            haystack,
+            position,
+            workspace,
+            meter,
+            &mut pending,
+        )?;
+
+        if earliest && pending.is_some() {
+            break;
+        }
+
+        // All live states are higher priority than `pending`. If none remain,
+        // the pending match is irrevocably selected.
+        if workspace.current_len == 0 && (pending.is_some() || position == window.end()) {
+            break;
+        }
+        if position == window.end() {
+            break;
+        }
+
+        consume_current(automaton, haystack[position], position, workspace, meter)?;
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "input position",
+            })?;
+    }
+
+    Ok((pending, boundaries))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_filtered_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    earliest: bool,
+    scanner: &StartPositionScanner,
+    guard: Option<&StartPositionClass>,
+    force_haystack_start: bool,
+) -> Result<(Option<MatchSpan>, usize), SearchError> {
+    let mut position = window.start();
+    let mut boundaries = 0usize;
+    let mut pending = None;
+
+    loop {
+        if pending.is_none()
+            && workspace.roots_len == 0
+            // An absolute-start branch may contribute a match only at
+            // original haystack boundary zero. Evaluate the full root there
+            // once; the scanner is a proof for later boundaries.
+            && !(force_haystack_start && position == 0)
+        {
+            position =
+                next_start_candidate(scanner, haystack, position, window.end(), guard, meter)?;
+            if position == window.end() {
+                break;
+            }
+        }
+        boundaries = boundaries
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "examined boundary count",
+            })?;
+        workspace.begin_boundary(meter, position)?;
+        expand_boundary_roots(
+            automaton,
+            haystack,
+            position,
+            workspace,
+            meter,
+            &mut pending,
+        )?;
+
+        if earliest && pending.is_some() {
+            break;
+        }
+
+        // All live states are higher priority than `pending`. If none remain,
+        // the pending match is irrevocably selected.
+        if workspace.current_len == 0 && (pending.is_some() || position == window.end()) {
+            break;
+        }
+        if position == window.end() {
+            break;
+        }
+
+        consume_current(automaton, haystack[position], position, workspace, meter)?;
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "input position",
+            })?;
+    }
+
+    Ok((pending, boundaries))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -789,48 +859,110 @@ fn prepare_start_filter<'a>(
     }
 
     let position_proof = derive_start_position_classes(automaton, workspace, meter, position)?;
-    let guard = select_start_guard(
-        &position_proof.sets[..position_proof.length],
-        meter,
-        position,
-    )?;
-    let scanner = if position_proof.length != 0 {
-        let root = position_proof.sets[0];
-        let scanner = byte_start_scanner(root, meter, position)?;
-        (root != ByteSet::ALL || guard.is_some()).then_some(scanner)
+    let (scanner, guard) = if position_proof.length == 0 {
+        (None, None)
     } else {
-        None
+        let selection = select_start_classes(
+            &position_proof.sets[..position_proof.length],
+            meter,
+            position,
+        )?;
+        if selection.scanner.set == ByteSet::ALL && selection.guard.is_none() {
+            (None, None)
+        } else {
+            let scanner = build_byte_start_scanner(
+                selection.scanner.set,
+                selection.scanner_cardinality,
+                meter,
+                position,
+            )?;
+            (
+                Some(StartPositionScanner {
+                    offset: selection.scanner.offset,
+                    scanner,
+                }),
+                selection.guard,
+            )
+        }
     };
 
     let proof = StartFilterProof {
         // The forced boundary matters only when skipping is enabled.
         force_haystack_start: scanner.is_some() && position_proof.force_haystack_start,
         scanner,
-        guard: scanner.and(guard),
+        guard,
     };
     // Publish only after the entire search succeeds. A racing successful
     // caller may win first; both values come from the same immutable graph.
     Ok(InvocationStartProof::Pending(proof))
 }
 
-fn select_start_guard(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartClassSelection {
+    scanner: StartPositionClass,
+    scanner_cardinality: u32,
+    guard: Option<StartPositionClass>,
+}
+
+const fn scanner_tie_rank(offset: u8) -> (bool, u8) {
+    // Root first avoids hot-path rewind. Among later positions, deeper scans a
+    // shorter suffix and rejects truncated windows earlier.
+    (offset == 0, offset)
+}
+
+fn select_start_classes(
     sets: &[ByteSet],
     meter: &mut WorkMeter,
     position: usize,
-) -> Result<Option<StartPositionClass>, SearchError> {
-    let mut best: Option<(u32, StartPositionClass)> = None;
-    for (offset, &set) in sets.iter().enumerate().skip(1) {
+) -> Result<StartClassSelection, SearchError> {
+    debug_assert!(!sets.is_empty());
+    debug_assert!(sets.len() <= START_FILTER_POSITION_COUNT);
+    let mut cardinalities = [0_u32; START_FILTER_POSITION_COUNT];
+    let mut scanner: Option<(u32, StartPositionClass)> = None;
+
+    for (offset, &set) in sets.iter().enumerate() {
         meter.charge(
             u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
                 .expect("byte bitmap population work fits u64"),
             position,
         )?;
         let cardinality = set.cardinality();
+        cardinalities[offset] = cardinality;
+        meter.charge(
+            u64::try_from(START_FILTER_SCANNER_SELECTION_WORK)
+                .expect("scanner selection work fits u64"),
+            position,
+        )?;
+        let class = StartPositionClass {
+            offset: u8::try_from(offset).expect("bounded start-filter offset fits u8"),
+            set,
+        };
+        let replace = match scanner {
+            None => true,
+            Some((best_cardinality, best_class)) => {
+                cardinality < best_cardinality
+                    || (cardinality == best_cardinality
+                        && scanner_tie_rank(class.offset) > scanner_tie_rank(best_class.offset))
+            }
+        };
+        if replace {
+            scanner = Some((cardinality, class));
+        }
+    }
+
+    let (scanner_cardinality, scanner) =
+        scanner.expect("a nonempty exact-position proof selects a scanner");
+    let mut guard: Option<(u32, StartPositionClass)> = None;
+    for (offset, &set) in sets.iter().enumerate() {
+        if offset == usize::from(scanner.offset) {
+            continue;
+        }
         meter.charge(
             u64::try_from(START_FILTER_GUARD_SELECTION_WORK)
                 .expect("guard selection work fits u64"),
             position,
         )?;
+        let cardinality = cardinalities[offset];
         if cardinality > START_FILTER_GUARD_MAX_CARDINALITY {
             continue;
         }
@@ -838,7 +970,7 @@ fn select_start_guard(
             offset: u8::try_from(offset).expect("bounded start-filter offset fits u8"),
             set,
         };
-        let replace = match best {
+        let replace = match guard {
             None => true,
             Some((best_cardinality, best_class)) => {
                 cardinality < best_cardinality
@@ -846,12 +978,18 @@ fn select_start_guard(
             }
         };
         if replace {
-            best = Some((cardinality, class));
+            guard = Some((cardinality, class));
         }
     }
-    Ok(best.map(|(_, class)| class))
+
+    Ok(StartClassSelection {
+        scanner,
+        scanner_cardinality,
+        guard: guard.map(|(_, class)| class),
+    })
 }
 
+#[cfg(test)]
 fn byte_start_scanner(
     set: ByteSet,
     meter: &mut WorkMeter,
@@ -863,6 +1001,16 @@ fn byte_start_scanner(
         position,
     )?;
     let cardinality = set.cardinality();
+    build_byte_start_scanner(set, cardinality, meter, position)
+}
+
+fn build_byte_start_scanner(
+    set: ByteSet,
+    cardinality: u32,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<StartScanner, SearchError> {
+    debug_assert_eq!(set.cardinality(), cardinality);
     if cardinality == 0 {
         return Ok(StartScanner::Empty);
     }
@@ -935,7 +1083,7 @@ fn insert_byte_range(words: &mut [u64; 4], start: u8, end: u8) {
 }
 
 fn next_start_candidate(
-    scanner: &StartScanner,
+    scanner: &StartPositionScanner,
     haystack: &[u8],
     position: usize,
     end: usize,
@@ -943,14 +1091,31 @@ fn next_start_candidate(
     meter: &mut WorkMeter,
 ) -> Result<usize, SearchError> {
     let mut search = position;
+    let scanner_offset = usize::from(scanner.offset);
     loop {
-        let candidate = next_scanner_candidate(scanner, haystack, search, end, meter)?;
+        let scan_start =
+            search
+                .checked_add(scanner_offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "start-filter scanner position",
+                })?;
+        if scan_start >= end {
+            return Ok(end);
+        }
+        let scan_position =
+            next_scanner_candidate(&scanner.scanner, haystack, scan_start, end, meter)?;
+        if scan_position == end {
+            return Ok(end);
+        }
+        let candidate =
+            scan_position
+                .checked_sub(scanner_offset)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "start-filter scanner matched before its exact offset",
+                })?;
         let Some(guard) = guard else {
             return Ok(candidate);
         };
-        if candidate == end {
-            return Ok(end);
-        }
         let guard_position = candidate.checked_add(usize::from(guard.offset)).ok_or(
             SearchError::ArithmeticOverflow {
                 computation: "start-filter guard position",
@@ -1114,7 +1279,7 @@ fn prepare_invocation(
     let required_generations = window
         .end()
         .checked_sub(window.start())
-        // Up to four proof generations precede one generation for the initial
+        // Up to eight proof generations precede one generation for the initial
         // boundary and one for every admitted byte.
         .and_then(|length| length.checked_add(START_FILTER_POSITION_COUNT))
         .and_then(|length| length.checked_add(1))
@@ -1468,11 +1633,11 @@ mod tests {
     use super::{scratch_bytes, WorkMeter, INVOCATION_RESET_WORK};
     use crate::{
         plan::{
-            ByteSet, StartFilterProof, StartPositionClass, StartScanner,
+            ByteSet, StartFilterProof, StartPositionClass, StartPositionScanner, StartScanner,
             BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
             BYTE_START_SET_SCANNER_SELECTION_WORK, BYTE_START_SMALL_MAX_MEMBERS,
             START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-            START_FILTER_POSITION_COUNT,
+            START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, K0Workspace, RawPlan, SearchError,
         SearchLimits, SearchWindow, Span, StateRole, WorkspaceLimits,
@@ -1527,6 +1692,53 @@ mod tests {
                 edge_kinds: vec![EdgeKind::ByteRange; ranges.len()],
                 byte_starts: ranges.iter().map(|&(start, _)| start).collect(),
                 byte_ends: ranges.iter().map(|&(_, end)| end).collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn absolute_byte_or_eight_byte_chain(
+        absolute: u8,
+        ranges: &[(u8, u8); START_FILTER_POSITION_COUNT],
+    ) -> Automaton {
+        let mut byte_starts = vec![0, 0, absolute];
+        byte_starts.extend(ranges.iter().map(|&(start, _)| start));
+        let mut byte_ends = vec![0, 0, absolute];
+        byte_ends.extend(ranges.iter().map(|&(_, end)| end));
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                ],
+                edge_offsets: vec![0, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                edge_targets: vec![1, 3, 2, 4, 5, 6, 7, 8, 9, 10, 2],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts,
+                byte_ends,
             },
             CompileLimits::default(),
         )
@@ -1924,34 +2136,55 @@ mod tests {
         scanner
     }
 
-    fn expected_scanner_selection_work(members: usize) -> u64 {
-        let selection = if members <= BYTE_START_SMALL_MAX_MEMBERS {
+    const fn positioned_scanner(offset: u8, scanner: StartScanner) -> StartPositionScanner {
+        StartPositionScanner { offset, scanner }
+    }
+
+    const fn root_scanner(scanner: StartScanner) -> StartPositionScanner {
+        positioned_scanner(0, scanner)
+    }
+
+    fn expected_scanner_construction_work(members: usize) -> u64 {
+        let construction = if members <= BYTE_START_SMALL_MAX_MEMBERS {
             members
                 .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                 .unwrap()
         } else {
             BYTE_START_SET_SCANNER_SELECTION_WORK
         };
+        u64::try_from(construction).unwrap()
+    }
+
+    fn expected_scanner_selection_work(members: usize) -> u64 {
+        u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
+            .unwrap()
+            .checked_add(expected_scanner_construction_work(members))
+            .unwrap()
+    }
+
+    fn expected_start_class_selection_work(positions: usize) -> u64 {
         u64::try_from(
-            BYTE_START_BITMAP_POPULATION_WORK
-                .checked_add(selection)
+            positions
+                .checked_mul(
+                    BYTE_START_BITMAP_POPULATION_WORK
+                        .checked_add(START_FILTER_SCANNER_SELECTION_WORK)
+                        .unwrap(),
+                )
+                .and_then(|work| {
+                    positions
+                        .saturating_sub(1)
+                        .checked_mul(START_FILTER_GUARD_SELECTION_WORK)
+                        .and_then(|guard| work.checked_add(guard))
+                })
                 .unwrap(),
         )
         .unwrap()
     }
 
-    fn expected_guard_selection_work(positions: usize) -> u64 {
-        u64::try_from(
-            positions
-                .saturating_sub(1)
-                .checked_mul(
-                    BYTE_START_BITMAP_POPULATION_WORK
-                        .checked_add(START_FILTER_GUARD_SELECTION_WORK)
-                        .unwrap(),
-                )
-                .unwrap(),
-        )
-        .unwrap()
+    fn expected_filter_selection_work(positions: usize, scanner_members: usize) -> u64 {
+        expected_start_class_selection_work(positions)
+            .checked_add(expected_scanner_construction_work(scanner_members))
+            .unwrap()
     }
 
     #[test]
@@ -2080,18 +2313,27 @@ mod tests {
     }
 
     #[test]
-    fn guard_selection_is_exact_bounded_and_prefers_the_deepest_smallest_class() {
+    fn class_selection_is_exact_bounded_and_prefers_root_then_deepest_ties() {
         let sets = [
             byte_set(b"Q"),
             byte_set(b"ab"),
             ByteSet::ALL,
             byte_set(b"Z"),
         ];
-        let expected = expected_guard_selection_work(sets.len());
+        let expected = expected_start_class_selection_work(sets.len());
 
         let mut exact = WorkMeter::new(expected, 0);
+        let selected = super::select_start_classes(&sets, &mut exact, 19).unwrap();
         assert_eq!(
-            super::select_start_guard(&sets, &mut exact, 19).unwrap(),
+            selected.scanner,
+            StartPositionClass {
+                offset: 0,
+                set: byte_set(b"Q"),
+            }
+        );
+        assert_eq!(selected.scanner_cardinality, 1);
+        assert_eq!(
+            selected.guard,
             Some(StartPositionClass {
                 offset: 3,
                 set: byte_set(b"Z"),
@@ -2100,19 +2342,19 @@ mod tests {
         assert_eq!(exact.consumed, expected);
 
         let mut one_below = WorkMeter::new(expected - 1, 0);
-        let error = super::select_start_guard(&sets, &mut one_below, 19).unwrap_err();
+        let error = super::select_start_classes(&sets, &mut one_below, 19).unwrap_err();
         assert!(matches!(
             error,
             SearchError::WorkLimitExceeded {
                 limit,
-                consumed: 14,
+                consumed: 22,
                 requested: 1,
                 position: 19,
             } if limit == expected - 1
         ));
 
         let mut population_refusal = WorkMeter::new(3, 0);
-        let error = super::select_start_guard(&sets, &mut population_refusal, 23).unwrap_err();
+        let error = super::select_start_classes(&sets, &mut population_refusal, 23).unwrap_err();
         assert!(matches!(
             error,
             SearchError::WorkLimitExceeded {
@@ -2125,10 +2367,10 @@ mod tests {
 
         let tied = [byte_set(b"Q"), byte_set(b"a"), ByteSet::ALL, byte_set(b"Z")];
         let mut tied_meter = WorkMeter::new(u64::MAX, 0);
+        let tied = super::select_start_classes(&tied, &mut tied_meter, 0).unwrap();
+        assert_eq!(tied.scanner.offset, 0);
         assert_eq!(
-            super::select_start_guard(&tied, &mut tied_meter, 0)
-                .unwrap()
-                .expect("two selective later classes"),
+            tied.guard.expect("two selective non-scanner classes"),
             StartPositionClass {
                 offset: 3,
                 set: byte_set(b"Z"),
@@ -2142,10 +2384,11 @@ mod tests {
             byte_set(b"YZ"),
         ];
         let mut shallow_meter = WorkMeter::new(u64::MAX, 0);
+        let shallow =
+            super::select_start_classes(&shallow_is_smaller, &mut shallow_meter, 0).unwrap();
+        assert_eq!(shallow.scanner.offset, 0);
         assert_eq!(
-            super::select_start_guard(&shallow_is_smaller, &mut shallow_meter, 0)
-                .unwrap()
-                .expect("two selective later classes"),
+            shallow.guard.expect("two selective non-scanner classes"),
             StartPositionClass {
                 offset: 1,
                 set: byte_set(b"a"),
@@ -2154,11 +2397,27 @@ mod tests {
 
         let all_later = [byte_set(b"Q"), ByteSet::ALL, ByteSet::ALL, ByteSet::ALL];
         let mut all_meter = WorkMeter::new(u64::MAX, 0);
-        assert_eq!(
-            super::select_start_guard(&all_later, &mut all_meter, 0).unwrap(),
-            None
-        );
+        let selected = super::select_start_classes(&all_later, &mut all_meter, 0).unwrap();
+        assert_eq!(selected.scanner.offset, 0);
+        assert_eq!(selected.guard, None);
         assert_eq!(all_meter.consumed, expected);
+
+        let no_root_tie = [
+            byte_set(b"ab"),
+            byte_set(b"Z"),
+            ByteSet::ALL,
+            byte_set(b"Y"),
+        ];
+        let mut no_root_meter = WorkMeter::new(u64::MAX, 0);
+        let selected = super::select_start_classes(&no_root_tie, &mut no_root_meter, 0).unwrap();
+        assert_eq!(
+            selected.scanner,
+            StartPositionClass {
+                offset: 3,
+                set: byte_set(b"Y"),
+            },
+            "the deepest equal class wins only when offset zero is not tied"
+        );
     }
 
     #[test]
@@ -2169,24 +2428,30 @@ mod tests {
             START_FILTER_GUARD_MAX_CARDINALITY
         );
         let mut maximum_meter = WorkMeter::new(u64::MAX, 0);
+        let selected =
+            super::select_start_classes(&[byte_set(b"Q"), maximum_eligible], &mut maximum_meter, 0)
+                .unwrap();
+        assert_eq!(selected.scanner.offset, 0);
         assert_eq!(
-            super::select_start_guard(&[byte_set(b"Q"), maximum_eligible], &mut maximum_meter, 0,)
-                .unwrap(),
+            selected.guard,
             Some(StartPositionClass {
                 offset: 1,
                 set: maximum_eligible,
             })
         );
-        assert_eq!(maximum_meter.consumed, expected_guard_selection_work(2));
+        assert_eq!(
+            maximum_meter.consumed,
+            expected_start_class_selection_work(2)
+        );
 
         for broad in [byte_range_set(0, 64), byte_range_set(0, 254), ByteSet::ALL] {
             assert!(broad.cardinality() > START_FILTER_GUARD_MAX_CARDINALITY);
             let mut broad_meter = WorkMeter::new(u64::MAX, 0);
-            assert_eq!(
-                super::select_start_guard(&[byte_set(b"Q"), broad], &mut broad_meter, 0,).unwrap(),
-                None
-            );
-            assert_eq!(broad_meter.consumed, expected_guard_selection_work(2));
+            let selected =
+                super::select_start_classes(&[byte_set(b"Q"), broad], &mut broad_meter, 0).unwrap();
+            assert_eq!(selected.scanner.offset, 0);
+            assert_eq!(selected.guard, None);
+            assert_eq!(broad_meter.consumed, expected_start_class_selection_work(2));
         }
 
         let broad_then_tied_eligible = [
@@ -2196,8 +2461,11 @@ mod tests {
             byte_set(b"Y"),
         ];
         let mut eligible_meter = WorkMeter::new(u64::MAX, 0);
+        let selected =
+            super::select_start_classes(&broad_then_tied_eligible, &mut eligible_meter, 0).unwrap();
+        assert_eq!(selected.scanner.offset, 0);
         assert_eq!(
-            super::select_start_guard(&broad_then_tied_eligible, &mut eligible_meter, 0,).unwrap(),
+            selected.guard,
             Some(StartPositionClass {
                 offset: 3,
                 set: byte_set(b"Y"),
@@ -2205,13 +2473,13 @@ mod tests {
         );
         assert_eq!(
             eligible_meter.consumed,
-            expected_guard_selection_work(broad_then_tied_eligible.len())
+            expected_start_class_selection_work(broad_then_tied_eligible.len())
         );
     }
 
     #[test]
     fn guarded_scanner_honors_window_end_and_exact_incremental_work() {
-        let scanner = StartScanner::One(b'a');
+        let scanner = root_scanner(StartScanner::One(b'a'));
         let guard = StartPositionClass {
             offset: 1,
             set: byte_set(b"b"),
@@ -2255,7 +2523,7 @@ mod tests {
         let mut high_meter = WorkMeter::new(u64::MAX, 0);
         assert_eq!(
             super::next_start_candidate(
-                &StartScanner::Set(byte_set(&[0x80, 0xfe])),
+                &root_scanner(StartScanner::Set(byte_set(&[0x80, 0xfe]))),
                 &[0x80, b'x', 0xff, 0xfe, b'x', 0],
                 0,
                 6,
@@ -2301,7 +2569,7 @@ mod tests {
         haystacks.push(long);
 
         for &bytes in scanner_sets {
-            let scanner = scanner_for(bytes);
+            let scanner = root_scanner(scanner_for(bytes));
             for haystack in &haystacks {
                 for start in 0..=haystack.len() {
                     for end in start..=haystack.len() {
@@ -2336,6 +2604,277 @@ mod tests {
     }
 
     #[test]
+    fn exact_position_scanners_zero_through_seven_match_every_window() {
+        let markers = [0, 0xff, b'Z', 0x80, b'!', 0x7f, b'/', 0xfe];
+
+        for scanner_offset in 0..START_FILTER_POSITION_COUNT {
+            let marker = markers[scanner_offset];
+            let mut ranges = [(0, 0xff); START_FILTER_POSITION_COUNT];
+            if scanner_offset == 0 {
+                ranges[0] = (marker, marker);
+            } else {
+                ranges[0] = (b'A', b'B');
+                ranges[scanner_offset] = (marker, marker);
+            }
+
+            let valid = ranges
+                .iter()
+                .enumerate()
+                .map(|(offset, &(start, _))| {
+                    if offset == scanner_offset {
+                        return start;
+                    }
+                    match offset % 4 {
+                        0 => start,
+                        1 => 0,
+                        2 => 0xff,
+                        _ => 0x80,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut haystacks = (0..=START_FILTER_POSITION_COUNT + 2)
+                .map(|length| vec![b'x'; length])
+                .collect::<Vec<_>>();
+            haystacks.extend([
+                valid.clone(),
+                {
+                    let mut source = vec![0xff, 0, 0x80];
+                    source.extend_from_slice(&valid);
+                    source.extend_from_slice(&[0, 0xff]);
+                    source
+                },
+                {
+                    let mut source = vec![marker; 19];
+                    source[3..3 + valid.len()].copy_from_slice(&valid);
+                    source
+                },
+                vec![0, 0xff, marker, 0x80, marker, 0x7f, 0xfe, marker],
+            ]);
+
+            let specialized = byte_chain(&ranges);
+            let reference = byte_chain(&ranges);
+            assert_all_windows_match_unspecialized(
+                &format!("exact-position-scanner-{scanner_offset}"),
+                &specialized,
+                &reference,
+                &haystacks,
+            );
+
+            let proof = specialized
+                .start_filter_proof
+                .get()
+                .expect("all-window comparison publishes the exact-position proof");
+            assert_eq!(
+                proof.scanner,
+                Some(positioned_scanner(
+                    u8::try_from(scanner_offset).unwrap(),
+                    StartScanner::One(marker),
+                ))
+            );
+            assert_eq!(
+                proof.guard,
+                (scanner_offset != 0).then_some(StartPositionClass {
+                    offset: 0,
+                    set: byte_set(b"AB"),
+                })
+            );
+
+            let mut workspace =
+                K0Workspace::new(&specialized, WorkspaceLimits::unlimited()).unwrap();
+            for clipped_end in 0..=scanner_offset {
+                let clipped = specialized
+                    .prepare::<Span>()
+                    .search_window_with_workspace(
+                        &valid,
+                        SearchWindow::new(0, clipped_end),
+                        &mut workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert!(clipped.output().is_none());
+                assert_eq!(
+                    clipped.accounting().boundaries(),
+                    0,
+                    "offset {scanner_offset} admitted a start without its scanner byte"
+                );
+            }
+            let published = specialized
+                .start_filter_proof
+                .get()
+                .expect("proof remains published");
+            assert!(
+                core::ptr::eq(proof, published),
+                "a warm call must borrow the original immutable proof"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_seven_scanner_preserves_absolute_start_and_work_bounds() {
+        let ranges = [
+            (b'A', b'B'),
+            (0, 0xff),
+            (0, 0xff),
+            (0, 0xff),
+            (0, 0xff),
+            (0, 0xff),
+            (0, 0xff),
+            (b'Z', b'Z'),
+        ];
+        let valid = [b'A', 0, 0xff, 0x80, b'x', 0, 0xfe, b'Z'];
+        let mut later = vec![b'x'; 17];
+        later.extend_from_slice(&valid);
+        let haystacks = vec![
+            vec![],
+            vec![0xfe],
+            vec![0xfe, b'x', b'x'],
+            valid.to_vec(),
+            later.clone(),
+            vec![0xfe, b'A', 0, 0xff, 0x80, b'x', 0, 0xfe],
+        ];
+
+        let specialized = absolute_byte_or_eight_byte_chain(0xfe, &ranges);
+        let reference = absolute_byte_or_eight_byte_chain(0xfe, &ranges);
+        assert_all_windows_match_unspecialized(
+            "absolute-or-offset-seven",
+            &specialized,
+            &reference,
+            &haystacks,
+        );
+        assert_eq!(
+            specialized
+                .start_filter_proof
+                .get()
+                .expect("absolute-start comparison publishes proof"),
+            &StartFilterProof {
+                scanner: Some(positioned_scanner(7, StartScanner::One(b'Z'))),
+                guard: Some(StartPositionClass {
+                    offset: 0,
+                    set: byte_set(b"AB"),
+                }),
+                force_haystack_start: true,
+            }
+        );
+
+        let mut workspace = K0Workspace::new(&specialized, WorkspaceLimits::unlimited()).unwrap();
+        let at_zero = specialized
+            .prepare::<Span>()
+            .search_with_workspace(b"\xfexxxxxxxZ", &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(at_zero.output(), &Some(crate::MatchSpan::new(0, 1)));
+
+        let bound = specialized
+            .conservative_reused_work_bound(later.len())
+            .unwrap();
+        let warm = specialized
+            .prepare::<Span>()
+            .search_with_workspace(&later, &mut workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm.output(), &Some(crate::MatchSpan::new(17, 25)));
+        assert!(warm.accounting().work() <= bound);
+
+        let metered = absolute_byte_or_eight_byte_chain(0xfe, &ranges);
+        let mut metered_workspace =
+            K0Workspace::new(&metered, WorkspaceLimits::unlimited()).unwrap();
+        let cold_bound = metered.conservative_reused_work_bound(later.len()).unwrap();
+        let cold = metered
+            .prepare::<Span>()
+            .search_with_workspace(&later, &mut metered_workspace, SearchLimits::unlimited())
+            .unwrap();
+        let warm = metered
+            .prepare::<Span>()
+            .search_with_workspace(&later, &mut metered_workspace, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(cold.output(), warm.output());
+        assert!(cold.accounting().work() <= cold_bound);
+        assert!(
+            cold.accounting().transition_work() > warm.accounting().transition_work(),
+            "the cold offset-seven proof must be fully charged before publication"
+        );
+    }
+
+    #[test]
+    fn declined_filters_use_the_exact_scanner_free_accounting_path() {
+        fn nullable() -> Automaton {
+            Automaton::from_raw(
+                RawPlan {
+                    start: 0,
+                    roles: vec![StateRole::Accept],
+                    edge_offsets: vec![0, 0],
+                    edge_targets: vec![],
+                    edge_kinds: vec![],
+                    byte_starts: vec![],
+                    byte_ends: vec![],
+                },
+                CompileLimits::default(),
+            )
+            .unwrap()
+        }
+
+        for (name, specialized, reference, haystack, window) in [
+            (
+                "all-byte",
+                byte_chain(&[(0, 0xff)]),
+                byte_chain(&[(0, 0xff)]),
+                vec![0, 0xff, b'x'],
+                SearchWindow::new(1, 3),
+            ),
+            (
+                "nullable",
+                nullable(),
+                nullable(),
+                vec![0, 0xff, b'x'],
+                SearchWindow::new(1, 3),
+            ),
+        ] {
+            pin_without_start_filter(&reference);
+            let mut specialized_workspace =
+                K0Workspace::new(&specialized, WorkspaceLimits::unlimited()).unwrap();
+            let mut reference_workspace =
+                K0Workspace::new(&reference, WorkspaceLimits::unlimited()).unwrap();
+            specialized
+                .prepare::<Span>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut specialized_workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            let warm = specialized
+                .prepare::<Span>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut specialized_workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            let unfiltered = reference
+                .prepare::<Span>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut reference_workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(warm.output(), unfiltered.output(), "{name} output");
+            assert_eq!(
+                warm.accounting(),
+                unfiltered.accounting(),
+                "{name} scanner-free accounting"
+            );
+            assert!(specialized
+                .start_filter_proof
+                .get()
+                .expect("successful cold call publishes decline")
+                .scanner
+                .is_none());
+        }
+    }
+
+    #[test]
     fn full_byte_root_declines_start_filtering() {
         let automaton = Automaton::from_raw(
             RawPlan {
@@ -2364,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn full_byte_root_with_broad_later_class_disables_the_filter() {
+    fn full_byte_root_uses_a_more_selective_broad_later_class() {
         let automaton = byte_chain(&[(0, 0xff), (0, 64)]);
         let mut workspace = K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
         let source = vec![0_u8; 257];
@@ -2378,9 +2917,12 @@ mod tests {
             automaton
                 .start_filter_proof
                 .get()
-                .expect("successful search publishes declined filter"),
+                .expect("successful search publishes later-position filter"),
             &StartFilterProof {
-                scanner: None,
+                scanner: Some(positioned_scanner(
+                    1,
+                    StartScanner::Set(byte_range_set(0, 64)),
+                )),
                 guard: None,
                 force_haystack_start: false,
             }
@@ -2410,7 +2952,7 @@ mod tests {
             "selective-root-dense-middle",
             &[(b'Q', b'Q'), (0, 0xff), (b'Z', b'Z')],
             StartFilterProof {
-                scanner: Some(StartScanner::One(b'Q')),
+                scanner: Some(root_scanner(StartScanner::One(b'Q'))),
                 guard: Some(StartPositionClass {
                     offset: 2,
                     set: byte_set(b"Z"),
@@ -2424,11 +2966,8 @@ mod tests {
             "all-byte-root-with-selective-guard",
             &[(0, 0xff), (b'Z', b'Z')],
             StartFilterProof {
-                scanner: Some(StartScanner::Set(ByteSet::ALL)),
-                guard: Some(StartPositionClass {
-                    offset: 1,
-                    set: byte_set(b"Z"),
-                }),
+                scanner: Some(positioned_scanner(1, StartScanner::One(b'Z'))),
+                guard: None,
                 force_haystack_start: false,
             },
             &haystacks,
@@ -2438,15 +2977,10 @@ mod tests {
             "high-byte-root-with-nul-guard",
             &[(0x80, 0xff), (0, 0), (0xfe, 0xff)],
             StartFilterProof {
-                scanner: Some(StartScanner::Set(ByteSet::from_words([
-                    0,
-                    0,
-                    u64::MAX,
-                    u64::MAX,
-                ]))),
+                scanner: Some(positioned_scanner(1, StartScanner::One(0))),
                 guard: Some(StartPositionClass {
-                    offset: 1,
-                    set: byte_set(&[0]),
+                    offset: 2,
+                    set: byte_set(&[0xfe, 0xff]),
                 }),
                 force_haystack_start: false,
             },
@@ -2554,7 +3088,7 @@ mod tests {
                 .get()
                 .expect("exhaustive search publishes proof"),
             &StartFilterProof {
-                scanner: Some(StartScanner::One(b'Q')),
+                scanner: Some(root_scanner(StartScanner::One(b'Q'))),
                 guard: None,
                 force_haystack_start: false,
             }
@@ -2588,7 +3122,7 @@ mod tests {
         );
 
         let expected = StartFilterProof {
-            scanner: Some(StartScanner::One(b'Q')),
+            scanner: Some(root_scanner(StartScanner::One(b'Q'))),
             guard: Some(StartPositionClass {
                 offset: 2,
                 set: byte_set(b"Z"),
@@ -2638,10 +3172,10 @@ mod tests {
     #[test]
     fn start_scanners_honor_exact_admitted_work() {
         let scanners = [
-            scanner_for(b"a"),
-            scanner_for(b"ab"),
-            scanner_for(b"abc"),
-            scanner_for(b"abcd"),
+            root_scanner(scanner_for(b"a")),
+            root_scanner(scanner_for(b"ab")),
+            root_scanner(scanner_for(b"abc")),
+            root_scanner(scanner_for(b"abcd")),
         ];
         for scanner in &scanners {
             let mut exact = WorkMeter::new(10, 7);
@@ -2703,7 +3237,7 @@ mod tests {
         let mut empty_meter = WorkMeter::new(7, 7);
         assert_eq!(
             super::next_start_candidate(
-                &StartScanner::Empty,
+                &root_scanner(StartScanner::Empty),
                 b"_xxx_",
                 1,
                 4,
@@ -2726,7 +3260,13 @@ mod tests {
             .get()
             .expect("successful absolute search publishes its proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(StartScanner::Empty)));
+        assert!(matches!(
+            proof.scanner,
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::Empty,
+            })
+        ));
     }
 
     #[test]
@@ -2753,7 +3293,7 @@ mod tests {
                     .unwrap()
             };
             let proof_work = graph_work
-                .checked_add(expected_scanner_selection_work(bytes.len()))
+                .checked_add(expected_filter_selection_work(1, bytes.len()))
                 .unwrap();
             assert_eq!(
                 cold.accounting()
@@ -2770,8 +3310,9 @@ mod tests {
                 .scanner
                 .as_ref()
                 .expect("a selective byte root enables start scanning");
+            assert_eq!(scanner.offset, 0);
             assert!(matches!(
-                (bytes, scanner),
+                (bytes, &scanner.scanner),
                 (b"", StartScanner::Empty)
                     | (b"a", StartScanner::One(b'a'))
                     | (b"ab", StartScanner::Two(b'a', b'b'))
@@ -2808,7 +3349,7 @@ mod tests {
             .unwrap();
         assert_eq!(cold.output(), warm.output());
         let specialization_work = 4_u64
-            .checked_add(expected_scanner_selection_work(1))
+            .checked_add(expected_filter_selection_work(1, 1))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -2893,8 +3434,8 @@ mod tests {
         ));
         assert!(automaton.start_filter_proof.get().is_none());
 
-        // Once all bitmap words are admitted and counted, retaining the
-        // scalar set scanner is the next indivisible construction charge.
+        // Once all bitmap words are admitted and counted, choosing this
+        // position is the next indivisible selection charge.
         let population_admitted = admitted.checked_add(population_work).unwrap();
         let error = automaton
             .prepare::<Span>()
@@ -2914,18 +3455,21 @@ mod tests {
                 requested,
                 ..
             } if consumed == population_admitted
-                && requested == u64::try_from(BYTE_START_SET_SCANNER_SELECTION_WORK).unwrap()
+                && requested == u64::try_from(START_FILTER_SCANNER_SELECTION_WORK).unwrap()
         ));
         assert!(automaton.start_filter_proof.get().is_none());
 
-        // A small scanner charges its member extraction after the same four
-        // population operations and likewise cannot publish on refusal.
+        // A small scanner charges its member extraction after population and
+        // exact-position selection, and likewise cannot publish on refusal.
         let small = ascii_literal(b'a');
         let mut small_workspace = K0Workspace::new(&small, WorkspaceLimits::unlimited()).unwrap();
         let small_proof_work = 4_u64;
         let small_extraction_limit = INVOCATION_RESET_WORK
             .checked_add(small_proof_work)
             .and_then(|work| work.checked_add(population_work))
+            .and_then(|work| {
+                work.checked_add(u64::try_from(START_FILTER_SCANNER_SELECTION_WORK).unwrap())
+            })
             .unwrap();
         let error = small
             .prepare::<Span>()
@@ -2952,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_guard_selection_does_not_publish_unpaid_specialization() {
+    fn refused_class_selection_does_not_publish_unpaid_specialization() {
         let ranges = [(b'Q', b'Q'), (0, 0xff), (b'Z', b'Z')];
         let measured = byte_chain(&ranges);
         let mut measured_workspace =
@@ -2967,10 +3511,10 @@ mod tests {
         .unwrap();
         assert_eq!(proof.length, 3);
 
-        let guard_work = expected_guard_selection_work(proof.length);
-        let one_below_guard = INVOCATION_RESET_WORK
+        let selection_work = expected_start_class_selection_work(proof.length);
+        let one_below_selection = INVOCATION_RESET_WORK
             .checked_add(proof_meter.consumed)
-            .and_then(|work| work.checked_add(guard_work))
+            .and_then(|work| work.checked_add(selection_work))
             .and_then(|work| work.checked_sub(1))
             .unwrap();
         let automaton = byte_chain(&ranges);
@@ -2981,7 +3525,7 @@ mod tests {
                 b"QxZ",
                 &mut workspace,
                 SearchLimits {
-                    max_work: one_below_guard,
+                    max_work: one_below_selection,
                     max_scratch_bytes: usize::MAX,
                 },
             )
@@ -2993,11 +3537,11 @@ mod tests {
                 consumed,
                 requested: 1,
                 position: 0,
-            } if limit == one_below_guard && consumed == one_below_guard
+            } if limit == one_below_selection && consumed == one_below_selection
         ));
         assert!(
             automaton.start_filter_proof.get().is_none(),
-            "a refused guard comparison must not publish a partial proof"
+            "a refused class comparison must not publish a partial proof"
         );
 
         automaton
@@ -3027,7 +3571,7 @@ mod tests {
             .unwrap();
         let specialization_admitted = INVOCATION_RESET_WORK
             .checked_add(proof_work)
-            .and_then(|work| work.checked_add(expected_scanner_selection_work(root.len())))
+            .and_then(|work| work.checked_add(expected_filter_selection_work(1, root.len())))
             .unwrap();
         let probe = ascii_root_bytes(&root);
         let mut probe_workspace = K0Workspace::new(&probe, WorkspaceLimits::unlimited()).unwrap();
@@ -3068,7 +3612,7 @@ mod tests {
             .search_with_workspace(b"za", &mut workspace, SearchLimits::unlimited())
             .unwrap();
         let specialization_work = proof_work
-            .checked_add(expected_scanner_selection_work(root.len()))
+            .checked_add(expected_filter_selection_work(1, root.len()))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -3249,7 +3793,13 @@ mod tests {
             .get()
             .expect("exhaustive successful search publishes the proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(StartScanner::One(b':'))));
+        assert!(matches!(
+            proof.scanner,
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::One(b':'),
+            })
+        ));
         assert_eq!(
             proof.guard,
             Some(StartPositionClass {
@@ -3354,7 +3904,13 @@ mod tests {
             .get()
             .expect("successful search publishes the proof");
         assert!(proof.force_haystack_start);
-        assert!(matches!(proof.scanner, Some(StartScanner::One(b':'))));
+        assert!(matches!(
+            proof.scanner,
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::One(b':'),
+            })
+        ));
         assert_eq!(
             proof.guard,
             Some(StartPositionClass {
@@ -3367,9 +3923,8 @@ mod tests {
             .prepare::<Span>()
             .search_with_workspace(&haystack, &mut workspace, SearchLimits::unlimited())
             .unwrap();
-        let specialization_work = 14_u64
-            .checked_add(expected_guard_selection_work(4))
-            .and_then(|work| work.checked_add(expected_scanner_selection_work(1)))
+        let specialization_work = 16_u64
+            .checked_add(expected_filter_selection_work(4, 1))
             .unwrap();
         assert_eq!(
             cold.accounting()
@@ -3536,15 +4091,15 @@ mod tests {
             automaton
                 .start_filter_proof
                 .get()
-                .expect("start proof should be initialized")
-                .scanner
-                .as_ref()
-                .and_then(|scanner| match scanner {
-                    StartScanner::Set(set) => Some(set.words()),
-                    _ => None,
-                })
-                .expect("digit root should retain a bitmap scanner"),
-            [0x03ff_0000_0000_0000, 0, 0, 0]
+                .expect("start proof should be initialized"),
+            &StartFilterProof {
+                scanner: Some(positioned_scanner(1, StartScanner::One(b'/'))),
+                guard: Some(StartPositionClass {
+                    offset: 0,
+                    set: byte_range_set(b'0', b'9'),
+                }),
+                force_haystack_start: false,
+            }
         );
         assert_eq!(accounting.boundaries(), 3);
         assert!(accounting.transition_work() < 120);
@@ -3644,7 +4199,10 @@ mod tests {
                 .get()
                 .expect("asserted proof should be initialized")
                 .scanner,
-            Some(StartScanner::One(b'a'))
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::One(b'a'),
+            })
         ));
 
         let high = Automaton::from_raw(
@@ -3669,12 +4227,10 @@ mod tests {
                 .get()
                 .expect("high-byte proof should be initialized")
                 .scanner,
-            Some(StartScanner::Set(ByteSet::from_words([
-                0,
-                0,
-                u64::MAX,
-                u64::MAX,
-            ])))
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::Set(ByteSet::from_words([0, 0, u64::MAX, u64::MAX,])),
+            })
         );
     }
 }

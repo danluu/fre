@@ -4,9 +4,9 @@ use std::sync::OnceLock;
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 
 /// Number of exact consumed-byte positions retained by the bounded start
-/// filter. Offset zero is the scanner; offsets one through three are eligible
-/// to supply one candidate guard.
-pub(crate) const START_FILTER_POSITION_COUNT: usize = 4;
+/// filter. Any of offsets zero through seven may supply the primary scanner;
+/// at most one other position may supply a candidate guard.
+pub(crate) const START_FILTER_POSITION_COUNT: usize = 8;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
 /// Maximum candidate guards retained by one immutable start-filter proof.
@@ -19,18 +19,21 @@ pub(crate) const BYTE_START_MEMBER_EXTRACTION_WORK: usize = 1;
 pub(crate) const BYTE_START_SMALL_MAX_MEMBERS: usize = 3;
 /// Exact abstract work to retain a broad bitmap scanner.
 pub(crate) const BYTE_START_SET_SCANNER_SELECTION_WORK: usize = 1;
-/// Exact abstract work to compare one later position with the incumbent guard.
+/// Exact abstract work to compare one position with the incumbent scanner.
+pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compare one non-scanner position with the incumbent
+/// guard.
 pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
-/// Largest later-position byte class selective enough to retain as a guard.
+/// Largest non-scanner byte class selective enough to retain as a guard.
 /// Sixty-four members are one quarter of the complete 256-byte domain.
 pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
-/// Conservative selection bound: population plus the largest one-to-three
-/// member extraction for offset zero, then population and comparison for
-/// every eligible guard offset.
-pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = BYTE_START_BITMAP_POPULATION_WORK
-    + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK
-    + START_FILTER_MAX_OFFSET
-        * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_GUARD_SELECTION_WORK);
+/// Conservative selection bound: count and compare every exact-position set,
+/// compare every non-scanner set for the optional guard, then construct the
+/// largest direct scanner.
+pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
+    * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
+    + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
+    + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -312,7 +315,7 @@ impl ByteSet {
     }
 }
 
-/// Immutable scanner selected from a proved offset-zero byte set.
+/// Immutable scanner selected from one proved exact-position byte set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartScanner {
     Empty,
@@ -329,10 +332,17 @@ pub(crate) struct StartPositionClass {
     pub(crate) set: ByteSet,
 }
 
+/// Scanner and exact consumed-byte offset used to recover candidate starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartPositionScanner {
+    pub(crate) offset: u8,
+    pub(crate) scanner: StartScanner,
+}
+
 /// Immutable bounded start-filter proof published after a successful search.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StartFilterProof {
-    pub(crate) scanner: Option<StartScanner>,
+    pub(crate) scanner: Option<StartPositionScanner>,
     pub(crate) guard: Option<StartPositionClass>,
     pub(crate) force_haystack_start: bool,
 }
@@ -492,7 +502,7 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // up to four exact-position byte classes and selects a scanner plus
+        // up to eight exact-position byte classes and selects a scanner plus
         // one guard. Each depth may inspect a state twice and a consuming edge
         // twice while building the next frontier, in addition to the ordinary
         // edge inspection. Later invocations read the automaton-owned result.
