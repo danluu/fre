@@ -273,21 +273,19 @@ struct MiddleSymbol {
 
 /// One exact occurrence of either retained anchor.
 ///
-/// The forward pass fills the three facts needed when this occurrence is a
-/// terminal and the two prefix facts needed when it is a start. The reverse
-/// pass fills the remaining start fact. Keeping only those six facts makes the
-/// source-independent scratch ceiling materially smaller than retaining a
-/// complete prefix record at every input boundary.
+/// The forward pass fills the three prefix facts needed at the start. The
+/// reverse pass fills the remaining suffix fact needed at the end. The
+/// compile proof that every anchor byte is in `D` lets execution derive the
+/// end invalid/data ranks from the start ranks and literal length. Compact
+/// boundaries are sound while the event route's source-free width gate holds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AnchorOccurrence {
-    start: usize,
-    end: usize,
-    start_invalid: usize,
-    start_data: usize,
-    start_first_run: usize,
-    end_invalid: usize,
-    end_data: usize,
-    end_last_run: usize,
+    start: u32,
+    end: u32,
+    start_invalid: u32,
+    start_data: u32,
+    start_first_run: u32,
+    end_last_run: u32,
 }
 
 struct AnchorEvents {
@@ -484,10 +482,14 @@ fn event_prospective(
     plan: &OrderedBoundedSpanSumPlan,
     input_bytes: usize,
 ) -> Result<OperationProspective, Error> {
+    u32::try_from(input_bytes).map_err(|_| Error::ArithmeticOverflow {
+        resource: Resource::Boundaries,
+    })?;
     let boundaries = add(input_bytes, 1, Resource::Boundaries)?;
     let first_events = anchor_occurrence_upper(input_bytes, plan.first_anchor().len())?;
     let second_events = anchor_occurrence_upper(input_bytes, plan.second_anchor().len())?;
-    let event_upper = add(first_events, second_events, Resource::MatchEvents)?;
+    let event_upper =
+        combined_anchor_occurrence_upper(input_bytes, plan.first_anchor(), plan.second_anchor())?;
     let allocation_upper = usize::from(first_events != 0)
         .checked_add(usize::from(second_events != 0))
         .ok_or(Error::ArithmeticOverflow {
@@ -503,19 +505,8 @@ fn event_prospective(
         event_bytes,
         Resource::ScratchBytes,
     )?;
-    let anchor_bytes = add(
-        plan.first_anchor().len(),
-        plan.second_anchor().len(),
-        Resource::ExecutionWork,
-    )?;
-    // Both complete anchor scans verify both retained literals at every
-    // first-byte candidate. `memchr2` emits at most one candidate per source
-    // position even when the two first bytes are equal.
-    let root_probes = mul(
-        mul(2, input_bytes, Resource::ExecutionWork)?,
-        anchor_bytes,
-        Resource::ExecutionWork,
-    )?;
+    let root_probes =
+        anchor_root_probe_upper(input_bytes, plan.first_anchor(), plan.second_anchor())?;
     let search_steps = mul(
         mul(2, event_upper, Resource::ExecutionWork)?,
         binary_search_step_upper(event_upper)?,
@@ -526,7 +517,7 @@ fn event_prospective(
         search_steps,
         Resource::ExecutionWork,
     )?;
-    let frontier_bookkeeping = mul(5, event_upper, Resource::ExecutionWork)?;
+    let frontier_bookkeeping = mul(4, event_upper, Resource::ExecutionWork)?;
     let work_bound = add(
         add(
             add(
@@ -534,7 +525,7 @@ fn event_prospective(
                 root_probes,
                 Resource::ExecutionWork,
             )?,
-            mul(6, event_upper, Resource::ExecutionWork)?,
+            mul(5, event_upper, Resource::ExecutionWork)?,
             Resource::ExecutionWork,
         )?,
         search_steps,
@@ -583,6 +574,95 @@ fn anchor_occurrence_upper(input_bytes: usize, anchor_bytes: usize) -> Result<us
         return Ok(0);
     };
     add(remaining, 1, Resource::MatchEvents)
+}
+
+fn combined_anchor_occurrence_upper(
+    input_bytes: usize,
+    first: &[u8],
+    second: &[u8],
+) -> Result<usize, Error> {
+    let independent = add(
+        anchor_occurrence_upper(input_bytes, first.len())?,
+        anchor_occurrence_upper(input_bytes, second.len())?,
+        Resource::MatchEvents,
+    )?;
+    if independent == 0 {
+        return Ok(0);
+    }
+    // Any adjacent distinct occurrence starts instantiate one of the four
+    // ordered literal pairs. Their distance must therefore be at least the
+    // minimum compatible positive shift across those pairs. At one start both
+    // literals can occur only when their common prefix is compatible.
+    let separation = minimum_positive_anchor_separation(first, second);
+    let distinct_starts = input_bytes.div_ceil(separation);
+    let same_start_multiplicity = if anchors_compatible_at_same_start(first, second) {
+        2
+    } else {
+        1
+    };
+    let correlated = mul(
+        distinct_starts,
+        same_start_multiplicity,
+        Resource::MatchEvents,
+    )?;
+    Ok(independent.min(correlated))
+}
+
+fn minimum_positive_anchor_separation(first: &[u8], second: &[u8]) -> usize {
+    [first, second]
+        .into_iter()
+        .flat_map(|left| {
+            [first, second]
+                .into_iter()
+                .map(move |right| minimum_compatible_shift(left, right))
+        })
+        .min()
+        .unwrap_or(1)
+}
+
+fn minimum_compatible_shift(left: &[u8], right: &[u8]) -> usize {
+    for shift in 1..=left.len() {
+        let suffix = &left[shift..];
+        let overlap = suffix.len().min(right.len());
+        if suffix[..overlap] == right[..overlap] {
+            return shift;
+        }
+    }
+    left.len()
+}
+
+fn anchors_compatible_at_same_start(first: &[u8], second: &[u8]) -> bool {
+    let overlap = first.len().min(second.len());
+    first[..overlap] == second[..overlap]
+}
+
+fn anchor_root_probe_upper(
+    input_bytes: usize,
+    first: &[u8],
+    second: &[u8],
+) -> Result<usize, Error> {
+    if isolated_distinct_anchor_leads(first, second) {
+        // In each of the two complete scans, charge one probe per candidate
+        // plus every source position at most once to the candidate prefix
+        // that reaches it. Because neither retained lead byte occurs in
+        // either literal suffix, those reached intervals cannot overlap
+        // before the next candidate.
+        return mul(4, input_bytes, Resource::ExecutionWork);
+    }
+    let anchor_bytes = add(first.len(), second.len(), Resource::ExecutionWork)?;
+    mul(
+        mul(2, input_bytes, Resource::ExecutionWork)?,
+        anchor_bytes,
+        Resource::ExecutionWork,
+    )
+}
+
+fn isolated_distinct_anchor_leads(first: &[u8], second: &[u8]) -> bool {
+    first[0] != second[0]
+        && !first[1..].contains(&first[0])
+        && !first[1..].contains(&second[0])
+        && !second[1..].contains(&first[0])
+        && !second[1..].contains(&second[0])
 }
 
 fn binary_search_step_upper(items: usize) -> Result<usize, Error> {
@@ -749,8 +829,8 @@ fn reduce_events(
     let mut events = AnchorEvents { first, second };
     scan_anchor_candidates(plan, haystack, accounting, |direction, start, end| {
         let occurrence = AnchorOccurrence {
-            start,
-            end,
+            start: compact_event_value(start, Resource::Boundaries)?,
+            end: compact_event_value(end, Resource::Boundaries)?,
             ..AnchorOccurrence::default()
         };
         let target = if direction == 0 {
@@ -771,6 +851,16 @@ fn reduce_events(
     let total_runs = annotate_forward(plan, haystack, &mut events, accounting)?;
     annotate_reverse(plan, haystack, &mut events, total_runs, accounting)?;
     reduce_annotated_events(plan, &events, total_runs, accounting)
+}
+
+fn compact_event_value(value: usize, resource: Resource) -> Result<u32, Error> {
+    u32::try_from(value).map_err(|_| Error::ArithmeticOverflow { resource })
+}
+
+fn expand_event_value(value: u32) -> Result<usize, Error> {
+    usize::try_from(value).map_err(|_| {
+        Error::InternalInvariant("ordered bounded-span compact event value does not fit usize")
+    })
 }
 
 fn exact_occurrences(
@@ -826,12 +916,13 @@ fn scan_anchor_candidates(
     let second = plan.second_anchor();
     for start in memchr::memchr2_iter(first[0], second[0], haystack) {
         charge_anchor_candidate(accounting)?;
-        if literal_matches(haystack, start, first, accounting)? {
+        let candidate = haystack[start];
+        if candidate == first[0] && literal_matches(haystack, start, first, accounting)? {
             charge_anchor_occurrence(accounting)?;
             let end = add(start, first.len(), Resource::Boundaries)?;
             observe(0, start, end)?;
         }
-        if literal_matches(haystack, start, second, accounting)? {
+        if candidate == second[0] && literal_matches(haystack, start, second, accounting)? {
             charge_anchor_occurrence(accounting)?;
             let end = add(start, second.len(), Resource::Boundaries)?;
             observe(1, start, end)?;
@@ -862,29 +953,20 @@ fn annotate_forward(
 ) -> Result<usize, Error> {
     charge_complete_source_pass(accounting, haystack.len())?;
     let mut first_start = 0_usize;
-    let mut first_end = 0_usize;
     let mut second_start = 0_usize;
-    let mut second_end = 0_usize;
     let mut invalid_prefix = 0_usize;
     let mut data_prefix = 0_usize;
     let mut first_run_prefix = 0_usize;
     let mut in_data_run = false;
     let mut run_has_data_only = false;
-    let mut next_annotation = forward_annotation_boundary(
-        &events.first,
-        first_start,
-        first_end,
-        &events.second,
-        second_start,
-        second_end,
-    );
+    let mut next_annotation =
+        forward_annotation_boundary(&events.first, first_start, &events.second, second_start)?;
 
     for boundary in 0..=haystack.len() {
         if next_annotation == Some(boundary) {
             annotate_forward_boundary(
                 events.first.as_mut_slice(),
                 &mut first_start,
-                &mut first_end,
                 boundary,
                 invalid_prefix,
                 data_prefix,
@@ -894,7 +976,6 @@ fn annotate_forward(
             annotate_forward_boundary(
                 events.second.as_mut_slice(),
                 &mut second_start,
-                &mut second_end,
                 boundary,
                 invalid_prefix,
                 data_prefix,
@@ -904,11 +985,9 @@ fn annotate_forward(
             next_annotation = forward_annotation_boundary(
                 &events.first,
                 first_start,
-                first_end,
                 &events.second,
                 second_start,
-                second_end,
-            );
+            )?;
         }
         if boundary == haystack.len() {
             break;
@@ -937,11 +1016,7 @@ fn annotate_forward(
             invalid_prefix = add(invalid_prefix, 1, Resource::Boundaries)?;
         }
     }
-    if first_start != events.first.len()
-        || first_end != events.first.len()
-        || second_start != events.second.len()
-        || second_end != events.second.len()
-    {
+    if first_start != events.first.len() || second_start != events.second.len() {
         return Err(Error::InternalInvariant(
             "ordered bounded-span forward annotation missed an anchor boundary",
         ));
@@ -952,61 +1027,47 @@ fn annotate_forward(
 fn forward_annotation_boundary(
     first: &[AnchorOccurrence],
     first_start: usize,
-    first_end: usize,
     second: &[AnchorOccurrence],
     second_start: usize,
-    second_end: usize,
-) -> Option<usize> {
+) -> Result<Option<usize>, Error> {
     [
         first.get(first_start).map(|event| event.start),
-        first.get(first_end).map(|event| event.end),
         second.get(second_start).map(|event| event.start),
-        second.get(second_end).map(|event| event.end),
     ]
     .into_iter()
     .flatten()
     .min()
+    .map(expand_event_value)
+    .transpose()
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the two monotone occurrence cursors receive one shared boundary fact tuple"
+    reason = "the monotone occurrence cursor receives one shared boundary fact tuple"
 )]
 fn annotate_forward_boundary(
     events: &mut [AnchorOccurrence],
     start_index: &mut usize,
-    end_index: &mut usize,
     boundary: usize,
     invalid_prefix: usize,
     data_prefix: usize,
     first_run_prefix: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(), Error> {
+    let compact_boundary = compact_event_value(boundary, Resource::Boundaries)?;
     while events
         .get(*start_index)
-        .is_some_and(|event| event.start == boundary)
+        .is_some_and(|event| event.start == compact_boundary)
     {
         let event = events
             .get_mut(*start_index)
             .ok_or(Error::InternalInvariant(
                 "ordered bounded-span start annotation escaped its event slice",
             ))?;
-        event.start_invalid = invalid_prefix;
-        event.start_data = data_prefix;
-        event.start_first_run = first_run_prefix;
+        event.start_invalid = compact_event_value(invalid_prefix, Resource::Boundaries)?;
+        event.start_data = compact_event_value(data_prefix, Resource::Boundaries)?;
+        event.start_first_run = compact_event_value(first_run_prefix, Resource::Boundaries)?;
         *start_index = add(*start_index, 1, Resource::MatchEvents)?;
-        charge_event_annotation(accounting)?;
-    }
-    while events
-        .get(*end_index)
-        .is_some_and(|event| event.end == boundary)
-    {
-        let event = events.get_mut(*end_index).ok_or(Error::InternalInvariant(
-            "ordered bounded-span end annotation escaped its event slice",
-        ))?;
-        event.end_invalid = invalid_prefix;
-        event.end_data = data_prefix;
-        *end_index = add(*end_index, 1, Resource::MatchEvents)?;
         charge_event_annotation(accounting)?;
     }
     Ok(())
@@ -1027,7 +1088,7 @@ fn annotate_reverse(
     let mut run_has_data_only = false;
     let mut boundary = haystack.len();
     let mut next_annotation =
-        reverse_annotation_boundary(&events.first, first_end, &events.second, second_end);
+        reverse_annotation_boundary(&events.first, first_end, &events.second, second_end)?;
 
     loop {
         if next_annotation == Some(boundary) {
@@ -1046,7 +1107,7 @@ fn annotate_reverse(
                 accounting,
             )?;
             next_annotation =
-                reverse_annotation_boundary(&events.first, first_end, &events.second, second_end);
+                reverse_annotation_boundary(&events.first, first_end, &events.second, second_end)?;
         }
         if boundary == 0 {
             break;
@@ -1086,7 +1147,7 @@ fn reverse_annotation_boundary(
     first_end: usize,
     second: &[AnchorOccurrence],
     second_end: usize,
-) -> Option<usize> {
+) -> Result<Option<usize>, Error> {
     [
         first_end
             .checked_sub(1)
@@ -1100,6 +1161,8 @@ fn reverse_annotation_boundary(
     .into_iter()
     .flatten()
     .max()
+    .map(expand_event_value)
+    .transpose()
 }
 
 fn annotate_reverse_boundary(
@@ -1109,10 +1172,11 @@ fn annotate_reverse_boundary(
     last_run_suffix: usize,
     accounting: &mut ExecutionAccounting,
 ) -> Result<(), Error> {
+    let compact_boundary = compact_event_value(boundary, Resource::Boundaries)?;
     while end_index
         .checked_sub(1)
         .and_then(|index| events.get(index))
-        .is_some_and(|event| event.end == boundary)
+        .is_some_and(|event| event.end == compact_boundary)
     {
         *end_index = end_index.checked_sub(1).ok_or(Error::InternalInvariant(
             "ordered bounded-span reverse event index underflow",
@@ -1120,7 +1184,7 @@ fn annotate_reverse_boundary(
         let event = events.get_mut(*end_index).ok_or(Error::InternalInvariant(
             "ordered bounded-span reverse annotation escaped its event slice",
         ))?;
-        event.end_last_run = last_run_suffix;
+        event.end_last_run = compact_event_value(last_run_suffix, Resource::Boundaries)?;
         charge_event_annotation(accounting)?;
     }
     Ok(())
@@ -1134,7 +1198,7 @@ fn reduce_annotated_events(
 ) -> Result<(usize, usize), Error> {
     let mut first_index = 0_usize;
     let mut second_index = 0_usize;
-    let mut minimum_start = 0_usize;
+    let mut minimum_start = 0_u32;
     let mut matches = 0_usize;
     let mut span_sum = 0_usize;
 
@@ -1189,16 +1253,13 @@ fn reduce_annotated_events(
         accounting.emitted_matches = add(accounting.emitted_matches, 1, Resource::MatchEvents)?;
         accounting.work = add(accounting.work, 1, Resource::ExecutionWork)?;
         matches = add(matches, 1, Resource::OutputMatches)?;
-        span_sum = add(
-            span_sum,
-            terminal
-                .end
-                .checked_sub(starter.start)
-                .ok_or(Error::InternalInvariant(
-                    "ordered bounded-span event route selected a reversed match",
-                ))?,
-            Resource::SpanSum,
-        )?;
+        let span = terminal
+            .end
+            .checked_sub(starter.start)
+            .ok_or(Error::InternalInvariant(
+                "ordered bounded-span event route selected a reversed match",
+            ))?;
+        span_sum = add(span_sum, expand_event_value(span)?, Resource::SpanSum)?;
         minimum_start = terminal.end;
     }
     Ok((matches, span_sum))
@@ -1228,11 +1289,11 @@ fn latest_terminal_index(
             "ordered bounded-span terminal search escaped its event slice",
         ))?;
         let run_sum = add(
-            terminal.start_first_run,
-            starter.end_last_run,
+            expand_event_value(terminal.start_first_run)?,
+            expand_event_value(starter.end_last_run)?,
             Resource::ExecutionWork,
         )?;
-        let admissible = terminal.start_invalid == starter.end_invalid && run_sum <= run_limit;
+        let admissible = terminal.start_invalid == starter.start_invalid && run_sum <= run_limit;
         if admissible {
             left = add(middle, 1, Resource::MatchEvents)?;
         } else {
@@ -1248,7 +1309,20 @@ fn latest_terminal_index(
     let latest = terminals.get(latest_index).ok_or(Error::InternalInvariant(
         "ordered bounded-span latest terminal escaped its event slice",
     ))?;
-    if latest.start == starter.end || latest.start_data > starter.end_data {
+    let anchor_data = starter
+        .end
+        .checked_sub(starter.start)
+        .ok_or(Error::InternalInvariant(
+            "ordered bounded-span compact starter boundaries reversed",
+        ))?;
+    let starter_end_data =
+        starter
+            .start_data
+            .checked_add(anchor_data)
+            .ok_or(Error::InternalInvariant(
+                "ordered bounded-span compact data rank overflowed",
+            ))?;
+    if latest.start == starter.end || latest.start_data > starter_end_data {
         return Ok(Some(latest_index));
     }
     // A nonempty separator-only middle is not in the language. All earlier
@@ -1265,7 +1339,7 @@ fn latest_terminal_index(
 
 fn lower_bound_terminal(
     terminals: &[AnchorOccurrence],
-    target: usize,
+    target: u32,
     accounting: &mut ExecutionAccounting,
 ) -> Result<usize, Error> {
     let mut left = 0_usize;
@@ -1976,6 +2050,13 @@ mod tests {
         }
     }
 
+    fn literal_occurrences(haystack: &[u8], literal: &[u8]) -> usize {
+        haystack
+            .windows(literal.len())
+            .filter(|window| *window == literal)
+            .count()
+    }
+
     fn assert_pre_source_refusal(
         compiled: &CompiledRegex,
         haystack: &[u8],
@@ -2188,13 +2269,13 @@ mod tests {
 
     #[test]
     fn ordered_bounded_span_sum_economics_choose_zero_allocation_dense_frontier() {
-        let pattern = r"(?:a(?:_*[ab]+_*){0,1}b)|(?:b(?:_*[ab]+_*){0,1}a)";
+        let pattern = r"(?:a(?:_*[ab]+_*){0,1}ab)|(?:ab(?:_*[ab]+_*){0,1}a)";
         let compiled = compiled(pattern);
         let plan = compiled
             .ordered_bounded_span_sum
             .as_ref()
             .expect("ordered bounded-span plan");
-        let input_bytes = 1_048_576;
+        let input_bytes = 2_097_152;
         let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
         let frontier = frontier_prospective(&compiled.program, plan, input_bytes).unwrap();
         assert!(events.work_bound > frontier.work_bound);
@@ -2224,23 +2305,24 @@ mod tests {
     #[test]
     fn ordered_bounded_span_sum_economics_threshold_covers_overlap_and_intersection() {
         // The retained anchors `a` and `ab` overlap by prefix, while space is
-        // in both S and D. At this exact source-independent boundary the event
-        // upper changes from 2^20-1 to 2^20+1, adding one binary-search rank
-        // step and making the fixed frontier the strict work winner.
+        // in both S and D. Compact event bookkeeping moves the exact
+        // source-independent crossover up one binary-search rank: the event
+        // upper changes from 2^21-1 to 2^21+1, making the fixed frontier the
+        // strict work winner.
         let pattern = r"(?:a(?:[ _]*[ ab]+[ _]*){0,1}ab)|(?:ab(?:[ _]*[ ab]+[ _]*){0,1}a)";
         let compiled = compiled(pattern);
         let plan = compiled
             .ordered_bounded_span_sum
             .as_ref()
             .expect("ordered bounded-span plan");
-        let below = 524_288;
+        let below = 1_048_576;
         let threshold = below + 1;
         let below_events = event_prospective(&compiled.program, plan, below).unwrap();
         let below_frontier = frontier_prospective(&compiled.program, plan, below).unwrap();
         let threshold_events = event_prospective(&compiled.program, plan, threshold).unwrap();
         let threshold_frontier = frontier_prospective(&compiled.program, plan, threshold).unwrap();
-        assert_eq!(below_events.match_events, (1 << 20) - 1);
-        assert_eq!(threshold_events.match_events, (1 << 20) + 1);
+        assert_eq!(below_events.match_events, (1 << 21) - 1);
+        assert_eq!(threshold_events.match_events, (1 << 21) + 1);
         assert!(below_events.work_bound < below_frontier.work_bound);
         assert!(threshold_events.work_bound > threshold_frontier.work_bound);
         assert_eq!(
@@ -2275,7 +2357,7 @@ mod tests {
                 &haystack,
                 0..haystack.len(),
                 Strategy::ReverseSequentialRows,
-                OperationLimits::default(),
+                super::super::intrinsic_attempt_limits(),
             )
             .unwrap();
         assert_eq!(attempt.value, expected);
@@ -2294,21 +2376,21 @@ mod tests {
     }
 
     #[test]
-    fn ordered_bounded_span_sum_events_survive_frontier_work_overflow() {
+    fn ordered_bounded_span_sum_compact_events_refuse_wider_inputs() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
         let compiled = compiled(PATTERN);
         let plan = compiled
             .ordered_bounded_span_sum
             .as_ref()
             .expect("ordered bounded-span plan");
-        let input_bytes = usize::MAX / 512;
-        let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
+        let input_bytes = usize::try_from(u32::MAX).unwrap().checked_add(1).unwrap();
         assert!(matches!(
-            frontier_prospective(&compiled.program, plan, input_bytes),
-            Err(Error::ArithmeticOverflow { .. })
-        ));
-        assert!(matches!(
-            frontier_work_envelope(plan, input_bytes),
-            Err(Error::ArithmeticOverflow { .. })
+            event_prospective(&compiled.program, plan, input_bytes),
+            Err(Error::ArithmeticOverflow {
+                resource: Resource::Boundaries
+            })
         ));
         let selection = select_executor(
             &compiled.program,
@@ -2318,8 +2400,163 @@ mod tests {
             usize::MAX,
         )
         .unwrap();
+        assert_eq!(selection.executor, SelectedExecutor::Frontier);
+        assert_eq!(
+            selection.physical_route,
+            OperationPhysicalRoute::OrderedBoundedSpanSum
+        );
+        assert_eq!(
+            selection.prepublication_fallback,
+            OperationPrepublicationFallback::OrderedBoundedEventsThenFrontier
+        );
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_compact_event_record_has_fixed_width() {
+        assert_eq!(core::mem::size_of::<AnchorOccurrence>(), 24);
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_combined_event_bound_covers_cross_overlap() {
+        let cases: [(&[u8], &[u8], usize, usize); 7] = [
+            (b"ab", b"ba", 1, 1),
+            (b"abc", b"bc", 1, 1),
+            (b"bc", b"abc", 1, 1),
+            (b"ab", b"ab", 2, 2),
+            (b"aba", b"aba", 2, 2),
+            (b"aaaa", b"aaaa", 1, 2),
+            (b"a", b"aa", 1, 2),
+        ];
+        let alphabet = [b'a', b'b', b'c'];
+        for (first, second, separation, multiplicity) in cases {
+            assert_eq!(
+                minimum_positive_anchor_separation(first, second),
+                separation,
+                "first={first:?} second={second:?}"
+            );
+            assert_eq!(
+                if anchors_compatible_at_same_start(first, second) {
+                    2
+                } else {
+                    1
+                },
+                multiplicity,
+                "first={first:?} second={second:?}"
+            );
+            for length in 0_u32..=8 {
+                let variants = 3_usize.pow(length);
+                for encoded in 0..variants {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; usize::try_from(length).unwrap()];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    let actual = literal_occurrences(&haystack, first)
+                        + literal_occurrences(&haystack, second);
+                    let upper =
+                        combined_anchor_occurrence_upper(haystack.len(), first, second).unwrap();
+                    assert!(
+                        actual <= upper,
+                        "first={first:?} second={second:?} haystack={haystack:?} actual={actual} upper={upper}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_isolated_lead_probe_bound_is_exhaustive() {
+        let pattern = r"(?:ab(?:_*[a-d]+_*){0,2}cd)|(?:cd(?:_*[a-d]+_*){0,2}ab)";
+        let compiled = compiled(pattern);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        assert!(isolated_distinct_anchor_leads(
+            plan.first_anchor(),
+            plan.second_anchor()
+        ));
+        let alphabet = [b'a', b'c', b'b', b'x'];
+        let mut haystack = [0_u8; 8];
+        for encoded in 0_u32..65_536 {
+            let mut value = encoded;
+            for byte in &mut haystack {
+                *byte = alphabet[usize::try_from(value & 3).unwrap()];
+                value >>= 2;
+            }
+            let mut accounting = ExecutionAccounting::default();
+            for _ in 0..2 {
+                scan_anchor_candidates(plan, &haystack, &mut accounting, |_, _, _| Ok(())).unwrap();
+            }
+            let upper =
+                anchor_root_probe_upper(haystack.len(), plan.first_anchor(), plan.second_anchor())
+                    .unwrap();
+            assert!(
+                accounting.root_probes <= upper,
+                "haystack={haystack:?} actual={} upper={upper}",
+                accounting.root_probes
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_bounded_span_sum_holmes_events_fit_comparator_limits() {
+        const INPUT_BYTES: usize = 594_933;
+        let pattern = r"Holmes(?:\s*.+\s*){0,10}Watson|Watson(?:\s*.+\s*){0,10}Holmes";
+        let compiled = compiled(pattern);
+        let plan = compiled
+            .ordered_bounded_span_sum
+            .as_ref()
+            .expect("ordered bounded-span plan");
+        assert_eq!(
+            minimum_positive_anchor_separation(plan.first_anchor(), plan.second_anchor()),
+            6
+        );
+        assert!(!anchors_compatible_at_same_start(
+            plan.first_anchor(),
+            plan.second_anchor()
+        ));
+        let prospective = event_prospective(&compiled.program, plan, INPUT_BYTES).unwrap();
+        assert_eq!(prospective.match_events, 99_156);
+        let expected_scratch = core::mem::size_of::<AnchorEvents>()
+            .checked_add(
+                prospective
+                    .match_events
+                    .checked_mul(core::mem::size_of::<AnchorOccurrence>())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(prospective.scratch_bytes, expected_scratch);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(prospective.scratch_bytes, 2_379_792);
+        assert_eq!(prospective.random_access_bytes, 2_379_732);
+        assert_eq!(prospective.sequential_bytes, 2_379_732);
+        assert_eq!(prospective.work_bound, 12_791_079);
+
+        let comparator_limits = OperationLimits {
+            max_boundaries: 594_934,
+            max_table_cells: 0,
+            max_random_access_bytes: 2_392_192,
+            max_scratch_bytes: 2_392_192,
+            max_log_bytes: 38_075_776,
+            max_sequential_bytes: 76_746_485,
+            max_match_events: 1_189_868,
+            max_output_matches: 594_934,
+            max_output_bytes: 64 << 20,
+            max_span_sum: 594_933,
+            max_peak_bytes: 38_083_936,
+            max_work: 536_870_912,
+        };
+        let selection = select_executor(
+            &compiled.program,
+            plan,
+            INPUT_BYTES,
+            comparator_limits,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(selection.executor, SelectedExecutor::Events);
-        assert_eq!(selection.prospective, events);
         assert_eq!(
             selection.physical_route,
             OperationPhysicalRoute::OrderedBoundedSpanSumEvents
@@ -2328,6 +2565,7 @@ mod tests {
             selection.prepublication_fallback,
             OperationPrepublicationFallback::None
         );
+        assert_eq!(selection.prospective, prospective);
     }
 
     #[test]
@@ -2691,7 +2929,7 @@ mod tests {
         assert_eq!(baseline.receipt.actual.frontier_insertions, event_count * 2);
         assert_eq!(
             baseline.receipt.actual.frontier_bookkeeping,
-            event_count * 5
+            event_count * 4
         );
         let exact = exact_limits(&prospective);
         let exact_attempt = compiled
