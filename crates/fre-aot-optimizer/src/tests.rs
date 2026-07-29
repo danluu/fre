@@ -18,7 +18,7 @@ fn optimize(literal: &[u8]) -> OptimizedCountV3 {
 
 #[test]
 fn selection_and_every_identity_are_deterministic() {
-    assert_eq!(COUNT_V3_OPTIMIZER_VERSION, 5);
+    assert_eq!(COUNT_V3_OPTIMIZER_VERSION, 6);
     let left_program = program(b"header: x-fre-request-id");
     let right_program = program(b"header: x-fre-request-id");
     let left = optimize_count_v3(
@@ -424,6 +424,53 @@ fn width_three_and_four_direct_masks_compete_with_filtered_recipes() {
             );
         }
     }
+}
+
+#[test]
+fn equal_cost_filter_ties_prefer_both_literal_boundaries() {
+    let costs = CountV3CostVector {
+        sparse: 100,
+        dense: 100,
+        false_positive: 100,
+        matches: 100,
+        tail: 100,
+        code_size: 100,
+    };
+    let candidates = [
+        Candidate {
+            strategy: CountV3Strategy::SparseRareColumns,
+            schedule: CountV3ScheduleId::SparseColumnsV1,
+            filters: [0, 1, 2, 3],
+            filter_count: 4,
+            periodic_stride: 0,
+            costs,
+            ordinal: 0,
+            pareto: true,
+        },
+        Candidate {
+            strategy: CountV3Strategy::SparseRareColumns,
+            schedule: CountV3ScheduleId::SparseColumnsV1,
+            filters: [0, 7, 2, 3],
+            filter_count: 4,
+            periodic_stride: 0,
+            costs,
+            ordinal: 1,
+            pareto: true,
+        },
+    ];
+    assert_eq!(missing_boundary_filters(&candidates[0], 8), 1);
+    assert_eq!(missing_boundary_filters(&candidates[1], 8), 0);
+
+    let mut work = Work::default();
+    let (selected, regret) = select_candidate(
+        &candidates,
+        CountV3TuningClass::GenericAarch64,
+        8,
+        &mut work,
+    )
+    .expect("equal-cost selection");
+    assert_eq!(selected, 1);
+    assert_eq!(regret, 0);
 }
 
 #[test]

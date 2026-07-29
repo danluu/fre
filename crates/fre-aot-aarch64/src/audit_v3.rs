@@ -3935,50 +3935,58 @@ fn policy_multi_specialized_v3(
     condition_v3(policy, ConditionV3::CarryClear, vector)?;
     add_register64_v3(policy, X15, X0, X3)?;
     add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[0]))?;
-    add_immediate64_v3(policy, X9, X15, u16::from(filter.offsets[1]))?;
     for block in 0..SPARSE_SCAN_BLOCKS_V3 {
         let offset = block * SIMD_CANDIDATE_STARTS_V3;
+        let mask =
+            u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks");
         exact_v3(
             policy,
             DecodedInstructionV3::LoadVector128 {
-                destination: 0,
+                destination: mask,
                 base: X8,
                 offset,
             },
         )?;
         exact_v3(
             policy,
-            DecodedInstructionV3::LoadVector128 {
-                destination: 1,
-                base: X9,
-                offset,
-            },
-        )?;
-        exact_v3(
-            policy,
             DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 0,
-                left: 0,
+                destination: mask,
+                left: mask,
                 right: vector_registers[0],
             },
         )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::CompareEqualBytes16 {
-                destination: 1,
-                left: 1,
-                right: vector_registers[1],
-            },
-        )?;
-        exact_v3(
-            policy,
-            DecodedInstructionV3::AndBytes16 {
-                destination: u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
-                    .expect("eight sparse masks"),
-                left: 0,
-                right: 1,
-            },
-        )?;
+    }
+    for index in 1..usize::from(filter.len) {
+        add_immediate64_v3(policy, X8, X15, u16::from(filter.offsets[index]))?;
+        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+            let offset = block * SIMD_CANDIDATE_STARTS_V3;
+            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                .expect("eight sparse masks");
+            exact_v3(
+                policy,
+                DecodedInstructionV3::LoadVector128 {
+                    destination: 0,
+                    base: X8,
+                    offset,
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::CompareEqualBytes16 {
+                    destination: 0,
+                    left: 0,
+                    right: vector_registers[index],
+                },
+            )?;
+            exact_v3(
+                policy,
+                DecodedInstructionV3::AndBytes16 {
+                    destination: mask,
+                    left: mask,
+                    right: 0,
+                },
+            )?;
+        }
     }
     exact_v3(
         policy,

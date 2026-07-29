@@ -2521,10 +2521,11 @@ fn emit_multi_specialized_v3(
     assembler.add_imm(X3, X3, SPARSE_SCAN_STARTS_V3 - SIMD_CANDIDATE_STARTS_V3)?;
     assembler.branch(primary_sparse_scan)?;
 
-    // A composite-empty block whose primary is present takes the robust pair
-    // route. Advance once, then reduce eight pair-filter blocks per iteration.
-    // This avoids repeatedly rediscovering a common primary byte on input such
-    // as a long run of the primary with no secondary/full-filter match.
+    // A composite-empty block whose primary is present takes the complete
+    // filter route. Advance once, then evaluate every selected column across
+    // eight blocks before reducing. This keeps the normal 16-start path free
+    // of staged reductions while ensuring the wide fallback cannot stay blind
+    // to whichever later column rejected a dense near-match stream.
     assembler.bind(sparse_scan)?;
     assembler.add_imm(X3, X3, SIMD_CANDIDATE_STARTS_V3)?;
     assembler.cmp_reg64(X3, X4)?;
@@ -2534,22 +2535,31 @@ fn emit_multi_specialized_v3(
     assembler.branch_cond(ConditionV3::CarryClear, vector)?;
     assembler.add_reg(X15, X0, X3)?;
     assembler.add_imm(X8, X15, u16::from(filter.offsets[0]))?;
-    assembler.add_imm(X9, X15, u16::from(filter.offsets[1]))?;
     for block in 0..SPARSE_SCAN_BLOCKS_V3 {
         let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
             CountAotError::ArithmeticOverflow {
                 site: CountAotArithmeticSite::CodeOffset,
             },
         )?;
-        assembler.load_vector128_offset(0, X8, offset)?;
-        assembler.load_vector128_offset(1, X9, offset)?;
-        assembler.compare_equal_bytes16(0, 0, vector_registers[0])?;
-        assembler.compare_equal_bytes16(1, 1, vector_registers[1])?;
-        assembler.and_bytes16(
-            u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks"),
-            0,
-            1,
-        )?;
+        let mask =
+            u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block).expect("eight sparse masks");
+        assembler.load_vector128_offset(mask, X8, offset)?;
+        assembler.compare_equal_bytes16(mask, mask, vector_registers[0])?;
+    }
+    for index in 1..usize::from(filter.len) {
+        assembler.add_imm(X8, X15, u16::from(filter.offsets[index]))?;
+        for block in 0..SPARSE_SCAN_BLOCKS_V3 {
+            let offset = block.checked_mul(SIMD_CANDIDATE_STARTS_V3).ok_or(
+                CountAotError::ArithmeticOverflow {
+                    site: CountAotArithmeticSite::CodeOffset,
+                },
+            )?;
+            let mask = u8::try_from(u16::from(SPARSE_BLOCK_MASK_BASE_V3) + block)
+                .expect("eight sparse masks");
+            assembler.load_vector128_offset(0, X8, offset)?;
+            assembler.compare_equal_bytes16(0, 0, vector_registers[index])?;
+            assembler.and_bytes16(mask, mask, 0)?;
+        }
     }
     assembler.or_bytes16(
         SPARSE_PAIR_01_MASK_V3,

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// Canonical recipe schema emitted by this optimizer.
 pub const COUNT_V3_RECIPE_SCHEMA_VERSION: u16 = 3;
 /// Version of the deterministic portfolio and cost model.
-pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 5;
+pub const COUNT_V3_OPTIMIZER_VERSION: u16 = 6;
 /// Maximum number of filter columns in one recipe.
 pub const COUNT_V3_MAX_FILTER_OFFSETS: usize = 4;
 /// Maximum exact-literal width consumed by Count-v3.
@@ -956,7 +956,8 @@ fn optimize_impl(
         .iter()
         .filter(|candidate| candidate.pareto)
         .count();
-    let (selected_index, minimax_regret) = select_candidate(&candidates, tuning, &mut work)?;
+    let (selected_index, minimax_regret) =
+        select_candidate(&candidates, tuning, literal.len(), &mut work)?;
     let selected = candidates[selected_index];
     work.add(materialization_work(literal.len(), selected.filter_count)?)?;
     if work.0 > limits.max_analysis_work {
@@ -1824,6 +1825,7 @@ fn dominates(left: CountV3CostVector, right: CountV3CostVector) -> bool {
 fn select_candidate(
     candidates: &[Candidate],
     tuning: CountV3TuningClass,
+    literal_width: usize,
     work: &mut Work,
 ) -> Result<(usize, u64), CountV3OptimizeError> {
     let mut best_components = [u32::MAX; 6];
@@ -1860,10 +1862,12 @@ fn select_candidate(
                 },
             )?;
         }
+        work.add(u64::from(candidate.filter_count).saturating_mul(2))?;
         let score = SelectionScore {
             maximum_regret,
             total_regret,
             code_size: candidate.costs.code_size,
+            missing_boundary_filters: missing_boundary_filters(candidate, literal_width),
             strategy: candidate.strategy.wire_id(),
             filter_count: candidate.filter_count,
             filters: candidate.filters,
@@ -1886,10 +1890,27 @@ struct SelectionScore {
     maximum_regret: u64,
     total_regret: u64,
     code_size: u32,
+    missing_boundary_filters: u8,
     strategy: u8,
     filter_count: u8,
     filters: [u8; COUNT_V3_MAX_FILTER_OFFSETS],
     ordinal: u16,
+}
+
+/// Prefer boundary coverage only after modeled costs and code size tie.
+///
+/// Equal-cost candidates commonly arise when several distinct literal bytes
+/// share one coarse prevalence class. Raw offset order is not a performance
+/// signal. Covering both boundaries is a deterministic pattern-only hedge
+/// against long prefix/suffix near-match streams, so it precedes the final
+/// strategy/filter-byte tie-breaks without overriding the cost model.
+fn missing_boundary_filters(candidate: &Candidate, literal_width: usize) -> u8 {
+    if literal_width < 2 {
+        return 0;
+    }
+    let filters = &candidate.filters[..usize::from(candidate.filter_count)];
+    let last = u8::try_from(literal_width - 1).expect("Count-v3 literal width is bounded");
+    u8::from(!filters.contains(&0)) + u8::from(!filters.contains(&last))
 }
 
 const fn tuning_weights(tuning: CountV3TuningClass) -> [u16; 6] {
