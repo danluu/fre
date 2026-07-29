@@ -3488,6 +3488,59 @@ fn capture_stream_count_values_alternate_sources_and_recover_from_poisoned_attem
 }
 
 #[test]
+fn cached_capture_count_session_admits_without_restarted_worst_case() {
+    let pattern = r"(?:(a())|(a))";
+    let haystack = vec![b'a'; 8_192];
+    let regex = CaptureBuilder::new(pattern)
+        .unicode(false)
+        .build()
+        .expect("participation stream");
+    let mut limits = CaptureRunLimits::default();
+    limits.aggregate.max_total_state_visits = 5_000_000;
+
+    assert!(
+        regex
+            .prepare_capture_stream_session(haystack.len(), limits, CaptureStreamDomains::Whole)
+            .expect("receipt stream preflight")
+            .is_none(),
+        "the restarted worst case must remain a source-free fallback"
+    );
+
+    let mut session = regex
+        .prepare_capture_count_stream_session(haystack.len(), limits)
+        .expect("cached Count preflight")
+        .expect("fixed participation cache");
+    assert!(session.is_cached_value_only());
+    let expected = haystack.len() * 3;
+    assert_eq!(
+        session.count_value(&haystack).expect("cold cached count"),
+        expected
+    );
+    assert_eq!(
+        session.count_value(&haystack).expect("steady cached count"),
+        expected
+    );
+
+    let mut bytes_one_below = limits;
+    bytes_one_below.selector.max_sequential_bytes = haystack.len() - 1;
+    let mut refused = regex
+        .prepare_capture_count_stream_session(haystack.len(), bytes_one_below)
+        .expect("bounded cache construction")
+        .expect("cache remains a construction-selected route");
+    assert_eq!(
+        refused
+            .count_value(&haystack)
+            .expect_err("complete scan must be reserved before source access")
+            .source,
+        CaptureExecutionSource::Stream(fre::CaptureStreamError::Resource {
+            resource: fre::CaptureStreamResource::BytesExamined,
+            required: haystack.len(),
+            limit: haystack.len() - 1,
+        })
+    );
+}
+
+#[test]
 fn participation_cache_matches_upstream_exhaustively_across_priority_and_boundaries() {
     let patterns = [
         r"(?:(a())|(a))",

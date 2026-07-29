@@ -27,7 +27,7 @@ use crate::tagged::{
 pub const CAPTURE_STREAM_ALGORITHM_VERSION: u32 = 1;
 
 /// Resource-accounting version of the fused capture stream.
-pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 4;
+pub const CAPTURE_STREAM_ACCOUNTING_VERSION: u32 = 5;
 
 const INLINE_GROUP_BITS: usize = 64;
 
@@ -1091,6 +1091,13 @@ enum Frontier {
     History(HistoryFrontier),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureStreamMode {
+    Restarted,
+    ExactOnly,
+    CachedValueOnly,
+}
+
 /// Prepared reusable capture stream.
 ///
 /// Construction allocates the complete fixed envelope before source access.
@@ -1106,12 +1113,11 @@ pub struct CaptureStream {
     seen: ExactVec<usize>,
     tags: TagWorkspace,
     generation: usize,
-    /// Exact-span sessions retain the same fixed frontier and tag workspace,
-    /// but are not admitted as the restarted whole-operation executor.
-    /// Keeping this bit explicit prevents a caller from accidentally using a
-    /// construction that only proved the exact replay envelope as a regular
-    /// restart stream.
-    exact_only: bool,
+    /// Exact-span and cached-value sessions retain the same fixed frontier and
+    /// tag workspace, but are not admitted as the restarted whole-operation
+    /// executor. Keeping the mode explicit prevents a caller from accidentally
+    /// using a narrower construction as a regular restart stream.
+    mode: CaptureStreamMode,
 }
 
 #[derive(Debug)]
@@ -1495,7 +1501,80 @@ impl CaptureStream {
             seen,
             tags,
             generation: 0,
-            exact_only: false,
+            mode: CaptureStreamMode::Restarted,
+        })
+    }
+
+    /// Allocate a bounded whole-haystack participation-count cache.
+    ///
+    /// This mode admits the exact fixed construction without claiming the
+    /// restarted-NFA worst case used by [`Self::execute`]. Its value-only
+    /// operation meters each disjoint source scan, reserves cold transition
+    /// work before learning it, and returns a typed refusal if the fixed cache
+    /// saturates. It never continues with the inline restarted executor.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cache-only fixed-envelope constructor mirrors the established stream allocation transaction"
+    )]
+    pub fn new_cached_value(
+        program: Arc<Program>,
+        source_bytes: usize,
+        limits: CaptureStreamLimits,
+    ) -> Result<Self, CaptureStreamError> {
+        let operation =
+            Self::operation_prospective(&program, source_bytes, CaptureStreamDomains::Whole)?;
+        let prospective = operation.construction;
+        if prospective.projection != CaptureStreamProjection::ParticipationMask
+            || prospective.participation_cache_cells() == 0
+        {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        operation.admits_construction(limits)?;
+        let mut tags = TagWorkspace::new(
+            prospective.groups,
+            prospective.tags.history_nodes,
+            0,
+            TagWorkspaceLimits {
+                max_groups: prospective.tags.groups,
+                max_history_nodes: prospective.tags.history_nodes,
+                max_mask_states: prospective.tags.mask_states,
+                max_mask_words: prospective.tags.mask_words,
+                max_build_work: prospective.tags.build_work,
+                max_initialized_bytes: prospective.tags.initialized_bytes,
+                max_copied_bytes: prospective.tags.copied_bytes,
+                max_scratch_bytes: prospective.tags.scratch_bytes,
+                max_persistent_bytes: prospective.tags.persistent_bytes,
+                max_peak_bytes: prospective.tags.peak_bytes,
+                max_allocator_bytes: prospective.tags.allocator_bytes,
+                max_allocations: prospective.tags.allocations,
+            },
+        )?;
+        let frontier = Frontier::Participation(ParticipationFrontier {
+            current: exact_vec(prospective.states)?,
+            next: exact_vec(prospective.states)?,
+            stack: exact_vec(prospective.states)?,
+        });
+        let mut seen = exact_vec(prospective.states)?;
+        for _ in 0..prospective.states {
+            exact_push(&mut seen, 0)?;
+        }
+        let participation_cache = ParticipationCache::new(&program, source_bytes, operation)?;
+        if !participation_cache.is_admitted()
+            || !tags.install_participation_cache(participation_cache)
+        {
+            return Err(CaptureStreamError::InvalidProgram);
+        }
+        Ok(Self {
+            program,
+            domains: CaptureStreamDomains::Whole,
+            limits,
+            prospective,
+            operation,
+            frontier,
+            seen,
+            tags,
+            generation: 0,
+            mode: CaptureStreamMode::CachedValueOnly,
         })
     }
 
@@ -1570,7 +1649,7 @@ impl CaptureStream {
             seen,
             tags,
             generation: 0,
-            exact_only: true,
+            mode: CaptureStreamMode::ExactOnly,
         })
     }
 
@@ -1580,21 +1659,31 @@ impl CaptureStream {
         self.prospective
     }
 
-    /// Complete source-free envelope bound to this prepared stream.
+    /// Complete source-free restart envelope bound to this prepared stream.
+    ///
+    /// A cached-value-only stream retains this as immutable program/operation
+    /// identity, but admits and meters its narrower physical mode separately;
+    /// callers can distinguish that case with [`Self::is_cached_value_only`].
     #[must_use]
     pub const fn operation_report(&self) -> CaptureStreamOperationProspective {
         self.operation
     }
 
+    /// Whether this stream was admitted only for bounded cached values.
+    #[must_use]
+    pub const fn is_cached_value_only(&self) -> bool {
+        matches!(self.mode, CaptureStreamMode::CachedValueOnly)
+    }
+
     /// Execute one complete fused operation and return only its capture count.
     ///
-    /// This keeps the same checked resource ledger as [`Self::execute`] but
-    /// avoids constructing and closing the full public receipt on an ordinary
-    /// successful value-only call. Callers that must publish an error should
-    /// replay with [`Self::execute`] so the authoritative terminal retains the
-    /// complete P/A evidence.
+    /// Regular streams are protected by the complete source-free operation
+    /// envelope admitted at construction. Cache-only streams instead meter
+    /// their disjoint scans and lazy transition work directly, without
+    /// constructing the full public receipt. Callers that need that receipt
+    /// must use a regular stream and [`Self::execute`].
     pub fn count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureStreamError> {
-        if self.exact_only {
+        if self.mode == CaptureStreamMode::ExactOnly {
             return Err(CaptureStreamError::InvalidProgram);
         }
         if haystack.len() != self.prospective.source_bytes {
@@ -1606,6 +1695,7 @@ impl CaptureStream {
         if self.domains == CaptureStreamDomains::Whole
             && self.prospective.projection == CaptureStreamProjection::ParticipationMask
         {
+            let cached_value_only = self.is_cached_value_only();
             let cache = self
                 .tags
                 .participation_cache_mut()
@@ -1615,8 +1705,12 @@ impl CaptureStream {
                 haystack,
                 self.prospective.groups,
                 self.operation,
+                cached_value_only.then_some(self.limits),
             ) {
                 return result;
+            }
+            if cached_value_only {
+                return Err(CaptureStreamError::InvalidProgram);
             }
         }
         let run = self.execute_run::<false>(haystack)?;
@@ -1635,7 +1729,7 @@ impl CaptureStream {
         &mut self,
         haystack: &[u8],
     ) -> Result<CaptureStreamRun, CaptureStreamError> {
-        if self.exact_only {
+        if self.mode != CaptureStreamMode::Restarted {
             return Err(CaptureStreamError::InvalidProgram);
         }
         if haystack.len() != self.prospective.source_bytes {
@@ -1758,6 +1852,10 @@ impl CaptureStream {
     }
 
     /// Execute one complete fused operation without allocating.
+    ///
+    /// Cached-value-only and exact-span streams return
+    /// [`CaptureStreamError::InvalidProgram`]; their construction did not
+    /// admit this receipt-bearing restarted operation.
     #[allow(
         clippy::too_many_lines,
         reason = "domain iteration and the terminal receipt are one allocation-free operation transaction"

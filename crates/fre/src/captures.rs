@@ -2463,19 +2463,29 @@ pub struct CaptureStreamSession {
 }
 
 impl CaptureStreamSession {
-    /// Immutable source-free execution envelope bound during preparation.
+    /// Immutable source-free restart envelope bound during preparation.
+    ///
+    /// For a cached-value-only session this authenticates the fixed program
+    /// but is intentionally not claimed to fit the session limits. Use
+    /// [`Self::is_cached_value_only`] to distinguish that mode.
     #[must_use]
     pub const fn operation_prospective(&self) -> CaptureStreamOperationProspective {
         self.stream.operation_report()
     }
 
+    /// Whether this session supports only bounded cached Count values.
+    #[must_use]
+    pub const fn is_cached_value_only(&self) -> bool {
+        self.stream.is_cached_value_only()
+    }
+
     /// Execute the prepared operation and return only the capture count.
     ///
-    /// Successful steady calls retain the complete checked runtime ledger but
-    /// do not construct or authenticate the much larger public receipt. If
-    /// the compact path refuses, a cold receipt-bearing replay is
-    /// authoritative, preserving the established typed terminal and proving
-    /// that a failed attempt did not poison the reusable workspace.
+    /// Regular sessions use the construction-admitted operation envelope and
+    /// replay a receipt-bearing terminal if the compact path refuses.
+    /// Cache-only sessions meter their own bounded work and return that typed
+    /// terminal directly; they never switch to restarted execution after
+    /// observing source bytes.
     #[allow(
         clippy::result_large_err,
         reason = "cold replay preserves the established complete capture execution error"
@@ -2483,7 +2493,20 @@ impl CaptureStreamSession {
     pub fn count_value(&mut self, haystack: &[u8]) -> Result<usize, CaptureExecutionError> {
         match self.stream.count_value(haystack) {
             Ok(value) => Ok(value),
+            Err(source) if self.stream.is_cached_value_only() => {
+                Err(self.stream_execution_error(source))
+            }
             Err(_) => self.replay_count_value(haystack),
+        }
+    }
+
+    fn stream_execution_error(&self, source: CaptureStreamError) -> CaptureExecutionError {
+        CaptureExecutionError {
+            identity: self.identity.clone(),
+            source: CaptureExecutionSource::Stream(source),
+            selector_receipt: None,
+            prefix_class_participation_receipt: None,
+            count_receipt: None,
         }
     }
 
@@ -3081,6 +3104,46 @@ impl CaptureRegex {
         limits: CaptureRunLimits,
         domains: CaptureStreamDomains,
     ) -> Result<Option<CaptureStreamSession>, CaptureExecutionError> {
+        self.prepare_capture_stream_session_mode(source_bytes, limits, domains, false)
+    }
+
+    /// Prepare a whole-haystack Count session, admitting the bounded
+    /// participation cache when the restarted receipt is too pessimistic.
+    ///
+    /// A cache-only session supports [`CaptureStreamSession::count_value`].
+    /// It returns a typed terminal on resource exhaustion or fixed-cache
+    /// saturation and never replays the restarted executor after observing
+    /// source bytes.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the established public preparation error preserves complete source receipts without an API-breaking box"
+    )]
+    pub fn prepare_capture_count_stream_session(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+    ) -> Result<Option<CaptureStreamSession>, CaptureExecutionError> {
+        self.prepare_capture_stream_session_mode(
+            source_bytes,
+            limits,
+            CaptureStreamDomains::Whole,
+            true,
+        )
+    }
+
+    #[allow(
+        clippy::large_types_passed_by_value,
+        clippy::result_large_err,
+        clippy::too_many_lines,
+        reason = "the private mode-neutral preparation transaction preserves the public by-value limits and complete error receipt"
+    )]
+    fn prepare_capture_stream_session_mode(
+        &self,
+        source_bytes: usize,
+        limits: CaptureRunLimits,
+        domains: CaptureStreamDomains,
+        allow_cached_value_only: bool,
+    ) -> Result<Option<CaptureStreamSession>, CaptureExecutionError> {
         let identity = self.cache_identity(limits);
         let expected_projection = self.capture_stream_session_projection(&identity, domains);
         let Some(expected_projection) = expected_projection else {
@@ -3113,7 +3176,16 @@ impl CaptureRegex {
                 count_receipt: None,
             });
         }
-        if operation.admits(stream_limits).is_err() {
+        let restarted_admitted = operation.admits(stream_limits).is_ok();
+        let cached_value_only = !restarted_admitted
+            && allow_cached_value_only
+            && domains == CaptureStreamDomains::Whole
+            && expected_projection == CaptureStreamProjection::ParticipationMask
+            && operation
+                .construction
+                .admits_construction(stream_limits)
+                .is_ok();
+        if !restarted_admitted && !cached_value_only {
             return Ok(None);
         }
         let Some(combined_peak_bytes) = operation
@@ -3126,12 +3198,21 @@ impl CaptureRegex {
         if combined_peak_bytes > limits.max_combined_peak_bytes {
             return Ok(None);
         }
-        let stream = match CaptureStream::new(
-            Arc::clone(self.engine.program()),
-            source_bytes,
-            domains,
-            stream_limits,
-        ) {
+        let constructed = if cached_value_only {
+            CaptureStream::new_cached_value(
+                Arc::clone(self.engine.program()),
+                source_bytes,
+                stream_limits,
+            )
+        } else {
+            CaptureStream::new(
+                Arc::clone(self.engine.program()),
+                source_bytes,
+                domains,
+                stream_limits,
+            )
+        };
+        let stream = match constructed {
             Ok(stream) => stream,
             Err(CaptureStreamError::Resource { .. } | CaptureStreamError::Allocation(_)) => {
                 return Ok(None);
@@ -3148,6 +3229,7 @@ impl CaptureRegex {
         };
         if stream.build_report() != operation.construction
             || stream.operation_report() != operation
+            || stream.is_cached_value_only() != cached_value_only
             || !stream
                 .build_report()
                 .authenticates_program(self.engine.program())

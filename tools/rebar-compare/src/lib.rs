@@ -3825,7 +3825,7 @@ fn current_fre_capture_count_preparation(
     run_limits: &CaptureRunLimits,
 ) -> Result<CurrentFreCapturePreparation, CompareError> {
     regex
-        .prepare_capture_stream_session(haystack_len, *run_limits, CaptureStreamDomains::Whole)
+        .prepare_capture_count_stream_session(haystack_len, *run_limits)
         .map_err(|error| {
             CompareError::new(format!(
                 "FRE capture-stream Count session preflight refused construction: {error}"

@@ -4,9 +4,10 @@
 //! counters plus the two inline participation words. Transition cells are
 //! keyed only by that state, the next byte and whether the next boundary is
 //! the absolute end. A full cache hands its just-computed ordered frontier to
-//! the inline executor at the already-advanced source position. The current
-//! operation therefore completes without a cache-induced replay, and the
-//! saturated cache is sticky-disabled for later calls.
+//! the inline executor at the already-advanced source position. A regular
+//! stream therefore completes without a cache-induced replay and
+//! sticky-disables the cache for later calls. A cache-only Count stream
+//! instead reserves a conservative inline-work bound before continuing.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -14,7 +15,7 @@
     clippy::cast_possible_truncation,
     clippy::inline_always,
     clippy::large_types_passed_by_value,
-    reason = "the admitted cache envelope proves arithmetic and packed-field representability; the frozen hot loop deliberately keeps its compiler-elided Copy receipt and forced inlining"
+    reason = "the admitted cache envelope and checked cache-only budget prove arithmetic; the frozen hot loop deliberately keeps its compiler-elided Copy receipt and forced inlining"
 )]
 
 use core::mem::size_of;
@@ -24,7 +25,7 @@ use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
 use crate::ast::Assertion;
 use crate::compile::{Program, State};
 use crate::stream::{
-    CaptureStreamAccounting, CaptureStreamError, CaptureStreamOperationProspective,
+    CaptureStreamError, CaptureStreamLimits, CaptureStreamOperationProspective,
     CaptureStreamResource,
 };
 
@@ -269,35 +270,22 @@ struct CacheStateMeta {
 
 #[derive(Clone, Copy, Debug)]
 struct CacheCell {
-    packed_delta: u64,
     control: u64,
 }
 
 impl Default for CacheCell {
     fn default() -> Self {
         Self {
-            packed_delta: 0,
             control: u64::from(CELL_UNFILLED),
         }
     }
 }
 
 impl CacheCell {
-    fn new(
-        next: u32,
-        packed_delta: u64,
-        peak_threads: u32,
-        participating: u8,
-    ) -> Result<Self, CaptureStreamError> {
-        if peak_threads > 0x00ff_ffff {
-            return Err(CaptureStreamError::InvalidProgram);
+    fn new(next: u32, participating: u8) -> Self {
+        Self {
+            control: u64::from(next) | (u64::from(participating) << 32),
         }
-        Ok(Self {
-            packed_delta,
-            control: u64::from(next)
-                | (u64::from(participating) << 32)
-                | (u64::from(peak_threads) << 40),
-        })
     }
 
     #[inline]
@@ -309,18 +297,11 @@ impl CacheCell {
     fn participating(self) -> u8 {
         (self.control >> 32) as u8
     }
-
-    #[inline]
-    fn peak_threads(self) -> u32 {
-        (self.control >> 40) as u32
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct InitialState {
     next: u32,
-    packed_delta: u64,
-    peak_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -368,80 +349,222 @@ impl CacheDelta {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DeltaLayout {
-    tag_shift: u32,
-    starts_shift: u32,
-    state_mask: u64,
-    tag_mask: u64,
-    starts_mask: u64,
+#[derive(Debug)]
+struct CacheValueBudget {
+    limits: CaptureStreamLimits,
+    remaining_work: usize,
+    remaining_bytes: usize,
+    remaining_state_visits: usize,
+    remaining_tag_actions: usize,
+    remaining_starts: usize,
+    searches: usize,
+    matches: usize,
+    count: usize,
 }
 
-impl DeltaLayout {
-    fn for_operation(operation: CaptureStreamOperationProspective) -> Option<Self> {
-        let state_bits = bits_needed(operation.state_visits);
-        let tag_bits = bits_needed(operation.tag_actions);
-        let starts_bits = bits_needed(operation.starts_injected);
-        let tag_shift = state_bits;
-        let starts_shift = state_bits.checked_add(tag_bits)?;
-        let total = starts_shift.checked_add(starts_bits)?;
-        if total > 64 {
-            return None;
-        }
-        Some(Self {
-            tag_shift,
-            starts_shift,
-            state_mask: low_mask(state_bits),
-            tag_mask: low_mask(tag_bits),
-            starts_mask: low_mask(starts_bits),
+impl CacheValueBudget {
+    fn new(limits: CaptureStreamLimits) -> Result<Self, CaptureStreamError> {
+        check(
+            CaptureStreamResource::LineDomains,
+            1,
+            limits.max_line_domains,
+        )?;
+        check(CaptureStreamResource::Work, 1, limits.max_work)?;
+        Ok(Self {
+            limits,
+            remaining_work: limits.max_work - 1,
+            remaining_bytes: limits.max_bytes_examined,
+            remaining_state_visits: limits.max_state_visits,
+            remaining_tag_actions: limits.max_tag_actions,
+            remaining_starts: limits.max_starts_injected,
+            searches: 0,
+            matches: 0,
+            count: 0,
         })
     }
 
-    fn pack(self, delta: CacheDelta) -> Result<u64, CaptureStreamError> {
-        let state_visits = u64::from(delta.state_visits);
-        let tag_actions = u64::from(delta.tag_actions);
-        let starts_injected = u64::from(delta.starts_injected);
-        if state_visits > self.state_mask
-            || tag_actions > self.tag_mask
-            || starts_injected > self.starts_mask
-        {
-            return Err(CaptureStreamError::InvalidProgram);
-        }
-        Ok(state_visits | (tag_actions << self.tag_shift) | (starts_injected << self.starts_shift))
+    fn begin_search(&mut self, maximum_scan: usize) -> Result<(), CaptureStreamError> {
+        let searches = self
+            .searches
+            .checked_add(1)
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::Searches,
+            ))?;
+        check(
+            CaptureStreamResource::Searches,
+            searches,
+            self.limits.max_searches,
+        )?;
+        check_remaining(
+            CaptureStreamResource::BytesExamined,
+            maximum_scan,
+            self.remaining_bytes,
+        )?;
+        let work = maximum_scan
+            .checked_add(1)
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
+        check_remaining(CaptureStreamResource::Work, work, self.remaining_work)?;
+        self.searches = searches;
+        self.remaining_bytes -= maximum_scan;
+        self.remaining_work -= work;
+        Ok(())
     }
 
-    fn unpack(self, packed: u64) -> (usize, usize, usize) {
-        (
-            (packed & self.state_mask) as usize,
-            ((packed >> self.tag_shift) & self.tag_mask) as usize,
-            ((packed >> self.starts_shift) & self.starts_mask) as usize,
-        )
-    }
-}
-
-#[derive(Debug, Default)]
-struct CacheAccounting {
-    packed_delta: u64,
-    peak_threads: u32,
-    bytes_examined: usize,
-    searches: usize,
-}
-
-impl CacheAccounting {
-    #[inline]
-    fn add_delta(&mut self, packed_delta: u64, peak_threads: u32) {
-        self.packed_delta += packed_delta;
-        self.peak_threads = self.peak_threads.max(peak_threads);
+    fn finish_search(
+        &mut self,
+        maximum_scan: usize,
+        actual_scan: usize,
+    ) -> Result<(), CaptureStreamError> {
+        let refund = maximum_scan
+            .checked_sub(actual_scan)
+            .ok_or(CaptureStreamError::InvalidProgram)?;
+        self.remaining_bytes =
+            self.remaining_bytes
+                .checked_add(refund)
+                .ok_or(CaptureStreamError::Overflow(
+                    CaptureStreamResource::BytesExamined,
+                ))?;
+        self.remaining_work = self
+            .remaining_work
+            .checked_add(refund)
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
+        Ok(())
     }
 
-    #[inline]
-    fn add_search(&mut self) {
-        self.searches += 1;
+    #[cold]
+    #[inline(never)]
+    fn charge_population(
+        &mut self,
+        program_states: usize,
+        retained_states: usize,
+    ) -> Result<(), CaptureStreamError> {
+        // One lazy transition can inspect the complete consuming frontier,
+        // visit the complete epsilon closure plus one duplicate seed per
+        // consuming thread, apply every tag once, compare the new frontier
+        // with every retained DFA state, copy one complete frontier and
+        // publish one cell. Reserving this bound before doing the cold work
+        // keeps a cache-only operation terminal without burdening cache hits.
+        let state_visits = program_states
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::StateVisits,
+            ))?;
+        let tag_actions = program_states;
+        let starts = 1;
+        let work = program_states
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(retained_states.checked_add(5)?))
+            .and_then(|value| value.checked_add(4))
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
+        check_remaining(
+            CaptureStreamResource::StateVisits,
+            state_visits,
+            self.remaining_state_visits,
+        )?;
+        check_remaining(
+            CaptureStreamResource::TagActions,
+            tag_actions,
+            self.remaining_tag_actions,
+        )?;
+        check_remaining(
+            CaptureStreamResource::StartsInjected,
+            starts,
+            self.remaining_starts,
+        )?;
+        check_remaining(CaptureStreamResource::Work, work, self.remaining_work)?;
+        self.remaining_state_visits -= state_visits;
+        self.remaining_tag_actions -= tag_actions;
+        self.remaining_starts -= starts;
+        self.remaining_work -= work;
+        Ok(())
     }
 
-    #[inline]
-    fn add_byte(&mut self) {
-        self.bytes_examined += 1;
+    #[cold]
+    #[inline(never)]
+    fn charge_inline(&mut self, program_states: usize) -> Result<(), CaptureStreamError> {
+        let state_visits = program_states
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::StateVisits,
+            ))?;
+        let tag_actions = program_states;
+        let starts = 1;
+        let work = program_states
+            .checked_mul(5)
+            .and_then(|value| value.checked_add(4))
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
+        check_remaining(
+            CaptureStreamResource::StateVisits,
+            state_visits,
+            self.remaining_state_visits,
+        )?;
+        check_remaining(
+            CaptureStreamResource::TagActions,
+            tag_actions,
+            self.remaining_tag_actions,
+        )?;
+        check_remaining(
+            CaptureStreamResource::StartsInjected,
+            starts,
+            self.remaining_starts,
+        )?;
+        check_remaining(CaptureStreamResource::Work, work, self.remaining_work)?;
+        self.remaining_state_visits -= state_visits;
+        self.remaining_tag_actions -= tag_actions;
+        self.remaining_starts -= starts;
+        self.remaining_work -= work;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn charge_initial_load(&mut self, program_states: usize) -> Result<(), CaptureStreamError> {
+        let work = program_states
+            .checked_add(1)
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
+        check_remaining(CaptureStreamResource::Work, work, self.remaining_work)?;
+        self.remaining_work -= work;
+        Ok(())
+    }
+
+    fn add_match(&mut self, participating: usize, groups: usize) -> Result<(), CaptureStreamError> {
+        let matches = self
+            .matches
+            .checked_add(1)
+            .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Matches))?;
+        check(
+            CaptureStreamResource::Matches,
+            matches,
+            self.limits.max_matches,
+        )?;
+        let count = self
+            .count
+            .checked_add(participating)
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::CaptureCount,
+            ))?;
+        check(
+            CaptureStreamResource::CaptureCount,
+            count,
+            self.limits.max_capture_count,
+        )?;
+        let capture_events = matches
+            .checked_mul(groups)
+            .ok_or(CaptureStreamError::Overflow(
+                CaptureStreamResource::CaptureEvents,
+            ))?;
+        check(
+            CaptureStreamResource::CaptureEvents,
+            capture_events,
+            self.limits.max_capture_events,
+        )?;
+        check_remaining(CaptureStreamResource::Work, groups, self.remaining_work)?;
+        self.matches = matches;
+        self.count = count;
+        self.remaining_work -= groups;
+        Ok(())
     }
 }
 
@@ -461,20 +584,21 @@ impl ParticipationCache {
     pub(crate) fn new(
         program: &Program,
         source_bytes: usize,
-        operation: CaptureStreamOperationProspective,
+        _operation: CaptureStreamOperationProspective,
     ) -> Result<Self, CaptureStreamError> {
         let shape = ParticipationCacheShape::for_program(program, source_bytes)?;
         if shape == ParticipationCacheShape::default() {
             return Ok(Self::disabled());
         }
-        let delta_layout = DeltaLayout::for_operation(operation);
-        let mut dfa = ParticipationDfa::allocate(shape, program.states.len(), delta_layout)?;
-        if delta_layout.is_some() {
-            dfa.initialize(program)?;
-        }
+        let mut dfa = ParticipationDfa::allocate(shape, program.states.len())?;
+        dfa.initialize(program)?;
         Ok(Self {
             storage: ExactBoxOrUsize::try_from_boxed(dfa).map_err(map_box_error)?,
         })
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.storage.boxed().is_some_and(|dfa| dfa.admitted)
     }
 
     #[inline]
@@ -484,12 +608,16 @@ impl ParticipationCache {
         haystack: &[u8],
         groups: usize,
         operation: CaptureStreamOperationProspective,
+        cache_only_limits: Option<CaptureStreamLimits>,
     ) -> Option<Result<usize, CaptureStreamError>> {
         let dfa = self.storage.boxed_mut()?;
-        if !dfa.admitted || dfa.saturated {
+        if !dfa.admitted {
             return None;
         }
-        let result = dfa.reduce(program, haystack, groups, operation);
+        if dfa.saturated && cache_only_limits.is_none() {
+            return None;
+        }
+        let result = dfa.reduce(program, haystack, groups, operation, cache_only_limits);
         Some(result)
     }
 }
@@ -509,7 +637,6 @@ pub(crate) struct ParticipationDfa {
     frontier_len: usize,
     generation: usize,
     initial: [InitialState; 4],
-    delta_layout: Option<DeltaLayout>,
     admitted: bool,
     saturated: bool,
 }
@@ -518,7 +645,6 @@ impl ParticipationDfa {
     fn allocate(
         shape: ParticipationCacheShape,
         program_states: usize,
-        delta_layout: Option<DeltaLayout>,
     ) -> Result<Self, CaptureStreamError> {
         Ok(Self {
             rows: allocated_slots(shape.cells, CacheCell::default())?,
@@ -534,7 +660,6 @@ impl ParticipationDfa {
             frontier_len: 0,
             generation: 0,
             initial: [InitialState::default(); 4],
-            delta_layout,
             admitted: false,
             saturated: false,
         })
@@ -573,14 +698,7 @@ impl ParticipationDfa {
                     }
                 }
             };
-            self.initial[context] = InitialState {
-                next,
-                packed_delta: self
-                    .delta_layout
-                    .ok_or(CaptureStreamError::InvalidProgram)?
-                    .pack(delta)?,
-                peak_threads: delta.peak_threads,
-            };
+            self.initial[context] = InitialState { next };
         }
         self.admitted = admitted;
         Ok(())
@@ -640,8 +758,8 @@ impl ParticipationDfa {
 
     #[inline(always)]
     fn cell(&self, row: u32, byte: u8, at_end: bool) -> Result<CacheCell, CaptureStreamError> {
-        let symbol = usize::from(byte) + usize::from(at_end) * BYTE_ALPHABET;
-        let index = row as usize + symbol;
+        let end_plane = self.rows.len() / 2;
+        let index = row as usize + usize::from(byte) + usize::from(at_end) * end_plane;
         self.rows
             .get(index)
             .copied()
@@ -656,7 +774,8 @@ impl ParticipationDfa {
         at_end: bool,
         cell: CacheCell,
     ) -> Result<(), CaptureStreamError> {
-        let symbol = usize::from(byte) + usize::from(at_end) * BYTE_ALPHABET;
+        let end_plane = self.rows.len() / 2;
+        let symbol = usize::from(byte) + usize::from(at_end) * end_plane;
         let index = usize::try_from(row)
             .ok()
             .and_then(|row| row.checked_add(symbol))
@@ -742,10 +861,8 @@ impl ParticipationDfa {
     fn load_initial(
         &mut self,
         context: BoundaryContext,
-        accounting: &mut CacheAccounting,
     ) -> Result<Option<ForwardState>, CaptureStreamError> {
         let initial = self.initial[context.index()];
-        accounting.add_delta(initial.packed_delta, initial.peak_threads);
         if initial.next == 0 {
             return Ok(None);
         }
@@ -781,24 +898,36 @@ impl ParticipationDfa {
         haystack: &[u8],
         groups: usize,
         operation: CaptureStreamOperationProspective,
+        cache_only_limits: Option<CaptureStreamLimits>,
     ) -> Result<usize, CaptureStreamError> {
         if groups == 0 || groups > 64 {
             return Err(CaptureStreamError::InvalidProgram);
         }
-        let delta_layout = self
-            .delta_layout
-            .ok_or(CaptureStreamError::InvalidProgram)?;
-        let mut accounting = CacheAccounting::default();
         let mut count = 0_usize;
         let mut matches = 0_usize;
         let mut cursor = 0_usize;
+        let mut budget = match cache_only_limits {
+            Some(limits) => Some(CacheValueBudget::new(limits)?),
+            None => None,
+        };
         loop {
-            accounting.add_search();
+            let maximum_scan = haystack
+                .len()
+                .checked_sub(cursor)
+                .ok_or(CaptureStreamError::InvalidProgram)?;
+            if let Some(budget) = budget.as_mut() {
+                budget.begin_search(maximum_scan)?;
+            }
             let initial_context = BoundaryContext {
                 at_start: cursor == 0,
                 at_end: cursor == haystack.len(),
             };
-            let Some(mut state) = self.load_initial(initial_context, &mut accounting)? else {
+            if self.saturated
+                && let Some(budget) = budget.as_mut()
+            {
+                budget.charge_initial_load(program.states.len())?;
+            }
+            let Some(mut state) = self.load_initial(initial_context)? else {
                 break;
             };
             let mut position = cursor;
@@ -808,7 +937,6 @@ impl ParticipationDfa {
                 if position == haystack.len() {
                     break pending_count.zip(pending_end);
                 }
-                accounting.add_byte();
                 let byte = haystack[position];
                 let next_position = position + 1;
                 let at_end = next_position == haystack.len();
@@ -816,7 +944,6 @@ impl ParticipationDfa {
                     ForwardState::Cached(row) => {
                         let cached = self.cell(row, byte, at_end)?;
                         if cached.next() != CELL_UNFILLED {
-                            accounting.add_delta(cached.packed_delta, cached.peak_threads());
                             position = next_position;
                             let participating = cached.participating();
                             if participating != 0 {
@@ -830,11 +957,17 @@ impl ParticipationDfa {
                             state = ForwardState::Cached(next - 1);
                             continue;
                         } else {
-                            self.populate_transition(program, row, byte, at_end, &mut accounting)?
+                            if let Some(budget) = budget.as_mut() {
+                                budget.charge_population(program.states.len(), self.state_len)?;
+                            }
+                            self.populate_transition(program, row, byte, at_end)?
                         }
                     }
                     ForwardState::Inline { pending } => {
-                        self.inline_transition(program, byte, at_end, pending, &mut accounting)?
+                        if let Some(budget) = budget.as_mut() {
+                            budget.charge_inline(program.states.len())?;
+                        }
+                        self.inline_transition(program, byte, at_end, pending)?
                     }
                 };
                 position = next_position;
@@ -847,6 +980,12 @@ impl ParticipationDfa {
                 };
                 state = next;
             };
+            let actual_scan = position
+                .checked_sub(cursor)
+                .ok_or(CaptureStreamError::InvalidProgram)?;
+            if let Some(budget) = budget.as_mut() {
+                budget.finish_search(maximum_scan, actual_scan)?;
+            }
             let Some((participating, end)) = selected else {
                 break;
             };
@@ -862,12 +1001,18 @@ impl ParticipationDfa {
                     .ok_or(CaptureStreamError::Overflow(
                         CaptureStreamResource::CaptureCount,
                     ))?;
+            if let Some(budget) = budget.as_mut() {
+                budget.add_match(participating, groups)?;
+            }
             matches = next_matches;
             count = next_count;
             cursor = end;
         }
-        finish_accounting(accounting, count, matches, groups, delta_layout, operation)?;
-        Ok(count)
+        if matches > operation.matches || count > operation.capture_count {
+            Err(CaptureStreamError::InvalidProgram)
+        } else {
+            Ok(count)
+        }
     }
 
     #[cold]
@@ -877,7 +1022,6 @@ impl ParticipationDfa {
         row: u32,
         byte: u8,
         at_end: bool,
-        accounting: &mut CacheAccounting,
     ) -> Result<Transition, CaptureStreamError> {
         let state = state_from_row(row)?;
         let (_, length, pending) = self.state_bounds(state)?;
@@ -938,11 +1082,6 @@ impl ParticipationDfa {
             self.scratch_len
                 .saturating_add(usize::from(accepted.is_some())),
         )?;
-        let packed_delta = self
-            .delta_layout
-            .ok_or(CaptureStreamError::InvalidProgram)?
-            .pack(delta)?;
-        accounting.add_delta(packed_delta, delta.peak_threads);
         let next_pending = pending || accepted.is_some();
         let next = if self.scratch_len == 0 {
             0
@@ -961,12 +1100,7 @@ impl ParticipationDfa {
                 }
             }
         };
-        let cell = CacheCell::new(
-            next,
-            packed_delta,
-            delta.peak_threads,
-            accepted.unwrap_or(0),
-        )?;
+        let cell = CacheCell::new(next, accepted.unwrap_or(0));
         self.set_cell(row, byte, at_end, cell)?;
         decode_transition(cell)
     }
@@ -977,7 +1111,6 @@ impl ParticipationDfa {
         byte: u8,
         at_end: bool,
         pending: bool,
-        accounting: &mut CacheAccounting,
     ) -> Result<Transition, CaptureStreamError> {
         let length = self.frontier_len;
         self.begin_closure()?;
@@ -1040,11 +1173,6 @@ impl ParticipationDfa {
             self.scratch_len
                 .saturating_add(usize::from(accepted.is_some())),
         )?;
-        let packed_delta = self
-            .delta_layout
-            .ok_or(CaptureStreamError::InvalidProgram)?
-            .pack(delta)?;
-        accounting.add_delta(packed_delta, delta.peak_threads);
         let next_pending = pending || accepted.is_some();
         if self.scratch_len == 0 {
             self.frontier.clear();
@@ -1211,116 +1339,22 @@ impl BoundaryContext {
     }
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "terminal closure consumes the operation-local accounting ledger"
-)]
-fn finish_accounting(
-    cache: CacheAccounting,
-    count: usize,
-    matches: usize,
-    groups: usize,
-    delta_layout: DeltaLayout,
-    operation: CaptureStreamOperationProspective,
-) -> Result<CaptureStreamAccounting, CaptureStreamError> {
-    let (state_visits, tag_actions, starts_injected) = delta_layout.unpack(cache.packed_delta);
-    let capture_events = groups
-        .checked_mul(matches)
-        .ok_or(CaptureStreamError::Overflow(
-            CaptureStreamResource::CaptureEvents,
-        ))?;
-    let mask_word_reads = matches.checked_mul(3).ok_or(CaptureStreamError::Overflow(
-        CaptureStreamResource::MaskWordReads,
-    ))?;
-    let reset_per_search = groups
-        .checked_mul(2)
-        .and_then(|slots| slots.checked_add(slots.div_ceil(64)))
-        .ok_or(CaptureStreamError::Overflow(
-            CaptureStreamResource::ResetCells,
-        ))?;
-    let reset_cells =
-        reset_per_search
-            .checked_mul(cache.searches)
-            .ok_or(CaptureStreamError::Overflow(
-                CaptureStreamResource::ResetCells,
-            ))?;
-    let expected_searches = matches.checked_add(1).ok_or(CaptureStreamError::Overflow(
-        CaptureStreamResource::Searches,
-    ))?;
-    let work = 1_usize
-        .checked_add(cache.searches)
-        .and_then(|value| value.checked_add(state_visits))
-        .and_then(|value| value.checked_add(tag_actions))
-        .and_then(|value| value.checked_add(mask_word_reads))
-        .and_then(|value| value.checked_add(reset_cells))
-        .and_then(|value| value.checked_add(capture_events))
-        .and_then(|value| value.checked_add(cache.bytes_examined))
-        .and_then(|value| value.checked_add(starts_injected))
-        .ok_or(CaptureStreamError::Overflow(CaptureStreamResource::Work))?;
-    if cache.searches != expected_searches
-        || count > capture_events
-        || operation.line_domains != 1
-        || cache.searches > operation.searches
-        || matches > operation.matches
-        || cache.bytes_examined > operation.bytes_examined
-        || starts_injected > operation.starts_injected
-        || state_visits > operation.state_visits
-        || tag_actions > operation.tag_actions
-        || mask_word_reads > operation.mask_word_reads
-        || reset_cells > operation.reset_cells
-        || capture_events > operation.capture_events
-        || count > operation.capture_count
-        || work > operation.work
-    {
-        return Err(CaptureStreamError::InvalidProgram);
-    }
-    Ok(CaptureStreamAccounting {
-        line_domains: 1,
-        searches: cache.searches,
-        state_visits,
-        tag_actions,
-        mask_word_reads,
-        reset_cells,
-        capture_events,
-        bytes_examined: cache.bytes_examined,
-        starts_injected,
-        peak_threads: cache.peak_threads as usize,
-        work,
-        ..CaptureStreamAccounting::default()
-    })
-}
-
-fn bits_needed(value: usize) -> u32 {
-    (usize::BITS - value.leading_zeros()).max(1)
-}
-
-fn low_mask(bits: u32) -> u64 {
-    if bits == 64 {
-        u64::MAX
-    } else {
-        (1_u64 << bits) - 1
-    }
-}
-
-fn encode_state(state: u32) -> Result<u32, CaptureStreamError> {
-    state
-        .checked_mul(
-            u32::try_from(BOUNDARY_ALPHABET).map_err(|_| CaptureStreamError::InvalidProgram)?,
-        )
-        .ok_or(CaptureStreamError::InvalidProgram)?
-        .checked_add(1)
-        .ok_or(CaptureStreamError::InvalidProgram)
-}
-
 fn decode_state(encoded: u32) -> Result<u32, CaptureStreamError> {
     encoded
         .checked_sub(1)
         .ok_or(CaptureStreamError::InvalidProgram)
 }
 
+fn encode_state(state: u32) -> Result<u32, CaptureStreamError> {
+    state
+        .checked_mul(u32::try_from(BYTE_ALPHABET).map_err(|_| CaptureStreamError::InvalidProgram)?)
+        .ok_or(CaptureStreamError::InvalidProgram)?
+        .checked_add(1)
+        .ok_or(CaptureStreamError::InvalidProgram)
+}
+
 fn state_from_row(row: u32) -> Result<u32, CaptureStreamError> {
-    let alphabet =
-        u32::try_from(BOUNDARY_ALPHABET).map_err(|_| CaptureStreamError::InvalidProgram)?;
+    let alphabet = u32::try_from(BYTE_ALPHABET).map_err(|_| CaptureStreamError::InvalidProgram)?;
     if !row.is_multiple_of(alphabet) {
         return Err(CaptureStreamError::InvalidProgram);
     }
@@ -1329,6 +1363,30 @@ fn state_from_row(row: u32) -> Result<u32, CaptureStreamError> {
 
 fn to_u32(value: usize) -> Result<u32, CaptureStreamError> {
     u32::try_from(value).map_err(|_| CaptureStreamError::InvalidProgram)
+}
+
+fn check(
+    resource: CaptureStreamResource,
+    required: usize,
+    limit: usize,
+) -> Result<(), CaptureStreamError> {
+    if required > limit {
+        Err(CaptureStreamError::Resource {
+            resource,
+            required,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_remaining(
+    resource: CaptureStreamResource,
+    required: usize,
+    remaining: usize,
+) -> Result<(), CaptureStreamError> {
+    check(resource, required, remaining)
 }
 
 fn map_box_error(error: CopyError) -> CaptureStreamError {
@@ -1411,7 +1469,6 @@ mod tests {
             CaptureStreamDomains::Whole,
         )
         .expect("operation prospective");
-        let delta_layout = DeltaLayout::for_operation(operation).expect("compact counter layout");
         // One initial state consumes the entire test-only state arena. The
         // first non-dead byte transition must therefore hand its just-built
         // frontier to the inline continuation at the current source
@@ -1428,8 +1485,8 @@ mod tests {
             allocations: 8,
             build_work: 0,
         };
-        let mut dfa = ParticipationDfa::allocate(shape, program.states.len(), Some(delta_layout))
-            .expect("forced-cap cache");
+        let mut dfa =
+            ParticipationDfa::allocate(shape, program.states.len()).expect("forced-cap cache");
         dfa.initialize(&program).expect("initial closures");
         assert!(dfa.admitted, "fixture must admit its initial closure");
         assert!(!dfa.saturated, "fixture must saturate after source starts");
@@ -1450,7 +1507,7 @@ mod tests {
             .captures
             .count;
         let observed = cache
-            .count_value(&program, haystack, program.groups.len(), operation)
+            .count_value(&program, haystack, program.groups.len(), operation, None)
             .expect("forced cache selected")
             .expect("forced cache result");
         assert_eq!(observed, expected);
@@ -1460,7 +1517,7 @@ mod tests {
         );
         assert!(
             cache
-                .count_value(&program, haystack, program.groups.len(), operation)
+                .count_value(&program, haystack, program.groups.len(), operation, None)
                 .is_none(),
             "sticky disable must select the established executor"
         );
@@ -1488,5 +1545,82 @@ mod tests {
             Ast::End,
         ]);
         assert_forced_saturation_preserves_result(&ast, b"abba");
+    }
+
+    #[test]
+    fn cache_only_saturation_continues_with_precharged_inline_work() {
+        let branch = Ast::alt([
+            Ast::concat([Ast::Byte(b'a').capture(1), Ast::Byte(b'b')]),
+            Ast::Byte(b'a').capture(2),
+        ])
+        .repeat(1, None, Greed::Greedy);
+        let ast = Ast::concat([branch, Ast::Byte(b'z').capture(3)]);
+        let haystack = b"ababaz";
+        let program =
+            Arc::new(Program::compile(&ast, BuildLimits::default()).expect("forced-cap program"));
+        let operation = CaptureStream::operation_prospective(
+            &program,
+            haystack.len(),
+            CaptureStreamDomains::Whole,
+        )
+        .expect("operation prospective");
+        let states = 1;
+        let cells = states * BOUNDARY_ALPHABET;
+        let items = program.states.len();
+        let shape = ParticipationCacheShape {
+            states,
+            cells,
+            items,
+            bytes: cache_bytes(program.states.len(), states, cells, items)
+                .expect("forced-cap bytes"),
+            allocations: 8,
+            build_work: 0,
+        };
+        let mut dfa =
+            ParticipationDfa::allocate(shape, program.states.len()).expect("forced-cap cache");
+        dfa.initialize(&program).expect("initial closures");
+        let mut cache = ParticipationCache {
+            storage: ExactBoxOrUsize::try_from_boxed(dfa).expect("forced-cap owner"),
+        };
+        let mut incumbent = CaptureStream::new(
+            Arc::clone(&program),
+            haystack.len(),
+            CaptureStreamDomains::Whole,
+            CaptureStreamLimits::default(),
+        )
+        .expect("incumbent stream");
+        let expected = incumbent
+            .execute(haystack)
+            .expect("incumbent result")
+            .captures
+            .count;
+        let observed = cache
+            .count_value(
+                &program,
+                haystack,
+                program.groups.len(),
+                operation,
+                Some(CaptureStreamLimits::default()),
+            )
+            .expect("cache-only route")
+            .expect("precharged inline continuation");
+        assert_eq!(observed, expected);
+        assert!(
+            cache.storage.boxed().is_some_and(|dfa| dfa.saturated),
+            "cache-only saturation must remain sticky"
+        );
+        assert_eq!(
+            cache
+                .count_value(
+                    &program,
+                    haystack,
+                    program.groups.len(),
+                    operation,
+                    Some(CaptureStreamLimits::default()),
+                )
+                .expect("sticky cache-only route")
+                .expect("precharged inline reuse"),
+            expected
+        );
     }
 }
