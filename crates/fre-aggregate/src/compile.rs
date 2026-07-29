@@ -675,10 +675,8 @@ pub(crate) enum StateByteSpanSumTopology {
     /// Byte-mode `A C{M,N} B | B C{M,N} A`, where the retained byte class is
     /// exact for every source byte.
     BoundedLiteralPair,
-    /// Unicode-on `A C{M,N} B | B C{M,N} A` evaluated directly only when the
-    /// complete source is ASCII. In that domain every UTF-8 scalar is exactly
-    /// one byte, so the retained ASCII projection of `C` is exact. Non-ASCII
-    /// sources keep the incumbent continuation route.
+    /// Reserved topology tag for a future Unicode projection whose ASCII
+    /// guard and continuation fallback share one authenticated envelope.
     AsciiGuardedBoundedLiteralPair,
 }
 
@@ -1612,7 +1610,14 @@ fn build_state_byte_span_sum_plan(
     if capture_policy != CapturePolicy::EraseForWholeMatch {
         return Ok(None);
     }
-    let bounded_pair = state_byte_bounded_literal_pair(hir, profile.unicode, budget)?;
+    // A Unicode projection needs a source-dependent whole-window ASCII
+    // theorem. Keep that shape on the continuation route until the guard and
+    // possible replay share one authenticated operation envelope.
+    let bounded_pair = if profile.unicode {
+        None
+    } else {
+        state_byte_bounded_literal_pair(hir, budget)?
+    };
     let parts = if profile.unicode || bounded_pair.is_some() {
         &[][..]
     } else {
@@ -1634,11 +1639,7 @@ fn build_state_byte_span_sum_plan(
                 Error::InternalInvariant("state-byte bounded-pair split exceeds u8")
             })?;
             proof = Some((
-                if profile.unicode {
-                    StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
-                } else {
-                    StateByteSpanSumTopology::BoundedLiteralPair
-                },
+                StateByteSpanSumTopology::BoundedLiteralPair,
                 pair.class,
                 ByteSet::empty(),
                 literal_len,
@@ -2044,12 +2045,9 @@ struct StateByteBoundedLiteralPairArm<'a> {
 
 /// Recognize the exact shape `A C{M,N} B | B C{M,N} A`.
 ///
-/// In byte mode, the retained byte class is exact. In Unicode mode, the
-/// descriptor is used only after a whole-source ASCII guard, where every
-/// scalar is one byte and the ASCII projection of `C` is exact.
+/// The retained byte class is exact for every byte-mode source.
 fn state_byte_bounded_literal_pair<'a>(
     hir: &'a Hir,
-    unicode: bool,
     budget: &mut CompileBudget,
 ) -> Result<Option<StateByteBoundedLiteralPair<'a>>, Error> {
     let hir = state_byte_transparent(hir, budget)?;
@@ -2060,10 +2058,10 @@ fn state_byte_bounded_literal_pair<'a>(
     let [first, second] = arms.as_slice() else {
         return Ok(None);
     };
-    let Some(first) = state_byte_bounded_literal_pair_arm(first, unicode, budget)? else {
+    let Some(first) = state_byte_bounded_literal_pair_arm(first, budget)? else {
         return Ok(None);
     };
-    let Some(second) = state_byte_bounded_literal_pair_arm(second, unicode, budget)? else {
+    let Some(second) = state_byte_bounded_literal_pair_arm(second, budget)? else {
         return Ok(None);
     };
     budget.charge(8)?;
@@ -2096,7 +2094,6 @@ fn state_byte_bounded_literal_pair<'a>(
 
 fn state_byte_bounded_literal_pair_arm<'a>(
     hir: &'a Hir,
-    unicode: bool,
     budget: &mut CompileBudget,
 ) -> Result<Option<StateByteBoundedLiteralPairArm<'a>>, Error> {
     let hir = state_byte_transparent(hir, budget)?;
@@ -2124,28 +2121,7 @@ fn state_byte_bounded_literal_pair_arm<'a>(
     let repeated = state_byte_transparent(&repetition.sub, budget)?;
     let mut class = ByteSet::empty();
     match repeated.kind() {
-        HirKind::Class(Class::Unicode(ranges)) if unicode => {
-            budget.charge(ranges.ranges().len())?;
-            for range in ranges.ranges() {
-                budget.charge(1)?;
-                if range.start() > '\u{7f}' {
-                    break;
-                }
-                let start = u8::try_from(u32::from(range.start())).map_err(|_| {
-                    Error::InternalInvariant("ASCII Unicode-class start does not fit one byte")
-                })?;
-                let end = u8::try_from(u32::from(range.end().min('\u{7f}'))).map_err(|_| {
-                    Error::InternalInvariant("ASCII Unicode-class end does not fit one byte")
-                })?;
-                budget.charge(add(
-                    inclusive_byte_width(start, end)?,
-                    1,
-                    Resource::CompileWork,
-                )?)?;
-                class.insert_range(start, end);
-            }
-        }
-        HirKind::Class(Class::Bytes(ranges)) if !unicode => {
+        HirKind::Class(Class::Bytes(ranges)) => {
             budget.charge(ranges.ranges().len())?;
             for range in ranges.ranges() {
                 budget.charge(add(

@@ -238,7 +238,7 @@ fn small_complete_byte_languages_match_the_rust_oracle() {
 }
 
 #[test]
-fn unicode_bounded_pair_uses_ascii_value_specialization_with_unicode_fallback() {
+fn unicode_bounded_pair_keeps_one_accounted_continuation_route() {
     const PATTERN: &str = r"Tom.{10,25}river|river.{10,25}Tom";
     let count = AggregateBuilder::new(PATTERN)
         .unicode(true)
@@ -251,10 +251,10 @@ fn unicode_bounded_pair_uses_ascii_value_specialization_with_unicode_fallback() 
     for report in [count.build_report(), span_sum.build_report()] {
         assert_eq!(report.plan, AggregatePlanKind::ContinuationProgram);
         let AggregateBuildAccounting::Continuation(build) = report.build else {
-            panic!("Unicode bounded pair did not retain its continuation fallback")
+            panic!("Unicode bounded pair did not retain its continuation route")
         };
-        assert_eq!(build.state_byte_span_sum_plans, 1);
-        assert!(build.state_byte_span_sum_build_work > 0);
+        assert_eq!(build.state_byte_span_sum_plans, 0);
+        assert_eq!(build.state_byte_span_sum_build_work, 0);
     }
 
     let oracle = RegexBuilder::new(PATTERN).unicode(true).build().unwrap();
@@ -298,8 +298,6 @@ fn unicode_bounded_pair_uses_ascii_value_specialization_with_unicode_fallback() 
             .unwrap(),
         expected.1
     );
-    assert_eq!(count_workspace.retained_continuation_bytes(), None);
-    assert_eq!(span_workspace.retained_continuation_bytes(), None);
 }
 
 #[test]

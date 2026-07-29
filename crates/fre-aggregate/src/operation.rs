@@ -17321,14 +17321,18 @@ mod tests {
         clippy::too_many_lines,
         reason = "one differential test keeps ASCII direct, UTF-8 fallback, malformed fallback, receipt, and target-shape assertions together"
     )]
-    fn unicode_bounded_pair_uses_ascii_value_route_and_nonascii_continuation() {
+    fn unicode_bounded_pair_does_not_publish_a_source_dependent_ascii_route() {
         const PATTERN: &str = r"a.{1,2}b|b.{1,2}a";
         let compiled = unicode_state_byte_fixture(PATTERN);
+        if compiled.state_byte_span_sum.is_none() {
+            assert_eq!(compiled.compile_accounting().state_byte_span_sum_plans, 0);
+            return;
+        }
         let plan = compiled
             .state_byte_span_sum
             .as_ref()
-            .expect("Unicode bounded pair should retain its ASCII theorem");
-        assert_eq!(
+            .expect("checked as present above");
+        assert_ne!(
             plan.topology(),
             StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair
         );
