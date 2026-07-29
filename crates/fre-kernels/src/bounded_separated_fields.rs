@@ -10,6 +10,8 @@
 
 use core::{fmt, mem::size_of};
 
+use memchr::{memchr, memchr_iter};
+
 use crate::{DirectBuildAttempt, DirectBuildAttemptActual, DirectBuildAttemptError};
 
 pub const PLAN_ID: &str = "bounded-separated-fields-count.inline-byte-bitsets.v1";
@@ -577,6 +579,29 @@ impl Alternative {
         Ok(false)
     }
 
+    #[inline]
+    fn matches_exact_value(self, bytes: &[u8]) -> bool {
+        let optional = usize::from(self.optional_index);
+        if bytes.len() == self.maximum_width() {
+            return self
+                .atoms
+                .iter()
+                .zip(bytes)
+                .take(self.maximum_width())
+                .all(|(class, &byte)| class.contains(byte));
+        }
+        self.optional_index != NO_OPTIONAL
+            && bytes.len() == self.minimum_width()
+            && self
+                .atoms
+                .iter()
+                .take(self.maximum_width())
+                .enumerate()
+                .filter(|(index, _)| *index != optional)
+                .zip(bytes)
+                .all(|((_, class), &byte)| class.contains(byte))
+    }
+
     fn match_prefix(
         self,
         bytes: &[u8],
@@ -619,6 +644,37 @@ impl Alternative {
             }
         }
         Ok(None)
+    }
+
+    #[inline]
+    fn match_prefix_value(self, bytes: &[u8]) -> Option<usize> {
+        let maximum = self.maximum_width();
+        if bytes.len() >= maximum
+            && self
+                .atoms
+                .iter()
+                .zip(bytes)
+                .take(maximum)
+                .all(|(class, &byte)| class.contains(byte))
+        {
+            return Some(maximum);
+        }
+        let minimum = self.minimum_width();
+        if self.optional_index != NO_OPTIONAL && bytes.len() >= minimum {
+            let optional = usize::from(self.optional_index);
+            if self
+                .atoms
+                .iter()
+                .take(maximum)
+                .enumerate()
+                .filter(|(index, _)| *index != optional)
+                .zip(bytes)
+                .all(|((_, class), &byte)| class.contains(byte))
+            {
+                return Some(minimum);
+            }
+        }
+        None
     }
 }
 
@@ -948,6 +1004,21 @@ impl BoundedSeparatedFieldsPlan {
         })
     }
 
+    /// Return only a successfully admitted count without materializing exact
+    /// execution accounting.
+    ///
+    /// `None` deliberately carries no terminal error. A caller that publishes
+    /// errors must replay [`Self::count`] with the same arguments so failures
+    /// retain the complete typed resource identity.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn count_value_success(&self, haystack: &[u8], limits: ReduceLimits) -> Option<u64> {
+        let upper_bounds = self.preflight(haystack.len(), limits).ok()?;
+        self.execute_separator_anchored_value(haystack, upper_bounds)
+            .map(|(count, _)| count)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the complete execution envelope is derived before the first input read"
@@ -1181,6 +1252,90 @@ impl BoundedSeparatedFieldsPlan {
         })
     }
 
+    /// Every match's first separator identifies its only possible maximal
+    /// non-separator start run. Separator order therefore partitions candidate
+    /// starts into monotonically increasing, disjoint ranges. Filtering those
+    /// starts by the end of the previous match preserves the diagnostic
+    /// reducer's leftmost-first non-overlap without visiting unrelated bytes.
+    #[inline]
+    fn execute_separator_anchored_value(
+        &self,
+        haystack: &[u8],
+        upper: ReduceUpperBounds,
+    ) -> Option<(u64, usize)> {
+        let minimum_width = usize::from(self.minimum_field_width);
+        let maximum_width = usize::from(self.maximum_field_width);
+        let mut run_start = 0_usize;
+        let mut next_start = 0_usize;
+        let mut candidate_checks = 0_usize;
+        let mut count = 0_u64;
+
+        for separator in memchr_iter(self.separator, haystack) {
+            let candidate_run_start = run_start;
+            run_start = separator.checked_add(1)?;
+            let earliest = candidate_run_start
+                .max(separator.saturating_sub(maximum_width))
+                .max(next_start);
+            let Some(latest) = separator.checked_sub(minimum_width) else {
+                continue;
+            };
+            if earliest > latest {
+                continue;
+            }
+            for start in earliest..=latest {
+                let width = separator.checked_sub(start)?;
+                if !self.field_can_match_width(width) {
+                    continue;
+                }
+                candidate_checks = candidate_checks.checked_add(1)?;
+                if candidate_checks > upper.candidates {
+                    return None;
+                }
+                if let Some(end) = self.match_at_first_separator_value(haystack, start, separator) {
+                    if end <= start || end > haystack.len() {
+                        return None;
+                    }
+                    count = count.checked_add(1)?;
+                    next_start = end;
+                    break;
+                }
+            }
+        }
+        (upper.input_bytes == haystack.len()
+            && candidate_checks <= upper.candidates
+            && count <= upper.match_events)
+            .then_some((count, candidate_checks))
+    }
+
+    #[inline]
+    fn match_at_first_separator_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        first_separator: usize,
+    ) -> Option<usize> {
+        if haystack.get(first_separator).copied()? != self.separator
+            || !self.field_matches_exact_value(haystack.get(start..first_separator)?)
+        {
+            return None;
+        }
+        let mut cursor = first_separator.checked_add(1)?;
+        for _ in 2..self.fields {
+            let remaining = haystack.get(cursor..)?;
+            let window = remaining
+                .len()
+                .min(usize::from(self.maximum_field_width).checked_add(1)?);
+            let separator_offset = memchr(self.separator, &remaining[..window])?;
+            if !self.field_matches_exact_value(&remaining[..separator_offset]) {
+                return None;
+            }
+            cursor = cursor.checked_add(separator_offset)?.checked_add(1)?;
+        }
+        let final_bytes = haystack.get(cursor..)?;
+        let width = self.field_match_prefix_value(final_bytes)?;
+        cursor.checked_add(width)
+    }
+
     fn match_at(
         &self,
         haystack: &[u8],
@@ -1239,6 +1394,24 @@ impl BoundedSeparatedFieldsPlan {
         Ok(false)
     }
 
+    #[inline]
+    fn field_can_match_width(&self, width: usize) -> bool {
+        self.alternatives[..usize::from(self.alternative_count)]
+            .iter()
+            .any(|alternative| {
+                width == alternative.maximum_width()
+                    || (alternative.optional_index != NO_OPTIONAL
+                        && width == alternative.minimum_width())
+            })
+    }
+
+    #[inline]
+    fn field_matches_exact_value(&self, bytes: &[u8]) -> bool {
+        self.alternatives[..usize::from(self.alternative_count)]
+            .iter()
+            .any(|alternative| alternative.matches_exact_value(bytes))
+    }
+
     fn field_match_prefix(
         &self,
         bytes: &[u8],
@@ -1250,6 +1423,13 @@ impl BoundedSeparatedFieldsPlan {
             }
         }
         Ok(None)
+    }
+
+    #[inline]
+    fn field_match_prefix_value(&self, bytes: &[u8]) -> Option<usize> {
+        self.alternatives[..usize::from(self.alternative_count)]
+            .iter()
+            .find_map(|alternative| alternative.match_prefix_value(bytes))
     }
 }
 
@@ -1395,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_small_differential_matches_regex_1_12_4() {
+    fn exhaustive_separator_anchored_value_matches_diagnostic_and_regex_1_12_4() {
         fn visit(
             plan: &BoundedSeparatedFieldsPlan,
             reference: &regex::bytes::Regex,
@@ -1404,8 +1584,21 @@ mod tests {
             remaining: usize,
         ) {
             let expected = u64::try_from(reference.find_iter(haystack).count()).unwrap();
-            let actual = plan.count(haystack, ReduceLimits::default()).unwrap().count;
-            assert_eq!(actual, expected, "haystack={haystack:?}");
+            let diagnostic = plan.count(haystack, ReduceLimits::default()).unwrap();
+            let (value, candidate_checks) = plan
+                .execute_separator_anchored_value(haystack, diagnostic.accounting.upper_bounds)
+                .expect("unchanged successful preflight admits compact value execution");
+            assert_eq!(diagnostic.count, expected, "haystack={haystack:?}");
+            assert_eq!(value, expected, "haystack={haystack:?}");
+            assert_eq!(
+                plan.count_value_success(haystack, ReduceLimits::default()),
+                Some(expected),
+                "haystack={haystack:?}"
+            );
+            assert!(
+                candidate_checks <= diagnostic.accounting.upper_bounds.candidates,
+                "candidate checks escaped N: haystack={haystack:?}"
+            );
             if remaining == 0 {
                 return;
             }
@@ -1425,6 +1618,90 @@ mod tests {
                 .build()
                 .unwrap();
         visit(&plan, &reference, b"012.x", &mut Vec::new(), 7);
+
+        let nullable = BoundedSeparatedFieldsPlan::build(
+            one_atom_source(AtomSource::Singleton(b'a'), true),
+            b'|',
+            3,
+            BuildLimits::default(),
+        )
+        .unwrap();
+        let nullable_reference = regex::bytes::RegexBuilder::new(r"(?-u:(?:a?\|){2}a?)")
+            .unicode(false)
+            .build()
+            .unwrap();
+        visit(&nullable, &nullable_reference, b"a|x", &mut Vec::new(), 7);
+    }
+
+    #[test]
+    fn compact_value_reuses_every_preflight_limit_and_refuses_one_below() {
+        let plan =
+            BoundedSeparatedFieldsPlan::build(two_field_source(), b'.', 2, BuildLimits::default())
+                .unwrap();
+        let haystack = b"0.0";
+        let upper = plan
+            .count(haystack, ReduceLimits::default())
+            .unwrap()
+            .accounting
+            .upper_bounds;
+        let exact = ReduceLimits {
+            max_input_bytes: upper.input_bytes,
+            max_sequential_bytes: upper.sequential_bytes,
+            max_count: upper.match_events,
+            max_work: upper.work,
+            max_peak_bytes: upper.peak_bytes,
+        };
+        assert_eq!(plan.count_value_success(haystack, exact), Some(1));
+
+        let one_below = ReduceLimits {
+            max_input_bytes: exact.max_input_bytes.checked_sub(1).unwrap(),
+            ..exact
+        };
+        assert_eq!(plan.count_value_success(haystack, one_below), None);
+        assert!(matches!(
+            plan.count(haystack, one_below),
+            Err(ReduceError::InputLimit { .. })
+        ));
+
+        let one_below = ReduceLimits {
+            max_sequential_bytes: exact.max_sequential_bytes.checked_sub(1).unwrap(),
+            ..exact
+        };
+        assert_eq!(plan.count_value_success(haystack, one_below), None);
+        assert!(matches!(
+            plan.count(haystack, one_below),
+            Err(ReduceError::SequentialLimit { .. })
+        ));
+
+        let one_below = ReduceLimits {
+            max_count: exact.max_count.checked_sub(1).unwrap(),
+            ..exact
+        };
+        assert_eq!(plan.count_value_success(haystack, one_below), None);
+        assert!(matches!(
+            plan.count(haystack, one_below),
+            Err(ReduceError::CountLimit { .. })
+        ));
+
+        let one_below = ReduceLimits {
+            max_work: exact.max_work.checked_sub(1).unwrap(),
+            ..exact
+        };
+        assert_eq!(plan.count_value_success(haystack, one_below), None);
+        assert!(matches!(
+            plan.count(haystack, one_below),
+            Err(ReduceError::WorkLimit { .. })
+        ));
+
+        let one_below = ReduceLimits {
+            max_peak_bytes: exact.max_peak_bytes.checked_sub(1).unwrap(),
+            ..exact
+        };
+        assert_eq!(plan.count_value_success(haystack, one_below), None);
+        assert!(matches!(
+            plan.count(haystack, one_below),
+            Err(ReduceError::PeakLimit { .. })
+        ));
     }
 
     #[test]
@@ -1446,6 +1723,11 @@ mod tests {
             }
             let result = plan.count(&haystack, ReduceLimits::default()).unwrap();
             assert_eq!(result.count, 1, "fields={fields}");
+            assert_eq!(
+                plan.count_value_success(&haystack, ReduceLimits::default()),
+                Some(1),
+                "fields={fields}"
+            );
             let fields = usize::try_from(fields).unwrap();
             let per_candidate = fields
                 .checked_sub(1)

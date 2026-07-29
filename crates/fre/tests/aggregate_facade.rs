@@ -2475,6 +2475,10 @@ fn assert_bounded_separated_ip_planner_boundary(pattern: &str, regex: &fre::Aggr
 
 // rebar-row:imported/mariomka/ip@rust/regex
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one route test keeps diagnostic and compact value exact/one-below contracts adjacent"
+)]
 fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
     let pattern =
         r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9])";
@@ -2512,7 +2516,12 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
         ..AggregateRunLimits::default()
     };
     let counted = regex.count(haystack, exact_run).unwrap();
-    assert_eq!(counted.value(), u64::try_from(expected.len()).unwrap());
+    let expected_count = u64::try_from(expected.len()).unwrap();
+    assert_eq!(counted.value(), expected_count);
+    assert_eq!(
+        regex.count_value(haystack, exact_run).unwrap(),
+        expected_count
+    );
     let AggregateExecutionDetails::BoundedSeparatedFields(accounting) = counted.report().details()
     else {
         panic!("assigned IP row did not execute bounded separated-field plan")
@@ -2530,18 +2539,22 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
     );
     assert!(accounting.actual.sequential_bytes <= exact_sequential);
     assert_eq!(accounting.actual.random_access_bytes, 0);
-    let error = regex
-        .count(
-            haystack,
-            AggregateRunLimits {
-                bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
-                    max_work: exact_work - 1,
-                    ..fre::BoundedSeparatedFieldsReduceLimits::default()
-                },
-                ..AggregateRunLimits::default()
-            },
-        )
-        .unwrap_err();
+    let work_one_below = AggregateRunLimits {
+        bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
+            max_work: exact_work - 1,
+            ..fre::BoundedSeparatedFieldsReduceLimits::default()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let value_error = regex.count_value(haystack, work_one_below).unwrap_err();
+    assert!(value_error.has_closed_direct_attempt());
+    assert!(matches!(
+        value_error.source,
+        AggregateExecutionSource::BoundedSeparatedFields(
+            fre::BoundedSeparatedFieldsReduceError::WorkLimit { needed, limit }
+        ) if needed == exact_work && limit + 1 == exact_work
+    ));
+    let error = regex.count(haystack, work_one_below).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,
@@ -2549,18 +2562,24 @@ fn bounded_separated_ip_count_selects_typed_plan_and_exact_work_boundary() {
             fre::BoundedSeparatedFieldsReduceError::WorkLimit { needed, limit }
         ) if needed == exact_work && limit + 1 == exact_work
     ));
-    let error = regex
-        .count(
-            haystack,
-            AggregateRunLimits {
-                bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
-                    max_sequential_bytes: exact_sequential - 1,
-                    ..fre::BoundedSeparatedFieldsReduceLimits::default()
-                },
-                ..AggregateRunLimits::default()
-            },
-        )
+    let sequential_one_below = AggregateRunLimits {
+        bounded_separated_fields: fre::BoundedSeparatedFieldsReduceLimits {
+            max_sequential_bytes: exact_sequential - 1,
+            ..fre::BoundedSeparatedFieldsReduceLimits::default()
+        },
+        ..AggregateRunLimits::default()
+    };
+    let value_error = regex
+        .count_value(haystack, sequential_one_below)
         .unwrap_err();
+    assert!(value_error.has_closed_direct_attempt());
+    assert!(matches!(
+        value_error.source,
+        AggregateExecutionSource::BoundedSeparatedFields(
+            fre::BoundedSeparatedFieldsReduceError::SequentialLimit { needed, limit }
+        ) if needed == exact_sequential && limit + 1 == exact_sequential
+    ));
+    let error = regex.count(haystack, sequential_one_below).unwrap_err();
     assert!(error.has_closed_direct_attempt());
     assert!(matches!(
         error.source,

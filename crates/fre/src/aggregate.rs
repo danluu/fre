@@ -16705,6 +16705,31 @@ impl AggregatePlan {
         }
     }
 
+    #[inline(never)]
+    fn execute_bounded_separated_fields_count_value(
+        &self,
+        engine: &BoundedSeparatedFieldsPlan,
+        haystack: &[u8],
+        limits: &AggregateRunLimits,
+    ) -> Result<u64, AggregateExecutionError> {
+        if let Some(value) = engine.count_value_success(haystack, limits.bounded_separated_fields) {
+            return Ok(value);
+        }
+        match engine.count(haystack, limits.bounded_separated_fields) {
+            Err(source) => Err(self.direct_execution_error(
+                haystack.len(),
+                limits,
+                AggregateExecutionSource::BoundedSeparatedFields(source),
+            )),
+            Ok(_) => Err(self.execution_error(
+                limits,
+                AggregateExecutionSource::InternalInvariant(
+                    "compact bounded separated-field count refusal did not reproduce during authenticated replay",
+                ),
+            )),
+        }
+    }
+
     // Keep the entry dispatcher as a small route selector. In particular,
     // direct Unicode count plans should not inherit stack probes or code
     // placement from receipt-heavy fallback routes.
@@ -16741,6 +16766,9 @@ impl AggregatePlan {
             }
             AggregateEngine::FixedPredicateWord64(engine) => {
                 self.execute_fixed_predicate_count_value(engine, haystack, limits)
+            }
+            AggregateEngine::BoundedSeparatedFields(engine) => {
+                self.execute_bounded_separated_fields_count_value(engine, haystack, limits)
             }
             _ => self.execute_count_value_fallback(haystack, limits),
         }
