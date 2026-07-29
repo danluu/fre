@@ -8,7 +8,7 @@
 //! Movable ASIMD production and same-thread SVE/SVE2 production remain
 //! type-disjoint. Qualification facades remain native-only for measurement.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU64};
 
 use fre_aot_static_runtime::{
     STATIC_COUNT_PRODUCTION_MIN_HAYSTACK_BYTES_V3, StaticCountCallErrorV3,
@@ -696,6 +696,26 @@ impl AggregateCountExactLiteralAotSveQualificationSessionV3<'_> {
         let upper = preflight_v3(self.checked, haystack.len(), limits.borrow())?;
         self.native
             .count(haystack, exact_runtime_limits_v3(upper))
+            .map_err(Into::into)
+    }
+
+    /// Repeat one qualification call inside the runtime's closed SVE
+    /// measurement contract.
+    ///
+    /// The facade performs its deterministic resource preflight once because
+    /// every iteration has identical inputs. The runtime then prepares its
+    /// call state, checks exact current-thread VL16 once, and enters a loop
+    /// containing only authenticated native calls and result validation.
+    #[inline]
+    pub fn count_value_repeated(
+        &self,
+        haystack: &[u8],
+        limits: impl core::borrow::Borrow<AggregateRunLimits>,
+        iterations: NonZeroU64,
+    ) -> Result<u64, AggregateCountExactLiteralAotExecutionErrorV3> {
+        let upper = preflight_v3(self.checked, haystack.len(), limits.borrow())?;
+        self.native
+            .count_repeated(haystack, exact_runtime_limits_v3(upper), iterations)
             .map_err(Into::into)
     }
 

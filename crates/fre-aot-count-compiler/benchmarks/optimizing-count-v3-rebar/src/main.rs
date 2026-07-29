@@ -45,6 +45,11 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+#[cfg(all(
+    feature = "qualification-private",
+    any(fre_count_v3_sve, fre_count_v3_sve2)
+))]
+use std::num::NonZeroU64;
 
 #[cfg(all(feature = "qualification-private", fre_count_v3_neon))]
 use fre::AggregateCountExactLiteralAotQualificationV3;
@@ -1103,9 +1108,24 @@ fn execute_count_v3(
     if kind == RunKind::Correctness {
         return Ok(0);
     }
-    measure_safe_values(iterations, expected, || {
-        session.count_value(black_box(haystack), &limits)
-    })
+    let iterations = NonZeroU64::new(iterations)
+        .ok_or_else(|| RunnerError::new("SVE repeated measurement requires nonzero iterations"))?;
+    let start = Instant::now();
+    let checksum = session
+        .count_value_repeated(black_box(haystack), &limits, iterations)
+        .map_err(|error| {
+            RunnerError::new(format!(
+                "SVE Count-v3 closed repeated measurement failed: {error}"
+            ))
+        })?;
+    let elapsed = elapsed_ns(start)?;
+    require_timed_checksum(
+        black_box(checksum),
+        expected,
+        iterations.get(),
+        "SVE Count-v3 closed repeated measurement",
+    )?;
+    Ok(elapsed)
 }
 
 #[cfg(all(feature = "production", fre_count_v3_neon))]

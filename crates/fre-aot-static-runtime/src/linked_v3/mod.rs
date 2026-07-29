@@ -1,6 +1,8 @@
 //! Static final-image adoption for optimizing Count-v3.
 
 use core::marker::PhantomData;
+#[cfg(any(test, feature = "count-v3-qualification-private"))]
+use core::num::NonZeroU64;
 use core::{mem, ptr, slice};
 use std::rc::Rc;
 
@@ -463,8 +465,10 @@ pub struct VerifiedStaticCountSveQualificationV3 {
 
 /// Current-thread SVE/SVE2 invocation session.
 ///
-/// Session creation checks exact VL16 and every call checks it again
-/// immediately before the native branch.
+/// Session creation checks exact VL16 and every single call checks it again
+/// immediately before the native branch. Qualification additionally exposes a
+/// closed repeated-call measurement contract that performs exactly one VL
+/// check after all setup and before its native loop.
 #[cfg(feature = "count-v3-qualification-private")]
 #[derive(Debug)]
 #[doc(hidden)]
@@ -697,6 +701,29 @@ impl StaticCountSveQualificationSessionV3<'_> {
         self.handle.core.count_sve(haystack, limits)
     }
 
+    /// Repeat one already-preflightable call inside a closed measurement loop.
+    ///
+    /// This qualification-only surface performs one exact current-thread
+    /// target/VL16 check after preparing all inputs and immediately before the
+    /// loop. No caller callback, allocation, target lookup, or mutable session
+    /// operation can run between that check and the authenticated native
+    /// entries. Each native result is still decoded and bounded; the returned
+    /// checksum is the wrapping sum of all values.
+    ///
+    /// Ordinary [`Self::count`] behavior is unchanged and continues to check
+    /// VL16 before every individual native branch.
+    #[inline]
+    pub fn count_repeated(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+        iterations: NonZeroU64,
+    ) -> Result<u64, StaticCountSveCallErrorV3> {
+        self.handle
+            .core
+            .count_sve_repeated(haystack, limits, iterations)
+    }
+
     #[must_use]
     pub const fn handle(&self) -> &VerifiedStaticCountSveQualificationV3 {
         self.handle
@@ -777,6 +804,79 @@ impl VerifiedCoreV3 {
             literal_len,
         )
         .map_err(Into::into)
+    }
+
+    #[cfg(feature = "count-v3-qualification-private")]
+    #[inline]
+    fn count_sve_repeated(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+        iterations: NonZeroU64,
+    ) -> Result<u64, StaticCountSveCallErrorV3> {
+        self.count_sve_repeated_with_target_check(
+            haystack,
+            limits,
+            iterations,
+            platform::require_current_thread_sve_target_v3,
+        )
+    }
+
+    /// Implement the closed qualification loop with an injectable target
+    /// check so unit tests can prove check ordering on non-SVE hosts.
+    #[cfg(any(test, feature = "count-v3-qualification-private"))]
+    #[allow(
+        unsafe_code,
+        reason = "the repeated entry was exactly audited and one target/VL16 check immediately precedes the closed native loop"
+    )]
+    #[inline]
+    fn count_sve_repeated_with_target_check(
+        &self,
+        haystack: &[u8],
+        limits: AggregateExecutionLimits,
+        iterations: NonZeroU64,
+        target_check: impl FnOnce(u8, u64, u16) -> Result<(), StaticCountSveThreadContractErrorV3>,
+    ) -> Result<u64, StaticCountSveCallErrorV3> {
+        let literal_len = usize::from(self.literal_bytes);
+        let upper =
+            preflight_exact_aggregate(haystack.len(), literal_len, AggregateOutput::Count, limits)
+                .map_err(StaticCountCallErrorV3::from)?;
+        let haystack_pointer = if haystack.is_empty() {
+            ptr::addr_of!(EMPTY_HAYSTACK_SENTINEL_V3)
+        } else {
+            haystack.as_ptr()
+        };
+        let iteration_count = iterations.get();
+        let mut checksum = 0_u64;
+
+        // This is deliberately the final setup operation. The remaining
+        // region is a closed loop over the immutable authenticated entry and
+        // local result/checksum state; no caller-supplied operation can run.
+        target_check(
+            self.eligibility_tuple.required_isa_id,
+            self.eligibility_tuple.actual_features,
+            self.eligibility_tuple.sve_vector_length_bytes,
+        )?;
+        for _ in 0..iteration_count {
+            let mut result = RawAggregateResultV3 {
+                value: POISONED_COUNT_RESULT_V3,
+            };
+            // SAFETY: target_check just established this thread's exact target
+            // contract, and the closed loop admits no intervening caller code.
+            let status = unsafe {
+                (self.entry)(haystack_pointer, haystack.len(), ptr::addr_of_mut!(result))
+            };
+            let value = decode_count_result_v3(
+                status,
+                result.value,
+                upper.count,
+                haystack.len(),
+                literal_len,
+            )
+            .map_err(StaticCountSveCallErrorV3::from)?;
+            checksum = checksum.wrapping_add(value);
+        }
+        Ok(checksum)
     }
 }
 
@@ -1433,6 +1533,7 @@ mod tests {
     }
 
     static DIRECT_ENTRY_CALLS_V3: AtomicUsize = AtomicUsize::new(0);
+    static REPEATED_TARGET_CHECKS_V3: AtomicUsize = AtomicUsize::new(0);
 
     #[allow(
         unsafe_code,
@@ -1739,6 +1840,75 @@ mod tests {
                 }
             ))
         );
+        assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repeated_sve_contract_preflights_then_checks_once_before_closed_entries() {
+        let core = counted_dummy_core_v3();
+        let expected_tuple = core.eligibility_tuple;
+        let iterations = NonZeroU64::new(4).unwrap();
+        DIRECT_ENTRY_CALLS_V3.store(0, Ordering::SeqCst);
+        REPEATED_TARGET_CHECKS_V3.store(0, Ordering::SeqCst);
+
+        let checksum = core
+            .count_sve_repeated_with_target_check(
+                b"needleneedle",
+                AggregateExecutionLimits::unlimited(),
+                iterations,
+                |required_isa_id, actual_features, vector_length| {
+                    assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
+                    assert_eq!(required_isa_id, expected_tuple.required_isa_id);
+                    assert_eq!(actual_features, expected_tuple.actual_features);
+                    assert_eq!(vector_length, expected_tuple.sve_vector_length_bytes);
+                    REPEATED_TARGET_CHECKS_V3.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(checksum, 8);
+        assert_eq!(REPEATED_TARGET_CHECKS_V3.load(Ordering::SeqCst), 1);
+        assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 4);
+
+        DIRECT_ENTRY_CALLS_V3.store(0, Ordering::SeqCst);
+        REPEATED_TARGET_CHECKS_V3.store(0, Ordering::SeqCst);
+        assert_eq!(
+            core.count_sve_repeated_with_target_check(
+                b"needleneedle",
+                AggregateExecutionLimits::unlimited(),
+                iterations,
+                |_, _, _| {
+                    REPEATED_TARGET_CHECKS_V3.fetch_add(1, Ordering::SeqCst);
+                    Err(StaticCountSveThreadContractErrorV3::UnsupportedHost)
+                },
+            ),
+            Err(StaticCountSveCallErrorV3::ThreadContract(
+                StaticCountSveThreadContractErrorV3::UnsupportedHost
+            ))
+        );
+        assert_eq!(REPEATED_TARGET_CHECKS_V3.load(Ordering::SeqCst), 1);
+        assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
+
+        let refused_limits = AggregateExecutionLimits {
+            max_haystack_bytes: 0,
+            ..AggregateExecutionLimits::unlimited()
+        };
+        REPEATED_TARGET_CHECKS_V3.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            core.count_sve_repeated_with_target_check(
+                b"needleneedle",
+                refused_limits,
+                iterations,
+                |_, _, _| {
+                    REPEATED_TARGET_CHECKS_V3.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ),
+            Err(StaticCountSveCallErrorV3::Count(
+                StaticCountCallErrorV3::Preflight(_)
+            ))
+        ));
+        assert_eq!(REPEATED_TARGET_CHECKS_V3.load(Ordering::SeqCst), 0);
         assert_eq!(DIRECT_ENTRY_CALLS_V3.load(Ordering::SeqCst), 0);
     }
 }

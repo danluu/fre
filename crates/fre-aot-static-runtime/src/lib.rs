@@ -13,8 +13,11 @@
 //! `Sync`. Production SVE adoption requires a source-authorized full tuple
 //! before any image address is read. Both production call boundaries enforce
 //! the evidence-backed long-input floor, while safe facades retain the
-//! portable owner for shorter calls. Qualification rechecks VL16 immediately
-//! before every raw measurement call and grants no production authority.
+//! portable owner for shorter calls. Qualification single calls recheck VL16
+//! immediately before every native branch. Its separate repeated-measurement
+//! contract performs one check immediately before a closed native loop, with
+//! no caller code between that check and the authenticated entries, and grants
+//! no production authority.
 //! The independent Search-v1 Span architecture uses a JIT- and compiler-neutral
 //! 584-byte expectation contract. Its literal source qualification table is
 //! checked before any final-image pointer is used, every identity is matched,
