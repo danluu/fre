@@ -6305,6 +6305,102 @@ mod tests {
         .unwrap()
     }
 
+    fn a_star(greedy: bool) -> Automaton {
+        let split_targets = if greedy { [1, 2] } else { [2, 1] };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 2, 3, 3],
+                edge_targets: vec![split_targets[0], split_targets[1], 0],
+                edge_kinds: vec![EdgeKind::Epsilon, EdgeKind::Epsilon, EdgeKind::ByteRange],
+                byte_starts: vec![0, 0, b'a'],
+                byte_ends: vec![0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn a_question(greedy: bool) -> Automaton {
+        let split_targets = if greedy { [1, 2] } else { [2, 1] };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 2, 3, 3],
+                edge_targets: vec![split_targets[0], split_targets[1], 2],
+                edge_kinds: vec![EdgeKind::Epsilon, EdgeKind::Epsilon, EdgeKind::ByteRange],
+                byte_starts: vec![0, 0, b'a'],
+                byte_ends: vec![0, 0, b'a'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn empty_or_a_plus(empty_first: bool, greedy_plus: bool) -> Automaton {
+        let root_targets = if empty_first { [3, 1] } else { [1, 3] };
+        let plus_targets = if greedy_plus { [1, 3] } else { [3, 1] };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 5, 5],
+                edge_targets: vec![
+                    root_targets[0],
+                    root_targets[1],
+                    2,
+                    plus_targets[0],
+                    plus_targets[1],
+                ],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                ],
+                byte_starts: vec![0, 0, b'a', 0, 0],
+                byte_ends: vec![0, 0, b'a', 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn empty_or_ab(empty_first: bool) -> Automaton {
+        let root_targets = if empty_first { [3, 1] } else { [1, 3] };
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4],
+                edge_targets: vec![root_targets[0], root_targets[1], 2, 3],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b'],
+                byte_ends: vec![0, 0, b'a', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn ordered_a_or_ab(long_first: bool) -> Automaton {
         let (first, second) = if long_first { (1_u32, 4_u32) } else { (4, 1) };
         Automaton::from_raw(
@@ -9354,6 +9450,184 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "nullable priority needs all four contracts over the same exhaustive windows"
+    )]
+    fn nullable_ordered_lazy_dfa_matches_pike_for_every_contract_and_window() {
+        let plans = [
+            ("greedy-star", a_star(true), false),
+            ("lazy-star", a_star(false), true),
+            ("greedy-question", a_question(true), false),
+            ("lazy-question", a_question(false), true),
+            ("empty-first-greedy-plus", empty_or_a_plus(true, true), true),
+            ("empty-first-lazy-plus", empty_or_a_plus(true, false), true),
+            (
+                "positive-first-greedy-plus",
+                empty_or_a_plus(false, true),
+                false,
+            ),
+            (
+                "positive-first-lazy-plus",
+                empty_or_a_plus(false, false),
+                false,
+            ),
+            ("empty-first-ab", empty_or_ab(true), true),
+            ("positive-first-ab", empty_or_ab(false), false),
+        ];
+        let haystacks = bounded_words(&[0x00, b'a', b'b', 0x80, 0xff], 3);
+        let mut checked = 0usize;
+
+        for (name, plan, terminal_initial) in &plans {
+            pin_without_start_filter(plan);
+            let mut pike = K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut endpoint =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut bidirectional =
+                K0Workspace::new_bidirectional(plan, WorkspaceLimits::unlimited()).unwrap();
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let want_exists = plan
+                            .prepare::<Exists>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got_exists = plan
+                            .prepare::<Exists>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut endpoint,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got_exists.output(),
+                            want_exists.output(),
+                            "{name}: Exists source={haystack:?} window={window:?}"
+                        );
+                        assert_eq!(
+                            got_exists.accounting().boundaries(),
+                            want_exists.accounting().boundaries(),
+                            "{name}: Exists boundary accounting"
+                        );
+
+                        let want_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got_earliest = plan
+                            .prepare::<EarliestEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut endpoint,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got_earliest.output(),
+                            want_earliest.output(),
+                            "{name}: EarliestEnd source={haystack:?} window={window:?}"
+                        );
+                        assert_eq!(
+                            got_earliest.accounting().boundaries(),
+                            want_earliest.accounting().boundaries(),
+                            "{name}: EarliestEnd boundary accounting"
+                        );
+
+                        let want_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got_selected = plan
+                            .prepare::<SelectedEnd>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut endpoint,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got_selected.output(),
+                            want_selected.output(),
+                            "{name}: SelectedEnd source={haystack:?} window={window:?}"
+                        );
+                        assert_eq!(
+                            got_selected.accounting().boundaries(),
+                            want_selected.accounting().boundaries(),
+                            "{name}: SelectedEnd boundary accounting"
+                        );
+
+                        let want_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut pike,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        let got_span = plan
+                            .prepare::<Span>()
+                            .search_window_with_workspace(
+                                haystack,
+                                window,
+                                &mut bidirectional,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            got_span.output(),
+                            want_span.output(),
+                            "{name}: Span source={haystack:?} window={window:?}"
+                        );
+                        if *terminal_initial {
+                            assert_eq!(
+                                got_span.accounting().boundaries(),
+                                want_span.accounting().boundaries(),
+                                "{name}: terminal Span boundary accounting"
+                            );
+                        }
+                        checked = checked.checked_add(1).unwrap();
+                    }
+                }
+            }
+
+            assert!(endpoint.lazy.initialized, "{name}: endpoint initialized");
+            assert!(!endpoint.lazy.declined, "{name}: endpoint accepted");
+            assert!(bidirectional.lazy.initialized, "{name}: span initialized");
+            assert_eq!(
+                bidirectional.reverse.initialized, !*terminal_initial,
+                "{name}: reverse preparation"
+            );
+            assert!(
+                !bidirectional.lazy.declined,
+                "{name}: span forward accepted"
+            );
+        }
+        assert!(checked > 10_000);
+    }
+
+    #[test]
     fn contextual_assertion_masks_match_the_canonical_edge_evaluator() {
         let mut haystacks = bounded_words(&[0, b'\r', b'\n', b';', b'a', b'_', 0x80], 3);
         haystacks.extend([
@@ -10018,8 +10292,21 @@ mod tests {
                 .into_output(),
             Some(0)
         );
-        assert!(nullable_workspace.lazy.declined);
-        assert!(!nullable_workspace.lazy.initialized);
+        assert!(!nullable_workspace.lazy.declined);
+        assert!(nullable_workspace.lazy.initialized);
+        assert!(super::lazy_initial_is_terminal(&nullable_workspace).unwrap());
+
+        let mut nullable_span =
+            K0Workspace::new_bidirectional(&nullable, WorkspaceLimits::unlimited()).unwrap();
+        assert!(!nullable_span.reverse.is_allocated());
+        let report = nullable
+            .prepare::<Span>()
+            .search_with_workspace(b"abc", &mut nullable_span, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(report.output(), &Some(MatchSpan::new(0, 0)));
+        assert_eq!(report.accounting().boundaries(), 1);
+        assert!(nullable_span.lazy.initialized);
+        assert!(!nullable_span.reverse.initialized);
     }
 
     #[test]
@@ -10262,6 +10549,144 @@ mod tests {
         }
         assert!(accelerated.lazy.saturated);
         assert!(accelerated.lazy.initialized);
+    }
+
+    #[test]
+    fn nullable_lazy_cache_budget_and_capacity_handoffs_preserve_priority() {
+        let plan = empty_or_ab(false);
+        pin_without_start_filter(&plan);
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut saturated =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        saturated.lazy.offsets.truncate(1);
+        saturated.lazy.lengths.truncate(1);
+        saturated.lazy.modes.truncate(1);
+        saturated.lazy.hashes.truncate(1);
+
+        for haystack in [b"ab".as_slice(), b"aba", b"a\xffb", b"\xffab", b""] {
+            for start in 0..=haystack.len() {
+                let window = SearchWindow::new(start, haystack.len());
+                let want = plan
+                    .prepare::<SelectedEnd>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut pike,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                let got = plan
+                    .prepare::<SelectedEnd>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut saturated,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                assert_eq!(
+                    got, want,
+                    "saturated nullable source={haystack:?}/{window:?}"
+                );
+            }
+        }
+        assert!(saturated.lazy.saturated);
+        assert!(saturated.lazy.initialized);
+
+        let mut retryable =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(b"", &mut retryable, SearchLimits::unlimited())
+            .unwrap();
+        let initial = retryable.lazy.initial;
+        assert_eq!(
+            retryable.lazy.cell(initial, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let mut refused = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            super::build_lazy_cached_transition(
+                &plan,
+                initial,
+                b'a',
+                &mut retryable,
+                &mut refused,
+                u64::MAX,
+                0,
+            )
+            .unwrap(),
+            super::LazyTransition::Inline {
+                accepted: false,
+                pending: true,
+            }
+        ));
+        assert!(!retryable.lazy.saturated);
+        assert_eq!(
+            retryable.lazy.cell(initial, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let mut retry = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            super::build_lazy_cached_transition(
+                &plan,
+                initial,
+                b'a',
+                &mut retryable,
+                &mut retry,
+                0,
+                0,
+            )
+            .unwrap(),
+            super::LazyTransition::Ready(_)
+        ));
+        assert_ne!(
+            retryable.lazy.cell(initial, b'a').unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+    }
+
+    #[test]
+    fn nullable_reverse_capacity_handoff_recovers_positive_span_without_empty_confusion() {
+        let plan = empty_or_ab(false);
+        pin_without_start_filter(&plan);
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut saturated =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        saturated.reverse.offsets.truncate(1);
+        saturated.reverse.lengths.truncate(1);
+        saturated.reverse.hashes.truncate(1);
+
+        for haystack in [b"ab".as_slice(), b"\xffab", b"aba", b"a\xffb", b""] {
+            for start in 0..=haystack.len() {
+                let window = SearchWindow::new(start, haystack.len());
+                let want = plan
+                    .prepare::<Span>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut pike,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                let got = plan
+                    .prepare::<Span>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut saturated,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output();
+                assert_eq!(got, want, "nullable reverse source={haystack:?}/{window:?}");
+            }
+        }
+        assert!(saturated.reverse.initialized);
+        assert!(saturated.reverse.saturated);
     }
 
     #[test]
@@ -10557,6 +10982,249 @@ mod tests {
                 needed,
                 limit,
             }) if needed == retained && limit == retained - 1
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all four nullable contracts need independent exact and one-below ledgers"
+    )]
+    fn warmed_nullable_lazy_contracts_enforce_exact_limits_and_pike_fallback_accounting() {
+        let plan = a_star(true);
+        pin_without_start_filter(&plan);
+        let haystack = b"aaaa";
+        let mut endpoint =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut span = K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let endpoint_retained = endpoint.retained_bytes();
+        let span_retained = span.retained_bytes();
+
+        let _ = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(haystack, &mut endpoint, SearchLimits::unlimited())
+            .unwrap();
+        let _ = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut span, SearchLimits::unlimited())
+            .unwrap();
+
+        let exists_work = plan
+            .prepare::<Exists>()
+            .search_with_workspace(haystack, &mut endpoint, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert!(plan
+            .prepare::<Exists>()
+            .search_with_workspace(
+                haystack,
+                &mut endpoint,
+                SearchLimits {
+                    max_work: exists_work,
+                    max_scratch_bytes: endpoint_retained,
+                },
+            )
+            .unwrap()
+            .into_output());
+        assert!(matches!(
+            plan.prepare::<Exists>().search_with_workspace(
+                haystack,
+                &mut endpoint,
+                SearchLimits {
+                    max_work: exists_work - 1,
+                    max_scratch_bytes: endpoint_retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == exists_work - 1
+        ));
+
+        let earliest_work = plan
+            .prepare::<EarliestEnd>()
+            .search_with_workspace(haystack, &mut endpoint, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<EarliestEnd>()
+                .search_with_workspace(
+                    haystack,
+                    &mut endpoint,
+                    SearchLimits {
+                        max_work: earliest_work,
+                        max_scratch_bytes: endpoint_retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(0)
+        );
+        assert!(matches!(
+            plan.prepare::<EarliestEnd>().search_with_workspace(
+                haystack,
+                &mut endpoint,
+                SearchLimits {
+                    max_work: earliest_work - 1,
+                    max_scratch_bytes: endpoint_retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == earliest_work - 1
+        ));
+
+        let selected_work = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(haystack, &mut endpoint, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_with_workspace(
+                    haystack,
+                    &mut endpoint,
+                    SearchLimits {
+                        max_work: selected_work,
+                        max_scratch_bytes: endpoint_retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(haystack.len())
+        );
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>().search_with_workspace(
+                haystack,
+                &mut endpoint,
+                SearchLimits {
+                    max_work: selected_work - 1,
+                    max_scratch_bytes: endpoint_retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == selected_work - 1
+        ));
+
+        let span_work = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut span, SearchLimits::unlimited())
+            .unwrap()
+            .accounting()
+            .work();
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_with_workspace(
+                    haystack,
+                    &mut span,
+                    SearchLimits {
+                        max_work: span_work,
+                        max_scratch_bytes: span_retained,
+                    },
+                )
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(0, haystack.len()))
+        );
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                haystack,
+                &mut span,
+                SearchLimits {
+                    max_work: span_work - 1,
+                    max_scratch_bytes: span_retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == span_work - 1
+        ));
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                haystack,
+                &mut span,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: span_retained - 1,
+                },
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == span_retained && limit == span_retained - 1
+        ));
+
+        let fallback_plan = empty_or_ab(false);
+        pin_without_start_filter(&fallback_plan);
+        let fallback_haystack = b"ab";
+        let mut pike = K0Workspace::new(&fallback_plan, WorkspaceLimits::unlimited()).unwrap();
+        let pike_report = fallback_plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(fallback_haystack, &mut pike, SearchLimits::unlimited())
+            .unwrap();
+        let certificate = fallback_plan
+            .conservative_reused_work_bound(fallback_haystack.len())
+            .unwrap();
+        let mut fresh =
+            K0Workspace::new_accelerated(&fallback_plan, WorkspaceLimits::unlimited()).unwrap();
+        let fresh_retained = fresh.retained_bytes();
+        let fallback = fallback_plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(
+                fallback_haystack,
+                &mut fresh,
+                SearchLimits {
+                    max_work: certificate,
+                    max_scratch_bytes: fresh_retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(fallback.output(), pike_report.output());
+        assert_eq!(
+            fallback.accounting().transition_work(),
+            pike_report.accounting().transition_work()
+        );
+        assert_eq!(
+            fallback.accounting().boundaries(),
+            pike_report.accounting().boundaries()
+        );
+        assert!(!fresh.lazy.initialized);
+        assert!(!fresh.lazy.declined);
+
+        let terminal = a_star(false);
+        pin_without_start_filter(&terminal);
+        let mut terminal_span =
+            K0Workspace::new_bidirectional(&terminal, WorkspaceLimits::unlimited()).unwrap();
+        let _ = terminal
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut terminal_span, SearchLimits::unlimited())
+            .unwrap();
+        let warm = terminal
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut terminal_span, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm.output(), &Some(MatchSpan::new(0, 0)));
+        assert_eq!(warm.accounting().boundaries(), 1);
+        assert!(!terminal_span.reverse.initialized);
+        let terminal_retained = terminal_span.retained_bytes();
+        let exact = terminal
+            .prepare::<Span>()
+            .search_with_workspace(
+                haystack,
+                &mut terminal_span,
+                SearchLimits {
+                    max_work: warm.accounting().work(),
+                    max_scratch_bytes: terminal_retained,
+                },
+            )
+            .unwrap();
+        assert_eq!(exact.output(), warm.output());
+        assert!(matches!(
+            terminal.prepare::<Span>().search_with_workspace(
+                haystack,
+                &mut terminal_span,
+                SearchLimits {
+                    max_work: warm.accounting().work() - 1,
+                    max_scratch_bytes: terminal_retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { .. })
         ));
     }
 

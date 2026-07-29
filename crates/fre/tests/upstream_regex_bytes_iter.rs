@@ -300,6 +300,60 @@ fn empty_progress_is_byte_wise_and_anchors_keep_original_context() {
 }
 
 #[test]
+fn nullable_k0_iteration_preserves_priority_and_empty_progress_across_reused_searches() {
+    let patterns = ["a*", "a*?", "a?", "a??", "(?:|ab)", "(?:ab|)"];
+    let haystacks: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"aaaa",
+        b"baab",
+        &[0xff, b'a', b'b', 0x80, b'a'],
+        &[0xc3, 0x28, b'a', b'b'],
+    ];
+
+    for pattern in patterns {
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap_or_else(|error| panic!("nullable K0 build failed for {pattern:?}: {error}"));
+        assert_eq!(regex.build_report().plan, PlanKind::K0, "{pattern:?}");
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap_or_else(|error| panic!("pinned build failed for {pattern:?}: {error}"));
+
+        for &haystack in haystacks {
+            let expected: Vec<_> = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect();
+            for repetition in 0..3 {
+                let (actual, accounting) =
+                    collect(&regex, haystack, PortableFindIterLimits::unlimited()).unwrap_or_else(
+                        |error| {
+                            panic!(
+                                "nullable K0 iteration failed for {pattern:?}/{haystack:?} \
+                                 repetition {repetition}: {error}"
+                            )
+                        },
+                    );
+                let actual: Vec<_> = actual
+                    .iter()
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "nullable K0 iteration mismatch for {pattern:?}/{haystack:?}"
+                );
+                assert_eq!(accounting.matches, expected.len());
+                assert!(accounting.search_calls >= accounting.matches);
+            }
+        }
+    }
+}
+
+#[test]
 fn whole_iterator_search_call_limit_is_exact_and_terminal() {
     let regex = PortableBuilder::new("")
         .unicode(false)
