@@ -135,6 +135,7 @@ dependencies = [
 name = "fre-aot-aarch64"
 version = "0.1.0"
 dependencies = [
+ "fre-aot-optimizer",
  "fre-exact-alloc",
  "fre-kernel-ir",
  "sha2",
@@ -163,6 +164,7 @@ dependencies = [
  "fre-aot-compiler",
  "fre-aot-count-contract",
  "fre-aot-macho",
+ "fre-aot-optimizer",
  "fre-exact-alloc",
  "fre-kernel-ir",
  "sha2",
@@ -173,6 +175,7 @@ name = "fre-aot-count-contract"
 version = "0.1.0"
 dependencies = [
  "fre-aot-aarch64",
+ "fre-aot-optimizer",
  "sha2",
 ]
 
@@ -192,6 +195,15 @@ dependencies = [
  "fre-aot-aarch64",
  "fre-exact-alloc",
  "fre-jit-aarch64",
+ "fre-kernel-ir",
+ "sha2",
+]
+
+[[package]]
+name = "fre-aot-optimizer"
+version = "0.1.0"
+dependencies = [
+ "fre-exact-alloc",
  "fre-kernel-ir",
  "sha2",
 ]
@@ -219,7 +231,9 @@ name = "fre-aot-static-runtime"
 version = "0.1.0"
 dependencies = [
  "fre-aot-aarch64",
+ "fre-aot-count-compiler",
  "fre-aot-count-contract",
+ "fre-aot-optimizer",
  "fre-aot-search-contract",
  "fre-kernel-ir",
  "fre-kernels",
@@ -314,6 +328,7 @@ dependencies = [
  "fre",
  "fre-jit-aarch64",
  "fre-kernel-ir",
+ "fre-kernels",
  "fre-target-features",
  "libc",
  "sha2",
