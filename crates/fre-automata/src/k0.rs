@@ -839,11 +839,12 @@ impl LazyWorkspace {
 
     fn intern_initial(
         &mut self,
+        pending: bool,
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<u32, SearchError> {
         let item_count = self.scratch_len;
-        if item_count == 0 || self.state_len != 0 || self.item_len != 0 {
+        if (item_count == 0 && !pending) || self.state_len != 0 || self.item_len != 0 {
             return Err(SearchError::InternalInvariant {
                 detail: "lazy DFA initial state has an invalid cache shape",
             });
@@ -857,7 +858,7 @@ impl LazyWorkspace {
             computation: "lazy DFA initial item work",
         })?;
         meter.charge(item_work, position)?;
-        let hash = lazy_hash(&self.scratch[..item_count], false);
+        let hash = lazy_hash(&self.scratch[..item_count], pending);
         meter.charge(item_work, position)?;
         self.items[..item_count].copy_from_slice(&self.scratch[..item_count]);
         self.offsets[0] = 0;
@@ -865,7 +866,7 @@ impl LazyWorkspace {
             u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
                 detail: "lazy DFA initial length does not fit u32",
             })?;
-        self.modes[0] = 0;
+        self.modes[0] = u8::from(pending);
         self.hashes[0] = hash;
         self.state_len = 1;
         self.item_len = item_count;
@@ -1546,10 +1547,10 @@ impl K0Workspace {
     /// workspace. Assertion-free byte automata add fixed-capacity direct rows;
     /// assertion-bearing byte automata instead key a bounded transition store
     /// by the exact enabled-assertion mask at each boundary. Neither store
-    /// grows during a search. Nullable and empty graphs discover their
-    /// immutable decline on the first endpoint call and then remain on Pike.
-    /// Facades with minimum-length metadata exclude those graphs before this
-    /// constructor. Span operations still use Pike execution.
+    /// grows during a search. Assertion-free nullable graphs retain their
+    /// ordered higher-priority consuming prefix plus the initial empty match;
+    /// contextual nullable and empty-language graphs remain on Pike. Span
+    /// operations use Pike unless an empty result needs no reverse recovery.
     ///
     /// # Errors
     ///
@@ -1967,9 +1968,13 @@ fn execute(
         && workspace.lazy.is_allocated()
         && workspace.reverse.is_allocated()
         && workspace.reverse.is_bound_to(automaton);
-    let may_use_lazy =
-        allow_lazy && workspace.lazy.is_allocated() && (!wants_span || may_use_reverse);
     let contextual = automaton.stats().assertion_edges() != 0;
+    let terminal_without_reverse = wants_span
+        && !contextual
+        && automaton.stats().consuming_edges() == 0;
+    let may_use_lazy = allow_lazy
+        && workspace.lazy.is_allocated()
+        && (!wants_span || may_use_reverse || terminal_without_reverse);
     let mut setup = setup;
     let (mut meter, setup_work) = prepare_invocation(
         automaton,
@@ -2070,14 +2075,19 @@ fn execute_prepared(
     let bidirectional_ready = if contextual {
         contextual_admitted
             && !start_proof.proof().relaxed_nullable
-            && (!may_use_reverse || workspace.reverse.context.is_allocated())
-    } else if may_use_reverse {
+            && (!wants_span || (may_use_reverse && workspace.reverse.context.is_allocated()))
+    } else if wants_span && may_use_lazy {
+        let terminal_initial = if workspace.lazy.initialized {
+            lazy_initial_is_terminal(workspace)?
+        } else {
+            false
+        };
         let forward_preparation = if workspace.lazy.initialized {
             0
         } else {
             lazy_initial_work_upper(automaton).unwrap_or(u64::MAX)
         };
-        let reverse_preparation = if workspace.reverse.initialized {
+        let reverse_preparation = if terminal_initial || workspace.reverse.initialized {
             0
         } else {
             reverse_initial_work_upper(automaton).unwrap_or(u64::MAX)
@@ -2088,21 +2098,27 @@ fn execute_prepared(
                 .remaining()
                 .checked_sub(lazy_core_reserve)
                 .is_some_and(|optional| combined_preparation <= optional);
-        admitted
-            && prepare_lazy(
+        if !admitted
+            || !prepare_lazy(
                 automaton,
                 workspace,
                 &mut meter,
                 lazy_core_reserve,
                 window.start(),
             )?
-            && prepare_reverse_lazy(
-                automaton,
-                workspace,
-                &mut meter,
-                lazy_core_reserve,
-                window.start(),
-            )?
+        {
+            false
+        } else {
+            lazy_initial_is_terminal(workspace)?
+                || (may_use_reverse
+                    && prepare_reverse_lazy(
+                        automaton,
+                        workspace,
+                        &mut meter,
+                        lazy_core_reserve,
+                        window.start(),
+                    )?)
+        }
     } else {
         true
     };
@@ -2166,36 +2182,44 @@ fn execute_prepared(
     if wants_span && used_lazy {
         if let Some(selected) = pending {
             let end = selected.end();
-            let (start, reverse_boundaries) = if contextual {
-                execute_context_reverse_lazy_loop(
-                    automaton,
-                    haystack,
-                    window.start(),
-                    end,
-                    workspace,
-                    &mut meter,
-                    contextual_learning_reserve,
-                )?
+            if end == window.start() {
+                // A nullable assertion-free initial closure can irrevocably
+                // select the empty match at the first searched boundary. Its
+                // start is already known, so reverse execution has no source
+                // byte to inspect and no ambiguity to resolve.
+                pending = Some(MatchSpan::new(end, end));
             } else {
-                execute_reverse_lazy_loop(
-                    automaton,
-                    haystack,
-                    window.start(),
-                    end,
-                    workspace,
-                    &mut meter,
-                    reverse_core_reserve,
-                )?
-            };
-            let start = start.ok_or(SearchError::InternalInvariant {
-                detail: "reverse DFA could not recover the forward-selected span",
-            })?;
-            pending = Some(MatchSpan::new(start, end));
-            boundaries = boundaries.checked_add(reverse_boundaries).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "bidirectional examined boundary count",
-                },
-            )?;
+                let (start, reverse_boundaries) = if contextual {
+                    execute_context_reverse_lazy_loop(
+                        automaton,
+                        haystack,
+                        window.start(),
+                        end,
+                        workspace,
+                        &mut meter,
+                        contextual_learning_reserve,
+                    )?
+                } else {
+                    execute_reverse_lazy_loop(
+                        automaton,
+                        haystack,
+                        window.start(),
+                        end,
+                        workspace,
+                        &mut meter,
+                        reverse_core_reserve,
+                    )?
+                };
+                let start = start.ok_or(SearchError::InternalInvariant {
+                    detail: "reverse DFA could not recover the forward-selected span",
+                })?;
+                pending = Some(MatchSpan::new(start, end));
+                boundaries = boundaries.checked_add(reverse_boundaries).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "bidirectional examined boundary count",
+                    },
+                )?;
+            }
         }
     }
 
@@ -2267,12 +2291,19 @@ fn execute_lazy_loop(
             detail: "initialized lazy DFA has no initial state",
         });
     }
+    let (_, initial_length, initial_pending) = workspace.lazy.state_bounds(initial)?;
+    if initial_pending && (earliest || initial_length == 0) {
+        return Ok(Some((
+            Some(MatchSpan::new(window.start(), window.start())),
+            1,
+        )));
+    }
     // Even a physically full cache retains useful prefix rows. Start from the
     // cached initial state and hand off only when an unfilled edge is reached.
     let mut state = LazyState::Cached(initial);
     let mut position = window.start();
     let mut boundaries = 0usize;
-    let mut pending_end = None;
+    let mut pending_end = initial_pending.then_some(window.start());
     let mut entered = false;
 
     loop {
@@ -2941,17 +2972,32 @@ fn prepare_lazy(
 
     begin_lazy_closure(workspace, meter, position)?;
     let accepted = expand_lazy_root(automaton, automaton.start, workspace, meter, position)?;
-    if accepted || workspace.lazy.scratch_len == 0 {
-        // Nullable and empty-language graphs remain on Pike. This decision is
-        // immutable for the exact bound automaton and is therefore sticky.
+    if !accepted && workspace.lazy.scratch_len == 0 {
+        // Empty-language graphs remain on Pike. This decision is immutable
+        // for the exact bound automaton and is therefore sticky.
         workspace.lazy.scratch_len = 0;
         workspace.lazy.declined = true;
         return Ok(false);
     }
-    let initial = workspace.lazy.intern_initial(meter, position)?;
+    // Ordered closure stops at the first Accept. Any consuming states already
+    // retained are precisely the higher-priority alternatives that may still
+    // replace this initial empty match. The existing pending mode therefore
+    // represents nullable execution without pattern-specific cases.
+    let initial = workspace.lazy.intern_initial(accepted, meter, position)?;
     workspace.lazy.initial = initial;
     workspace.lazy.initialized = true;
     Ok(true)
+}
+
+fn lazy_initial_is_terminal(workspace: &K0Workspace) -> Result<bool, SearchError> {
+    let initial = workspace.lazy.initial;
+    if initial == LAZY_NO_STATE {
+        return Err(SearchError::InternalInvariant {
+            detail: "initialized lazy DFA has no initial state",
+        });
+    }
+    let (_, length, pending) = workspace.lazy.state_bounds(initial)?;
+    Ok(pending && length == 0)
 }
 
 fn begin_lazy_closure(
@@ -3378,11 +3424,10 @@ fn prepare_reverse_lazy(
     }
 
     begin_reverse_closure(workspace, meter, position)?;
-    let mut reaches_start = false;
     for state in 0..automaton.stats().states() {
         meter.charge(1, position)?;
         if automaton.roles[state] == StateRole::Accept {
-            reaches_start |= expand_reverse_root(
+            let _ = expand_reverse_root(
                 automaton,
                 u32::try_from(state).map_err(|_| SearchError::InternalInvariant {
                     detail: "validated reverse Accept state does not fit u32",
@@ -3394,11 +3439,15 @@ fn prepare_reverse_lazy(
         }
     }
     collect_reverse_frontier(automaton, workspace, meter, position)?;
-    if reaches_start || workspace.reverse.scratch_len == 0 {
+    if workspace.reverse.scratch_len == 0 {
         workspace.reverse.scratch_len = 0;
         workspace.reverse.declined = true;
         return Ok(false);
     }
+    // A nullable graph reaches the forward start without consuming at the
+    // selected-end boundary. Positive forward selections suppress that
+    // later-start empty match, while terminal initial empties skip reverse
+    // preparation entirely. Retain only the consuming reverse frontier here.
     let initial = workspace.reverse.intern_initial(meter, position)?;
     workspace.reverse.initial = initial;
     workspace.reverse.initialized = true;
