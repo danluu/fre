@@ -2909,7 +2909,8 @@ impl CompiledRegex {
                     &mut accounting,
                 )?
             }
-            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            StateByteSpanSumTopology::BoundedLiteralPair
+            | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
                 reduce_ascii_bounded_literal_pair(
                     plan,
                     local,
@@ -2999,7 +3000,8 @@ impl CompiledRegex {
                     attempt_accounting,
                 )?
             }
-            StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+            StateByteSpanSumTopology::BoundedLiteralPair
+            | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
                 reduce_ascii_bounded_literal_pair(
                     plan,
                     local,
@@ -4902,7 +4904,8 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
             add(plan.literal().len(), 4, Resource::ExecutionWork)?
         }
-        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+        StateByteSpanSumTopology::BoundedLiteralPair
+        | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
             let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
                 "state-byte bounded-pair plan lost its anchors",
             ))?;
@@ -4929,7 +4932,8 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::DisjointInternalRuns
         | StateByteSpanSumTopology::DisjointInternalRunsCheckpoint => 4,
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => 0,
-        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 2,
+        StateByteSpanSumTopology::BoundedLiteralPair
+        | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => 2,
         _ => 2,
     };
     let state_transition_bound = mul(
@@ -4955,7 +4959,8 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             let factor = add(plan.literal().len(), 3, Resource::ExecutionWork)?;
             mul(input_bytes, factor, Resource::ExecutionWork)?
         }
-        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+        StateByteSpanSumTopology::BoundedLiteralPair
+        | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
             let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
                 "state-byte bounded-pair plan lost its anchors",
             ))?;
@@ -4984,7 +4989,8 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
         StateByteSpanSumTopology::RepeatedLazyDelimiterSuffix => {
             mul(input_bytes, plan.literal().len(), Resource::ExecutionWork)?
         }
-        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+        StateByteSpanSumTopology::BoundedLiteralPair
+        | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
             mul(input_bytes, 2, Resource::ExecutionWork)?
         }
     };
@@ -4993,7 +4999,8 @@ fn state_byte_reducer_envelope<const OBSERVED_WORK: bool>(
             let factor = add(plan.literal().len(), 1, Resource::SequentialBytes)?;
             mul(input_bytes, factor, Resource::SequentialBytes)?
         }
-        StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
+        StateByteSpanSumTopology::BoundedLiteralPair
+        | StateByteSpanSumTopology::AsciiGuardedBoundedLiteralPair => {
             let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
                 "state-byte bounded-pair plan lost its anchors",
             ))?;
@@ -5307,7 +5314,9 @@ fn reduce_ascii_bounded_literal_pair(
     work_limit: usize,
     accounting: &mut impl StateByteMeter,
 ) -> Result<(usize, usize), Error> {
-    debug_assert!(haystack.is_ascii());
+    debug_assert!(
+        plan.topology() == StateByteSpanSumTopology::BoundedLiteralPair || haystack.is_ascii()
+    );
     let (left, right) = plan.bounded_pair_anchors().ok_or(Error::InternalInvariant(
         "state-byte bounded-pair plan lost its anchors",
     ))?;
@@ -17420,6 +17429,29 @@ mod tests {
             );
         }
 
+        let byte_compiled = state_byte_span_sum_fixture(PATTERN);
+        let byte_plan = byte_compiled
+            .state_byte_span_sum
+            .as_ref()
+            .expect("byte bounded pair should retain its exact class");
+        assert_eq!(
+            byte_plan.topology(),
+            StateByteSpanSumTopology::BoundedLiteralPair
+        );
+        for haystack in [&b"axyb-bxya"[..], &b"a\xFFb-b\xFFa"[..]] {
+            assert_eq!(
+                byte_compiled
+                    .count_value(
+                        haystack,
+                        0..haystack.len(),
+                        Strategy::ReverseSequentialRows,
+                        OperationLimits::default(),
+                    )
+                    .unwrap(),
+                upstream_count(PATTERN, haystack)
+            );
+        }
+
         let admitted = compiled
             .admit_count(
                 b"axyb",
@@ -17433,11 +17465,15 @@ mod tests {
             OperationPhysicalRoute::StateByteSpanSum
         );
 
-        let benchmark_shape = unicode_state_byte_fixture(r"Tom.{10,25}river|river.{10,25}Tom");
+        let benchmark_shape = state_byte_span_sum_fixture(r"Tom.{10,25}river|river.{10,25}Tom");
         let benchmark_plan = benchmark_shape
             .state_byte_span_sum
             .as_ref()
             .expect("target shape should retain the bounded-pair theorem");
+        assert_eq!(
+            benchmark_plan.topology(),
+            StateByteSpanSumTopology::BoundedLiteralPair
+        );
         let input_bytes = 16 * 1_048_576;
         let envelope = super::state_byte_reducer_envelope::<true>(
             benchmark_plan,
