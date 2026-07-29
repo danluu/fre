@@ -6020,11 +6020,39 @@ fn charge_composite_build(
 fn charge_count_execution(
     accounting: &mut CompositeAccounting,
     report: &AggregateExecutionReport,
+    input_bytes: usize,
     value: u64,
     limits: CompositeLimits,
 ) -> Result<(), ExecutionError> {
     let details = report.details();
     let (work, events, peak) = match details {
+        AggregateExecutionDetails::ImpossibleMatchDomain(receipt) => {
+            let identity = report.identity();
+            if value != 0
+                || receipt.operation() != AggregateOperation::Count
+                || receipt.input_bytes() != input_bytes
+                || receipt.reason() != fre::AggregateImpossibleMatchReason::BelowMinimumBytes
+                || !receipt
+                    .minimum_match_bytes()
+                    .is_some_and(|minimum| input_bytes < minimum)
+                || receipt.source_bytes_read() != 0
+                || receipt.operation_allocations() != 0
+                || !matches!(
+                    identity.plan,
+                    AggregatePlanKind::FiniteLiteralDfa | AggregatePlanKind::PackedFiniteLiteral
+                )
+                || !matches!(
+                    identity.plan_identity,
+                    AggregatePlanIdentity::FiniteLiteral(_)
+                )
+                || !report.has_closed_impossible_match_domain_attempt()
+            {
+                return Err(ExecutionError::fault(
+                    "regex-redux impossible count execution accounting mismatch",
+                ));
+            }
+            (u64::from(receipt.branch_checks()), 0, 0)
+        }
         AggregateExecutionDetails::FiniteLiteral {
             upper_bounds,
             actual,
@@ -6455,7 +6483,8 @@ fn execute_composite_count_stage(
     require_composite_count_minimum_identity(regex.build_report(), minimum_match_bytes)?;
     require_composite_build_plan_identity(regex.build_report(), AggregateOperation::Count)?;
     charge_composite_build(&mut state.accounting, regex.build_report(), limits)?;
-    let operation_limits = count_run_limits_with_policy(state.sequence.len(), &regex, run_limits)?;
+    let input_bytes = state.sequence.len();
+    let operation_limits = count_run_limits_with_policy(input_bytes, &regex, run_limits)?;
     let result = regex
         .count(&state.sequence, operation_limits)
         .map_err(|error| {
@@ -6469,6 +6498,7 @@ fn execute_composite_count_stage(
     charge_count_execution(
         &mut state.accounting,
         result.report(),
+        input_bytes,
         result.value(),
         limits,
     )
@@ -22547,6 +22577,7 @@ mod tests {
             haystack: Vec<u8>,
             unicode: bool,
             expected: u64,
+            impossible_domain: bool,
         }
 
         fn endpoint(length: usize, suffix: &[u8]) -> Vec<u8> {
@@ -22576,16 +22607,39 @@ mod tests {
             );
         }
 
-        fn assert_guard(
-            details: &fre::AggregateExecutionDetails,
+        fn assert_execution(
+            report: &fre::AggregateExecutionReport,
             prospective: fre::FixedAbsoluteDomainProspective,
             composite_prospective: Option<fre::AggregateFixedAbsoluteDomainResidualProspective>,
             limits: &fre::AggregateRunLimits,
             haystack_len: usize,
+            impossible_domain: bool,
         ) {
-            let fre::AggregateExecutionDetails::FixedAbsoluteDomain(details) = details else {
-                panic!("fixed absolute-domain lifecycle lacks fixed execution details")
+            let fre::AggregateExecutionDetails::FixedAbsoluteDomain(details) = report.details()
+            else {
+                let Some(receipt) = report.impossible_match_domain_receipt() else {
+                    panic!("fixed absolute-domain lifecycle lacks authenticated execution details")
+                };
+                assert!(impossible_domain);
+                assert!(report.has_closed_impossible_match_domain_attempt());
+                assert_eq!(receipt.operation(), fre::AggregateOperation::Count);
+                assert_eq!(receipt.input_bytes(), haystack_len);
+                assert_eq!(
+                    receipt.reason(),
+                    fre::AggregateImpossibleMatchReason::AboveAbsoluteMaximumBytes
+                );
+                assert!(receipt.absolute_whole_input());
+                assert!(
+                    receipt
+                        .maximum_match_bytes()
+                        .is_some_and(|maximum| haystack_len > maximum)
+                );
+                assert_eq!(receipt.branch_checks(), 2);
+                assert_eq!(receipt.source_bytes_read(), 0);
+                assert_eq!(receipt.operation_allocations(), 0);
+                return;
             };
+            assert!(!impossible_domain);
             match details {
                 fre::AggregateFixedAbsoluteDomainExecutionDetails::Direct { guard } => {
                     assert!(composite_prospective.is_none());
@@ -22629,6 +22683,7 @@ mod tests {
                 haystack: endpoint(1_048_603, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
                 unicode: false,
                 expected: 27,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/medium-1mb@rust/regex::first-public-operation",
@@ -22637,6 +22692,7 @@ mod tests {
                 haystack: endpoint(1_048_603, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
                 unicode: false,
                 expected: 27,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/easy1-1mb@rust/regex::steady-public-operation",
@@ -22645,6 +22701,7 @@ mod tests {
                 haystack: endpoint(1_048_595, b"AABCCCDEEEFGGHHHIJJ"),
                 unicode: false,
                 expected: 19,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/easy1-1mb@rust/regex::first-public-operation",
@@ -22653,6 +22710,7 @@ mod tests {
                 haystack: endpoint(1_048_595, b"AABCCCDEEEFGGHHHIJJ"),
                 unicode: false,
                 expected: 19,
+                impossible_domain: false,
             },
             Case {
                 id: "opt/reverse-anchored/word-end@rust/regex::steady-public-operation",
@@ -22661,6 +22719,7 @@ mod tests {
                 haystack: endpoint(1_000_001, b"X"),
                 unicode: false,
                 expected: 1,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/medium-32k@rust/regex::steady-public-operation",
@@ -22669,6 +22728,7 @@ mod tests {
                 haystack: endpoint(32_795, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
                 unicode: false,
                 expected: 27,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/easy1-32k@rust/regex::steady-public-operation",
@@ -22677,6 +22737,7 @@ mod tests {
                 haystack: endpoint(32_787, b"AABCCCDEEEFGGHHHIJJ"),
                 unicode: false,
                 expected: 19,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/medium-1k@rust/regex::steady-public-operation",
@@ -22685,6 +22746,7 @@ mod tests {
                 haystack: endpoint(1_051, b"XABCDEFGHIJKLMNOPQRSTUVWXYZ"),
                 unicode: false,
                 expected: 27,
+                impossible_domain: false,
             },
             Case {
                 id: "imported/rsc/easy1-1k@rust/regex::steady-public-operation",
@@ -22693,6 +22755,7 @@ mod tests {
                 haystack: endpoint(1_043, b"AABCCCDEEEFGGHHHIJJ"),
                 unicode: false,
                 expected: 19,
+                impossible_domain: false,
             },
             Case {
                 id: "opt/fixed-length/go33484-1@rust/regex::steady-public-operation",
@@ -22701,6 +22764,7 @@ mod tests {
                 haystack: vec![b'a'; 10_000],
                 unicode: false,
                 expected: 0,
+                impossible_domain: true,
             },
             Case {
                 id: "opt/fixed-length/go33484-2@rust/regex::steady-public-operation",
@@ -22709,6 +22773,7 @@ mod tests {
                 haystack: vec![b'a'; 10_000],
                 unicode: false,
                 expected: 0,
+                impossible_domain: true,
             },
             Case {
                 id: "opt/fixed-length/go33484-3@rust/regex::steady-public-operation",
@@ -22717,6 +22782,7 @@ mod tests {
                 haystack: vec![b'a'; 1_000],
                 unicode: true,
                 expected: 0,
+                impossible_domain: true,
             },
             Case {
                 id: "imported/rsc/anchored-literal-long-non-match@rust/regex::steady-public-operation",
@@ -22725,6 +22791,7 @@ mod tests {
                 haystack: (b'a'..=b'z').cycle().take(390).collect(),
                 unicode: false,
                 expected: 0,
+                impossible_domain: false,
             },
         ];
 
@@ -22796,12 +22863,13 @@ mod tests {
                         &identity.syntax_key,
                         &first.report().identity().syntax_key
                     ));
-                    assert_guard(
-                        first.report().details(),
+                    assert_execution(
+                        first.report(),
                         prospective,
                         composite_prospective,
                         limits,
                         case.haystack.len(),
+                        case.impossible_domain,
                     );
                 }
                 CurrentFreAggregateOperationInner::SpanSumSingle(regex, limits) => {
@@ -22842,12 +22910,13 @@ mod tests {
                         &identity.syntax_key,
                         &first.report().identity().syntax_key
                     ));
-                    assert_guard(
-                        first.report().details(),
+                    assert_execution(
+                        first.report(),
                         prospective,
                         composite_prospective,
                         limits,
                         case.haystack.len(),
+                        case.impossible_domain,
                     );
                 }
                 CurrentFreAggregateOperationInner::CountCanonical(_)
