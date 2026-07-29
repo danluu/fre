@@ -2338,7 +2338,7 @@ mod tests {
             .ordered_bounded_span_sum
             .as_ref()
             .expect("ordered bounded-span plan");
-        let input_bytes = 72_057_594_037_927_935;
+        let input_bytes = usize::MAX / 256;
         let events = event_prospective(&compiled.program, plan, input_bytes).unwrap();
         let frontier_work = frontier_work_envelope(plan, input_bytes).unwrap();
         assert!(events.work_bound > frontier_work.work_bound);
