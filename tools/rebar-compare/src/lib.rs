@@ -2376,32 +2376,11 @@ fn try_current_fre_folded_count_lifecycle_with_limits(
                 "FRE folded-literal count lifecycle preflight: {error}"
             ))
         })?;
-    Ok(Some((regex, UnicodeFoldedLiteralRunLimits::exact(upper))))
-}
-
-fn try_current_fre_folded_span_sum_lifecycle(
-    pattern: &str,
-    unicode: bool,
-    case_insensitive: bool,
-    haystack_len: usize,
-) -> Result<
-    Option<(
-        UnicodeFoldedLiteralSpanSumRegex,
-        UnicodeFoldedLiteralRunLimits,
-    )>,
-    CompareError,
-> {
-    let limits = RunLimits::default();
-    let build_limits = unicode_folded_literal_build_limits(&limits)
-        .map_err(|error| CompareError::new(error.message))?;
-    try_current_fre_folded_span_sum_lifecycle_with_limits(
-        pattern,
-        unicode,
-        case_insensitive,
-        haystack_len,
-        &limits,
-        build_limits,
-    )
+    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
+        Ok(run_limits) => run_limits,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((regex, run_limits)))
 }
 
 fn try_current_fre_folded_span_sum_lifecycle_with_limits(
@@ -2451,7 +2430,11 @@ fn try_current_fre_folded_span_sum_lifecycle_with_limits(
                 "FRE folded-literal span-sum lifecycle preflight: {error}"
             ))
         })?;
-    Ok(Some((regex, UnicodeFoldedLiteralRunLimits::exact(upper))))
+    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
+        Ok(run_limits) => run_limits,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((regex, run_limits)))
 }
 
 fn build_current_fre_count_lifecycle(
@@ -2469,6 +2452,7 @@ fn build_current_fre_count_lifecycle(
         case_insensitive,
         haystack_len,
         &run_limits,
+        &run_limits,
         build_limits,
     )
 }
@@ -2479,6 +2463,7 @@ fn build_current_fre_count_lifecycle_with_folded_limits(
     case_insensitive: bool,
     haystack_len: usize,
     run_limits: &RunLimits,
+    folded_policy_limits: &RunLimits,
     folded_build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     if let [pattern] = patterns
@@ -2487,7 +2472,7 @@ fn build_current_fre_count_lifecycle_with_folded_limits(
             unicode,
             case_insensitive,
             haystack_len,
-            run_limits,
+            folded_policy_limits,
             folded_build_limits,
         )?
     {
@@ -2617,12 +2602,35 @@ fn build_current_fre_span_sum_lifecycle(
     case_insensitive: bool,
     haystack_len: usize,
 ) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
+    let run_limits = RunLimits::default();
+    let build_limits = unicode_folded_literal_build_limits(&run_limits)
+        .map_err(|error| CompareError::new(error.message))?;
+    build_current_fre_span_sum_lifecycle_with_folded_limits(
+        patterns,
+        unicode,
+        case_insensitive,
+        haystack_len,
+        &run_limits,
+        build_limits,
+    )
+}
+
+fn build_current_fre_span_sum_lifecycle_with_folded_limits(
+    patterns: &[String],
+    unicode: bool,
+    case_insensitive: bool,
+    haystack_len: usize,
+    folded_policy_limits: &RunLimits,
+    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<CurrentFreAggregateOperationLifecycle, CompareError> {
     if let [pattern] = patterns
-        && let Some((regex, limits)) = try_current_fre_folded_span_sum_lifecycle(
+        && let Some((regex, limits)) = try_current_fre_folded_span_sum_lifecycle_with_limits(
             pattern,
             unicode,
             case_insensitive,
             haystack_len,
+            folded_policy_limits,
+            folded_build_limits,
         )?
     {
         return Ok(CurrentFreAggregateOperationLifecycle {
@@ -15819,17 +15827,20 @@ fn fre_aggregate_count(
         return fre_aggregate_many_count(request, limits);
     }
     let folded_build_limits = unicode_folded_literal_build_limits(limits)?;
-    fre_aggregate_count_with_folded_limits(request, limits, folded_build_limits)
+    fre_aggregate_count_with_folded_limits(request, limits, limits, folded_build_limits)
 }
 
 fn fre_aggregate_count_with_folded_limits(
     request: CandidateRequest<'_>,
     limits: &RunLimits,
+    folded_policy_limits: &RunLimits,
     folded_build_limits: UnicodeFoldedLiteralBuildLimits,
 ) -> Result<FreReduction, ExecutionError> {
-    if let Some(reduction) =
-        try_unicode_folded_literal_count_with_limits(request, limits, folded_build_limits)?
-    {
+    if let Some(reduction) = try_unicode_folded_literal_count_with_limits(
+        request,
+        folded_policy_limits,
+        folded_build_limits,
+    )? {
         return Ok(reduction);
     }
     if let Some(reduction) = canonical_case_fold::try_count(request, limits)? {
@@ -15869,7 +15880,21 @@ fn fre_aggregate_span_sum(
     if request.patterns.len() != 1 {
         return fre_aggregate_many_span_sum(request, limits);
     }
-    if let Some(reduction) = try_unicode_folded_literal_span_sum(request, limits)? {
+    let folded_build_limits = unicode_folded_literal_build_limits(limits)?;
+    fre_aggregate_span_sum_with_folded_limits(request, limits, limits, folded_build_limits)
+}
+
+fn fre_aggregate_span_sum_with_folded_limits(
+    request: CandidateRequest<'_>,
+    limits: &RunLimits,
+    folded_policy_limits: &RunLimits,
+    folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+) -> Result<FreReduction, ExecutionError> {
+    if let Some(reduction) = try_unicode_folded_literal_span_sum_with_limits(
+        request,
+        folded_policy_limits,
+        folded_build_limits,
+    )? {
         return Ok(reduction);
     }
     let pattern = one_fre_pattern(request)?;
@@ -15899,21 +15924,28 @@ fn fre_aggregate_span_sum(
     Ok(FreReduction { actual, plan })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnicodeFoldedLiteralPolicyRefusal {
+    Work { needed: usize, limit: usize },
+    ReducerSteps { needed: usize, limit: usize },
+}
+
 fn validate_unicode_folded_literal_policy(
     upper: fre::UnicodeFoldedLiteralRunUpperBounds,
     limits: &RunLimits,
-) -> Result<UnicodeFoldedLiteralRunLimits, ExecutionError> {
+) -> Result<UnicodeFoldedLiteralRunLimits, UnicodeFoldedLiteralPolicyRefusal> {
     if upper.work > limits.fre_aggregate_operation_work {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE Unicode folded-literal work requires {}, limit is {}",
-            upper.work, limits.fre_aggregate_operation_work
-        )));
+        return Err(UnicodeFoldedLiteralPolicyRefusal::Work {
+            needed: upper.work,
+            limit: limits.fre_aggregate_operation_work,
+        });
     }
-    if upper.reducer_steps > usize::try_from(limits.reducer_steps).unwrap_or(usize::MAX) {
-        return Err(ExecutionError::unsupported(format!(
-            "FRE Unicode folded-literal reducer steps require {}, limit is {}",
-            upper.reducer_steps, limits.reducer_steps
-        )));
+    let reducer_limit = usize::try_from(limits.reducer_steps).unwrap_or(usize::MAX);
+    if upper.reducer_steps > reducer_limit {
+        return Err(UnicodeFoldedLiteralPolicyRefusal::ReducerSteps {
+            needed: upper.reducer_steps,
+            limit: reducer_limit,
+        });
     }
     Ok(UnicodeFoldedLiteralRunLimits::exact(upper))
 }
@@ -15956,7 +15988,10 @@ fn try_unicode_folded_literal_count_with_limits(
         .map_err(|error| {
             unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal Count preflight")
         })?;
-    let run_limits = validate_unicode_folded_literal_policy(upper, limits)?;
+    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
+        Ok(run_limits) => run_limits,
+        Err(_) => return Ok(None),
+    };
     let result = regex
         .execute(request.haystack, run_limits)
         .map_err(|error| {
@@ -15966,14 +16001,6 @@ fn try_unicode_folded_literal_count_with_limits(
         actual: result.value,
         plan: UNICODE_FOLDED_LITERAL_PLAN,
     }))
-}
-
-fn try_unicode_folded_literal_span_sum(
-    request: CandidateRequest<'_>,
-    limits: &RunLimits,
-) -> Result<Option<FreReduction>, ExecutionError> {
-    let build_limits = unicode_folded_literal_build_limits(limits)?;
-    try_unicode_folded_literal_span_sum_with_limits(request, limits, build_limits)
 }
 
 fn try_unicode_folded_literal_span_sum_with_limits(
@@ -16014,7 +16041,10 @@ fn try_unicode_folded_literal_span_sum_with_limits(
         .map_err(|error| {
             unicode_folded_literal_run_error(&error, "FRE Unicode folded-literal SpanSum preflight")
         })?;
-    let run_limits = validate_unicode_folded_literal_policy(upper, limits)?;
+    let run_limits = match validate_unicode_folded_literal_policy(upper, limits) {
+        Ok(run_limits) => run_limits,
+        Err(_) => return Ok(None),
+    };
     let result = regex
         .execute(request.haystack, run_limits)
         .map_err(|error| {
@@ -25978,7 +26008,6 @@ mod tests {
             unicode: true,
             case_insensitive: true,
         };
-
         for folded_limits in [planner_refusal, trie_refusal] {
             assert!(
                 try_unicode_folded_literal_count_with_limits(request, &run_limits, folded_limits,)
@@ -25986,8 +26015,13 @@ mod tests {
                     .is_none(),
                 "a speculative folded resource refusal must be a raw-route miss"
             );
-            let raw = fre_aggregate_count_with_folded_limits(request, &run_limits, folded_limits)
-                .expect("the incumbent raw Count route remains available");
+            let raw = fre_aggregate_count_with_folded_limits(
+                request,
+                &run_limits,
+                &run_limits,
+                folded_limits,
+            )
+            .expect("the incumbent raw Count route remains available");
             assert_eq!(raw.actual, 2);
             assert_ne!(raw.plan, UNICODE_FOLDED_LITERAL_PLAN);
 
@@ -25996,6 +26030,7 @@ mod tests {
                 true,
                 true,
                 haystack.len(),
+                &run_limits,
                 &run_limits,
                 folded_limits,
             )
@@ -26010,6 +26045,164 @@ mod tests {
                 computation: "synthetic non-resource fault",
             }
         ));
+    }
+
+    fn assert_folded_count_policy_fallback(
+        pattern: &str,
+        patterns: &[String],
+        haystack: &[u8],
+        incumbent_limits: &RunLimits,
+        folded_policy_limits: &RunLimits,
+        folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+    ) {
+        let request = CandidateRequest {
+            job_id: "focused/folded-policy-fallback@rust/regex",
+            model: "count",
+            patterns,
+            haystack,
+            unicode: true,
+            case_insensitive: true,
+        };
+        assert!(
+            try_unicode_folded_literal_count_with_limits(
+                request,
+                folded_policy_limits,
+                folded_build_limits,
+            )
+            .unwrap()
+            .is_none(),
+            "a speculative folded operation-policy refusal must be a raw-route miss"
+        );
+        assert!(
+            try_current_fre_folded_count_lifecycle_with_limits(
+                pattern,
+                true,
+                true,
+                haystack.len(),
+                folded_policy_limits,
+                folded_build_limits,
+            )
+            .unwrap()
+            .is_none(),
+            "the retained Count selector must apply the same outer policy"
+        );
+        let raw = fre_aggregate_count_with_folded_limits(
+            request,
+            incumbent_limits,
+            folded_policy_limits,
+            folded_build_limits,
+        )
+        .expect("the incumbent raw Count route remains available");
+        assert_eq!(raw.actual, 2);
+        assert_ne!(raw.plan, UNICODE_FOLDED_LITERAL_PLAN);
+        let retained = build_current_fre_count_lifecycle_with_folded_limits(
+            patterns,
+            true,
+            true,
+            haystack.len(),
+            incumbent_limits,
+            folded_policy_limits,
+            folded_build_limits,
+        )
+        .expect("the incumbent retained Count route remains available");
+        assert_eq!(retained.plan(), raw.plan);
+        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
+        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
+    }
+
+    fn assert_folded_span_sum_policy_fallback(
+        pattern: &str,
+        patterns: &[String],
+        haystack: &[u8],
+        incumbent_limits: &RunLimits,
+        folded_policy_limits: &RunLimits,
+        folded_build_limits: UnicodeFoldedLiteralBuildLimits,
+    ) {
+        let request = CandidateRequest {
+            job_id: "focused/folded-policy-fallback@rust/regex",
+            model: "count-spans",
+            patterns,
+            haystack,
+            unicode: true,
+            case_insensitive: true,
+        };
+        assert!(
+            try_unicode_folded_literal_span_sum_with_limits(
+                request,
+                folded_policy_limits,
+                folded_build_limits,
+            )
+            .unwrap()
+            .is_none(),
+            "a speculative folded operation-policy refusal must leave raw SpanSum unselected"
+        );
+        assert!(
+            try_current_fre_folded_span_sum_lifecycle_with_limits(
+                pattern,
+                true,
+                true,
+                haystack.len(),
+                folded_policy_limits,
+                folded_build_limits,
+            )
+            .unwrap()
+            .is_none(),
+            "the retained SpanSum selector must apply the same outer policy"
+        );
+        let raw = fre_aggregate_span_sum_with_folded_limits(
+            request,
+            incumbent_limits,
+            folded_policy_limits,
+            folded_build_limits,
+        )
+        .expect("the incumbent raw SpanSum route remains available");
+        let expected = u64::try_from(pattern.len().checked_mul(2).unwrap()).unwrap();
+        assert_eq!(raw.actual, expected);
+        assert_ne!(raw.plan, UNICODE_FOLDED_LITERAL_PLAN);
+        let retained = build_current_fre_span_sum_lifecycle_with_folded_limits(
+            patterns,
+            true,
+            true,
+            haystack.len(),
+            folded_policy_limits,
+            folded_build_limits,
+        )
+        .expect("the incumbent retained SpanSum route remains available");
+        assert_eq!(retained.plan(), raw.plan);
+        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
+        assert_eq!(retained.execute(haystack).unwrap(), raw.actual);
+    }
+
+    #[test]
+    fn folded_operation_policy_refusals_fall_through_raw_and_retained_ladders() {
+        let pattern = "Шерлок Холмс";
+        let patterns = [pattern.to_string()];
+        let haystack = "ШЕРЛОК ХОЛМС/шерлок холмс".as_bytes();
+        let incumbent_limits = RunLimits::default();
+        let folded_build_limits = unicode_folded_literal_build_limits(&incumbent_limits).unwrap();
+        let mut work_refusal = incumbent_limits.clone();
+        work_refusal.fre_aggregate_operation_work = 0;
+        let mut reducer_refusal = incumbent_limits.clone();
+        reducer_refusal.reducer_steps = 0;
+
+        for folded_policy_limits in [&work_refusal, &reducer_refusal] {
+            assert_folded_count_policy_fallback(
+                pattern,
+                &patterns,
+                haystack,
+                &incumbent_limits,
+                folded_policy_limits,
+                folded_build_limits,
+            );
+            assert_folded_span_sum_policy_fallback(
+                pattern,
+                &patterns,
+                haystack,
+                &incumbent_limits,
+                folded_policy_limits,
+                folded_build_limits,
+            );
+        }
     }
 
     #[test]

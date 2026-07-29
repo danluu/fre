@@ -616,6 +616,21 @@ impl FoldedLiteralTriePlan {
         patterns: &[FoldedLiteral<'_>],
         limits: BuildLimits,
     ) -> Result<BuildAttempt, BuildError> {
+        Self::build_with_dispatch(SimdDispatchContext::capture(), patterns, limits)
+    }
+
+    /// Construct one trie from a capability snapshot captured before the
+    /// caller enters its bounded construction transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns checked resource/allocation/invariant errors. All resource
+    /// limits are enforced before exact persistent allocation.
+    pub fn build_with_dispatch(
+        dispatch: SimdDispatchContext,
+        patterns: &[FoldedLiteral<'_>],
+        limits: BuildLimits,
+    ) -> Result<BuildAttempt, BuildError> {
         let prospective = preflight_from_lengths(patterns)?;
         enforce_build_limits(prospective, limits)?;
         let (fallback, canonical_comparisons) = fallback_reason(patterns)?;
@@ -682,7 +697,7 @@ impl FoldedLiteralTriePlan {
         build.persistent_bytes =
             exact_retained_bytes(nodes.capacity(), edges.capacity(), outputs.capacity())?;
         build.peak_bytes = build.persistent_bytes;
-        let (root_prefilter, root_prefilter_work) = select_root_prefilter(patterns)?;
+        let (root_prefilter, root_prefilter_work) = select_root_prefilter(dispatch, patterns)?;
         work = checked_build_add(
             work,
             root_prefilter_work,
@@ -1035,6 +1050,7 @@ struct PrefilterColumn {
     reason = "one allocation-free traversal keeps fixed-column derivation, ranking and exact work accounting visibly coupled"
 )]
 fn select_root_prefilter(
+    dispatch: SimdDispatchContext,
     patterns: &[FoldedLiteral<'_>],
 ) -> Result<(Option<RootPrefilter>, usize), BuildError> {
     if patterns.is_empty() {
@@ -1198,7 +1214,7 @@ fn select_root_prefilter(
         let guard = selected[1];
         let classifier = if usize::from(primary.needle_count) > MEMCHR_ROOT_PREFILTER_NEEDLES {
             let (classifier, classifier_work) =
-                root_prefilter_classifier(primary.byte_set, primary.high_nibbles)?;
+                root_prefilter_classifier(dispatch, primary.byte_set, primary.high_nibbles)?;
             work = checked_build_add(
                 work,
                 classifier_work,
@@ -1296,6 +1312,7 @@ fn byte_set_members(set: [u64; ROOT_PREFILTER_BYTE_WORDS]) -> ByteSetMembers {
 }
 
 fn root_prefilter_classifier(
+    dispatch: SimdDispatchContext,
     set: [u64; ROOT_PREFILTER_BYTE_WORDS],
     high_nibbles: u16,
 ) -> Result<(ByteBucketClassifier, usize), BuildError> {
@@ -1347,7 +1364,7 @@ fn root_prefilter_classifier(
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded root prefilter classifier work",
         })?;
-    let classifier = SimdDispatchContext::capture()
+    let classifier = dispatch
         .byte_bucket_classifier(tables, DispatchPolicy::Auto)
         .expect("automatic byte-bucket dispatch retains a scalar fallback");
     Ok((classifier, work))
@@ -2283,6 +2300,7 @@ mod tests {
         scan_source_probe,
     };
     use crate::{LiteralCandidate, Window};
+    use fre_simd_kernels::{ByteBucketClassifier, DispatchPolicy, SimdDispatchContext};
 
     const KELVIN: [char; 3] = ['K', 'k', '\u{212A}'];
     const SIGMA: [char; 3] = ['Σ', 'ς', 'σ'];
@@ -2514,14 +2532,32 @@ mod tests {
         const DENSE_CYRILLIC_ROOT: [char; 4] = ['А', 'Р', 'р', 'ё'];
         let classes = one_class(&DENSE_CYRILLIC_ROOT);
         let patterns = [FoldedLiteral::new(&classes)];
-        let plan = admitted(&patterns);
+        let plan = match FoldedLiteralTriePlan::build_with_dispatch(
+            SimdDispatchContext::capture(),
+            &patterns,
+            BuildLimits::default(),
+        )
+        .unwrap()
+        {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("unexpected fallback: {fallback:?}")
+            }
+        };
         assert_eq!(plan.build.root_prefilter_offset, Some(1));
         assert_eq!(plan.build.root_prefilter_needles, 4);
         let selection = plan
             .build
             .root_prefilter_classifier_selection
             .expect("the wide prefilter publishes its retained classifier selection");
-        assert!(!selection.variant_id.is_empty());
+        let retained_selection = plan
+            .root_prefilter
+            .as_ref()
+            .and_then(|prefilter| prefilter.classifier.as_ref())
+            .map(ByteBucketClassifier::selection)
+            .expect("the wide prefilter retains its published classifier");
+        assert_eq!(selection, retained_selection);
+        assert_eq!(selection.policy, DispatchPolicy::Auto);
         assert_eq!(
             collect(&plan, "xАРрё".as_bytes()),
             [

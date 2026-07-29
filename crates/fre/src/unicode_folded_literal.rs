@@ -19,7 +19,7 @@ use fre_kernels::{
     FoldedLiteral, FoldedLiteralTrieBuildAccounting, FoldedLiteralTrieBuildAttempt,
     FoldedLiteralTrieBuildError, FoldedLiteralTrieBuildLimits, FoldedLiteralTriePlan,
     FoldedLiteralTrieScanAttemptError, FoldedLiteralTrieScanLimits, FoldedLiteralTrieScanReceipt,
-    FoldedLiteralTrieScanUpperBounds, FoldedScalarClass, LiteralCandidate,
+    FoldedLiteralTrieScanUpperBounds, FoldedScalarClass, LiteralCandidate, SimdDispatchContext,
 };
 use fre_syntax::{
     AdmissionPolicy, AdmissionStatus, CacheKey, CanonicalPattern, CompatibilityProfile,
@@ -228,7 +228,19 @@ impl UnicodeFoldedLiteralBuilder {
         UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralCountRegex>,
         UnicodeFoldedLiteralBuildError,
     > {
-        build(self, UnicodeFoldedLiteralOperation::Count).map(|attempt| match attempt {
+        self.build_count_with_dispatch(SimdDispatchContext::capture())
+    }
+
+    /// Build Count from one capability snapshot captured before bounded
+    /// syntax, planner and trie accounting begins.
+    pub fn build_count_with_dispatch(
+        self,
+        dispatch: SimdDispatchContext,
+    ) -> Result<
+        UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralCountRegex>,
+        UnicodeFoldedLiteralBuildError,
+    > {
+        build(dispatch, self, UnicodeFoldedLiteralOperation::Count).map(|attempt| match attempt {
             UnicodeFoldedLiteralBuildAttempt::Admitted(plan) => {
                 UnicodeFoldedLiteralBuildAttempt::Admitted(UnicodeFoldedLiteralCountRegex(plan))
             }
@@ -244,7 +256,19 @@ impl UnicodeFoldedLiteralBuilder {
         UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralSpanSumRegex>,
         UnicodeFoldedLiteralBuildError,
     > {
-        build(self, UnicodeFoldedLiteralOperation::SpanSum).map(|attempt| match attempt {
+        self.build_span_sum_with_dispatch(SimdDispatchContext::capture())
+    }
+
+    /// Build SpanSum from one capability snapshot captured before bounded
+    /// syntax, planner and trie accounting begins.
+    pub fn build_span_sum_with_dispatch(
+        self,
+        dispatch: SimdDispatchContext,
+    ) -> Result<
+        UnicodeFoldedLiteralBuildAttempt<UnicodeFoldedLiteralSpanSumRegex>,
+        UnicodeFoldedLiteralBuildError,
+    > {
+        build(dispatch, self, UnicodeFoldedLiteralOperation::SpanSum).map(|attempt| match attempt {
             UnicodeFoldedLiteralBuildAttempt::Admitted(plan) => {
                 UnicodeFoldedLiteralBuildAttempt::Admitted(UnicodeFoldedLiteralSpanSumRegex(plan))
             }
@@ -459,6 +483,7 @@ impl Default for Shape {
     reason = "profile selection, two-pass HIR materialization and no-fallback trie publication stay in one auditable transaction"
 )]
 fn build(
+    dispatch: SimdDispatchContext,
     builder: UnicodeFoldedLiteralBuilder,
     operation: UnicodeFoldedLiteralOperation,
 ) -> Result<
@@ -591,17 +616,18 @@ fn build(
             computation: "folded planner allocation count",
         },
     )?;
-    let trie = match FoldedLiteralTriePlan::build(&literals, builder.limits.trie)
-        .map_err(UnicodeFoldedLiteralBuildError::Trie)?
-    {
-        FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
-        FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
-            return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
-                reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
-                planner: planner_accounting(shape, scratch_bytes, planner_allocations),
-            });
-        }
-    };
+    let trie =
+        match FoldedLiteralTriePlan::build_with_dispatch(dispatch, &literals, builder.limits.trie)
+            .map_err(UnicodeFoldedLiteralBuildError::Trie)?
+        {
+            FoldedLiteralTrieBuildAttempt::Admitted(plan) => plan,
+            FoldedLiteralTrieBuildAttempt::DenseFallback(_) => {
+                return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
+                    reason: UnicodeFoldedLiteralIneligibility::NonCanonicalClasses,
+                    planner: planner_accounting(shape, scratch_bytes, planner_allocations),
+                });
+            }
+        };
     if trie.build_accounting().root_prefilter_needles == 0 {
         return Ok(UnicodeFoldedLiteralBuildAttempt::Ineligible {
             reason: UnicodeFoldedLiteralIneligibility::NoUsefulRootPrefilter,
