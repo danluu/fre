@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod v3;
+
 use core::fmt;
 
 use fre_aot_aarch64::{

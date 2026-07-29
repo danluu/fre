@@ -1,7 +1,7 @@
 [package]
 name = "fre-aot-count-compiler"
 version.workspace = true
-description = "Focused JIT-neutral Count-v2 compiler and deterministic implementation objects"
+description = "Focused JIT-neutral Count-v2/v3 compiler and deterministic implementation objects"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 fre-aot-aarch64 = { path = "../fre-aot-aarch64" }
 fre-aot-count-contract = { path = "../fre-aot-count-contract" }
+fre-aot-optimizer = { path = "../fre-aot-optimizer" }
 fre-exact-alloc = { path = "../fre-exact-alloc" }
 fre-kernel-ir = { path = "../fre-kernel-ir" }
 sha2 = "=0.10.9"
