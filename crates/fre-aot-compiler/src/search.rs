@@ -30,6 +30,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG28_V1, SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1,
     SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
+    SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
     search_backend_literal_width_is_valid_v1,
 };
 use fre_jit_aarch64::{
@@ -165,7 +167,7 @@ impl std::error::Error for SearchManifestErrorV1 {}
 /// Explicit macOS `AArch64` code-generation profile.
 ///
 /// The default remains V8 so all existing manifests and artifact identities
-/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, and V24 are
+/// remain byte-for-byte stable. V9, V10, V12, V13, V15-V17, V24, and V25 are
 /// reachable only through named candidate constructors until source
 /// qualification grants deployment authority.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -180,6 +182,7 @@ pub enum MacosAarch64SearchBackendV1 {
     AsimdV16,
     AsimdV17,
     AsimdV24,
+    AsimdV25,
 }
 
 impl MacosAarch64SearchBackendV1 {
@@ -195,6 +198,7 @@ impl MacosAarch64SearchBackendV1 {
             Self::AsimdV16 => SearchBackendPolicy::AsimdV16,
             Self::AsimdV17 => SearchBackendPolicy::AsimdV17,
             Self::AsimdV24 => SearchBackendPolicy::AsimdV24,
+            Self::AsimdV25 => SearchBackendPolicy::AsimdV25,
         }
     }
 
@@ -304,6 +308,12 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV24)
     }
 
+    /// Construct an explicit ASIMD V25/tag38 sixth-empty-promotion candidate
+    /// manifest. This does not grant runtime or routing authority.
+    pub fn v25_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
+        Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV25)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// This keeps evidence runners independent of Rust enum variant names.
@@ -321,6 +331,7 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG29_V1 => Self::v16_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG30_V1 => Self::v17_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG37_V1 => Self::v24_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG38_V1 => Self::v25_candidate(policy),
             requested => Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested }),
         }
     }
@@ -743,6 +754,7 @@ impl SearchCompileReceiptV1 {
                     || value == BackendVersion::SEARCH_V16.0
                     || value == BackendVersion::SEARCH_V17.0
                     || value == BackendVersion::SEARCH_V24.0
+                    || value == BackendVersion::SEARCH_V25.0
             )
             && metadata.abi_kind() == AbiKind::Search
             && metadata.literal_bytes() == 0
@@ -954,11 +966,20 @@ pub fn plan_and_compile_macos_aarch64_exact_search_v1<O: Operation>(
         literal_bytes,
         manifest.policy.max_literal_bytes,
     )?;
-    if manifest.backend == MacosAarch64SearchBackendV1::AsimdV24
-        && !(u64::from(SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1)
-            ..=u64::from(SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1))
-            .contains(&literal_bytes)
-    {
+    let backend_literal_shape_is_valid = match manifest.backend {
+        MacosAarch64SearchBackendV1::AsimdV24 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
+        MacosAarch64SearchBackendV1::AsimdV25 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
+        _ => true,
+    };
+    if !backend_literal_shape_is_valid {
         return Err(SearchCompileErrorV1::BackendLiteralShape {
             backend: manifest.backend,
             literal_bytes,
@@ -2203,6 +2224,91 @@ mod tests {
             assert_eq!(
                 compiled.receipt().metadata().backend_version(),
                 BackendVersion::SEARCH_V24.0
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_v25_tag38_is_deterministic_static_and_width_strict() {
+        let v25_manifest = MacosAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+            SearchCompilePolicyV1::default(),
+        )
+        .expect("V25 candidate manifest");
+        let tagged = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG38_V1,
+        )
+        .expect("tag38 candidate manifest");
+        assert_eq!(
+            v25_manifest.backend(),
+            MacosAarch64SearchBackendV1::AsimdV25
+        );
+        assert_eq!(tagged.identity(), v25_manifest.identity());
+
+        let source = b"sixth-promote-25!".to_vec();
+        let first = plan_and_compile_macos_aarch64_exact_search_v1(
+            v25_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first V25 object");
+        let second = plan_and_compile_macos_aarch64_exact_search_v1(
+            v25_manifest,
+            source,
+            RustProfile::default(),
+        )
+        .expect("second V25 object");
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V25.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        assert_eq!(
+            first.receipt().canonical_bytes().expect("typed receipt"),
+            second.receipt().canonical_bytes().expect("typed receipt")
+        );
+        let expectation = crate::build_static_search_span_expectation_v1(&first)
+            .expect("V25 neutral expectation");
+        let claim = fre_aot_search_contract::inspect_static_search_span_expectation_v1(
+            expectation.as_bytes(),
+        )
+        .expect("V25 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG38_V1);
+        assert!(expectation.authenticates_claim(&claim));
+
+        for width in 1..SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1 {
+            let error = plan_and_compile_macos_aarch64_exact_search_v1(
+                v25_manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect_err("V25 must reject a sub-six width");
+            assert!(matches!(
+                error,
+                SearchCompileErrorV1::BackendLiteralShape {
+                    backend: MacosAarch64SearchBackendV1::AsimdV25,
+                    literal_bytes,
+                } if literal_bytes == u64::from(width)
+            ));
+        }
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
+        ] {
+            let compiled = plan_and_compile_macos_aarch64_exact_search_v1(
+                v25_manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect("V25 admitted envelope boundary");
+            assert_eq!(
+                compiled.receipt().metadata().backend_version(),
+                BackendVersion::SEARCH_V25.0
             );
         }
     }

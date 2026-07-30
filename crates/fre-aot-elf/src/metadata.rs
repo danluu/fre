@@ -314,7 +314,8 @@ impl MetadataV1 {
                     || version == BackendVersion::SEARCH_V15.0
                     || version == BackendVersion::SEARCH_V16.0
                     || version == BackendVersion::SEARCH_V17.0
-                    || version == BackendVersion::SEARCH_V24.0 =>
+                    || version == BackendVersion::SEARCH_V24.0
+                    || version == BackendVersion::SEARCH_V25.0 =>
             {
                 self.features == CpuFeatures::ASIMD.bits()
                     && search_backend_literal_width_is_valid_v1(
@@ -562,6 +563,13 @@ mod tests {
         }
     }
 
+    fn tag38_metadata(width: u32) -> MetadataV1 {
+        MetadataV1 {
+            backend_version: BackendVersion::SEARCH_V25.0,
+            ..tag37_metadata(width)
+        }
+    }
+
     #[test]
     fn tag37_metadata_decoder_enforces_the_central_width_envelope() {
         for width in [6, 32] {
@@ -577,6 +585,25 @@ mod tests {
             assert!(
                 tag37_metadata(width).validate_shape().is_err(),
                 "ELF metadata admitted tag37 width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn tag38_metadata_decoder_enforces_the_central_width_envelope() {
+        for width in [6, 32] {
+            let mut metadata = tag38_metadata(width);
+            metadata.compile_identity = compute_compile_identity_v1(metadata).0;
+            let encoded = metadata.encode().expect("canonical tag38 metadata");
+            assert_eq!(
+                MetadataV1::decode(&encoded).expect("decode tag38 metadata"),
+                metadata
+            );
+        }
+        for width in [0, 1, 5, 33] {
+            assert!(
+                tag38_metadata(width).validate_shape().is_err(),
+                "ELF metadata admitted tag38 width {width}"
             );
         }
     }

@@ -26,6 +26,8 @@ use fre_aot_search_contract::{
     SEARCH_BACKEND_ASIMD_TAG29_V1, SEARCH_BACKEND_ASIMD_TAG30_V1,
     SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1,
     SEARCH_BACKEND_ASIMD_TAG37_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG37_V1,
+    SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
+    SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1, SEARCH_BACKEND_ASIMD_TAG38_V1,
     inspect_static_search_span_expectation_v1, search_backend_literal_width_is_valid_v1,
 };
 use fre_jit_aarch64::{
@@ -143,6 +145,7 @@ pub enum LinuxAarch64SearchBackendV1 {
     AsimdV16,
     AsimdV17,
     AsimdV24,
+    AsimdV25,
     Sve2Fixed16Tag21Vl16,
 }
 
@@ -159,6 +162,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV16 => SearchBackendPolicy::AsimdV16,
             Self::AsimdV17 => SearchBackendPolicy::AsimdV17,
             Self::AsimdV24 => SearchBackendPolicy::AsimdV24,
+            Self::AsimdV25 => SearchBackendPolicy::AsimdV25,
             Self::Sve2Fixed16Tag21Vl16 => SearchBackendPolicy::Sve2Fixed16V2,
         }
     }
@@ -179,7 +183,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV15
             | Self::AsimdV16
             | Self::AsimdV17
-            | Self::AsimdV24 => CpuFeatures::ASIMD,
+            | Self::AsimdV24
+            | Self::AsimdV25 => CpuFeatures::ASIMD,
             Self::Sve2Fixed16Tag21Vl16 => CpuFeatures::ASIMD_SVE2,
         }
     }
@@ -195,7 +200,8 @@ impl LinuxAarch64SearchBackendV1 {
             | Self::AsimdV15
             | Self::AsimdV16
             | Self::AsimdV17
-            | Self::AsimdV24 => 0,
+            | Self::AsimdV24
+            | Self::AsimdV25 => 0,
             Self::Sve2Fixed16Tag21Vl16 => 16,
         }
     }
@@ -211,6 +217,7 @@ impl LinuxAarch64SearchBackendV1 {
             Self::AsimdV16 => 8,
             Self::AsimdV17 => 9,
             Self::AsimdV24 => 10,
+            Self::AsimdV25 => 11,
             Self::Sve2Fixed16Tag21Vl16 => 2,
         }
     }
@@ -375,6 +382,14 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
         Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV24)
     }
 
+    /// Construct an explicit ASIMD V25/tag38 sixth-empty-promotion
+    /// candidate. This does not grant runtime or automatic-routing authority.
+    pub fn v25_candidate(
+        policy: LinuxAarch64SearchCompilePolicyV1,
+    ) -> Result<Self, LinuxSearchManifestErrorV1> {
+        Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV25)
+    }
+
     /// Construct a named candidate by its static-contract backend tag.
     ///
     /// The external evidence runner can therefore carry the backend as sealed
@@ -392,6 +407,7 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
             SEARCH_BACKEND_ASIMD_TAG29_V1 => Self::v16_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG30_V1 => Self::v17_candidate(policy),
             SEARCH_BACKEND_ASIMD_TAG37_V1 => Self::v24_candidate(policy),
+            SEARCH_BACKEND_ASIMD_TAG38_V1 => Self::v25_candidate(policy),
             requested => {
                 Err(LinuxSearchManifestErrorV1::UnsupportedCandidateBackendTag { requested })
             }
@@ -1006,6 +1022,11 @@ pub fn plan_and_compile_linux_aarch64_exact_search_v1<O: Operation>(
                 ..=u64::from(SEARCH_BACKEND_ASIMD_TAG37_MAX_LITERAL_BYTES_V1))
                 .contains(&literal_bytes)
         }
+        LinuxAarch64SearchBackendV1::AsimdV25 => {
+            (u64::from(SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1)
+                ..=u64::from(SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1))
+                .contains(&literal_bytes)
+        }
         _ => true,
     };
     if !backend_literal_shape_is_valid {
@@ -1430,7 +1451,8 @@ const fn target_for_backend(backend: LinuxAarch64SearchBackendV1) -> TargetSpec 
         | LinuxAarch64SearchBackendV1::AsimdV15
         | LinuxAarch64SearchBackendV1::AsimdV16
         | LinuxAarch64SearchBackendV1::AsimdV17
-        | LinuxAarch64SearchBackendV1::AsimdV24 => TargetSpec::AARCH64_AAPCS64,
+        | LinuxAarch64SearchBackendV1::AsimdV24
+        | LinuxAarch64SearchBackendV1::AsimdV25 => TargetSpec::AARCH64_AAPCS64,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16 => TargetSpec::AARCH64_AAPCS64_SVE2_16,
     }
 }
@@ -1519,6 +1541,7 @@ fn decode_backend_profile(
         LinuxAarch64SearchBackendV1::AsimdV16,
         LinuxAarch64SearchBackendV1::AsimdV17,
         LinuxAarch64SearchBackendV1::AsimdV24,
+        LinuxAarch64SearchBackendV1::AsimdV25,
         LinuxAarch64SearchBackendV1::Sve2Fixed16Tag21Vl16,
     ] {
         if tag == backend.tag()
@@ -2229,6 +2252,126 @@ mod tests {
             assert_eq!(
                 compiled.receipt().metadata().backend_version(),
                 BackendVersion::SEARCH_V24.0
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the tag38 test binds constructor, wire receipt, object, expectation, and width boundaries"
+    )]
+    fn explicit_v25_tag38_is_deterministic_static_receipt_strict_and_width_strict() {
+        let v25_manifest = LinuxAarch64ExactSearchManifestV1::<Span>::v25_candidate(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+        )
+        .expect("V25 candidate manifest");
+        let tagged = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG38_V1,
+        )
+        .expect("tag38 candidate manifest");
+        assert_eq!(
+            v25_manifest.backend(),
+            LinuxAarch64SearchBackendV1::AsimdV25
+        );
+        assert_eq!(tagged.identity(), v25_manifest.identity());
+
+        let source = b"sixth-promote-25!".to_vec();
+        let first = plan_and_compile_linux_aarch64_exact_search_v1(
+            v25_manifest,
+            source.clone(),
+            RustProfile::default(),
+        )
+        .expect("first Linux V25 object");
+        let second = plan_and_compile_linux_aarch64_exact_search_v1(
+            v25_manifest,
+            source,
+            RustProfile::default(),
+        )
+        .expect("second Linux V25 object");
+        assert_eq!(
+            first.receipt().backend(),
+            LinuxAarch64SearchBackendV1::AsimdV25
+        );
+        assert_eq!(
+            first.receipt().metadata().backend_version(),
+            BackendVersion::SEARCH_V25.0
+        );
+        assert_eq!(first.object().as_bytes(), second.object().as_bytes());
+        assert_eq!(first.receipt(), second.receipt());
+        let receipt_bytes = first
+            .receipt()
+            .canonical_receipt_bytes()
+            .expect("canonical V25 receipt");
+        let reopened = first
+            .receipt()
+            .validate_canonical_receipt_bytes(&receipt_bytes)
+            .expect("strict V25 receipt reopen");
+        reopened
+            .validate_object(first.object().as_bytes(), ObjectLimitsV1::default())
+            .expect("V25 receipt/object binding");
+        for index in 0..receipt_bytes.len() {
+            let mut changed = receipt_bytes;
+            changed[index] ^= 1;
+            assert!(
+                first
+                    .receipt()
+                    .validate_canonical_receipt_bytes(&changed)
+                    .is_err(),
+                "typed V25 receipt reopen accepted byte mutation {index}"
+            );
+        }
+        let literal_bytes_offset =
+            RECEIPT_DOMAIN_V1.len() + 2 + 2 + 32 + 1 + 1 + 2 + 8 + 2 + 32 + 32;
+        let mut invalid_width = receipt_bytes;
+        invalid_width[literal_bytes_offset..literal_bytes_offset + 4]
+            .copy_from_slice(&5_u32.to_le_bytes());
+        assert!(
+            inspect_linux_search_compile_receipt_v1(&invalid_width).is_err(),
+            "claim-side V25 receipt decoder accepted a sub-six literal"
+        );
+        let expectation = crate::build_linux_static_search_span_expectation_v1(&first)
+            .expect("Linux V25 neutral expectation");
+        let claim = inspect_static_search_span_expectation_v1(expectation.as_bytes())
+            .expect("Linux V25 expectation inspection");
+        assert_eq!(claim.backend_version(), SEARCH_BACKEND_ASIMD_TAG38_V1);
+        reopened
+            .validate_span_expectation(expectation.as_bytes())
+            .expect("V25 receipt/expectation binding");
+
+        for width in 1..SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1 {
+            let error = plan_and_compile_linux_aarch64_exact_search_v1(
+                v25_manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect_err("V25 must reject a sub-six width");
+            assert!(matches!(
+                error,
+                LinuxSearchCompileErrorV1::BackendLiteralShape {
+                    backend: LinuxAarch64SearchBackendV1::AsimdV25,
+                    literal_bytes,
+                } if literal_bytes == u64::from(width)
+            ));
+        }
+        for width in [
+            SEARCH_BACKEND_ASIMD_TAG38_MIN_LITERAL_BYTES_V1,
+            SEARCH_BACKEND_ASIMD_TAG38_MAX_LITERAL_BYTES_V1,
+        ] {
+            let compiled = plan_and_compile_linux_aarch64_exact_search_v1(
+                v25_manifest,
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    [..usize::try_from(width).expect("small width")]
+                    .to_vec(),
+                RustProfile::default(),
+            )
+            .expect("V25 admitted envelope boundary");
+            assert_eq!(
+                compiled.receipt().metadata().backend_version(),
+                BackendVersion::SEARCH_V25.0
             );
         }
     }
