@@ -88,6 +88,10 @@ struct ByteSetTables {
 pub struct ByteSetMask16(u16);
 
 impl ByteSetMask16 {
+    pub(crate) const fn new(member_mask: u16) -> Self {
+        Self(member_mask)
+    }
+
     /// Bit `i` is set exactly when source byte `i` belongs to the set.
     #[must_use]
     pub const fn member_mask(self) -> u16 {

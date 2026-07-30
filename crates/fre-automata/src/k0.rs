@@ -1,8 +1,8 @@
 use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier, ASCII_NARROW_BYTES,
-    ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
+    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
 };
 use memchr::{memchr, memchr2, memchr3};
 
@@ -12,9 +12,10 @@ use crate::{
         StartFilterProof, StartFilterProofCell, StartFilterPublication, StartPositionClass,
         StartPositionScanner, StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
         BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-        BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-        START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-        START_FILTER_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
+        BYTE_START_RANGE_DETECTION_WORK, BYTE_START_SET_CLASSIFIER_BUILD_WORK,
+        BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+        START_FILTER_GUARD_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+        START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
     SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
@@ -5258,6 +5259,14 @@ fn build_byte_start_scanner(
         });
     }
 
+    meter.charge(
+        u64::try_from(BYTE_START_RANGE_DETECTION_WORK).expect("range detection work fits u64"),
+        position,
+    )?;
+    if let Some((start, end)) = inclusive_byte_range(set, cardinality) {
+        return Ok(StartScanner::Range { start, end });
+    }
+
     if let Some(ascii) = ascii_start_set(set) {
         meter.charge(
             u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK)
@@ -5276,6 +5285,34 @@ fn build_byte_start_scanner(
         position,
     )?;
     Ok(StartScanner::Set(build_full_byte_start_classifier(set)))
+}
+
+fn inclusive_byte_range(set: ByteSet, cardinality: u32) -> Option<(u8, u8)> {
+    debug_assert_eq!(set.cardinality(), cardinality);
+    let words = set.words();
+    let mut first_word = None;
+    let mut last_word = None;
+    for (index, word) in words.into_iter().enumerate() {
+        if word != 0 {
+            first_word.get_or_insert(index);
+            last_word = Some(index);
+        }
+    }
+    let first_word = first_word?;
+    let last_word = last_word?;
+    let word_bits = usize::try_from(u64::BITS).ok()?;
+    let first_bit = usize::try_from(words[first_word].trailing_zeros()).ok()?;
+    let last_bit = u64::BITS
+        .checked_sub(1)?
+        .checked_sub(words[last_word].leading_zeros())
+        .and_then(|bit| usize::try_from(bit).ok())?;
+    let start = first_word.checked_mul(word_bits)?.checked_add(first_bit)?;
+    let end = last_word.checked_mul(word_bits)?.checked_add(last_bit)?;
+    let span = end.checked_sub(start)?.checked_add(1)?;
+    if u32::try_from(span).ok()? != cardinality {
+        return None;
+    }
+    Some((u8::try_from(start).ok()?, u8::try_from(end).ok()?))
 }
 
 fn ascii_start_set(set: ByteSet) -> Option<AsciiByteSet> {
@@ -5384,6 +5421,10 @@ fn next_scanner_candidate(
                 memchr3(*first, *second, *third, source)
             })
         }
+        StartScanner::Range {
+            start,
+            end: range_end,
+        } => next_range_start_candidate(*start, *range_end, haystack, position, end, meter),
         StartScanner::AsciiSet { classifier, .. } => {
             next_ascii_start_candidate(classifier.classifier(), haystack, position, end, meter)
         }
@@ -5448,6 +5489,80 @@ fn next_small_start_candidate(
     Err(SearchError::InternalInvariant {
         detail: "start scanner admitted progress beyond the work limit",
     })
+}
+
+fn next_range_start_candidate(
+    start: u8,
+    range_end: u8,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    debug_assert!(start <= range_end);
+    let width = range_end.wrapping_sub(start);
+
+    // Nearby candidates are cheaper as direct comparisons, and a guard that
+    // rejects one candidate can re-enter at the following byte without
+    // repeatedly classifying an overlapping fixed-width block.
+    let scalar_prefix_end = position.saturating_add(BYTE_SET_BLOCK_BYTES).min(end);
+    while position < scalar_prefix_end {
+        meter.charge(1, position)?;
+        if haystack[position].wrapping_sub(start) <= width {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-range prefix position",
+            })?;
+    }
+
+    // Charge a complete logical block before its first source read. A match
+    // in any lane therefore has the same hard-limit threshold as the broad
+    // full-byte classifier it replaces.
+    let block_work = u64::try_from(BYTE_SET_BLOCK_BYTES).expect("range block width fits in u64");
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES && meter.remaining() >= block_work {
+        meter.charge(block_work, position)?;
+        let block_end =
+            position
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "start-range block end",
+                })?;
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack
+            .get(position..block_end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "start-range scanner exceeded the validated search window",
+            })?
+            .try_into()
+            .expect("checked start-range block extent");
+        let members =
+            classify_byte_delta_16(start, range_end.wrapping_sub(start), block).member_mask();
+        if members != 0 {
+            let offset = usize::try_from(members.trailing_zeros())
+                .expect("a start-range lane fits in usize");
+            return position
+                .checked_add(offset)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "start-range candidate",
+                });
+        }
+        position = block_end;
+    }
+
+    while position < end {
+        meter.charge(1, position)?;
+        if haystack[position].wrapping_sub(start) <= width {
+            return Ok(position);
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "scalar start-range position",
+            })?;
+    }
+    Ok(end)
 }
 
 fn next_set_start_candidate(
@@ -6633,17 +6748,18 @@ mod tests {
     };
 
     use super::{
-        scratch_bytes, ContextTransitionSlot, WorkMeter, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
-        CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
+        classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter,
+        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
     };
     use crate::{
         plan::{
             ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
             StartPositionScanner, StartScanner, BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK,
             BYTE_START_BITMAP_POPULATION_WORK, BYTE_START_MEMBER_EXTRACTION_WORK,
-            BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
-            START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
-            START_FILTER_MAX_OFFSET, START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
+            BYTE_START_RANGE_DETECTION_WORK, BYTE_START_SET_CLASSIFIER_BUILD_WORK,
+            BYTE_START_SMALL_MAX_MEMBERS, START_FILTER_GUARD_MAX_CARDINALITY,
+            START_FILTER_GUARD_SELECTION_WORK, START_FILTER_MAX_OFFSET,
+            START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0SearchSession, K0Workspace,
@@ -8311,15 +8427,25 @@ mod tests {
     }
 
     fn expected_scanner_construction_work(bytes: &[u8]) -> u64 {
-        let construction = if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
-            bytes
-                .len()
+        let set = byte_set(bytes);
+        let cardinality = usize::try_from(set.cardinality()).unwrap();
+        let construction = if cardinality <= BYTE_START_SMALL_MAX_MEMBERS {
+            cardinality
                 .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                 .unwrap()
-        } else if bytes.iter().all(u8::is_ascii) {
-            BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK
         } else {
-            BYTE_START_SET_CLASSIFIER_BUILD_WORK
+            let fallback = if super::inclusive_byte_range(set, u32::try_from(cardinality).unwrap())
+                .is_some()
+            {
+                0
+            } else if bytes.iter().all(u8::is_ascii) {
+                BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK
+            } else {
+                BYTE_START_SET_CLASSIFIER_BUILD_WORK
+            };
+            BYTE_START_RANGE_DETECTION_WORK
+                .checked_add(fallback)
+                .unwrap()
         };
         u64::try_from(construction).unwrap()
     }
@@ -8456,10 +8582,11 @@ mod tests {
                     .checked_mul(START_FILTER_GUARD_SELECTION_WORK)
                     .and_then(|guards| work.checked_add(guards))
             })
+            .and_then(|work| work.checked_add(BYTE_START_RANGE_DETECTION_WORK))
             .and_then(|work| work.checked_add(BYTE_START_SET_CLASSIFIER_BUILD_WORK))
             .unwrap();
         assert_eq!(START_FILTER_MAX_SELECTION_WORK, expected_selection_work);
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 352);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 356);
 
         // All exact-position sets remain a transient cold stack value. The
         // immutable owner still retains only its selected scanner and guard.
@@ -8534,23 +8661,32 @@ mod tests {
 
             let mut one_below = WorkMeter::new(expected.checked_sub(1).unwrap(), 0);
             let error = super::byte_start_scanner(byte_set(bytes), &mut one_below, 17).unwrap_err();
-            let expected_tail = if bytes.is_empty() {
+            let set = byte_set(bytes);
+            let cardinality = usize::try_from(set.cardinality()).unwrap();
+            let range = (cardinality > BYTE_START_SMALL_MAX_MEMBERS)
+                .then(|| super::inclusive_byte_range(set, u32::try_from(cardinality).unwrap()))
+                .flatten();
+            let expected_tail = if cardinality == 0 {
                 u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
-            } else if bytes.len() <= BYTE_START_SMALL_MAX_MEMBERS {
+            } else if cardinality <= BYTE_START_SMALL_MAX_MEMBERS {
                 u64::try_from(
-                    bytes
-                        .len()
+                    cardinality
                         .checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK)
                         .unwrap(),
                 )
                 .unwrap()
+            } else if range.is_some() {
+                u64::try_from(BYTE_START_RANGE_DETECTION_WORK).unwrap()
             } else if bytes.iter().all(u8::is_ascii) {
                 u64::try_from(BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK).unwrap()
             } else {
                 u64::try_from(BYTE_START_SET_CLASSIFIER_BUILD_WORK).unwrap()
             };
-            let expected_consumed = if bytes.is_empty() {
+            let expected_consumed = if cardinality == 0 {
                 0
+            } else if cardinality > BYTE_START_SMALL_MAX_MEMBERS && range.is_none() {
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK)
+                    .unwrap()
             } else {
                 u64::try_from(BYTE_START_BITMAP_POPULATION_WORK).unwrap()
             };
@@ -9337,6 +9473,71 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_start_ranges_are_selected_without_displacing_small_scanners() {
+        for (start, end) in [
+            (0_u8, 3_u8),
+            (62, 65),
+            (0x7e, 0x81),
+            (0x80, 0x9f),
+            (0xfc, 0xff),
+            (0, 0xfe),
+        ] {
+            let set = byte_range_set(start, end);
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let scanner = super::byte_start_scanner(set, &mut meter, 0).unwrap();
+            assert_eq!(scanner, StartScanner::Range { start, end });
+            assert_eq!(
+                meter.consumed,
+                u64::try_from(BYTE_START_BITMAP_POPULATION_WORK + BYTE_START_RANGE_DETECTION_WORK)
+                    .unwrap()
+            );
+        }
+
+        for (bytes, expected) in [
+            (&[0x80][..], StartScanner::One(0x80)),
+            (&[0x80, 0x81][..], StartScanner::Two(0x80, 0x81)),
+            (
+                &[0x80, 0x81, 0x82][..],
+                StartScanner::Three(0x80, 0x81, 0x82),
+            ),
+        ] {
+            assert_eq!(scanner_for(bytes), expected);
+        }
+
+        let ascii_hole = scanner_for(&[0, 1, 3, 4]);
+        assert!(matches!(ascii_hole, StartScanner::AsciiSet { .. }));
+        let full_byte_hole = scanner_for(&[0x7f, 0x80, 0x82, 0x83]);
+        assert!(matches!(full_byte_hole, StartScanner::Set(_)));
+    }
+
+    #[test]
+    fn start_range_mask_is_exact_for_all_interval_boundaries_and_lanes() {
+        for start in 0_u8..=u8::MAX {
+            for end in [start, start.saturating_add(1), u8::MAX] {
+                let block: [u8; fre_simd_kernels::BYTE_SET_BLOCK_BYTES] =
+                    core::array::from_fn(|lane| {
+                        u8::try_from(
+                            lane.wrapping_mul(197)
+                                .wrapping_add(usize::from(start))
+                                .wrapping_add(usize::from(end))
+                                & 255,
+                        )
+                        .unwrap()
+                    });
+                let actual =
+                    classify_byte_delta_16(start, end.wrapping_sub(start), &block).member_mask();
+                let expected = block.iter().enumerate().fold(0_u16, |mask, (lane, &byte)| {
+                    mask | (u16::from((start..=end).contains(&byte)) << lane)
+                });
+                assert_eq!(
+                    actual, expected,
+                    "range {start:#04x}..={end:#04x} block={block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn byte_start_scanners_match_scalar_reference_for_every_window() {
         let scanner_sets: &[&[u8]] = &[
             &[],
@@ -9346,7 +9547,10 @@ mod tests {
             b"ac\x7f",
             b"\x80\xff",
             b"\0a\xff",
+            b"\0\x01\x02\x03",
             b"abcd",
+            b"\x7e\x7f\x80\x81",
+            b"\xfc\xfd\xfe\xff",
             b"\x3f\x40AB",
             b"\x80\x81\x8f\x90",
             b"\0\x1f\x40\x7f\x80\xbf\xc0\xff",
@@ -9392,7 +9596,7 @@ mod tests {
                             StartScanner::AsciiSet { .. } => {
                                 expected_ascii_scanner_work(start, end, expected)
                             }
-                            StartScanner::Set(_) => {
+                            StartScanner::Set(_) | StartScanner::Range { .. } => {
                                 expected_full_byte_scanner_work(start, end, expected)
                             }
                             StartScanner::Empty => 0,
@@ -9419,8 +9623,6 @@ mod tests {
     #[test]
     fn broad_full_byte_scanners_match_every_window_and_vector_threshold() {
         let mut sets = vec![
-            byte_range_set(0x80, 0xff),
-            byte_range_set(0x70, 0x90),
             byte_set(&[0x80, 0x81, 0x8e, 0x8f]),
             byte_set(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
             byte_set(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xff]),
@@ -9976,8 +10178,8 @@ mod tests {
             proof.scanner,
             Some(StartPositionScanner {
                 offset: 1,
-                scanner: StartScanner::AsciiSet { set, .. },
-            }) if set == byte_range_set(0, 64)
+                scanner: StartScanner::Range { start: 0, end: 64 },
+            })
         ));
         assert_eq!(proof.guard, None);
         assert!(!proof.force_haystack_start);
@@ -10377,7 +10579,13 @@ mod tests {
                     | (b"a", StartScanner::One(b'a'))
                     | (b"ab", StartScanner::Two(b'a', b'b'))
                     | (b"abc", StartScanner::Three(b'a', b'b', b'c'))
-                    | (b"abcd", StartScanner::AsciiSet { .. })
+                    | (
+                        b"abcd",
+                        StartScanner::Range {
+                            start: b'a',
+                            end: b'd'
+                        }
+                    )
             ));
 
             let mut meter = WorkMeter::new(u64::MAX, 0);

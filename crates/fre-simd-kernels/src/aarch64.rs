@@ -7,6 +7,7 @@ use super::{
     ASCII_NARROW_BYTES, AsciiMasks16, AsciiRunResult, AsciiRunTables, HIGH_NIBBLE_BITS,
     LANE_WEIGHTS, scalar,
 };
+use crate::{BYTE_SET_BLOCK_BYTES, ByteSetMask16};
 
 #[allow(
     unsafe_code,
@@ -52,12 +53,37 @@ pub(super) unsafe fn classify_16_neon(
     reason = "this private register-only helper inherits the proved NEON boundary from its sole target-feature caller"
 )]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn boolean_lanes_to_mask(lanes: uint8x16_t, weights: uint8x16_t) -> u16 {
     let one_or_zero = vshrq_n_u8::<7>(lanes);
     let weighted = vmulq_u8(one_or_zero, weights);
     let low = u16::from(vaddv_u8(vget_low_u8(weighted)));
     let high = u16::from(vaddv_u8(vget_high_u8(weighted)));
     low | (high << 8)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private target-feature leaf loads one exact block after the compiler target proved NEON usable"
+)]
+#[target_feature(enable = "neon")]
+#[inline]
+pub(super) unsafe fn classify_byte_delta_16_neon(
+    origin: u8,
+    maximum_delta: u8,
+    bytes: &[u8; BYTE_SET_BLOCK_BYTES],
+) -> ByteSetMask16 {
+    use core::arch::aarch64::{vcleq_u8, vsubq_u8};
+
+    // SAFETY: `bytes` and the fixed weights are initialized exact-width
+    // arrays, and the compiler target proves NEON before this leaf is called.
+    let (input, lane_weights) =
+        unsafe { (vld1q_u8(bytes.as_ptr()), vld1q_u8(LANE_WEIGHTS.as_ptr())) };
+    let offsets = vsubq_u8(input, vdupq_n_u8(origin));
+    let member_lanes = vcleq_u8(offsets, vdupq_n_u8(maximum_delta));
+    // SAFETY: this function itself is entered only with NEON enabled, and the
+    // helper has no memory access or additional precondition.
+    ByteSetMask16::new(unsafe { boolean_lanes_to_mask(member_lanes, lane_weights) })
 }
 
 #[allow(
