@@ -3922,6 +3922,249 @@ fn v22_all_search_output_contracts_publish_and_execute() {
 }
 
 #[test]
+fn v23_primary_pointer_executes_natively_across_exits_backedges_and_guards() {
+    fn pointer_literal(width: usize, zero_primary: bool) -> Vec<u8> {
+        let primary = if zero_primary { 0 } else { width - 1 };
+        let secondary = if zero_primary { width - 1 } else { 0 };
+        let mut literal = vec![b'e'; width];
+        literal[primary] = 0x1f;
+        literal[secondary] = 0x1e;
+        literal
+    }
+
+    let _lock = native_test_lock();
+    let mut comparisons = 0_u64;
+    for width in [6_usize, 13, 32] {
+        for zero_primary in [true, false] {
+            let literal = pointer_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 native pointer program");
+            let image = emit_audited_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("audited V23 native pointer image");
+            assert_eq!(
+                image.as_image().backend_version(),
+                BackendVersion::SEARCH_V23
+            );
+            let selected = decode(image.as_image().code())
+                .expect("V23 native pointer decode")
+                .into_iter()
+                .filter_map(|instruction| match instruction {
+                    DecodedInstruction::LoadByte {
+                        destination: 11,
+                        base: 8,
+                        offset,
+                    } => Some(usize::from(offset)),
+                    _ => None,
+                })
+                .take(5)
+                .collect::<Vec<_>>();
+            assert_eq!(selected.len(), 5);
+            assert_eq!(selected[0], if zero_primary { 0 } else { width - 1 });
+            let unselected = (0..width)
+                .find(|offset| !selected.contains(offset))
+                .expect("V23 native learned offset");
+            let avoid = (0_u16..=255)
+                .map(|value| u8::try_from(value).expect("bounded byte"))
+                .find(|byte| !literal.contains(byte))
+                .expect("V23 native literal leaves one avoiding byte");
+            let kernel = publish_audited::<Span>(&image, PublicationLimits::default())
+                .expect("publish V23 pointer image");
+            let window_start = 3_usize;
+            let wide_base = window_start + 1;
+            let post_three_wide = wide_base + 3 * 64;
+
+            for (kind, exact, last_candidate) in [
+                (
+                    "wide exact",
+                    Some(post_three_wide + 11),
+                    post_three_wide + 80,
+                ),
+                (
+                    "narrow exact",
+                    Some(post_three_wide + 7),
+                    post_three_wide + 20,
+                ),
+                ("tail exact", Some(post_three_wide + 7), post_three_wide + 7),
+                ("no match", None, post_three_wide + 7),
+            ] {
+                let window_end = last_candidate + width;
+                let mut bytes = vec![avoid; window_end + 17];
+                if let Some(candidate) = exact {
+                    install_literal(&mut bytes, candidate, &literal);
+                }
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, window_end),
+                        );
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "guarded V23 pointer exit width={width} zero_primary={zero_primary} kind={kind}: {error:?}"
+                        )
+                    });
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                }
+            }
+
+            for missing_stage in 2_usize..selected.len() {
+                let exact = post_three_wide + 7;
+                let last_candidate = post_three_wide + 20;
+                let window_end = last_candidate + width;
+                let mut bytes = vec![avoid; window_end + 17];
+                for group in 0..3_usize {
+                    let false_candidate = wide_base + group * 64 + 5;
+                    for &offset in &selected[..missing_stage] {
+                        bytes[false_candidate + offset] = literal[offset];
+                    }
+                }
+                install_literal(&mut bytes, exact, &literal);
+                for right_boundary in [false, true] {
+                    platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+                        assert_native_matches(
+                            &program,
+                            &kernel,
+                            guarded,
+                            SearchWindow::new(window_start, window_end),
+                        );
+                    })
+                    .expect("guarded V23 static-empty execution");
+                    comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+                }
+            }
+
+            let primary_only = wide_base + 5;
+            let secondary_only = wide_base + 2 * 64 + 9;
+            let exact = wide_base + 3 * 64 + 11;
+            let window_end = exact + width + 80;
+            let mut secondary_bytes = vec![avoid; window_end + 17];
+            secondary_bytes[primary_only + selected[0]] = literal[selected[0]];
+            secondary_bytes[secondary_only + selected[1]] = literal[selected[1]];
+            install_literal(&mut secondary_bytes, exact, &literal);
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&secondary_bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, window_end),
+                    );
+                })
+                .expect("guarded V23 secondary-only execution");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+
+            let false_candidate = wide_base + 5;
+            let exact = wide_base + 4 * 64 + 11;
+            let window_end = exact + width + 80;
+            let mut learned_bytes = vec![avoid; window_end + 17];
+            install_literal(&mut learned_bytes, false_candidate, &literal);
+            learned_bytes[false_candidate + unselected] = avoid;
+            install_literal(&mut learned_bytes, exact, &literal);
+            for right_boundary in [false, true] {
+                platform::with_guarded_haystack(&learned_bytes, right_boundary, |guarded| {
+                    assert_native_matches(
+                        &program,
+                        &kernel,
+                        guarded,
+                        SearchWindow::new(window_start, window_end),
+                    );
+                })
+                .expect("guarded V23 persistent learned execution");
+                comparisons = comparisons.checked_add(1).expect("bounded comparisons");
+            }
+        }
+    }
+    assert_eq!(comparisons, 3 * 2 * (4 + 3 + 1 + 1) * 2);
+}
+
+#[test]
+fn v23_all_search_output_contracts_publish_and_execute() {
+    let _lock = native_test_lock();
+    let mut literal = vec![b'e'; 13];
+    literal[0] = 0x1f;
+    literal[12] = 0x1e;
+    let exists_program =
+        build_exact_literal::<Exists>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V23 Exists program");
+    let selected_end_program = build_exact_literal::<SelectedEnd>(
+        &literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("V23 SelectedEnd program");
+    let span_program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V23 Span program");
+    let exists_image = emit_audited_with_backend(
+        &exists_program,
+        SearchBackendPolicy::AsimdV23,
+        EmitLimits::default(),
+    )
+    .expect("V23 Exists image");
+    let selected_end_image = emit_audited_with_backend(
+        &selected_end_program,
+        SearchBackendPolicy::AsimdV23,
+        EmitLimits::default(),
+    )
+    .expect("V23 SelectedEnd image");
+    let span_image = emit_audited_with_backend(
+        &span_program,
+        SearchBackendPolicy::AsimdV23,
+        EmitLimits::default(),
+    )
+    .expect("V23 Span image");
+    for image in [
+        exists_image.as_image(),
+        selected_end_image.as_image(),
+        span_image.as_image(),
+    ] {
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V23);
+    }
+
+    let exists = publish_audited::<Exists>(&exists_image, PublicationLimits::default())
+        .expect("publish V23 Exists");
+    let selected_end =
+        publish_audited::<SelectedEnd>(&selected_end_image, PublicationLimits::default())
+            .expect("publish V23 SelectedEnd");
+    let span = publish_audited::<Span>(&span_image, PublicationLimits::default())
+        .expect("publish V23 Span");
+    let avoid = 0xff_u8;
+    assert!(!literal.contains(&avoid));
+    let window_start = 3_usize;
+    let exact = window_start + 4 * 64 + 11;
+    let mut bytes = vec![avoid; exact + literal.len() + 96];
+    install_literal(&mut bytes, exact, &literal);
+    for right_boundary in [false, true] {
+        platform::with_guarded_haystack(&bytes, right_boundary, |guarded| {
+            let window = SearchWindow::new(window_start, guarded.len());
+            assert_eq!(exists.search(guarded, window), Ok(true));
+            assert_eq!(
+                selected_end.search(guarded, window),
+                Ok(Some(exact + literal.len()))
+            );
+            let found = span
+                .search(guarded, window)
+                .expect("V23 Span call")
+                .expect("V23 Span match");
+            assert_eq!((found.start(), found.end()), (exact, exact + literal.len()));
+        })
+        .expect("guarded V23 output-contract execution");
+    }
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the width/topology matrix keeps learned-mode, vector-tail, one-candidate, and clipped-window guard cases explicit"
