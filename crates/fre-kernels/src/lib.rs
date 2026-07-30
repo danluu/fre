@@ -15,8 +15,9 @@ use memchr::memmem::{Finder, FinderBuilder};
 pub use fre_simd_kernels::{
     ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
     ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection,
-    AsciiWordSpaceClassifier, AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, DispatchPolicy,
-    DispatchProfile, Feature, FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass,
+    AsciiWordSpaceClassifier, AsciiWordSpaceMasks16, AsciiWordSpaceMasks32, BYTE_SET_BLOCK_BYTES,
+    BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier, DispatchPolicy, DispatchProfile,
+    Feature, FeatureSet, SelectionReceipt, SimdDispatchContext, TuningClass,
     UnsupportedRequiredFeatures, dispatch_profile,
 };
 

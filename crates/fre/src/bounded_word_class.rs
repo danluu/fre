@@ -10,8 +10,9 @@
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize, ExactVec};
 use fre_kernels::{
     ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES, ASCII_RUN_SCANNER_BUILD_WORK,
-    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, DispatchPolicy,
-    SimdDispatchContext,
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
+    DispatchPolicy, SimdDispatchContext,
 };
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
@@ -20,7 +21,7 @@ use crate::{
     unicode_word_run::{Accounting, Error},
 };
 
-pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-bulk-skip-v3";
+pub(crate) const PLAN_ID: &str = "bounded-word-class-linear-full-byte-v4";
 
 /// Pointwise checks stay cheaper than entering a fixed-width classifier when
 /// a candidate is close to the current cursor. This constant is independent
@@ -57,18 +58,28 @@ enum ClassMatcher {
 enum CandidateMode {
     /// Every class member is ASCII, so the classifier's member mask is exact.
     ExactAsciiMembers,
+    /// The arbitrary-byte classifier's member mask is the exact byte class.
+    ExactByteMembers,
     /// ASCII members and every high byte require scalar Unicode inspection.
     UnicodeAsciiMemberOrNonAscii,
 }
 
 #[derive(Debug)]
-struct CandidateScanner {
-    classifier: AsciiByteSetClassifier,
-    /// Exact ASCII byte classes can scan their ASCII nonmember complement as
-    /// one maximal run. Unicode keeps the classifier path because every high
-    /// byte is a semantic decode candidate.
-    nonmember_scanner: ExactBoxOrUsize<AsciiByteSetRunScanner>,
-    mode: CandidateMode,
+enum CandidateScanner {
+    /// Exact ASCII byte classes retain the wide classifier and scan their
+    /// ASCII nonmember complement as one maximal run.
+    ExactAscii {
+        classifier: AsciiByteSetClassifier,
+        nonmember_scanner: ExactBoxOrUsize<AsciiByteSetRunScanner>,
+    },
+    /// Classes containing any high byte use the accepted exact 256-bit set
+    /// classifier directly instead of falling through to composed K0.
+    ExactBytes {
+        classifier: ExactBoxOrUsize<ByteSetClassifier>,
+    },
+    /// Unicode keeps the established ASCII-member-or-high-byte classifier
+    /// until the separately qualified lead-byte successor is available.
+    Unicode { classifier: AsciiByteSetClassifier },
 }
 
 /// Immutable, allocation-free-at-search-time native plan.
@@ -259,17 +270,61 @@ impl ScanningBoundaryCursor {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScannedCandidate {
-    AsciiMember { position: usize, byte: u8 },
+    ByteMember { position: usize, byte: u8 },
     NonAscii { position: usize },
 }
 
 impl CandidateScanner {
+    fn next(
+        &self,
+        haystack: &[u8],
+        position: usize,
+        end: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScannedCandidate>, Error> {
+        match self {
+            Self::ExactBytes { classifier } => Self::next_exact_bytes(
+                classifier
+                    .boxed()
+                    .expect("the exact-byte scanner owns its compiled classifier"),
+                haystack,
+                position,
+                end,
+                accounting,
+                limits,
+            ),
+            Self::ExactAscii {
+                classifier,
+                nonmember_scanner,
+            } => Self::next_ascii_family(
+                classifier,
+                Some(
+                    nonmember_scanner
+                        .boxed()
+                        .expect("the exact-ASCII scanner owns its complement scanner"),
+                ),
+                false,
+                haystack,
+                position,
+                end,
+                accounting,
+                limits,
+            ),
+            Self::Unicode { classifier } => Self::next_ascii_family(
+                classifier, None, true, haystack, position, end, accounting, limits,
+            ),
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the scalar, bulk-run, fixed-width, and tail paths keep their exact shared ledger adjacent"
     )]
-    fn next(
-        &self,
+    fn next_ascii_family(
+        classifier: &AsciiByteSetClassifier,
+        nonmember_scanner: Option<&AsciiByteSetRunScanner>,
+        unicode: bool,
         haystack: &[u8],
         mut position: usize,
         end: usize,
@@ -283,9 +338,9 @@ impl CandidateScanner {
             )
             .ok_or_else(|| accounting_overflow(limits))?;
         while position < prefix_end {
-            if let Some(candidate) =
-                self.scalar_candidate(haystack, position, accounting, limits)?
-            {
+            if let Some(candidate) = Self::scalar_ascii_candidate(
+                classifier, unicode, haystack, position, accounting, limits,
+            )? {
                 return Ok(Some(candidate));
             }
             position = position
@@ -299,7 +354,7 @@ impl CandidateScanner {
         let mut fixed_block_proved = false;
         while end.saturating_sub(position) >= ASCII_WIDE_BYTES {
             if fixed_block_proved
-                && let Some(scanner) = self.nonmember_scanner.boxed()
+                && let Some(scanner) = nonmember_scanner
                 && end.saturating_sub(position) >= BULK_SKIP_MIN_BYTES
             {
                 let available = limits.max_work.saturating_sub(accounting.work);
@@ -330,10 +385,10 @@ impl CandidateScanner {
                     }
                     let byte = haystack[position];
                     if byte.is_ascii() {
-                        debug_assert!(self.classifier.set().contains(byte));
+                        debug_assert!(classifier.set().contains(byte));
                         charge(accounting, limits)?;
                         record_source(accounting, 1, 1, limits)?;
-                        return Ok(Some(ScannedCandidate::AsciiMember { position, byte }));
+                        return Ok(Some(ScannedCandidate::ByteMember { position, byte }));
                     }
                     // The ASCII run scanner deliberately stops at a high byte.
                     // Exact byte classes reject it, so retain the fixed
@@ -352,20 +407,18 @@ impl CandidateScanner {
             let block: &[u8; ASCII_WIDE_BYTES] = haystack[position..block_end]
                 .try_into()
                 .expect("the candidate scanner checked its wide extent");
-            let masks = self.classifier.classify_32(block);
-            let decoded = match self.mode {
-                CandidateMode::ExactAsciiMembers => ASCII_WIDE_BYTES,
-                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
-                    usize::try_from(masks.ascii_mask().count_ones())
-                        .expect("a 32-bit ASCII lane count fits usize")
-                }
+            let masks = classifier.classify_32(block);
+            let decoded = if unicode {
+                usize::try_from(masks.ascii_mask().count_ones())
+                    .expect("a 32-bit ASCII lane count fits usize")
+            } else {
+                ASCII_WIDE_BYTES
             };
             record_source(accounting, ASCII_WIDE_BYTES, decoded, limits)?;
-            let candidates = match self.mode {
-                CandidateMode::ExactAsciiMembers => masks.member_mask(),
-                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
-                    masks.member_mask() | !masks.ascii_mask()
-                }
+            let candidates = if unicode {
+                masks.member_mask() | !masks.ascii_mask()
+            } else {
+                masks.member_mask()
             };
             if candidates != 0 {
                 let offset = usize::try_from(candidates.trailing_zeros())
@@ -379,7 +432,7 @@ impl CandidateScanner {
                 if masks.member_mask() & bit != 0 {
                     charge(accounting, limits)?;
                     record_source(accounting, 1, 0, limits)?;
-                    return Ok(Some(ScannedCandidate::AsciiMember {
+                    return Ok(Some(ScannedCandidate::ByteMember {
                         position: candidate_position,
                         byte: block[offset],
                     }));
@@ -400,20 +453,18 @@ impl CandidateScanner {
             let block: &[u8; ASCII_NARROW_BYTES] = haystack[position..block_end]
                 .try_into()
                 .expect("the candidate scanner checked its narrow extent");
-            let masks = self.classifier.classify_16(block);
-            let decoded = match self.mode {
-                CandidateMode::ExactAsciiMembers => ASCII_NARROW_BYTES,
-                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
-                    usize::try_from(masks.ascii_mask().count_ones())
-                        .expect("a 16-bit ASCII lane count fits usize")
-                }
+            let masks = classifier.classify_16(block);
+            let decoded = if unicode {
+                usize::try_from(masks.ascii_mask().count_ones())
+                    .expect("a 16-bit ASCII lane count fits usize")
+            } else {
+                ASCII_NARROW_BYTES
             };
             record_source(accounting, ASCII_NARROW_BYTES, decoded, limits)?;
-            let candidates = match self.mode {
-                CandidateMode::ExactAsciiMembers => masks.member_mask(),
-                CandidateMode::UnicodeAsciiMemberOrNonAscii => {
-                    masks.member_mask() | !masks.ascii_mask()
-                }
+            let candidates = if unicode {
+                masks.member_mask() | !masks.ascii_mask()
+            } else {
+                masks.member_mask()
             };
             if candidates != 0 {
                 let offset = usize::try_from(candidates.trailing_zeros())
@@ -427,7 +478,7 @@ impl CandidateScanner {
                 if masks.member_mask() & bit != 0 {
                     charge(accounting, limits)?;
                     record_source(accounting, 1, 0, limits)?;
-                    return Ok(Some(ScannedCandidate::AsciiMember {
+                    return Ok(Some(ScannedCandidate::ByteMember {
                         position: candidate_position,
                         byte: block[offset],
                     }));
@@ -440,8 +491,77 @@ impl CandidateScanner {
         }
 
         while position < end {
+            if let Some(candidate) = Self::scalar_ascii_candidate(
+                classifier, unicode, haystack, position, accounting, limits,
+            )? {
+                return Ok(Some(candidate));
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| accounting_overflow(limits))?;
+        }
+        Ok(None)
+    }
+
+    fn next_exact_bytes(
+        classifier: &ByteSetClassifier,
+        haystack: &[u8],
+        mut position: usize,
+        end: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScannedCandidate>, Error> {
+        let prefix_end = position
+            .checked_add(
+                end.saturating_sub(position)
+                    .min(CANDIDATE_SCALAR_PREFIX_BYTES),
+            )
+            .ok_or_else(|| accounting_overflow(limits))?;
+        while position < prefix_end {
             if let Some(candidate) =
-                self.scalar_candidate(haystack, position, accounting, limits)?
+                Self::scalar_byte_candidate(classifier, haystack, position, accounting, limits)?
+            {
+                return Ok(Some(candidate));
+            }
+            position = position
+                .checked_add(1)
+                .ok_or_else(|| accounting_overflow(limits))?;
+        }
+
+        while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+            charge_many(accounting, BYTE_SET_BLOCK_BYTES, limits)?;
+            let block_end = position
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .ok_or_else(|| accounting_overflow(limits))?;
+            let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+                .try_into()
+                .expect("the exact-byte scanner checked its fixed extent");
+            let candidates = classifier.classify_16(block).member_mask();
+            record_source(
+                accounting,
+                BYTE_SET_BLOCK_BYTES,
+                BYTE_SET_BLOCK_BYTES,
+                limits,
+            )?;
+            if candidates != 0 {
+                let offset = usize::try_from(candidates.trailing_zeros())
+                    .expect("a 16-bit candidate lane fits usize");
+                let candidate_position = position
+                    .checked_add(offset)
+                    .ok_or_else(|| accounting_overflow(limits))?;
+                charge(accounting, limits)?;
+                record_source(accounting, 1, 0, limits)?;
+                return Ok(Some(ScannedCandidate::ByteMember {
+                    position: candidate_position,
+                    byte: block[offset],
+                }));
+            }
+            position = block_end;
+        }
+
+        while position < end {
+            if let Some(candidate) =
+                Self::scalar_byte_candidate(classifier, haystack, position, accounting, limits)?
             {
                 return Ok(Some(candidate));
             }
@@ -452,8 +572,9 @@ impl CandidateScanner {
         Ok(None)
     }
 
-    fn scalar_candidate(
-        &self,
+    fn scalar_ascii_candidate(
+        classifier: &AsciiByteSetClassifier,
+        unicode: bool,
         haystack: &[u8],
         position: usize,
         accounting: &mut Accounting,
@@ -461,16 +582,31 @@ impl CandidateScanner {
     ) -> Result<Option<ScannedCandidate>, Error> {
         charge(accounting, limits)?;
         let byte = haystack[position];
-        let decoded =
-            usize::from(matches!(self.mode, CandidateMode::ExactAsciiMembers) || byte.is_ascii());
+        let decoded = usize::from(!unicode || byte.is_ascii());
         record_source(accounting, 1, decoded, limits)?;
-        if self.classifier.set().contains(byte) {
-            return Ok(Some(ScannedCandidate::AsciiMember { position, byte }));
+        if classifier.set().contains(byte) {
+            return Ok(Some(ScannedCandidate::ByteMember { position, byte }));
         }
-        if matches!(self.mode, CandidateMode::UnicodeAsciiMemberOrNonAscii) && !byte.is_ascii() {
+        if unicode && !byte.is_ascii() {
             return Ok(Some(ScannedCandidate::NonAscii { position }));
         }
         Ok(None)
+    }
+
+    fn scalar_byte_candidate(
+        classifier: &ByteSetClassifier,
+        haystack: &[u8],
+        position: usize,
+        accounting: &mut Accounting,
+        limits: SearchLimits,
+    ) -> Result<Option<ScannedCandidate>, Error> {
+        charge(accounting, limits)?;
+        let byte = haystack[position];
+        record_source(accounting, 1, 1, limits)?;
+        Ok(classifier
+            .set()
+            .contains(byte)
+            .then_some(ScannedCandidate::ByteMember { position, byte }))
     }
 }
 
@@ -605,11 +741,32 @@ impl Inspection<'_> {
                             additional: 1,
                         },
                     })?;
-                Some(CandidateScanner {
+                Some(CandidateScanner::ExactAscii {
                     classifier,
                     nonmember_scanner,
-                    mode: CandidateMode::ExactAsciiMembers,
                 })
+            }
+            (Some(CandidateMode::ExactByteMembers), ClassMatcher::Bytes(words)) => {
+                if words[2] == 0 && words[3] == 0 {
+                    return Err(crate::BuildError::InternalInvariant(
+                        "full-byte candidate scanner retained an ASCII-only class",
+                    ));
+                }
+                let classifier = self
+                    .dispatch
+                    .byte_set_classifier(ByteSet256::from_words(*words), DispatchPolicy::Auto)
+                    .expect("automatic byte-set dispatch retains a scalar fallback");
+                let classifier =
+                    ExactBoxOrUsize::try_from_boxed(classifier).map_err(|error| match error {
+                        CopyError::LayoutOverflow => crate::BuildError::InternalInvariant(
+                            "bounded word-class byte-set classifier owner layout overflowed",
+                        ),
+                        CopyError::AllocationFailed => crate::BuildError::AllocationFailed {
+                            structure: "bounded word-class byte-set classifier owner",
+                            additional: 1,
+                        },
+                    })?;
+                Some(CandidateScanner::ExactBytes { classifier })
             }
             (
                 Some(CandidateMode::UnicodeAsciiMemberOrNonAscii),
@@ -622,12 +779,7 @@ impl Inspection<'_> {
                         DispatchPolicy::Auto,
                     )
                     .expect("automatic ASCII classifier dispatch retains a scalar fallback");
-                Some(CandidateScanner {
-                    classifier,
-                    nonmember_scanner: ExactBoxOrUsize::try_from_usize(0)
-                        .expect("zero is an exactly representable inline scanner tag"),
-                    mode: CandidateMode::UnicodeAsciiMemberOrNonAscii,
-                })
+                Some(CandidateScanner::Unicode { classifier })
             }
             (Some(_), _) => {
                 return Err(crate::BuildError::InternalInvariant(
@@ -877,7 +1029,7 @@ impl Plan {
                 return Ok(None);
             };
             match candidate {
-                ScannedCandidate::AsciiMember { position, byte } => {
+                ScannedCandidate::ByteMember { position, byte } => {
                     return Ok(Some((position, 1, is_ascii_word(byte))));
                 }
                 ScannedCandidate::NonAscii {
@@ -1125,12 +1277,13 @@ pub(crate) fn inspect(
                 )?;
                 charge_build(&mut work, range_count, max_planner_work)?;
                 charge_build(&mut work, members, max_planner_work)?;
-                if !ascii_only {
-                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
-                }
                 (
                     InspectedClass::Bytes(class),
-                    Some(CandidateMode::ExactAsciiMembers),
+                    Some(if ascii_only {
+                        CandidateMode::ExactAsciiMembers
+                    } else {
+                        CandidateMode::ExactByteMembers
+                    }),
                 )
             }
             (BoundaryMode::Unicode, HirKind::Class(Class::Unicode(class))) => {
@@ -1171,13 +1324,24 @@ pub(crate) fn inspect(
                 return Ok(InspectionOutcome::Ineligible { planner_work: work });
             }
         };
-    if candidate_mode.is_some() {
-        charge_build(
-            &mut work,
-            u64::try_from(ASCII_CLASSIFIER_BUILD_WORK)
-                .map_err(|_| InspectionError::ArithmeticOverflow("ASCII classifier work"))?,
-            max_planner_work,
-        )?;
+    match candidate_mode {
+        Some(CandidateMode::ExactAsciiMembers | CandidateMode::UnicodeAsciiMemberOrNonAscii) => {
+            charge_build(
+                &mut work,
+                u64::try_from(ASCII_CLASSIFIER_BUILD_WORK)
+                    .map_err(|_| InspectionError::ArithmeticOverflow("ASCII classifier work"))?,
+                max_planner_work,
+            )?;
+        }
+        Some(CandidateMode::ExactByteMembers) => {
+            charge_build(
+                &mut work,
+                u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK)
+                    .map_err(|_| InspectionError::ArithmeticOverflow("byte-set classifier work"))?,
+                max_planner_work,
+            )?;
+        }
+        None => {}
     }
     if candidate_mode == Some(CandidateMode::ExactAsciiMembers) {
         charge_build(
@@ -1202,9 +1366,16 @@ pub(crate) fn inspect(
         .ok_or(InspectionError::ArithmeticOverflow(
             "bounded word-class run-scanner storage",
         ))?;
+    let byte_classifier_bytes =
+        usize::from(candidate_mode == Some(CandidateMode::ExactByteMembers))
+            .checked_mul(core::mem::size_of::<ByteSetClassifier>())
+            .ok_or(InspectionError::ArithmeticOverflow(
+                "bounded word-class byte-set classifier storage",
+            ))?;
     let storage_bytes = core::mem::size_of::<Plan>()
         .checked_add(range_bytes)
         .and_then(|bytes| bytes.checked_add(run_scanner_bytes))
+        .and_then(|bytes| bytes.checked_add(byte_classifier_bytes))
         .ok_or(InspectionError::ArithmeticOverflow(
             "bounded word-class plan storage",
         ))?;
@@ -1414,7 +1585,8 @@ mod tests {
 
     use super::{
         ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, BULK_SKIP_MIN_BYTES,
-        CandidateMode, InspectionError, InspectionOutcome, PLAN_ID, inspect,
+        BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSetClassifier, CandidateMode, CandidateScanner,
+        InspectionError, InspectionOutcome, PLAN_ID, inspect,
     };
     use crate::{
         BuildError, BuildLimits, PlanSelection, PortableBuilder, SearchLimits, SearchWindow,
@@ -1480,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn classifier_admission_build_work_and_high_byte_refusal_are_exact() {
+    fn classifier_admission_build_work_and_full_byte_ownership_are_exact() {
         let parse = |pattern: &str| {
             ParserBuilder::new()
                 .unicode(false)
@@ -1497,32 +1669,58 @@ mod tests {
         else {
             panic!("ASCII class should be eligible");
         };
-        let high = inspect(&high_hir, SimdDispatchContext::capture(), 0, u64::MAX)
-            .expect("high-byte inspection");
-        assert!(matches!(high, InspectionOutcome::Ineligible { .. }));
+        let InspectionOutcome::Eligible(high) =
+            inspect(&high_hir, SimdDispatchContext::capture(), 0, u64::MAX)
+                .expect("high-byte inspection")
+        else {
+            panic!("high-byte class should be eligible");
+        };
         assert_eq!(ascii.candidate_mode, Some(CandidateMode::ExactAsciiMembers));
+        assert_eq!(high.candidate_mode, Some(CandidateMode::ExactByteMembers));
         assert_eq!(
-            ascii.planner_work(),
-            high.planner_work()
-                .checked_add(u64::try_from(ASCII_CLASSIFIER_BUILD_WORK).unwrap())
+            ascii
+                .planner_work()
+                .checked_sub(u64::try_from(ASCII_CLASSIFIER_BUILD_WORK).unwrap())
                 .unwrap()
-                .checked_add(u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK).unwrap())
+                .checked_sub(u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK).unwrap())
+                .unwrap(),
+            high.planner_work()
+                .checked_sub(u64::try_from(BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap())
+                .unwrap()
+        );
+        assert_eq!(
+            ascii
+                .storage_bytes()
+                .checked_sub(core::mem::size_of::<super::AsciiByteSetRunScanner>())
+                .unwrap(),
+            high.storage_bytes()
+                .checked_sub(core::mem::size_of::<ByteSetClassifier>())
                 .unwrap()
         );
 
         let ascii = ascii.build().expect("ASCII plan");
-        assert!(
-            ascii
-                .candidate_scanner
-                .as_ref()
-                .is_some_and(|scanner| scanner.nonmember_scanner.boxed().is_some())
-        );
-        let high = PortableBuilder::new(r"(?-u:\b[\x80-\x81]{1,3}\b)")
+        assert!(matches!(
+            ascii.candidate_scanner.as_ref(),
+            Some(CandidateScanner::ExactAscii {
+                nonmember_scanner,
+                ..
+            }) if nonmember_scanner.boxed().is_some()
+        ));
+        let high = high.build().expect("high-byte plan");
+        assert!(matches!(
+            high.candidate_scanner.as_ref(),
+            Some(CandidateScanner::ExactBytes { classifier })
+                if classifier.boxed().is_some_and(|classifier| {
+                    classifier.set().contains(0x80) && classifier.set().contains(0x81)
+                })
+        ));
+
+        let facade = PortableBuilder::new(r"(?-u:\b[\x80-\x81]{1,3}\b)")
             .unicode(false)
             .plan_selection(PlanSelection::Auto)
             .build()
-            .expect("high-byte fallback plan");
-        assert_ne!(high.runtime_implementation_id(), PLAN_ID);
+            .expect("high-byte direct plan");
+        assert_eq!(facade.runtime_implementation_id(), PLAN_ID);
     }
 
     #[test]
@@ -1668,6 +1866,52 @@ mod tests {
                 limit: 46,
             })
         ));
+    }
+
+    #[test]
+    fn full_byte_crossover_and_absent_scan_have_exact_ledgers() {
+        let plan = plan(r"(?-u:\b[\x80-\x81]{1,3}\b)", false);
+        let absent = vec![0x90; 56];
+        let (matched, accounting) = plan
+            .find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits::unlimited(),
+            )
+            .expect("full-byte absent scan");
+        assert_eq!(matched, None);
+        assert_eq!(accounting.work(), 56);
+        assert_eq!(accounting.bytes_examined(), 56);
+        assert_eq!(accounting.scalars_decoded(), 56);
+        assert!(matches!(
+            plan.find_window(
+                &absent,
+                SearchWindow::full(&absent),
+                SearchLimits {
+                    max_work: 55,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Err(crate::UnicodeWordRunError::WorkLimitExceeded {
+                needed: 56,
+                limit: 55,
+            })
+        ));
+
+        let mut dense = absent;
+        dense[3] = 0x80;
+        dense[20] = 0x81;
+        dense[39] = 0x80;
+        assert_eq!(
+            plan.find_window(
+                &dense,
+                SearchWindow::full(&dense),
+                SearchLimits::unlimited(),
+            )
+            .expect("full-byte dense scan")
+            .0,
+            None
+        );
     }
 
     #[test]

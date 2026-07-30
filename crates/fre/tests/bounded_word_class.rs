@@ -7,7 +7,7 @@ use fre::{
 };
 use regex_automata::{Input, meta::Regex as MetaRegex, util::syntax};
 
-const PLAN_ID: &str = "bounded-word-class-linear-bulk-skip-v3";
+const PLAN_ID: &str = "bounded-word-class-linear-full-byte-v4";
 
 fn fre_regex(pattern: &str, unicode: bool) -> fre::PortableRegex {
     PortableBuilder::new(pattern)
@@ -168,8 +168,8 @@ fn bounded_ascii_and_unicode_classes_match_every_window() {
         (r"(?-u:\b[A-Za-z]{3,9}\b)", false, true),
         (r"(?-u:\b[A-F]{2,5}\b)", false, true),
         (r"(?-u:\b[A/_-]{2,5}\b)", false, true),
-        (r"(?-u:\b[^A-Za-z]{1,4}\b)", false, false),
-        (r"(?-u:\b[\x80-\xFFQ]{1,3}\b)", false, false),
+        (r"(?-u:\b[^A-Za-z]{1,4}\b)", false, true),
+        (r"(?-u:\b[\x80-\xFFQ]{1,3}\b)", false, true),
         (r"(?-u:\b[A-Z]{2,}\b)", false, true),
         (r"\b\p{L}{2,8}\b", true, true),
         (r"\b[\p{Greek}_-]{1,4}\b", true, true),
