@@ -21,6 +21,8 @@
   },
   "static_pipeline": {
     "source_commit": null,
+    "backend_name": null,
+    "backend_tag": null,
     "object_contract_schema": null,
     "compiler_identity": null,
     "object_formats": [
@@ -32,6 +34,10 @@
   "auto_routing": {
     "source_commit": null,
     "policy_identity": null,
+    "plan_identity": null,
+    "analyzer_identity": null,
+    "evidence_identity": null,
+    "family_selector": null,
     "minimum_literal_bytes": null,
     "maximum_literal_bytes": null,
     "minimum_window_bytes": null,
@@ -49,12 +55,14 @@
   },
   "platform_artifacts": {
     "macos_aarch64": {
+      "manifest_identity": null,
       "object_sha256": null,
       "linked_image_sha256": null,
       "symbol_receipt_sha256": null,
       "facade_receipt_sha256": null
     },
     "linux_aarch64": {
+      "manifest_identity": null,
       "object_sha256": null,
       "linked_image_sha256": null,
       "symbol_receipt_sha256": null,

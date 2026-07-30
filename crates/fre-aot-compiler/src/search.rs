@@ -25,6 +25,7 @@ use fre_aot_macho::{
     AbiKind, BindingIdentity, BindingIdentityError, BuiltObject, CompileIdentity, MetadataV1,
     ObjectError, ObjectIdentity, ObjectLimits, inspect_object,
 };
+use fre_aot_search_contract::SEARCH_BACKEND_ASIMD_TAG23_V1;
 use fre_jit_aarch64::{
     ArtifactIdentity, BackendVersion, CpuFeatures, EmitError, EmitLimits, ImageStats, NativeImage,
     SearchBackendPolicy, TargetSpec, emit_with_backend,
@@ -143,6 +144,7 @@ pub enum SearchManifestErrorV1 {
     LiteralPolicyExceedsHardLimit { limit: u64, requested: u64 },
     ZeroResultPersistentLimit,
     ZeroObservedStageScratchLimit,
+    UnsupportedCandidateBackendTag { requested: u16 },
     ArithmeticOverflow,
 }
 
@@ -245,6 +247,21 @@ impl<O: Operation> MacosAarch64ExactSearchManifestV1<O> {
     /// grant runtime or automatic-routing authority.
     pub fn v10_candidate(policy: SearchCompilePolicyV1) -> Result<Self, SearchManifestErrorV1> {
         Self::with_backend(policy, MacosAarch64SearchBackendV1::AsimdV10)
+    }
+
+    /// Construct a named candidate by its static-contract backend tag.
+    ///
+    /// This keeps evidence runners independent of Rust enum variant names.
+    /// A future reviewed backend can extend this closed mapping without
+    /// changing fixture or runner source.
+    pub fn candidate_backend_tag(
+        policy: SearchCompilePolicyV1,
+        backend_tag: u16,
+    ) -> Result<Self, SearchManifestErrorV1> {
+        match backend_tag {
+            SEARCH_BACKEND_ASIMD_TAG23_V1 => Self::v10_candidate(policy),
+            requested => Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag { requested }),
+        }
     }
 
     #[must_use]
@@ -1701,10 +1718,26 @@ mod tests {
             SearchCompilePolicyV1::default(),
         )
         .expect("V10 candidate manifest");
+        let tagged = MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG23_V1,
+        )
+        .expect("tag23 candidate manifest");
         assert_eq!(
             v10_manifest.backend(),
             MacosAarch64SearchBackendV1::AsimdV10
         );
+        assert_eq!(tagged.backend(), v10_manifest.backend());
+        assert_eq!(tagged.identity(), v10_manifest.identity());
+        assert!(matches!(
+            MacosAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+                SearchCompilePolicyV1::default(),
+                u16::MAX,
+            ),
+            Err(SearchManifestErrorV1::UnsupportedCandidateBackendTag {
+                requested: u16::MAX
+            })
+        ));
         assert_ne!(v10_manifest.identity(), v8_manifest.identity());
         assert_ne!(v10_manifest.identity(), v9_manifest.identity());
 

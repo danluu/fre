@@ -148,6 +148,8 @@ def validate(value: dict[str, Any]) -> list[str]:
         static,
         {
             "source_commit",
+            "backend_name",
+            "backend_tag",
             "object_contract_schema",
             "compiler_identity",
             "object_formats",
@@ -159,6 +161,14 @@ def validate(value: dict[str, Any]) -> list[str]:
         static.get("object_formats") == ["macho-aarch64", "elf-aarch64"],
         "static object-format matrix changed",
     )
+    require_optional_text(static["backend_name"], "static backend name is invalid")
+    if static["backend_tag"] is not None:
+        refuse(
+            isinstance(static["backend_tag"], int)
+            and not isinstance(static["backend_tag"], bool)
+            and 0 < static["backend_tag"] <= 0xFFFF,
+            "static backend tag is invalid",
+        )
     require_optional_commit(static["source_commit"], "static pipeline commit is invalid")
     require_optional_text(
         static["object_contract_schema"], "object contract schema is invalid"
@@ -173,6 +183,10 @@ def validate(value: dict[str, Any]) -> list[str]:
         {
             "source_commit",
             "policy_identity",
+            "plan_identity",
+            "analyzer_identity",
+            "evidence_identity",
+            "family_selector",
             "minimum_literal_bytes",
             "maximum_literal_bytes",
             "minimum_window_bytes",
@@ -182,7 +196,20 @@ def validate(value: dict[str, Any]) -> list[str]:
         "auto routing",
     )
     require_optional_commit(routing["source_commit"], "routing commit is invalid")
-    require_optional_sha(routing["policy_identity"], "routing policy identity is invalid")
+    for field in (
+        "policy_identity",
+        "plan_identity",
+        "analyzer_identity",
+        "evidence_identity",
+    ):
+        require_optional_sha(routing[field], f"routing {field} is invalid")
+    if routing["family_selector"] is not None:
+        refuse(
+            isinstance(routing["family_selector"], int)
+            and not isinstance(routing["family_selector"], bool)
+            and 0 <= routing["family_selector"] <= 0xFFFF,
+            "routing family selector is invalid",
+        )
     for field in (
         "minimum_literal_bytes",
         "maximum_literal_bytes",
@@ -229,6 +256,7 @@ def validate(value: dict[str, Any]) -> list[str]:
         exact_keys(
             require_object(raw, platform),
             {
+                "manifest_identity",
                 "object_sha256",
                 "linked_image_sha256",
                 "symbol_receipt_sha256",
@@ -236,8 +264,10 @@ def validate(value: dict[str, Any]) -> list[str]:
             },
             platform,
         )
-        for field in raw.values():
-            require_optional_sha(field, f"{platform} artifact SHA-256 is invalid")
+        for field, identity in raw.items():
+            require_optional_sha(
+                identity, f"{platform} artifact {field} SHA-256 is invalid"
+            )
     runner = require_object(value["runner"], "runner")
     exact_keys(
         runner,

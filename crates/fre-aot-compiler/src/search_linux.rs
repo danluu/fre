@@ -21,7 +21,7 @@ use fre_aot_elf::{
     inspect_search_object_v1,
 };
 use fre_aot_search_contract::{
-    ClaimedSearchMetadataV1, ClaimedStaticSearchSpanExpectationV1,
+    ClaimedSearchMetadataV1, ClaimedStaticSearchSpanExpectationV1, SEARCH_BACKEND_ASIMD_TAG23_V1,
     inspect_static_search_span_expectation_v1,
 };
 use fre_jit_aarch64::{
@@ -212,6 +212,7 @@ impl Default for LinuxAarch64SearchCompilePolicyV1 {
 pub enum LinuxSearchManifestErrorV1 {
     SourcePolicyExceedsHardLimit { limit: u64, requested: u64 },
     LiteralPolicyExceedsHardLimit { limit: u64, requested: u64 },
+    UnsupportedCandidateBackendTag { requested: u16 },
 }
 
 impl fmt::Display for LinuxSearchManifestErrorV1 {
@@ -286,6 +287,23 @@ impl<O: Operation> LinuxAarch64ExactSearchManifestV1<O> {
         policy: LinuxAarch64SearchCompilePolicyV1,
     ) -> Result<Self, LinuxSearchManifestErrorV1> {
         Self::new(policy, LinuxAarch64SearchBackendV1::AsimdV10)
+    }
+
+    /// Construct a named candidate by its static-contract backend tag.
+    ///
+    /// The external evidence runner can therefore carry the backend as sealed
+    /// data. Extending this closed mapping for a later reviewed backend does
+    /// not require fixture or runner changes.
+    pub fn candidate_backend_tag(
+        policy: LinuxAarch64SearchCompilePolicyV1,
+        backend_tag: u16,
+    ) -> Result<Self, LinuxSearchManifestErrorV1> {
+        match backend_tag {
+            SEARCH_BACKEND_ASIMD_TAG23_V1 => Self::v10_candidate(policy),
+            requested => {
+                Err(LinuxSearchManifestErrorV1::UnsupportedCandidateBackendTag { requested })
+            }
+        }
     }
 
     #[must_use]
@@ -1630,6 +1648,22 @@ mod tests {
             LinuxAarch64SearchCompilePolicyV1::default(),
         )
         .expect("V10 candidate manifest");
+        let tagged = LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+            LinuxAarch64SearchCompilePolicyV1::default(),
+            SEARCH_BACKEND_ASIMD_TAG23_V1,
+        )
+        .expect("tag23 candidate manifest");
+        assert_eq!(tagged.backend(), v10_manifest.backend());
+        assert_eq!(tagged.identity(), v10_manifest.identity());
+        assert!(matches!(
+            LinuxAarch64ExactSearchManifestV1::<Span>::candidate_backend_tag(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+                u16::MAX,
+            ),
+            Err(LinuxSearchManifestErrorV1::UnsupportedCandidateBackendTag {
+                requested: u16::MAX
+            })
+        ));
         let source = b"needle".to_vec();
         let v8 = plan_and_compile_linux_aarch64_exact_search_v1(
             v8_manifest,
