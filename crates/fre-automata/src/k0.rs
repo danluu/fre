@@ -42,8 +42,9 @@ const ASSERTION_KIND_COUNT: usize = 18;
 const CONTEXT_SYMBOL_BYTE_BITS: u32 = 9;
 const CONTEXT_INITIAL_BYTE: u32 = 256;
 const CONTEXT_TRANSITION_WAYS: usize = 4;
-const CONTEXT_TRANSITION_SLOTS: usize = LAZY_MAX_STATES * BYTE_ALPHABET;
-const CONTEXT_TRANSITION_BUCKETS: usize = CONTEXT_TRANSITION_SLOTS / CONTEXT_TRANSITION_WAYS;
+const CONTEXT_TRANSITION_MAX_SLOTS: usize = LAZY_MAX_STATES * BYTE_ALPHABET;
+const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
+    CONTEXT_TRANSITION_MAX_SLOTS / CONTEXT_TRANSITION_WAYS;
 const CONTEXT_EMPTY_SOURCE: u32 = u32::MAX;
 const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
 
@@ -93,13 +94,20 @@ impl ContextTransitionSlot {
 
 struct ContextTransitionStore {
     slots: Vec<ContextTransitionSlot>,
+    bucket_mask: usize,
 }
 
 impl fmt::Debug for ContextTransitionStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let buckets = if self.slots.is_empty() {
+            0
+        } else {
+            self.bucket_mask.saturating_add(1)
+        };
         formatter
             .debug_struct("ContextTransitionStore")
             .field("slots", &self.slots.len())
+            .field("buckets", &buckets)
             .field("occupied", &self.occupied_slots())
             .finish()
     }
@@ -107,13 +115,18 @@ impl fmt::Debug for ContextTransitionStore {
 
 impl ContextTransitionStore {
     fn new(slot_count: usize, total_bytes: usize) -> Result<Self, SearchError> {
+        let bucket_mask = contextual_transition_bucket_mask(slot_count)?;
         Ok(Self {
             slots: allocate_slots(slot_count, ContextTransitionSlot::EMPTY, total_bytes)?,
+            bucket_mask,
         })
     }
 
     const fn disabled() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            slots: Vec::new(),
+            bucket_mask: 0,
+        }
     }
 
     fn is_allocated(&self) -> bool {
@@ -138,13 +151,23 @@ impl ContextTransitionStore {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<(Option<u32>, Option<usize>), SearchError> {
-        if self.slots.len() != CONTEXT_TRANSITION_SLOTS {
+        let expected_slots = self
+            .bucket_mask
+            .checked_add(1)
+            .and_then(|buckets| buckets.checked_mul(CONTEXT_TRANSITION_WAYS))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual transition store shape",
+            })?;
+        if self.slots.is_empty()
+            || self.slots.len() != expected_slots
+            || self.slots.len() > CONTEXT_TRANSITION_MAX_SLOTS
+        {
             return Err(SearchError::InternalInvariant {
-                detail: "contextual transition store has an invalid fixed shape",
+                detail: "contextual transition store has an invalid bucket shape",
             });
         }
         meter.charge(1, position)?;
-        let bucket = contextual_transition_hash(source, symbol) & (CONTEXT_TRANSITION_BUCKETS - 1);
+        let bucket = contextual_transition_hash(source, symbol) & self.bucket_mask;
         let begin =
             bucket
                 .checked_mul(CONTEXT_TRANSITION_WAYS)
@@ -204,13 +227,61 @@ impl ContextTransitionStore {
     }
 }
 
+// Reserve one byte transition per exact potential lazy state, then round the
+// four-way bucket domain up for masking. The proof depends only on immutable
+// graph shape; a full bucket still executes through the bounded inline path.
+fn contextual_transition_slots(state_capacity: usize) -> Result<usize, SearchError> {
+    if state_capacity == 0 {
+        return Ok(0);
+    }
+    let bounded_states = state_capacity.min(LAZY_MAX_STATES);
+    let desired_slots =
+        bounded_states
+            .checked_mul(BYTE_ALPHABET)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual transition desired slots",
+            })?;
+    let desired_buckets = desired_slots.div_ceil(CONTEXT_TRANSITION_WAYS);
+    let bucket_count = desired_buckets
+        .checked_next_power_of_two()
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual transition bucket rounding",
+        })?
+        .min(CONTEXT_TRANSITION_MAX_BUCKETS);
+    bucket_count
+        .checked_mul(CONTEXT_TRANSITION_WAYS)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual transition slots",
+        })
+}
+
+fn contextual_transition_bucket_mask(slot_count: usize) -> Result<usize, SearchError> {
+    if slot_count == 0 {
+        return Ok(0);
+    }
+    if slot_count > CONTEXT_TRANSITION_MAX_SLOTS || slot_count % CONTEXT_TRANSITION_WAYS != 0 {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual transition store has an invalid slot count",
+        });
+    }
+    let bucket_count = slot_count / CONTEXT_TRANSITION_WAYS;
+    if !bucket_count.is_power_of_two() {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual transition store bucket count is not a power of two",
+        });
+    }
+    bucket_count
+        .checked_sub(1)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual transition store has no buckets",
+        })
+}
+
 fn contextual_transition_hash(source: u32, symbol: u32) -> usize {
     let key = u64::from(symbol) ^ (u64::from(source) << 32);
     let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let folded = (mixed ^ (mixed >> 32)) & u64::from(u32::MAX);
-    let bucket_mask =
-        u64::try_from(CONTEXT_TRANSITION_BUCKETS - 1).expect("context bucket mask fits u64");
-    usize::try_from(folded & bucket_mask).expect("masked context hash fits usize")
+    usize::try_from(folded).expect("folded context hash fits usize")
 }
 
 const fn contextual_symbol(byte: u32, assertions: u32) -> u32 {
@@ -329,7 +400,7 @@ impl WorkspaceLayout {
         };
         let lazy_context_slots =
             if lazy_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
-                CONTEXT_TRANSITION_SLOTS
+                contextual_transition_slots(lazy_state_capacity)?
             } else {
                 0
             };
@@ -341,7 +412,7 @@ impl WorkspaceLayout {
             };
         let reverse_context_slots =
             if reverse_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
-                CONTEXT_TRANSITION_SLOTS
+                contextual_transition_slots(reverse_state_capacity)?
             } else {
                 0
             };
@@ -6114,7 +6185,7 @@ mod tests {
 
     use super::{
         scratch_bytes, ContextTransitionSlot, WorkMeter, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
-        CONTEXT_INITIAL_SOURCE, CONTEXT_TRANSITION_SLOTS, INVOCATION_RESET_WORK,
+        CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
     };
     use crate::{
         plan::{
@@ -6461,6 +6532,33 @@ mod tests {
         .unwrap()
     }
 
+    fn asserted_line_three_classes() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 3, 4, 4],
+                edge_targets: vec![1, 2, 3, 4],
+                edge_kinds: vec![
+                    EdgeKind::AssertLineStartLf,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, b'a', b'c', b'e'],
+                byte_ends: vec![0, b'b', b'd', b'f'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn absolute_nullable_or_colon() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -6768,6 +6866,55 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn contextual_transition_slots_round_exact_state_domains_to_buckets() {
+        let cases = [
+            (0, 0),
+            (1, 256),
+            (2, 512),
+            (3, 1_024),
+            (4, 1_024),
+            (5, 2_048),
+            (8, 2_048),
+            (9, 4_096),
+            (16, 4_096),
+            (17, 8_192),
+            (32, 8_192),
+            (33, super::CONTEXT_TRANSITION_MAX_SLOTS),
+            (super::LAZY_MAX_STATES, super::CONTEXT_TRANSITION_MAX_SLOTS),
+            (
+                super::LAZY_MAX_STATES + 1,
+                super::CONTEXT_TRANSITION_MAX_SLOTS,
+            ),
+            (usize::MAX, super::CONTEXT_TRANSITION_MAX_SLOTS),
+        ];
+        for (state_capacity, expected_slots) in cases {
+            let slots = super::contextual_transition_slots(state_capacity).unwrap();
+            assert_eq!(slots, expected_slots, "state capacity {state_capacity}");
+            if slots != 0 {
+                let buckets = slots / super::CONTEXT_TRANSITION_WAYS;
+                assert!(buckets.is_power_of_two());
+                assert!(buckets <= super::CONTEXT_TRANSITION_MAX_BUCKETS);
+                assert_eq!(
+                    super::contextual_transition_bucket_mask(slots).unwrap(),
+                    buckets - 1
+                );
+            }
+        }
+        assert_eq!(super::contextual_transition_bucket_mask(0).unwrap(), 0);
+        for slots in [
+            1,
+            super::CONTEXT_TRANSITION_WAYS + 1,
+            super::CONTEXT_TRANSITION_WAYS * 3,
+            super::CONTEXT_TRANSITION_MAX_SLOTS + super::CONTEXT_TRANSITION_WAYS,
+        ] {
+            assert!(matches!(
+                super::contextual_transition_bucket_mask(slots),
+                Err(SearchError::InternalInvariant { .. })
+            ));
+        }
     }
 
     #[test]
@@ -7164,18 +7311,47 @@ mod tests {
         let full = contextual.bidirectional_workspace_layout().unwrap();
         assert_eq!(endpoint.lazy_state_capacity, 3);
         assert_eq!(endpoint.lazy_item_capacity, 2);
-        assert_eq!(endpoint.lazy_context_slots, CONTEXT_TRANSITION_SLOTS);
+        assert_eq!(endpoint.lazy_context_slots, 1_024);
         assert_eq!(full.reverse_state_capacity, 2);
         assert_eq!(full.reverse_item_capacity, 1);
-        assert_eq!(full.reverse_context_slots, CONTEXT_TRANSITION_SLOTS);
+        assert_eq!(full.reverse_context_slots, 512);
         let workspace =
             K0Workspace::new_bidirectional(&contextual, WorkspaceLimits::unlimited()).unwrap();
         assert!(workspace.lazy.rows.is_empty());
         assert!(workspace.reverse.rows.is_empty());
-        assert_eq!(workspace.lazy.context.slots.len(), CONTEXT_TRANSITION_SLOTS);
+        assert_eq!(workspace.lazy.context.slots.len(), 1_024);
+        assert_eq!(workspace.reverse.context.slots.len(), 512);
         assert_eq!(
-            workspace.reverse.context.slots.len(),
-            CONTEXT_TRANSITION_SLOTS
+            workspace.lazy.context.retained_bytes().unwrap(),
+            1_024 * size_of::<ContextTransitionSlot>()
+        );
+        assert_eq!(
+            workspace.reverse.context.retained_bytes().unwrap(),
+            512 * size_of::<ContextTransitionSlot>()
+        );
+        assert_eq!(workspace.retained_bytes(), full.logical_bytes());
+        assert_eq!(
+            workspace.construction_accounting().allocated_bytes(),
+            full.logical_bytes()
+        );
+
+        let three_classes = asserted_line_three_classes();
+        assert_eq!(three_classes.stats().consuming_states(), 3);
+        assert_eq!(three_classes.stats().consuming_edges(), 3);
+        let endpoint = three_classes.accelerated_workspace_layout().unwrap();
+        let full = three_classes.bidirectional_workspace_layout().unwrap();
+        assert_eq!(endpoint.lazy_state_capacity, 31);
+        assert_eq!(endpoint.lazy_context_slots, 8_192);
+        assert_eq!(full.reverse_state_capacity, 16);
+        assert_eq!(full.reverse_context_slots, 4_096);
+        let workspace =
+            K0Workspace::new_bidirectional(&three_classes, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(workspace.lazy.context.slots.len(), 8_192);
+        assert_eq!(workspace.reverse.context.slots.len(), 4_096);
+        assert_eq!(workspace.retained_bytes(), full.logical_bytes());
+        assert_eq!(
+            workspace.construction_accounting().allocated_bytes(),
+            full.logical_bytes()
         );
     }
 
@@ -11141,6 +11317,8 @@ mod tests {
         let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
         let mut contextual =
             K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let forward_slots = contextual.lazy.context.slots.len();
+        let reverse_slots = contextual.reverse.context.slots.len();
         for slot in &mut contextual.lazy.context.slots {
             *slot = ContextTransitionSlot {
                 source: CONTEXT_INITIAL_SOURCE - 1,
@@ -11214,14 +11392,8 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            contextual.lazy.context.occupied_slots(),
-            CONTEXT_TRANSITION_SLOTS
-        );
-        assert_eq!(
-            contextual.reverse.context.occupied_slots(),
-            CONTEXT_TRANSITION_SLOTS
-        );
+        assert_eq!(contextual.lazy.context.occupied_slots(), forward_slots);
+        assert_eq!(contextual.reverse.context.occupied_slots(), reverse_slots);
     }
 
     #[test]
