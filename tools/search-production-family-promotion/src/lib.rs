@@ -1500,15 +1500,16 @@ fn validate_discovery_inventory(
     {
         return fail("discovery candidate/refusal counts are partial or inconsistent");
     }
-    let mut ordinals = BTreeSet::new();
+    let mut candidate_ordinals = BTreeSet::new();
     for candidate in &receipt.candidates {
         validate_discovery_literal(
             candidate.ordinal,
             &candidate.semantic_candidate_sha256,
             &candidate.literal_sha256,
             &candidate.literal_hex,
-            envelope,
-            &mut ordinals,
+            envelope.minimum_literal_bytes,
+            envelope.maximum_literal_bytes,
+            &mut candidate_ordinals,
         )?;
         for (label, digest) in [
             ("compile identity", &candidate.compile_identity),
@@ -1541,14 +1542,16 @@ fn validate_discovery_inventory(
             }
         }
     }
+    let mut refusal_ordinals = BTreeSet::new();
     for refusal in &receipt.refusals {
         validate_discovery_literal(
             refusal.ordinal,
             &refusal.semantic_candidate_sha256,
             &refusal.literal_sha256,
             &refusal.literal_hex,
-            envelope,
-            &mut ordinals,
+            1,
+            envelope.maximum_literal_bytes,
+            &mut refusal_ordinals,
         )?;
         decode_sha256(
             &refusal.compile_receipt_sha256,
@@ -1563,10 +1566,12 @@ fn validate_discovery_inventory(
             return fail("discovery refusal disposition or basename is not canonical");
         }
     }
-    if u64::try_from(ordinals.len()).ok() != Some(receipt.literal_disposition_count)
-        || (0..receipt.literal_disposition_count).any(|ordinal| !ordinals.contains(&ordinal))
+    if u64::try_from(candidate_ordinals.len()).ok() != Some(candidate_count)
+        || (0..candidate_count).any(|ordinal| !candidate_ordinals.contains(&ordinal))
+        || u64::try_from(refusal_ordinals.len()).ok() != Some(refusal_count)
+        || (0..refusal_count).any(|ordinal| !refusal_ordinals.contains(&ordinal))
     {
-        return fail("discovery literal dispositions do not cover exact ordinals");
+        return fail("discovery candidates or refusals do not cover exact local ordinals");
     }
     Ok(())
 }
@@ -1576,15 +1581,16 @@ fn validate_discovery_literal(
     semantic_candidate_sha256: &str,
     literal_sha256: &str,
     literal_hex: &str,
-    envelope: &PrivateEnvelope,
+    minimum_literal_bytes: u32,
+    maximum_literal_bytes: u32,
     ordinals: &mut BTreeSet<u64>,
 ) -> Result<()> {
     decode_sha256(semantic_candidate_sha256, "semantic candidate SHA-256")?;
     let literal = decode_hex_bytes(literal_hex, "discovery literal bytes")?;
     let literal_len = u32::try_from(literal.len())
         .map_err(|_| PromotionError::new("discovery literal length exceeds u32"))?;
-    if literal_len < envelope.minimum_literal_bytes
-        || literal_len > envelope.maximum_literal_bytes
+    if literal_len < minimum_literal_bytes
+        || literal_len > maximum_literal_bytes
         || decode_sha256(literal_sha256, "discovery literal SHA-256")? != sha256(&literal)
         || !ordinals.insert(ordinal)
     {
@@ -3159,7 +3165,7 @@ mod tests {
             _ => panic!("unsupported synthetic target"),
         };
         let candidate_literal = b"abcdef";
-        let refusal_literal = b"ghijkl";
+        let refusal_literal = b"ghij";
         json_bytes(&json!({
             "schema": BUILD_RECEIPT_SCHEMA,
             "identity_sha256": digest_text(b"synthetic-discovery-identity"),
@@ -3223,11 +3229,11 @@ mod tests {
                 "glue_symbol": "fre_glue",
             }],
             "refusals": [{
-                "ordinal": 1,
+                "ordinal": 0,
                 "semantic_candidate_sha256": digest_text(b"synthetic-refusal-semantic"),
                 "literal_sha256": hex(&sha256(refusal_literal)),
                 "literal_hex": hex(refusal_literal),
-                "disposition": "compile-refused",
+                "disposition": "structural-refusal",
                 "compile_receipt_sha256": digest_text(b"synthetic-refusal-receipt"),
                 "compile_receipt_basename": "refusal-receipt.json",
             }],
