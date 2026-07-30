@@ -11272,6 +11272,699 @@ fn v22_every_width_and_window_shape_matches_the_kir_oracle() {
     assert_eq!(comparisons, 1_296);
 }
 
+fn v23_pointer_test_literal(width: usize, zero_primary: bool) -> Vec<u8> {
+    assert!((6..=MAX_REPEATED_CONFIRM_BYTES).contains(&width));
+    let primary = if zero_primary { 0 } else { width - 1 };
+    let secondary = if zero_primary { width - 1 } else { 0 };
+    let mut literal = vec![b'e'; width];
+    literal[primary] = 0x1f;
+    literal[secondary] = 0x1e;
+    literal
+}
+
+fn v23_direct_target(index: usize, instruction: DecodedInstruction) -> Option<usize> {
+    if !matches!(
+        instruction,
+        DecodedInstruction::Branch { .. }
+            | DecodedInstruction::BranchCondition { .. }
+            | DecodedInstruction::CompareBranchZero64 { .. }
+    ) {
+        return None;
+    }
+    let displacement = i64::from(instruction.direct_displacement()?);
+    let byte_index = i64::try_from(index).ok()?.checked_mul(4)?;
+    let target = byte_index.checked_add(displacement)?;
+    if target < 0 || target % 4 != 0 {
+        return None;
+    }
+    usize::try_from(target / 4).ok()
+}
+
+fn v23_without_direct_displacement(instruction: DecodedInstruction) -> DecodedInstruction {
+    match instruction {
+        DecodedInstruction::Branch { .. } => DecodedInstruction::Branch { displacement: 0 },
+        DecodedInstruction::BranchCondition { condition, .. } => {
+            DecodedInstruction::BranchCondition {
+                condition,
+                displacement: 0,
+            }
+        }
+        DecodedInstruction::CompareBranchZero64 {
+            register, nonzero, ..
+        } => DecodedInstruction::CompareBranchZero64 {
+            register,
+            nonzero,
+            displacement: 0,
+        },
+        instruction => instruction,
+    }
+}
+
+fn v23_cfg_reaches(
+    decoded: &[DecodedInstruction],
+    start: usize,
+    goal: usize,
+    blocked: Option<usize>,
+) -> bool {
+    let mut pending = vec![start];
+    let mut visited = vec![false; decoded.len()];
+    while let Some(index) = pending.pop() {
+        if index >= decoded.len() || Some(index) == blocked || visited[index] {
+            continue;
+        }
+        if index == goal {
+            return true;
+        }
+        visited[index] = true;
+        match decoded[index] {
+            DecodedInstruction::Branch { .. } => {
+                if let Some(target) = v23_direct_target(index, decoded[index]) {
+                    pending.push(target);
+                }
+            }
+            DecodedInstruction::BranchCondition { .. }
+            | DecodedInstruction::CompareBranchZero64 { .. } => {
+                if let Some(target) = v23_direct_target(index, decoded[index]) {
+                    pending.push(target);
+                }
+                pending.push(index + 1);
+            }
+            DecodedInstruction::Return => {}
+            _ => pending.push(index + 1),
+        }
+    }
+    false
+}
+
+#[test]
+fn v23_policy_version_wire_and_output_contracts_are_explicit() {
+    let literal = v23_pointer_test_literal(13, false);
+    let span =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V23 Span IR");
+    assert_eq!(
+        SearchBackendPolicy::AsimdV23.backend_version(),
+        BackendVersion::SEARCH_V23
+    );
+    let selected = emit_with_backend(&span, SearchBackendPolicy::AsimdV23, EmitLimits::default())
+        .expect("policy-selected V23 image");
+    assert_eq!(
+        selected,
+        emit_search_version_for_test(&span, EmitLimits::default(), BackendVersion::SEARCH_V23,)
+            .expect("version-selected V23 image")
+    );
+
+    let exists =
+        build_exact_literal::<Exists>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V23 Exists IR");
+    let selected_end = build_exact_literal::<SelectedEnd>(
+        &literal,
+        AnchorFlags::default(),
+        ValidateLimits::default(),
+    )
+    .expect("V23 SelectedEnd IR");
+    for (output, image) in [
+        (
+            OutputKind::Exists,
+            emit_with_backend(
+                &exists,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 Exists image"),
+        ),
+        (
+            OutputKind::SelectedEnd,
+            emit_with_backend(
+                &selected_end,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 SelectedEnd image"),
+        ),
+        (OutputKind::Span, selected.clone()),
+    ] {
+        assert_eq!(image.backend_version(), BackendVersion::SEARCH_V23);
+        assert_eq!(
+            image.search_manifest().expect("V23 manifest").output,
+            output
+        );
+        let report = audit(&image).expect("whole-template V23 audit");
+        assert_eq!(
+            (report.decode_passes, report.source_identity_rebuilds),
+            (1, 1)
+        );
+        assert!(image.code().len() <= 3_072);
+        let aot = image.to_aot(AotLimits::default()).expect("bounded V23 AOT");
+        assert_eq!(&aot.as_bytes()[..8], b"FREA64\0\x24");
+        assert_eq!(aot.identity(), image.artifact_identity());
+    }
+
+    let v22 = emit_with_backend(&span, SearchBackendPolicy::AsimdV22, EmitLimits::default())
+        .expect("frozen V22 image");
+    assert_ne!(selected.artifact_identity(), v22.artifact_identity());
+
+    let mut v23_as_v22 = selected.clone();
+    v23_as_v22.backend_version = BackendVersion::SEARCH_V22;
+    v23_as_v22
+        .search
+        .as_mut()
+        .expect("V23 manifest")
+        .backend_version = BackendVersion::SEARCH_V22;
+    assert_resealed_search_rejected(v23_as_v22, "V23 code resealed as V22");
+
+    let mut v22_as_v23 = v22;
+    v22_as_v23.backend_version = BackendVersion::SEARCH_V23;
+    v22_as_v23
+        .search
+        .as_mut()
+        .expect("V22 manifest")
+        .backend_version = BackendVersion::SEARCH_V23;
+    assert_resealed_search_rejected(v22_as_v23, "V22 code resealed as V23");
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the all-width decoded V23 proof keeps pointer setup, both reconstructions, X13 liveness, CFG dominance, and the frozen V22 suffix adjacent"
+)]
+fn v23_pointer_wide_cfg_and_x13_liveness_hold_for_every_width() {
+    let mut zero_primary_cases = 0_u64;
+    let mut nonzero_primary_cases = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for zero_primary in [true, false] {
+            let literal = v23_pointer_test_literal(width, zero_primary);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("V23 pointer CFG IR");
+            let v22 = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV22,
+                EmitLimits::default(),
+            )
+            .expect("frozen V22 CFG image");
+            let v23 = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV23,
+                EmitLimits::default(),
+            )
+            .expect("V23 pointer CFG image");
+            audit(&v23).expect("V23 pointer CFG audit");
+            assert!(v23.code().len() <= 3_072, "width={width}");
+            let manifest = v23.search_manifest().expect("V23 pointer CFG manifest");
+            assert_eq!(
+                manifest.primary_offset,
+                if zero_primary {
+                    zero_primary_cases += 1;
+                    0
+                } else {
+                    nonzero_primary_cases += 1;
+                    u16::try_from(width - 1).expect("bounded primary offset")
+                },
+                "width={width} zero_primary={zero_primary}"
+            );
+            let v22_manifest = v22.search_manifest().expect("V22 CFG manifest");
+            assert_eq!(
+                (
+                    manifest.primary_offset,
+                    manifest.secondary_offset,
+                    manifest.verification_offset,
+                    manifest.quaternary_offset,
+                    manifest.quinary_offset,
+                ),
+                (
+                    v22_manifest.primary_offset,
+                    v22_manifest.secondary_offset,
+                    v22_manifest.verification_offset,
+                    v22_manifest.quaternary_offset,
+                    v22_manifest.quinary_offset,
+                ),
+                "V23 retains the V22 gate width={width} zero_primary={zero_primary}"
+            );
+
+            let primary_offset = manifest.primary_offset;
+            let decoded = decode(v23.code()).expect("V23 pointer CFG decode");
+            let bound_setup = decoded
+                .iter()
+                .position(|instruction| {
+                    *instruction
+                        == DecodedInstruction::AddRegister64 {
+                            destination: 13,
+                            left: 9,
+                            right: 7,
+                        }
+                })
+                .expect("V23 X13 final-primary-pointer setup");
+            let after_bound = if primary_offset == 0 {
+                bound_setup + 1
+            } else {
+                assert_eq!(
+                    decoded[bound_setup + 1],
+                    DecodedInstruction::AddImmediate64 {
+                        destination: 13,
+                        source: 13,
+                        immediate: primary_offset,
+                    },
+                    "width={width}"
+                );
+                bound_setup + 2
+            };
+            let wide = decoded[after_bound..]
+                .iter()
+                .position(|instruction| {
+                    *instruction
+                        == DecodedInstruction::LoadVectorPair128 {
+                            first_destination: 0,
+                            second_destination: 2,
+                            base: 15,
+                            offset: 0,
+                        }
+                })
+                .map(|offset| after_bound + offset)
+                .expect("V23 primary-wide entry");
+            assert!(
+                decoded[after_bound..wide]
+                    .iter()
+                    .all(|instruction| instruction.written_gpr() != Some(13)),
+                "X13 remains the final pointer before wide entry width={width}"
+            );
+
+            let learn_select = decoded[wide..]
+                .windows(2)
+                .position(|window| {
+                    window
+                        == [
+                            DecodedInstruction::MoveRegister64 {
+                                destination: 7,
+                                source: 5,
+                            },
+                            DecodedInstruction::MoveZero64 {
+                                destination: 13,
+                                immediate: 0,
+                                shift: 0,
+                            },
+                        ]
+                })
+                .map(|offset| wide + offset)
+                .expect("V23 wide_learn_select");
+            let first_x13_clobber = decoded[after_bound..]
+                .iter()
+                .position(|instruction| instruction.written_gpr() == Some(13))
+                .map(|offset| after_bound + offset)
+                .expect("V23 post-setup X13 reuse");
+            assert_eq!(
+                first_x13_clobber,
+                learn_select + 1,
+                "wide_learn_select is the first X13 clobber width={width}"
+            );
+
+            let pointer_advance = decoded[wide..learn_select]
+                .windows(3)
+                .position(|window| {
+                    window[0]
+                        == DecodedInstruction::AddImmediate64 {
+                            destination: 15,
+                            source: 15,
+                            immediate: 64,
+                        }
+                        && window[1]
+                            == DecodedInstruction::CompareRegister64 {
+                                left: 15,
+                                right: 13,
+                            }
+                        && matches!(
+                            window[2],
+                            DecodedInstruction::BranchCondition {
+                                condition: Condition::LowerOrSame,
+                                ..
+                            }
+                        )
+                })
+                .map(|offset| wide + offset)
+                .expect("V23 primary-pointer advance");
+            assert_eq!(
+                v23_direct_target(pointer_advance + 2, decoded[pointer_advance + 2]),
+                Some(wide),
+                "V23 pointer bound backedge width={width}"
+            );
+            assert!(
+                !matches!(
+                    decoded[pointer_advance.saturating_sub(1)],
+                    DecodedInstruction::AddImmediate64 {
+                        destination: 5,
+                        source: 5,
+                        immediate: 64,
+                    }
+                ),
+                "the primary-empty steady state removes the V22 X5 add width={width}"
+            );
+
+            let reconstructions = decoded[..learn_select]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instruction)| {
+                    (*instruction
+                        == DecodedInstruction::SubtractRegister64 {
+                            destination: 5,
+                            left: 15,
+                            right: 9,
+                        })
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reconstructions.len(),
+                2,
+                "one exhaustion and one primary-hit reconstruction width={width}"
+            );
+            let exhaustion_reconstruction = pointer_advance + 3;
+            assert!(
+                reconstructions.contains(&exhaustion_reconstruction),
+                "wide exhaustion reconstructs X5 width={width}"
+            );
+            let primary_hit_reconstruction = *reconstructions
+                .iter()
+                .find(|&&index| index != exhaustion_reconstruction)
+                .expect("V23 primary-hit reconstruction");
+            for &reconstruction in &reconstructions {
+                if primary_offset == 0 {
+                    assert_ne!(
+                        decoded.get(reconstruction + 1),
+                        Some(&DecodedInstruction::SubtractImmediate64 {
+                            destination: 5,
+                            source: 5,
+                            immediate: 0,
+                        }),
+                        "zero offset needs no immediate reconstruction width={width}"
+                    );
+                } else {
+                    assert_eq!(
+                        decoded[reconstruction + 1],
+                        DecodedInstruction::SubtractImmediate64 {
+                            destination: 5,
+                            source: 5,
+                            immediate: primary_offset,
+                        },
+                        "width={width}"
+                    );
+                }
+            }
+            let primary_hit_edge = (wide..pointer_advance)
+                .find(|&index| {
+                    v23_direct_target(index, decoded[index]) == Some(primary_hit_reconstruction)
+                })
+                .expect("V23 primary-hit edge");
+            assert!(
+                matches!(
+                    decoded[primary_hit_edge],
+                    DecodedInstruction::CompareBranchZero64 {
+                        register: 10,
+                        nonzero: true,
+                        ..
+                    }
+                ),
+                "primary presence reaches reconstruction width={width}"
+            );
+
+            let incoming_pointer_advances = decoded[..learn_select]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instruction)| {
+                    (v23_direct_target(index, *instruction) == Some(pointer_advance))
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                incoming_pointer_advances.len() >= 4,
+                "static-empty paths return to the pointer advance width={width}"
+            );
+            assert!(
+                incoming_pointer_advances
+                    .iter()
+                    .all(|&index| index > primary_hit_reconstruction),
+                "every static backedge is dominated by X5 reconstruction width={width}"
+            );
+            assert!(
+                v23_cfg_reaches(&decoded, 0, learn_select, None),
+                "wide learning is reachable width={width}"
+            );
+            assert!(
+                !v23_cfg_reaches(&decoded, 0, learn_select, Some(primary_hit_reconstruction),),
+                "primary-hit X5 reconstruction dominates wide learning width={width}"
+            );
+            assert!(
+                !v23_cfg_reaches(&decoded, learn_select, pointer_advance, None),
+                "learned state cannot return to pointer-only advance width={width}"
+            );
+
+            let v22_decoded = decode(v22.code()).expect("V22 suffix decode");
+            let v22_learn_select = v22_decoded
+                .windows(2)
+                .position(|window| {
+                    window
+                        == [
+                            DecodedInstruction::MoveRegister64 {
+                                destination: 7,
+                                source: 5,
+                            },
+                            DecodedInstruction::MoveZero64 {
+                                destination: 13,
+                                immediate: 0,
+                                shift: 0,
+                            },
+                        ]
+                })
+                .expect("V22 wide_learn_select");
+            assert_eq!(
+                decoded[learn_select..]
+                    .iter()
+                    .copied()
+                    .map(v23_without_direct_displacement)
+                    .collect::<Vec<_>>(),
+                v22_decoded[v22_learn_select..]
+                    .iter()
+                    .copied()
+                    .map(v23_without_direct_displacement)
+                    .collect::<Vec<_>>(),
+                "V23 retains the complete V22 learned and suffix graph width={width}"
+            );
+        }
+    }
+    assert_eq!(zero_primary_cases, 27);
+    assert_eq!(nonzero_primary_cases, 27);
+}
+
+#[test]
+fn v23_rejects_resealed_bound_advance_compare_and_both_reconstruction_mutations() {
+    let literal = v23_pointer_test_literal(13, false);
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V23 pointer mutation IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV23,
+        EmitLimits::default(),
+    )
+    .expect("V23 pointer mutation image");
+    let decoded = decode(image.code()).expect("V23 pointer mutation decode");
+    let learn_select = decoded
+        .windows(2)
+        .position(|window| {
+            window
+                == [
+                    DecodedInstruction::MoveRegister64 {
+                        destination: 7,
+                        source: 5,
+                    },
+                    DecodedInstruction::MoveZero64 {
+                        destination: 13,
+                        immediate: 0,
+                        shift: 0,
+                    },
+                ]
+        })
+        .expect("V23 mutation wide_learn_select");
+    let bound = decoded[..learn_select]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::AddRegister64 {
+                    destination: 13,
+                    left: 9,
+                    right: 7,
+                }
+        })
+        .expect("V23 mutation bound");
+    let advance = decoded[..learn_select]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::AddImmediate64 {
+                    destination: 15,
+                    source: 15,
+                    immediate: 64,
+                }
+        })
+        .expect("V23 mutation pointer advance");
+    let comparison = decoded[advance + 1..learn_select]
+        .iter()
+        .position(|instruction| {
+            *instruction
+                == DecodedInstruction::CompareRegister64 {
+                    left: 15,
+                    right: 13,
+                }
+        })
+        .map(|offset| advance + 1 + offset)
+        .expect("V23 mutation pointer comparison");
+    let reconstructions = decoded[..learn_select]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (*instruction
+                == DecodedInstruction::SubtractRegister64 {
+                    destination: 5,
+                    left: 15,
+                    right: 9,
+                })
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reconstructions.len(), 2);
+
+    let mut wrong_bound = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_bound,
+        bound,
+        DecodedInstruction::AddRegister64 {
+            destination: 13,
+            left: 9,
+            right: 6,
+        },
+    );
+    assert_resealed_search_rejected(wrong_bound, "V23 X13 bound source substitution");
+
+    let mut wrong_advance = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_advance,
+        advance,
+        DecodedInstruction::AddImmediate64 {
+            destination: 15,
+            source: 15,
+            immediate: 63,
+        },
+    );
+    assert_resealed_search_rejected(wrong_advance, "V23 pointer stride substitution");
+
+    let mut wrong_comparison = image.clone();
+    replace_test_decoded_at(
+        &mut wrong_comparison,
+        comparison,
+        DecodedInstruction::CompareRegister64 { left: 15, right: 7 },
+    );
+    assert_resealed_search_rejected(wrong_comparison, "V23 pointer bound substitution");
+
+    for (exit, reconstruction) in ["wide exhaustion", "primary hit"]
+        .into_iter()
+        .zip(reconstructions)
+    {
+        let mut wrong_reconstruction = image.clone();
+        replace_test_decoded_at(
+            &mut wrong_reconstruction,
+            reconstruction,
+            DecodedInstruction::SubtractRegister64 {
+                destination: 5,
+                left: 15,
+                right: 8,
+            },
+        );
+        assert_resealed_search_rejected(
+            wrong_reconstruction,
+            &format!("V23 {exit} reconstruction base substitution"),
+        );
+    }
+}
+
+#[test]
+fn v23_frozen_v22_aot_matrix_bytes_are_exact() {
+    fn gate_literal(topology: u8, width: usize) -> Vec<u8> {
+        match topology {
+            0 => (0..width)
+                .map(|offset| 33 + u8::try_from((17 * offset) % 64).expect("bounded"))
+                .collect(),
+            1 => {
+                let mut literal = vec![b'~'; width];
+                literal[..5].copy_from_slice(b"A3mQz");
+                literal
+            }
+            2 => {
+                let mut literal = vec![b'x'; width];
+                for (offset, byte) in [0, width / 4, width / 2, (3 * width) / 4, width - 1]
+                    .into_iter()
+                    .zip(*b"MNOPR")
+                {
+                    literal[offset] = byte;
+                }
+                literal
+            }
+            3 => {
+                const ALPHABET: &[u8; 16] = b"0123456789ABCDEF";
+                let mut state =
+                    0x9e37_79b9_7f4a_7c15_u64 ^ u64::try_from(width).expect("host width");
+                (0..width)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[usize::from(state.to_le_bytes()[0] & 15)]
+                    })
+                    .collect()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"FRE-V21-FROZEN-OLD-BACKEND-MATRIX-V1\0");
+    digest.update(BackendVersion::SEARCH_V22.0.to_le_bytes());
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        for topology in 0_u8..4 {
+            let literal = gate_literal(topology, width);
+            let program = build_exact_literal::<Span>(
+                &literal,
+                AnchorFlags::default(),
+                ValidateLimits::default(),
+            )
+            .expect("frozen V22 byte-identity IR");
+            let image = emit_with_backend(
+                &program,
+                SearchBackendPolicy::AsimdV22,
+                EmitLimits::default(),
+            )
+            .expect("frozen V22 byte-identity image");
+            audit(&image).expect("frozen V22 byte-identity audit");
+            let aot = image
+                .to_aot(AotLimits::default())
+                .expect("frozen V22 bounded AOT");
+            digest.update([topology]);
+            digest.update(u64::try_from(width).expect("width").to_le_bytes());
+            digest.update(
+                u64::try_from(aot.as_bytes().len())
+                    .expect("AOT length")
+                    .to_le_bytes(),
+            );
+            digest.update(aot.as_bytes());
+        }
+    }
+    assert_eq!(
+        format!("{:x}", digest.finalize()),
+        "54788961fbffa9c91b7fae92b91787b342ae8becebc65d579b521bcbba1fce67"
+    );
+}
+
 #[test]
 fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
     let literal = b"0123456789abcdef";
