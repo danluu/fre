@@ -1,0 +1,152 @@
+{
+  "schema": "fre.aot.search-tag30-qualification-runner-identity.v1",
+  "campaign_inputs": {
+    "contract_schema": "fre.aot.search-tag30-qualification-campaign-contract.v1",
+    "contract_sha256": null,
+    "prepared_inputs_schema": "fre.aot.search-tag30-prepared-inputs.v1",
+    "prepared_inputs_sha256": null,
+    "prepare_source_sha256": null,
+    "learned_freeze_sha256": "367ad3655ec2f70d4a8173f68df76013fdf32dd95e07d1ebeeedb14c580b817f",
+    "learned_generator_sha256": "63a32488f9ac108bcc6cc5b245c4bbaea59056703787c3f40244e7b62e0b203e",
+    "long_policy_freeze_sha256": "70123d2c2068d9260d3a8d3face867bc01f42dbd91e82a686bf06af11b0babbb",
+    "long_policy_derivation_sha256": "b8690387a15655da415466943ff93726b828146e7c849266aa35907203b03671",
+    "selector_contract_sha256": "38ca5ebc1b239b541afcf9eeb679bf8b156c8690e7422a96f69a9457a155daf0",
+    "projections": {
+      "universal_full": {
+        "schema": "fre.aot.search-tag30-learned-continuation-projection.v1",
+        "rows": 123424,
+        "projection_digest": "0326944c2c95dfd10740d2ea0a72c910dd1a03df8c16e3a2180391d069841480",
+        "file_sha256": null
+      },
+      "universal_timed": {
+        "schema": "fre.aot.search-tag30-learned-continuation-projection.v1",
+        "rows": 3078,
+        "projection_digest": "a92a59554188a82b6e7c49833dda599aa7d87014ae6815ba9fbe0f5502b31a4c",
+        "file_sha256": null
+      },
+      "long_policy_full": {
+        "schema": "fre.aot.search-tag30-long-input-policy-projection.v1",
+        "rows": 123424,
+        "projection_digest": "c912b402244ff9814fe6160f9f5a117d7b253af5ff35ee69a78a6250aae94561",
+        "file_sha256": null
+      },
+      "long_policy_timed": {
+        "schema": "fre.aot.search-tag30-long-input-policy-projection.v1",
+        "rows": 1458,
+        "projection_digest": "b3093f9fed70fd500852742d18994fce80d4a144cb9b9cbaac4ad0e7f84ccffd",
+        "file_sha256": null
+      }
+    }
+  },
+  "object_candidates": {
+    "manifest_schema": "fre.aot.search-tag30-qualification-object-candidates.v1",
+    "manifest_sha256": "2ba3659c13c0d40da9716bcace03a6e5fd8514bf9932b99f51116da57b1d308b",
+    "payload_sha256": "7363999204f52f66ae93f0c8087fba071e2fbd51eadf84f2e08e45eec06da54e",
+    "candidate_count": 808,
+    "source_construction": "canonical-byte-escaped-exact",
+    "candidate_domain_hex": "4652452d5345415243482d54414733302d5155414c494649434154494f4e2d43414e4449444154450001"
+  },
+  "literal_dispositions": {
+    "schema": "fre.aot.search-tag30-qualification-literal-dispositions.v1",
+    "sha256": "a2f2c15e38b21ab664117c2da3011a8059b7e8bf807b9f6fbc00c34ff1c6dcd1",
+    "payload_sha256": "abf60247a4a735435ac53be7c614691ae41563dbaf845f6ddb5e8e21e90fcbd0",
+    "literal_count": 922,
+    "eligible_literal_count": 808,
+    "ineligible_literal_count": 114
+  },
+  "emitter": {
+    "source_commit": null,
+    "backend": "AsimdV17",
+    "backend_tag": 30,
+    "aot_magic_hex": "465245413634001e",
+    "candidate_policy": 15,
+    "authorization": false,
+    "llvm": false
+  },
+  "static_pipeline": {
+    "source_commit": null,
+    "backend_name": "AsimdV17",
+    "backend_tag": 30,
+    "compiler_identity": null,
+    "object_formats": [
+      "macho-aarch64",
+      "elf-aarch64"
+    ],
+    "link_interface_schema": "fre.aot.search-span-family-qualification-final-image-glue.v1"
+  },
+  "auto_routing": {
+    "source_commit": null,
+    "policy_identity": "70123d2c2068d9260d3a8d3face867bc01f42dbd91e82a686bf06af11b0babbb",
+    "plan_identity": null,
+    "analyzer_identity": null,
+    "evidence_identity": null,
+    "family_selector": 13,
+    "minimum_literal_bytes": 6,
+    "maximum_literal_bytes": 32,
+    "minimum_window_bytes": 65536,
+    "portable_prefix_candidate_starts": 256,
+    "full_window_preflight_authoritative": true
+  },
+  "static_facade": {
+    "source_commit": null,
+    "source_set_sha256": null,
+    "abi": "fre-aot-static-search-span-v1",
+    "output": "Span",
+    "jit_publication": false,
+    "construction_in_steady_timing": false,
+    "link_adoption_in_steady_timing": false
+  },
+  "private_family": {
+    "source_path": "crates/fre-aot-static-runtime/src/search_support/private_rows.rs",
+    "source_sha256": null,
+    "promotion_state": null,
+    "discovery_authorization_schema": "fre.aot.search-tag30-qualification-discovery-authorization.v1",
+    "discovery_authorization_sha256": null,
+    "family_selector": 13,
+    "minimum_literal_bytes": 6,
+    "maximum_literal_bytes": 32,
+    "minimum_window_bytes": 65536,
+    "portable_prefix_candidate_starts": 256,
+    "evidence_identity_algorithm": "sha256",
+    "evidence_identity_domain_hex": "4652452d5345415243482d54414733302d5052452d524553554c542d43414d504149474e2d494e54454e540001",
+    "evidence_identity_raw_digest_order": [
+      "domain_bytes",
+      "campaign_contract_sha256",
+      "analyzer_source_sha256",
+      "discovery_authorization_file_sha256"
+    ]
+  },
+  "platform_artifacts": {
+    "macos_aarch64": {
+      "host_id": "local-apple-aarch64-asimd",
+      "manifest_identity": null,
+      "discovery_build_receipt_sha256": null
+    },
+    "linux_aarch64": {
+      "host_id": "zstd-eval-c9g-neoverse-v3-aarch64-asimd",
+      "manifest_identity": null,
+      "discovery_build_receipt_sha256": null
+    }
+  },
+  "runner": {
+    "source_commit": null,
+    "source_set_sha256": null,
+    "source_archive_sha256": null,
+    "analyzer_source_sha256": null,
+    "controller_source_sha256": null,
+    "prepare_source_sha256": null,
+    "identity_renderer_source_sha256": null,
+    "compiler_family": "rustc-1.93",
+    "fixture_oracle": "scalar-overlapping-leftmost",
+    "paired_order": "alternating",
+    "repetitions": 6,
+    "target_elapsed_ns": 440000000,
+    "minimum_elapsed_ns": 400000000,
+    "calibrate_both_variants": true
+  },
+  "state": {
+    "heldout_materialized": false,
+    "development_timing_permitted": false,
+    "blocker": "target-conditional selector-13 private family source promotion is unresolved"
+  }
+}
