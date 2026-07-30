@@ -71,7 +71,6 @@ impl Accounting {
 /// captures as transparent because the aggregate facade exposes whole-match
 /// values only. Every node, literal byte, range, repetition-role check and
 /// boundary comparison is charged before it is inspected.
-#[cfg(test)]
 pub(super) fn inspect(hir: &Hir, limit: usize) -> Result<InspectionOutcome<'_>, InspectionError> {
     inspect_attempt(hir, limit).map_err(AggregateInspectionAttemptError::into_source)
 }

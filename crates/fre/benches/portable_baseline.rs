@@ -123,6 +123,7 @@ fn compare_search(case: &Case) {
         PlanKind::PackedLiteralSet => "fre-packed-literal-set",
         PlanKind::LiteralSetDfa => "fre-literal-set-dfa",
         PlanKind::RequiredLiteral => "fre-required-literal",
+        PlanKind::LiteralClassRunLiteral => "fre-literal-class-run-literal",
         PlanKind::ForwardAnchored => "fre-forward-anchored",
         PlanKind::K0 => "fre-k0",
         PlanKind::UnicodeFoldedLiteral => "fre-unicode-folded-literal",

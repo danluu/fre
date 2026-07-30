@@ -401,6 +401,7 @@ const fn plan_tag(plan: PlanKind) -> u8 {
         PlanKind::K0 => 6,
         PlanKind::UnicodeWordRun => 7,
         PlanKind::UnicodeFoldedLiteral => 8,
+        PlanKind::LiteralClassRunLiteral => 9,
     }
 }
 

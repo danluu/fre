@@ -13,11 +13,12 @@ use crate::{
     FRE_V1_DIAGNOSTIC_NONE, FRE_V1_DIAGNOSTIC_PANIC, FRE_V1_FEATURE_EXISTS,
     FRE_V1_FEATURE_PLAN_INFO, FRE_V1_FEATURE_RUST_BYTES, FRE_V1_FEATURE_SELECTED_END,
     FRE_V1_FEATURE_SPAN, FRE_V1_FEATURE_THREAD_SAFE_REGEX, FRE_V1_FEATURES, FRE_V1_JIT_DENY,
-    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN,
-    FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR,
-    FRE_V1_STATUS_INVALID_ARGUMENT, FRE_V1_STATUS_INVALID_PATTERN_ENCODING,
-    FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH, FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC,
-    FRE_V1_STATUS_SEARCH_ERROR, FRE_V1_STATUS_STRUCT_TOO_SMALL, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
+    FRE_V1_PLAN_EXACT_LITERAL, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
+    FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN, FRE_V1_PROFILE_RUST_BYTES,
+    FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR, FRE_V1_STATUS_INVALID_ARGUMENT,
+    FRE_V1_STATUS_INVALID_PATTERN_ENCODING, FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH,
+    FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC, FRE_V1_STATUS_SEARCH_ERROR,
+    FRE_V1_STATUS_STRUCT_TOO_SMALL, FRE_V1_STATUS_UNSUPPORTED_CONFIG,
     FRE_V1_STATUS_UNSUPPORTED_PROFILE, FreV1AbiDescriptor, FreV1Config, FreV1Diagnostic,
     FreV1ExistsResult, FreV1Header, FreV1MatchResult, FreV1PlanInfo, FreV1Regex,
     FreV1SelectedEndResult, boundary,
@@ -75,6 +76,7 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
     assert_eq!(FRE_V1_PROFILE_RUST_BYTES, 1);
     assert_eq!(FRE_V1_JIT_DENY, 1);
     assert_eq!(FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, 8);
+    assert_eq!(FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, 9);
     assert_eq!(
         FRE_V1_FEATURES,
         FRE_V1_FEATURE_RUST_BYTES
@@ -264,6 +266,20 @@ fn unicode_word_run_has_a_stable_public_plan_tag() {
         FRE_V1_STATUS_OK
     );
     assert_eq!(plan.plan, FRE_V1_PLAN_UNICODE_WORD_RUN);
+    // SAFETY: transfers the sole live reference from compile.
+    assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+}
+
+#[test]
+fn literal_class_run_has_a_stable_public_plan_tag() {
+    let (regex, _) = compile(br"(?-u:ab[ \t]+cd)", FreV1Config::checked_default());
+    let mut plan = FreV1PlanInfo::caller_init();
+    // SAFETY: compile returned one live handle and plan is valid output storage.
+    assert_eq!(
+        unsafe { fre_v1_regex_plan(regex, &raw mut plan, ptr::null_mut()) },
+        FRE_V1_STATUS_OK
+    );
+    assert_eq!(plan.plan, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL);
     // SAFETY: transfers the sole live reference from compile.
     assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
 }

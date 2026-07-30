@@ -51,7 +51,7 @@ fn authenticated_bytes_source_api_inventory_has_no_silent_omissions() {
     assert_eq!(UPSTREAM_MISC_PATH, "tests/misc.rs");
     assert_eq!(UPSTREAM_MISC_SHA256.len(), 64);
     assert_eq!(UPSTREAM_API_IDS.len(), 23);
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 6);
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 7);
     assert_eq!(PORTABLE_REGEX_SET_EXPLAIN_SCHEMA_VERSION, 4);
 }
 
@@ -109,6 +109,13 @@ fn capture_name_metadata_matches_pinned_bytes_across_every_portable_plan() {
             r"(?P<word>\b(\w{2,})\b)",
             PlanKind::UnicodeWordRun,
             PortableBuilder::new(r"(?P<word>\b(\w{2,})\b)").build(),
+        ),
+        (
+            "(?P<run>ab([xy]+)cd)",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new("(?P<run>ab([xy]+)cd)")
+                .unicode(false)
+                .build(),
         ),
         (
             "(?P<outer>(?P<inner>ab)+)",
@@ -222,6 +229,11 @@ fn capture_cardinality_metadata_matches_pinned_bytes_across_every_portable_plan(
             PortableBuilder::new(r"\b\w{2,}\b").build(),
         ),
         (
+            "(ab[xy]+cd)",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new("(ab[xy]+cd)").unicode(false).build(),
+        ),
+        (
             "((?:ab)+)",
             PlanKind::K0,
             PortableBuilder::new("((?:ab)+)")
@@ -331,6 +343,13 @@ fn fresh_capture_location_buffers_match_pinned_bytes_metadata() {
             PortableBuilder::new(r"(?P<word>\b\w{2,}\b)").build(),
         ),
         (
+            "literal/class-run/literal",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new("(?P<run>ab[xy]+cd)")
+                .unicode(false)
+                .build(),
+        ),
+        (
             "generic K0",
             PlanKind::K0,
             PortableBuilder::new("((?:ab)+)")
@@ -406,6 +425,10 @@ fn capture_free_locations_read_matches_pinned_bytes_across_every_portable_plan()
             PortableBuilder::new(r"\A[a-z]+Z").unicode(false).build(),
         ),
         (true, PortableBuilder::new(r"\b\w{2,}\b").build()),
+        (
+            false,
+            PortableBuilder::new(r"ab[xy]+cd").unicode(false).build(),
+        ),
         (
             false,
             PortableBuilder::new("(?:ab)+")
@@ -588,6 +611,15 @@ fn match_offset_accessors_match_pinned_bytes_across_every_portable_plan() {
             PortableBuilder::new(r"\b\w{2,}\b").build(),
             regex::bytes::RegexBuilder::new(r"\b\w{2,}\b").build(),
             " \u{3B1}\u{3B2} ".as_bytes(),
+        ),
+        (
+            "literal/class-run/literal",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new(r"ab[xy]+cd").unicode(false).build(),
+            regex::bytes::RegexBuilder::new(r"ab[xy]+cd")
+                .unicode(false)
+                .build(),
+            b"\xFFabxyxcd".as_slice(),
         ),
         (
             "generic K0",
@@ -791,6 +823,11 @@ fn source_identity_survives_every_portable_plan_family() {
             PortableBuilder::new(r"\b\w{2,}\b").build(),
         ),
         (
+            "ab[xy]+cd",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new("ab[xy]+cd").unicode(false).build(),
+        ),
+        (
             "(?:ab)+",
             PlanKind::K0,
             PortableBuilder::new("(?:ab)+")
@@ -889,6 +926,15 @@ fn clone_matches_pinned_bytes_and_preserves_exact_plan_identity() {
             PortableBuilder::new(r"\b\w{2,}\b").build(),
             regex::bytes::RegexBuilder::new(r"\b\w{2,}\b").build(),
             " \u{3B1}\u{3B2} ".as_bytes(),
+        ),
+        (
+            "literal/class-run/literal",
+            PlanKind::LiteralClassRunLiteral,
+            PortableBuilder::new(r"ab[xy]+cd").unicode(false).build(),
+            regex::bytes::RegexBuilder::new(r"ab[xy]+cd")
+                .unicode(false)
+                .build(),
+            b"\xFFabxyxcd".as_slice(),
         ),
         (
             "automatic K0",

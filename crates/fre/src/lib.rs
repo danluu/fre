@@ -441,15 +441,17 @@ pub use fre_kernels::{
     LiteralClassRunLiteralBuildError, LiteralClassRunLiteralBuildLimits,
     LiteralClassRunLiteralOperationIdentity, LiteralClassRunLiteralReduceAccounting,
     LiteralClassRunLiteralReduceError, LiteralClassRunLiteralReduceLimits,
-    LiteralClassRunLiteralUpperBounds, ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
-    ORDERED_LITERAL_COUNT_PLAN_ID, ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
-    OrderedLiteralAggregateActualCounters, OrderedLiteralAggregateBuildAccounting,
-    OrderedLiteralAggregateBuildError, OrderedLiteralAggregateBuildLimits,
-    OrderedLiteralAggregateReduceError, OrderedLiteralAggregateReduceLimits,
-    OrderedLiteralAggregateUpperBounds, PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID,
-    PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, PACKED_ORDERED_LITERAL_COUNT_PLAN_ID,
-    PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID, PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID,
-    PREFIX_CLASS_ALTERNATION_PLAN_ID, PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
+    LiteralClassRunLiteralSearchAccounting, LiteralClassRunLiteralSearchError,
+    LiteralClassRunLiteralSearchLimits, LiteralClassRunLiteralUpperBounds,
+    ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID, ORDERED_LITERAL_COUNT_PLAN_ID,
+    ORDERED_LITERAL_SPAN_SUM_PLAN_ID, OrderedLiteralAggregateActualCounters,
+    OrderedLiteralAggregateBuildAccounting, OrderedLiteralAggregateBuildError,
+    OrderedLiteralAggregateBuildLimits, OrderedLiteralAggregateReduceError,
+    OrderedLiteralAggregateReduceLimits, OrderedLiteralAggregateUpperBounds,
+    PACKED_BOUNDED_PREFIX_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_AGGREGATE_ALGORITHM_ID,
+    PACKED_ORDERED_LITERAL_COUNT_PLAN_ID, PACKED_ORDERED_LITERAL_SPAN_SUM_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_COUNT_OPERATION_ID, PREFIX_CLASS_ALTERNATION_PLAN_ID,
+    PREFIX_CLASS_ALTERNATION_SPAN_SUM_OPERATION_ID,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ACCOUNTING_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_ALGORITHM_VERSION,
     PREFIX_CLASS_UNIFORM_PARTICIPATION_OPERATION_ID, PREFIX_CLASS_UNIFORM_PARTICIPATION_PLAN_ID,
@@ -547,9 +549,9 @@ use fre_kernels::{
     AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan,
     ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
     ForwardAnchoredPlan, ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError,
-    ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralError, LiteralPlan,
-    LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits, LiteralSetError,
-    LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
+    ForwardAnchoredSearchLimits, LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan,
+    LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
+    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
@@ -599,7 +601,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 6;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 7;
 
 /// Escapes all regular-expression meta characters in `pattern`.
 ///
@@ -629,6 +631,8 @@ pub struct BuildLimits {
     pub packed_literal_set: PackedLiteralSetBuildLimits,
     /// Proof-restricted `CLASS+ SUFFIX` construction limits.
     pub required_literal: RequiredLiteralBuildLimits,
+    /// Canonical `LITERAL? BYTE_CLASS+ LITERAL?` construction limits.
+    pub literal_class_run_literal: LiteralClassRunLiteralBuildLimits,
     /// Unique-boundary `\A CLASS+ SUFFIX (?:\z)?` construction limits.
     pub forward_anchored: ForwardAnchoredBuildLimits,
     /// Maximum checked planner traversal/copy work.
@@ -648,6 +652,7 @@ impl Default for BuildLimits {
             literal_set: LiteralSetBuildLimits::default(),
             packed_literal_set: PackedLiteralSetBuildLimits::default(),
             required_literal: RequiredLiteralBuildLimits::default(),
+            literal_class_run_literal: LiteralClassRunLiteralBuildLimits::default(),
             forward_anchored: ForwardAnchoredBuildLimits::default(),
             max_planner_work: 8_000_000,
             max_persistent_bytes: 268_435_456,
@@ -851,6 +856,8 @@ pub struct BuildReport {
     pub minimum_match_bytes: Option<usize>,
     /// Complete construction certificate for the proof-restricted plan.
     pub required_literal: Option<RequiredLiteralBuildAccounting>,
+    /// Complete construction certificate for the literal/class-run plan.
+    pub literal_class_run_literal: Option<LiteralClassRunLiteralBuildAccounting>,
     /// Complete construction certificate for the forward-boundary plan.
     pub forward_anchored: Option<ForwardAnchoredBuildAccounting>,
 }
@@ -866,6 +873,8 @@ pub enum PlanKind {
     LiteralSetDfa,
     /// Proof-restricted SIMD-aware `CLASS+ SUFFIX` kernel. This is not JIT.
     RequiredLiteral,
+    /// Canonical literal/class-run search backed by one native literal anchor.
+    LiteralClassRunLiteral,
     /// Absolute-start unique-boundary forward scan. This is not JIT.
     ForwardAnchored,
     /// Generic bounded portable prioritized automaton.
@@ -890,6 +899,8 @@ pub enum BuildError {
     LiteralSet(LiteralSetError),
     /// Required-literal proof or construction failure.
     RequiredLiteral(RequiredLiteralBuildError),
+    /// Literal/class-run proof revalidation or construction failure.
+    LiteralClassRunLiteral(LiteralClassRunLiteralBuildError),
     /// A forced required-literal request did not have the exact HIR shape.
     RequiredLiteralShape,
     /// Forward-anchored proof or construction failure.
@@ -969,6 +980,7 @@ impl BuildError {
                 _ => BuildFailureClass::InternalFailure,
             },
             Self::RequiredLiteral(error) => required_literal_failure_class(error),
+            Self::LiteralClassRunLiteral(error) => literal_class_run_literal_failure_class(error),
             Self::RequiredLiteralShape | Self::ForwardAnchoredShape => {
                 BuildFailureClass::Unsupported
             }
@@ -1004,6 +1016,37 @@ fn required_literal_failure_class(error: &RequiredLiteralBuildError) -> BuildFai
         | RequiredLiteralBuildError::ScratchLimit { .. }
         | RequiredLiteralBuildError::PersistentLimit { .. }
         | RequiredLiteralBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        _ => BuildFailureClass::InternalFailure,
+    }
+}
+
+fn literal_class_run_literal_failure_class(
+    error: &LiteralClassRunLiteralBuildError,
+) -> BuildFailureClass {
+    match error {
+        LiteralClassRunLiteralBuildError::LiteralBytesLimit { .. }
+        | LiteralClassRunLiteralBuildError::ClassRangesLimit { .. }
+        | LiteralClassRunLiteralBuildError::ClassMembersLimit { .. }
+        | LiteralClassRunLiteralBuildError::WorkLimit { .. }
+        | LiteralClassRunLiteralBuildError::ScratchLimit { .. }
+        | LiteralClassRunLiteralBuildError::PersistentLimit { .. }
+        | LiteralClassRunLiteralBuildError::PeakLimit { .. } => BuildFailureClass::ResourceLimit,
+        LiteralClassRunLiteralBuildError::MissingLiteralAnchor
+        | LiteralClassRunLiteralBuildError::EmptyPrefix
+        | LiteralClassRunLiteralBuildError::NonEmptyPrefixForCompleteAsciiWordRun
+        | LiteralClassRunLiteralBuildError::EmptySuffix
+        | LiteralClassRunLiteralBuildError::EmptyClass
+        | LiteralClassRunLiteralBuildError::NonCanonicalClass
+        | LiteralClassRunLiteralBuildError::PrefixBoundaryInClass
+        | LiteralClassRunLiteralBuildError::SuffixBoundaryInClass
+        | LiteralClassRunLiteralBuildError::InexactAsciiWordClass
+        | LiteralClassRunLiteralBuildError::SuffixByteOutsideAsciiWordClass => {
+            BuildFailureClass::Unsupported
+        }
+        LiteralClassRunLiteralBuildError::AllocationFailed { .. }
+        | LiteralClassRunLiteralBuildError::ArithmeticOverflow { .. } => {
+            BuildFailureClass::InternalFailure
+        }
         _ => BuildFailureClass::InternalFailure,
     }
 }
@@ -1079,6 +1122,9 @@ impl fmt::Display for BuildError {
             Self::RequiredLiteral(error) => {
                 write!(f, "required-literal construction failed: {error}")
             }
+            Self::LiteralClassRunLiteral(error) => {
+                write!(f, "literal/class-run construction failed: {error}")
+            }
             Self::RequiredLiteralShape => {
                 f.write_str("pattern is outside the forced required-literal HIR shape")
             }
@@ -1120,6 +1166,7 @@ impl std::error::Error for BuildError {
             Self::Literal(error) => Some(error),
             Self::LiteralSet(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
+            Self::LiteralClassRunLiteral(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::RequiredLiteralShape
             | Self::ForwardAnchoredShape
@@ -1175,6 +1222,12 @@ impl From<LiteralSetError> for BuildError {
 impl From<RequiredLiteralBuildError> for BuildError {
     fn from(value: RequiredLiteralBuildError) -> Self {
         Self::RequiredLiteral(value)
+    }
+}
+
+impl From<LiteralClassRunLiteralBuildError> for BuildError {
+    fn from(value: LiteralClassRunLiteralBuildError) -> Self {
+        Self::LiteralClassRunLiteral(value)
     }
 }
 
@@ -1370,6 +1423,8 @@ pub enum SearchAccounting {
     LiteralSetDfa(LiteralSetAccounting),
     /// Complete required-literal proof-bound and actual counters.
     RequiredLiteral(RequiredLiteralSearchAccounting),
+    /// Complete literal/class-run source-independent envelope and counters.
+    LiteralClassRunLiteral(LiteralClassRunLiteralSearchAccounting),
     /// Complete forward-boundary proof-bound and structural counters.
     ForwardAnchored(ForwardAnchoredSearchAccounting),
     /// Exact folded-scalar trie early-stop counters.
@@ -1392,6 +1447,7 @@ impl SearchAccounting {
             Self::PackedLiteralSet(_) => PlanKind::PackedLiteralSet,
             Self::LiteralSetDfa(_) => PlanKind::LiteralSetDfa,
             Self::RequiredLiteral(_) => PlanKind::RequiredLiteral,
+            Self::LiteralClassRunLiteral(_) => PlanKind::LiteralClassRunLiteral,
             Self::ForwardAnchored(_) => PlanKind::ForwardAnchored,
             Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
@@ -1413,6 +1469,7 @@ impl SearchAccounting {
                 u64::try_from(accounting.transitions_upper_bound).unwrap_or(u64::MAX)
             }
             Self::RequiredLiteral(accounting) => accounting.work_upper_bound,
+            Self::LiteralClassRunLiteral(accounting) => accounting.work_upper_bound,
             Self::ForwardAnchored(accounting) => accounting.work_upper_bound,
             Self::UnicodeFoldedLiteral(accounting) => {
                 u64::try_from(accounting.work).unwrap_or(u64::MAX)
@@ -1452,6 +1509,7 @@ pub enum SearchError {
     PackedLiteralSet(PackedLiteralSetError),
     LiteralSetDfa(LiteralSetError),
     RequiredLiteral(RequiredLiteralSearchError),
+    LiteralClassRunLiteral(LiteralClassRunLiteralSearchError),
     ForwardAnchored(ForwardAnchoredSearchError),
     UnicodeFoldedLiteral(UnicodeFoldedLiteralSearchError),
     UnicodeWordRun(UnicodeWordRunError),
@@ -1467,6 +1525,9 @@ impl fmt::Display for SearchError {
             }
             Self::LiteralSetDfa(error) => write!(f, "literal-set DFA search failed: {error}"),
             Self::RequiredLiteral(error) => write!(f, "required-literal search failed: {error}"),
+            Self::LiteralClassRunLiteral(error) => {
+                write!(f, "literal/class-run search failed: {error}")
+            }
             Self::ForwardAnchored(error) => {
                 write!(f, "forward-anchored search failed: {error}")
             }
@@ -1486,6 +1547,7 @@ impl std::error::Error for SearchError {
             Self::PackedLiteralSet(error) => Some(error),
             Self::LiteralSetDfa(error) => Some(error),
             Self::RequiredLiteral(error) => Some(error),
+            Self::LiteralClassRunLiteral(error) => Some(error),
             Self::ForwardAnchored(error) => Some(error),
             Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
@@ -1520,6 +1582,12 @@ impl From<LiteralSetError> for SearchError {
 impl From<RequiredLiteralSearchError> for SearchError {
     fn from(value: RequiredLiteralSearchError) -> Self {
         Self::RequiredLiteral(value)
+    }
+}
+
+impl From<LiteralClassRunLiteralSearchError> for SearchError {
+    fn from(value: LiteralClassRunLiteralSearchError) -> Self {
+        Self::LiteralClassRunLiteral(value)
     }
 }
 
@@ -2064,6 +2132,7 @@ impl PortableBuilder {
                     static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
+                    literal_class_run_literal: None,
                     forward_anchored: None,
                 }
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2128,6 +2197,7 @@ impl PortableBuilder {
                     static_captures_len,
                     minimum_match_bytes,
                     required_literal: None,
+                    literal_class_run_literal: None,
                     forward_anchored: None,
                 }
                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2243,6 +2313,7 @@ impl PortableBuilder {
                             static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
+                            literal_class_run_literal: None,
                             forward_anchored: Some(build),
                         }
                         .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2302,6 +2373,7 @@ impl PortableBuilder {
                                 static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: None,
+                                literal_class_run_literal: None,
                                 forward_anchored: Some(build),
                             }
                             .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2379,6 +2451,7 @@ impl PortableBuilder {
                                 static_captures_len,
                                 minimum_match_bytes,
                                 required_literal: Some(build),
+                                literal_class_run_literal: None,
                                 forward_anchored: None,
                             }
                             .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2393,11 +2466,120 @@ impl PortableBuilder {
         } else if self.selection == PlanSelection::ForceRequiredLiteral {
             return Err(BuildError::RequiredLiteralShape);
         }
+        let mut literal_class_run_work = required_work;
+        if self.selection == PlanSelection::Auto {
+            let remaining = self
+                .limits
+                .max_planner_work
+                .checked_sub(required_work)
+                .ok_or(BuildError::InternalInvariant(
+                    "required-literal planner work exceeded its enforced limit",
+                ))?;
+            let inspection_limit = usize::try_from(remaining).unwrap_or(usize::MAX);
+            let inspection = literal_class_run_literal::inspect(&rust.hir, inspection_limit)
+                .map_err(|error| match error {
+                    literal_class_run_literal::InspectionError::WorkLimit { needed, .. } => {
+                        let needed =
+                            required_work.saturating_add(u64::try_from(needed).unwrap_or(u64::MAX));
+                        BuildError::PlannerWorkLimit {
+                            needed,
+                            limit: self.limits.max_planner_work,
+                        }
+                    }
+                    literal_class_run_literal::InspectionError::Overflow => {
+                        BuildError::InternalInvariant(
+                            "literal/class-run inspection accounting overflowed",
+                        )
+                    }
+                })?;
+            let inspection_work = match inspection {
+                literal_class_run_literal::InspectionOutcome::Eligible(inspection) => {
+                    inspection.work
+                }
+                literal_class_run_literal::InspectionOutcome::Ineligible { work } => work,
+            };
+            literal_class_run_work = required_work
+                .checked_add(u64::try_from(inspection_work).map_err(|_| {
+                    BuildError::InternalInvariant("literal/class-run planner work does not fit u64")
+                })?)
+                .ok_or(BuildError::InternalInvariant(
+                    "cumulative literal/class-run planner work overflowed u64",
+                ))?;
+            if literal_class_run_work > self.limits.max_planner_work {
+                return Err(BuildError::PlannerWorkLimit {
+                    needed: literal_class_run_work,
+                    limit: self.limits.max_planner_work,
+                });
+            }
+            if let literal_class_run_literal::InspectionOutcome::Eligible(inspection) = inspection {
+                let ranges = || {
+                    inspection
+                        .class
+                        .ranges()
+                        .iter()
+                        .map(|range| (range.start(), range.end()))
+                };
+                let dispatch = SimdDispatchContext::capture();
+                let plan = match inspection.boundary_semantics {
+                    LiteralClassRunLiteralBoundarySemantics::Unguarded => {
+                        LiteralClassRunLiteralPlan::build_with_dispatch(
+                            dispatch,
+                            inspection.prefix,
+                            ranges(),
+                            inspection.suffix,
+                            self.limits.literal_class_run_literal,
+                        )
+                    }
+                    LiteralClassRunLiteralBoundarySemantics::CompleteAsciiWordRun => {
+                        LiteralClassRunLiteralPlan::build_complete_ascii_word_run_with_dispatch(
+                            dispatch,
+                            inspection.prefix,
+                            ranges(),
+                            inspection.suffix,
+                            self.limits.literal_class_run_literal,
+                        )
+                    }
+                }
+                .map_err(BuildError::LiteralClassRunLiteral)?;
+                let build = plan.build_accounting();
+                return Ok(PortableRegex {
+                    source,
+                    capture_names,
+                    line_total_grep_plan,
+                    plan: PortablePlan::LiteralClassRunLiteral(plan),
+                    profile: profile.clone(),
+                    limits: self.limits,
+                    selection: self.selection,
+                    report: BuildReport {
+                        profile: profile.clone(),
+                        admission,
+                        syntax,
+                        plan: PlanKind::LiteralClassRunLiteral,
+                        planner_work: literal_class_run_work,
+                        lowering: None,
+                        states: 0,
+                        edges: 0,
+                        plan_storage_bytes: build.persistent_bytes,
+                        source_storage_bytes,
+                        capture_name_storage_bytes,
+                        charged_persistent_bytes: 0,
+                        persistent_byte_limit: 0,
+                        captures_len,
+                        static_captures_len,
+                        minimum_match_bytes,
+                        required_literal: None,
+                        literal_class_run_literal: Some(build),
+                        forward_anchored: None,
+                    }
+                    .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                });
+            }
+        }
         let (finite_words, finite_work) = finite::extract(
             &rust.hir,
             self.limits.literal_set.max_patterns,
             self.limits.literal_set.max_pattern_bytes,
-            required_work,
+            literal_class_run_work,
             self.limits.max_planner_work,
             false,
             finite::GuardedFiniteBuildLimits::unlimited(),
@@ -2433,6 +2615,7 @@ impl PortableBuilder {
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
+                        literal_class_run_literal: None,
                         forward_anchored: None,
                     }
                     .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2469,6 +2652,7 @@ impl PortableBuilder {
                             static_captures_len,
                             minimum_match_bytes,
                             required_literal: None,
+                            literal_class_run_literal: None,
                             forward_anchored: None,
                         }
                         .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2502,6 +2686,7 @@ impl PortableBuilder {
                         static_captures_len,
                         minimum_match_bytes,
                         required_literal: None,
+                        literal_class_run_literal: None,
                         forward_anchored: None,
                     }
                     .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2591,6 +2776,7 @@ impl PortableBuilder {
                                     static_captures_len,
                                     minimum_match_bytes,
                                     required_literal: None,
+                                    literal_class_run_literal: None,
                                     forward_anchored: None,
                                 }
                                 .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2653,6 +2839,7 @@ impl PortableBuilder {
                 static_captures_len,
                 minimum_match_bytes,
                 required_literal: None,
+                literal_class_run_literal: None,
                 forward_anchored: None,
             }
             .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
@@ -2875,6 +3062,7 @@ enum PortablePlan {
     LiteralSetDfa(LiteralSetPlan),
     RequiredLiteral(RequiredLiteralPlan),
     DispatchedRequiredLiteral(DispatchedRequiredLiteralPlan),
+    LiteralClassRunLiteral(LiteralClassRunLiteralPlan),
     ForwardAnchored(ForwardAnchoredPlan),
     DispatchedForwardAnchored(DispatchedForwardAnchoredPlan),
     ForwardEndFixed(AbsoluteEndFixedPlan),
@@ -2893,6 +3081,7 @@ impl PortablePlan {
             Self::LiteralSetDfa(_) => "literal-set-dfa",
             Self::RequiredLiteral(required) => required.plan_id(),
             Self::DispatchedRequiredLiteral(required) => required.plan_id(),
+            Self::LiteralClassRunLiteral(_) => fre_kernels::LITERAL_CLASS_RUN_LITERAL_PLAN_ID,
             Self::ForwardAnchored(forward) => forward.plan_id(),
             Self::DispatchedForwardAnchored(forward) => forward.plan_id(),
             Self::ForwardEndFixed(fixed) => fixed.plan_id(),
@@ -3301,6 +3490,17 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
+                ))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -3429,6 +3629,14 @@ impl PortableRegex {
                     haystack,
                     LiteralWindow::new(window.start(), window.end()),
                     required_literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::LiteralClassRunLiteral(plan) => plan
+                .shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
                 )
                 .map(|(matched, _)| matched.is_some())
                 .map_err(SearchError::from),
@@ -3588,6 +3796,14 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::LiteralClassRunLiteral(accounting)))
+            }
             PortablePlan::ForwardAnchored(forward) => {
                 let literal_window = LiteralWindow::new(window.start(), window.end());
                 let (matched, accounting) = forward.find_window(
@@ -3712,6 +3928,14 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) =
+                    plan.find(haystack, literal_class_run_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
             PortablePlan::ForwardAnchored(forward) => {
@@ -3990,6 +4214,17 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::LiteralClassRunLiteral(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_class_run_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::LiteralClassRunLiteral(accounting),
                 ))
             }
             PortablePlan::ForwardAnchored(forward) => {
@@ -4931,6 +5166,14 @@ fn required_literal_limits(limits: SearchLimits) -> RequiredLiteralSearchLimits 
     }
 }
 
+fn literal_class_run_literal_limits(limits: SearchLimits) -> LiteralClassRunLiteralSearchLimits {
+    LiteralClassRunLiteralSearchLimits {
+        max_work_upper_bound: limits.max_work,
+        max_candidate_visits: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
+        max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
 fn forward_anchored_limits(limits: SearchLimits) -> ForwardAnchoredSearchLimits {
     ForwardAnchoredSearchLimits {
         max_work_upper_bound: limits.max_work,
@@ -5340,7 +5583,8 @@ mod tests {
             ))
         ));
 
-        // Auto mode declines those theorem shapes before selecting K0.
+        // The singleton repetition is canonicalized as a repeated literal,
+        // outside both direct byte-class plans, so Auto retains K0.
         let safe_fallback = PortableBuilder::new("b+aba")
             .unicode(false)
             .build()

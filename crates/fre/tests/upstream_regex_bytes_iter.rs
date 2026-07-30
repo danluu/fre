@@ -64,6 +64,7 @@ fn find_iter_matches_pinned_bytes_across_every_portable_plan() {
         b"",
         b"ab",
         b"abab",
+        b"--abxyxcd--abxcd--",
         b"xxfoobaz-alphaZ-Sherlock",
         " αβ ab 雪_42 ".as_bytes(),
         &[0xFF, b'a', b'b', b'Z', 0x80],
@@ -102,6 +103,7 @@ fn borrowed_find_iter_matches_pinned_bytes_across_every_portable_plan() {
         b"",
         b"ab",
         b"abab",
+        b"--abxyxcd--abxcd--",
         b"xxfoobaz-alphaZ-Sherlock",
         " αβ ab 雪_42 ".as_bytes(),
         &[0xFF, b'a', b'b', b'Z', 0x80],
@@ -197,7 +199,7 @@ fn borrowed_find_iter_preserves_limit_errors_workspace_and_fusion() {
     assert!(matches.next().is_none(), "terminal refusal must fuse");
 }
 
-fn differential_cases() -> [DifferentialCase; 8] {
+fn differential_cases() -> [DifferentialCase; 9] {
     [
         DifferentialCase {
             pattern: "ab",
@@ -240,6 +242,13 @@ fn differential_cases() -> [DifferentialCase; 8] {
             selection: PlanSelection::Auto,
             force_literal_set_dfa: false,
             expected_plan: PlanKind::UnicodeWordRun,
+        },
+        DifferentialCase {
+            pattern: r"ab[xy]+cd",
+            unicode: false,
+            selection: PlanSelection::Auto,
+            force_literal_set_dfa: false,
+            expected_plan: PlanKind::LiteralClassRunLiteral,
         },
         DifferentialCase {
             pattern: "(?:ab)+",

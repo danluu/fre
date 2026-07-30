@@ -347,7 +347,12 @@ pub use literal_class_run_literal::{
     ReduceError as LiteralClassRunLiteralReduceError,
     ReduceLimits as LiteralClassRunLiteralReduceLimits,
     ReduceUpperBounds as LiteralClassRunLiteralUpperBounds,
+    SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SEARCH_OPERATION_ID,
+    SHORTEST_SEARCH_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SHORTEST_SEARCH_OPERATION_ID,
     SPAN_SUM_OPERATION_ID as LITERAL_CLASS_RUN_LITERAL_SPAN_SUM_OPERATION_ID,
+    SearchAccounting as LiteralClassRunLiteralSearchAccounting,
+    SearchError as LiteralClassRunLiteralSearchError,
+    SearchLimits as LiteralClassRunLiteralSearchLimits,
     SpanSumResult as LiteralClassRunLiteralSpanSumResult,
 };
 

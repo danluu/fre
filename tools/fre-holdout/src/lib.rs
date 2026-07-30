@@ -1584,6 +1584,7 @@ fn plan_name(plan: PlanKind) -> &'static str {
         PlanKind::PackedLiteralSet => "packed-literal-set",
         PlanKind::LiteralSetDfa => "literal-set-dfa",
         PlanKind::RequiredLiteral => "required-literal",
+        PlanKind::LiteralClassRunLiteral => "literal-class-run-literal",
         PlanKind::ForwardAnchored => "forward-anchored",
         PlanKind::K0 => "k0",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal",

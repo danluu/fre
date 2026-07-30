@@ -171,6 +171,7 @@ fn emit(
         PlanKind::PackedLiteralSet => "packed-literal-set",
         PlanKind::LiteralSetDfa => "literal-set-dfa",
         PlanKind::RequiredLiteral => "required-literal-v1",
+        PlanKind::LiteralClassRunLiteral => "literal-class-run-literal-v1",
         PlanKind::ForwardAnchored => "anchored-class-suffix-forward-v1",
         PlanKind::K0 => "k0",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal-first-start-v1",
