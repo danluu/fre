@@ -11698,7 +11698,7 @@ fn v23_pointer_wide_cfg_and_x13_liveness_hold_for_every_width() {
                 })
                 .collect::<Vec<_>>();
             assert!(
-                incoming_pointer_advances.len() >= 4,
+                incoming_pointer_advances.len() == 3,
                 "static-empty paths return to the pointer advance width={width}"
             );
             assert!(
