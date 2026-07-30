@@ -25,7 +25,7 @@ Both Apple AArch64 and the C9g Neoverse-V3 host must independently pass:
 - candidate/portable geometric mean strictly below 0.80 overall and for every
   width, topology, window size, outcome, and learned-source kind;
 - no individual cell above 1.05; and
-- at least 80% strict paired wins.
+- at least 80% strict paired wins across the complete projection on each host.
 
 Each cell uses six alternating paired repetitions on one logical CPU, and each
 variant must run for at least 400 ms. The class grants no production authority
