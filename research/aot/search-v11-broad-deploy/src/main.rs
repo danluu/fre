@@ -34,6 +34,8 @@ const SCREEN_SIZES: [usize; 7] = [257, 1_021, 4_093, 16_381, 65_521, 262_139, 1_
 const SCREEN_ALIGNMENTS: [u8; 4] = [0, 1, 7, 15];
 const HEADER: &str = "schema,phase,seed,width,shape,size,scenario,alignment,window_start,window_end,repetition,order,engine,iterations,total_ns,ns_per_iter,checksum,semantic";
 const SCHEMA: &str = "fre-search-v12-broad-devscreen-v1";
+const SVE2_WIDTH16_SCHEMA: &str = "fre-search-v12-width16-sve2-devscreen-v1";
+const SVE2_WIDTH16_ENV: &str = "FRE_SEARCH_V12_SVE2_WIDTH16_COMPARE";
 const CHECKSUM_SEED: u64 = 0x243f_6a88_85a3_08d3;
 const MAX_CALIBRATION_ITERATIONS: usize = 1 << 30;
 const HYBRID_MIN_LITERAL_BYTES: usize = 2;
@@ -221,6 +223,35 @@ impl Engine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Sve2Width16Engine {
+    NativeV12,
+    NativeSve2Tag21,
+    HybridV12,
+    HybridSve2Tag21,
+    Portable,
+}
+
+impl Sve2Width16Engine {
+    const ALL: [Self; 5] = [
+        Self::NativeV12,
+        Self::NativeSve2Tag21,
+        Self::HybridV12,
+        Self::HybridSve2Tag21,
+        Self::Portable,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::NativeV12 => "native-v12-aot-code-tag25",
+            Self::NativeSve2Tag21 => "native-sve2-fixed16-aot-code-tag21",
+            Self::HybridV12 => "hybrid-portable256-v12-tag25-floor4093-width2",
+            Self::HybridSve2Tag21 => "hybrid-portable256-sve2-fixed16-tag21-floor4093-width2",
+            Self::Portable => "portable-memmem",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Fixture {
     storage: Vec<u8>,
@@ -263,6 +294,15 @@ fn main() -> Result<(), DynError> {
     let target_ns = u64::try_from(target_ms)?
         .checked_mul(1_000_000)
         .ok_or_else(|| invalid("target nanoseconds overflow"))?;
+    let sve2_width16_compare = match std::env::var_os(SVE2_WIDTH16_ENV) {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err(
+                invalid("FRE_SEARCH_V12_SVE2_WIDTH16_COMPARE must be absent or exactly 1").into(),
+            );
+        }
+    };
 
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
@@ -270,6 +310,9 @@ fn main() -> Result<(), DynError> {
     let mut ordinal = 0_usize;
     for &seed in phase.seeds() {
         for &width in &WIDTHS {
+            if sve2_width16_compare && width != 16 {
+                continue;
+            }
             for shape in Shape::ALL {
                 let literal = make_literal(seed, width, shape);
                 for &size in phase.sizes() {
@@ -284,16 +327,29 @@ fn main() -> Result<(), DynError> {
                         if !selected {
                             continue;
                         }
-                        run_case(
-                            &mut output,
-                            phase,
-                            seed,
-                            shape,
-                            size,
-                            scenario,
-                            &literal,
-                            target_ns,
-                        )?;
+                        if sve2_width16_compare {
+                            run_sve2_width16_case(
+                                &mut output,
+                                phase,
+                                seed,
+                                shape,
+                                size,
+                                scenario,
+                                &literal,
+                                target_ns,
+                            )?;
+                        } else {
+                            run_case(
+                                &mut output,
+                                phase,
+                                seed,
+                                shape,
+                                size,
+                                scenario,
+                                &literal,
+                                target_ns,
+                            )?;
+                        }
                     }
                 }
             }
@@ -301,6 +357,216 @@ fn main() -> Result<(), DynError> {
     }
     output.flush()?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sve2_width16_case(
+    output: &mut impl io::Write,
+    phase: Phase,
+    seed: u64,
+    shape: Shape,
+    size: usize,
+    scenario: Scenario,
+    literal: &[u8],
+    target_ns: u64,
+) -> Result<(), DynError> {
+    require(literal.len() == 16, "SVE2 comparison requires width 16")?;
+    let portable = LiteralPlan::new(literal, LiteralBuildLimits::default())?;
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())?;
+    let image_v12 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV12,
+        EmitLimits::default(),
+    )?;
+    let image_sve2 = emit_audited_with_backend(
+        &program,
+        SearchBackendPolicy::Sve2Fixed16V2,
+        EmitLimits::default(),
+    )?;
+    let primary_offset = first_candidate_primary_offset(image_v12.as_image().code())?;
+    let fixture = make_fixture(seed, size, scenario, literal, primary_offset)?;
+    let bytes = fixture.bytes();
+    let portable_window = PortableWindow::new(fixture.window_start, fixture.window_end);
+    let native_window = NativeWindow::new(fixture.window_start, fixture.window_end);
+    let kernel_v12 = publish_audited::<Span>(&image_v12, PublicationLimits::default())?;
+    let kernel_sve2 = publish_audited::<Span>(&image_sve2, PublicationLimits::default())?;
+    let session_v12 = kernel_v12.begin_current_thread_session()?;
+    let session_sve2 = kernel_sve2.begin_current_thread_session()?;
+
+    let expected = encode_portable(
+        portable
+            .find_window(bytes, portable_window, LiteralSearchLimits::unlimited())?
+            .0,
+    );
+    for engine in Sve2Width16Engine::ALL {
+        let actual = invoke_sve2_width16_engine(
+            engine,
+            &portable,
+            &session_v12,
+            &session_sve2,
+            bytes,
+            portable_window,
+            native_window,
+            literal.len(),
+        )?;
+        require(
+            expected == actual,
+            "V12/SVE2/hybrid/portable semantic mismatch before timing",
+        )?;
+    }
+
+    for _ in 0..3 {
+        for engine in Sve2Width16Engine::ALL {
+            black_box(invoke_sve2_width16_engine(
+                engine,
+                &portable,
+                &session_v12,
+                &session_sve2,
+                bytes,
+                portable_window,
+                native_window,
+                literal.len(),
+            )?);
+        }
+    }
+    let iterations = calibrate_sve2_width16(
+        &portable,
+        &session_v12,
+        &session_sve2,
+        bytes,
+        portable_window,
+        native_window,
+        literal.len(),
+        target_ns,
+        expected,
+    )?;
+    let scenario_name = scenario.name();
+    for repetition in 0..phase.repetitions() {
+        let mut order = Sve2Width16Engine::ALL;
+        let rotation = repetition % order.len();
+        order.rotate_left(rotation);
+        let order_name = order
+            .iter()
+            .map(|engine| engine.name())
+            .collect::<Vec<_>>()
+            .join("+");
+        for engine in order {
+            let measurement = measure(iterations, expected, || {
+                invoke_sve2_width16_engine(
+                    engine,
+                    &portable,
+                    &session_v12,
+                    &session_sve2,
+                    bytes,
+                    portable_window,
+                    native_window,
+                    literal.len(),
+                )
+            })?;
+            let ns_per_iter = measurement.total_ns as f64 / iterations as f64;
+            writeln!(
+                output,
+                "{SVE2_WIDTH16_SCHEMA},{},{seed:016x},{},{},{size},{scenario_name},{},{},{},{repetition},{order_name},{},{iterations},{},{ns_per_iter:.6},{:016x},{:016x}",
+                phase.name(),
+                literal.len(),
+                shape.name(),
+                scenario.alignment(),
+                fixture.window_start,
+                fixture.window_end,
+                engine.name(),
+                measurement.total_ns,
+                measurement.checksum,
+                measurement.semantic,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_sve2_width16_engine(
+    engine: Sve2Width16Engine,
+    portable: &LiteralPlan,
+    session_v12: &PublishedKernelThreadSession<'_, Span>,
+    session_sve2: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    portable_window: PortableWindow,
+    native_window: NativeWindow,
+    literal_bytes: usize,
+) -> Result<u64, DynError> {
+    match engine {
+        Sve2Width16Engine::NativeV12 => {
+            invoke_native(session_v12, haystack, native_window, literal_bytes)
+        }
+        Sve2Width16Engine::NativeSve2Tag21 => {
+            invoke_native(session_sve2, haystack, native_window, literal_bytes)
+        }
+        Sve2Width16Engine::HybridV12 => invoke_hybrid(
+            portable,
+            session_v12,
+            haystack,
+            native_window,
+            literal_bytes,
+        ),
+        Sve2Width16Engine::HybridSve2Tag21 => invoke_hybrid(
+            portable,
+            session_sve2,
+            haystack,
+            native_window,
+            literal_bytes,
+        ),
+        Sve2Width16Engine::Portable => invoke_portable(portable, haystack, portable_window),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn calibrate_sve2_width16(
+    portable: &LiteralPlan,
+    session_v12: &PublishedKernelThreadSession<'_, Span>,
+    session_sve2: &PublishedKernelThreadSession<'_, Span>,
+    haystack: &[u8],
+    portable_window: PortableWindow,
+    native_window: NativeWindow,
+    literal_bytes: usize,
+    target_ns: u64,
+    expected: u64,
+) -> Result<usize, DynError> {
+    let mut iterations = 1_usize;
+    loop {
+        let mut faster_ns = u64::MAX;
+        for engine in Sve2Width16Engine::ALL {
+            let measurement = measure(iterations, expected, || {
+                invoke_sve2_width16_engine(
+                    engine,
+                    portable,
+                    session_v12,
+                    session_sve2,
+                    haystack,
+                    portable_window,
+                    native_window,
+                    literal_bytes,
+                )
+            })?;
+            faster_ns = faster_ns.min(measurement.total_ns);
+        }
+        faster_ns = faster_ns.max(1);
+        if faster_ns >= target_ns / 4 || iterations == MAX_CALIBRATION_ITERATIONS {
+            let scale = target_ns
+                .checked_add(faster_ns - 1)
+                .ok_or_else(|| invalid("calibration rounding overflow"))?
+                / faster_ns;
+            let scale = usize::try_from(scale.max(1))?;
+            return Ok(iterations
+                .checked_mul(scale)
+                .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+                .min(MAX_CALIBRATION_ITERATIONS));
+        }
+        iterations = iterations
+            .checked_mul(8)
+            .unwrap_or(MAX_CALIBRATION_ITERATIONS)
+            .min(MAX_CALIBRATION_ITERATIONS);
+    }
 }
 
 fn scenarios(phase: Phase, width: usize) -> Vec<Scenario> {

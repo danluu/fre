@@ -64,3 +64,33 @@ absolute nanoseconds, with a predeclared 3ns median / 4ns p90 overhead cap.
 
 No result from this development binary is production authority or heldout
 evidence.
+
+## Linux SVE2 fixed-VL16 comparison
+
+On a Linux/AArch64 host that exposes OS-usable ASIMD, SVE, and SVE2 with
+`VL=16`, the same binary has a separate width-16 comparison mode:
+
+```sh
+FRE_SEARCH_V12_SVE2_WIDTH16_COMPARE=1 \
+  research/aot/search-v11-broad-deploy/target/release/fre-search-v11-broad-deploy \
+  screen 0 96 3 > width16-sve2-0.csv
+```
+
+This mode visits only width 16 but retains the exact four seeds, four shapes,
+seven sizes, base scenarios, alignments, and all 16 candidate-independent
+mutation offsets above. It measures five paired engines: direct V12/tag25,
+direct fixed-VL16 SVE2/tag21, each engine behind the identical portable-256
+prefix split, and portable `memmem`. Analyze a complete disjoint shard set
+with:
+
+```sh
+python3 research/aot/search-v11-broad-deploy/analyze_sve2_width16.py \
+  width16-sve2-*.csv > width16-sve2-analysis.json
+```
+
+The analyzer requires exactly 3,808 fixtures and 57,120 rows. Both tail
+engines independently face the long-scan, shape, size, required-scenario, and
+every-mutation-offset gates. SVE2 is preferred only if it clears every gate
+and has a stable deployable advantage; otherwise a qualified V12 route avoids
+adding an SVE2-only production fork. This development comparison cannot grant
+production authority.
