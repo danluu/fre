@@ -540,7 +540,7 @@ pub use text_set::{
     PortableTextRegexSetBuildError, PortableTextRegexSetBuildReport, PortableTextRegexSetBuilder,
 };
 
-use fre_automata::{Automaton, EarliestEnd, Exists, K0Workspace, SelectedEnd, Span};
+use fre_automata::{Automaton, EarliestEnd, Exists, K0SearchSession, SelectedEnd, Span};
 use fre_kernels::{
     AbsoluteEndFixedPlan, DispatchedForwardAnchoredPlan, DispatchedRequiredLiteralPlan,
     ForwardAnchoredBuildAccounting, ForwardAnchoredBuildError, ForwardAnchoredBuildLimits,
@@ -3017,36 +3017,17 @@ impl PortableRegex {
                 let assertion_free_nullable = self.report.minimum_match_bytes == Some(0)
                     && !automaton.stats().has_assertions();
                 let endpoint_eligible = positive || assertion_free_nullable;
-                let full_fits = bidirectional
-                    && positive
-                    && automaton
-                        .bidirectional_workspace_layout()
-                        .is_ok_and(|layout| {
-                            layout.construction_work() <= workspace_limits.max_setup_work
-                                && layout.logical_bytes() <= workspace_limits.max_scratch_bytes
-                        });
-                let endpoints_fit = endpoint_eligible
-                    && automaton
-                        .accelerated_workspace_layout()
-                        .is_ok_and(|layout| {
-                            layout.construction_work() <= workspace_limits.max_setup_work
-                                && layout.logical_bytes() <= workspace_limits.max_scratch_bytes
-                        });
                 // Select the optional cache from its source-free layout before
                 // allocating. Once accelerated construction begins, propagate
                 // every failure so a partial attempt cannot disappear from
                 // successful setup accounting.
-                let workspace = if full_fits {
-                    K0Workspace::new_bidirectional(automaton, workspace_limits)?
-                } else if endpoints_fit {
-                    K0Workspace::new_accelerated(automaton, workspace_limits)?
-                } else {
-                    K0Workspace::new(automaton, workspace_limits)?
-                };
-                PortableSearchSessionPlan::K0 {
+                let session = K0SearchSession::new_selected(
                     automaton,
-                    workspace,
-                }
+                    workspace_limits,
+                    endpoint_eligible,
+                    bidirectional && positive,
+                )?;
+                PortableSearchSessionPlan::K0 { session }
             }
             _ => PortableSearchSessionPlan::Native(self),
         };
@@ -4048,10 +4029,7 @@ pub struct PortableSearchSession<'a> {
 )]
 enum PortableSearchSessionPlan<'a> {
     Native(&'a PortableRegex),
-    K0 {
-        automaton: &'a Automaton,
-        workspace: K0Workspace,
-    },
+    K0 { session: K0SearchSession<'a> },
 }
 
 impl PortableSearchSession<'_> {
@@ -4072,9 +4050,7 @@ impl PortableSearchSession<'_> {
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         match &self.plan {
             PortableSearchSessionPlan::Native(_) => None,
-            PortableSearchSessionPlan::K0 { workspace, .. } => {
-                Some(workspace.construction_accounting())
-            }
+            PortableSearchSessionPlan::K0 { session } => Some(session.construction_accounting()),
         }
     }
 
@@ -4156,13 +4132,8 @@ impl PortableSearchSession<'_> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => {
-                let report = automaton
-                    .prepare::<Exists>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?;
+            PortableSearchSessionPlan::K0 { session } => {
+                let report = session.search_window::<Exists>(haystack, window, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
@@ -4187,12 +4158,8 @@ impl PortableSearchSession<'_> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window_value(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => automaton
-                .prepare::<Exists>()
-                .search_window_with_workspace(haystack, window, workspace, limits)
+            PortableSearchSessionPlan::K0 { session } => session
+                .search_window::<Exists>(haystack, window, limits)
                 .map(fre_automata::SearchReport::into_output)
                 .map_err(SearchError::from),
         }
@@ -4238,13 +4205,8 @@ impl PortableSearchSession<'_> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.shortest_match_window(haystack, window, limits)
             }
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => {
-                let report = automaton
-                    .prepare::<EarliestEnd>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?;
+            PortableSearchSessionPlan::K0 { session } => {
+                let report = session.search_window::<EarliestEnd>(haystack, window, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
@@ -4264,13 +4226,8 @@ impl PortableSearchSession<'_> {
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::Native(regex) => regex.selected_end(haystack, limits),
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => {
-                let report = automaton
-                    .prepare::<SelectedEnd>()
-                    .search_with_workspace(haystack, workspace, limits)?;
+            PortableSearchSessionPlan::K0 { session } => {
+                let report = session.search::<SelectedEnd>(haystack, limits)?;
                 let accounting = report.accounting();
                 Ok((report.into_output(), SearchAccounting::K0(accounting)))
             }
@@ -4353,13 +4310,8 @@ impl PortableSearchSession<'_> {
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         match &mut self.plan {
             PortableSearchSessionPlan::Native(regex) => regex.find_window(haystack, window, limits),
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => {
-                let report = automaton
-                    .prepare::<Span>()
-                    .search_window_with_workspace(haystack, window, workspace, limits)?;
+            PortableSearchSessionPlan::K0 { session } => {
+                let report = session.search_window::<Span>(haystack, window, limits)?;
                 let accounting = report.accounting();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),
@@ -4380,13 +4332,8 @@ impl PortableSearchSession<'_> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_window(haystack, SearchWindow::new(start, haystack.len()), limits)
             }
-            PortableSearchSessionPlan::K0 {
-                automaton,
-                workspace,
-            } => {
-                let report = automaton
-                    .prepare::<Span>()
-                    .search_at_with_workspace_cursor(haystack, start, workspace, limits)?;
+            PortableSearchSessionPlan::K0 { session } => {
+                let report = session.search_span_at_cursor(haystack, start, limits)?;
                 let accounting = report.accounting();
                 let matched = report.into_output().map(|span| Match {
                     start: span.start(),

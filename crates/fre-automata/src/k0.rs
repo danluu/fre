@@ -1643,6 +1643,20 @@ pub struct K0Workspace {
     construction: SetupAccounting,
 }
 
+/// Reusable K0 storage bound to one exact immutable automaton.
+///
+/// Unlike [`K0Workspace`], this owner cannot be paired with another automaton
+/// after construction. Searches can therefore reuse the authenticated graph
+/// shape and cursor capabilities while retaining all per-invocation window,
+/// work, scratch, reset, and accounting checks.
+#[derive(Debug)]
+pub struct K0SearchSession<'a> {
+    automaton: &'a Automaton,
+    workspace: K0Workspace,
+    capabilities: LazyCapabilities,
+    span_start_proof: SpanCursorStartProof,
+}
+
 impl K0Workspace {
     /// Allocate and fully initialize fixed-capacity workspace for `automaton`.
     ///
@@ -1704,6 +1718,14 @@ impl K0Workspace {
         mode: WorkspaceMode,
     ) -> Result<Self, SearchError> {
         let layout = WorkspaceLayout::for_automaton_mode(automaton, mode)?;
+        Self::new_with_layout(automaton, limits, layout)
+    }
+
+    fn new_with_layout(
+        automaton: &Automaton,
+        limits: WorkspaceLimits,
+        layout: WorkspaceLayout,
+    ) -> Result<Self, SearchError> {
         if layout.construction_work > limits.max_setup_work {
             return Err(SearchError::WorkspaceSetupWorkLimitExceeded {
                 limit: limits.max_setup_work,
@@ -1900,6 +1922,97 @@ impl K0Workspace {
     }
 }
 
+impl<'a> K0SearchSession<'a> {
+    /// Select and construct the best admitted reusable workspace tier.
+    ///
+    /// This is an internal facade bridge. `endpoint_eligible` and
+    /// `bidirectional` are source-independent planner facts. Optional cache
+    /// tiers that do not fit fall back to the next smaller tier; the ordinary
+    /// Pike tier remains mandatory and reports its setup refusal.
+    #[doc(hidden)]
+    pub fn new_selected(
+        automaton: &'a Automaton,
+        limits: WorkspaceLimits,
+        endpoint_eligible: bool,
+        bidirectional: bool,
+    ) -> Result<Self, SearchError> {
+        let fits = |layout: WorkspaceLayout| {
+            layout.construction_work <= limits.max_setup_work
+                && layout.logical_bytes <= limits.max_scratch_bytes
+        };
+        let layout = if endpoint_eligible && bidirectional {
+            WorkspaceLayout::for_bidirectional_automaton(automaton)
+                .ok()
+                .filter(|layout| fits(*layout))
+        } else {
+            None
+        }
+        .or_else(|| {
+            endpoint_eligible
+                .then(|| WorkspaceLayout::for_accelerated_automaton(automaton).ok())
+                .flatten()
+                .filter(|layout| fits(*layout))
+        })
+        .map_or_else(
+            || WorkspaceLayout::for_automaton(automaton),
+            Result::<_, SearchError>::Ok,
+        )?;
+        let workspace = K0Workspace::new_with_layout(automaton, limits, layout)?;
+        let capabilities = LazyCapabilities {
+            lazy: workspace.lazy.is_allocated(),
+            reverse: workspace.reverse.is_allocated(),
+            contextual: automaton.stats().assertion_edges() != 0,
+        };
+        Ok(Self {
+            automaton,
+            workspace,
+            capabilities,
+            span_start_proof: retained_span_cursor_start_proof(automaton),
+        })
+    }
+
+    /// Constructor allocation and initialization charges.
+    #[must_use]
+    pub const fn construction_accounting(&self) -> SetupAccounting {
+        self.workspace.construction_accounting()
+    }
+
+    pub(crate) fn search_window_untyped(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+        contract: OutputContract,
+    ) -> Result<UntypedReport, SearchError> {
+        execute_bound(
+            self.automaton,
+            haystack,
+            window,
+            &mut self.workspace,
+            limits,
+            contract,
+            self.capabilities,
+        )
+    }
+
+    pub(crate) fn search_span_at_untyped(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<UntypedReport, SearchError> {
+        search_span_with_bound_cursor(
+            self.automaton,
+            haystack,
+            start,
+            &mut self.workspace,
+            limits,
+            self.capabilities,
+            &mut self.span_start_proof,
+        )
+    }
+}
+
 struct WorkMeter {
     limit: u64,
     consumed: u64,
@@ -2046,6 +2159,22 @@ fn effective_lazy_mode(
     Ok(EffectiveLazyMode { lazy, reverse })
 }
 
+fn effective_bound_lazy_mode(
+    workspace: &K0Workspace,
+    wants_span: bool,
+    capabilities: LazyCapabilities,
+) -> Result<EffectiveLazyMode, SearchError> {
+    let cached_start_known = capabilities.lazy
+        && wants_span
+        && !capabilities.contextual
+        && workspace.lazy.initialized
+        && lazy_initial_has_pending(workspace)?;
+    let reverse = capabilities.reverse && wants_span && !cached_start_known;
+    let may_prove_start_without_reverse = wants_span && !capabilities.contextual;
+    let lazy = capabilities.lazy && (!wants_span || reverse || may_prove_start_without_reverse);
+    Ok(EffectiveLazyMode { lazy, reverse })
+}
+
 pub(crate) fn search_span_with_workspace_cursor(
     automaton: &Automaton,
     haystack: &[u8],
@@ -2104,6 +2233,65 @@ pub(crate) fn search_span_with_workspace_cursor(
     Ok(report)
 }
 
+fn search_span_with_bound_cursor(
+    automaton: &Automaton,
+    haystack: &[u8],
+    start: usize,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    capabilities: LazyCapabilities,
+    retained_start_proof: &mut SpanCursorStartProof,
+) -> Result<UntypedReport, SearchError> {
+    let window = SearchWindow::new(start, haystack.len());
+    validate_window(haystack, window)?;
+    let mode = effective_bound_lazy_mode(workspace, true, capabilities)?;
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, setup_work) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        mode.lazy,
+        mode.reverse,
+    )?;
+    let start_proof = match *retained_start_proof {
+        SpanCursorStartProof::AutomatonOwned => {
+            let proof =
+                automaton
+                    .start_filter_proof
+                    .get()
+                    .ok_or(SearchError::InternalInvariant {
+                        detail: "bound cursor lost its automaton-owned start-filter proof",
+                    })?;
+            InvocationStartProof::Published(proof)
+        }
+        SpanCursorStartProof::Ordinary => {
+            InvocationStartProof::Published(&ORDINARY_START_FILTER_PROOF)
+        }
+        SpanCursorStartProof::Unprepared => {
+            prepare_start_filter(automaton, workspace, &mut meter, window.start())?
+        }
+    };
+    let report = execute_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        OutputContract::Span,
+        mode.lazy,
+        mode.reverse,
+        capabilities.contextual,
+        meter,
+        setup_work,
+        start_proof,
+    )?;
+    *retained_start_proof = retained_span_cursor_start_proof(automaton);
+    Ok(report)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2159,6 +2347,58 @@ fn execute(
         mode.lazy,
         mode.reverse,
         contextual,
+        meter,
+        setup_work,
+        start_proof,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the bound Pike/lazy entry authenticates one complete invocation"
+)]
+fn execute_bound(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    limits: SearchLimits,
+    contract: OutputContract,
+    capabilities: LazyCapabilities,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    let wants_span = matches!(contract, OutputContract::Span);
+    let mode = if wants_span {
+        effective_bound_lazy_mode(workspace, true, capabilities)?
+    } else {
+        EffectiveLazyMode {
+            lazy: capabilities.lazy,
+            reverse: false,
+        }
+    };
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, setup_work) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        &mut setup,
+        mode.lazy,
+        mode.reverse,
+    )?;
+    let start_proof = prepare_start_filter(automaton, workspace, &mut meter, window.start())?;
+    execute_prepared(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        limits,
+        setup,
+        contract,
+        mode.lazy,
+        mode.reverse,
+        capabilities.contextual,
         meter,
         setup_work,
         start_proof,
@@ -5283,6 +5523,27 @@ fn prepare_invocation(
             actual_zero_width_edges: workspace.layout.zero_width_edges,
         });
     }
+
+    prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        limits,
+        setup,
+        may_use_lazy,
+        may_use_reverse,
+    )
+}
+
+fn prepare_bound_invocation(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    limits: SearchLimits,
+    setup: &mut SetupAccounting,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<(WorkMeter, u64), SearchError> {
     if workspace.retained_bytes > limits.max_scratch_bytes {
         return Err(SearchError::ResourceLimit {
             resource: ResourceKind::ScratchBytes,
@@ -5298,7 +5559,6 @@ fn prepare_invocation(
             position: window.start(),
         });
     }
-
     prepare_prevalidated_invocation(
         automaton,
         workspace,
@@ -6211,9 +6471,9 @@ mod tests {
             START_FILTER_MAX_OFFSET, START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0Workspace, MatchSpan, RawPlan,
-        ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
-        WorkspaceLimits,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0SearchSession, K0Workspace,
+        MatchSpan, RawPlan, ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd,
+        Span, StateRole, WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -12736,5 +12996,137 @@ mod tests {
             Some(3)
         );
         assert!(workspace.lazy.initialized);
+    }
+
+    #[test]
+    fn exact_bound_session_matches_validating_workspace_and_cursor() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+        assert_eq!(session.automaton.identity(), plan.identity());
+        assert!(session.capabilities.lazy);
+        assert!(session.capabilities.reverse);
+        let retained = session.construction_accounting().retained_bytes();
+        let haystack = b"zzabzzab";
+
+        let _ = session
+            .search::<Span>(haystack, SearchLimits::unlimited())
+            .unwrap();
+        let warm = session
+            .search::<Span>(haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(warm.into_output(), Some(MatchSpan::new(2, 4)));
+        assert!(warm.accounting().setup().reused());
+        assert_eq!(warm.accounting().setup().retained_bytes(), retained);
+        assert_eq!(warm.accounting().scratch_bytes(), retained);
+
+        let mut validating =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let _ = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut validating, SearchLimits::unlimited())
+            .unwrap();
+        let validating_warm = plan
+            .prepare::<Span>()
+            .search_with_workspace(haystack, &mut validating, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(validating_warm.output(), warm.output());
+        assert_eq!(
+            validating_warm.accounting().transition_work(),
+            warm.accounting().transition_work()
+        );
+        assert_eq!(
+            validating_warm.accounting().boundaries(),
+            warm.accounting().boundaries()
+        );
+        assert_eq!(
+            session
+                .search_span_at_cursor(haystack, 4, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(MatchSpan::new(6, 8))
+        );
+    }
+
+    #[test]
+    fn exact_bound_session_preserves_per_call_limits_and_recovers() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true).unwrap();
+        let retained = session.construction_accounting().retained_bytes();
+        let haystack = b"zzabzzab";
+        let _ = session
+            .search::<Span>(haystack, SearchLimits::unlimited())
+            .unwrap();
+        let warm = session
+            .search::<Span>(haystack, SearchLimits::unlimited())
+            .unwrap();
+        let exact = SearchLimits {
+            max_work: warm.accounting().work(),
+            max_scratch_bytes: retained,
+        };
+        assert_eq!(
+            session.search::<Span>(haystack, exact).unwrap().output(),
+            warm.output()
+        );
+        assert!(matches!(
+            session.search::<Span>(
+                haystack,
+                SearchLimits {
+                    max_work: exact.max_work - 1,
+                    max_scratch_bytes: retained,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == exact.max_work - 1
+        ));
+        assert!(matches!(
+            session.search::<Span>(
+                haystack,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained - 1,
+                },
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == retained && limit == retained - 1
+        ));
+        assert!(matches!(
+            session.search_window::<Span>(
+                haystack,
+                SearchWindow::new(3, haystack.len() + 1),
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InvalidWindow {
+                start: 3,
+                end,
+                haystack_len,
+            }) if end == haystack.len() + 1 && haystack_len == haystack.len()
+        ));
+        assert_eq!(
+            session
+                .search::<Span>(haystack, SearchLimits::unlimited())
+                .unwrap()
+                .output(),
+            warm.output()
+        );
+    }
+
+    #[test]
+    fn caller_owned_workspace_still_rejects_a_wrong_shape() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let wrong_plan = ascii_literal(b'a');
+        let mut wrong_workspace =
+            K0Workspace::new(&wrong_plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(matches!(
+            plan.prepare::<Span>().search_with_workspace(
+                b"zzabzzab",
+                &mut wrong_workspace,
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::WorkspaceLayoutMismatch { .. })
+        ));
     }
 }

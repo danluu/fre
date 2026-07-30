@@ -1,6 +1,6 @@
 use core::marker::PhantomData;
 
-use crate::{Automaton, K0Workspace, SearchError, SearchLimits, SearchWindow};
+use crate::{Automaton, K0SearchSession, K0Workspace, SearchError, SearchLimits, SearchWindow};
 
 /// The capture-free output promised by a prepared entry point.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,6 +408,65 @@ impl TypedPlan<'_, Span> {
             workspace,
             limits,
         )?;
+        Ok(SearchReport::new(report.found, report.accounting))
+    }
+}
+
+impl K0SearchSession<'_> {
+    /// Search the full haystack under one typed output contract.
+    ///
+    /// The session is permanently bound to the immutable automaton that
+    /// constructed its workspace. Per-call range, work, scratch, reset, and
+    /// accounting checks remain identical to the caller-owned workspace API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for a hard-limit refusal or execution failure.
+    pub fn search<O: Operation>(
+        &mut self,
+        haystack: &[u8],
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        self.search_window::<O>(haystack, SearchWindow::full(haystack), limits)
+    }
+
+    /// Search a byte range under one typed output contract.
+    ///
+    /// Assertions inspect the complete original haystack. The range is
+    /// validated on every call even though graph and workspace compatibility
+    /// were authenticated during construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] for an invalid range, a hard-limit refusal, or
+    /// execution failure.
+    pub fn search_window<O: Operation>(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<O::Output>, SearchError> {
+        let report = self.search_window_untyped(haystack, window, limits, O::CONTRACT)?;
+        Ok(SearchReport::new(
+            O::project(report.found),
+            report.accounting,
+        ))
+    }
+
+    /// Search a complete-haystack suffix with retained span cursor facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::search_window`].
+    #[doc(hidden)]
+    pub fn search_span_at_cursor(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchReport<Option<MatchSpan>>, SearchError> {
+        let report = self.search_span_at_untyped(haystack, start, limits)?;
         Ok(SearchReport::new(report.found, report.accounting))
     }
 }
