@@ -1,7 +1,7 @@
 //! Explicit binding of an authenticated optimizing Count-v3 handle.
 //!
 //! Binding authenticates one precompiled image once. Production calls apply
-//! one evidence-backed size split: inputs below 4096 bytes stay on the retained
+//! one evidence-backed size split: inputs below 65,536 bytes stay on the retained
 //! portable owner and longer inputs use authenticated native code. The typed
 //! outcome exposes the route that actually ran. No call performs artifact
 //! lookup, target dispatch, compilation, recipe selection, or code audit.
@@ -407,7 +407,7 @@ impl AggregateCountExactLiteralAotSveSessionV3<'_> {
             .map(AggregateCountExactLiteralAotOutcomeV3::value)
     }
 
-    /// Count through the portable owner below 4096 bytes or through the
+    /// Count through the portable owner below 65,536 bytes or through the
     /// authenticated SVE/SVE2 image at and above that evidence floor.
     #[inline]
     pub fn count_value_with_route(

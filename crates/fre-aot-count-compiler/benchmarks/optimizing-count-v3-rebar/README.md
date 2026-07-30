@@ -185,11 +185,13 @@ For a retained Count-v3 timing, the runner:
 4. executes one typed outcome call and requires the same native route; and
 5. times only subsequent value-only facade calls.
 
-Every production inventory cell is at least 4096 bytes. A shorter live input
-is refused before timing even though the general production facade can
-portably serve short inputs elsewhere. Production SVE/SVE2 session creation
-requires the current Linux thread already to have exact VL=16 bytes; unlike
-qualification, confirmation does not mutate the thread VL.
+Every authenticated build-inventory cell is at least 4,096 bytes. The
+controller selects only production timing cells of at least 65,536 bytes, and
+the runner requires the source-authorized facade to take a native route.
+Below that production floor the general facade falls back to its portable
+route, so the confirmation refuses to time it. Production SVE/SVE2 session
+creation requires the current Linux thread already to have exact VL=16 bytes;
+unlike qualification, confirmation does not mutate the thread VL.
 
 ## Bounded post-promotion controller
 
