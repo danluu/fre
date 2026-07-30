@@ -4559,6 +4559,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV16, BackendVersion::SEARCH_V16),
         (SearchBackendPolicy::AsimdV17, BackendVersion::SEARCH_V17),
         (SearchBackendPolicy::AsimdV18, BackendVersion::SEARCH_V18),
+        (SearchBackendPolicy::AsimdV19, BackendVersion::SEARCH_V19),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,
@@ -8185,6 +8186,464 @@ fn v18_bounded_deterministic_fuzz_matches_the_kir_oracle() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V19 structural gate binds its wire, fixed four-mask conversion, shared queue/verifier, restoration, and mutation rejection in one reviewable proof"
+)]
+fn v19_saved_mask_graph_is_distinct_exact_and_independently_audited() {
+    let literal = b"0123456789abcdef";
+    let program =
+        build_exact_literal::<Span>(literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V19 structural IR");
+    let v17 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV17,
+        EmitLimits::default(),
+    )
+    .expect("frozen V17 image");
+    let v19 = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV19,
+        EmitLimits::default(),
+    )
+    .expect("V19 saved-mask image");
+    audit(&v19).expect("independent V19 saved-mask template");
+    assert_eq!(v19.backend_version(), BackendVersion::SEARCH_V19);
+    assert_eq!(
+        &v19.to_aot(AotLimits::default())
+            .expect("bounded V19 AOT")
+            .as_bytes()[..8],
+        b"FREA64\0\x20"
+    );
+    assert_ne!(v19.code(), v17.code());
+    assert_ne!(v19.artifact_identity(), v17.artifact_identity());
+    let v17_manifest = v17.search_manifest().expect("V17 manifest");
+    let v19_manifest = v19.search_manifest().expect("V19 manifest");
+    assert_eq!(v19_manifest.candidate_policy_version, 15);
+    assert_eq!(
+        (
+            v19_manifest.primary_offset,
+            v19_manifest.secondary_offset,
+            v19_manifest.verification_offset,
+            v19_manifest.quaternary_offset,
+            v19_manifest.quinary_offset,
+        ),
+        (
+            v17_manifest.primary_offset,
+            v17_manifest.secondary_offset,
+            v17_manifest.verification_offset,
+            v17_manifest.quaternary_offset,
+            v17_manifest.quinary_offset,
+        ),
+        "V19 reuses the frozen phase-unique V17 selector"
+    );
+
+    let decoded = decode(v19.code()).expect("V19 structural decode");
+    let conversions = [(0_u8, 0_u8), (2, 1), (4, 2), (6, 3)];
+    let conversion_starts = decoded
+        .windows(12)
+        .enumerate()
+        .filter_map(|(start, window)| {
+            conversions
+                .iter()
+                .enumerate()
+                .all(|(ordinal, &(source, destination))| {
+                    let base = ordinal * 3;
+                    window[base]
+                        == DecodedInstruction::ShiftRightNarrowHalfwordsToBytes8 {
+                            destination: 16,
+                            source,
+                        }
+                        && window[base + 1]
+                            == DecodedInstruction::MoveVectorDoubleTo64 {
+                                destination,
+                                source: 16,
+                            }
+                        && window[base + 2]
+                            == DecodedInstruction::AndRegister64 {
+                                destination,
+                                left: destination,
+                                right: 14,
+                            }
+                })
+                .then_some(start)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        conversion_starts.len(),
+        1,
+        "exactly one Q0/Q2/Q4/Q6 to X0/X1/X2/X3 conversion site"
+    );
+    let saved = conversion_starts[0];
+    assert_eq!(
+        decoded[saved + 12],
+        DecodedInstruction::MoveRegister64 {
+            destination: 7,
+            source: 5,
+        }
+    );
+    assert_eq!(
+        decoded[saved + 13],
+        DecodedInstruction::MoveZero64 {
+            destination: 11,
+            immediate: 4,
+            shift: 0,
+        }
+    );
+
+    let branch_target = |index: usize| {
+        let displacement = match decoded[index] {
+            DecodedInstruction::Branch { displacement }
+            | DecodedInstruction::BranchCondition { displacement, .. }
+            | DecodedInstruction::CompareBranchZero64 { displacement, .. } => displacement,
+            _ => panic!("instruction {index} is not a V19 branch"),
+        };
+        let address = i64::try_from(index)
+            .expect("small V19 graph")
+            .checked_mul(4)
+            .and_then(|address| address.checked_add(i64::from(displacement)))
+            .expect("bounded V19 branch target");
+        assert_eq!(address % 4, 0);
+        usize::try_from(address / 4).expect("nonnegative V19 branch target")
+    };
+    let saved_entries = decoded
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            matches!(
+                instruction,
+                DecodedInstruction::CompareBranchZero64 {
+                    register: 10,
+                    nonzero: true,
+                    ..
+                }
+            )
+            .then(|| branch_target(index))
+            .filter(|&target| target == saved)
+            .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        saved_entries.len(),
+        1,
+        "primary-first pair hits enter the one saved-mask site"
+    );
+
+    let reset = decoded[saved..]
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstruction::MoveZero64 {
+                    destination: 11,
+                    immediate: 0,
+                    shift: 0,
+                }
+                && window[1]
+                    == DecodedInstruction::AddImmediate64 {
+                        destination: 5,
+                        source: 7,
+                        immediate: 16,
+                    }
+                && window[2]
+                    == DecodedInstruction::AddRegister64 {
+                        destination: 15,
+                        left: 9,
+                        right: 5,
+                    }
+        })
+        .map(|offset| saved + offset)
+        .expect("V19 saved-mask restoration");
+    let saved_graph = &decoded[saved..reset];
+    assert_eq!(
+        saved_graph
+            .iter()
+            .filter(|instruction| {
+                **instruction
+                    == DecodedInstruction::ReverseBits64 {
+                        destination: 10,
+                        source: 0,
+                    }
+            })
+            .count(),
+        1,
+        "all four blocks share one lane selector and exact verifier"
+    );
+    assert_eq!(
+        saved_graph
+            .windows(3)
+            .filter(|window| {
+                *window
+                    == [
+                        DecodedInstruction::MoveRegister64 {
+                            destination: 0,
+                            source: 1,
+                        },
+                        DecodedInstruction::MoveRegister64 {
+                            destination: 1,
+                            source: 2,
+                        },
+                        DecodedInstruction::MoveRegister64 {
+                            destination: 2,
+                            source: 3,
+                        },
+                    ]
+            })
+            .count(),
+        1,
+        "the queue has exactly one fixed destructive X1/X2/X3 shift"
+    );
+    assert!(
+        !saved_graph.iter().any(|instruction| {
+            matches!(
+                instruction,
+                DecodedInstruction::LoadVectorPair128 { .. }
+                    | DecodedInstruction::DuplicateByte16 { .. }
+                    | DecodedInstruction::CompareEqualBytes16 {
+                        right: 1 | 3 | 5 | 7 | 23,
+                        ..
+                    }
+            )
+        }),
+        "saved recovery must not reload or recompute any screening column"
+    );
+
+    let queue_shift = saved_graph
+        .windows(3)
+        .position(|window| {
+            window[0]
+                == DecodedInstruction::MoveRegister64 {
+                    destination: 0,
+                    source: 1,
+                }
+                && window[1]
+                    == DecodedInstruction::MoveRegister64 {
+                        destination: 1,
+                        source: 2,
+                    }
+                && window[2]
+                    == DecodedInstruction::MoveRegister64 {
+                        destination: 2,
+                        source: 3,
+                    }
+        })
+        .map(|offset| saved + offset)
+        .expect("V19 fixed queue shift");
+    let mut queue_mutation = v19.clone();
+    replace_test_decoded_at(
+        &mut queue_mutation,
+        queue_shift + 1,
+        DecodedInstruction::MoveRegister64 {
+            destination: 1,
+            source: 3,
+        },
+    );
+    assert_resealed_search_rejected(queue_mutation, "V19 reordered saved-mask queue");
+
+    let mut v19_as_v17 = v19.clone();
+    v19_as_v17.backend_version = BackendVersion::SEARCH_V17;
+    v19_as_v17
+        .search
+        .as_mut()
+        .expect("V19 manifest")
+        .backend_version = BackendVersion::SEARCH_V17;
+    assert_resealed_search_rejected(v19_as_v17, "V19 code resealed as V17");
+
+    let mut v17_as_v19 = v17;
+    v17_as_v19.backend_version = BackendVersion::SEARCH_V19;
+    v17_as_v19
+        .search
+        .as_mut()
+        .expect("V17 manifest")
+        .backend_version = BackendVersion::SEARCH_V19;
+    assert_resealed_search_rejected(v17_as_v19, "V17 code resealed as V19");
+}
+
+#[test]
+fn v19_saved_masks_cover_every_lane_block_and_false_survivor_shape() {
+    let literal = [11_u8, 37, 63, 89, 115, 141, 167, 193, 219, 245, 17, 43, 69];
+    let program =
+        build_exact_literal::<Span>(&literal, AnchorFlags::default(), ValidateLimits::default())
+            .expect("V19 four-block IR");
+    let image = emit_with_backend(
+        &program,
+        SearchBackendPolicy::AsimdV19,
+        EmitLimits::default(),
+    )
+    .expect("V19 four-block image");
+    audit(&image).expect("V19 four-block image audit");
+    let manifest = image.search_manifest().expect("V19 four-block manifest");
+    let primary = usize::from(manifest.primary_offset);
+    let secondary = usize::from(manifest.secondary_offset);
+    let avoid = (0_u16..=255)
+        .map(|value| u8::try_from(value).expect("bounded byte"))
+        .find(|byte| !literal.contains(byte))
+        .expect("V19 literal leaves an avoiding byte");
+    let window_start = 3_usize;
+    let wide_base = window_start + 1;
+
+    for block in 0..4_usize {
+        for lane in 0..16_usize {
+            let candidate = wide_base + block * 16 + lane;
+            let mut haystack = vec![avoid; 160];
+            haystack[candidate..candidate + literal.len()].copy_from_slice(&literal);
+            let expected = program
+                .execute(
+                    &haystack,
+                    SearchWindow::new(window_start, haystack.len()),
+                    ExecutionLimits::unlimited(),
+                )
+                .expect("V19 lane/block oracle")
+                .output()
+                .map(|span| (span.start(), span.end()));
+            let actual = simulate(&image, &haystack, window_start, haystack.len())
+                .expect("V19 lane/block simulation");
+            assert_eq!(span_output(actual), expected, "block={block} lane={lane}");
+            assert_eq!(expected, Some((candidate, candidate + literal.len())));
+        }
+    }
+
+    let scenarios: &[(&[usize], Option<usize>)] = &[
+        (&[0, 2, 14, 33, 35, 47], Some(63)),
+        (&[0, 7, 32, 46], None),
+        (&[17, 18, 31], Some(55)),
+        (&[15, 16, 31, 32, 47, 48, 61], Some(62)),
+    ];
+    for (scenario, &(false_offsets, exact_offset)) in scenarios.iter().enumerate() {
+        let mut haystack = vec![avoid; 160];
+        for &offset in false_offsets {
+            let candidate = wide_base + offset;
+            haystack[candidate + primary] = literal[primary];
+            haystack[candidate + secondary] = literal[secondary];
+        }
+        if let Some(offset) = exact_offset {
+            let candidate = wide_base + offset;
+            haystack[candidate..candidate + literal.len()].copy_from_slice(&literal);
+        }
+        let expected = program
+            .execute(
+                &haystack,
+                SearchWindow::new(window_start, haystack.len()),
+                ExecutionLimits::unlimited(),
+            )
+            .expect("V19 survivor-shape oracle")
+            .output()
+            .map(|span| (span.start(), span.end()));
+        let actual = simulate(&image, &haystack, window_start, haystack.len())
+            .expect("V19 survivor-shape simulation");
+        assert_eq!(
+            span_output(actual),
+            expected,
+            "false-survivor scenario={scenario}"
+        );
+        assert_eq!(
+            expected,
+            exact_offset.map(|offset| {
+                let start = wide_base + offset;
+                (start, start + literal.len())
+            })
+        );
+    }
+}
+
+#[test]
+fn v19_every_width_and_window_shape_matches_the_kir_oracle() {
+    let mut state = 0xa6f3_917c_42de_580b_u64;
+    let mut comparisons = 0_u64;
+    for width in 6_usize..=MAX_REPEATED_CONFIRM_BYTES {
+        let literal = (0..width)
+            .map(|offset| {
+                u8::try_from(offset)
+                    .expect("bounded V19 width")
+                    .wrapping_mul(61)
+                    .wrapping_add(7)
+            })
+            .collect::<Vec<_>>();
+        let program = build_exact_literal::<Span>(
+            &literal,
+            AnchorFlags::default(),
+            ValidateLimits::default(),
+        )
+        .expect("V19 every-width IR");
+        let image = emit_with_backend(
+            &program,
+            SearchBackendPolicy::AsimdV19,
+            EmitLimits::default(),
+        )
+        .expect("V19 every-width image");
+        audit(&image).expect("V19 every-width image audit");
+        let manifest = image.search_manifest().expect("V19 every-width manifest");
+        let primary = usize::from(manifest.primary_offset);
+        let secondary = usize::from(manifest.secondary_offset);
+
+        for case in 0..8_usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let hay_len = 112 + usize::try_from(state >> 24).expect("host usize") % 97;
+            let mut haystack = Vec::with_capacity(hay_len);
+            for _ in 0..hay_len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                haystack.push(state.to_le_bytes()[0]);
+            }
+
+            for offset in [1_usize, 17, 34, 63] {
+                if offset + secondary.max(primary) < haystack.len() {
+                    haystack[offset + primary] = literal[primary];
+                    haystack[offset + secondary] = literal[secondary];
+                }
+            }
+            let exact = (case & 1 == 0).then(|| {
+                5 + (usize::try_from(state >> 8).expect("host usize")
+                    % (haystack.len() - width - 5))
+            });
+            if let Some(candidate) = exact {
+                haystack[candidate..candidate + width].copy_from_slice(&literal);
+            }
+
+            let random_start =
+                usize::try_from(state >> 16).expect("host usize") % (haystack.len() + 1);
+            let random_end = random_start
+                + (usize::try_from(state >> 32).expect("host usize")
+                    % (haystack.len() - random_start + 1));
+            let short_end = width.saturating_sub(1).min(haystack.len());
+            let exact_window = exact
+                .map(|candidate| (candidate, candidate + width))
+                .unwrap_or((random_start, random_end));
+            let windows = [
+                (0, 0),
+                (0, short_end),
+                (0, haystack.len()),
+                (random_start, haystack.len()),
+                (random_start, random_end),
+                exact_window,
+            ];
+            for (start, end) in windows {
+                let expected = program
+                    .execute(
+                        &haystack,
+                        SearchWindow::new(start, end),
+                        ExecutionLimits::unlimited(),
+                    )
+                    .expect("V19 every-width oracle")
+                    .output()
+                    .map(|span| (span.start(), span.end()));
+                let actual = simulate(&image, &haystack, start, end)
+                    .expect("V19 every-width safe ISA simulation");
+                assert_eq!(
+                    span_output(actual),
+                    expected,
+                    "width={width} case={case} window={start}..{end}"
+                );
+                comparisons = comparisons.checked_add(1).expect("bounded V19 matrix");
+            }
+        }
+    }
+    assert_eq!(comparisons, 1_296);
+}
+
+#[test]
 fn v17_post_window_setup_leaves_x1_x2_x3_available_for_saved_masks() {
     let literal = b"0123456789abcdef";
     let program =
@@ -8412,7 +8871,7 @@ fn v13_adaptive_recovery_decoded_edges_cover_zero_one_and_max_remaining_columns(
 }
 
 #[test]
-fn v9_through_v18_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
+fn v9_through_v19_reject_shapes_without_one_nonempty_unanchored_exact_candidate() {
     for backend in [
         SearchBackendPolicy::AsimdV9,
         SearchBackendPolicy::AsimdV10,
@@ -8424,6 +8883,7 @@ fn v9_through_v18_reject_shapes_without_one_nonempty_unanchored_exact_candidate(
         SearchBackendPolicy::AsimdV16,
         SearchBackendPolicy::AsimdV17,
         SearchBackendPolicy::AsimdV18,
+        SearchBackendPolicy::AsimdV19,
     ] {
         for anchors in [
             AnchorFlags {
