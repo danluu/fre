@@ -16,9 +16,11 @@ distinct pattern/semantic artifact row.
 The authenticated production selector is restricted before confirmation by
 `minimum-haystack-65536-bytes-v1`: every selected production cell has
 `input_bytes >= 65536`. This is a conservative tightening of the original
-4,096-byte qualification-universe floor. The build script independently
-enforces the production floor. Haystack length remains absent from the
-pattern-only compiler input.
+4,096-byte qualification-universe floor. The build script retains and
+authenticates that complete qualification universe so its object registry stays
+identity-equal to the qualified registry; the production confirmation
+controller and runtime route independently enforce the 65,536-byte production
+floor. Haystack length remains absent from the pattern-only compiler input.
 
 The regex payload compiler receives no cell, job, family, partition, haystack,
 oracle, or timing value. Cell attribution is joined only after all objects have
