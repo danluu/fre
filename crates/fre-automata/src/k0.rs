@@ -2824,15 +2824,22 @@ fn execute_lazy_loop(
                 detail: "lazy DFA source position exceeded the validated window",
             })?;
         let transition = match state {
-            LazyState::Cached(cached) => build_lazy_cached_transition(
-                automaton,
-                cached,
-                byte,
-                workspace,
-                meter,
-                core_reserve,
-                position,
-            )?,
+            LazyState::Cached(cached) => {
+                let cell = workspace.lazy.cell(cached, byte)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_lazy_cached_transition(
+                        automaton,
+                        cached,
+                        byte,
+                        workspace,
+                        meter,
+                        core_reserve,
+                        position,
+                    )?
+                } else {
+                    LazyTransition::Ready(cell)
+                }
+            }
             LazyState::Inline { pending } => {
                 build_lazy_inline_transition(automaton, byte, pending, workspace, meter, position)?
             }
