@@ -1883,6 +1883,7 @@ mod tests {
         V9,
         V10,
         V15,
+        V16,
     }
 
     fn macos_family_compiler_fixture_with_backend(
@@ -1904,6 +1905,10 @@ mod tests {
                 SearchCompilePolicyV1::default(),
             )
             .expect("macOS V15 manifest"),
+            FamilyTestBackend::V16 => MacosAarch64ExactSearchManifestV1::<Span>::v16_candidate(
+                SearchCompilePolicyV1::default(),
+            )
+            .expect("macOS V16 manifest"),
         };
         let compiled =
             plan_and_compile_macos_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -1955,6 +1960,10 @@ mod tests {
                 LinuxAarch64SearchCompilePolicyV1::default(),
             )
             .expect("Linux V15 manifest"),
+            FamilyTestBackend::V16 => LinuxAarch64ExactSearchManifestV1::<Span>::v16_candidate(
+                LinuxAarch64SearchCompilePolicyV1::default(),
+            )
+            .expect("Linux V16 manifest"),
         };
         let compiled =
             plan_and_compile_linux_aarch64_exact_search_v1(manifest, literal.to_vec(), profile)
@@ -2041,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn broad_v9_v10_and_v15_families_reconstruct_and_bind_literals_on_both_object_platforms() {
+    fn broad_v9_v10_v15_and_v16_families_reconstruct_and_bind_literals_on_both_object_platforms() {
         for fixture in [
             macos_family_compiler_fixture(b"mac-family-lit16"),
             linux_family_compiler_fixture(b"lin-family-lit16"),
@@ -2049,6 +2058,8 @@ mod tests {
             linux_family_compiler_fixture_with_backend(b"lin-v10-family16", FamilyTestBackend::V10),
             macos_family_compiler_fixture_with_backend(b"phase-unique-15!", FamilyTestBackend::V15),
             linux_family_compiler_fixture_with_backend(b"phase-unique-15!", FamilyTestBackend::V15),
+            macos_family_compiler_fixture_with_backend(b"phase-unique-16!", FamilyTestBackend::V16),
+            linux_family_compiler_fixture_with_backend(b"phase-unique-16!", FamilyTestBackend::V16),
         ] {
             assert_family_payload_mutations_refused(&fixture);
             let handle = VerifiedStaticSearchSpanV1 {
