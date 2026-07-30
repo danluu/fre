@@ -1,0 +1,57 @@
+{
+  "schema": "fre-search-aot-candidate-preregistration-amendment-v1",
+  "candidate": "v24-sixth-static-r1",
+  "amends": {
+    "path": "research/aot/search-v24-sixth-static-r1/preregistration-v1.json",
+    "sha256": "768773c7e270947eef7a0bf8bcf4e9f695b1508523cf2c2b3ab5c3496136353c",
+    "section": "fresh_performance_gate.strict_acceptance"
+  },
+  "timing_status_at_amendment": "NO_V24_BUILD_EXECUTION_OR_TIMING_HAS_OCCURRED",
+  "reason": "The user rejected a literal every-cell veto as too strict. This prospective amendment retains a large aggregate-win requirement and bounds broad and tail regressions while allowing a small number of noisy or intrinsically unfavorable cells.",
+  "unchanged": [
+    "Candidate source design, backend version, policy, and wire identity",
+    "Correctness, ABI, audit, mutation, identity, and EC2 requirements",
+    "One-shot timing rule, host, reference, fixtures, repetitions, orders, and semantic checks",
+    "The complete 1,944-cell membership and every frozen scenario, topology, outcome, window, and width",
+    "Prohibition on Rebar as design, membership, threshold, or gate input",
+    "Terminal refusal without same-identity retest, retune, or post-timing threshold change"
+  ],
+  "superseded_acceptance": {
+    "overall_candidate_over_v17_geomean_lte": 0.8,
+    "every_broad_stratum_candidate_over_v17_geomean_lte": 1.01,
+    "every_individual_candidate_over_v17_ratio_lte": 1.05,
+    "semantics": "all equal"
+  },
+  "replacement_acceptance": {
+    "overall_candidate_over_v17_geomean_lte": 0.8,
+    "every_broad_stratum_candidate_over_v17_geomean_lte": 1.02,
+    "broad_strata": [
+      "scenario",
+      "topology",
+      "outcome",
+      "window",
+      "width"
+    ],
+    "cell_tail": {
+      "cell_count": 1944,
+      "ratio": "candidate_ns_per_search / reference_ns_per_search",
+      "empirical_quantile_method": "nearest-rank: sort all 1,944 cell ratios ascending and select one-indexed rank ceil(q * 1,944)",
+      "p95_candidate_over_v17_ratio_lte": 1.05,
+      "cells_strictly_over_1_05_lte": 19,
+      "cells_strictly_over_1_05_fraction_lte": 0.01,
+      "maximum_candidate_over_v17_ratio_lte": 1.1
+    },
+    "semantics": "all equal"
+  },
+  "interpretation": {
+    "overall": "The candidate must still deliver at least a 20% geometric-mean speedup over V17 across the complete frozen lattice.",
+    "breadth": "No frozen scenario, topology, outcome, window, or width slice may regress by more than 2% in geometric mean.",
+    "tail": "At least 99% of individual cells must be no worse than 5% slower, and no cell may be more than 10% slower. The explicit p95 condition is retained as a reported distribution check.",
+    "correctness": "Any semantic, ABI, audit, mutation, identity, or guard-page failure remains an unconditional failure."
+  },
+  "prospective_fence": {
+    "amendment_must_be_committed_before_v24_implementation_build_execution_or_timing": true,
+    "no_post_timing_change": true,
+    "v23_terminal_result_is_not_reclassified": true
+  }
+}
