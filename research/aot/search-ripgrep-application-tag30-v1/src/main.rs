@@ -504,7 +504,6 @@ fn correctness_rows(
             project(candidate) == row.expected_span,
             "candidate span changed",
         )?;
-        require_current_cpu(cpu)?;
         fragment.record(&json!({
             "schema": CORRECTNESS_ROW_SCHEMA,
             "ordinal": row.ordinal,
@@ -574,13 +573,13 @@ fn timing_rows(
         };
         let expected = row.expected_span;
         verify_pair(&engine.portable, &candidate, fixture.haystack(), expected)?;
-        require_current_cpu(cpu)?;
+        wait_for_measurement_cpu(cpu)?;
         let calibration =
             calibrated_iterations(&engine.portable, &candidate, fixture.haystack(), cpu)?;
         let iterations = calibration.selected_iterations;
         let mut pairs = Vec::with_capacity(REPETITIONS);
         for repetition in 0..REPETITIONS {
-            require_current_cpu(cpu)?;
+            wait_for_measurement_cpu(cpu)?;
             let (portable, candidate_measurement, order) = if repetition % 2 == 0 {
                 (
                     measure_portable(&engine.portable, fixture.haystack(), iterations, cpu)?,
@@ -624,7 +623,7 @@ fn timing_rows(
                 "candidate_cpu_attempts": cpu_attempt_receipts(&candidate_measurement),
             }));
         }
-        require_current_cpu(cpu)?;
+        wait_for_measurement_cpu(cpu)?;
         fragment.record(&json!({
             "schema": TIMING_ROW_SCHEMA,
             "ordinal": row.ordinal,
@@ -1732,6 +1731,7 @@ fn wait_for_measurement_cpu(_expected: usize) -> Result<(), io::Error> {
     Err(invalid("application runner requires Linux or macOS"))
 }
 
+#[cfg(target_os = "linux")]
 fn require_current_cpu(expected: usize) -> Result<(), io::Error> {
     let actual = current_cpu()?;
     require(

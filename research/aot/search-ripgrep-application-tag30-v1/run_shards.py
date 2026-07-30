@@ -250,9 +250,9 @@ def run(argv: Sequence[str]) -> None:
         cpu: tuple(
             shard
             for shard in range(SHARDS)
-            if shard % len(cpus) == worker
+            if shard % len(cpus) == worker_index
         )
-        for worker, cpu in enumerate(cpus)
+        for worker_index, cpu in enumerate(cpus)
     }
     receipts = []
     with concurrent.futures.ThreadPoolExecutor(
