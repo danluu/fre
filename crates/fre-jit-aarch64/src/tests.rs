@@ -4566,6 +4566,7 @@ fn explicit_search_backend_policy_selects_distinct_artifact_identities() {
         (SearchBackendPolicy::AsimdV22, BackendVersion::SEARCH_V22),
         (SearchBackendPolicy::AsimdV23, BackendVersion::SEARCH_V23),
         (SearchBackendPolicy::AsimdV24, BackendVersion::SEARCH_V24),
+        (SearchBackendPolicy::AsimdV25, BackendVersion::SEARCH_V25),
         (SearchBackendPolicy::Sve16, BackendVersion::SEARCH_SVE16_V1),
         (
             SearchBackendPolicy::Sve2Fixed16,

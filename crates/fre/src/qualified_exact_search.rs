@@ -78,6 +78,14 @@ const fn qualification_for_backend_with_atoms(
         | QualifiedExactSearchBackendPolicy::AsimdV15
         | QualifiedExactSearchBackendPolicy::AsimdV16
         | QualifiedExactSearchBackendPolicy::AsimdV17
+        | QualifiedExactSearchBackendPolicy::AsimdV18
+        | QualifiedExactSearchBackendPolicy::AsimdV19
+        | QualifiedExactSearchBackendPolicy::AsimdV20
+        | QualifiedExactSearchBackendPolicy::AsimdV21
+        | QualifiedExactSearchBackendPolicy::AsimdV22
+        | QualifiedExactSearchBackendPolicy::AsimdV23
+        | QualifiedExactSearchBackendPolicy::AsimdV24
+        | QualifiedExactSearchBackendPolicy::AsimdV25
         | QualifiedExactSearchBackendPolicy::Sve16 => QualifiedExactSearchQualification::Candidate,
     }
 }
@@ -888,6 +896,14 @@ const fn selected_end_register_backend_v2(
         | QualifiedExactSearchBackendPolicy::AsimdV15
         | QualifiedExactSearchBackendPolicy::AsimdV16
         | QualifiedExactSearchBackendPolicy::AsimdV17
+        | QualifiedExactSearchBackendPolicy::AsimdV18
+        | QualifiedExactSearchBackendPolicy::AsimdV19
+        | QualifiedExactSearchBackendPolicy::AsimdV20
+        | QualifiedExactSearchBackendPolicy::AsimdV21
+        | QualifiedExactSearchBackendPolicy::AsimdV22
+        | QualifiedExactSearchBackendPolicy::AsimdV23
+        | QualifiedExactSearchBackendPolicy::AsimdV24
+        | QualifiedExactSearchBackendPolicy::AsimdV25
         | QualifiedExactSearchBackendPolicy::Sve16
         | QualifiedExactSearchBackendPolicy::Sve2Fixed16 => None,
     }
