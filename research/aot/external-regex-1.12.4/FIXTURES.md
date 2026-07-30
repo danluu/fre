@@ -51,3 +51,12 @@ Because blocks have the literal width and contain the absent byte at a fixed
 endpoint, every literal-width window—including one crossing a block
 boundary—contains that byte and cannot match. A scalar overlapping oracle must
 still prove zero occurrences over the complete fixture.
+
+The v2 materialization produced 28 fixtures at
+`/private/tmp/fre-external-regex-dev-fixtures-v2`. Its manifest SHA-256 is
+`b979ed327db7e9623bccba1ef775d1957b7323c8b30edb44f40593176f52b44a`;
+the v2 generator SHA-256 is
+`98b641a054e2c1f92eeefa50cf8aea8d108ac7f6600bae0974642e9dcbc0e5fa`.
+A second complete generation was byte-identical for the manifest and all 28
+fixtures. The generator also reauthenticated and copied every predecessor
+fixture by its v1 manifest receipt, so the original evidence remains unchanged.
