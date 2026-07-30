@@ -843,6 +843,9 @@ fn emit_exact(
         BackendVersion::SEARCH_V16 => {
             emit_exact_candidates_v16(template, manifest, literal, none, found)
         }
+        BackendVersion::SEARCH_V17 => {
+            emit_exact_candidates_v17(template, manifest, literal, none, found)
+        }
         BackendVersion::SEARCH_SVE2_FIXED16_V2 => {
             emit_exact_candidates_sve2_fixed16_v2(template, manifest, literal, none, found)
         }
@@ -1469,6 +1472,35 @@ fn emit_exact_candidates_v16(
     emit_exact_candidates_v8(template, manifest, literal, none, found)
 }
 
+fn emit_exact_candidates_v17(
+    template: &mut Template,
+    manifest: SearchManifest,
+    literal: &[u8],
+    none: Label,
+    found: Label,
+) -> Result<(), AuditError> {
+    let first_candidate_miss = template.new_label(LabelKind::Internal);
+    let selected = literal
+        .get(usize::from(manifest.primary_offset))
+        .copied()
+        .ok_or(AuditError::InvalidSearchManifest)?;
+
+    template.add_reg(15, 9, 5);
+    template.load_byte(10, 15, manifest.primary_offset);
+    template.cmp_imm32(10, u16::from(selected));
+    template.branch_cond(Condition::NotEqual, first_candidate_miss);
+    if literal.len() > 1 {
+        emit_literal_equality_specialized(template, 15, 8, literal.len(), first_candidate_miss)?;
+    }
+    template.mov_reg(13, 5);
+    template.add_reg(14, 5, 12);
+    template.branch(found);
+
+    template.bind(first_candidate_miss)?;
+    template.add_imm(5, 5, 1);
+    emit_exact_candidates_v8(template, manifest, literal, none, found)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the complete v4 mask-guided control-flow template remains independent and reviewable"
@@ -1973,22 +2005,34 @@ fn emit_exact_candidates_v8(
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_discover = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_column_ready = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_advance = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     )
     .then(|| template.new_label(LabelKind::Internal));
     let learned_scan = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     )
     .then(|| template.new_label(LabelKind::Loop));
     let learned_disabled = matches!(
@@ -1998,7 +2042,10 @@ fn emit_exact_candidates_v8(
     .then(|| template.new_label(LabelKind::SlowPath));
     let learned_tail = matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     )
     .then(|| template.new_label(LabelKind::SlowPath));
     let tail_setup = template.new_label(LabelKind::SlowPath);
@@ -2039,7 +2086,10 @@ fn emit_exact_candidates_v8(
     }
     if matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     ) {
         if !filters_cover_zero {
             return Err(AuditError::InvalidSearchManifest);
@@ -2291,6 +2341,7 @@ fn emit_exact_candidates_v8(
             | BackendVersion::SEARCH_V14
             | BackendVersion::SEARCH_V15
             | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     ) {
         emit_literal_equality_specialized(template, 15, 8, literal.len(), candidate_miss)?;
     } else if literal.len() == 16 {
@@ -2354,23 +2405,30 @@ fn emit_exact_candidates_v8(
         template.bind(exhausted)?;
     } else if matches!(
         manifest.backend_version,
-        BackendVersion::SEARCH_V14 | BackendVersion::SEARCH_V15 | BackendVersion::SEARCH_V16
+        BackendVersion::SEARCH_V14
+            | BackendVersion::SEARCH_V15
+            | BackendVersion::SEARCH_V16
+            | BackendVersion::SEARCH_V17
     ) {
         let discover = learned_discover.ok_or(AuditError::InvalidSearchManifest)?;
         let column_ready = learned_column_ready.ok_or(AuditError::InvalidSearchManifest)?;
         let learned_next = learned_advance.ok_or(AuditError::InvalidSearchManifest)?;
         let learned_block = learned_scan.ok_or(AuditError::InvalidSearchManifest)?;
-        let disabled = learned_disabled.ok_or(AuditError::InvalidSearchManifest)?;
         let finish_tail = learned_tail.ok_or(AuditError::InvalidSearchManifest)?;
-        let exhausted = recovery_exhausted.ok_or(AuditError::InvalidSearchManifest)?;
-        let adaptive_entry = adaptive_recovery.ok_or(AuditError::InvalidSearchManifest)?;
+        let continue_learned = manifest.backend_version == BackendVersion::SEARCH_V17;
 
-        // X11 is initialized once before scanning. Only state zero may enter
-        // discovery; active mode reaching this ordinary miss path is treated
-        // conservatively as a one-way transition to the V13 fallback.
+        // State zero enters discovery. V17 clears a failed retained bit and
+        // continues with the learned column; V14-V16 keep their frozen
+        // one-way transition to V13.
         template.compare_branch_zero(11, false, discover);
-        template.mov_imm64(11, 2);
-        template.branch(disabled);
+        if continue_learned {
+            template.compare_branch_zero(0, true, lane_loop);
+            template.branch(learned_next);
+        } else {
+            let disabled = learned_disabled.ok_or(AuditError::InvalidSearchManifest)?;
+            template.mov_imm64(11, 2);
+            template.branch(disabled);
+        }
 
         // The complete equality immediately above proved that this exact
         // candidate differs somewhere. Discover one source-derived mismatch
@@ -2393,7 +2451,7 @@ fn emit_exact_candidates_v8(
         template.compare_branch_zero(0, false, learned_next);
 
         // Intersect current five-column survivors with the learned mismatch.
-        // A survivor disables learned mode and preserves the mask for V13.
+        // V17 exact-verifies survivors and then resumes learned scanning.
         template.add_reg(15, 9, 7);
         template.move_vector_byte_to32(10, 25);
         template.add_reg(15, 15, 10);
@@ -2402,8 +2460,13 @@ fn emit_exact_candidates_v8(
         emit_sparse_lane_mask_to(template, 16, 18, 10);
         template.and_reg(0, 0, 10);
         template.compare_branch_zero(0, false, learned_next);
-        template.mov_imm64(11, 2);
-        template.branch(disabled);
+        if continue_learned {
+            template.branch(lane_loop);
+        } else {
+            let disabled = learned_disabled.ok_or(AuditError::InvalidSearchManifest)?;
+            template.mov_imm64(11, 2);
+            template.branch(disabled);
+        }
 
         // Probe the learned column first on every subsequent block.
         template.bind(learned_next)?;
@@ -2422,7 +2485,10 @@ fn emit_exact_candidates_v8(
         template.add_reg(15, 13, 10);
         template.load_vector128(16, 15, 0);
         template.compare_equal_bytes16(16, 16, 24);
-        if manifest.backend_version == BackendVersion::SEARCH_V16 {
+        if matches!(
+            manifest.backend_version,
+            BackendVersion::SEARCH_V16 | BackendVersion::SEARCH_V17
+        ) {
             template.unsigned_max_pairwise_bytes16(18, 16, 16);
             template.move_vector_double_to64(0, 18);
             template.compare_branch_zero(0, false, learned_next);
@@ -2499,50 +2565,60 @@ fn emit_exact_candidates_v8(
             template.and_reg(0, 0, 10);
             template.compare_branch_zero(0, false, learned_next);
         }
-        template.mov_imm64(11, 2);
-        template.branch(disabled);
+        if continue_learned {
+            template.branch(lane_loop);
+        } else {
+            let disabled = learned_disabled.ok_or(AuditError::InvalidSearchManifest)?;
+            template.mov_imm64(11, 2);
+            template.branch(disabled);
+        }
 
         template.bind(finish_tail)?;
         template.branch(tail_setup);
 
-        // Mirror the frozen V13 retained-mask handler exactly after the
-        // one-way disable transition.
-        template.bind(disabled)?;
-        template.compare_branch_zero(0, false, exhausted);
-        let adaptive = independent_adaptive_offsets_v13(
-            literal,
-            primary_offset,
-            secondary_offset,
-            verification_offset,
-            quaternary_offset,
-            quinary_offset,
-        );
-        emit_branch_if_mask_has_multiple(template, 0, 10, adaptive_entry);
-        template.branch(lane_loop);
-        template.bind(adaptive_entry)?;
-        template.add_reg(13, 9, 7);
-        for (index, &offset) in adaptive.iter().enumerate() {
-            template.load_byte(10, 8, offset);
-            template.dup_byte16(17, 10);
-            let column = if offset == 0 {
-                13
-            } else {
-                template.add_imm(15, 13, offset);
-                15
-            };
-            template.load_vector128(16, column, 0);
-            template.compare_equal_bytes16(16, 16, 17);
-            emit_sparse_lane_mask_to(template, 16, 18, 10);
-            template.and_reg(0, 0, 10);
+        if !continue_learned {
+            let disabled = learned_disabled.ok_or(AuditError::InvalidSearchManifest)?;
+            let exhausted = recovery_exhausted.ok_or(AuditError::InvalidSearchManifest)?;
+            let adaptive_entry = adaptive_recovery.ok_or(AuditError::InvalidSearchManifest)?;
+
+            // Mirror the frozen V13 retained-mask handler exactly for V14-V16.
+            template.bind(disabled)?;
             template.compare_branch_zero(0, false, exhausted);
-            if index + 1 < adaptive.len() {
-                template.sub_imm(10, 0, 1);
-                template.and_reg(10, 0, 10);
-                template.compare_branch_zero(10, false, lane_loop);
+            let adaptive = independent_adaptive_offsets_v13(
+                literal,
+                primary_offset,
+                secondary_offset,
+                verification_offset,
+                quaternary_offset,
+                quinary_offset,
+            );
+            emit_branch_if_mask_has_multiple(template, 0, 10, adaptive_entry);
+            template.branch(lane_loop);
+            template.bind(adaptive_entry)?;
+            template.add_reg(13, 9, 7);
+            for (index, &offset) in adaptive.iter().enumerate() {
+                template.load_byte(10, 8, offset);
+                template.dup_byte16(17, 10);
+                let column = if offset == 0 {
+                    13
+                } else {
+                    template.add_imm(15, 13, offset);
+                    15
+                };
+                template.load_vector128(16, column, 0);
+                template.compare_equal_bytes16(16, 16, 17);
+                emit_sparse_lane_mask_to(template, 16, 18, 10);
+                template.and_reg(0, 0, 10);
+                template.compare_branch_zero(0, false, exhausted);
+                if index + 1 < adaptive.len() {
+                    template.sub_imm(10, 0, 1);
+                    template.and_reg(10, 0, 10);
+                    template.compare_branch_zero(10, false, lane_loop);
+                }
             }
+            template.branch(lane_loop);
+            template.bind(exhausted)?;
         }
-        template.branch(lane_loop);
-        template.bind(exhausted)?;
     } else {
         template.compare_branch_zero(0, true, lane_loop);
     }
