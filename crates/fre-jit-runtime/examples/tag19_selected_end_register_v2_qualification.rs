@@ -347,7 +347,8 @@ mod linux_aarch64 {
                 .into());
             }
         }
-        let affinity = fs::read_to_string("/proc/thread-self/status")?
+        let thread_status = fs::read_to_string("/proc/thread-self/status")?;
+        let affinity = thread_status
             .lines()
             .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
             .map(str::trim)
