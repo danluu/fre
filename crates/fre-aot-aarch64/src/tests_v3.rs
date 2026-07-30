@@ -1658,6 +1658,57 @@ fn apple_static_wide_omits_the_adaptive_pair_subgraph() {
             ..
         }
     )));
+
+    let guarded_static_backedges = |image: &crate::AotCountImageV3| {
+        let instructions = decoded_v3(image);
+        instructions
+            .iter()
+            .enumerate()
+            .filter(|(index, instruction)| {
+                matches!(
+                    instruction,
+                    DecodedInstructionV3::BranchCondition {
+                        condition: crate::ConditionV3::CarrySet,
+                        ..
+                    }
+                ) && branch_target_v3(&instructions, *index)
+                    < u32::try_from(index.checked_mul(4).unwrap()).unwrap()
+            })
+            .map(|(index, _)| {
+                assert!(index >= 4);
+                assert_eq!(
+                    instructions[index - 4],
+                    DecodedInstructionV3::CompareRegister64 { left: 3, right: 4 }
+                );
+                assert!(matches!(
+                    instructions[index - 3],
+                    DecodedInstructionV3::BranchCondition {
+                        condition: crate::ConditionV3::Higher,
+                        ..
+                    }
+                ));
+                assert_eq!(
+                    instructions[index - 2],
+                    DecodedInstructionV3::SubtractRegister64 {
+                        destination: 5,
+                        left: 4,
+                        right: 3,
+                    }
+                );
+                assert_eq!(
+                    instructions[index - 1],
+                    DecodedInstructionV3::CompareImmediate64 {
+                        register: 5,
+                        immediate: 127,
+                    }
+                );
+            })
+            .count()
+    };
+    assert_eq!(guarded_static_backedges(&apple), 2);
+    for adaptive in [&generic, &neoverse, &apple_sve, &apple_sve2] {
+        assert_eq!(guarded_static_backedges(adaptive), 0);
+    }
 }
 
 #[test]

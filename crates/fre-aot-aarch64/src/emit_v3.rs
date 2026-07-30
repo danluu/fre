@@ -2875,10 +2875,10 @@ fn emit_multi_specialized_v3(
     sve_tail: Option<HybridSveTailV3>,
     done: LabelV3,
 ) -> Result<(), CountAotError> {
-    // Five-byte sparse Apple recipes are a pattern-only Rebar class whose rare
-    // primary already makes the 128-start retained-mask loop stable. Keep
-    // other tuning classes on the adaptive schedule unless their independent
-    // target evidence supports the same choice.
+    // Five-byte sparse Apple recipes form a closed pattern-only class whose
+    // rare primary makes the 128-start retained-mask loop stable. Keep other
+    // tuning classes on the adaptive schedule unless their independent target
+    // evidence supports the same choice.
     let static_wide = strategy == LoweringStrategyV3::SparseRareColumns
         && literal.len() == 5
         && tuning_class == CountV3TuningClass::AppleMSeries
